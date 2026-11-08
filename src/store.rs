@@ -27,10 +27,18 @@ pub fn path(workspace: &std::path::Path) -> Option<PathBuf> {
         .fold(0xcbf29ce484222325u64, |hash, byte| {
             (hash ^ byte as u64).wrapping_mul(0x100000001b3)
         });
-    Some(
-        base.join("Still")
-            .join(format!("workspace-{hash:016x}.json")),
-    )
+    let name = format!("workspace-{hash:016x}.json");
+    let directory = base.join("Shina");
+    let path = directory.join(&name);
+    if !path.exists() {
+        // Carry a Still-era index over once, so renaming the app does not lose threads.
+        let previous = base.join("Still").join(&name);
+        if previous.is_file() {
+            let _ = fs::create_dir_all(&directory);
+            let _ = fs::copy(&previous, &path);
+        }
+    }
+    Some(path)
 }
 
 pub fn load(path: &std::path::Path) -> Result<Option<Value>, String> {
@@ -110,7 +118,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory =
-            std::env::temp_dir().join(format!("still-store-{}-{unique}", std::process::id()));
+            std::env::temp_dir().join(format!("shina-store-{}-{unique}", std::process::id()));
         let file = directory.join("index.json");
         {
             let mut store = Store::new(file.clone(), Arc::new(|| {}));

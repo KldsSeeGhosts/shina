@@ -72,7 +72,7 @@ fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) -> bool {
 
 /// Resolve npm's JavaScript entry directly on Windows, avoiding cmd.exe quoting and console windows.
 fn command() -> Result<Command, String> {
-    if let Some(path) = env::var_os("STILL_PI_CLI") {
+    if let Some(path) = env::var_os("SHINA_PI_CLI").or_else(|| env::var_os("STILL_PI_CLI")) {
         return command_for(&PathBuf::from(path));
     }
     #[cfg(windows)]
@@ -95,7 +95,7 @@ fn command() -> Result<Command, String> {
                 }
             }
         }
-        Err("Pi was not found. Install Pi, or set STILL_PI_CLI to its CLI .js or .exe path, then reconnect.".into())
+        Err("Pi was not found. Install Pi, or set SHINA_PI_CLI to its CLI .js or .exe path, then reconnect.".into())
     }
     #[cfg(not(windows))]
     Ok(Command::new("pi"))
@@ -116,7 +116,7 @@ fn command_for(path: &Path) -> Result<Command, String> {
         .extension()
         .is_some_and(|ext| ext == "cmd" || ext == "ps1")
     {
-        Err("STILL_PI_CLI must name Pi's CLI .js or native executable, not a shell wrapper.".into())
+        Err("SHINA_PI_CLI must name Pi's CLI .js or native executable, not a shell wrapper.".into())
     } else {
         Ok(Command::new(path))
     }

@@ -555,7 +555,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     .gap(1.0)
                     .grow(1.0)
                     .min_w(0.0)
-                    .child(label("Still", TextStyle::new(12.0, 560.0), p.ink))
+                    .child(label("Shina", TextStyle::new(12.0, 560.0), p.ink))
                     .child(label(
                         if s.demo {
                             "Example workspace"

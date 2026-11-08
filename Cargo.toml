@@ -1,5 +1,5 @@
 [package]
-name = "still"
+name = "shina"
 version = "0.1.0"
 edition = "2024"
 description = "A native Rune workspace for the Pi coding agent"

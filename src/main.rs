@@ -57,7 +57,7 @@ fn main() {
                 workspace = PathBuf::from(path);
             }
             other => {
-                eprintln!("Unknown Still argument: {other}");
+                eprintln!("Unknown Shina argument: {other}");
                 std::process::exit(2);
             }
         }
@@ -93,7 +93,7 @@ fn main() {
                 state.captain_picker = true;
             }),
         ],
-        ..AppSpec::new("Still", (1280.0, 840.0), init, ui::view)
+        ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
     .titlebar(rune::Titlebar::new(44.0))
     .run();

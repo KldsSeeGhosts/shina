@@ -1,6 +1,6 @@
-# Still
+# Shina
 
-A native desktop chat workspace built with [Rune](https://github.com/anomalyco/rune) and the [Pi coding agent](https://github.com/earendil-works/pi). Still is a working-name prototype, not a T3 Code or Capy client.
+A native desktop chat workspace built with [Rune](https://github.com/anomalyco/rune) and the [Pi coding agent](https://github.com/earendil-works/pi). Shina is a working-name prototype, not a T3 Code or Capy client.
 
 The interface is entirely Rune. Pi runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
 
@@ -24,7 +24,7 @@ For a native executable with no console window:
 
 ```powershell
 cargo build --release
-.\target\release\still.exe
+.\target\release\shina.exe
 ```
 
 An optional development flag selects a project on launch:
@@ -33,7 +33,7 @@ An optional development flag selects a project on launch:
 cargo run -- --workspace C:\path\to\project
 ```
 
-If automatic Pi discovery fails, set `STILL_PI_CLI` to the full path of Pi's CLI JavaScript file or a native executable. On Windows the adapter resolves the installed npm entry directly and launches it with Node. It does not use a command shell or copy credentials.
+If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI JavaScript file or a native executable. Earlier setups may still use `STILL_PI_CLI`; Shina reads it as a fallback. On Windows the adapter resolves the installed npm entry directly and launches it with Node. It does not use a command shell or copy credentials.
 
 ## What works
 
@@ -58,9 +58,9 @@ Pi tools can edit files and execute commands with your account's permissions. Th
 
 For this first adapter, Pi launches with extensions, MCP, skills, and prompt-template discovery disabled. This prevents startup integrations from running before the client supports their full behavior. **Do not use this version if you depend on a Pi extension for safety checks or tool approvals.** The adapter does not modify your Pi configuration or authentication. It uses Pi's configured default model.
 
-On Windows, Still's small workspace index lives under `%LOCALAPPDATA%\Still`. Pi keeps its own session files and credentials in its normal locations outside this repository. Drafts currently survive thread switches, but not app restarts. Run one Still instance per workspace to avoid competing index writes.
+On Windows, Shina's small workspace index lives under `%LOCALAPPDATA%\Shina`. A Still-era index is copied over on first launch, so renaming the app does not lose saved threads. Pi keeps its own session files and credentials in its normal locations outside this repository. Drafts currently survive thread switches, but not app restarts. Run one Shina instance per workspace to avoid competing index writes.
 
-Closing Still closes the agent input pipes and waits for shutdown. After a short grace period, it terminates any remaining agent process. This is cleanup, not process-tree isolation.
+Closing Shina closes the agent input pipes and waits for shutdown. After a short grace period, it terminates any remaining agent process. This is cleanup, not process-tree isolation.
 
 ## Validation
 
@@ -75,11 +75,11 @@ The opt-in integration test starts the installed Pi and requests state and histo
 Render with Rune's actual GPU renderer, without opening a window:
 
 ```powershell
-cargo run -- --demo --snap artifacts\still-light.png --size 1280x840 --scale 1
-cargo run -- --demo --scene dark --snap artifacts\still-dark.png --size 1280x840 --scale 1
-cargo run -- --demo --snap artifacts\still-narrow.png --size 620x720 --scale 1
-cargo run -- --demo --scene captain --snap artifacts\still-captain.png --size 1280x840 --scale 1
-cargo run -- --demo --scene picker --snap artifacts\still-picker.png --size 1280x840 --scale 1
+cargo run -- --demo --snap artifacts\shina-light.png --size 1280x840 --scale 1
+cargo run -- --demo --scene dark --snap artifacts\shina-dark.png --size 1280x840 --scale 1
+cargo run -- --demo --snap artifacts\shina-narrow.png --size 620x720 --scale 1
+cargo run -- --demo --scene captain --snap artifacts\shina-captain.png --size 1280x840 --scale 1
+cargo run -- --demo --scene picker --snap artifacts\shina-picker.png --size 1280x840 --scale 1
 ```
 
 ## Implementation and limits
