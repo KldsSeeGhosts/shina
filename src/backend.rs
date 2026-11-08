@@ -1,0 +1,339 @@
+//! Pi is an RPC subprocess, never a terminal. All pipes and process waits live off the UI thread.
+use rune::Waker;
+use serde_json::{Value, json};
+use std::{
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+pub enum Event {
+    Record(Value),
+    Error(String),
+    Diagnostic(String),
+    Exited,
+}
+
+static WORKERS: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Only called after Rune's window closes. Disconnect itself never waits on the UI thread.
+pub fn shutdown_all() {
+    let workers = std::mem::take(&mut *WORKERS.lock().expect("worker registry"));
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+pub struct Pi {
+    commands: SyncSender<Value>,
+    pub events: Receiver<Event>,
+}
+
+impl Pi {
+    pub fn start(workspace: PathBuf, session: Option<String>, wake: Waker) -> Self {
+        let (commands, input) = mpsc::sync_channel::<Value>(32);
+        let (events, output) = mpsc::sync_channel(256);
+        let worker = thread::spawn(move || {
+            if let Err(error) = run(&workspace, session.as_deref(), input, &events, &wake) {
+                publish(&events, &wake, Event::Error(error));
+            }
+            publish(&events, &wake, Event::Exited);
+        });
+        let mut workers = WORKERS.lock().expect("worker registry");
+        workers.retain(|worker| !worker.is_finished());
+        workers.push(worker);
+        Self {
+            commands,
+            events: output,
+        }
+    }
+
+    pub fn send(&self, record: Value) -> Result<(), String> {
+        self.commands
+            .try_send(record)
+            .map_err(|e| format!("Pi did not accept the command: {e}"))
+    }
+}
+
+fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) -> bool {
+    // A full queue applies backpressure instead of growing memory without a limit.
+    let sent = output.send(event).is_ok();
+    wake();
+    sent
+}
+
+/// Resolve npm's JavaScript entry directly on Windows, avoiding cmd.exe quoting and console windows.
+fn command() -> Result<Command, String> {
+    if let Some(path) = env::var_os("STILL_PI_CLI") {
+        return command_for(&PathBuf::from(path));
+    }
+    #[cfg(windows)]
+    {
+        for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+            let executable = directory.join("pi.exe");
+            if executable.is_file() {
+                return Ok(Command::new(executable));
+            }
+            for package in [
+                "@earendil-works/pi-coding-agent",
+                "@mariozechner/pi-coding-agent",
+            ] {
+                let root = directory.join("node_modules").join(package);
+                for entry in ["dist/bundle/cli.js", "dist/cli.js"] {
+                    let path = root.join(entry);
+                    if path.is_file() {
+                        return command_for(&path);
+                    }
+                }
+            }
+        }
+        Err("Pi was not found. Install Pi, or set STILL_PI_CLI to its CLI .js or .exe path, then reconnect.".into())
+    }
+    #[cfg(not(windows))]
+    Ok(Command::new("pi"))
+}
+
+fn command_for(path: &Path) -> Result<Command, String> {
+    if !path.is_file() {
+        return Err(format!("The Pi CLI does not exist at {}.", path.display()));
+    }
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "js" || ext == "mjs")
+    {
+        let mut command = Command::new("node");
+        command.arg(path);
+        Ok(command)
+    } else if path
+        .extension()
+        .is_some_and(|ext| ext == "cmd" || ext == "ps1")
+    {
+        Err("STILL_PI_CLI must name Pi's CLI .js or native executable, not a shell wrapper.".into())
+    } else {
+        Ok(Command::new(path))
+    }
+}
+
+fn run(
+    workspace: &Path,
+    session: Option<&str>,
+    input: Receiver<Value>,
+    output: &SyncSender<Event>,
+    wake: &Waker,
+) -> Result<(), String> {
+    let mut command = command()?;
+    command
+        .args([
+            "--mode",
+            "rpc",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-prompt-templates",
+        ])
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(session) = session {
+        command.args(["--session", session]);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not start Pi: {e}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let events = output.clone();
+    let waker = wake.clone();
+    let ready = Arc::new(AtomicBool::new(false));
+    let received_state = ready.clone();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_record(&mut reader) {
+                Ok(Some(record)) => {
+                    if record["type"] == "response" && record["command"] == "get_state" {
+                        received_state.store(true, Ordering::Relaxed);
+                    }
+                    if !publish(&events, &waker, Event::Record(record)) {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    publish(&events, &waker, Event::Error(error));
+                    break;
+                }
+            }
+        }
+    });
+    let events = output.clone();
+    let waker = wake.clone();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        // Keep draining diagnostics, but send a bounded amount to the UI.
+        let mut sent = 0;
+        loop {
+            let mut bytes = Vec::new();
+            let result = Read::by_ref(&mut reader)
+                .take(8192)
+                .read_until(b'\n', &mut bytes);
+            match result {
+                Ok(0) | Err(_) => break,
+                _ if sent < 12 => {
+                    sent += 1;
+                    if !publish(
+                        &events,
+                        &waker,
+                        Event::Diagnostic(String::from_utf8_lossy(&bytes).trim().to_owned()),
+                    ) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    let result = (|| {
+        let started = Instant::now();
+        write_record(&mut stdin, &json!({"id":"state", "type":"get_state"}))?;
+        write_record(&mut stdin, &json!({"id":"history", "type":"get_messages"}))?;
+        loop {
+            if !ready.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(15) {
+                return Err("Pi did not answer within 15 seconds. Check its CLI configuration and workspace trust, then reconnect.".into());
+            }
+            match input.recv_timeout(Duration::from_millis(100)) {
+                Ok(record) => write_record(&mut stdin, &record)?,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Pi exited with {status}. Check the connection details and reconnect."
+                    ))
+                };
+            }
+        }
+        Ok(())
+    })();
+    // Dropping Pi disconnects the command channel. Close stdin, allow graceful shutdown, then reap.
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_millis(700);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return result;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn write_record(writer: &mut impl Write, record: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, record).map_err(|e| e.to_string())?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|e| format!("Could not write to Pi: {e}"))
+}
+
+fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    let count = Read::by_ref(reader)
+        .take(LIMIT + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|e| format!("Could not read Pi output: {e}"))?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if count as u64 > LIMIT {
+        return Err(
+            "Pi sent a protocol record larger than 8 MiB. Disconnect and reconnect.".into(),
+        );
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("Pi sent an invalid RPC record: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn framing_preserves_unicode_and_accepts_crlf() {
+        let input = "{\"type\":\"test\",\"text\":\"a\u{2028}b\u{2029}c\"}\r\n{\"type\":\"next\"}\n";
+        let mut reader = std::io::Cursor::new(input.as_bytes());
+        assert_eq!(
+            read_record(&mut reader).unwrap().unwrap()["text"],
+            "a\u{2028}b\u{2029}c"
+        );
+        assert_eq!(read_record(&mut reader).unwrap().unwrap()["type"], "next");
+        assert!(read_record(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn command_encoding_is_one_jsonl_record() {
+        let mut output = Vec::new();
+        write_record(
+            &mut output,
+            &json!({"type":"prompt","message":"quoted \"text\"\nand newline"}),
+        )
+        .unwrap();
+        assert_eq!(output.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output).unwrap()["message"],
+            "quoted \"text\"\nand newline"
+        );
+    }
+
+    #[test]
+    #[ignore = "Starts the installed Pi, but sends no model prompt"]
+    fn installed_pi_answers_state_and_history_without_a_prompt() {
+        let pi = Pi::start(std::env::temp_dir(), None, Arc::new(|| {}));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut state = false;
+        let mut history = false;
+        while Instant::now() < deadline && !(state && history) {
+            match pi.events.recv_timeout(Duration::from_secs(1)) {
+                Ok(Event::Record(record)) if record["type"] == "response" => {
+                    assert_ne!(
+                        record["success"], false,
+                        "Pi rejected the read-only handshake"
+                    );
+                    if record["command"] == "get_state" {
+                        state = true;
+                    }
+                    if record["command"] == "get_messages" {
+                        history = true;
+                    }
+                }
+                Ok(Event::Error(error)) => panic!("Pi handshake failed: {error}"),
+                Ok(Event::Exited) => panic!("Pi exited before answering the handshake"),
+                _ => {}
+            }
+        }
+        drop(pi);
+        shutdown_all();
+        assert!(state && history, "Pi did not return both state and history");
+    }
+}
