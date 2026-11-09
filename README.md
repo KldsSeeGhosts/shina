@@ -45,14 +45,14 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 - Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, Happy when settled, and Sad when offline. The set is Ember, Juniper, Sable, and Pip.
 - Captain conversation groups with nested threads, a native Captain picker that shows each captain's live status, and thread pinning.
 - Independent Pi processes for connected threads. Switching threads preserves their drafts and leaves other work running.
-- Running, needs-input, failed, and settled states. `agent_end` does not settle a thread. The adapter waits for `agent_settled`.
+- Running, needs-input, and failed states. `agent_end` does not finish a run; the adapter waits for `agent_settled`. A finished thread goes quiet instead of showing a status, and a stopped run returns to idle. Background threads that finish get an unread badge.
 - Canceling a run clears the queue before requesting an abort.
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
 - An atomic per-workspace index remembers thread titles, archive state, and Pi session paths. Reconnect to load a saved transcript, tool summaries, and tool results.
 - Live progress distinguishes model thinking, text generation, tool execution, retries, and compaction. Rejected prompts return to the draft; cancellation releases a pending dialog before clearing the queue and aborting.
 - Native folder selection. Switching folders refuses to discard unsent drafts or interrupt busy threads.
 
-Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+B for the sidebar, Ctrl+L for the composer, and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
+Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
 
 Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working, settled, and offline states. Autonomous crew delegation is not connected. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
 

@@ -485,7 +485,12 @@ impl Thread {
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
                 self.request = None;
+                let aborted = record["aborted"] == true;
                 self.finish_run();
+                // A stopped run is idle, not a finished task.
+                if aborted && self.status == Status::Settled {
+                    self.status = Status::Ready;
+                }
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
@@ -621,6 +626,8 @@ pub struct State {
     pub active: usize,
     pub next_id: usize,
     pub dark: bool,
+    /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
+    pub zoom: f32,
     pub show_activity: bool,
     pub show_archive: bool,
     pub sidebar: bool,
@@ -649,6 +656,7 @@ impl State {
             active: 0,
             next_id: 2,
             dark: false,
+            zoom: 1.0,
             show_activity: false,
             show_archive: false,
             sidebar: true,
@@ -793,6 +801,19 @@ impl State {
             .map(|thread| thread.status)
             .max_by_key(|status| status.urgency())
             .unwrap_or(Status::Offline)
+    }
+    /// Steps the zoom one notch in (`1`), out (`-1`), or back to 100% (`0`).
+    pub fn step_zoom(&mut self, direction: i32) {
+        let index = ZOOM_STEPS
+            .iter()
+            .position(|&z| (z - self.zoom).abs() < 0.001)
+            .unwrap_or(4);
+        self.zoom = match direction {
+            0 => 1.0,
+            d if d > 0 => ZOOM_STEPS[(index + 1).min(ZOOM_STEPS.len() - 1)],
+            _ => ZOOM_STEPS[index.saturating_sub(1)],
+        };
+        self.checkpoint();
     }
     pub fn toggle_pin(&mut self) {
         self.current_mut().pinned = !self.current().pinned;
@@ -944,6 +965,9 @@ impl State {
                     return;
                 }
                 self.dark = index["dark"] == true;
+                if let Some(zoom) = index["zoom"].as_f64() {
+                    self.zoom = snap_zoom(zoom as f32);
+                }
             }
             Ok(Some(_)) => {
                 self.storage_error = Some("The saved thread index uses an unsupported version. It has not been overwritten.".into());
@@ -963,7 +987,7 @@ impl State {
             return;
         }
         let snapshot = json!({
-            "version":2, "dark":self.dark,
+            "version":2, "dark":self.dark, "zoom":self.zoom,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "threads":self.threads.iter().map(|thread|json!({
                 "id":thread.id, "title":thread.title, "session":thread.session, "archived":thread.archived,
@@ -1096,6 +1120,16 @@ pub fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
         state.checkpoint();
     }
     changed
+}
+
+pub const ZOOM_STEPS: [f32; 10] = [0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+/// The closest supported zoom step, so a hand-edited index cannot pick an odd scale.
+pub fn snap_zoom(zoom: f32) -> f32 {
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - zoom).abs().total_cmp(&(b - zoom).abs()))
+        .unwrap_or(1.0)
 }
 
 pub fn string<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -1250,15 +1284,32 @@ mod tests {
         assert!(thread.pending_thinking.is_none());
     }
     #[test]
+    fn zoom_steps_clamp_and_reset() {
+        let mut state = State::new(std::env::temp_dir(), true);
+        state.step_zoom(1);
+        assert_eq!(state.zoom, 1.1);
+        for _ in 0..20 {
+            state.step_zoom(1);
+        }
+        assert_eq!(state.zoom, 2.0);
+        state.step_zoom(0);
+        assert_eq!(state.zoom, 1.0);
+        for _ in 0..20 {
+            state.step_zoom(-1);
+        }
+        assert_eq!(state.zoom, 0.67);
+        assert_eq!(snap_zoom(1.3), 1.25);
+    }
+    #[test]
     fn aborted_message_is_not_a_provider_failure() {
         let mut thread = Thread::new(1);
         thread.status = Status::Running;
         thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted","errorMessage":"Request was aborted"}}));
         thread.apply(json!({"type":"agent_settled","aborted":true}));
-        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.status, Status::Ready);
         assert!(thread.error.is_none());
         thread.apply(json!({"type":"response","command":"abort","success":true}));
-        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.status, Status::Ready);
     }
     #[test]
     fn successful_retry_clears_the_transient_provider_error() {

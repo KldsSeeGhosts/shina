@@ -29,6 +29,12 @@ fn key(state: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
     } else if event.is_command('k') {
         state.search_open = true;
         state.search.focused = true;
+    } else if event.is_command('=') || event.is_command('+') {
+        state.step_zoom(1);
+    } else if event.is_command('-') || event.is_command('_') {
+        state.step_zoom(-1);
+    } else if event.is_command('0') {
+        state.step_zoom(0);
     } else if event.key == Key::Escape && state.current().status.busy() {
         state.current_mut().stop();
     } else {
@@ -84,6 +90,10 @@ fn main() {
             ("dark", |state| {
                 state.populate_demo();
                 state.dark = true;
+            }),
+            ("zoomed", |state| {
+                state.populate_demo();
+                state.zoom = 1.25;
             }),
             ("captain", |state| {
                 state.populate_demo();
