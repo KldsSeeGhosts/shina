@@ -369,7 +369,12 @@ fn status_mark(status: Status, p: Palette, size: f32) -> El {
     }
     .a11y_hidden()
 }
+/// A status chip for states that need attention. A finished or idle thread shows nothing:
+/// the reply itself says it is done, and background completions use the unread badge.
 fn status(status: Status, p: Palette) -> El {
+    if matches!(status, Status::Ready | Status::Settled | Status::Offline) {
+        return el();
+    }
     row()
         .center_y()
         .gap(6.0)
@@ -394,15 +399,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .unwrap_or(false);
     let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
     let chrome = cx.chrome_insets();
+    // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
+    // by k and scaled back up, so layout, hit testing and text stay native at every step.
+    let zoom = s.zoom.clamp(0.5, 2.0);
+    let frame = cx.layout_with("zoom-frame", |r| (r[2], r[3]));
     // One strip at the titlebar's height holds the sidebar header, tabs, actions, and the
     // window's caption buttons, so they share a centre line and never overlap the pane.
     let mut top = row()
         .key("top-strip")
-        .h(chrome.height.max(40.0))
+        .h(chrome.height.max(40.0 * zoom) / zoom)
         .window_drag()
         .center_y()
         .pl(8.0)
-        .pr(chrome.trailing.max(8.0));
+        .pr((chrome.trailing / zoom).max(8.0));
     if docked {
         top = top.child(
             sidebar_header(s, p)
@@ -448,23 +457,29 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         pane = pane.child(body);
     }
-    let root = col()
+    let mut root = col()
         .key("workspace-root")
-        .w_full()
-        .h_full()
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
     if s.captain_editor.is_some() {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
-        root.child(captain_editor(s, p, height))
+        root = root.child(captain_editor(s, p, height));
     } else if s.settings_picker.is_some() {
-        root.child(settings_picker(s, p))
+        root = root.child(settings_picker(s, p));
     } else if s.captain_picker {
-        root.child(captain_picker(s, p))
-    } else {
-        root
+        root = root.child(captain_picker(s, p));
     }
+    root = match frame {
+        Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
+        _ => root.w_full().h_full(),
+    };
+    el().key("zoom-frame")
+        .w_full()
+        .h_full()
+        .fill(p.bg)
+        .center()
+        .child(root)
 }
 
 fn settings_picker(s: &State, p: Palette) -> El {
@@ -775,12 +790,6 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             }
             if state == Status::Waiting {
                 captain_row = captain_row.child(label("Needs you", SMALL, status_ink(state, p)));
-            } else if state == Status::Settled {
-                captain_row = captain_row.child(
-                    el().size(24.0, 24.0)
-                        .center()
-                        .child(icon("check", status_ink(state, p))),
-                );
             }
             content = content.child(captain_row);
             if selected {
@@ -1134,11 +1143,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     if thread.unread {
         title = title.child(counter(1, p));
     }
-    let detailed = selected
-        || matches!(
-            thread.status,
-            Status::Running | Status::Waiting | Status::Failed | Status::Connecting
-        );
+    let detailed = matches!(
+        thread.status,
+        Status::Running | Status::Waiting | Status::Failed | Status::Connecting
+    );
     if !detailed {
         return item.child(title);
     }
