@@ -1,4 +1,4 @@
-use crate::model::{SettingsPicker, State, Status, truncate};
+use crate::model::{SettingsPicker, State, Status, Thread, Tool, truncate};
 use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, col, el, memo, row, text, text_input};
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
@@ -204,8 +204,16 @@ fn icon(kind: &str, ink: Color) -> El {
         r#"<circle cx="8" cy="8" r="5.75" stroke="currentColor" fill="none"/><path d="M8 5v3.5" stroke="currentColor" stroke-linecap="round"/><circle cx="8" cy="11" r=".8" fill="currentColor"/>"#
     );
     glyph!(
-        PULSE,
-        r#"<path d="M1.5 8.5h3l1.75-4 3.5 8 1.75-4h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+        FILE,
+        r#"<path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5zM9 1.5V5h4M5.5 8h5M5.5 10.5h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        TERMINAL,
+        r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><path d="m4 6 2 2-2 2M8.5 10H12" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        EXPAND,
+        r#"<path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
     let glyph = match kind {
         "plus" => &PLUS,
@@ -236,7 +244,9 @@ fn icon(kind: &str, ink: Color) -> El {
         "open" => &CHEVRON_RIGHT,
         "lock" => &rune_kit::glyphs::LOCK,
         "close" => &rune_kit::glyphs::CLOSE,
-        "activity" => &PULSE,
+        "file" => &FILE,
+        "terminal" => &TERMINAL,
+        "expand" => &EXPAND,
         _ => &rune_kit::glyphs::CHECK_SMALL,
     };
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
@@ -413,11 +423,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .pl(8.0)
         .pr((chrome.trailing / zoom).max(8.0));
     if docked {
-        top = top.child(
-            sidebar_header(s, p)
-                .w(if narrow { 216.0 } else { 232.0 })
-                .pr(8.0),
-        );
+        top = top.child(el().w(if narrow { 216.0 } else { 232.0 }));
     }
     top = top.child(header(s, p, narrow, compact).grow(1.0).min_w(0.0));
     let mut workspace = row().grow(1.0).min_h(0.0).px(8.0).pb(8.0);
@@ -434,12 +440,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.panel)
         .border(0.5, p.line)
         .clip_rounded(12.0);
-    if s.show_activity && narrow {
+    if s.show_activity && (narrow || s.activity_full) {
         pane = pane.child(activity(s, p, true));
     } else {
         let mut body = row().grow(1.0).min_h(0.0);
-        let main = col().grow(1.0).min_w(0.0).min_h(0.0);
-        let main = if s.current().messages.is_empty() {
+        let main = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .min_h(0.0)
+            .child(chat_header(s, p, narrow, compact));
+        let main = if s.current().messages.is_empty() && s.current().tools.is_empty() {
             main.items_center()
                 .child(spacer())
                 .child(conversation(s, p, wide))
@@ -627,11 +637,10 @@ fn settings_picker(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// Logo, search, and sidebar toggle. Lives in the window's top strip above the sidebar.
+/// Shell-local controls, separate from the draggable window title strip.
 fn sidebar_header(s: &State, p: Palette) -> El {
     row()
         .h(36.0)
-        .window_drag()
         .center_y()
         .px(8.0)
         .child(
@@ -682,6 +691,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         .min_h(0.0)
         .pr(8.0);
     side = side
+        .child(sidebar_header(s, p))
         .child(nav("new-thread", "New thread", "compose", p, false, |s| {
             s.new_thread()
         }))
@@ -1787,30 +1797,13 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(card)
 }
 
-fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
-    // Placed in the window's top strip; the strip handles dragging and caption-button room.
-    let docked = if compact {
-        s.compact_sidebar
-    } else {
-        s.sidebar
-    };
+fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
+    // Only tabs live in the title strip. Native caption buttons occupy its right edge.
     row()
         .h(36.0)
         .window_drag()
         .center_y()
         .gap(6.0)
-        .child(if docked {
-            // Cancel the row gap so the tab starts exactly at the pane's left edge.
-            el().ml(-6.0)
-        } else {
-            icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, move |s| {
-                if compact {
-                    s.compact_sidebar = true;
-                } else {
-                    s.sidebar = true;
-                }
-            })
-        })
         .child(
             row()
                 .key("active-tab")
@@ -1833,6 +1826,51 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         .child(icon_button("new-tab", "New thread", "plus", p, |s| {
             s.new_thread()
         }))
+        .child(spacer())
+}
+
+fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
+    let docked = if compact {
+        s.compact_sidebar
+    } else {
+        s.sidebar
+    };
+    row()
+        .key("chat-header")
+        .h(36.0)
+        .px(10.0)
+        .center_y()
+        .gap(6.0)
+        .child(if docked {
+            el()
+        } else {
+            icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, move |s| {
+                if compact {
+                    s.compact_sidebar = true;
+                } else {
+                    s.sidebar = true;
+                }
+            })
+        })
+        .child(
+            row()
+                .key("shell-thread")
+                .center_y()
+                .gap(8.0)
+                .px(10.0)
+                .h(26.0)
+                .radius(6.0)
+                .shrink()
+                .max_w(if narrow { 220.0 } else { 320.0 })
+                .fill(p.card)
+                .border(0.5, p.line)
+                .child(if let Some(captain) = s.current().captain {
+                    avatar(s, p, captain, 20.0, shown_status(s))
+                } else {
+                    icon("thread", p.muted)
+                })
+                .child(label(&s.current().title, TextStyle::new(12.0, 520.0), p.ink).truncate()),
+        )
         .child(spacer())
         .child(if s.demo {
             row()
@@ -1861,14 +1899,6 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                     |s| s.toggle_pin(),
                 ));
             }
-            actions = actions.child(toggle_button(
-                "toggle-activity",
-                "Toggle activity",
-                "activity",
-                s.show_activity,
-                p,
-                |s| s.show_activity = !s.show_activity,
-            ));
             if !s.current().status.busy() {
                 actions = actions.child(icon_button(
                     "archive-thread",
@@ -1882,10 +1912,283 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                     |s| s.archive(),
                 ));
             }
+            if !s.show_activity {
+                actions = actions.child(icon_button(
+                    "open-session-panel",
+                    "Show session details",
+                    "panel",
+                    p,
+                    |s| {
+                        s.show_activity = true;
+                        s.activity_full = false;
+                    },
+                ));
+            }
             actions
         })
-        // The divider has equal room on both sides before the caption buttons.
-        .child(el().w(1.0).h(16.0).ml(2.0).mr(8.0).fill(p.line))
+}
+
+fn tool_kind(name: &str) -> (&'static str, &'static str, &'static str) {
+    match name.to_ascii_lowercase().as_str() {
+        "read" | "read_file" => ("file", "Read", "file"),
+        "edit" | "write" | "edit_file" | "write_file" | "apply_patch" => ("edit", "Edited", "file"),
+        "bash" | "powershell" | "shell" | "exec" | "exec_command" => ("terminal", "Ran", "command"),
+        "grep" | "rg" | "search" | "find" => ("search", "Searched", "query"),
+        "ls" | "list" | "list_directory" => ("folder", "Listed", "directory"),
+        _ => ("bolt", "Called", "tool"),
+    }
+}
+
+fn tool_title(tool: &Tool) -> String {
+    let (_, verb, noun) = tool_kind(&tool.name);
+    let name = if noun == "tool" {
+        format!("{verb} {}", tool.name)
+    } else {
+        verb.into()
+    };
+    if tool.detail.is_empty() {
+        name
+    } else {
+        format!("{name} {}", tool.detail)
+    }
+}
+
+fn tool_summary(tools: &[&Tool]) -> String {
+    let mut counts: Vec<(&str, &str, usize)> = vec![];
+    for tool in tools {
+        let (_, verb, noun) = tool_kind(&tool.name);
+        if let Some(entry) = counts.iter_mut().find(|entry| entry.0 == verb) {
+            entry.2 += 1;
+        } else {
+            counts.push((verb, noun, 1));
+        }
+    }
+    counts
+        .iter()
+        .enumerate()
+        .map(|(index, (verb, noun, count))| {
+            let verb = if index == 0 {
+                verb.to_string()
+            } else {
+                verb.to_lowercase()
+            };
+            let noun = if *count == 1 {
+                noun.to_string()
+            } else if *noun == "directory" {
+                "directories".into()
+            } else {
+                format!("{noun}s")
+            };
+            format!("{verb} {count} {noun}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+/// Equal anchors are consecutive calls. Sorting also handles parallel calls and late results.
+fn tool_runs(t: &Thread, message: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut tools: Vec<usize> = t
+        .tools
+        .iter()
+        .enumerate()
+        .filter(|(_, tool)| tool.anchor.message == message)
+        .map(|(index, _)| index)
+        .collect();
+    tools.sort_by_key(|index| t.tools[*index].anchor);
+    let mut runs: Vec<(usize, Vec<usize>)> = vec![];
+    for index in tools {
+        let offset = t.tools[index].anchor.offset;
+        if let Some((last_offset, indices)) = runs.last_mut()
+            && *last_offset == offset
+        {
+            indices.push(index);
+        } else {
+            runs.push((offset, vec![index]));
+        }
+    }
+    runs
+}
+
+fn inline_tool(s: &State, p: Palette, index: usize) -> El {
+    let tool = &s.current().tools[index];
+    let title = tool_title(tool);
+    let ink = if tool.failed { p.danger } else { p.muted };
+    let mut content = col().gap(5.0).child(
+        row()
+            .key(format!("inline-tool-{}-{index}", s.current().id))
+            .role("button")
+            .label(format!(
+                "{} output for {title}",
+                if tool.expanded { "Hide" } else { "Show" }
+            ))
+            .focusable(true)
+            .center_y()
+            .gap(7.0)
+            .min_h(28.0)
+            .px(6.0)
+            .radius(5.0)
+            .hover(p.selected)
+            .on_press(move |s: &mut State| {
+                let tool = &mut s.current_mut().tools[index];
+                tool.expanded = !tool.expanded;
+            })
+            .child(tool_icon(tool_kind(&tool.name).0, ink))
+            .child(label(&title, SMALL, ink).grow(1.0).min_w(0.0).truncate())
+            .child(label(
+                if tool.failed {
+                    "Failed"
+                } else if tool.done {
+                    "Done"
+                } else {
+                    "Running"
+                },
+                TextStyle::new(11.0, 420.0),
+                ink,
+            ))
+            .child(if let Some(ms) = tool.duration_ms {
+                label(duration(ms), TextStyle::new(11.0, 420.0), p.muted)
+            } else {
+                el()
+            })
+            .child(icon(
+                if tool.expanded { "chevron" } else { "open" },
+                p.muted,
+            )),
+    );
+    if tool.expanded {
+        content = content.child(
+            col()
+                .key(format!("tool-output-{}-{index}", s.current().id))
+                .role("group")
+                .label(format!("Output for {title}"))
+                .ml(28.0)
+                .padding(10.0)
+                .gap(8.0)
+                .radius(6.0)
+                .fill(p.card)
+                .border(0.5, p.line)
+                .child(
+                    label(&tool.detail, SMALL, p.muted)
+                        .wrap_anywhere()
+                        .selectable(true),
+                )
+                .child(
+                    col()
+                        .max_h(220.0)
+                        .scroll(ScrollSpec {
+                            stick_bottom: !tool.done,
+                        })
+                        .child(
+                            label(
+                                if tool.output.is_empty() {
+                                    if tool.done {
+                                        "No text output."
+                                    } else {
+                                        "Waiting for output..."
+                                    }
+                                } else {
+                                    &tool.output
+                                },
+                                TextStyle::new(11.5, 400.0)
+                                    .family(rune::Family::SystemMono)
+                                    .lh(17.0),
+                                p.ink,
+                            )
+                            .wrap_anywhere()
+                            .selectable(true),
+                        ),
+                ),
+        );
+    }
+    content
+}
+
+fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
+    if indices.len() == 1 {
+        return inline_tool(s, p, indices[0]);
+    }
+    let t = s.current();
+    let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
+    let first = indices[0];
+    let expanded = tools[0].group_expanded;
+    let failed = tools.iter().filter(|tool| tool.failed).count();
+    let running = tools.iter().any(|tool| !tool.done);
+    let known_duration: Option<u64> = tools.iter().map(|tool| tool.duration_ms).sum();
+    let ink = if failed > 0 { p.danger } else { p.muted };
+    let summary = tool_summary(&tools);
+    let mut group = col()
+        .key(format!("tool-group-{}-{first}", t.id))
+        .gap(3.0)
+        .child(
+            row()
+                .key(format!("toggle-tool-group-{}-{first}", t.id))
+                .role("button")
+                .label(format!(
+                    "{} {summary}",
+                    if expanded { "Collapse" } else { "Expand" }
+                ))
+                .focusable(true)
+                .center_y()
+                .gap(7.0)
+                .min_h(28.0)
+                .px(6.0)
+                .radius(5.0)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    let tool = &mut s.current_mut().tools[first];
+                    tool.group_expanded = !tool.group_expanded;
+                })
+                .child(icon(
+                    if failed > 0 {
+                        "alert"
+                    } else if running {
+                        "dot"
+                    } else {
+                        "check"
+                    },
+                    ink,
+                ))
+                .child(label(summary, SMALL, ink).grow(1.0).min_w(0.0).wrap())
+                .child(label(
+                    if failed > 0 {
+                        format!("{failed} failed")
+                    } else if running {
+                        "Running".into()
+                    } else {
+                        "Done".into()
+                    },
+                    TextStyle::new(11.0, 420.0),
+                    ink,
+                ))
+                .child(if let Some(ms) = known_duration {
+                    label(duration(ms), TextStyle::new(11.0, 420.0), p.muted)
+                } else {
+                    el()
+                })
+                .child(icon(if expanded { "chevron" } else { "open" }, p.muted)),
+        );
+    if expanded {
+        let mut rows = col().grow(1.0).min_w(0.0).gap(2.0);
+        for index in indices {
+            rows = rows.child(inline_tool(s, p, *index));
+        }
+        group = group.child(
+            row()
+                .gap(10.0)
+                .pl(12.0)
+                .child(el().w(1.0).h_full().fill(p.line))
+                .child(rows),
+        );
+    }
+    group
 }
 
 fn conversation(s: &State, p: Palette, wide: bool) -> El {
@@ -1897,7 +2200,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         .pt(20.0)
         .pb(24.0)
         .gap(18.0);
-    if t.messages.is_empty() {
+    if t.messages.is_empty() && t.tools.is_empty() {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
@@ -2028,6 +2331,9 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         for (index, message) in t.messages.iter().enumerate().skip(start) {
             let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
+                for (_, indices) in tool_runs(t, index) {
+                    messages = messages.child(inline_tools(s, p, &indices));
+                }
                 row().justify_end().child(
                     label(&message.text, body_style(wide), p.ink)
                         .key(format!("{key}-text"))
@@ -2078,48 +2384,69 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     if let Some(captain) = t.captain {
                         heading = heading.child(avatar(s, p, captain, 20.0, t.status));
                     }
-                    heading = heading
-                        .child(label(
-                            t.captain
-                                .map(|id| format!("Captain {}", s.captains[id].name))
-                                .unwrap_or("Pi".into()),
-                            TextStyle::new(13.0, 600.0),
-                            p.ink,
-                        ))
-                        .child(if t.model == crate::model::DEFAULT_MODEL {
-                            el()
-                        } else {
-                            label(&t.model, SMALL, p.muted)
-                        });
+                    heading = heading.child(label(
+                        t.captain
+                            .map(|id| format!("Captain {}", s.captains[id].name))
+                            .unwrap_or("Pi".into()),
+                        TextStyle::new(13.0, 600.0),
+                        p.ink,
+                    ));
                     response = response.child(heading);
-                } else if let Some(seconds) = t.elapsed {
-                    response = response.child(disclosure(
-                        "worked-summary",
-                        &format!("Worked for {seconds}s"),
-                        p,
-                        |s| s.show_activity = !s.show_activity,
+                }
+                let mut offset = 0;
+                for (end, indices) in tool_runs(t, index) {
+                    // Recorded offsets come from complete UTF-8 text blocks. Ignore invalid
+                    // offsets defensively instead of slicing through a character.
+                    let end = if message.text.is_char_boundary(end) {
+                        end
+                    } else {
+                        offset
+                    };
+                    if end > offset {
+                        let chunk = &message.text[offset..end];
+                        response = response.child(memo(
+                            format!("{key}-body-{offset}"),
+                            (chunk, s.dark, false),
+                            || Markdown::new(chunk).scroll_wide(true).render(&style),
+                        ));
+                    }
+                    response = response.child(inline_tools(s, p, &indices));
+                    offset = end;
+                }
+                if offset < message.text.len() {
+                    let chunk = &message.text[offset..];
+                    response = response.child(memo(
+                        format!("{key}-body-{offset}"),
+                        (chunk, s.dark, streaming),
+                        || {
+                            Markdown::new(chunk)
+                                .streaming(streaming)
+                                .scroll_wide(true)
+                                .render(&style)
+                        },
                     ));
                 }
-                response.child(memo(
-                    format!("{key}-body"),
-                    (&message.text, s.dark, streaming),
-                    || {
-                        Markdown::new(&message.text)
-                            .streaming(streaming)
-                            .scroll_wide(true)
-                            .render(&style)
-                    },
-                ))
+                response
             };
             messages = messages.child(body.key(key));
         }
-        if !t.tools.is_empty() {
-            let count = t.tools.len();
+        for (_, indices) in tool_runs(t, t.messages.len()) {
+            messages = messages.child(inline_tools(s, p, &indices));
+        }
+        if let Some(seconds) = t.elapsed
+            && t.status == Status::Settled
+        {
             messages = messages.child(
-                disclosure("tool-summary", &format!("{count} tool calls"), p, |s| {
-                    s.show_activity = true
-                })
-                .mt(-8.0),
+                row()
+                    .center_y()
+                    .gap(10.0)
+                    .child(el().h(0.5).grow(1.0).fill(p.line))
+                    .child(label(
+                        format!("Worked for {seconds}s"),
+                        TextStyle::new(11.0, 420.0),
+                        p.muted,
+                    ))
+                    .child(el().h(0.5).grow(1.0).fill(p.line)),
             );
         }
         if t.status == Status::Running {
@@ -2139,7 +2466,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec {
-            stick_bottom: !t.messages.is_empty(),
+            stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
         })
         .items_center()
         .child(messages)
@@ -2155,27 +2482,6 @@ fn suggestion(key: &str, title: &str, prompt: &'static str, p: Palette) -> El {
     .radius(15.0)
     .fill(p.card)
     .border(0.5, p.line)
-}
-
-/// A secondary summary such as "Worked for 42s" that opens the activity pane.
-fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .label(title)
-        .focusable(true)
-        .self_start()
-        .center_y()
-        .gap(4.0)
-        .h(22.0)
-        .pl(6.0)
-        .pr(4.0)
-        .ml(-6.0)
-        .radius(6.0)
-        .hover(p.selected)
-        .on_press(action)
-        .child(label(title, TextStyle::new(12.0, 420.0), p.muted))
-        .child(icon("open", p.muted))
 }
 
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
@@ -2369,136 +2675,106 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
     let t = s.current();
-    let mut pane = col()
-        .key("activity-pane")
-        .min_h(0.0)
-        .gap(10.0)
-        .padding(12.0);
+    let mut pane = col().key("session-panel").min_h(0.0);
     pane = if narrow {
         pane.grow(1.0)
     } else {
-        pane.w(320.0).h_full()
+        pane.w(300.0).h_full()
     };
     pane = pane.child(
         row()
+            .key("session-panel-header")
+            .h(36.0)
+            .px(8.0)
             .center_y()
-            .gap(6.0)
-            .child(icon("list", p.muted))
-            .child(label("Overview", TextStyle::new(12.0, 450.0), p.ink))
-            .child(spacer())
-            .child(status(t.status, p)),
-    );
-    pane = pane
-        .child(
-            label("Session", SMALL, p.muted)
-                .w_full()
-                .fill(p.selected)
-                .px(6.0)
-                .py(5.0),
-        )
-        .child(label(&t.model, LABEL, p.ink).wrap())
-        .child(
-            label(
-                if t.session.is_some() {
-                    "Pi session saved on this computer"
-                } else {
-                    "Session not yet saved"
-                },
-                SMALL,
-                p.muted,
+            .gap(4.0)
+            .child(
+                row()
+                    .center_y()
+                    .gap(6.0)
+                    .px(8.0)
+                    .h(25.0)
+                    .radius(5.0)
+                    .fill(p.selected)
+                    .child(icon("thread", p.muted))
+                    .child(label("Session", SMALL, p.ink)),
             )
-            .wrap(),
+            .child(spacer())
+            .child(icon_button(
+                "expand-session-panel",
+                if s.activity_full {
+                    "Restore split view"
+                } else {
+                    "Expand session details"
+                },
+                "expand",
+                p,
+                |s| s.activity_full = !s.activity_full,
+            ))
+            .child(icon_button(
+                "close-session-panel",
+                "Hide session details",
+                "panel",
+                p,
+                |s| {
+                    s.show_activity = false;
+                    s.activity_full = false;
+                },
+            )),
+    );
+    let mut details = col()
+        .padding(16.0)
+        .gap(16.0)
+        .child(label(&t.title, TextStyle::new(14.0, 560.0), p.ink).wrap())
+        .child(status(t.status, p))
+        .child(rule(p))
+        .child(
+            col()
+                .gap(5.0)
+                .child(label("Model", SMALL, p.muted))
+                .child(label(&t.model, LABEL, p.ink).wrap()),
         )
         .child(
-            label("Tool activity", SMALL, p.ink)
-                .w_full()
-                .fill(p.selected)
-                .px(6.0)
-                .py(5.0),
+            col()
+                .gap(5.0)
+                .child(label("Conversation", SMALL, p.muted))
+                .child(label(
+                    if t.session.is_some() {
+                        "Saved locally by Pi"
+                    } else {
+                        "No saved session yet"
+                    },
+                    LABEL,
+                    p.ink,
+                )),
         );
-    let mut tools = col().gap(10.0);
+    if let Some(session) = &t.session {
+        details = details.child(
+            label(session, SMALL, p.muted)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    if !t.diagnostics.is_empty() {
+        details = details
+            .child(rule(p))
+            .child(label("Session notices", LABEL, p.ink));
+    }
     for diagnostic in &t.diagnostics {
-        tools = tools.child(
+        details = details.child(
             label(truncate(diagnostic, 600), SMALL, p.muted)
                 .wrap_anywhere()
                 .selectable(true),
         );
     }
-    if t.tools.is_empty() {
-        tools = tools.child(
-            label(
-                "Tool calls will appear here when Pi works on your project.",
-                BODY,
-                p.muted,
-            )
-            .wrap(),
-        );
-    }
-    for tool in t.tools.iter().rev().take(50) {
-        let ink = if tool.failed { p.danger } else { p.muted };
-        let mut item = col()
-            .key(format!("tool-{}", tool.id))
-            .gap(6.0)
-            .px(6.0)
-            .py(7.0)
-            .child(
-                row()
-                    .center_y()
-                    .gap(7.0)
-                    .child(icon(if tool.done { "check" } else { "dot" }, ink))
-                    .child(label(&tool.name, LABEL, p.ink))
-                    .child(spacer())
-                    .child(label(
-                        if tool.failed {
-                            "Failed"
-                        } else if tool.done {
-                            "Done"
-                        } else {
-                            "Running"
-                        },
-                        SMALL,
-                        ink,
-                    )),
-            )
-            .child(
-                label(&tool.detail, SMALL, p.muted)
-                    .wrap_anywhere()
-                    .selectable(true),
-            );
-        if t.expanded_tools && !tool.output.is_empty() {
-            item = item.child(
-                col()
-                    .max_h(200.0)
-                    .scroll(ScrollSpec {
-                        stick_bottom: false,
-                    })
-                    .child(
-                        label(&tool.output, SMALL, p.ink)
-                            .wrap_anywhere()
-                            .selectable(true),
-                    ),
-            );
-        }
-        tools = tools.child(item);
-    }
-    pane.child(button(
-        "expand-tool-output",
-        if t.expanded_tools {
-            "Hide tool output"
-        } else {
-            "Show tool output"
-        },
-        p,
-        |s| s.current_mut().expanded_tools = !s.current().expanded_tools,
-    ))
-    .child(
+    pane.child(
         col()
             .grow(1.0)
             .min_h(0.0)
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
-            .child(tools),
+            .child(details),
     )
 }
 
@@ -2603,7 +2879,7 @@ mod tests {
         let (rect, _) = rt.presented("composer").unwrap();
         assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5);
         assert!(rect[2] > 200.0);
-        for key in ["toggle-activity", "archive-thread", "leave-example"] {
+        for key in ["open-session-panel", "archive-thread", "leave-example"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5,
@@ -2629,6 +2905,87 @@ mod tests {
         rt.frame(4.0);
         assert!(!rt.state.compact_sidebar, "sidebar toggle did not close it");
         assert!(rt.presented("sidebar").is_none());
+    }
+    #[test]
+    fn tool_groups_and_individual_outputs_expand_independently() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        assert!(rt.find("toggle-tool-group-1-0").is_some());
+        assert!(rt.find("inline-tool-1-0").is_none());
+        press(&mut rt, "toggle-tool-group-1-0");
+        rt.frame(2.0);
+        assert!(rt.state.current().tools[0].group_expanded);
+        assert!(rt.find("inline-tool-1-0").is_some());
+        press(&mut rt, "inline-tool-1-0");
+        rt.frame(4.0);
+        assert!(rt.state.current().tools[0].expanded);
+        assert!(rt.presented("tool-output-1-0").is_some());
+        assert!(rt.presented("tool-output-1-1").is_none());
+        assert!(
+            !rt.state.show_activity,
+            "tool output never opens a side panel"
+        );
+    }
+    #[test]
+    fn shell_controls_are_below_the_title_strip_and_panel_controls_stay_inside() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        let (strip, _) = rt.presented("top-strip").unwrap();
+        for key in ["sidebar-toggle", "archive-thread", "open-session-panel"] {
+            let (rect, _) = rt.presented(key).unwrap();
+            assert!(
+                rect[1] >= strip[1] + strip[3],
+                "{key} is still in the window title strip"
+            );
+        }
+        assert!(rt.find("toggle-activity").is_none());
+        press(&mut rt, "open-session-panel");
+        rt.frame(2.0);
+        assert!(rt.state.show_activity);
+        let (panel, _) = rt.presented("session-panel").unwrap();
+        for key in ["expand-session-panel", "close-session-panel"] {
+            let (rect, _) = rt.presented(key).unwrap();
+            assert!(rect[0] >= panel[0] && rect[0] + rect[2] <= panel[0] + panel[2] + 0.5);
+        }
+        press(&mut rt, "expand-session-panel");
+        rt.frame(4.0);
+        assert!(rt.state.activity_full);
+        assert!(rt.presented("composer").is_none());
+        press(&mut rt, "close-session-panel");
+        rt.frame(6.0);
+        assert!(!rt.state.show_activity && !rt.state.activity_full);
+        assert!(rt.presented("composer").is_some());
+    }
+    #[test]
+    fn narrow_session_panel_can_close_without_hiding_the_composer_permanently() {
+        let mut rt = runtime(620.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        press(&mut rt, "open-session-panel");
+        rt.frame(2.0);
+        assert!(rt.presented("session-panel").is_some());
+        press(&mut rt, "close-session-panel");
+        rt.frame(4.0);
+        assert!(rt.presented("composer").is_some());
+    }
+    #[test]
+    fn summaries_group_calls_at_the_same_transcript_position_only() {
+        let mut s = State::new(".".into(), false);
+        s.populate_demo();
+        let t = s.current();
+        assert_eq!(tool_runs(t, 2), vec![(0, vec![0, 1])]);
+        assert_eq!(tool_runs(t, 3), vec![(0, vec![2, 3])]);
+        assert_eq!(
+            tool_summary(&t.tools[..2].iter().collect::<Vec<_>>()),
+            "Read 2 files"
+        );
+        assert_eq!(
+            tool_summary(&t.tools[2..].iter().collect::<Vec<_>>()),
+            "Edited 1 file, ran 1 command"
+        );
+        assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
     }
     #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {
