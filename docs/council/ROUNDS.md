@@ -13,7 +13,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 0 (baseline) | 6.2 | | | |
 | 2 | 7.5 | 8.5 | | 3 of 3 approve |
 | 3 | 7.8 | 8.5 | 7.6 (Capy 7.7) | 3 of 3 approve |
-| 4 | see round 4 | | | |
+| 4 | 7.9 | 8.7 | 8.1 (Capy 7.7) | 3 of 3 approve |
 
 ## Round 1
 
@@ -52,5 +52,5 @@ Shipped in round 4: demo data whose "Working" state comes from a running thread;
 | Judge | Baseline | Round 3 | Round 4 | Capy | Crew art r3 / r4 / Capy | Approves |
 |---|---|---|---|---|---|---|
 | Sonnet 5.5 | 5.8 | 7.1 | 7.4 | 8.4 | 6.6 / 7.4 / 6.0 | yes |
-| GPT 6.1 Sol | pending | | | | | |
-| Gemini 4 Argon | pending | | | | | |
+| GPT 6.1 Sol | 6.5 | 7.7 | 8.0 | 8.7 | 7.5 / 8.1 / 8.3 | yes |
+| Gemini 4 Argon | 6.9 | 8.0 | 8.3 | 9.1 | 7.9 / 8.8 / 8.7 | yes |
