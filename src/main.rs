@@ -56,7 +56,7 @@ fn main() {
         // Install this build, then hand over to the installed copy.
         match install::install() {
             Ok(installed) => {
-                let _ = std::process::Command::new(installed).spawn();
+                let _ = install::launch(&installed, None);
             }
             Err(error) => {
                 eprintln!("Could not install Shina: {error}");
