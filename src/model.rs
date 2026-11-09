@@ -254,9 +254,6 @@ pub struct Thread {
     history_loaded: bool,
     initializing: bool,
     session_started: Option<Instant>,
-    /// This thread is the draft the sidebar froze, so its "Drafts" row stays while the composer is
-    /// empty. Saved so a restored draft keeps its row.
-    draft_frozen: bool,
     last_activity: Instant,
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
@@ -301,11 +298,6 @@ impl Thread {
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
     }
-    /// A blank slot that already parked a thread is disposable. Saving it would restore one slot
-    /// for every past park, so only the open thread's slot is saved.
-    fn keep_slot(&self) -> bool {
-        !self.blank_draft() || self.life.last_visited_at.is_none() || self.draft_frozen
-    }
     /// A new thread slot with nothing queued, running, saved or named in it. Its title becomes
     /// whatever the user types, before any prompt is sent.
     fn blank_draft(&self) -> bool {
@@ -326,11 +318,6 @@ impl Thread {
             && !self.queued()
             && !self.renamed
             && self.parent.is_none()
-    }
-    /// An unsent draft that earns a "Drafts" row in the sidebar. The open draft's row waits while
-    /// the composer is empty so it cannot pop in mid-typing. Captains have their own area.
-    pub fn has_draft_row(&self) -> bool {
-        self.is_draft() && (self.has_draft_content() || self.draft_frozen)
     }
     pub fn actionable(&self) -> bool {
         self.request.is_some() || self.status == Status::Waiting || self.status == Status::Failed
@@ -439,7 +426,6 @@ impl Thread {
             history_loaded: false,
             initializing: false,
             session_started: None,
-            draft_frozen: false,
             last_activity: Instant::now(),
             prewarm_attempted: false,
             selected_model: None,
@@ -1625,6 +1611,10 @@ impl Thread {
 
 pub struct State {
     pub data_dir: PathBuf,
+    /// The open thread's id and whether it was a draft with content when it was opened. Like
+    /// T3 Code's frozen draft row, the open draft's sidebar row neither pops in while typing nor
+    /// disappears when its composer is cleared.
+    opened_draft: Option<(usize, bool)>,
     launch_project: Option<PathBuf>,
     pub threads: Vec<Thread>,
     pub active: usize,
@@ -1750,6 +1740,7 @@ impl State {
             shelves: [false; 3],
             settled_visible: 10,
             undo: None,
+            opened_draft: None,
             snooze_menu: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
@@ -1835,8 +1826,11 @@ impl State {
         }
         self.active = index;
         self.selected_threads.clear();
-        self.open_draft();
         let id = self.current().id;
+        if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
+            let listed = self.current().is_draft() && self.current().has_draft_content();
+            self.opened_draft = Some((id, listed));
+        }
         if !self.tabs.contains(&id) {
             self.tabs.push(id);
         }
@@ -1927,7 +1921,7 @@ impl State {
                 t.archived() == self.show_archive
                     && !t.delegated
                     && !self.is_captain_home(t)
-                    && !t.blank_draft()
+                    && (!t.is_draft() || self.draft_listed(t))
             })
             .filter(|(_, t)| self.in_scope(t))
             .collect();
@@ -1935,8 +1929,8 @@ impl State {
         threads.sort_by(|(_, a), (_, b)| {
             let sa = self.thread_section(a, at);
             let sb = self.thread_section(b, at);
-            b.has_draft_row()
-                .cmp(&a.has_draft_row())
+            self.draft_listed(b)
+                .cmp(&self.draft_listed(a))
                 .then_with(|| sa.cmp(&sb))
                 .then_with(|| {
                     lifecycle::compare(
@@ -1952,13 +1946,16 @@ impl State {
         });
         threads.into_iter().map(|(i, _)| i).collect()
     }
-    /// Only the most recently opened thread may hold a frozen draft.
-    fn open_draft(&mut self) {
-        for thread in &mut self.threads {
-            thread.draft_frozen = false;
+    /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
+    /// whatever it had when it was opened.
+    pub fn draft_listed(&self, t: &Thread) -> bool {
+        if !t.is_draft() {
+            return false;
         }
-        let draft = self.current().is_draft();
-        self.current_mut().draft_frozen = draft;
+        match self.opened_draft {
+            Some((id, listed)) if id == t.id && id == self.current().id => listed,
+            _ => t.has_draft_content(),
+        }
     }
     pub fn in_scope(&self, t: &Thread) -> bool {
         match self.project_scope {
@@ -2010,9 +2007,6 @@ impl State {
     }
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
         let id = self.threads[index].id;
-        if !mods.cmd && !mods.shift {
-            self.open_draft();
-        }
         if mods.cmd {
             if let Some(i) = self.selected_threads.iter().position(|t| *t == id) {
                 self.selected_threads.remove(i);
@@ -2080,7 +2074,7 @@ impl State {
                 if !self.search.text.is_empty() {
                     let search = self.search.text.to_lowercase();
                     return t.title.to_lowercase().contains(&search)
-                        || t.has_draft_row() && t.draft.text.to_lowercase().contains(&search)
+                        || self.draft_listed(t) && t.draft.text.to_lowercase().contains(&search)
                         || t.messages
                             .iter()
                             .any(|m| m.text.to_lowercase().contains(&search));
@@ -2333,6 +2327,12 @@ impl State {
         };
         if self.lifecycle_busy(id) {
             self.lifecycle_error = Some("Stop this thread and its crew before archiving.".into());
+            return;
+        }
+        // A blank draft has nothing to keep, so archiving it never leaves an archive row.
+        if self.threads[index].blank_draft() {
+            self.invalidate_undo(id);
+            self.remove_threads(&std::collections::HashSet::from([id]));
             return;
         }
         if self.threads[index].archived() {
@@ -2694,23 +2694,16 @@ impl State {
         let reuse = self.threads.iter().position(|t| {
             t.project == project && !t.delegated && !t.captain_home && t.blank_draft()
         });
-        if let Some(index) = reuse {
-            self.active = index;
-            self.selected_threads.clear();
-            self.show_archive = false;
-            self.current_mut().life.last_visited_at = Some(lifecycle::now());
-            self.checkpoint();
-            return;
-        }
-        let mut thread = Thread::new(self.next_id);
-        thread.project = project;
-        if let Some(project) = self.project(project) {
-            thread.machine = project.machine.clone();
-        }
-        self.threads.push(thread);
-        self.next_id += 1;
-        self.active = self.threads.len() - 1;
-        self.tabs.push(self.current().id);
+        let index = reuse.unwrap_or_else(|| {
+            let mut thread = Thread::new(self.next_id);
+            thread.project = project;
+            if let Some(project) = self.project(project) {
+                thread.machine = project.machine.clone();
+            }
+            self.threads.push(thread);
+            self.next_id += 1;
+            self.threads.len() - 1
+        });
         self.show_archive = false;
         self.project_picker = None;
         if match self.project_scope {
@@ -2721,10 +2714,11 @@ impl State {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
         }
-        if !self.catalog.models.is_empty() {
+        self.select_thread(index);
+        if reuse.is_none() && !self.catalog.models.is_empty() {
             self.apply_catalog();
+            self.checkpoint();
         }
-        self.checkpoint();
     }
     pub fn open_captain(&mut self, captain: usize) {
         if captain >= self.captains.len() {
@@ -3888,7 +3882,6 @@ impl State {
                     }
                     thread.title = record["title"].as_str()?.into();
                     thread.renamed = record["renamed"] == true;
-                    thread.draft_frozen = record["draftFrozen"] == true;
                     thread.session = record["session"].as_str().map(str::to_owned);
                     if let Some(model) = record["model"].as_str() {
                         // Only CPA choices survive restart, even in hand-edited indexes.
@@ -4131,13 +4124,15 @@ impl State {
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
-            "threads":self.threads.iter().filter(|thread| thread.keep_slot()).map(|thread|json!({
+            "threads":self.threads.iter().filter(|thread| {
+                // A blank draft is saved only while it is open or has a tab.
+                !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
+            }).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
-                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking,
-                "draftFrozen":thread.draft_frozen
+                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
             })).collect::<Vec<_>>()
         })
     }
@@ -4965,8 +4960,19 @@ mod tests {
         assert!(state.sidebar_threads().is_empty(), "no empty Drafts rows");
         state.current_mut().draft.replace_text("A first prompt");
         let active = state.active;
+        assert!(
+            state.sidebar_threads().is_empty(),
+            "the open draft's row does not pop in while typing"
+        );
+        state.select_thread((active + 1) % state.threads.len());
         assert_eq!(state.sidebar_threads(), vec![active]);
+        state.select_thread(active);
         state.current_mut().draft.replace_text("");
+        assert_eq!(
+            state.sidebar_threads(),
+            vec![active],
+            "the open draft keeps its row while its composer is cleared"
+        );
         state.discard_draft(state.current().id);
         assert_eq!(state.threads.len(), 2, "the blank thread is gone");
         assert!(state.undo.is_none(), "a blank draft offers no Undo");
@@ -4974,6 +4980,38 @@ mod tests {
         state.show_archive = true;
         assert!(state.sidebar_threads().is_empty(), "nothing was archived");
         assert!(state.tabs.contains(&state.current().id));
+    }
+
+    #[test]
+    fn reusing_a_blank_draft_navigates_and_saves_it_like_a_new_one() {
+        let mut state = State::new(".".into(), false);
+        let a = state.data_dir.join("project-a");
+        let b = state.data_dir.join("project-b");
+        state.projects.entries.push(Project::new(2, a));
+        state.projects.entries.push(Project::new(3, b));
+        state.new_thread_in(Some(2));
+        let draft = state.current().id;
+        state.new_thread_in(Some(3));
+        state.current_mut().draft.replace_text("Project B work");
+        state.project_scope = ProjectScope::Project(3);
+        state.project_picker = Some(ProjectPicker::NewThread);
+        state.new_thread_in(Some(2));
+        assert_eq!(state.current().id, draft, "the blank draft is reused");
+        assert!(state.project_picker.is_none());
+        assert_eq!(state.project_scope, ProjectScope::All);
+        assert!(state.tabs.contains(&draft));
+        let saved = state.snapshot();
+        assert!(
+            saved["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == draft),
+            "the open blank draft is saved with the active id and tabs that name it"
+        );
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&saved).unwrap();
+        assert_eq!(restored.current().id, draft);
     }
 
     #[test]
@@ -6116,9 +6154,13 @@ mod tests {
         let mut state = State::new(PathBuf::from("."), false);
         state.current_mut().draft.replace_text("Keep this");
         state.new_thread();
+        let blank = state.current().id;
         state.archive();
         assert_eq!(state.current().draft.text, "Keep this");
-        assert!(state.threads[1].archived());
+        assert!(
+            !state.threads.iter().any(|t| t.id == blank),
+            "an archived blank draft leaves no record"
+        );
     }
     #[test]
     fn captain_portrait_follows_the_most_urgent_thread() {

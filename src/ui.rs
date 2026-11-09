@@ -898,15 +898,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let drafts: Vec<_> = visible
         .iter()
         .copied()
-        .filter(|i| s.threads[*i].has_draft_row())
+        .filter(|i| s.draft_listed(&s.threads[*i]))
         .collect();
-    if drafts.is_empty() {
-        // A blank draft never earns a row, but its row is laid out while it is open so content
-        // typed into it, even as the first change to the window, appears at rest.
-        if s.current().is_draft() {
-            content = content.child(thread_row(s, s.active, p, false));
-        }
-    } else {
+    if !drafts.is_empty() {
         content = content.child(section_title("Drafts", p));
         for i in drafts {
             content = content.child(thread_row(s, i, p, false));
@@ -1501,7 +1495,7 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
 fn thread_matches(s: &State, index: usize, search: &str) -> bool {
     let thread = &s.threads[index];
     thread.title.to_lowercase().contains(search)
-        || thread.has_draft_row() && thread.draft.text.to_lowercase().contains(search)
+        || s.draft_listed(thread) && thread.draft.text.to_lowercase().contains(search)
         || thread
             .messages
             .iter()
@@ -4556,6 +4550,8 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.state.current_mut().draft.replace_text("A prompt");
         rt.state.new_thread();
+        rt.state.current_mut().draft.replace_text("Another prompt");
+        rt.state.select_thread(0);
         rt.state.pin_thread(1);
         rt.invalidate();
         rt.frame(0.0);
