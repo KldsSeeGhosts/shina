@@ -50,6 +50,24 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
+fn running_demo(state: &mut State) {
+    state.populate_demo();
+    let thread = state.current_mut();
+    thread.status = model::Status::Running;
+    thread.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(24));
+    thread.elapsed = None;
+    thread.phase = "Running powershell".into();
+    thread.messages.truncate(3);
+    for tool in &mut thread.tools[2..] {
+        tool.anchor.message = 2;
+        tool.anchor.offset = thread.messages[2].text.len();
+    }
+    let tool = &mut thread.tools[3];
+    tool.done = false;
+    tool.duration_ms = None;
+    tool.started = Some(std::time::Instant::now());
+}
+
 fn main() {
     if let Err(error) =
         rune::set_app_icon(include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon.png")).to_vec())
@@ -138,6 +156,19 @@ fn main() {
             ("collapsed", |state| {
                 state.populate_demo();
                 state.sidebar = false;
+            }),
+            ("work-running", running_demo),
+            ("work-running-dark", |state| {
+                running_demo(state);
+                state.dark = true;
+            }),
+            ("work-collapsed", |state| {
+                state.populate_demo();
+                state.current_mut().work[0].expanded = false;
+            }),
+            ("thinking-output", |state| {
+                state.populate_demo();
+                state.current_mut().thoughts[0].expanded = true;
             }),
             ("tool-output", |state| {
                 state.populate_demo();
