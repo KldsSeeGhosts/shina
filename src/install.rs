@@ -142,6 +142,9 @@ pub fn install() -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|e| e.to_string())?;
     let target = place_exe(&current)?;
     let shortcut = start_menu_shortcut().ok_or("APPDATA is not set.")?;
+    // Recreate rather than overwrite: launchers such as Caelestia watch the Start Menu folder
+    // for added and removed files, and an in-place rewrite would leave them with a stale entry.
+    let _ = fs::remove_file(&shortcut);
     let home = env::var("USERPROFILE").unwrap_or_default();
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({}); $s.TargetPath = {}; \
