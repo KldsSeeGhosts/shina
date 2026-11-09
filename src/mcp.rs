@@ -32,7 +32,8 @@ own role and instructions. Shina shows the user every thread, its status, and it
 Ordinary coding tasks need no Shina tools.
 
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, under the same \
-project, machine and project captain. Use it for parallel, self-contained work, and give the new \
+project, machine and calling captain, if any. Each captain owns its crew even when several \
+captains share a folder. Use it for parallel, self-contained work, and give the new \
 thread a complete brief: it has no access to this conversation. A delegated thread cannot \
 delegate further.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
@@ -41,9 +42,11 @@ after your current work. These messages are labeled Shina, not user instructions
 - `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
 A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop.
 - `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
-corrections or follow-up work. Only the parent may control a child.
+corrections or follow-up work. It also answers a pending crew input, editor or select question. \
+For select, send one listed option exactly. Confirmations always require the user. Only the parent may control a child.
 - `mcp__shina__list_threads`, `mcp__shina__read_thread`, and `mcp__shina__list_captains` read \
-the user's conversations and crew. list_threads defaults to this thread's project. Pass \
+the user's conversations and crew. list_threads defaults to the calling captain's home and crew, \
+or this thread's project for lone threads. Pass \
 all_projects:true to include other projects and project-less chats. Read a thread before you answer a question about it.";
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
@@ -165,7 +168,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "list_threads",
-            "description": "List threads in the caller's project, including project and machine. Use all_projects for every project and project-less chats.",
+            "description": "List the calling captain's home and crew, or lone threads in the caller's project. Includes project and machine. Use all_projects for every conversation.",
             "inputSchema": {"type":"object","properties":{
                 "include_archived": {"type":"boolean","description":"Include archived threads. Default false."},
                 "all_projects": {"type":"boolean","description":"Include all projects and project-less threads. Default false."}
@@ -193,7 +196,7 @@ pub fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
-                "captain": {"type":"string","description":"Optional assertion of the project's assigned captain. Children cannot choose a different captain."},
+                "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
                 "wait_seconds": wait
             },"required":["prompt"]}
         },

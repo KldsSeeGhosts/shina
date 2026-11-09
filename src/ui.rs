@@ -1,7 +1,8 @@
+use crate::lifecycle::{self, Section};
 use crate::model::{
     ProjectPicker, ProjectScope, RowTarget, SettingsPicker, State, Status, Thread, Tool, truncate,
 };
-use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, col, el, memo, row, text, text_input};
+use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, col, el, memo, row, text};
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 
@@ -82,6 +83,9 @@ fn measure(wide: bool) -> f32 {
 const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
 
+fn text_input(edit: &rune::TextEdit, style: TextStyle) -> El {
+    rune::text_input(edit, style).on_input_key(|s: &mut State, event, _| s.undo_key(event, true))
+}
 fn label(value: impl Into<String>, style: TextStyle, ink: Color) -> El {
     text(value).font(style).color(ink)
 }
@@ -143,6 +147,10 @@ fn icon(kind: &str, ink: Color) -> El {
     glyph!(
         PIN,
         r#"<path d="m6 2 7 7-2.5.5L8 12 4 8l2.5-2.5zM6 10l-4 4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        CLOCK,
+        r#"<circle cx="8" cy="8.5" r="5" stroke="currentColor" fill="none"/><path d="M8 5.5v3.3l2 1.2M2 3l2-1M12 2l2 1" stroke="currentColor" stroke-linecap="round"/>"#
     );
     glyph!(
         MORE,
@@ -234,6 +242,7 @@ fn icon(kind: &str, ink: Color) -> El {
         "moon" => &MOON,
         "alert" => &ALERT,
         "pin" => &PIN,
+        "clock" => &CLOCK,
         "more" => &MORE,
         "list" => &LIST,
         "branch" => &BRANCH,
@@ -350,7 +359,7 @@ fn toggle_button(
 fn shown_status(s: &State) -> Status {
     let t = s.current();
     match t.captain {
-        Some(captain) if s.is_captain_home(t) => s.captain_status(captain),
+        Some(_) if s.is_captain_home(t) => s.home_status(t.id),
         _ => t.status,
     }
 }
@@ -373,7 +382,7 @@ fn status_mark(status: Status, p: Palette, size: f32) -> El {
             .radius(size / 2.0)
             .border((size / 3.5).max(1.5), ink),
         Status::Failed => el().size(size - 1.0, size - 1.0).radius(1.5).fill(ink),
-        Status::Settled => icon("check", ink).size(size + 5.0, size + 5.0),
+        Status::Completed => icon("check", ink).size(size + 5.0, size + 5.0),
         _ => el()
             .size(size, size)
             .radius(size / 2.0)
@@ -384,7 +393,7 @@ fn status_mark(status: Status, p: Palette, size: f32) -> El {
 /// A status chip for states that need attention. A finished or idle thread shows nothing:
 /// the reply itself says it is done, and background completions use the unread badge.
 fn status(status: Status, p: Palette) -> El {
-    if matches!(status, Status::Ready | Status::Settled) {
+    if matches!(status, Status::Ready | Status::Completed) {
         return el();
     }
     row()
@@ -409,6 +418,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let wide = cx
         .layout_with("workspace-root", |r| r[2] >= WIDE_WINDOW)
         .unwrap_or(false);
+    let sidebar_width = if narrow {
+        s.sidebar_width.min(216.0)
+    } else {
+        s.sidebar_width
+    };
     let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
     let chrome = cx.chrome_insets();
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
@@ -425,18 +439,53 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .pl(8.0)
         .pr((chrome.trailing / zoom).max(8.0));
     if docked {
-        top = top.child(
-            sidebar_header(s, p, compact)
-                .w(if narrow { 216.0 } else { 232.0 })
-                .pr(16.0),
-        );
+        top = top.child(sidebar_header(s, p, compact).w(sidebar_width).pr(16.0));
     } else {
         top = top.child(sidebar_toggle(p, compact));
     }
     top = top.child(header(s, p, narrow, compact).grow(1.0).min_w(0.0));
     let mut workspace = row().grow(1.0).min_h(0.0).px(8.0).pb(8.0);
     if docked {
-        workspace = workspace.child(sidebar(s, p, narrow));
+        workspace = workspace.child(sidebar(s, p, sidebar_width));
+        if !compact {
+            let max_width = (s.viewport_width - 480.0).clamp(200.0, 400.0);
+            workspace = workspace.child(
+                el().key("sidebar-resize")
+                    .role("separator")
+                    .label("Resize sidebar")
+                    .w(4.0)
+                    .h_full()
+                    .hover(p.line)
+                    .focusable(true)
+                    .on_double_press(|s: &mut State| {
+                        s.sidebar_width = 232.0;
+                        s.checkpoint();
+                    })
+                    .on_drag(move |s: &mut State, drag, _| {
+                        if drag.phase == rune::Phase::Down {
+                            drag.data = s.sidebar_width;
+                        }
+                        if drag.cancelled() {
+                            s.sidebar_width = drag.data;
+                        } else {
+                            s.sidebar_width = (drag.data + drag.dx / zoom).clamp(200.0, max_width);
+                        }
+                        if drag.phase == rune::Phase::Up {
+                            s.checkpoint();
+                        }
+                    })
+                    .on_key(move |s: &mut State, ev, _| {
+                        let step = match ev.key {
+                            rune::Key::Left => -10.0,
+                            rune::Key::Right => 10.0,
+                            _ => return false,
+                        };
+                        s.sidebar_width = (s.sidebar_width + step).clamp(200.0, max_width);
+                        s.checkpoint();
+                        true
+                    }),
+            );
+        }
     }
     let mut pane = col()
         .key("chat-pane")
@@ -477,6 +526,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     let mut root = col()
         .key("workspace-root")
+        .on_layout(|s: &mut State, rect| {
+            s.viewport_width = rect[2];
+            s.viewport_height = rect[3];
+        })
+        .on_key(|s: &mut State, ev, _| s.undo_key(ev, true))
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
@@ -500,6 +554,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.row_menu.is_some() {
         root = root.child(row_menu(s, p));
+    }
+    if s.snooze_menu.is_some() {
+        root = root.child(snooze_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -706,13 +763,8 @@ fn sidebar_header(s: &State, p: Palette, compact: bool) -> El {
         .child(sidebar_toggle(p, compact))
 }
 
-fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
-    let mut side = col()
-        .key("sidebar")
-        .w(if narrow { 216.0 } else { 232.0 })
-        .h_full()
-        .min_h(0.0)
-        .pr(8.0);
+fn sidebar(s: &State, p: Palette, width: f32) -> El {
+    let mut side = col().key("sidebar").w(width).h_full().min_h(0.0).pr(8.0);
     side = side
         .child(nav("new-thread", "New thread", "compose", p, false, |s| {
             s.project_picker = Some(ProjectPicker::NewThread);
@@ -755,7 +807,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 ),
         );
     }
-    let mut content = col().pb(12.0).gap(1.0);
+    let mut content = col().pb(12.0).gap(1.0).min_h(s.sidebar_viewport_height);
     let search = s.search.text.to_lowercase();
     if !s.show_archive {
         content = content.child(section_title("Captains", p).child(icon_button(
@@ -765,37 +817,36 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             p,
             |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
         )));
-        for id in s.sorted_projects() {
-            let project = s.project(Some(id)).expect("sorted project");
-            if let Some(captain) = project.captain {
-                let status = s.project_captain_status(Some(id), captain);
-                let home = project
-                    .captain_thread
-                    .and_then(|id| s.threads.iter().position(|t| t.id == id));
-                if let Some(index) = home {
-                    content = content.child(thread_row(s, index, p, false));
-                } else {
-                    content = content.child(
-                        menu_item(
-                            &format!("captain-{id}"),
-                            &format!("{} · {}", s.captains[captain].name, project.name),
-                            "thread",
-                            p,
-                        )
-                        .on_press(move |s: &mut State| s.choose_project_captain(id))
-                        .child(status_mark(status, p, 6.0)),
-                    );
+        for (index, home) in s
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| s.is_captain_home(t) && !t.archived())
+        {
+            content = content.child(thread_row(s, index, p, false));
+            if home.id == s.selected_row() {
+                for (index, _) in s
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.parent == Some(home.id) && !t.archived())
+                {
+                    content = content.child(el().ml(18.0).child(thread_row(s, index, p, true)));
                 }
             }
         }
     }
-    let scope = match s.project_scope {
-        ProjectScope::All => "All projects".into(),
-        ProjectScope::NoProject => "No project".into(),
-        ProjectScope::Project(id) => s
-            .project(Some(id))
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "All projects".into()),
+    let scope = if !s.scope_additional.is_empty() {
+        format!("{} projects", s.scope_additional.len() + 1)
+    } else {
+        match s.project_scope {
+            ProjectScope::All => "All projects".into(),
+            ProjectScope::NoProject => "No project".into(),
+            ProjectScope::Project(id) => s
+                .project(Some(id))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "All projects".into()),
+        }
     };
     content = content.child(
         section_title(
@@ -814,25 +865,119 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         })
         .w_full(),
     );
-    let mut last_pinned = None;
-    for index in s.sidebar_threads() {
-        let thread = &s.threads[index];
-        if sidebar_parent(s, thread).is_some_and(|i| !s.is_captain_home(&s.threads[i]))
-            || !thread_matches(s, thread, &search)
-        {
-            continue;
+    let all = s.sidebar_threads();
+    let visible = s.visible_sidebar_threads();
+    let drafts: Vec<_> = visible
+        .iter()
+        .copied()
+        .filter(|i| s.threads[*i].is_draft())
+        .collect();
+    if !drafts.is_empty() {
+        content = content.child(section_title("Drafts", p));
+        for i in drafts {
+            content = content.child(thread_row(s, i, p, false));
         }
-        if last_pinned != Some(thread.pinned) {
-            content = content.child(section_title(
-                if thread.pinned { "Pinned" } else { "Recent" },
+        content = content.child(rule(p));
+    }
+    let mut first_shelf = true;
+    for section in [
+        Section::Pinned,
+        Section::Active,
+        Section::Working,
+        Section::Snoozed,
+        Section::Settled,
+    ] {
+        let rows: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|i| {
+                !s.threads[*i].is_draft()
+                    && s.thread_section(&s.threads[*i], lifecycle::now()) == section
+            })
+            .collect();
+        let shelf = match section {
+            Section::Working => Some(0),
+            Section::Snoozed => Some(1),
+            Section::Settled => Some(2),
+            _ => None,
+        };
+        if let Some(shelf) = shelf {
+            if rows.is_empty() && section != Section::Settled {
+                continue;
+            }
+            if first_shelf {
+                content = content.child(spacer());
+                first_shelf = false;
+            }
+            let key = format!("shelf-{section:?}");
+            let title = format!("{section:?}");
+            let marker = format!("drop-{section:?}");
+            content = content.child(
+                row()
+                    .key(&key)
+                    .role("button")
+                    .label(format!("{title}, {} threads", rows.len()))
+                    .focusable(true)
+                    .h(30.0)
+                    .px(8.0)
+                    .gap(6.0)
+                    .center_y()
+                    .hover(p.selected)
+                    .on_drawn_layout(move |s: &mut State, rect| {
+                        s.drop_rects.insert(marker.clone(), rect);
+                    })
+                    .on_press(move |s: &mut State| {
+                        s.shelves[shelf] = !s.shelves[shelf];
+                        s.checkpoint();
+                    })
+                    .child(icon(
+                        if s.shelves[shelf] { "chevron" } else { "open" },
+                        p.muted,
+                    ))
+                    .child(label(title, SMALL, p.muted).grow(1.0))
+                    .child(label(rows.len().to_string(), SMALL, p.muted)),
+            );
+        } else if s.drag_thread.is_some() {
+            let marker = format!("drop-{section:?}");
+            let selected = s.drag_target.is_some_and(|(to, _)| to == section);
+            content = content.child(
+                row()
+                    .key(&marker)
+                    .h(28.0)
+                    .px(8.0)
+                    .center_y()
+                    .fill(if selected { p.teal_bg } else { p.selected })
+                    .on_drawn_layout(move |s: &mut State, rect| {
+                        s.drop_rects.insert(marker.clone(), rect);
+                    })
+                    .child(label(format!("{section:?}"), SMALL, p.muted)),
+            );
+        }
+        for index in rows.iter().copied().filter(|i| visible.contains(i)) {
+            if thread_matches(s, &s.threads[index], &search) {
+                content = content.child(thread_row(s, index, p, false));
+            }
+        }
+        if section == Section::Settled && s.shelves[2] && rows.len() > s.settled_visible {
+            content = content.child(button(
+                "settled-more",
+                &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
                 p,
+                |s| s.settled_visible += 25,
             ));
-            last_pinned = Some(thread.pinned);
         }
-        content = content.child(thread_group(s, index, p, false, &search));
+    }
+    if all.is_empty() {
+        content = content.child(
+            label("No threads in these projects yet", SMALL, p.muted)
+                .wrap()
+                .padding(8.0),
+        );
     }
     side = side.child(
         col()
+            .key("sidebar-scroll")
+            .on_layout(|s: &mut State, rect| s.sidebar_viewport_height = rect[3])
             .grow(1.0)
             .min_h(0.0)
             .scroll(ScrollSpec {
@@ -842,6 +987,22 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     );
     if let Some(row) = update_row(s, p) {
         side = side.child(row);
+    }
+    if let Some(error) = &s.lifecycle_error {
+        side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
+    }
+    if let Some(notice) = &s.undo {
+        let count = notice.entries.len();
+        let title = format!(
+            "{}{} · Ctrl+Z",
+            notice.action.label(),
+            if count > 1 {
+                format!(" {count}")
+            } else {
+                String::new()
+            }
+        );
+        side = side.child(button("thread-undo", &title, p, |s| s.undo_thread_action()).h(32.0));
     }
     side = side.child(row().px(8.0).w_full().child(rule(p))).child(
         row()
@@ -914,7 +1075,12 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
         .radius(5.0)
         .hover(p.selected)
         .child(icon(glyph, p.muted))
-        .child(label(title, TextStyle::new(12.5, 450.0), p.ink).grow(1.0))
+        .child(
+            label(title, TextStyle::new(12.5, 450.0), p.ink)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
 }
 
 /// Removed projects plus the two ways to add one.
@@ -1243,7 +1409,7 @@ fn face_for(status: Status) -> crate::visuals::Face {
         Status::Ready => Face::Normal,
         Status::Running => Face::Determined,
         Status::Waiting => Face::Surprised,
-        Status::Settled => Face::Happy,
+        Status::Completed => Face::Happy,
         Status::Failed => Face::Dizzy,
     }
 }
@@ -1298,66 +1464,30 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
-fn counter(count: usize, p: Palette) -> El {
-    el().min_w(16.0)
-        .h(15.0)
-        .px(4.0)
-        .radius(8.0)
-        .fill(p.teal)
-        .center()
-        .child(label(
-            count.to_string(),
-            TextStyle::new(10.0, 560.0),
-            Color::WHITE,
-        ))
-}
-fn sidebar_parent(s: &State, thread: &crate::model::Thread) -> Option<usize> {
-    s.threads.iter().position(|parent| {
-        Some(parent.id) == thread.parent
-            && parent.archived == s.show_archive
-            && parent.project == thread.project
-    })
-}
-
 fn thread_matches(s: &State, thread: &crate::model::Thread, search: &str) -> bool {
     thread.title.to_lowercase().contains(search)
+        || thread.is_draft() && thread.draft.text.to_lowercase().contains(search)
+        || thread
+            .messages
+            .iter()
+            .any(|m| m.text.to_lowercase().contains(search))
         || s.threads.iter().any(|child| {
             child.parent == Some(thread.id)
-                && child.archived == s.show_archive
+                && child.archived() == s.show_archive
                 && child.title.to_lowercase().contains(search)
         })
-}
-
-fn thread_group(s: &State, index: usize, p: Palette, nested: bool, search: &str) -> El {
-    let mut group = col().child(thread_row(s, index, p, nested));
-    let mut children = col()
-        .ml(19.0)
-        .pl(13.0)
-        .gap(1.0)
-        .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
-    let mut any = false;
-    for child in s.grouped_threads(s.threads[index].project) {
-        let thread = &s.threads[child];
-        if sidebar_parent(s, thread) == Some(index)
-            && thread.archived == s.show_archive
-            && thread.title.to_lowercase().contains(search)
-        {
-            children = children.child(thread_row(s, child, p, true));
-            any = true;
-        }
-    }
-    if any {
-        group = group.child(children);
-    }
-    group
 }
 
 fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let thread = &s.threads[index];
     let id = thread.id;
     let target = RowTarget::Thread(id);
-    let selected = index == s.active;
-    let item = col()
+    let selected = id == s.selected_row() || s.selected_threads.contains(&id);
+    let section = s.thread_section(thread, lifecycle::now());
+    let slim = matches!(section, Section::Snoozed | Section::Settled) && !s.is_captain_home(thread);
+    let hovered = s.hovered_row == Some(target);
+    let draft = thread.is_draft();
+    let mut item = col()
         .key(format!("thread-{}", thread.id))
         .role("button")
         .label(format!("{}, {}", thread.title, thread.status.label()))
@@ -1370,12 +1500,26 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .justify_center()
         .fill(if selected {
             p.selected
+        } else if draft {
+            p.gold.alpha(0.06)
         } else {
             Color::TRANSPARENT
         })
         .hover(p.selected)
-        .on_press(move |s: &mut State| {
-            s.select_thread(index);
+        .on_press_tx(move |s: &mut State, tx| {
+            s.click_thread(index, tx.mods());
+        })
+        .on_double_press(move |s: &mut State| s.begin_rename(id))
+        .on_key(move |s: &mut State, ev, _| {
+            if ev.key == rune::Key::Function(2) {
+                s.begin_rename(id);
+                true
+            } else {
+                false
+            }
+        })
+        .on_drawn_layout(move |s: &mut State, rect| {
+            s.drop_rects.insert(format!("thread-{id}"), rect);
         })
         .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
         .on_hover_change(move |s: &mut State, hovered, _| {
@@ -1385,32 +1529,55 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 s.hovered_row = None;
             }
         });
+    if !s.is_captain_home(thread) && thread.machine == "local" && section != Section::Working {
+        item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
+    }
 
+    let captain_home = s.is_captain_home(thread);
+    // T3 cards lead with the project line; Captains lead with their avatar and name.
+    let lead = if nested {
+        None
+    } else if captain_home {
+        Some(avatar(
+            s,
+            p,
+            thread.captain.expect("captain home"),
+            20.0,
+            s.home_status(thread.id),
+        ))
+    } else {
+        Some(icon(
+            if draft {
+                "edit"
+            } else if thread.pinned() {
+                "pin"
+            } else {
+                "thread"
+            },
+            if selected { p.ink } else { p.muted },
+        ))
+    };
     let mut title = row().gap(8.0).center_y();
-    if !nested {
-        title = title.child(if s.is_captain_home(thread) {
-            avatar(
-                s,
-                p,
-                thread.captain.expect("captain home"),
-                20.0,
-                s.project_captain_status(thread.project, thread.captain.unwrap()),
-            )
-        } else {
-            icon(
-                if thread.pinned { "pin" } else { "thread" },
-                if selected { p.ink } else { p.muted },
-            )
-        });
+    if captain_home && let Some(lead) = lead.clone() {
+        title = title.child(lead);
     }
     title = title.child(
-        label(&thread.title, LABEL, if selected { p.ink } else { p.muted })
-            .truncate()
-            .grow(1.0),
+        label(
+            if draft && !thread.draft.text.is_empty() {
+                thread.draft.text.lines().next().unwrap_or(&thread.title)
+            } else {
+                &thread.title
+            },
+            LABEL,
+            if selected || thread.unread() || thread.life.woke(lifecycle::now()) {
+                p.ink
+            } else {
+                p.muted
+            },
+        )
+        .truncate()
+        .grow(1.0),
     );
-    if thread.unread {
-        title = title.child(counter(1, p));
-    }
     title = title.child(
         icon_button(
             &format!("thread-more-{id}"),
@@ -1419,16 +1586,48 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             p,
             move |s| s.row_menu = Some(target),
         )
-        .opacity(if selected || s.hovered_row == Some(target) {
-            1.0
-        } else {
-            0.0
-        }),
+        .opacity(if hovered || selected { 1.0 } else { 0.0 }),
     );
+    let action = if section == Section::Snoozed {
+        "Wake"
+    } else if section == Section::Settled {
+        "Un-settle"
+    } else {
+        "Settle"
+    };
+    if slim {
+        if hovered {
+            title = title.child(
+                icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
+                    if section == Section::Snoozed {
+                        s.unsnooze_thread(id);
+                    } else {
+                        s.settle_thread(id);
+                    }
+                })
+                .disabled(section != Section::Snoozed && s.lifecycle_busy(id)),
+            );
+        } else {
+            let time = if section == Section::Snoozed {
+                lifecycle::wake_label(thread.life.snoozed_until.unwrap_or(0), lifecycle::now())
+            } else {
+                relative_time(thread.life.settled_at.unwrap_or(0) / 1000).unwrap_or_default()
+            };
+            title = title.child(label(time, SMALL, p.muted));
+        }
+        let mut line = row().gap(8.0).center_y();
+        if !captain_home && let Some(lead) = lead {
+            line = line.child(lead);
+        }
+        return item.h(36.0).child(line.child(title.grow(1.0)));
+    }
     let mut meta = row()
-        .gap(5.0)
+        .gap(if captain_home { 5.0 } else { 8.0 })
         .center_y()
-        .pl(if nested { 0.0 } else { 24.0 });
+        .pl(if captain_home { 28.0 } else { 0.0 });
+    if !captain_home && let Some(lead) = lead {
+        meta = meta.child(lead);
+    }
     meta = meta.child(
         label(
             s.project(thread.project)
@@ -1440,18 +1639,93 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .truncate()
         .grow(1.0),
     );
-    if thread.status.busy() || thread.status == Status::Failed {
-        meta = meta.child(status_mark(thread.status, p, 5.0));
-    }
-    if let Some(age) = relative_time(thread.updated) {
+    let approval = thread
+        .request
+        .as_ref()
+        .is_some_and(|r| r["method"] == "confirm")
+        || s.threads.iter().any(|c| {
+            c.parent == Some(id) && c.request.as_ref().is_some_and(|r| r["method"] == "confirm")
+        });
+    let at = lifecycle::now();
+    let state_label = if approval {
+        "Approval"
+    } else if thread.request.is_some() {
+        "Input"
+    } else if thread.status == Status::Running {
+        "Working"
+    } else if thread.status == Status::Waiting {
+        "Waiting"
+    } else if thread.status == Status::Failed {
+        "Failed"
+    } else if thread.life.woke(at) {
+        "Woke"
+    } else if thread.unread() {
+        "Done"
+    } else {
+        ""
+    };
+    if thread.life.woke(at) {
+        meta = meta.child(button(&format!("thread-woke-{id}"), "Woke", p, move |s| {
+            s.threads[index].life.last_visited_at = Some(lifecycle::now());
+            s.checkpoint();
+        }));
+    } else if hovered && draft {
+        meta = meta.child(icon_button(
+            &format!("thread-discard-{id}"),
+            "Discard draft",
+            "close",
+            p,
+            move |s| s.discard_draft(id),
+        ));
+    } else if hovered && !s.is_captain_home(thread) {
+        if !thread.draft.text.is_empty() {
+            meta = meta.child(icon_button(
+                &format!("thread-discard-{id}"),
+                "Discard draft",
+                "close",
+                p,
+                move |s| s.discard_draft(id),
+            ));
+        }
+        meta = meta.child(
+            icon_button(
+                &format!("thread-snooze-{id}"),
+                "Snooze",
+                "clock",
+                p,
+                move |s| s.open_snooze(id),
+            )
+            .disabled(!s.can_snooze(id)),
+        );
+        meta = meta.child(
+            icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
+                s.settle_thread(id)
+            })
+            .disabled(s.lifecycle_busy(id)),
+        );
+    } else if !state_label.is_empty() {
+        meta = meta.child(label(
+            state_label,
+            SMALL,
+            if approval {
+                p.gold
+            } else if thread.status == Status::Failed {
+                p.danger
+            } else {
+                p.teal_text
+            },
+        ));
+    } else if let Some(age) = relative_time(thread.updated) {
         meta = meta.child(label(age, SMALL, p.muted).key(format!("thread-age-{id}")));
     }
-    if let Some(parent) = thread.parent {
-        meta = meta.child(label(format!("#{parent}"), SMALL, p.muted));
-    } else if let Some(captain) = thread.captain.filter(|_| !s.is_captain_home(thread)) {
-        meta = meta.child(label(&s.captains[captain].name, SMALL, p.muted));
+    if thread.machine != "local" {
+        meta = meta.child(icon("cloud", p.muted));
     }
-    item.child(title).child(meta)
+    if captain_home {
+        item.child(title).child(meta)
+    } else {
+        item.child(meta).child(title)
+    }
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -1562,7 +1836,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .child(label("New Captain", LABEL, p.ink)),
     ).child(rule(p)).child(
         label(
-            "One persistent Captain per project. Crew threads inherit its project and instructions.",
+            "Captains have separate conversations and crew. Several can share a project, or use no project.",
             SMALL,
             p.muted,
         )
@@ -1630,29 +1904,100 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 )),
         );
     }
-    let mut body = col().key("captain-form-body").gap(12.0).min_h(0.0)
+    let captain_project = s.captain_project.unwrap_or(s.current().project);
+    let mut body = col()
+        .key("captain-form-body")
+        .gap(12.0)
+        .min_h(0.0)
         .max_h((height - 180.0).max(180.0))
-        .scroll(ScrollSpec { stick_bottom: false })
-        .child(col().gap(6.0).child(label("Portrait", SMALL, p.muted)).child(portraits))
-        .child(col().gap(5.0).child(label("Name", SMALL, p.muted))
-            .child(text_input(&editor.name, BODY).key("captain-name").label("Captain name")
-                .placeholder("e.g. Atlas", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.field_line)
-                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name)))
-        .child(col().gap(5.0).child(label("Role", SMALL, p.muted))
-            .child(text_input(&editor.role, BODY).key("captain-role").label("Captain role")
-                .placeholder("e.g. Code review", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.field_line)
-                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role)))
-        .child(col().gap(5.0).child(label("Instructions for Pi", SMALL, p.muted))
-            .child(text_input(&editor.instructions, BODY).key("captain-instructions").label("Captain instructions")
-                .placeholder("What should this captain focus on? Optional.", p.muted).color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().min_h(76.0).max_h(140.0).padding(8.0)
-                .radius(6.0).fill(field).border(1.0, p.field_line)
-                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().instructions)))
-        .child(label(
-            "Saved to the captain roster. Assigned projects use these instructions and Pi's configured CPA model.",
-            SMALL, p.muted).wrap());
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            button(
+                "captain-project-choice",
+                &format!(
+                    "Project: {}",
+                    s.project(captain_project)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("No project")
+                ),
+                p,
+                |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
+            )
+            .disabled(editing),
+        )
+        .child(
+            col()
+                .gap(6.0)
+                .child(label("Portrait", SMALL, p.muted))
+                .child(portraits),
+        )
+        .child(
+            col().gap(5.0).child(label("Name", SMALL, p.muted)).child(
+                text_input(&editor.name, BODY)
+                    .key("captain-name")
+                    .label("Captain name")
+                    .placeholder("e.g. Atlas", p.muted)
+                    .single_line()
+                    .color(p.ink)
+                    .caret(p.teal, p.teal_bg)
+                    .w_full()
+                    .padding(8.0)
+                    .radius(6.0)
+                    .fill(field)
+                    .border(1.0, p.field_line)
+                    .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name),
+            ),
+        )
+        .child(
+            col().gap(5.0).child(label("Role", SMALL, p.muted)).child(
+                text_input(&editor.role, BODY)
+                    .key("captain-role")
+                    .label("Captain role")
+                    .placeholder("e.g. Code review", p.muted)
+                    .single_line()
+                    .color(p.ink)
+                    .caret(p.teal, p.teal_bg)
+                    .w_full()
+                    .padding(8.0)
+                    .radius(6.0)
+                    .fill(field)
+                    .border(1.0, p.field_line)
+                    .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
+            ),
+        )
+        .child(
+            col()
+                .gap(5.0)
+                .child(label("Instructions for Pi", SMALL, p.muted))
+                .child(
+                    text_input(&editor.instructions, BODY)
+                        .key("captain-instructions")
+                        .label("Captain instructions")
+                        .placeholder("What should this captain focus on? Optional.", p.muted)
+                        .color(p.ink)
+                        .caret(p.teal, p.teal_bg)
+                        .w_full()
+                        .min_h(76.0)
+                        .max_h(140.0)
+                        .padding(8.0)
+                        .radius(6.0)
+                        .fill(field)
+                        .border(1.0, p.field_line)
+                        .on_edit(|s: &mut State| {
+                            &mut s.captain_editor.as_mut().unwrap().instructions
+                        }),
+                ),
+        )
+        .child(
+            label(
+                "The captain and its crew use these instructions and Pi's configured CPA model.",
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        );
     if let Some(error) = &editor.error {
         body = body.child(label(error, SMALL, p.danger).wrap());
     }
@@ -1822,6 +2167,21 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         .px(10.0)
         .center_y()
         .gap(4.0);
+    // Crew threads link back to the thread that started them; nothing else repeats the tab.
+    if let Some(parent) = s
+        .current()
+        .parent
+        .and_then(|id| s.threads.iter().position(|t| t.id == id))
+    {
+        header = header.child(label("From", SMALL, p.muted)).child(
+            button("breadcrumb-parent", &s.threads[parent].title, p, move |s| {
+                s.select_thread(parent)
+            })
+            .max_w(240.0)
+            .shrink()
+            .min_w(0.0),
+        );
+    }
     header = header.child(spacer()).child(if s.demo {
         row()
             .key("demo-badge")
@@ -1881,32 +2241,201 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
     let Some(thread) = s.threads.iter().find(|t| t.id == id) else {
         return el();
     };
+    let captain = s.is_captain_home(thread);
     let mut actions = col()
         .gap(1.0)
+        .max_h((s.viewport_height - 80.0).max(240.0))
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    if !captain {
+        actions = actions
+            .child(
+                menu_item(
+                    "menu-pin-thread",
+                    if thread.pinned() {
+                        "Unpin thread"
+                    } else {
+                        "Pin thread"
+                    },
+                    "pin",
+                    p,
+                )
+                .disabled(thread.machine != "local")
+                .on_press(move |s: &mut State| {
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.pin_thread(id);
+                }),
+            )
+            .child(
+                menu_item(
+                    "menu-settle-thread",
+                    if thread.life.settled() {
+                        "Un-settle thread"
+                    } else {
+                        "Settle thread"
+                    },
+                    "check",
+                    p,
+                )
+                .disabled(
+                    thread.machine != "local" || !thread.life.settled() && s.lifecycle_busy(id),
+                )
+                .on_press(move |s: &mut State| {
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.settle_thread(id);
+                }),
+            );
+        if thread.life.snoozed(lifecycle::now()) {
+            actions = actions.child(
+                menu_item("menu-snooze-thread", "Wake thread", "clock", p).on_press(
+                    move |s: &mut State| {
+                        s.row_menu = None;
+                        s.thread_menu = false;
+                        s.unsnooze_thread(id);
+                    },
+                ),
+            );
+        } else {
+            actions = actions.child(
+                menu_item("menu-snooze-thread", "Snooze...", "clock", p)
+                    .disabled(!s.can_snooze(id))
+                    .on_press(move |s: &mut State| s.open_snooze(id)),
+            );
+        }
+    }
+    actions = actions
+        .child(rule(p))
         .child(
             menu_item("menu-rename-thread", "Rename thread", "edit", p)
                 .on_press(move |s: &mut State| s.begin_rename(id)),
         )
         .child(
+            menu_item("menu-mark-unread", "Mark unread", "thread", p)
+                .disabled(thread.life.last_completed_at.is_none())
+                .on_press(move |s: &mut State| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.life.mark_unread();
+                    }
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.checkpoint();
+                }),
+        );
+    if !captain {
+        let project = thread.project;
+        actions = actions
+            .child(
+                menu_item(
+                    "menu-filter-project",
+                    if s.project_scope == ProjectScope::All {
+                        "Filter by project"
+                    } else {
+                        "Show all projects"
+                    },
+                    "folder",
+                    p,
+                )
+                .on_press(move |s: &mut State| {
+                    s.project_scope = if s.project_scope != ProjectScope::All {
+                        ProjectScope::All
+                    } else {
+                        project
+                            .map(ProjectScope::Project)
+                            .unwrap_or(ProjectScope::NoProject)
+                    };
+                    s.scope_additional.clear();
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.checkpoint();
+                }),
+            )
+            .child(
+                menu_item(
+                    "menu-auto-settle",
+                    if thread.life.auto_settle_disabled_at.is_some() {
+                        "Enable auto-settle"
+                    } else {
+                        "Disable auto-settle"
+                    },
+                    "check",
+                    p,
+                )
+                .on_press(move |s: &mut State| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.life.auto_settle_disabled_at = if t.life.auto_settle_disabled_at.is_some()
+                        {
+                            None
+                        } else {
+                            Some(lifecycle::now())
+                        };
+                    }
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.checkpoint();
+                }),
+            );
+        actions = actions.child(
             menu_item(
-                "menu-pin-thread",
-                if thread.pinned {
-                    "Unpin thread"
-                } else {
-                    "Pin thread"
-                },
-                "pin",
+                "menu-auto-settle-days",
+                &format!("Inactivity: {} days, click to change", s.auto_settle_days),
+                "clock",
                 p,
             )
-            .on_press(move |s: &mut State| {
-                s.row_menu = None;
-                s.thread_menu = false;
-                s.pin_thread(id);
+            .on_press(|s: &mut State| {
+                s.auto_settle_days = match s.auto_settle_days {
+                    0 => 1,
+                    1 => 3,
+                    3 => 7,
+                    7 => 14,
+                    14 => 30,
+                    _ => 0,
+                };
+                s.sweep_lifecycle(lifecycle::now());
+                s.checkpoint();
             }),
+        );
+        if !thread.draft.text.is_empty() {
+            actions = actions.child(
+                menu_item("menu-discard-draft", "Discard draft", "close", p).on_press(
+                    move |s: &mut State| {
+                        s.row_menu = None;
+                        s.thread_menu = false;
+                        s.discard_draft(id);
+                    },
+                ),
+            );
+        }
+    }
+    actions = actions
+        .child(rule(p))
+        .child(
+            menu_item("menu-copy-thread-id", "Copy thread ID", "thread", p).on_press_tx(
+                move |s: &mut State, tx| {
+                    tx.copy(id.to_string());
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                },
+            ),
+        )
+        .child(
+            menu_item("menu-copy-path", "Copy path", "folder", p).on_press_tx(
+                move |s: &mut State, tx| {
+                    if let Some(i) = s.threads.iter().position(|t| t.id == id)
+                        && let Ok(path) = s.thread_directory(i)
+                    {
+                        tx.copy(path.to_string_lossy().into_owned());
+                    }
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                },
+            ),
         );
     let archive = menu_item(
         "menu-archive-thread",
-        if thread.archived {
+        if thread.archived() {
             "Restore thread"
         } else {
             "Archive thread"
@@ -1914,7 +2443,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
         "archive",
         p,
     );
-    actions = actions.child(if thread.status.busy() {
+    actions = actions.child(if s.lifecycle_busy(id) || thread.machine != "local" {
         archive
             .disabled(true)
             .child(label("Working", SMALL, p.muted))
@@ -1944,10 +2473,150 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
     )
 }
 
+fn snooze_menu(s: &State, p: Palette) -> El {
+    let (_, choices) = s.snooze_menu.as_ref().unwrap();
+    let mut card = col()
+        .key("snooze-menu")
+        .w(280.0)
+        .padding(12.0)
+        .gap(4.0)
+        .radius(8.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .on_press(|_: &mut State| {})
+        .child(label("Snooze thread", LABEL, p.ink));
+    if s.custom_snooze_open {
+        card = card
+            .child(label("Local date and time, or duration", SMALL, p.muted))
+            .child(
+                text_input(&s.snooze_edit, LABEL)
+                    .key("snooze-custom-input")
+                    .label("Snooze time")
+                    .placeholder("2026-11-12 09:00 or 90m, 3h, 2d", p.muted)
+                    .single_line()
+                    .color(p.ink)
+                    .on_edit(|s: &mut State| &mut s.snooze_edit),
+            )
+            .child(button("snooze-custom-save", "Snooze", p, move |s| {
+                if let Some(until) =
+                    lifecycle::custom_snooze(&s.snooze_edit.text, chrono::Local::now())
+                {
+                    let ids = s.snooze_targets.clone();
+                    for id in ids {
+                        s.snooze_thread(id, until);
+                    }
+                } else {
+                    s.lifecycle_error =
+                        Some("Choose a valid future local time. DST gaps are not valid.".into());
+                }
+            }));
+    } else {
+        for (i, choice) in choices.iter().enumerate() {
+            card = card.child(
+                menu_item(&format!("snooze-preset-{i}"), &choice.label, "clock", p)
+                    .child(spacer())
+                    .child(label(&choice.time, SMALL, p.muted))
+                    .on_press(move |s: &mut State| {
+                        let until = s
+                            .snooze_menu
+                            .as_ref()
+                            .and_then(|(_, c)| c.get(i))
+                            .and_then(|c| lifecycle::pick_preset(c, lifecycle::now()));
+                        if let Some(until) = until {
+                            let ids = s.snooze_targets.clone();
+                            for id in ids {
+                                s.snooze_thread(id, until);
+                            }
+                        } else {
+                            s.lifecycle_error =
+                                Some("That snooze time has passed. Choose another time.".into());
+                        }
+                    }),
+            );
+        }
+        card = card.child(rule(p)).child(
+            menu_item("snooze-custom", "Custom...", "clock", p).on_press(|s: &mut State| {
+                s.custom_snooze_open = true;
+                s.snooze_edit.focused = true;
+            }),
+        );
+    }
+    if let Some(error) = &s.lifecycle_error {
+        card = card.child(label(error, SMALL, p.danger).wrap());
+    }
+    card = card.child(button("snooze-cancel", "Cancel", p, |s| {
+        s.snooze_menu = None;
+        s.lifecycle_error = None;
+    }));
+    el().key("snooze-backdrop")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .center()
+        .fill(Color::BLACK.alpha(0.2))
+        .modal(false, |s: &mut State| s.snooze_menu = None)
+        .child(card)
+}
+
+fn bulk_thread_actions(s: &State, p: Palette) -> El {
+    let count = s.selected_threads.len();
+    let mut actions = col().gap(1.0);
+    for (key, title, action) in [
+        ("bulk-unpin", "Unpin", 0),
+        ("bulk-settle", "Settle", 1),
+        ("bulk-snooze", "Snooze...", 2),
+        ("bulk-unread", "Mark unread", 3),
+        ("bulk-delete", "Delete...", 4),
+    ] {
+        actions = actions.child(
+            menu_item(key, &format!("{title} ({count})"), "thread", p).on_press(
+                move |s: &mut State| {
+                    let ids = s.selected_threads.clone();
+                    s.row_menu = None;
+                    if action == 2 {
+                        if let Some(id) = ids.first() {
+                            s.open_snooze(*id);
+                        }
+                        return;
+                    }
+                    if action == 4 {
+                        if let Some(id) = ids.first() {
+                            s.request_delete(*id);
+                        }
+                        return;
+                    }
+                    for id in ids {
+                        if action == 0 {
+                            if s.threads.iter().any(|t| t.id == id && t.pinned()) {
+                                s.pin_thread(id);
+                            }
+                        } else if action == 1 {
+                            if s.threads.iter().any(|t| t.id == id && !t.life.settled()) {
+                                s.settle_thread(id);
+                            }
+                        } else if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                            t.life.mark_unread();
+                        }
+                    }
+                    s.checkpoint();
+                },
+            ),
+        );
+    }
+    actions
+}
+
 fn row_menu(s: &State, p: Palette) -> El {
     let target = s.row_menu.expect("row menu target");
     let (anchor, actions) = match target {
-        RowTarget::Thread(id) => (format!("thread-{id}"), thread_actions(s, id, p)),
+        RowTarget::Thread(id) => (
+            format!("thread-{id}"),
+            if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
+                bulk_thread_actions(s, p)
+            } else {
+                thread_actions(s, id, p)
+            },
+        ),
         RowTarget::Project(id) => (
             format!("project-option-{id}"),
             col()
@@ -2040,9 +2709,22 @@ fn thread_dialog(s: &State, p: Palette) -> El {
                 .on_submit(|s: &mut State, _| s.save_thread_name()),
         );
     } else {
-        let descendants = s.deletion_ids(id).len().saturating_sub(1);
+        let roots = if s.delete_roots.is_empty() {
+            vec![id]
+        } else {
+            s.delete_roots.clone()
+        };
+        let count = roots.len();
+        let all: std::collections::HashSet<_> =
+            roots.iter().flat_map(|id| s.deletion_ids(*id)).collect();
+        let descendants = all.len().saturating_sub(count);
+        let target = if count > 1 {
+            format!("these {count} threads and their")
+        } else {
+            "this thread and its".into()
+        };
         card = card.child(label(format!(
-            "Delete this thread and its {descendants} delegated children? Running agents will stop. Project files and Pi session files stay on disk."
+            "Delete {target} {descendants} delegated children? Running agents will stop. Project files and Pi session files stay on disk."
         ), BODY, p.ink).wrap());
     }
     card = card.child(
@@ -2121,19 +2803,26 @@ fn project_picker(s: &State, p: Palette) -> El {
         card = card.child(
             menu_item("scope-all-projects", "All projects", "list", p).on_press(|s: &mut State| {
                 s.project_scope = ProjectScope::All;
+                s.scope_additional.clear();
+                s.selected_threads.clear();
                 s.project_picker = None;
+                s.checkpoint();
             }),
         );
     }
-    if mode != ProjectPicker::AssignCaptain {
+    {
         card = card.child(
-            menu_item("choose-no-project", "No project", "thread", p).on_press(
-                move |s: &mut State| {
+            menu_item("choose-no-project", "No project", "thread", p).on_press_tx(
+                move |s: &mut State, tx| {
                     if mode == ProjectPicker::NewThread {
                         s.new_thread_in(None);
+                    } else if mode == ProjectPicker::Scope {
+                        s.set_project_scope(None, tx.mods().shift);
                     } else {
-                        s.project_scope = ProjectScope::NoProject;
+                        s.projects.captain_target = None;
+                        s.captain_project = Some(None);
                         s.project_picker = None;
+                        s.captain_picker = s.captain_editor.is_none();
                     }
                 },
             ),
@@ -2144,7 +2833,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     for id in s.sorted_projects() {
         let project = s.project(Some(id)).expect("sorted project");
-        if project.hidden || (mode == ProjectPicker::AssignCaptain && project.captain.is_some()) {
+        if project.hidden {
             continue;
         }
         let target = RowTarget::Project(id);
@@ -2156,13 +2845,25 @@ fn project_picker(s: &State, p: Palette) -> El {
                 .child(
                     menu_item(&format!("choose-project-{id}"), &project.name, "folder", p)
                         .grow(1.0)
+                        .child(
+                            if mode == ProjectPicker::Scope
+                                && (s.project_scope == ProjectScope::Project(id)
+                                    || s.scope_additional.contains(&id))
+                            {
+                                icon("check", p.teal)
+                            } else {
+                                el()
+                            },
+                        )
                         .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
-                        .on_press(move |s: &mut State| {
-                            s.project_picker = None;
-                            match mode {
-                                ProjectPicker::NewThread => s.new_thread_in(Some(id)),
-                                ProjectPicker::Scope => s.project_scope = ProjectScope::Project(id),
-                                ProjectPicker::AssignCaptain => s.choose_project_captain(id),
+                        .on_press_tx(move |s: &mut State, tx| match mode {
+                            ProjectPicker::NewThread => s.new_thread_in(Some(id)),
+                            ProjectPicker::Scope => s.set_project_scope(Some(id), tx.mods().shift),
+                            ProjectPicker::AssignCaptain => {
+                                s.project_picker = None;
+                                s.projects.captain_target = Some(id);
+                                s.captain_project = Some(Some(id));
+                                s.captain_picker = s.captain_editor.is_none();
                             }
                         }),
                 )
@@ -2785,7 +3486,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                                             .filter(|thread| {
                                                 thread.captain == Some(captain)
                                                     && !thread.captain_home
-                                                    && !thread.archived
+                                                    && !thread.archived()
                                                     && thread.status.busy()
                                             })
                                             .count();
@@ -2987,7 +3688,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         area = area.child(dialog(s, p));
     }
     let can_send = !s.demo
-        && !t.archived
+        && !t.archived()
         && !t.status.busy()
         && !t.configuring
         && !t.draft.text.trim().is_empty();
@@ -3018,7 +3719,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     } else {
         send
     };
-    let locked = s.demo || t.archived || t.status.busy() || t.configuring;
+    let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
     let identity = if let Some(captain) = t.captain {
         avatar(s, p, captain, 16.0, shown_status(s))
     } else {
@@ -3060,7 +3761,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                     .max_h(170.0)
                     .on_edit(|s: &mut State| &mut s.current_mut().draft)
                     .on_submit(|s: &mut State, _| {
-                        if !s.demo && !s.current().archived {
+                        if !s.demo && !s.current().archived() {
                             s.send();
                         }
                     }),
@@ -3326,6 +4027,159 @@ pub(crate) mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
+    }
+    #[test]
+    fn shelves_start_collapsed_keep_the_open_row_and_page_settled_threads() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        assert!(rt.find("shelf-Working").is_some());
+        assert!(rt.find("shelf-Snoozed").is_some());
+        assert!(rt.find("shelf-Settled").is_some());
+        assert!(rt.find("thread-2").is_none());
+        assert!(rt.find("thread-4").is_none());
+        press(&mut rt, "shelf-Working");
+        assert!(rt.find("thread-2").is_some());
+        rt.state.select_thread(1);
+        rt.frame(0.0);
+        press(&mut rt, "shelf-Working");
+        assert!(
+            rt.find("thread-2").is_some(),
+            "collapsed shelf retains the open thread"
+        );
+        for id in 11..51 {
+            let mut t = Thread::new(id);
+            t.life.settle(lifecycle::now() - id as u64);
+            rt.state.threads.push(t);
+        }
+        rt.state.shelves[2] = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        let count = |s: &State| {
+            s.visible_sidebar_threads()
+                .iter()
+                .filter(|i| s.threads[**i].life.settled())
+                .count()
+        };
+        assert_eq!(count(&rt.state), 10);
+        assert!(rt.find("settled-more").is_some());
+        rt.update(|_, tx| tx.scroll_into_view("settled-more"));
+        rt.frame(0.5);
+        press(&mut rt, "settled-more");
+        assert_eq!(count(&rt.state), 35);
+    }
+
+    #[test]
+    fn snooze_menu_custom_validation_and_footer_undo_use_real_controls() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        press(&mut rt, "thread-actions");
+        press(&mut rt, "menu-snooze-thread");
+        assert!(rt.find("snooze-menu").is_some());
+        assert!(rt.find("snooze-preset-0").is_some());
+        press(&mut rt, "snooze-custom");
+        rt.state.snooze_edit.replace_text("not a date");
+        rt.frame(0.0);
+        press(&mut rt, "snooze-custom-save");
+        assert!(rt.state.lifecycle_error.is_some());
+        rt.state.snooze_edit.replace_text("90m");
+        rt.frame(0.0);
+        press(&mut rt, "snooze-custom-save");
+        assert!(rt.state.threads[0].life.snoozed(lifecycle::now()));
+        assert!(rt.find("thread-undo").is_some());
+        press(&mut rt, "thread-undo");
+        assert!(!rt.state.threads[0].life.snoozed(lifecycle::now()));
+        assert!(rt.state.undo.is_none());
+    }
+
+    #[test]
+    fn footer_undo_claims_ctrl_z_in_a_focused_composer_only_until_typing() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        rt.state.pin_thread(1);
+        rt.state.pin_thread(1);
+        rt.invalidate();
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('z'),
+            mods: rune::Mods {
+                cmd: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.threads[0].pinned());
+        rt.state.pin_thread(1);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("x".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert!(!rt.state.undo.as_ref().unwrap().owns_text_key);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('z'),
+            mods: rune::Mods {
+                cmd: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(!rt.state.threads[0].pinned());
+    }
+
+    #[test]
+    fn captain_home_menus_offer_no_lifecycle_controls_and_search_never_lists_homes() {
+        let mut rt = runtime(1280.0);
+        rt.state.open_captain(0);
+        let home = rt.state.current().id;
+        rt.state
+            .search
+            .replace_text(rt.state.current().title.clone());
+        assert!(rt.state.visible_sidebar_threads().is_empty());
+        rt.frame(0.0);
+        press(&mut rt, "thread-actions");
+        for key in [
+            "menu-pin-thread",
+            "menu-settle-thread",
+            "menu-snooze-thread",
+            "menu-auto-settle",
+        ] {
+            assert!(rt.find(key).is_none());
+        }
+        assert!(rt.find(&format!("thread-{home}")).is_some());
+    }
+
+    #[test]
+    fn native_pointer_drag_pins_at_the_target_position_and_resizes_the_sidebar() {
+        let mut rt = runtime(1280.0);
+        rt.state.new_thread();
+        rt.state.pin_thread(1);
+        rt.invalidate();
+        rt.frame(0.0);
+        let (x, y) = rt.find("thread-2").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_move(x, y - 20.0);
+        rt.frame(0.0);
+        assert_eq!(rt.state.drag_thread, Some(2));
+        let (rect, _) = rt.presented("thread-1").unwrap();
+        rt.pointer_move(rect[0] + 40.0, rect[1] + 3.0);
+        rt.frame(0.0);
+        rt.pointer_up(rect[0] + 40.0, rect[1] + 3.0);
+        rt.frame(0.0);
+        assert!(rt.state.threads[1].pinned());
+        assert!(rt.state.threads[1].life.pin_order_key < rt.state.threads[0].life.pin_order_key);
+        let width = rt.state.sidebar_width;
+        let (x, y) = rt.find("sidebar-resize").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_move(x + 30.0, y);
+        rt.pointer_up(x + 30.0, y);
+        rt.frame(0.0);
+        assert!((rt.state.sidebar_width - width - 30.0).abs() < 0.1);
     }
 
     /// Exercise the actual renderer with the messages from an opt-in live Pi run.
@@ -3708,14 +4562,17 @@ pub(crate) mod tests {
         }
         press(&mut rt, "assign-captain");
         assert_eq!(rt.state.project_picker, Some(ProjectPicker::AssignCaptain));
-        assert!(rt.find("choose-no-project").is_none());
+        assert!(rt.find("choose-no-project").is_some());
         press(&mut rt, "choose-project-3");
         press(&mut rt, "choose-captain-0");
         assert_eq!(rt.state.project(Some(3)).unwrap().captain, Some(0));
         assert_eq!(rt.state.current().project, Some(3));
         assert!(rt.find("thread-2").is_some());
         press(&mut rt, "assign-captain");
-        assert!(rt.find("choose-project-3").is_none());
+        assert!(
+            rt.find("choose-project-3").is_some(),
+            "several captains can share a project"
+        );
         assert!(rt.find("choose-project-1").is_some());
     }
 
@@ -3749,7 +4606,7 @@ pub(crate) mod tests {
         press(&mut rt, "new-thread");
         rt.frame(2.0);
         press(&mut rt, "choose-project-1");
-        assert_eq!(rt.state.current().captain, Some(2));
+        assert_eq!(rt.state.current().captain, None);
         assert!(!rt.state.current().captain_home);
     }
     #[test]
@@ -3812,17 +4669,19 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn delegated_children_follow_their_parent_in_the_sidebar() {
+    fn captain_crew_follows_its_home_and_never_enters_the_lone_thread_list() {
         let mut rt = runtime(1280.0);
         rt.state.threads[0].title = "Parent".into();
-        rt.state.threads[0].pinned = true;
+        rt.state.threads[0].captain_home = true;
+        rt.state.threads[0].captain = Some(2);
+        rt.state.threads[0].life.pinned_at = Some(1);
         let mut child = crate::model::Thread::new(2);
         child.title = "Delegated child".into();
         child.parent = Some(1);
         child.project = Some(1);
         child.delegated = true;
         child.captain = Some(2);
-        child.pinned = true;
+        child.life.pinned_at = Some(1);
         rt.state.threads.push(child);
         rt.frame(0.0);
         let (parent, _) = rt.presented("thread-1").unwrap();
@@ -3832,15 +4691,16 @@ pub(crate) mod tests {
         rt.frame(0.0);
         assert!(
             rt.presented("thread-1").is_some(),
-            "a matching child keeps its parent visible"
+            "captains stay in their own area during thread search"
         );
         press(&mut rt, "thread-2");
         assert_eq!(rt.state.current().id, 2);
         assert!(rt.presented("thread-2").is_some());
+        assert!(rt.state.sidebar_threads().is_empty());
     }
 
     #[test]
-    fn cross_captain_children_of_a_home_are_visible_and_archived_children_still_have_rows() {
+    fn captain_crew_is_visible_in_the_captain_view_but_not_the_lone_archive() {
         let mut rt = runtime(1280.0);
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
@@ -3853,10 +4713,14 @@ pub(crate) mod tests {
         rt.state.threads.push(child);
         rt.frame(0.0);
         assert!(rt.presented("thread-3").is_some());
-        rt.state.threads.last_mut().unwrap().archived = true;
+        rt.state.threads.last_mut().unwrap().life.archived_at = Some(1);
         rt.state.show_archive = true;
+        rt.invalidate();
         rt.frame(0.0);
-        assert!(rt.presented("thread-3").is_some());
+        assert!(
+            rt.find("thread-3").is_none(),
+            "exiting rows are not interactive archive rows"
+        );
     }
 
     #[test]
@@ -3873,7 +4737,7 @@ pub(crate) mod tests {
             "the pin item is shown"
         );
         press(&mut rt, "menu-pin-thread");
-        assert!(rt.state.current().pinned);
+        assert!(rt.state.current().pinned());
         assert_eq!(rt.state.current().draft.text, "Keep this draft");
         assert!(rt.find("thread-1").is_some());
     }
@@ -3901,7 +4765,7 @@ pub(crate) mod tests {
         assert_eq!(rt.state.current().title, "Renamed in sidebar");
         press(&mut rt, "thread-actions");
         press(&mut rt, "menu-pin-thread");
-        assert!(rt.state.current().pinned);
+        assert!(rt.state.current().pinned());
         press(&mut rt, "thread-more-1");
         press(&mut rt, "menu-delete-thread");
         assert_eq!(

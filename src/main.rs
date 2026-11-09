@@ -3,6 +3,7 @@
 mod backend;
 mod captains;
 mod install;
+mod lifecycle;
 mod mcp;
 mod model;
 mod projects;
@@ -16,21 +17,73 @@ use model::State;
 use rune::{AppSpec, Key, KeyEvent, Tx};
 use std::{path::PathBuf, sync::OnceLock};
 
-static OPTIONS: OnceLock<(PathBuf, bool)> = OnceLock::new();
+static OPTIONS: OnceLock<(PathBuf, bool, bool)> = OnceLock::new();
 
 fn init() -> State {
-    let (path, demo) = OPTIONS.get().expect("startup options");
-    State::new(path.clone(), *demo)
+    let (path, demo, snapshot) = OPTIONS.get().expect("startup options");
+    let mut state = State::new(path.clone(), *demo);
+    if *snapshot && !demo {
+        state.load_snapshot();
+    }
+    state
 }
 
 fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if event.is_command('n') {
+    if state.undo_key(event, false) {
+        return true;
+    }
+    if event.mods.shift && event.is_command('s') {
+        state.settle_thread(state.current().id);
+    } else if event.mods.shift && event.is_command('p') {
+        state.pin_thread(state.current().id);
+    } else if event.mods.shift
+        && (event.is_command('[')
+            || event.is_command(']')
+            || event.is_command('{')
+            || event.is_command('}'))
+    {
+        let order = state.visible_sidebar_threads();
+        if !order.is_empty() {
+            let i = order
+                .iter()
+                .position(|i| state.threads[*i].id == state.selected_row())
+                .unwrap_or(0);
+            let next = if event.is_command('[') || event.is_command('{') {
+                (i + order.len() - 1) % order.len()
+            } else {
+                (i + 1) % order.len()
+            };
+            state.select_thread(order[next]);
+        }
+    } else if matches!(event.key, Key::Command('1'..='9')) && !event.mods.shift && !event.mods.alt {
+        let Key::Command(n) = event.key else {
+            unreachable!()
+        };
+        if let Some(i) = state
+            .visible_sidebar_threads()
+            .get(n as usize - '1' as usize)
+        {
+            state.select_thread(*i);
+        }
+    } else if event.is_command('n') {
+        if event.mods.alt {
+            state.new_thread_in(None);
+        } else {
+            state.new_thread();
+        }
+        state.current_mut().draft.focused = true;
+    } else if event.mods.shift && event.is_command('o') {
         state.new_thread();
         state.current_mut().draft.focused = true;
     } else if event.is_command('o') {
         projects::pick_folder(state, tx);
     } else if event.is_command('b') {
-        state.sidebar = !state.sidebar;
+        if state.viewport_width < 760.0 {
+            state.compact_sidebar = !state.compact_sidebar;
+        } else {
+            state.sidebar = !state.sidebar;
+        }
+        state.checkpoint();
     } else if event.is_command('l') {
         state.current_mut().draft.focused = true;
     } else if event.is_command('k') {
@@ -135,12 +188,15 @@ fn main() {
         eprintln!("The workspace must be a directory.");
         std::process::exit(2);
     }
-    OPTIONS.set((workspace, demo)).ok();
+    let snapshot = std::env::args().any(|arg| arg == "--snap");
+    OPTIONS.set((workspace, demo, snapshot)).ok();
     rune::App::new(AppSpec {
         fonts: &[include_bytes!("../assets/fonts/InterVariable.ttf")],
         families: ("Inter Variable", "Cascadia Mono, Consolas"),
         min_size: Some((620.0, 480.0)),
-        setup: Some(|state: &mut State, wake| state.setup(wake)),
+        setup: Some(|state: &mut State, wake| {
+            if !OPTIONS.get().expect("startup options").2 { state.setup(wake); }
+        }),
         poll: Some(model::poll),
         on_key: Some(key),
         scenes: &[
@@ -192,6 +248,18 @@ fn main() {
                 state.dark = true;
                 state.thread_menu = true;
             }),
+            ("shelves-expanded", |state| {
+                state.populate_demo();
+                state.shelves = [true; 3];
+            }),
+            ("snooze-menu", |state| {
+                state.populate_demo();
+                state.open_snooze(1);
+            }),
+            ("undo-notice", |state| {
+                state.populate_demo();
+                state.settle_thread(3);
+            }),
             ("projects", |state| {
                 state.populate_demo();
                 state.open_project_menu();
@@ -233,6 +301,8 @@ fn main() {
         ],
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
+    .on_close(|state: &mut State, _| state.checkpoint())
+    .on_quit(|state: &mut State, _| state.checkpoint())
     .titlebar(rune::Titlebar::new(44.0))
     .run();
     backend::shutdown_all();
