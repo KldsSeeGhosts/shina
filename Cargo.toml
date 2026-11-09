@@ -1,6 +1,6 @@
 [package]
 name = "shina"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "A native Rune workspace for the Pi coding agent"
 license = "MIT"
@@ -9,6 +9,11 @@ license = "MIT"
 rune = { git = "https://github.com/anomalyco/rune", rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b", default-features = false, features = ["accessibility", "embedded-fonts", "native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b", features = ["markdown"] }
 serde_json = "1"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+chrono-tz = "0.10"
 
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1,5 +1,8 @@
 use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
+use crate::lifecycle::{
+    self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep, Working,
+};
 use crate::projects::{Project, ProjectId};
 use crate::session::{AgentModel, Catalog, IDLE_TIMEOUT, START_TIMEOUT};
 use rune::{TextEdit, Tx, Waker};
@@ -33,7 +36,7 @@ pub enum Status {
     Ready,
     Running,
     Waiting,
-    Settled,
+    Completed,
     Failed,
 }
 
@@ -43,7 +46,7 @@ impl Status {
             Self::Ready => "Ready",
             Self::Running => "Working",
             Self::Waiting => "Needs you",
-            Self::Settled => "Settled",
+            Self::Completed => "Done",
             Self::Failed => "Error",
         }
     }
@@ -58,7 +61,7 @@ impl Status {
             Self::Waiting => 5,
             Self::Running => 4,
             Self::Ready => 2,
-            Self::Settled => 1,
+            Self::Completed => 1,
         }
     }
 }
@@ -196,13 +199,12 @@ pub struct Thread {
     pub request: Option<Value>,
     pub reply: TextEdit,
     pub session: Option<String>,
-    pub archived: bool,
-    pub unread: bool,
+    pub life: Lifecycle,
+    pub working: Working,
     pub started: Option<Instant>,
     pub elapsed: Option<u64>,
     pub captain: Option<usize>,
     pub captain_home: bool,
-    pub pinned: bool,
     /// Started by another thread through the Shina MCP. Delegated threads cannot delegate.
     pub delegated: bool,
     pub parent: Option<usize>,
@@ -228,9 +230,40 @@ pub struct Thread {
     injection_id: Option<String>,
     task_result: Option<&'static str>,
     completion_notified: bool,
+    forwarded_question: Option<String>,
 }
 
 impl Thread {
+    pub fn pinned(&self) -> bool {
+        self.life.pinned_at.is_some()
+    }
+    pub fn archived(&self) -> bool {
+        self.life.archived_at.is_some()
+    }
+    pub fn unread(&self) -> bool {
+        self.life.unread()
+    }
+    pub fn is_draft(&self) -> bool {
+        !self.captain_home
+            && !self.delegated
+            && !self.archived()
+            && !self.pinned()
+            && !self.life.settled()
+            && self.life.snoozed_at.is_none()
+            && self.status == Status::Ready
+            && self.session.is_none()
+            && self.messages.is_empty()
+            && self.life.latest_user_message_at.is_none()
+            && self.life.last_completed_at.is_none()
+    }
+    pub fn actionable(&self) -> bool {
+        self.request.is_some() || self.status == Status::Waiting || self.status == Status::Failed
+    }
+    pub fn queued(&self) -> bool {
+        self.queued_prompt.is_some()
+            || self.pending_prompt.is_some()
+            || !self.pending_injections.is_empty()
+    }
     pub fn new(id: usize) -> Self {
         Self {
             id,
@@ -259,13 +292,12 @@ impl Thread {
             request: None,
             reply: TextEdit::default(),
             session: None,
-            archived: false,
-            unread: false,
+            life: Lifecycle::new(lifecycle::now()),
+            working: Working::default(),
             started: None,
             elapsed: None,
             captain: None,
             captain_home: false,
-            pinned: false,
             delegated: false,
             parent: None,
             host: None,
@@ -289,6 +321,7 @@ impl Thread {
             injection_id: None,
             task_result: None,
             completion_notified: true,
+            forwarded_question: None,
         }
     }
 
@@ -417,6 +450,7 @@ impl Thread {
         self.draft.replace_text("");
         self.status = Status::Running;
         self.updated = crate::projects::now();
+        self.life.user_sent(lifecycle::now());
         self.started = Some(Instant::now());
         self.elapsed = None;
         self.assistant = None;
@@ -471,6 +505,7 @@ impl Thread {
         match result {
             Ok(()) => {
                 self.request = None;
+                self.forwarded_question = None;
                 self.status = Status::Running;
             }
             Err(error) => self.error = Some(error),
@@ -491,6 +526,7 @@ impl Thread {
         self.status = Status::Ready;
         self.assistant = None;
         self.request = None;
+        self.forwarded_question = None;
         self.initializing = false;
         self.session_started = None;
         self.configuring = false;
@@ -538,7 +574,7 @@ impl Thread {
             || self.phase == "Stopping"
             || !matches!(
                 self.status,
-                Status::Ready | Status::Settled | Status::Running | Status::Waiting
+                Status::Ready | Status::Completed | Status::Running | Status::Waiting
             )
         {
             return false;
@@ -557,6 +593,11 @@ impl Thread {
             return false;
         }
         self.injection_id = Some(format!("{}-{}", self.id, self.serial));
+        let at = lifecycle::now();
+        if self.life.settled() {
+            self.life.unsettle(at, false);
+        }
+        self.life.last_requested_at = Some(at);
         if !self.pending_injections[0].shown {
             self.messages.push(Message {
                 role: "Shina",
@@ -591,6 +632,7 @@ impl Thread {
         self.disconnect();
         self.error = Some(error);
         self.status = Status::Failed;
+        self.life.failed_at = Some(lifecycle::now());
         self.complete_task("failed");
     }
 
@@ -992,6 +1034,7 @@ impl Thread {
                 }
             }
             "agent_start" => {
+                self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
                 self.assistant = None;
                 self.phase = "Waiting for the model".into();
@@ -1000,11 +1043,12 @@ impl Thread {
             }
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
+                self.life.last_completed_at = Some(lifecycle::now());
                 self.request = None;
                 let aborted = record["aborted"] == true;
                 self.finish_run();
                 // A stopped run is idle, not a finished task.
-                if aborted && self.status == Status::Settled {
+                if aborted && self.status == Status::Completed {
                     self.status = Status::Ready;
                 }
                 self.complete_task(if aborted {
@@ -1163,8 +1207,11 @@ impl Thread {
         self.status = if self.error.is_some() {
             Status::Failed
         } else {
-            Status::Settled
+            Status::Completed
         };
+        if self.status == Status::Failed {
+            self.life.failed_at = Some(lifecycle::now());
+        }
         self.elapsed = self
             .started
             .take()
@@ -1207,7 +1254,30 @@ pub struct State {
     pub rename_thread: Option<usize>,
     pub rename_edit: TextEdit,
     pub delete_thread: Option<usize>,
+    pub delete_roots: Vec<usize>,
     pub project_scope: ProjectScope,
+    pub scope_additional: Vec<ProjectId>,
+    pub selected_threads: Vec<usize>,
+    pub selection_anchor: Option<usize>,
+    pub shelves: [bool; 3],
+    pub settled_visible: usize,
+    pub undo: Option<UndoNotice>,
+    pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
+    pub snooze_targets: Vec<usize>,
+    pub custom_snooze_open: bool,
+    pub snooze_edit: TextEdit,
+    pub lifecycle_error: Option<String>,
+    pub auto_settle_days: u32,
+    pub drag_thread: Option<usize>,
+    pub drag_target: Option<(Section, Option<usize>)>,
+    pub drop_rects: std::collections::HashMap<String, [f32; 4]>,
+    pub viewport_height: f32,
+    pub viewport_width: f32,
+    pub sidebar_width: f32,
+    pub sidebar_viewport_height: f32,
+    pub ui_store: Option<crate::store::Store>,
+    last_sweep: u64,
+    last_lifecycle_clock: u64,
     pub project_picker: Option<ProjectPicker>,
     pub activity_full: bool,
     pub show_archive: bool,
@@ -1221,6 +1291,7 @@ pub struct State {
     pub storage_error: Option<String>,
     pub artwork: Arc<crate::visuals::Artwork>,
     pub captain_picker: bool,
+    pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     pub captain_editor: Option<CaptainEditor>,
     pub search_open: bool,
@@ -1237,6 +1308,24 @@ pub struct State {
 }
 
 impl State {
+    /// Headless snapshots read a supplied isolated profile without starting Pi or saving.
+    pub fn load_snapshot(&mut self) {
+        let result = (|| {
+            if let Some(index) = crate::store::load_global(&self.data_dir, None)? {
+                if index["version"] != 3 && index["version"] != 4 {
+                    return Err("Unsupported index version.".into());
+                }
+                self.restore_global(&index)?;
+            }
+            if let Some(ui) = crate::store::load(&self.data_dir.join("ui-state.json"))? {
+                self.restore_ui(&ui)?;
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = result {
+            self.storage_error = Some(error);
+        }
+    }
     pub fn new(workspace: PathBuf, demo: bool) -> Self {
         let workspace = if workspace.as_os_str().is_empty() {
             workspace
@@ -1261,7 +1350,30 @@ impl State {
             rename_thread: None,
             rename_edit: TextEdit::default(),
             delete_thread: None,
+            delete_roots: vec![],
             project_scope: ProjectScope::All,
+            scope_additional: vec![],
+            selected_threads: vec![],
+            selection_anchor: None,
+            shelves: [false; 3],
+            settled_visible: 10,
+            undo: None,
+            snooze_menu: None,
+            snooze_targets: vec![],
+            custom_snooze_open: false,
+            snooze_edit: TextEdit::default(),
+            lifecycle_error: None,
+            auto_settle_days: 3,
+            drag_thread: None,
+            drag_target: None,
+            drop_rects: Default::default(),
+            viewport_height: 720.0,
+            viewport_width: 1280.0,
+            sidebar_width: 232.0,
+            sidebar_viewport_height: 0.0,
+            ui_store: None,
+            last_sweep: 0,
+            last_lifecycle_clock: 0,
             project_picker: None,
             activity_full: false,
             show_archive: false,
@@ -1274,6 +1386,7 @@ impl State {
             storage_error: None,
             artwork,
             captain_picker: false,
+            captain_project: None,
             captains: Captain::defaults(),
             captain_editor: None,
             search_open: false,
@@ -1304,16 +1417,39 @@ impl State {
     pub fn current_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.active]
     }
+    pub fn undo_key(&mut self, event: &rune::KeyEvent, text_field: bool) -> bool {
+        let at = lifecycle::now();
+        let Some(notice) = &mut self.undo else {
+            return false;
+        };
+        if notice.expires <= at {
+            self.undo = None;
+            return false;
+        }
+        if event.is_command('z') && !event.mods.shift && (!text_field || notice.owns_text_key) {
+            self.undo_thread_action();
+            return true;
+        }
+        if !matches!(event.key, rune::Key::Modifier { .. }) {
+            notice.owns_text_key = false;
+        }
+        false
+    }
     pub fn select_thread(&mut self, index: usize) {
         if index >= self.threads.len() {
             return;
         }
         self.active = index;
+        self.selected_threads.clear();
         let id = self.current().id;
         if !self.tabs.contains(&id) {
             self.tabs.push(id);
         }
-        self.current_mut().unread = false;
+        self.current_mut().life.last_visited_at = Some(lifecycle::now());
+        if !self.in_scope(self.current()) {
+            self.project_scope = ProjectScope::All;
+            self.scope_additional.clear();
+        }
         self.checkpoint();
     }
     pub fn close_tab(&mut self, id: usize) {
@@ -1335,8 +1471,7 @@ impl State {
         self.projects.entries.iter().find(|p| Some(p.id) == id)
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
-        self.project(thread.project)
-            .is_some_and(|p| p.captain_thread == Some(thread.id))
+        thread.captain_home && !thread.delegated
     }
     pub fn thread_directory(&self, index: usize) -> Result<PathBuf, String> {
         let thread = self.threads.get(index).ok_or("Thread does not exist.")?;
@@ -1379,32 +1514,238 @@ impl State {
         });
         projects.into_iter().map(|p| p.id).collect()
     }
-    pub fn grouped_threads(&self, project: Option<ProjectId>) -> Vec<usize> {
-        let mut threads: Vec<_> = self
-            .threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.project == project && t.archived == self.show_archive)
-            .collect();
-        threads.sort_by_key(|(_, t)| std::cmp::Reverse((t.pinned, t.updated, t.id)));
-        threads.into_iter().map(|(i, _)| i).collect()
-    }
     pub fn sidebar_threads(&self) -> Vec<usize> {
         let mut threads: Vec<_> = self
             .threads
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                t.archived == self.show_archive && (self.show_archive || !self.is_captain_home(t))
+                t.archived() == self.show_archive && !t.delegated && !self.is_captain_home(t)
             })
-            .filter(|(_, t)| match self.project_scope {
-                ProjectScope::All => true,
-                ProjectScope::Project(id) => t.project == Some(id),
-                ProjectScope::NoProject => t.project.is_none(),
-            })
+            .filter(|(_, t)| self.in_scope(t))
             .collect();
-        threads.sort_by_key(|(_, t)| std::cmp::Reverse((t.pinned, t.updated, t.id)));
+        let at = lifecycle::now();
+        threads.sort_by(|(_, a), (_, b)| {
+            let sa = self.thread_section(a, at);
+            let sb = self.thread_section(b, at);
+            b.is_draft()
+                .cmp(&a.is_draft())
+                .then_with(|| sa.cmp(&sb))
+                .then_with(|| {
+                    lifecycle::compare(
+                        sa,
+                        &a.life,
+                        &b.life,
+                        a.working.returned_at,
+                        b.working.returned_at,
+                    )
+                })
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.machine.cmp(&b.machine))
+        });
         threads.into_iter().map(|(i, _)| i).collect()
+    }
+    pub fn in_scope(&self, t: &Thread) -> bool {
+        match self.project_scope {
+            ProjectScope::All => true,
+            ProjectScope::Project(id) => {
+                t.project == Some(id)
+                    || t.project
+                        .is_some_and(|p| self.scope_additional.contains(&p))
+            }
+            ProjectScope::NoProject => {
+                t.project.is_none()
+                    || t.project
+                        .is_some_and(|p| self.scope_additional.contains(&p))
+            }
+        }
+    }
+    pub fn set_project_scope(&mut self, project: Option<ProjectId>, multi: bool) {
+        let mut choices: Vec<_> = if multi {
+            match self.project_scope {
+                ProjectScope::All => vec![],
+                ProjectScope::NoProject => std::iter::once(None)
+                    .chain(self.scope_additional.iter().copied().map(Some))
+                    .collect(),
+                ProjectScope::Project(id) => std::iter::once(Some(id))
+                    .chain(self.scope_additional.iter().copied().map(Some))
+                    .collect(),
+            }
+        } else {
+            vec![]
+        };
+        if let Some(i) = choices.iter().position(|id| *id == project) {
+            choices.remove(i);
+        } else {
+            choices.push(project);
+        }
+        choices.sort();
+        choices.dedup();
+        self.project_scope = match choices.first() {
+            None => ProjectScope::All,
+            Some(None) => ProjectScope::NoProject,
+            Some(Some(id)) => ProjectScope::Project(*id),
+        };
+        self.scope_additional = choices.into_iter().skip(1).flatten().collect();
+        self.selected_threads.clear();
+        if !multi {
+            self.project_picker = None;
+        }
+        self.checkpoint();
+    }
+    pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
+        let id = self.threads[index].id;
+        if mods.cmd {
+            if let Some(i) = self.selected_threads.iter().position(|t| *t == id) {
+                self.selected_threads.remove(i);
+            } else {
+                self.selected_threads.push(id);
+            }
+        } else if mods.shift {
+            let order = self.visible_sidebar_threads();
+            let start = order
+                .iter()
+                .position(|i| Some(self.threads[*i].id) == self.selection_anchor);
+            let end = order.iter().position(|i| self.threads[*i].id == id);
+            if let (Some(a), Some(b)) = (start, end) {
+                self.selected_threads = order[a.min(b)..=a.max(b)]
+                    .iter()
+                    .map(|i| self.threads[*i].id)
+                    .collect();
+            }
+        } else {
+            self.select_thread(index);
+        }
+        if !mods.shift {
+            self.selection_anchor = Some(id);
+        }
+    }
+    pub fn thread_section(&self, t: &Thread, at: u64) -> Section {
+        if t.machine != "local" {
+            return if t.pinned() {
+                Section::Pinned
+            } else {
+                Section::Active
+            };
+        }
+        lifecycle::section(
+            &t.life,
+            at,
+            t.machine == "local"
+                && (t.working.was_working || t.status == Status::Running && !self.row_attention(t)),
+        )
+    }
+    pub fn row_attention(&self, t: &Thread) -> bool {
+        t.actionable()
+            || self.threads.iter().any(|c| {
+                c.parent == Some(t.id)
+                    && c.request.as_ref().is_some_and(|r| r["method"] == "confirm")
+            })
+    }
+    pub fn row_pending(&self, t: &Thread) -> bool {
+        t.request.is_some()
+            || t.status == Status::Waiting
+            || self.threads.iter().any(|c| {
+                c.parent == Some(t.id)
+                    && c.request.as_ref().is_some_and(|r| r["method"] == "confirm")
+            })
+    }
+    pub fn selected_row(&self) -> usize {
+        self.current().parent.unwrap_or(self.current().id)
+    }
+    pub fn visible_sidebar_threads(&self) -> Vec<usize> {
+        let mut settled = 0;
+        self.sidebar_threads()
+            .into_iter()
+            .filter(|i| {
+                let t = &self.threads[*i];
+                if !self.search.text.is_empty() {
+                    let search = self.search.text.to_lowercase();
+                    return t.title.to_lowercase().contains(&search)
+                        || t.is_draft() && t.draft.text.to_lowercase().contains(&search)
+                        || t.messages
+                            .iter()
+                            .any(|m| m.text.to_lowercase().contains(&search));
+                }
+                let section = self.thread_section(t, lifecycle::now());
+                let shelf = match section {
+                    Section::Working => Some(0),
+                    Section::Snoozed => Some(1),
+                    Section::Settled => Some(2),
+                    _ => None,
+                };
+                if let Some(shelf) = shelf {
+                    if !self.shelves[shelf] {
+                        return t.id == self.selected_row();
+                    }
+                    if shelf == 2 {
+                        settled += 1;
+                        return settled <= self.settled_visible || t.id == self.selected_row();
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+    pub fn drag_pointer(&mut self, id: usize, drag: &rune::Drag) {
+        if drag.cancelled() {
+            self.drag_thread = None;
+            self.drag_target = None;
+            return;
+        }
+        if drag.dx.hypot(drag.dy) >= 6.0 && drag.phase != rune::Phase::Up {
+            self.drag_thread = Some(id);
+        }
+        if self.drag_thread == Some(id) {
+            let [x, y] = drag.window_point();
+            self.drag_target = None;
+            for i in self.visible_sidebar_threads() {
+                let t = &self.threads[i];
+                if t.id == id {
+                    continue;
+                }
+                if let Some([rx, ry, rw, rh]) =
+                    self.drop_rects.get(&format!("thread-{}", t.id)).copied()
+                    && x >= rx
+                    && x <= rx + rw
+                    && y >= ry
+                    && y <= ry + rh
+                {
+                    let section = self.thread_section(t, lifecycle::now());
+                    let before = if y < ry + rh / 2.0 {
+                        Some(t.id)
+                    } else {
+                        self.sidebar_threads()
+                            .into_iter()
+                            .skip_while(|j| *j != i)
+                            .skip(1)
+                            .find(|j| {
+                                self.thread_section(&self.threads[*j], lifecycle::now()) == section
+                            })
+                            .map(|j| self.threads[j].id)
+                    };
+                    self.drag_target = Some((section, before));
+                    break;
+                }
+            }
+            for section in [Section::Pinned, Section::Active, Section::Settled] {
+                if let Some([rx, ry, rw, rh]) =
+                    self.drop_rects.get(&format!("drop-{section:?}")).copied()
+                    && x >= rx
+                    && x <= rx + rw
+                    && y >= ry
+                    && y <= ry + rh
+                {
+                    self.drag_target = Some((section, None));
+                }
+            }
+        }
+        if drag.phase == rune::Phase::Up {
+            if let Some((section, before)) = self.drag_target.take() {
+                self.drop_thread(id, section, before);
+            }
+            self.drag_thread = None;
+        }
     }
     pub fn remove_project(&mut self, id: ProjectId) {
         if let Some(project) = self.projects.entries.iter_mut().find(|p| p.id == id) {
@@ -1438,6 +1779,11 @@ impl State {
         self.checkpoint();
     }
     pub fn request_delete(&mut self, id: usize) {
+        self.delete_roots = if self.selected_threads.contains(&id) {
+            self.selected_threads.clone()
+        } else {
+            vec![id]
+        };
         self.delete_thread = Some(id);
         self.row_menu = None;
         self.thread_menu = false;
@@ -1461,7 +1807,18 @@ impl State {
         let Some(id) = self.delete_thread.take() else {
             return;
         };
-        let ids = self.deletion_ids(id);
+        let roots = if self.delete_roots.is_empty() {
+            vec![id]
+        } else {
+            std::mem::take(&mut self.delete_roots)
+        };
+        let ids: std::collections::HashSet<_> = roots
+            .into_iter()
+            .flat_map(|id| self.deletion_ids(id))
+            .collect();
+        for id in &ids {
+            self.invalidate_undo(*id);
+        }
         let current = self.current().id;
         let mut parents = Vec::new();
         for thread in &mut self.threads {
@@ -1516,24 +1873,347 @@ impl State {
         self.checkpoint();
     }
     pub fn pin_thread(&mut self, id: usize) {
-        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
-            thread.pinned = !thread.pinned;
+        if self
+            .threads
+            .iter()
+            .any(|t| t.id == id && self.is_captain_home(t))
+        {
+            return;
         }
+        let Some(index) = self
+            .threads
+            .iter()
+            .position(|t| t.id == id && t.machine == "local")
+        else {
+            return;
+        };
+        if self.threads[index].pinned() {
+            self.remember(Action::Unpin, index);
+            self.threads[index].life.pinned_at = None;
+            self.threads[index].life.pin_order_key = None;
+        } else {
+            self.invalidate_undo(id);
+            let key = self.first_pin_key(id);
+            self.threads[index].life.pin(lifecycle::now(), Some(key));
+        }
+        self.threads[index].working = Working::default();
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
-        if let Some(index) = self.threads.iter().position(|t| t.id == id) {
-            let previous = self.active;
-            self.active = index;
-            self.archive();
-            if let Some(thread) = self.threads.get(previous)
-                && !thread.archived
-                && previous != index
+        let Some(index) = self
+            .threads
+            .iter()
+            .position(|t| t.id == id && t.machine == "local")
+        else {
+            return;
+        };
+        if self.lifecycle_busy(id) {
+            self.lifecycle_error = Some("Stop this thread and its crew before archiving.".into());
+            return;
+        }
+        if self.threads[index].archived() {
+            self.invalidate_undo(id);
+            self.threads[index].life.archived_at = None;
+        } else {
+            self.remember(Action::Archive, index);
+            self.threads[index].life.archived_at = Some(lifecycle::now());
+            self.threads[index].disconnect();
+            self.tabs.retain(|t| *t != id);
+            self.advance_parked(id);
+        }
+        self.threads[index].working = Working::default();
+        self.checkpoint();
+    }
+    fn first_pin_key(&mut self, except: usize) -> String {
+        let mut pins: Vec<_> = self
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.pinned() && t.id != except)
+            .map(|(i, _)| i)
+            .collect();
+        pins.sort_by(|a, b| {
+            lifecycle::compare(
+                Section::Pinned,
+                &self.threads[*a].life,
+                &self.threads[*b].life,
+                0,
+                0,
+            )
+        });
+        let after = pins
+            .first()
+            .and_then(|i| self.threads[*i].life.pin_order_key.as_deref());
+        if let Some(key) = lifecycle::pin_key_between(None, after) {
+            return key;
+        }
+        let keys = lifecycle::spread_pin_keys(pins.len() + 1);
+        for (index, key) in pins.into_iter().zip(keys.iter().skip(1)) {
+            self.threads[index].life.pin_order_key = Some(key.clone());
+        }
+        keys[0].clone()
+    }
+    pub fn lifecycle_busy(&self, id: usize) -> bool {
+        self.threads.iter().any(|t| {
+            (t.id == id || t.parent == Some(id))
+                && (t.status.busy() || t.request.is_some() || t.configuring || t.queued())
+        })
+    }
+    fn invalidate_undo(&mut self, id: usize) {
+        if let Some(notice) = &mut self.undo {
+            notice.entries.retain(|e| e.id != id);
+        }
+        if self.undo.as_ref().is_some_and(|n| n.entries.is_empty()) {
+            self.undo = None;
+        }
+    }
+    fn remember(&mut self, action: Action, index: usize) {
+        let t = &self.threads[index];
+        UndoNotice::push(
+            &mut self.undo,
+            action,
+            t.id,
+            lifecycle::plan_undo(action, &t.life, &t.draft.text),
+            lifecycle::now(),
+        );
+    }
+    pub fn settle_thread(&mut self, id: usize) {
+        if self
+            .threads
+            .iter()
+            .any(|t| t.id == id && self.is_captain_home(t))
+        {
+            return;
+        }
+        let Some(i) = self
+            .threads
+            .iter()
+            .position(|t| t.id == id && t.machine == "local")
+        else {
+            return;
+        };
+        if self.threads[i].life.settled() {
+            self.invalidate_undo(id);
+            self.threads[i].life.unsettle(lifecycle::now(), true);
+        } else {
+            if self.lifecycle_busy(id) {
+                self.lifecycle_error =
+                    Some("Stop this thread and answer pending requests before settling.".into());
+                return;
+            }
+            self.remember(Action::Settle, i);
+            self.threads[i].life.settle(lifecycle::now());
+            self.threads[i].disconnect();
+            self.advance_parked(id);
+        }
+        self.threads[i].working = Working::default();
+        self.checkpoint();
+    }
+    fn advance_parked(&mut self, id: usize) {
+        if self.current().id != id {
+            return;
+        }
+        let order = self.sidebar_threads();
+        let start = order
+            .iter()
+            .position(|i| self.threads[*i].id == id)
+            .unwrap_or(0);
+        for offset in 1..=order.len() {
+            let i = order[(start + offset) % order.len()];
+            let t = &self.threads[i];
+            if t.id != id
+                && !t.archived()
+                && !matches!(
+                    self.thread_section(t, lifecycle::now()),
+                    Section::Snoozed | Section::Settled
+                )
             {
-                self.active = previous;
+                self.select_thread(i);
+                return;
+            }
+        }
+        self.new_thread_in(self.current().project);
+    }
+    pub fn can_snooze(&self, id: usize) -> bool {
+        self.threads.iter().find(|t| t.id == id).is_some_and(|t| {
+            t.machine == "local"
+                && !self.is_captain_home(t)
+                && !t.archived()
+                && !self.row_pending(t)
+                && !t.queued()
+        })
+    }
+    pub fn open_snooze(&mut self, id: usize) {
+        self.row_menu = None;
+        self.thread_menu = false;
+        self.snooze_menu = Some((id, lifecycle::snooze_choices()));
+        self.snooze_targets = if self.selected_threads.contains(&id) {
+            self.selected_threads.clone()
+        } else {
+            vec![id]
+        };
+        self.custom_snooze_open = false;
+        self.lifecycle_error = None;
+    }
+    pub fn snooze_thread(&mut self, id: usize, until: u64) {
+        if until <= lifecycle::now() || !self.can_snooze(id) {
+            self.lifecycle_error =
+                Some("Choose a future snooze time after answering pending requests.".into());
+            return;
+        }
+        let i = self.threads.iter().position(|t| t.id == id).unwrap();
+        self.remember(Action::Snooze, i);
+        self.threads[i].life.snooze(lifecycle::now(), until);
+        self.threads[i].working = Working::default();
+        self.snooze_menu = None;
+        self.advance_parked(id);
+        self.checkpoint();
+    }
+    pub fn unsnooze_thread(&mut self, id: usize) {
+        self.invalidate_undo(id);
+        if let Some(t) = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == id && t.machine == "local")
+        {
+            t.life.unsnooze(lifecycle::now());
+            t.working = Working::default();
+        }
+        self.checkpoint();
+    }
+    pub fn discard_draft(&mut self, id: usize) {
+        let Some(i) = self.threads.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.remember(Action::Discard, i);
+        self.threads[i].draft.replace_text("");
+        if self.threads[i].messages.is_empty() && self.threads[i].session.is_none() {
+            self.threads[i].life.archived_at = Some(lifecycle::now());
+            self.advance_parked(id);
+        }
+        self.checkpoint();
+    }
+    pub fn undo_thread_action(&mut self) {
+        let at = lifecycle::now();
+        let Some(notice) = self.undo.take().filter(|n| n.expires > at) else {
+            return;
+        };
+        for entry in notice.entries {
+            let Some(i) = self.threads.iter().position(|t| t.id == entry.id) else {
+                continue;
+            };
+            for step in entry.steps {
+                if self.threads[i].machine != "local" {
+                    break;
+                }
+                let t = &mut self.threads[i];
+                match step {
+                    UndoStep::Unsettle => t.life.unsettle(at, true),
+                    UndoStep::Unsnooze => t.life.unsnooze(at),
+                    UndoStep::Pin(key) => t.life.pin(at, key),
+                    UndoStep::Snooze(until) if until > at => t.life.snooze(at, until),
+                    UndoStep::Snooze(_) => {}
+                    UndoStep::Unarchive => t.life.archived_at = None,
+                    UndoStep::RestoreDraft(draft) => {
+                        t.draft.replace_text(&draft);
+                        t.life.archived_at = None;
+                    }
+                }
             }
         }
         self.checkpoint();
+    }
+    pub fn drop_thread(&mut self, id: usize, to: Section, before: Option<usize>) {
+        if self
+            .threads
+            .iter()
+            .any(|t| t.id == id && self.is_captain_home(t))
+        {
+            return;
+        }
+        let Some(i) = self
+            .threads
+            .iter()
+            .position(|t| t.id == id && t.machine == "local")
+        else {
+            return;
+        };
+        let from = self.thread_section(&self.threads[i], lifecycle::now());
+        match lifecycle::plan_drop(from, to) {
+            DropPlan::Pin | DropPlan::ReorderPin => {
+                self.invalidate_undo(id);
+                let mut pins: Vec<_> = self
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.pinned() && t.id != id)
+                    .map(|(i, _)| i)
+                    .collect();
+                pins.sort_by(|a, b| {
+                    lifecycle::compare(
+                        Section::Pinned,
+                        &self.threads[*a].life,
+                        &self.threads[*b].life,
+                        0,
+                        0,
+                    )
+                });
+                let place = before
+                    .and_then(|id| pins.iter().position(|i| self.threads[*i].id == id))
+                    .unwrap_or(pins.len());
+                let a = place
+                    .checked_sub(1)
+                    .and_then(|p| self.threads[pins[p]].life.pin_order_key.as_deref());
+                let b = pins
+                    .get(place)
+                    .and_then(|p| self.threads[*p].life.pin_order_key.as_deref());
+                let usable = (place == 0 || a.is_some()) && (place == pins.len() || b.is_some());
+                let key = usable.then(|| lifecycle::pin_key_between(a, b)).flatten();
+                self.threads[i].life.pin(lifecycle::now(), key.clone());
+                if key.is_none() {
+                    pins.insert(place, i);
+                    for (i, key) in pins.into_iter().zip(lifecycle::spread_pin_keys(
+                        self.threads.iter().filter(|t| t.pinned()).count(),
+                    )) {
+                        self.threads[i].life.pin_order_key = Some(key);
+                    }
+                }
+            }
+            DropPlan::Unpin => self.pin_thread(id),
+            DropPlan::Unsettle | DropPlan::Settle => self.settle_thread(id),
+            DropPlan::Wake => self.unsnooze_thread(id),
+            DropPlan::None => return,
+        }
+        self.threads[i].working = Working::default();
+        self.checkpoint();
+    }
+    /// Called each minute and after run-end events. PR integration can call this same hook.
+    pub fn sweep_lifecycle(&mut self, at: u64) -> bool {
+        self.last_sweep = at;
+        let eligible: Vec<_> = self
+            .threads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                if t.is_draft() || t.machine != "local" {
+                    return None;
+                }
+                t.life
+                    .auto_settle_at(
+                        at,
+                        self.auto_settle_days,
+                        self.lifecycle_busy(t.id),
+                        t.captain_home || t.delegated || self.is_captain_home(t),
+                    )
+                    .map(|stamp| (i, stamp))
+            })
+            .collect();
+        for (i, stamp) in &eligible {
+            self.threads[*i].life.settle(*stamp);
+            self.threads[*i].disconnect();
+            self.threads[*i].working = Working::default();
+        }
+        !eligible.is_empty()
     }
     pub fn choose_project_captain(&mut self, id: ProjectId) {
         if let Some(captain) = self.project(Some(id)).and_then(|p| p.captain) {
@@ -1554,7 +2234,6 @@ impl State {
         let mut thread = Thread::new(self.next_id);
         thread.project = project;
         if let Some(project) = self.project(project) {
-            thread.captain = project.captain;
             thread.machine = project.machine.clone();
         }
         self.threads.push(thread);
@@ -1569,6 +2248,7 @@ impl State {
             ProjectScope::NoProject => project.is_some(),
         } {
             self.project_scope = ProjectScope::All;
+            self.scope_additional.clear();
         }
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
@@ -1579,44 +2259,58 @@ impl State {
         if captain >= self.captains.len() {
             return;
         }
-        let Some(project_id) = self.projects.captain_target.or(self.current().project) else {
-            self.captain_picker = false;
-            return;
-        };
-        let Some(project) = self.project(Some(project_id)) else {
-            return;
-        };
-        let captain = project.captain.unwrap_or(captain);
-        let home = project.captain_thread;
-        let machine = project.machine.clone();
+        let explicit = self.captain_project.take();
+        let project_id =
+            explicit.unwrap_or(self.projects.captain_target.or(self.current().project));
+        let machine = self
+            .project(project_id)
+            .map(|p| p.machine.clone())
+            .unwrap_or_else(|| "local".into());
         if let Some(index) = self
             .threads
             .iter()
-            .position(|thread| Some(thread.id) == home)
+            .enumerate()
+            .filter(|(_, thread)| {
+                thread.captain_home
+                    && thread.captain == Some(captain)
+                    && (explicit.is_none() && self.projects.captain_target.is_none()
+                        || thread.project == project_id)
+            })
+            .min_by_key(|(_, t)| {
+                (
+                    t.archived(),
+                    t.project != project_id,
+                    std::cmp::Reverse(t.id),
+                )
+            })
+            .map(|(i, _)| i)
         {
             self.active = index;
-            self.current_mut().archived = false;
-            self.current_mut().unread = false;
+            self.current_mut().life.archived_at = None;
+            self.current_mut().life.last_visited_at = Some(lifecycle::now());
         } else {
             let mut thread = Thread::new(self.next_id);
             self.next_id += 1;
             thread.title = self.captains[captain].name.clone();
             thread.captain = Some(captain);
             thread.captain_home = true;
-            thread.project = Some(project_id);
+            thread.project = project_id;
             thread.machine = machine;
             self.threads.push(thread);
             self.active = self.threads.len() - 1;
         }
         let home = self.current().id;
-        let project = self
+        let project_id = self.current().project;
+        if let Some(project) = self
             .projects
             .entries
             .iter_mut()
-            .find(|p| p.id == project_id)
-            .unwrap();
-        project.captain = Some(captain);
-        project.captain_thread = Some(home);
+            .find(|p| Some(p.id) == project_id)
+            && project.captain.is_none()
+        {
+            project.captain = Some(captain);
+            project.captain_thread = Some(home);
+        }
         self.show_archive = false;
         self.captain_picker = false;
         self.projects.captain_target = None;
@@ -1628,6 +2322,21 @@ impl State {
     }
 
     pub fn begin_new_captain(&mut self) {
+        let suggested = self
+            .projects
+            .entries
+            .iter()
+            .find(|p| {
+                !p.hidden
+                    && !self
+                        .threads
+                        .iter()
+                        .any(|t| t.captain_home && t.project == Some(p.id))
+            })
+            .map(|p| p.id);
+        if self.captain_project.is_none() {
+            self.captain_project = Some(suggested.or(self.current().project));
+        }
         self.captain_picker = false;
         self.captain_editor = Some(CaptainEditor::new());
     }
@@ -1714,10 +2423,27 @@ impl State {
         self.threads
             .iter()
             .filter(|thread| {
-                thread.project == project && thread.captain == Some(captain) && !thread.archived
+                thread.project == project
+                    && thread.captain == Some(captain)
+                    && !thread.archived()
+                    && (thread.captain_home || thread.delegated)
+                    && (thread.captain_home
+                        || thread
+                            .request
+                            .as_ref()
+                            .is_none_or(|r| r["method"] == "confirm"))
             })
             .map(|thread| thread.status)
             .max_by_key(|status| status.urgency())
+            .unwrap_or(Status::Ready)
+    }
+    pub fn home_status(&self, home: usize) -> Status {
+        self.threads
+            .iter()
+            .filter(|t| !t.archived() && (t.id == home || t.parent == Some(home)))
+            .filter(|t| t.id == home || t.request.as_ref().is_none_or(|r| r["method"] == "confirm"))
+            .map(|t| t.status)
+            .max_by_key(|s| s.urgency())
             .unwrap_or(Status::Ready)
     }
     /// Steps the zoom one notch in (`1`), out (`-1`), or back to 100% (`0`).
@@ -1808,10 +2534,22 @@ impl State {
                 let archived = args["include_archived"] == true;
                 let all = args["all_projects"] == true;
                 let project = self.threads[caller_index].project;
+                let coordinator = if self.threads[caller_index].captain_home {
+                    Some(caller)
+                } else {
+                    self.threads[caller_index].parent
+                };
                 let threads: Vec<Value> = self
                     .threads
                     .iter()
-                    .filter(|t| (archived || !t.archived) && (all || t.project == project))
+                    .filter(|t| {
+                        (archived || !t.archived())
+                            && (all
+                                || match coordinator {
+                                    Some(home) => t.id == home || t.parent == Some(home),
+                                    None => t.project == project && !t.captain_home && !t.delegated,
+                                })
+                    })
                     .map(|t| {
                         json!({
                             "thread_id": t.id,
@@ -1821,7 +2559,7 @@ impl State {
                             "captain": captain_name(self, t.captain),
                             "captain_home": self.is_captain_home(t),
                             "status": status_word(t.status),
-                            "archived": t.archived,
+                            "archived": t.archived(),
                             "delegated": t.delegated,
                             "parent": t.parent,
                             "is_caller": t.id == caller,
@@ -1863,7 +2601,7 @@ impl State {
                             "name": c.name,
                             "role": c.role,
                             "status": status_word(self.project_captain_status(self.threads[caller_index].project, i)),
-                            "assigned": self.project(self.threads[caller_index].project).is_some_and(|p| p.captain == Some(i)),
+                            "assigned": self.threads.iter().any(|t| t.captain_home && t.captain == Some(i)),
                         })
                     })
                     .collect();
@@ -1881,7 +2619,9 @@ impl State {
                     return Err("prompt must describe the task.".into());
                 }
                 let project = self.threads[caller_index].project;
-                let assigned = self.project(project).and_then(|p| p.captain);
+                let assigned = self.threads[caller_index]
+                    .captain
+                    .filter(|_| self.threads[caller_index].captain_home);
                 let captain = match args["captain"]
                     .as_str()
                     .map(str::trim)
@@ -1891,7 +2631,7 @@ impl State {
                         if !assigned
                             .is_some_and(|id| self.captains[id].name.eq_ignore_ascii_case(name))
                         {
-                            return Err("Children inherit their project's captain. Choose a captain on the project first.".into());
+                            return Err("Crew inherits the calling captain. Open that captain's home to delegate with its profile.".into());
                         }
                         assigned
                     }
@@ -1913,7 +2653,7 @@ impl State {
                 thread.delegated = true;
                 thread.parent = Some(caller);
                 thread.arm_task();
-                thread.unread = true;
+                thread.life.mark_unread();
                 thread.enqueue_injection(format!("Shina: task from parent #{caller}\n\n{prompt}"));
                 let id = thread.id;
                 self.threads.push(thread);
@@ -1945,7 +2685,7 @@ impl State {
                     "parent": thread.parent,
                     "captain": captain_name(self, thread.captain),
                     "status": status,
-                    "finished": thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Settled | Status::Failed)),
+                    "finished": thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed)),
                     "phase": thread.phase,
                     "error": thread.error,
                     "latest_reply": reply,
@@ -1968,6 +2708,31 @@ impl State {
                         .map(str::trim)
                         .filter(|m| !m.is_empty())
                         .ok_or("message must contain a correction or follow-up brief.")?;
+                    if let Some(request) = thread.request.as_ref().filter(|r| {
+                        matches!(r["method"].as_str(), Some("input" | "editor" | "select"))
+                    }) {
+                        if request["method"] == "select"
+                            && !request["options"].as_array().is_some_and(|choices| {
+                                choices
+                                    .iter()
+                                    .any(|choice| choice.as_str() == Some(message))
+                            })
+                        {
+                            return Err("Choose one of the crew question's listed options.".into());
+                        }
+                        thread.respond(json!({"value":message}));
+                        if thread.request.is_some() {
+                            return Err(thread
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Could not answer the crew question.".into()));
+                        }
+                        return self.mcp_call(
+                            caller,
+                            "task_status",
+                            &json!({"thread_id":self.threads[index].id}),
+                        );
+                    }
                     if !thread.status.busy() {
                         thread.arm_task();
                         if thread.status == Status::Failed && thread.pi.is_some() {
@@ -2058,7 +2823,6 @@ impl State {
         for (parent, text) in completions {
             if let Some(index) = self.threads.iter().position(|t| t.id == parent) {
                 self.threads[index].enqueue_injection(text);
-                self.threads[index].unread = index != self.active;
                 if self.threads[index].pi.is_none() {
                     self.connect_thread(index);
                 }
@@ -2089,7 +2853,7 @@ impl State {
     }
     pub fn send(&mut self) {
         if self.demo
-            || self.current().archived
+            || self.current().archived()
             || self.current().status.busy()
             || self.current().configuring
             || self.current().draft.text.trim().is_empty()
@@ -2097,6 +2861,8 @@ impl State {
             return;
         }
         self.current_mut().send();
+        let id = self.current().id;
+        self.invalidate_undo(id);
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
@@ -2104,7 +2870,7 @@ impl State {
     }
 
     pub fn retry(&mut self) {
-        if self.demo || self.current().archived || self.current().status.busy() {
+        if self.demo || self.current().archived() || self.current().status.busy() {
             return;
         }
         if self.current().draft.text.trim().is_empty()
@@ -2157,7 +2923,7 @@ impl State {
         let thread = self.current();
         if self.runtime_enabled
             && !self.demo
-            && !thread.archived
+            && !thread.archived()
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
@@ -2193,12 +2959,12 @@ impl State {
             .threads
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.project == Some(id) && !t.archived)
+            .filter(|(_, t)| t.project == Some(id) && !t.archived())
             .max_by_key(|(_, t)| (t.updated, t.id))
             .map(|(i, _)| i)
         {
             self.active = index;
-            self.current_mut().unread = false;
+            self.current_mut().life.last_visited_at = Some(lifecycle::now());
             self.select_thread(index);
         } else {
             self.new_thread_in(Some(id));
@@ -2207,23 +2973,9 @@ impl State {
         self.checkpoint();
         Ok(id)
     }
+    #[cfg(test)]
     pub fn archive(&mut self) {
-        if self.current().status.busy() {
-            return;
-        }
-        let archived = !self.current().archived;
-        self.current_mut().archived = archived;
-        if archived {
-            let id = self.current().id;
-            self.tabs.retain(|&tab| tab != id);
-            self.current_mut().disconnect();
-            if let Some(index) = self.threads.iter().position(|thread| !thread.archived) {
-                self.select_thread(index);
-            } else {
-                self.new_thread();
-            }
-        }
-        self.checkpoint();
+        self.archive_thread(self.current().id);
     }
     pub fn setup(&mut self, wake: Waker) {
         self.wake = wake.clone();
@@ -2252,7 +3004,7 @@ impl State {
     fn load_global(&mut self, wake: Waker) {
         let path = self.data_dir.join("index.json");
         match crate::store::load_global(&self.data_dir, self.launch_project.as_deref()) {
-            Ok(Some(index)) if index["version"] == 3 => {
+            Ok(Some(index)) if index["version"] == 3 || index["version"] == 4 => {
                 if let Err(error) = self.restore_global(&index) {
                     self.storage_error =
                         Some(format!("{error} The index has not been overwritten."));
@@ -2269,6 +3021,21 @@ impl State {
                 return;
             }
         }
+        let ui_path = self.data_dir.join("ui-state.json");
+        match crate::store::load(&ui_path) {
+            Ok(Some(ui)) => {
+                if let Err(error) = self.restore_ui(&ui) {
+                    self.storage_error = Some(error);
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.storage_error = Some(error);
+                return;
+            }
+        }
+        self.ui_store = Some(crate::store::Store::new(ui_path, wake.clone()));
         self.store = Some(crate::store::Store::new(path, wake));
         if let Some(path) = self.launch_project.take()
             && let Err(error) = self.add_project(path)
@@ -2330,6 +3097,17 @@ impl State {
                         return None;
                     }
                     let mut thread = Thread::new(id);
+                    if index["version"] == 4 && record.get("lifecycle").is_none() {
+                        return None;
+                    }
+                    for field in ["renamed", "captainHome", "delegated"] {
+                        if record
+                            .get(field)
+                            .is_some_and(|v| !v.is_null() && !v.is_boolean())
+                        {
+                            return None;
+                        }
+                    }
                     thread.project = if record["project"].is_null() {
                         None
                     } else {
@@ -2357,22 +3135,17 @@ impl State {
                     if let Some(level) = &thread.selected_thinking {
                         thread.thinking = level.clone();
                     }
-                    thread.archived = record["archived"] == true;
-                    thread.unread = record["unread"] == true;
+                    thread.life = Lifecycle::from_record(record).ok()?;
                     thread.captain = if record["captain"].is_null() {
                         None
                     } else {
                         let id = usize::try_from(record["captain"].as_u64()?).ok()?;
-                        if id >= captains.len() || thread.project.is_none() {
+                        if id >= captains.len() {
                             return None;
                         }
                         Some(id)
                     };
                     thread.captain_home = record["captainHome"] == true;
-                    if thread.project.is_none() && thread.captain_home {
-                        return None;
-                    }
-                    thread.pinned = record["pinned"] == true;
                     thread.delegated = record["delegated"] == true;
                     thread.parent = if record["parent"].is_null() {
                         None
@@ -2422,6 +3195,19 @@ impl State {
             )?;
             let next_project = next_counter(&index["nextProjectId"], maximum_project_id)?;
             self.threads = restored;
+            // v0.8 kept home flags but hid all except the project's default. Every
+            // flagged home is now an independent coordinator, with its original id.
+            for thread in &mut self.threads {
+                if thread.captain_home {
+                    thread.life.settled_override = None;
+                    thread.life.settled_at = None;
+                    thread.life.snoozed_at = None;
+                    thread.life.snoozed_until = None;
+                    thread.life.pinned_at = None;
+                    thread.life.pin_order_key = None;
+                    thread.life.auto_settle_disabled_at = Some(thread.life.created_at);
+                }
+            }
             self.captains = captains;
             self.projects.entries = projects;
             self.projects.next_id = next_project;
@@ -2430,7 +3216,7 @@ impl State {
                 .threads
                 .iter()
                 .position(|t| Some(t.id as u64) == index["active"].as_u64())
-                .or_else(|| self.threads.iter().position(|t| !t.archived))
+                .or_else(|| self.threads.iter().position(|t| !t.archived()))
                 .unwrap_or(0);
             if self.threads.is_empty() {
                 self.threads.push(Thread::new(self.next_id));
@@ -2442,7 +3228,7 @@ impl State {
                 .flatten()
                 .filter_map(Value::as_u64)
                 .filter_map(|id| usize::try_from(id).ok())
-                .filter(|id| self.threads.iter().any(|t| t.id == *id && !t.archived))
+                .filter(|id| self.threads.iter().any(|t| t.id == *id && !t.archived()))
                 .collect();
             let mut seen_tabs = std::collections::HashSet::new();
             self.tabs.retain(|id| seen_tabs.insert(*id));
@@ -2453,6 +3239,7 @@ impl State {
             return Err("The saved index has no valid thread list.".into());
         }
         self.dark = index["dark"] == true;
+        self.auto_settle_days = index["autoSettleAfterDays"].as_u64().unwrap_or(3).min(3650) as u32;
         if let Some(zoom) = index["zoom"].as_f64() {
             self.zoom = snap_zoom(zoom as f32);
         }
@@ -2469,6 +3256,65 @@ impl State {
         };
         Ok(())
     }
+    fn ui_snapshot(&self) -> Value {
+        json!({
+            "version":1, "shelves":self.shelves, "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "scope": match self.project_scope { ProjectScope::All => json!("all"),
+                ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
+            "scopeAdditional":self.scope_additional,
+            "drafts":self.threads.iter().map(|t| (t.id.to_string(), json!(t.draft.text))).collect::<serde_json::Map<_,_>>(),
+        })
+    }
+    fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
+        if ui["version"] != 1 {
+            return Err("Unsupported UI state. Existing files have not been overwritten.".into());
+        }
+        self.shelves =
+            serde_json::from_value(ui["shelves"].clone()).map_err(|_| "Invalid shelf state.")?;
+        self.sidebar = ui["sidebar"].as_bool().ok_or("Invalid sidebar state.")?;
+        self.sidebar_width = ui
+            .get("sidebarWidth")
+            .map(|v| {
+                v.as_f64()
+                    .filter(|n| n.is_finite())
+                    .map(|n| n.clamp(200.0, 400.0) as f32)
+                    .ok_or("Invalid sidebar width.")
+            })
+            .transpose()?
+            .unwrap_or(232.0);
+        self.project_scope = match ui["scope"].as_str() {
+            Some("all") => ProjectScope::All,
+            Some("none") => ProjectScope::NoProject,
+            _ => ProjectScope::Project(
+                ui["scope"]
+                    .as_u64()
+                    .and_then(|id| usize::try_from(id).ok())
+                    .ok_or("Invalid project scope.")?,
+            ),
+        };
+        self.scope_additional = serde_json::from_value(ui["scopeAdditional"].clone())
+            .map_err(|_| "Invalid project scopes.")?;
+        if let ProjectScope::Project(id) = self.project_scope
+            && self.project(Some(id)).is_none()
+            && self
+                .scope_additional
+                .iter()
+                .all(|id| self.project(Some(*id)).is_none())
+        {
+            self.project_scope = ProjectScope::All;
+        }
+        for (id, draft) in ui["drafts"].as_object().ok_or("Invalid saved drafts.")? {
+            let draft = draft.as_str().ok_or("Invalid draft text.")?;
+            if let Some(t) = id
+                .parse::<usize>()
+                .ok()
+                .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+            {
+                t.draft.replace_text(draft);
+            }
+        }
+        Ok(())
+    }
     pub fn checkpoint(&mut self) {
         if self.demo {
             return;
@@ -2477,24 +3323,24 @@ impl State {
         if let Some(store) = &mut self.store {
             store.save(snapshot);
         }
+        let ui = self.ui_snapshot();
+        if let Some(store) = &mut self.ui_store {
+            store.save(ui);
+        }
     }
     fn snapshot(&self) -> Value {
         json!({
-            "version":3, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
+            "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
-            "projectScope":match self.project_scope {
-                ProjectScope::All => json!("all"),
-                ProjectScope::NoProject => json!("none"),
-                ProjectScope::Project(id) => json!(id),
-            },
+            "autoSettleAfterDays": self.auto_settle_days,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "threads":self.threads.iter().map(|thread|json!({
-                "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "archived":thread.archived,
-                "captain":thread.captain, "captainHome":thread.captain_home, "pinned":thread.pinned, "delegated":thread.delegated,
+                "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
+                "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
-                "project":thread.project, "machine":thread.machine, "updated":thread.updated, "unread":thread.unread,
+                "project":thread.project, "machine":thread.machine, "updated":thread.updated,
                 "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
             })).collect::<Vec<_>>()
         })
@@ -2505,7 +3351,7 @@ impl State {
         let mut thread = Thread::new(1);
         thread.title = "Fix the reconnect listener".into();
         thread.captain = Some(0);
-        thread.status = Status::Settled;
+        thread.status = Status::Completed;
         thread.model = DEFAULT_MODEL.into();
         thread.thinking = "medium".into();
         thread.elapsed = Some(42);
@@ -2590,15 +3436,15 @@ impl State {
         self.threads.push(thread);
         for (id, title, status) in [
             (2, "Review sidebar keys", Status::Running),
-            (3, "Reduce cold-start work", Status::Settled),
-            (4, "Add a native file picker", Status::Settled),
-            (5, "Plan the Pi session adapter", Status::Settled),
+            (3, "Reduce cold-start work", Status::Completed),
+            (4, "Add a native file picker", Status::Completed),
+            (5, "Plan the Pi session adapter", Status::Completed),
             (6, "Audit the Markdown renderer", Status::Ready),
         ] {
             let mut thread = Thread::new(id);
             thread.title = title.into();
             thread.status = status;
-            thread.pinned = id == 3;
+            thread.life.pinned_at = (id == 3).then_some(lifecycle::now());
             if id == 2 {
                 thread.captain = Some(0);
             }
@@ -2608,7 +3454,7 @@ impl State {
         for (id, captain, status) in [
             (7, 0, Status::Ready),
             (8, 1, Status::Waiting),
-            (9, 2, Status::Settled),
+            (9, 2, Status::Completed),
             (10, 3, Status::Ready),
         ] {
             let mut thread = Thread::new(id);
@@ -2645,7 +3491,22 @@ impl State {
             thread.updated = crate::projects::now().saturating_sub(thread.id as u64 * 60);
         }
         self.threads[9].title = "Plan a weekend tool".into();
-        self.threads[1].unread = true;
+        self.threads[1].life.last_completed_at = Some(lifecycle::now());
+        self.threads[1].life.last_visited_at = Some(0);
+        for t in &mut self.threads {
+            t.life.created_at = t.updated.saturating_mul(1000);
+            t.life.updated_at = t.life.created_at;
+            if !t.captain_home {
+                t.life.latest_user_message_at = Some(t.life.created_at);
+            }
+        }
+        self.threads[2].life.pin_order_key = Some("n".into());
+        self.threads[3]
+            .life
+            .snooze(lifecycle::now(), lifecycle::now() + 10_800_000);
+        self.threads[4].life.settle(lifecycle::now() - 86_400_000);
+        self.shelves = [false; 3];
+        self.undo = None;
         self.tabs = vec![1, 3, 10];
     }
 }
@@ -2661,7 +3522,8 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         tx.wake_after(remaining);
     }
     changed |= state.prewarm_current();
-    if !state.demo
+    if state.runtime_enabled
+        && !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
     {
         while let Some(request) = server.next_request() {
@@ -2683,6 +3545,8 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    let mut run_ended = false;
+    let mut crew_questions = Vec::new();
     for (index, thread) in state.threads.iter_mut().enumerate() {
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for _ in 0..256 {
@@ -2690,22 +3554,45 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             let Some(event) = event else { break };
             changed = true;
             thread.updated = crate::projects::now();
+            thread.life.updated_at = lifecycle::now();
             match event {
                 Event::Record(record) => {
                     let settled = record["type"] == "agent_settled";
+                    if record["type"] == "extension_ui_request"
+                        && matches!(
+                            record["method"].as_str(),
+                            Some("input" | "editor" | "select")
+                        )
+                        && let Some(parent) = thread.parent
+                    {
+                        let token = record["id"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| record.to_string());
+                        if thread.forwarded_question.as_deref() != Some(token.as_str()) {
+                            thread.forwarded_question = Some(token);
+                            crew_questions.push((parent, format!(
+                            "Shina: crew #{} asks a question.\n{}\nAnswer with mcp__shina__task_send using thread_id {} and message containing your answer. For select, use one listed option exactly. Approval requests still require the user.",
+                            thread.id, record, thread.id
+                            )));
+                        }
+                    }
+                    run_ended |= settled;
                     thread.apply(record);
                     if settled {
                         thread.command("get_state", json!({}));
                     }
-                    if index != state.active {
-                        thread.unread = true;
+                    if index == state.active {
+                        thread.life.last_visited_at = Some(lifecycle::now());
                     }
                 }
                 Event::Error(error) => {
+                    run_ended = true;
                     thread.fail_session(error);
                 }
                 Event::Diagnostic(diagnostic) => thread.diagnostics.push(diagnostic),
                 Event::Exited => {
+                    run_ended = true;
                     thread.fail_session(
                         "Pi stopped unexpectedly. Retry to resume the saved conversation.".into(),
                     );
@@ -2739,9 +3626,88 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             tx.wake_after(remaining);
         }
     }
+    for (parent, question) in crew_questions {
+        if let Some(i) = state.threads.iter().position(|t| t.id == parent) {
+            state.threads[i].enqueue_injection(question);
+            if state.threads[i].pi.is_none() {
+                state.connect_thread(i);
+            }
+        }
+    }
     changed |= state.poll_tasks(Instant::now());
+    let at = lifecycle::now();
+    let attention: Vec<_> = state
+        .threads
+        .iter()
+        .map(|t| state.row_attention(t))
+        .collect();
+    let early_wake: Vec<_> = state
+        .threads
+        .iter()
+        .map(|t| {
+            state.row_pending(t)
+                || t.life
+                    .failed_at
+                    .is_some_and(|failed| failed > t.life.snoozed_at.unwrap_or(u64::MAX))
+        })
+        .collect();
+    for (i, t) in state.threads.iter_mut().enumerate() {
+        if t.life
+            .snoozed_until
+            .is_some_and(|wake| wake > state.last_lifecycle_clock && wake <= at)
+        {
+            changed = true;
+        }
+        let previous = t.working.was_working;
+        if t.life.snoozed(at) && early_wake[i] {
+            // Store the early edge once. Answering the request must not re-snooze it
+            // or make the scheduled wake display a second Woke notification.
+            t.life.last_snooze_wake_at = Some(at);
+            changed = true;
+        }
+        let skip =
+            attention[i] || t.pinned() || t.life.settled() || t.life.snoozed(at) || t.archived();
+        let working = t.status == Status::Running && t.machine == "local";
+        t.working.observe(at, working, skip);
+        changed |= previous != t.working.was_working;
+        if let Some(deadline) = t.working.deadline {
+            tx.wake_after(Duration::from_millis(deadline.saturating_sub(at)));
+        }
+        if let Some(wake) = t.life.snoozed_until.filter(|wake| *wake > at) {
+            tx.wake_after(Duration::from_millis(wake - at));
+        }
+        if i == state.active && t.life.woke(at) {
+            t.life.last_visited_at = Some(at);
+            changed = true;
+        }
+    }
+    state.last_lifecycle_clock = at;
+    if run_ended || at.saturating_sub(state.last_sweep) >= 60000 {
+        state.sweep_lifecycle(at);
+        // The minute clock also repaints wake countdowns and row ages.
+        changed = true;
+    }
+    tx.wake_after(Duration::from_millis(
+        60000 - at.saturating_sub(state.last_sweep).min(60000),
+    ));
+    if let Some(notice) = &state.undo {
+        if notice.expires <= at {
+            state.undo = None;
+            changed = true;
+        } else {
+            tx.wake_after(Duration::from_millis(notice.expires - at));
+        }
+    }
     if let Some(error) = state
         .store
+        .as_ref()
+        .and_then(|store| store.errors.try_recv().ok())
+    {
+        state.storage_error = Some(error);
+        changed = true;
+    }
+    if let Some(error) = state
+        .ui_store
         .as_ref()
         .and_then(|store| store.errors.try_recv().ok())
     {
@@ -2797,7 +3763,7 @@ fn status_word(status: Status) -> &'static str {
         Status::Running => "working",
         Status::Waiting => "needs input",
         Status::Failed => "failed",
-        Status::Settled => "done",
+        Status::Completed => "done",
     }
 }
 
@@ -2838,6 +3804,292 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_captain_homes_restore_without_demoting_or_settling_and_keep_their_crew() {
+        let mut old = State::new(".".into(), false);
+        for captain in 0..4 {
+            old.open_captain(captain);
+        }
+        let homes: Vec<_> = old
+            .threads
+            .iter()
+            .filter(|t| t.captain_home)
+            .map(|t| t.id)
+            .collect();
+        for id in homes {
+            let home = old.threads.iter_mut().find(|t| t.id == id).unwrap();
+            home.session = Some(format!("original-home-{id}.jsonl"));
+            let mut crew = Thread::new(old.next_id);
+            old.next_id += 1;
+            crew.project = home.project;
+            crew.captain = home.captain;
+            crew.parent = Some(id);
+            crew.delegated = true;
+            crew.session = Some(format!("original-crew-{id}.jsonl"));
+            old.threads.push(crew);
+        }
+        let mut index = old.snapshot();
+        index["version"] = 3.into();
+        for t in index["threads"].as_array_mut().unwrap() {
+            t.as_object_mut().unwrap().remove("lifecycle");
+            t["pinned"] = true.into();
+            t["unread"] = true.into();
+        }
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&index).unwrap();
+        assert_eq!(restored.threads.len(), old.threads.len());
+        assert_eq!(
+            restored.threads.iter().filter(|t| t.captain_home).count(),
+            4
+        );
+        for (before, after) in old.threads.iter().zip(&restored.threads) {
+            assert_eq!(
+                (before.id, &before.session, before.parent),
+                (after.id, &after.session, after.parent)
+            );
+            if after.captain_home {
+                assert!(!after.life.settled());
+                assert!(
+                    !restored.sidebar_threads().contains(
+                        &restored
+                            .threads
+                            .iter()
+                            .position(|t| t.id == after.id)
+                            .unwrap()
+                    )
+                );
+                assert!(!after.pinned());
+            }
+        }
+        restored.search.replace_text("Pip");
+        assert!(restored.visible_sidebar_threads().is_empty());
+        restored.sweep_lifecycle(lifecycle::now() + 100 * 86_400_000);
+        assert!(
+            restored
+                .threads
+                .iter()
+                .filter(|t| t.captain_home)
+                .all(|t| !t.life.settled())
+        );
+        // No-project homes are valid entities, too.
+        restored.captain_project = Some(None);
+        restored.open_captain(0);
+        assert!(restored.current().project.is_none());
+        let mut again = State::new(PathBuf::new(), false);
+        again.restore_global(&restored.snapshot()).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_refusals_undo_invalidation_expiry_and_text_focus() {
+        let mut state = State::new(".".into(), false);
+        state.pin_thread(1);
+        let key = state.current().life.pin_order_key.clone();
+        state.settle_thread(1);
+        assert!(state.threads[0].life.settled());
+        assert_ne!(state.current().id, 1);
+        state.undo_thread_action();
+        assert!(state.threads[0].pinned());
+        assert_eq!(state.threads[0].life.pin_order_key, key);
+        assert_eq!(state.threads[0].life.settled_override, None); // re-pin clears the override
+        state.pin_thread(1);
+        state.pin_thread(1);
+        assert!(
+            state.undo.is_none(),
+            "a new pin invalidates an old unpin undo"
+        );
+        state.threads[0].status = Status::Running;
+        state.settle_thread(1);
+        assert!(!state.threads[0].life.settled());
+        state.threads[0].status = Status::Ready;
+        state.pin_thread(1);
+        let ctrl_z = rune::KeyEvent {
+            key: rune::Key::Command('z'),
+            mods: rune::Mods {
+                cmd: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        assert!(
+            state.undo_key(&ctrl_z, true),
+            "fresh notice owns undo inside a field"
+        );
+        state.pin_thread(1);
+        state.undo_key(
+            &rune::KeyEvent {
+                key: rune::Key::Text("a".into()),
+                mods: Default::default(),
+            },
+            true,
+        );
+        assert!(
+            !state.undo_key(&ctrl_z, true),
+            "typing gives undo back to the text field"
+        );
+        state.undo.as_mut().unwrap().expires = 0;
+        assert!(!state.undo_key(&ctrl_z, false));
+        assert!(state.undo.is_none());
+    }
+
+    #[test]
+    fn undo_restores_unpin_snooze_archive_and_discarded_draft() {
+        let mut state = State::new(".".into(), false);
+        let at = lifecycle::now();
+        state.current_mut().life.pin(at, Some("nb".into()));
+        state.current_mut().life.snooze(at, at + 3_600_000);
+        state.pin_thread(1);
+        state.undo_thread_action();
+        assert_eq!(state.threads[0].life.pin_order_key.as_deref(), Some("nb"));
+        assert_eq!(state.threads[0].life.snoozed_until, Some(at + 3_600_000));
+        state.archive_thread(1);
+        assert!(state.threads[0].archived());
+        state.undo_thread_action();
+        assert!(!state.threads[0].archived());
+        assert_eq!(state.threads[0].life.pin_order_key.as_deref(), Some("nb"));
+        let draft = state.current().id;
+        state.current_mut().draft.replace_text("Keep the draft");
+        state.discard_draft(draft);
+        state.undo_thread_action();
+        assert_eq!(
+            state
+                .threads
+                .iter()
+                .find(|t| t.id == draft)
+                .unwrap()
+                .draft
+                .text,
+            "Keep the draft"
+        );
+    }
+
+    #[test]
+    fn early_snooze_wake_rolls_up_approval_but_not_crew_questions() {
+        let mut state = State::new(".".into(), false);
+        let mut crew = Thread::new(2);
+        crew.delegated = true;
+        crew.parent = Some(1);
+        crew.request = Some(json!({"method":"input"}));
+        state.threads.push(crew);
+        assert!(!state.row_attention(&state.threads[0]));
+        state.threads[1].request = Some(json!({"method":"confirm"}));
+        assert!(state.row_attention(&state.threads[0]));
+        state.threads[0].life.snooze(1, lifecycle::now() + 100000);
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert!(!state.threads[0].life.snoozed(lifecycle::now()));
+        assert!(state.threads[0].life.last_snooze_wake_at.is_some());
+    }
+    #[test]
+    fn crew_questions_reach_the_coordinator_once_and_task_send_answers_without_approving() {
+        let mut state = State::new(".".into(), false);
+        let (parent_commands, _parent_events) = fake_pi(&mut state.threads[0], Status::Ready);
+        let (index, child_commands, events) = child(&mut state);
+        let request = json!({"type":"extension_ui_request","id":"question","method":"select","title":"Which file?","options":["a.rs","b.rs"]});
+        events.send(Event::Record(request.clone())).unwrap();
+        events.send(Event::Record(request)).unwrap();
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.threads[0].pending_injections.len(), 1);
+        assert!(
+            parent_commands.try_recv().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains("crew #2 asks")
+        );
+        assert!(!state.row_pending(&state.threads[0]));
+        assert!(
+            state
+                .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"invalid"}))
+                .is_err()
+        );
+        state
+            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"b.rs"}))
+            .unwrap();
+        let response = child_commands.try_recv().unwrap();
+        assert_eq!(response["type"], "extension_ui_response");
+        assert_eq!(response["value"], "b.rs");
+        assert!(state.threads[index].request.is_none());
+        state.threads[index].apply(json!({"type":"extension_ui_request","id":"approval","method":"confirm","title":"Run tool?"}));
+        state
+            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"yes"}))
+            .unwrap();
+        assert!(
+            state.threads[index].request.is_some(),
+            "a coordinator cannot approve for the user"
+        );
+        assert!(
+            child_commands
+                .try_iter()
+                .all(|r| r["type"] != "extension_ui_response")
+        );
+    }
+
+    #[test]
+    fn ui_state_is_separate_and_corrupt_lifecycle_never_enables_saving() {
+        let mut state = State::new(".".into(), false);
+        state.shelves = [true, false, true];
+        state.sidebar = false;
+        state
+            .current_mut()
+            .draft
+            .replace_text("Keep this unsent draft");
+        state.set_project_scope(Some(1), false);
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&state.snapshot()).unwrap();
+        restored.restore_ui(&state.ui_snapshot()).unwrap();
+        assert_eq!(restored.current().draft.text, "Keep this unsent draft");
+        assert_eq!(restored.shelves, [true, false, true]);
+        assert!(!restored.sidebar);
+        assert!(state.snapshot().get("projectScope").is_none());
+        let mut damaged = state.snapshot();
+        damaged["threads"][0]["lifecycle"]["pinnedAt"] = "bad".into();
+        let path = state.data_dir.join("index.json");
+        std::fs::write(&path, damaged.to_string()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        state.launch_project = None;
+        state.load_global(Arc::new(|| {}));
+        assert!(state.storage_error.is_some());
+        assert!(state.store.is_none());
+        state.checkpoint();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    #[test]
+    fn multi_project_scope_persists_and_opening_a_hidden_thread_widens_it() {
+        let mut state = State::new(".".into(), false);
+        state
+            .projects
+            .entries
+            .push(Project::new(2, state.data_dir.join("other-project")));
+        state.new_thread_in(Some(2));
+        state.new_thread_in(None);
+        state.set_project_scope(Some(1), false);
+        state.set_project_scope(Some(2), true);
+        assert_eq!(state.sidebar_threads().len(), 2);
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&state.snapshot()).unwrap();
+        restored.restore_ui(&state.ui_snapshot()).unwrap();
+        assert_eq!(restored.sidebar_threads().len(), 2);
+        restored.select_thread(2);
+        assert_eq!(restored.project_scope, ProjectScope::All);
+        assert!(restored.scope_additional.is_empty());
+        for (i, t) in restored.threads.iter_mut().enumerate() {
+            t.life.created_at = (3 - i) as u64;
+        }
+        restored.click_thread(
+            0,
+            rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        );
+        restored.click_thread(
+            1,
+            rune::Mods {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(restored.selected_threads.len(), 2);
+    }
 
     fn fake_pi(
         thread: &mut Thread,
@@ -2881,7 +4133,7 @@ mod tests {
     fn simultaneous_completions_are_delivered_exactly_once_to_idle_or_busy_parents() {
         for status in [
             Status::Ready,
-            Status::Settled,
+            Status::Completed,
             Status::Running,
             Status::Waiting,
         ] {
@@ -3322,7 +4574,7 @@ mod tests {
         thread.apply(json!({"type":"agent_end"}));
         assert_eq!(thread.status, Status::Running);
         thread.apply(json!({"type":"agent_settled","aborted":false}));
-        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.status, Status::Completed);
     }
     #[test]
     fn final_message_replaces_deltas_without_duplicating_text() {
@@ -3340,21 +4592,28 @@ mod tests {
         state.new_thread();
         state.archive();
         assert_eq!(state.current().draft.text, "Keep this");
-        assert!(state.threads[1].archived);
+        assert!(state.threads[1].archived());
     }
     #[test]
     fn captain_portrait_follows_the_most_urgent_thread() {
         let mut state = State::new(PathBuf::from("."), false);
         state.open_captain(0);
-        state.current_mut().status = Status::Settled;
+        let home = state.current().id;
+        state.current_mut().status = Status::Completed;
         state.new_thread();
+        state.current_mut().captain = Some(0);
+        state.current_mut().delegated = true;
+        state.current_mut().parent = Some(home);
         state.current_mut().status = Status::Running;
         state.new_thread();
+        state.current_mut().captain = Some(0);
+        state.current_mut().delegated = true;
+        state.current_mut().parent = Some(home);
         state.current_mut().status = Status::Waiting;
         assert_eq!(state.captain_status(0), Status::Waiting);
         state.current_mut().status = Status::Failed;
         assert_eq!(state.captain_status(0), Status::Failed);
-        state.current_mut().archived = true;
+        state.current_mut().life.archived_at = Some(1);
         assert_eq!(state.captain_status(0), Status::Running);
         assert_eq!(state.captain_status(1), Status::Ready);
     }
@@ -3672,7 +4931,7 @@ mod tests {
         thread.error = Some("Temporary provider error".into());
         thread.apply(json!({"type":"auto_retry_end","success":true}));
         thread.apply(json!({"type":"agent_settled","aborted":false}));
-        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.status, Status::Completed);
         assert!(thread.error.is_none());
     }
     #[test]
@@ -3847,16 +5106,16 @@ mod tests {
             role: "Pi",
             text: "Previous answer".into(),
         });
-        thread.status = Status::Settled;
+        thread.status = Status::Completed;
         let idle = thread.last_activity + IDLE_TIMEOUT;
         thread.status = Status::Running;
         assert!(!thread.reclaim_idle(idle), "never reclaim work");
         thread.status = Status::Waiting;
         assert!(!thread.reclaim_idle(idle), "never reclaim a dialog");
-        thread.status = Status::Settled;
+        thread.status = Status::Completed;
         assert!(thread.reclaim_idle(idle));
         assert!(thread.pi.is_none());
-        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.status, Status::Completed);
         assert_eq!(thread.session.as_deref(), Some("saved.jsonl"));
         assert_eq!(thread.messages.len(), 1);
         thread.draft.replace_text("Continue");
@@ -4040,7 +5299,11 @@ mod tests {
         state.new_thread();
         state.current_mut().draft.replace_text("Crew draft");
         let crew_id = state.current().id;
-        assert_eq!(state.current().captain, Some(4));
+        assert_eq!(
+            state.current().captain,
+            None,
+            "New thread creates a lone conversation"
+        );
         state.edit_captain(4);
         state
             .captain_editor
@@ -4190,7 +5453,7 @@ mod tests {
                 );
                 assert_eq!(parent.project, child.project);
                 assert_eq!(parent.title, "Original title");
-                assert!(child.pinned && child.archived && child.delegated);
+                assert!(child.pinned() && child.archived() && child.delegated);
                 assert_eq!(
                     parent.selected_model,
                     Some(("cpa".into(), "saved-model".into()))
@@ -4212,7 +5475,7 @@ mod tests {
                         .iter()
                         .filter(|t| t.project == Some(project.id) && state.is_captain_home(t))
                         .count(),
-                    1
+                    2
                 );
             }
             state.checkpoint();
@@ -4221,7 +5484,7 @@ mod tests {
             crate::store::load(&directory.join("index.json"))
                 .unwrap()
                 .unwrap()["version"],
-            3
+            4
         );
         {
             let mut restored = State::new(PathBuf::new(), false);
@@ -4283,15 +5546,15 @@ mod tests {
     }
 
     #[test]
-    fn captains_are_unique_per_project_and_mcp_lists_the_callers_project() {
+    fn captains_share_projects_and_mcp_lists_only_the_callers_crew() {
         let mut state = State::new(".".into(), false);
         state.open_captain(0);
         let first = state.current().id;
         state.open_captain(2);
-        assert_eq!(
+        assert_ne!(
             state.current().id,
             first,
-            "a second persona cannot create another coordinator"
+            "a second persona has an independent coordinator"
         );
         let b = state.add_project(std::env::temp_dir()).unwrap();
         state.open_captain(1);
@@ -4301,11 +5564,12 @@ mod tests {
         state.new_thread_in(None);
         let scratch = state.current().id;
         state.open_captain(3);
-        assert_eq!(state.current().id, scratch);
-        assert!(state.current().captain.is_none());
+        assert_ne!(state.current().id, scratch);
+        assert!(state.current().project.is_none());
+        assert!(state.current().captain_home);
         // Active UI project must not affect the authenticated caller's scope.
         let list = state.mcp_call(first, "list_threads", &json!({})).unwrap();
-        assert_eq!(list["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(list["threads"].as_array().unwrap().len(), 1);
         assert!(
             list["threads"]
                 .as_array()
@@ -4347,11 +5611,17 @@ mod tests {
     fn sidebar_is_pinned_then_recent_and_scopes_without_project_groups() {
         let mut state = State::new(".".into(), false);
         state.threads[0].updated = 10;
+        state.threads[0].life.created_at = 10000;
         state.new_thread();
         state.current_mut().updated = 30;
+        state.current_mut().life.created_at = 30000;
         state.new_thread_in(None);
         state.current_mut().updated = 20;
-        state.current_mut().pinned = true;
+        state.current_mut().life.created_at = 20000;
+        state.current_mut().life.pinned_at = Some(1);
+        for t in &mut state.threads {
+            t.life.latest_user_message_at = Some(t.life.created_at);
+        }
         let ids = |s: &State| {
             s.sidebar_threads()
                 .iter()
@@ -4363,7 +5633,7 @@ mod tests {
         assert_eq!(ids(&state), vec![2, 1]);
         state.project_scope = ProjectScope::NoProject;
         assert_eq!(ids(&state), vec![3]);
-        state.current_mut().archived = true;
+        state.current_mut().life.archived_at = Some(1);
         assert!(ids(&state).is_empty());
         state.show_archive = true;
         assert_eq!(ids(&state), vec![3]);
@@ -4493,7 +5763,7 @@ mod tests {
             Arc::new(|| {}),
             Some(profile.prompt()),
         );
-        receive_until(&mut thread, |t| t.status == Status::Settled);
+        receive_until(&mut thread, |t| t.status == Status::Completed);
         assert_eq!(thread.model_provider, "cpa");
         assert_eq!(
             thread.messages.last().unwrap().text.trim(),
@@ -4552,7 +5822,7 @@ mod tests {
                 );
             }
         };
-        pump(&mut state, &|s| s.threads[0].status == Status::Settled);
+        pump(&mut state, &|s| s.threads[0].status == Status::Completed);
         let thread = &state.threads[0];
         assert!(
             thread
@@ -4674,9 +5944,9 @@ mod tests {
                     thread.diagnostics
                 );
             }
-            saw_idle_parent |= state.threads[0].status == Status::Settled
+            saw_idle_parent |= state.threads[0].status == Status::Completed
                 && !state.threads[0].messages.iter().any(|m| m.role == "Shina");
-            let finished = state.threads[0].status == Status::Settled
+            let finished = state.threads[0].status == Status::Completed
                 && state.threads[0]
                     .messages
                     .iter()
@@ -4766,7 +6036,7 @@ mod tests {
         });
         thread = crate::ui::tests::verify_tool_rows(thread);
         receive_until(&mut thread, |t| {
-            t.status == Status::Settled && t.session.is_some()
+            t.status == Status::Completed && t.session.is_some()
         });
         assert_eq!(fs::read_to_string(&fixture).unwrap(), "answer=42\n");
         assert!(
