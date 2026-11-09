@@ -17,6 +17,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 5 | 8.1 | 8.7 | 8.1 (Capy 7.9) | 3 of 3 approve |
 | 6 | 8.1 | 8.6 | 8.3 (Capy 7.8) | 3 of 3 approve |
 | 7 | 8.0 | 8.6 | 7.7 (Capy 7.7) | 3 of 3 approve |
+| 8 | 8.1 | 8.8 | 8.0 (Capy 8.1) | 3 of 3 approve |
 
 ## Round 1
 
@@ -95,3 +96,16 @@ Shipped in round 7: one status mark per captain row; dot, ring, and square badge
 | **Average** | 6.2 | 7.8 | **8.0** | 8.6 | 7.7 / **7.7** / 7.7 | 3 of 3 |
 
 Crew art was unchanged this round. Judges asked for larger badges whose shapes read at 1x, one status vocabulary across badges, chips, and thread rows, and a captain home whose status agrees with the sidebar.
+
+Shipped in round 8: a single top strip for sidebar header, tabs, actions, and caption buttons; one status vocabulary in badges, chips, rows, and headers; badges at every avatar size; a captain home showing the captain's overall status; brighter dark status text; a demo composer placeholder; a clearer selected portrait; a whole-window review brief with native renders and corner crops.
+
+## Round 8 (`r8/`)
+
+| Judge | Baseline | Round 7 | Round 8 | Capy | Crew art r7 / r8 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.0 | 6.7 | 7.4 | 8.1 | 7.3 / 7.3 / 7.0 | yes |
+| GPT 6.1 Sol | 6.3 | 7.7 | 8.2 | 8.8 | 8.0 / 8.0 / 8.1 | yes |
+| Gemini 4 Argon | 6.3 | 7.9 | 8.7 | 9.4 | 8.8 / 8.8 / 9.2 | yes |
+| **Average** | 5.9 | 7.4 | **8.1** | 8.8 | 8.0 / **8.0** / 8.1 | 3 of 3 |
+
+First round under the whole-window brief. Window chrome & alignment, round 7 to round 8: Sonnet 4.5 to 7.2, GPT 6.4 to 8.8, Gemini 6.4 to 8.9. Whole window: Sonnet 6.0 to 7.4, GPT 7.4 to 8.2, Gemini 7.2 to 8.7. Judges now flag the narrow reading column at native size and small alignment drifts along the sidebar's right edge.
