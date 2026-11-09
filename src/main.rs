@@ -57,7 +57,7 @@ fn main() {
         // Install this build, then hand over to the installed copy.
         match install::install() {
             Ok(installed) => {
-                let _ = install::launch(&installed, None);
+                let _ = install::launch_with(&installed, &[]);
             }
             Err(error) => {
                 eprintln!("Could not install Shina: {error}");
@@ -74,6 +74,9 @@ fn main() {
         return;
     }
     install::remove_replaced_exe();
+    if install::is_installed() {
+        install::adopt_app_id();
+    }
     // The installed app reopens the last workspace; development builds use the current folder.
     let mut workspace = install::is_installed()
         .then(install::last_workspace)
