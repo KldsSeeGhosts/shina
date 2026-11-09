@@ -31,6 +31,30 @@ struct TaskWaiter {
     _timer: mpsc::Sender<()>,
 }
 
+/// A model and reasoning choice, in the same shape `delegate_task` accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Selection {
+    provider: String,
+    model: String,
+    reasoning: Option<String>,
+}
+
+impl Selection {
+    fn to_value(&self) -> Value {
+        let mut value = json!({"provider": self.provider, "model": self.model});
+        if let Some(reasoning) = &self.reasoning {
+            value["options"] = json!({"reasoning": reasoning});
+        }
+        value
+    }
+}
+
+/// The validated fields of a `delegate_task.target` request.
+struct DelegationTarget {
+    model: String,
+    reasoning: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ready,
@@ -409,6 +433,47 @@ impl Thread {
             self.configuring = true;
             self.pending_thinking = Some(level);
         }
+    }
+
+    /// The pinned choice if one exists, otherwise the model Pi last applied.
+    fn selected_or_effective_model(&self) -> Option<(String, String)> {
+        self.selected_model
+            .as_ref()
+            .filter(|(provider, model)| provider == "cpa" && !model.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                (self.model_provider == "cpa" && !self.model_id.trim().is_empty())
+                    .then(|| (self.model_provider.clone(), self.model_id.clone()))
+            })
+    }
+
+    fn selected_or_effective_reasoning(&self) -> Option<String> {
+        self.selected_thinking
+            .clone()
+            .filter(|level| !level.trim().is_empty())
+            .or_else(|| (!self.thinking.trim().is_empty()).then(|| self.thinking.clone()))
+    }
+
+    /// What a delegated child inherits when its target omits a model or level.
+    fn inherited_selection(&self) -> Option<Selection> {
+        let (provider, model) = self.selected_or_effective_model()?;
+        Some(Selection {
+            provider,
+            model,
+            reasoning: self.selected_or_effective_reasoning(),
+        })
+    }
+
+    /// What the thread is actually running now, for status and read output.
+    fn effective_selection(&self) -> Option<Selection> {
+        if self.model_provider != "cpa" || self.model_id.trim().is_empty() {
+            return None;
+        }
+        Some(Selection {
+            provider: self.model_provider.clone(),
+            model: self.model_id.clone(),
+            reasoning: (!self.thinking.trim().is_empty()).then(|| self.thinking.clone()),
+        })
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
@@ -2459,6 +2524,170 @@ impl State {
         };
         self.checkpoint();
     }
+    /// Models Shina can validate against, preferring the live catalog over the caller's last
+    /// handshake metadata. The bool records which source was used.
+    fn delegation_models(&self, caller: &Thread) -> (Vec<AgentModel>, &'static str) {
+        let mut models = self.catalog.models.clone();
+        if let Some(default) = &self.catalog.default_model
+            && !models
+                .iter()
+                .any(|model| model.provider == default.provider && model.id == default.id)
+        {
+            models.push(default.clone());
+        }
+        if !models.is_empty() {
+            return (models, "catalog");
+        }
+        if !caller.models.is_empty() {
+            return (caller.models.clone(), "caller");
+        }
+        (models, "none")
+    }
+
+    fn default_selection(&self) -> Option<Selection> {
+        let model = self.catalog.default_model.as_ref()?;
+        let reasoning = (!self.catalog.default_thinking.trim().is_empty()
+            && model
+                .thinking_levels
+                .iter()
+                .any(|level| level == &self.catalog.default_thinking))
+        .then(|| self.catalog.default_thinking.clone());
+        Some(Selection {
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            reasoning,
+        })
+    }
+
+    fn inherited_selection(&self, caller_index: usize) -> Option<Selection> {
+        self.threads
+            .get(caller_index)?
+            .inherited_selection()
+            .or_else(|| self.default_selection())
+    }
+
+    fn discovery_state(&self, source: &str) -> &'static str {
+        if source == "caller" {
+            return "caller_metadata";
+        }
+        let has_catalog = !self.catalog.models.is_empty() || self.catalog.default_model.is_some();
+        if self.catalog.error.is_some() {
+            return if has_catalog { "stale" } else { "failed" };
+        }
+        if self.catalog.remaining().is_some() {
+            return if has_catalog { "refreshing" } else { "loading" };
+        }
+        if source == "none" {
+            "not_started"
+        } else {
+            "ready"
+        }
+    }
+
+    fn validate_delegation_selection(
+        &self,
+        models: &[AgentModel],
+        selection: &Selection,
+        explicit: bool,
+    ) -> Result<(), String> {
+        if models.is_empty() {
+            return if explicit {
+                Err("Model discovery is not ready, so Shina cannot validate the requested target. Call orchestrator_capabilities and retry when ready is true.".into())
+            } else {
+                Ok(())
+            };
+        }
+        let Some(model) = models
+            .iter()
+            .find(|model| model.provider == selection.provider && model.id == selection.model)
+        else {
+            let available = models
+                .iter()
+                .take(6)
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(if explicit {
+                format!(
+                    "The requested CPA model {} is not in the current catalog. Available model ids include: {available}. Call orchestrator_capabilities for the full list.",
+                    selection.model
+                )
+            } else {
+                format!(
+                    "The inherited CPA model {} is not in the current catalog. Pass target with an available model from orchestrator_capabilities.",
+                    selection.model
+                )
+            });
+        };
+        if let Some(reasoning) = &selection.reasoning
+            && !model.thinking_levels.iter().any(|level| level == reasoning)
+        {
+            let supported = if model.thinking_levels.is_empty() {
+                "none".to_owned()
+            } else {
+                model.thinking_levels.join(", ")
+            };
+            return Err(format!(
+                "Reasoning level {reasoning} is not supported by CPA model {}. Supported levels: {supported}. Pass an exact level; Shina will not substitute or clamp one.",
+                model.id
+            ));
+        }
+        Ok(())
+    }
+
+    fn orchestrator_capabilities(&self, caller_index: usize) -> Value {
+        let caller = &self.threads[caller_index];
+        let (models, source) = self.delegation_models(caller);
+        let default_selection = self.default_selection();
+        let caller_selection = caller.inherited_selection();
+        let inherit_selection = caller_selection
+            .clone()
+            .or_else(|| default_selection.clone());
+        let model_values: Vec<Value> = models
+            .iter()
+            .map(|model| {
+                json!({
+                    "provider": model.provider,
+                    "id": model.id,
+                    "name": model.name,
+                    "reasoning_levels": model.thinking_levels,
+                })
+            })
+            .collect();
+        json!({
+            "ready": !models.is_empty(),
+            "discovery": {
+                "state": self.discovery_state(source),
+                "source": source,
+                "error": self.catalog.error,
+            },
+            "runtime": {
+                "harness": "pi",
+                "providers": ["cpa"],
+                "hosts": ["local"],
+                "machine": caller.machine,
+                "host_supported": caller.machine == "local",
+            },
+            "constraints": {
+                "direct_providers": false,
+                "remote_hosts": false,
+                "model_ids": "exact ids only",
+                "reasoning_levels": "exact levels only, never clamped",
+            },
+            "default_selection": default_selection.map_or(Value::Null, |selection| selection.to_value()),
+            "caller_selection": caller_selection.map_or(Value::Null, |selection| selection.to_value()),
+            "inherit_selection": inherit_selection.map_or(Value::Null, |selection| selection.to_value()),
+            "models": model_values,
+            "notes": [
+                "Shina delegates only through Pi's CPA provider. Direct providers are never offered or used.",
+                "Only the local machine is supported. A child inherits the caller's project, machine and captain.",
+                "Pass exact model ids and reasoning levels. Unknown or unsupported choices are rejected before the child is created and are never silently substituted or clamped.",
+                "Omit target to inherit inherit_selection. Given target fields override the inherited selection.",
+                "When ready is false, discovery has not produced a usable catalog. Do not invent model ids or levels."
+            ],
+        })
+    }
+
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
     pub fn connect_thread(&mut self, index: usize) {
         if self.demo || index >= self.threads.len() {
@@ -2530,6 +2759,7 @@ impl State {
                 .unwrap_or(Value::Null)
         };
         match tool {
+            "orchestrator_capabilities" => Ok(self.orchestrator_capabilities(caller_index)),
             "list_threads" => {
                 let archived = args["include_archived"] == true;
                 let all = args["all_projects"] == true;
@@ -2562,6 +2792,7 @@ impl State {
                             "archived": t.archived(),
                             "delegated": t.delegated,
                             "parent": t.parent,
+                            "selection": selection_value(t),
                             "is_caller": t.id == caller,
                         })
                     })
@@ -2587,6 +2818,7 @@ impl State {
                     "project": self.project(thread.project).map(Project::to_value),
                     "machine": thread.machine,
                     "status": status_word(thread.status),
+                    "selection": selection_value(thread),
                     "message_count": thread.messages.len(),
                     "messages": messages,
                 }))
@@ -2617,6 +2849,31 @@ impl State {
                 let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
                 if prompt.is_empty() {
                     return Err("prompt must describe the task.".into());
+                }
+                if self.threads[caller_index].machine != "local" {
+                    return Err(format!(
+                        "Shina delegates only on the local machine. The caller's machine {} is unavailable.",
+                        self.threads[caller_index].machine
+                    ));
+                }
+                let target = parse_delegation_target(args)?;
+                let (models, _) = self.delegation_models(&self.threads[caller_index]);
+                let selection = match &target {
+                    Some(target) => {
+                        let inherited = self.threads[caller_index].inherited_selection();
+                        Some(Selection {
+                            provider: "cpa".into(),
+                            model: target.model.clone(),
+                            reasoning: target
+                                .reasoning
+                                .clone()
+                                .or_else(|| inherited.and_then(|choice| choice.reasoning)),
+                        })
+                    }
+                    None => self.inherited_selection(caller_index),
+                };
+                if let Some(selection) = &selection {
+                    self.validate_delegation_selection(&models, selection, target.is_some())?;
                 }
                 let project = self.threads[caller_index].project;
                 let assigned = self.threads[caller_index]
@@ -2652,6 +2909,13 @@ impl State {
                 thread.captain = captain;
                 thread.delegated = true;
                 thread.parent = Some(caller);
+                thread.models = models;
+                if let Some(selection) = &selection {
+                    thread.set_model(selection.provider.clone(), selection.model.clone());
+                    if let Some(reasoning) = &selection.reasoning {
+                        thread.set_thinking(reasoning.clone());
+                    }
+                }
                 thread.arm_task();
                 thread.life.mark_unread();
                 thread.enqueue_injection(format!("Shina: task from parent #{caller}\n\n{prompt}"));
@@ -2685,6 +2949,7 @@ impl State {
                     "parent": thread.parent,
                     "captain": captain_name(self, thread.captain),
                     "status": status,
+                    "selection": selection_value(thread),
                     "finished": thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed)),
                     "phase": thread.phase,
                     "error": thread.error,
@@ -3737,6 +4002,84 @@ fn next_counter(saved: &Value, maximum: usize) -> Result<usize, String> {
     Ok(next)
 }
 
+fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
+    let Some(target) = args.get("target") else {
+        return Ok(None);
+    };
+    let object = target
+        .as_object()
+        .ok_or("target must be an object with model and optional provider and options.")?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "provider" | "model" | "options"))
+    {
+        return Err(format!(
+            "Unknown target setting {key}. Use provider, model and options."
+        ));
+    }
+    let model = object
+        .get("model")
+        .ok_or("target.model is required when target is set.")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or(
+            "target.model must be a non-empty exact CPA model id from orchestrator_capabilities.",
+        )?;
+    if let Some(provider) = object.get("provider") {
+        let provider = provider
+            .as_str()
+            .ok_or("target.provider must be the string cpa.")?;
+        if provider != "cpa" {
+            return Err(
+                "Only Shina's CPA provider is supported. Set target.provider to cpa or omit it."
+                    .into(),
+            );
+        }
+    }
+    let reasoning = match object.get("options") {
+        None => None,
+        Some(options) => {
+            let options = options
+                .as_object()
+                .ok_or("target.options must be an object with reasoning, or its alias thinking.")?;
+            let mut reasoning: Option<String> = None;
+            for (key, value) in options {
+                let level = match key.as_str() {
+                    "reasoning" | "thinking" => value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|level| !level.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "target.options.{key} must be a non-empty reasoning level from orchestrator_capabilities."
+                            )
+                        })?,
+                    _ => {
+                        return Err(format!(
+                            "Unknown target.options setting {key}. Use reasoning, or its alias thinking."
+                        ));
+                    }
+                };
+                if let Some(existing) = &reasoning
+                    && existing != level
+                {
+                    return Err(
+                        "target.options.reasoning and target.options.thinking disagree. Pass one level."
+                            .into(),
+                    );
+                }
+                reasoning = Some(level.to_owned());
+            }
+            reasoning
+        }
+    };
+    Ok(Some(DelegationTarget {
+        model: model.to_owned(),
+        reasoning,
+    }))
+}
+
 fn wait_seconds(args: &Value) -> Result<u64, String> {
     match args.get("wait_seconds") {
         None => Ok(0),
@@ -3765,6 +4108,12 @@ fn status_word(status: Status) -> &'static str {
         Status::Failed => "failed",
         Status::Completed => "done",
     }
+}
+
+fn selection_value(thread: &Thread) -> Value {
+    thread
+        .effective_selection()
+        .map_or(Value::Null, |selection| selection.to_value())
 }
 
 pub fn string<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -4102,6 +4451,28 @@ mod tests {
         (commands, events)
     }
 
+    fn model_with_levels(id: &str, levels: &[&str]) -> AgentModel {
+        let mut map = serde_json::Map::new();
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            map.insert(
+                level.into(),
+                if levels.contains(&level) {
+                    json!(level)
+                } else {
+                    Value::Null
+                },
+            );
+        }
+        let mut value = json!({
+            "provider": "cpa",
+            "id": id,
+            "name": format!("{id} model"),
+            "reasoning": true,
+        });
+        value["thinkingLevelMap"] = Value::Object(map);
+        AgentModel::from_value(&value).unwrap()
+    }
+
     fn preparing_pi(thread: &mut Thread) -> (mpsc::Receiver<Value>, mpsc::SyncSender<Event>) {
         let result = fake_pi(thread, Status::Ready);
         thread.initializing = true;
@@ -4340,6 +4711,420 @@ mod tests {
                 .unwrap()
                 .contains("Ping")
         );
+    }
+
+    #[test]
+    fn explicit_delegation_selection_applies_before_the_first_prompt_and_is_reported() {
+        let mut state = State::new(".".into(), false);
+        state.demo = true;
+        let fast = model_with_levels("fast", &["off", "low"]);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.models = vec![fast.clone(), deep.clone()];
+        state.catalog.default_model = Some(fast);
+        state.catalog.default_thinking = "low".into();
+        let result = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"Inspect the test fixture",
+                    "target":{"provider":"cpa","model":"deep","options":{"reasoning":"max"}}
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["selection"]["model"], "deep");
+        assert_eq!(result["selection"]["options"]["reasoning"], "max");
+        let index = state.threads.len() - 1;
+        let child_id = state.threads[index].id;
+        {
+            let child = &state.threads[index];
+            assert_eq!(child.selected_model, Some(("cpa".into(), "deep".into())));
+            assert_eq!(child.selected_thinking.as_deref(), Some("max"));
+            assert_eq!(child.model_id, "deep");
+            assert_eq!(child.thinking, "max");
+            assert_eq!(
+                child.thinking_levels.last().map(String::as_str),
+                Some("max")
+            );
+            assert_eq!(child.models.len(), 2);
+        }
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":child_id}))
+            .unwrap();
+        assert_eq!(status["selection"]["model"], "deep");
+        assert_eq!(status["selection"]["options"]["reasoning"], "max");
+        let read = state
+            .mcp_call(1, "read_thread", &json!({"thread_id":child_id}))
+            .unwrap();
+        assert_eq!(read["selection"]["model"], "deep");
+        let list = state
+            .mcp_call(1, "list_threads", &json!({"all_projects":true}))
+            .unwrap();
+        let listed = list["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["thread_id"] == json!(child_id))
+            .unwrap();
+        assert_eq!(listed["selection"]["model"], "deep");
+        assert_eq!(listed["selection"]["options"]["reasoning"], "max");
+
+        // Mock a fresh Pi handshake. The child must acknowledge model and reasoning before
+        // its injected brief becomes a prompt.
+        let (commands, events) = preparing_pi(&mut state.threads[index]);
+        for record in [
+            json!({"type":"response","id":"state","command":"get_state","success":true,"data":{
+                "isStreaming":false,"model":{"provider":"cpa","id":"fast"},"thinkingLevel":"low"
+            }}),
+            json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}),
+        ] {
+            events.send(Event::Record(record)).unwrap();
+        }
+        poll(&mut state, 0.0, &mut Tx::default());
+        let model = commands.try_recv().unwrap();
+        assert_eq!(model["type"], "set_model");
+        assert_eq!(model["modelId"], "deep");
+        assert!(
+            commands.try_recv().is_err(),
+            "the prompt must wait for the model acknowledgement"
+        );
+        state.threads[index].apply(json!({"type":"response","command":"set_model","success":true,"data":{"provider":"cpa","id":"deep"}}));
+        let thinking = loop {
+            let command = commands.try_recv().expect("reasoning command");
+            assert_ne!(
+                command["type"], "prompt",
+                "the prompt must wait for the reasoning choice"
+            );
+            if command["type"] == "set_thinking_level" {
+                break command;
+            }
+        };
+        assert_eq!(thinking["level"], "max");
+        assert!(
+            commands.try_recv().is_err(),
+            "the prompt must wait for the reasoning acknowledgement"
+        );
+        state.threads[index]
+            .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| command["type"] != "prompt"),
+            "the prompt must wait for startup to finish"
+        );
+        state.poll_tasks(Instant::now());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        assert!(
+            prompt["message"]
+                .as_str()
+                .unwrap()
+                .contains("Inspect the test fixture")
+        );
+        assert_eq!(state.threads[index].model_id, "deep");
+        assert_eq!(state.threads[index].thinking, "max");
+    }
+
+    #[test]
+    fn invalid_delegation_targets_are_rejected_without_creating_children() {
+        let mut state = State::new(".".into(), false);
+        state.demo = true;
+        let fast = model_with_levels("fast", &["off", "low"]);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.models = vec![fast, deep];
+        state.catalog.default_model = Some(state.catalog.models[0].clone());
+        let before = state.threads.len();
+        let cases = [
+            ("null target", Value::Null),
+            ("wrong target type", json!("deep")),
+            ("missing model", json!({"provider":"cpa"})),
+            ("empty model", json!({"provider":"cpa","model":"  "})),
+            ("wrong model type", json!({"provider":"cpa","model":7})),
+            ("wrong provider type", json!({"provider":7,"model":"fast"})),
+            (
+                "direct provider",
+                json!({"provider":"google","model":"fast"}),
+            ),
+            (
+                "unknown target setting",
+                json!({"provider":"cpa","model":"fast","role":"review"}),
+            ),
+            (
+                "wrong options type",
+                json!({"provider":"cpa","model":"fast","options":[]}),
+            ),
+            (
+                "unknown option",
+                json!({"provider":"cpa","model":"fast","options":{"temperature":"hot"}}),
+            ),
+            (
+                "wrong reasoning type",
+                json!({"provider":"cpa","model":"fast","options":{"reasoning":5}}),
+            ),
+            (
+                "empty reasoning",
+                json!({"provider":"cpa","model":"fast","options":{"reasoning":" "}}),
+            ),
+            (
+                "conflicting aliases",
+                json!({"provider":"cpa","model":"fast","options":{"reasoning":"low","thinking":"high"}}),
+            ),
+            ("unknown model", json!({"provider":"cpa","model":"missing"})),
+        ];
+        for (label, target) in cases {
+            let error = state
+                .mcp_call(
+                    1,
+                    "delegate_task",
+                    &json!({"prompt":"No child","target":target}),
+                )
+                .unwrap_err();
+            assert!(!error.is_empty(), "{label}");
+            assert_eq!(
+                state.threads.len(),
+                before,
+                "{label} must not create a child: {error}"
+            );
+        }
+        let error = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"No child",
+                    "target":{"provider":"cpa","model":"fast","options":{"reasoning":"max"}}
+                }),
+            )
+            .unwrap_err();
+        assert!(error.contains("Supported levels: off, low"), "{error}");
+        assert!(
+            error.contains("will not substitute or clamp"),
+            "an explicit level must never be clamped: {error}"
+        );
+        assert_eq!(state.threads.len(), before);
+        state.threads[0].machine = "remote".into();
+        let error = state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"No child"}))
+            .unwrap_err();
+        assert!(
+            error.contains("only on the local machine"),
+            "unsupported hosts must fail before a child starts: {error}"
+        );
+        assert_eq!(state.threads.len(), before);
+    }
+
+    #[test]
+    fn delegation_inherits_pinned_selection_and_overrides_only_given_fields() {
+        let mut state = State::new(".".into(), false);
+        state.demo = true;
+        state.threads[0].model_provider = "cpa".into();
+        state.threads[0].model_id = "fast".into();
+        state.threads[0].thinking = "low".into();
+        state.threads[0].selected_model = Some(("cpa".into(), "deep".into()));
+        state.threads[0].selected_thinking = Some("max".into());
+        let before = state.threads.len();
+        let error = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"No child","target":{"model":"deep"}}),
+            )
+            .unwrap_err();
+        assert!(error.contains("discovery is not ready"), "{error}");
+        assert_eq!(state.threads.len(), before);
+
+        let result = state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"Inherit my choice"}))
+            .unwrap();
+        let child = state.threads.last().unwrap();
+        assert_eq!(child.selected_model, Some(("cpa".into(), "deep".into())));
+        assert_eq!(child.selected_thinking.as_deref(), Some("max"));
+        assert_eq!(result["selection"]["model"], "deep");
+        assert_eq!(result["selection"]["options"]["reasoning"], "max");
+
+        let fast = model_with_levels("fast", &["off", "low"]);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.models = vec![fast, deep];
+        state.catalog.default_model = Some(state.catalog.models[0].clone());
+        state.catalog.default_thinking = "low".into();
+        let error = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"No child","target":{"model":"fast"}}),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("Reasoning level max is not supported by CPA model fast"),
+            "{error}"
+        );
+        assert_eq!(state.threads.len(), before + 1);
+
+        let result = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"Use the alias",
+                    "target":{"provider":"cpa","model":"fast","options":{"thinking":"low"}}
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["selection"]["model"], "fast");
+        assert_eq!(result["selection"]["options"]["reasoning"], "low");
+        let child = state.threads.last().unwrap();
+        assert_eq!(child.selected_model, Some(("cpa".into(), "fast".into())));
+        assert_eq!(child.selected_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn delegation_uses_the_catalog_default_when_the_caller_has_no_selection() {
+        let mut state = State::new(".".into(), false);
+        state.demo = true;
+        let fast = model_with_levels("fast", &["off", "low"]);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.models = vec![fast.clone(), deep];
+        state.catalog.default_model = Some(fast);
+        state.catalog.default_thinking = "low".into();
+        let result = state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"Use the default"}))
+            .unwrap();
+        assert_eq!(result["selection"]["model"], "fast");
+        assert_eq!(result["selection"]["options"]["reasoning"], "low");
+        let child = state.threads.last().unwrap();
+        assert_eq!(child.selected_model, Some(("cpa".into(), "fast".into())));
+        assert_eq!(child.selected_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn orchestrator_capabilities_report_catalog_defaults_caller_choice_and_limits() {
+        let mut state = State::new(".".into(), false);
+        let fast = model_with_levels("fast", &["off", "low"]);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.models = vec![fast.clone(), deep.clone()];
+        state.catalog.default_model = Some(fast);
+        state.catalog.default_thinking = "low".into();
+        state.threads[0].selected_model = Some(("cpa".into(), "deep".into()));
+        state.threads[0].selected_thinking = Some("max".into());
+        let capabilities = state
+            .mcp_call(1, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert_eq!(capabilities["ready"], true);
+        assert_eq!(capabilities["discovery"]["state"], "ready");
+        assert_eq!(capabilities["discovery"]["source"], "catalog");
+        assert_eq!(capabilities["discovery"]["error"], Value::Null);
+        let models = capabilities["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        let deep_entry = models.iter().find(|model| model["id"] == "deep").unwrap();
+        assert_eq!(
+            deep_entry["reasoning_levels"],
+            json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(capabilities["default_selection"]["model"], "fast");
+        assert_eq!(
+            capabilities["default_selection"]["options"]["reasoning"],
+            "low"
+        );
+        assert_eq!(capabilities["caller_selection"]["model"], "deep");
+        assert_eq!(
+            capabilities["caller_selection"]["options"]["reasoning"],
+            "max"
+        );
+        assert_eq!(capabilities["inherit_selection"]["model"], "deep");
+        assert_eq!(capabilities["runtime"]["harness"], "pi");
+        assert_eq!(capabilities["runtime"]["providers"], json!(["cpa"]));
+        assert_eq!(capabilities["runtime"]["hosts"], json!(["local"]));
+        assert_eq!(capabilities["runtime"]["machine"], "local");
+        assert_eq!(capabilities["runtime"]["host_supported"], true);
+        assert_eq!(capabilities["constraints"]["direct_providers"], false);
+        assert_eq!(capabilities["constraints"]["remote_hosts"], false);
+    }
+
+    #[test]
+    fn capabilities_report_discovery_not_ready_without_inventing_models() {
+        let mut state = State::new(".".into(), false);
+        state.catalog.error = Some("Model discovery timed out.".into());
+        let capabilities = state
+            .mcp_call(1, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert_eq!(capabilities["ready"], false);
+        assert_eq!(capabilities["discovery"]["state"], "failed");
+        assert_eq!(capabilities["discovery"]["source"], "none");
+        assert_eq!(
+            capabilities["discovery"]["error"],
+            "Model discovery timed out."
+        );
+        assert!(capabilities["models"].as_array().unwrap().is_empty());
+        assert!(capabilities["default_selection"].is_null());
+        assert!(capabilities["caller_selection"].is_null());
+        assert!(capabilities["inherit_selection"].is_null());
+        let before = state.threads.len();
+        let error = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"No child","target":{"model":"deep"}}),
+            )
+            .unwrap_err();
+        assert!(error.contains("discovery is not ready"), "{error}");
+        assert_eq!(state.threads.len(), before);
+    }
+
+    #[test]
+    fn capabilities_use_caller_metadata_when_catalog_discovery_is_unavailable() {
+        let mut state = State::new(".".into(), false);
+        let deep = model_with_levels(
+            "deep",
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        );
+        state.catalog.error = Some("Model discovery timed out.".into());
+        state.threads[0].models = vec![deep];
+        state.threads[0].selected_model = Some(("cpa".into(), "deep".into()));
+        state.threads[0].selected_thinking = Some("max".into());
+        let capabilities = state
+            .mcp_call(1, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert_eq!(capabilities["ready"], true);
+        assert_eq!(capabilities["discovery"]["state"], "caller_metadata");
+        assert_eq!(capabilities["discovery"]["source"], "caller");
+        assert_eq!(
+            capabilities["discovery"]["error"],
+            "Model discovery timed out."
+        );
+        assert_eq!(capabilities["models"].as_array().unwrap().len(), 1);
+        assert_eq!(capabilities["models"][0]["id"], "deep");
+        assert_eq!(capabilities["inherit_selection"]["model"], "deep");
+        assert_eq!(
+            capabilities["inherit_selection"]["options"]["reasoning"],
+            "max"
+        );
+        state.demo = true;
+        let before = state.threads.len();
+        let result = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"Use caller metadata","target":{"model":"deep"}}),
+            )
+            .unwrap();
+        assert_eq!(state.threads.len(), before + 1);
+        assert_eq!(result["selection"]["model"], "deep");
+        assert_eq!(result["selection"]["options"]["reasoning"], "max");
     }
 
     #[test]

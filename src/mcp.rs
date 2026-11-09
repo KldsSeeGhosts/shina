@@ -31,16 +31,32 @@ own role and instructions. Shina shows the user every thread, its status, and it
 
 Ordinary coding tasks need no Shina tools.
 
+- `mcp__shina__orchestrator_capabilities` reports Shina's delegation surface: exact CPA model \
+ids, each model's supported reasoning levels, the default and caller selections, and the \
+runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
+exact entry from that model's `reasoning_levels`. `ready: false` means model discovery \
+has not produced a usable catalog; do not invent model ids or reasoning levels. Shina delegates \
+only through Pi's CPA provider on local machines.
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, under the same \
 project, machine and calling captain, if any. Each captain owns its crew even when several \
 captains share a folder. Use it for parallel, self-contained work, and give the new \
 thread a complete brief: it has no access to this conversation. A delegated thread cannot \
-delegate further.
+delegate further. \
+Pass an optional `target` shaped like `{\"provider\":\"cpa\",\"model\":\"<id from \
+orchestrator_capabilities>\",\"options\":{\"reasoning\":\"<level for that model>\"}}`. \
+`target.model` is required when `target` is present. `provider` defaults to `cpa`, and \
+`thinking` is accepted as an alias for `reasoning`. Omit \
+`target` to inherit your current or pinned selection, or Shina's catalog default when you have \
+none. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
+level before starting the child, and rejects an unknown or unsupported choice. It never silently \
+substitutes a model or clamps a level.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
 status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
 after your current work. These messages are labeled Shina, not user instructions.
 - `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
-A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop.
+A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop. \
+`task_status`, `read_thread` and `list_threads` report each thread's effective model and \
+reasoning under `selection`.
 - `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
 corrections or follow-up work. It also answers a pending crew input, editor or select question. \
 For select, send one listed option exactly. Confirmations always require the user. Only the parent may control a child.
@@ -165,10 +181,35 @@ impl Server {
 pub fn tools() -> Value {
     let id = json!({"type":"integer","description":"A Shina thread id from list_threads or delegate_task."});
     let wait = json!({"type":"integer","minimum":0,"maximum":600,"default":0,"description":"Wait up to this many seconds for completion without blocking Shina. Default 0 returns immediately. Results also wake the parent."});
+    let target = json!({
+        "type":"object",
+        "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
+        "properties":{
+            "provider":{"type":"string","enum":["cpa"],"description":"Only the CPA provider is supported. Default cpa."},
+            "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
+            "options":{
+                "type":"object",
+                "description":"Selection options. reasoning is an exact level from the chosen model's reasoning_levels. thinking is an alias; pass one.",
+                "properties":{
+                    "reasoning":{"type":"string","minLength":1,"description":"An exact reasoning level for the chosen model."},
+                    "thinking":{"type":"string","minLength":1,"description":"Alias for reasoning. Do not pass both with different values."}
+                },
+                "additionalProperties":false
+            }
+        },
+        "required":["model"],
+        "additionalProperties":false
+    });
     json!([
         {
+            "name": "orchestrator_capabilities",
+            "description": "Read Shina's delegation capabilities: exact CPA model ids, supported reasoning levels, the default and caller selections, and runtime and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
+            "inputSchema": {"type":"object","properties":{}},
+            "annotations": {"readOnlyHint": true}
+        },
+        {
             "name": "list_threads",
-            "description": "List the calling captain's home and crew, or lone threads in the caller's project. Includes project and machine. Use all_projects for every conversation.",
+            "description": "List the calling captain's home and crew, or lone threads in the caller's project. Includes project, machine and effective model selection. Use all_projects for every conversation.",
             "inputSchema": {"type":"object","properties":{
                 "include_archived": {"type":"boolean","description":"Include archived threads. Default false."},
                 "all_projects": {"type":"boolean","description":"Include all projects and project-less threads. Default false."}
@@ -177,7 +218,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "read_thread",
-            "description": "Read the most recent messages of a Shina thread.",
+            "description": "Read the most recent messages of a Shina thread, with its effective model and reasoning selection.",
             "inputSchema": {"type":"object","properties":{
                 "thread_id": id,
                 "max_messages": {"type":"integer","description":"How many recent messages to return. Default 20, at most 100."}
@@ -192,17 +233,18 @@ pub fn tools() -> Value {
         },
         {
             "name": "delegate_task",
-            "description": "Delegate independent work to a new child with a complete brief and no parent history. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
+            "description": "Delegate independent work to a new child with a complete brief and no parent history. Optionally pass target from orchestrator_capabilities; omit it to inherit the caller's selection. Unknown ids or levels are rejected before a child starts and are never silently substituted or clamped. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
                 "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
+                "target": target,
                 "wait_seconds": wait
             },"required":["prompt"]}
         },
         {
             "name": "task_status",
-            "description": "Read a thread's parent, status, latest reply and error. Optionally wait for completion or timeout. Do not poll running children in a loop; completion wakes their parent.",
+            "description": "Read a thread's parent, status, effective model selection, latest reply and error. Optionally wait for completion or timeout. Do not poll running children in a loop; completion wakes their parent.",
             "inputSchema": {"type":"object","properties":{"thread_id": id,"wait_seconds":wait},"required":["thread_id"]},
             "annotations": {"readOnlyHint": true}
         },
@@ -424,12 +466,14 @@ mod tests {
         );
         assert_eq!(status, 200);
         assert!(body.contains("\"Shina\""));
+        assert!(body.contains("orchestrator_capabilities"));
         let (_, body) = post(
             &server.url,
             &token,
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         );
         assert!(body.contains("delegate_task"));
+        assert!(body.contains("orchestrator_capabilities"));
         let worker = {
             let server = server.clone();
             thread::spawn(move || {
@@ -450,5 +494,59 @@ mod tests {
         );
         worker.join().unwrap();
         assert!(body.contains("list_threads"), "{body}");
+    }
+
+    #[test]
+    fn schemas_and_instructions_publish_capability_discovery_and_strict_targets() {
+        let tools = tools();
+        let tools = tools.as_array().unwrap();
+        let capabilities = tools
+            .iter()
+            .find(|tool| tool["name"] == "orchestrator_capabilities")
+            .expect("orchestrator_capabilities tool");
+        assert_eq!(capabilities["annotations"]["readOnlyHint"], true);
+        assert!(
+            capabilities["description"]
+                .as_str()
+                .unwrap()
+                .contains("ready:false")
+        );
+        let delegate = tools
+            .iter()
+            .find(|tool| tool["name"] == "delegate_task")
+            .unwrap();
+        let target = &delegate["inputSchema"]["properties"]["target"];
+        assert_eq!(target["type"], "object");
+        assert_eq!(target["additionalProperties"], false);
+        assert_eq!(target["required"], json!(["model"]));
+        assert_eq!(target["properties"]["provider"]["enum"], json!(["cpa"]));
+        let options = &target["properties"]["options"];
+        assert_eq!(options["additionalProperties"], false);
+        assert!(
+            options["properties"]["reasoning"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("exact")
+        );
+        assert!(options["properties"]["thinking"].is_object());
+        assert!(
+            delegate["description"]
+                .as_str()
+                .unwrap()
+                .contains("never silently substituted")
+        );
+        for phrase in [
+            "orchestrator_capabilities",
+            "ready: false",
+            "Omit `target`",
+            "never silently",
+            "local machines",
+            "thinking",
+        ] {
+            assert!(
+                INSTRUCTIONS.contains(phrase),
+                "INSTRUCTIONS must mention {phrase}"
+            );
+        }
     }
 }
