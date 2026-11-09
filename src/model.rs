@@ -1025,6 +1025,8 @@ pub struct State {
     /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
     pub zoom: f32,
     pub show_activity: bool,
+    /// The open thread's "More actions" menu in the chat header.
+    pub thread_menu: bool,
     pub activity_full: bool,
     pub show_archive: bool,
     pub sidebar: bool,
@@ -1063,6 +1065,7 @@ impl State {
             dark: false,
             zoom: 1.0,
             show_activity: false,
+            thread_menu: false,
             activity_full: false,
             show_archive: false,
             sidebar: true,
