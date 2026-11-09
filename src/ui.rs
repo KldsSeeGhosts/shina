@@ -1348,44 +1348,64 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// Shown only when there is something to do: an update to fetch, one downloading, or one
-/// ready to install with a restart.
+/// Shown only while an update is on its way or waits for a restart. Downloading is passive;
+/// the only action is one restart, disabled while any thread still has work.
 fn update_row(s: &State, p: Palette) -> Option<El> {
     use crate::update::Status;
-    type Action = Option<fn(&mut State)>;
-    let (key, title, action): (&str, String, Action) = match &s.updater.status {
-        Status::Available { tag } => (
-            "update-download",
-            format!("Update to {tag}"),
-            Some(|s: &mut State| s.updater.download(s.wake.clone())),
-        ),
-        Status::Downloading { tag } => ("update-progress", format!("Downloading {tag}"), None),
-        Status::Ready { tag, .. } => (
-            "update-restart",
-            format!("Restart to install {tag}"),
-            Some(|s: &mut State| s.restart_for_update = true),
-        ),
-        _ => return None,
-    };
-    let mut button = row()
-        .key(key)
-        .role("button")
-        .label(title.clone())
-        .h(30.0)
-        .mx(8.0)
-        .mb(8.0)
-        .px(10.0)
-        .gap(8.0)
-        .center_y()
-        .radius(6.0)
-        .fill(p.teal_bg)
-        .child(icon("send", p.teal_text))
-        .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text));
-    if let Some(action) = action {
-        button = button.focusable(true).hover(p.selected).on_press(action);
+    match s.updater.status() {
+        Status::Disabled | Status::Idle | Status::Checking => None,
+        Status::Downloading { tag } => {
+            let title = format!("Downloading update {tag}");
+
+            Some(
+                row()
+                    .key("update-progress")
+                    .role("status")
+                    .label(title.clone())
+                    .h(30.0)
+                    .mx(8.0)
+                    .mb(8.0)
+                    .px(10.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(6.0)
+                    .fill(p.teal_bg)
+                    .child(icon("send", p.teal_text))
+                    .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text)),
+            )
+        }
+        Status::Ready { update } => {
+            let title = format!("Restart to update to {}", update.tag);
+            let blocker = s.update_restart_blocker();
+            let description = blocker.or(s.restart_notice.as_deref()).map(str::to_owned);
+            let mut button = row()
+                .key("update-restart")
+                .role("button")
+                .label(title.clone())
+                .description(description.clone().unwrap_or_default())
+                .h(30.0)
+                .mx(8.0)
+                .mb(8.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .fill(p.teal_bg)
+                .disabled(blocker.is_some())
+                .a11y_value(description.unwrap_or_default())
+                .child(icon("send", p.teal_text))
+                .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text));
+            if blocker.is_none() {
+                button = button
+                    .focusable(true)
+                    .hover(p.selected)
+                    .on_press(|s: &mut State| s.restart_for_update = true);
+            }
+            Some(button)
+        }
     }
-    Some(button)
 }
+
 fn nav(
     key: &str,
     title: &str,
@@ -4419,6 +4439,93 @@ pub(crate) mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.0);
     }
+    fn find<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+        if tree["key"] == key {
+            return Some(tree);
+        }
+        tree["children"]
+            .as_array()?
+            .iter()
+            .find_map(|c| find(c, key))
+    }
+
+    #[test]
+    fn the_update_row_offers_one_restart_and_a_passive_download() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        // A development build shows nothing, and never a download button.
+        assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+        assert!(find(&rt.accessibility_json(), "update-download").is_none());
+        rt.state.updater = crate::update::Updater::test_downloading("v9.0.0");
+        rt.invalidate();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let progress = match find(&tree, "update-progress") {
+            Some(node) => node,
+            None => panic!(
+                "a downloading row; status={:?} tree={}",
+                rt.state.updater.status(),
+                serde_json::to_string(&tree).unwrap()
+            ),
+        };
+        assert_eq!(progress["role"], "status");
+        assert_eq!(progress["name"], "Downloading update v9.0.0");
+        assert!(find(&tree, "update-restart").is_none());
+        assert!(find(&tree, "update-download").is_none());
+        rt.state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
+            tag: "v9.1.0".into(),
+            target: crate::install::InstalledTarget::Windows {
+                exe: "shina.exe".into(),
+            },
+            asset: "shina.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: "download.exe".into(),
+            prepared: "prepared.exe".into(),
+        });
+        rt.invalidate();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let restart = find(&tree, "update-restart").expect("one restart action");
+        assert_eq!(restart["name"], "Restart to update to v9.1.0");
+        assert!(
+            restart["actions"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == "click"))
+        );
+        press(&mut rt, "update-restart");
+        assert!(
+            rt.state.restart_for_update,
+            "the click only requests a restart"
+        );
+        // A running thread disables the button and says why.
+        rt.state.restart_for_update = false;
+        rt.state.threads[0].status = Status::Running;
+        rt.invalidate();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let restart = find(&tree, "update-restart").expect("the row stays");
+        assert!(
+            restart["states"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|x| x == "disabled")),
+            "a busy app cannot restart: {restart}"
+        );
+        // A disabled control takes no press: the click only requests a restart when ready.
+        rt.pointer_down(120.0, 640.0);
+        rt.pointer_up(120.0, 640.0);
+        rt.frame(0.0);
+        assert!(
+            !rt.state.restart_for_update,
+            "a disabled restart cannot be clicked"
+        );
+        rt.state.threads[0].status = Status::Ready;
+        rt.state.updater = crate::update::Updater::test_idle();
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+    }
+
     #[test]
     fn shelves_start_collapsed_keep_the_open_row_and_page_settled_threads() {
         let mut rt = runtime(1280.0);

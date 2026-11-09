@@ -4,10 +4,16 @@ use serde_json::Value;
 use std::{fs, path::PathBuf, sync::mpsc, thread};
 
 pub struct Store {
-    sender: Option<mpsc::Sender<String>>,
+    sender: Option<mpsc::Sender<Message>>,
     pub errors: mpsc::Receiver<String>,
     last: String,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+/// A queued write, or a barrier that is acknowledged after every earlier write finished.
+enum Message {
+    Save(String),
+    Flush(mpsc::Sender<Result<(), String>>),
 }
 
 #[cfg(not(test))]
@@ -344,12 +350,29 @@ pub fn load(path: &std::path::Path) -> Result<Option<Value>, String> {
 
 impl Store {
     pub fn new(path: PathBuf, wake: Waker) -> Self {
-        let (sender, receiver) = mpsc::channel::<String>();
+        let (sender, receiver) = mpsc::channel::<Message>();
         let (errors, error_receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
-            while let Ok(mut snapshot) = receiver.recv() {
+            let mut last: Result<(), String> = Ok(());
+            while let Ok(message) = receiver.recv() {
+                let mut snapshot = match message {
+                    Message::Save(snapshot) => snapshot,
+                    Message::Flush(ack) => {
+                        // Every earlier write is done here; barriers are never coalesced.
+                        let _ = ack.send(last.clone());
+                        continue;
+                    }
+                };
+                // Coalesce newer writes, but never across a barrier.
+                let mut barrier = None;
                 while let Ok(newer) = receiver.try_recv() {
-                    snapshot = newer;
+                    match newer {
+                        Message::Save(newer) => snapshot = newer,
+                        Message::Flush(ack) => {
+                            barrier = Some(ack);
+                            break;
+                        }
+                    }
                 }
                 let result = (|| -> std::io::Result<()> {
                     fs::create_dir_all(path.parent().expect("index directory"))?;
@@ -362,11 +385,19 @@ impl Store {
                     fs::rename(temporary, &path)?;
                     Ok(())
                 })();
-                if let Err(error) = result {
-                    let _ = errors.send(format!(
-                        "Could not save the thread index: {error}. Pi still owns its session files."
-                    ));
-                    wake();
+                last = match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let message = format!(
+                            "Could not save the thread index: {error}. Pi still owns its session files."
+                        );
+                        let _ = errors.send(message.clone());
+                        wake();
+                        Err(message)
+                    }
+                };
+                if let Some(ack) = barrier {
+                    let _ = ack.send(last.clone());
                 }
             }
         });
@@ -384,10 +415,24 @@ impl Store {
             && self
                 .sender
                 .as_ref()
-                .is_some_and(|sender| sender.send(serialized.clone()).is_ok())
+                .is_some_and(|sender| sender.send(Message::Save(serialized.clone())).is_ok())
         {
             self.last = serialized;
         }
+    }
+
+    /// Waits until every write queued so far is on disk, and reports the last write's result.
+    pub fn flush(&self) -> Result<(), String> {
+        let Some(sender) = &self.sender else {
+            return Err("The store is no longer running.".into());
+        };
+        let (ack, result) = mpsc::channel();
+        sender
+            .send(Message::Flush(ack))
+            .map_err(|_| "The store is no longer running.".to_string())?;
+        result
+            .recv()
+            .map_err(|_| "The store stopped before flushing.".to_string())?
     }
 }
 
@@ -616,6 +661,37 @@ mod tests {
         assert_eq!(load_global(&directory, None).unwrap().unwrap(), global);
         fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn flush_waits_for_queued_writes_reports_failure_and_is_never_coalesced() {
+        let directory = directory().unwrap().join("flush");
+        let file = directory.join("index.json");
+        let mut store = Store::new(file.clone(), Arc::new(|| {}));
+        store.save(serde_json::json!({"value":"first"}));
+        store.flush().unwrap();
+        assert_eq!(load(&file).unwrap().unwrap()["value"], "first");
+        store.save(serde_json::json!({"value":"second"}));
+        store.save(serde_json::json!({"value":"third"}));
+        store.flush().unwrap();
+        assert_eq!(load(&file).unwrap().unwrap()["value"], "third");
+        // A save after a barrier is written for the next barrier, not lost with it.
+        store.save(serde_json::json!({"value":"fourth"}));
+        store.flush().unwrap();
+        assert_eq!(load(&file).unwrap().unwrap()["value"], "fourth");
+        // A blocked target turns the barrier into the write's failure.
+        let blocked = directory.join("blocked");
+        fs::create_dir_all(blocked.join("index.json")).unwrap();
+        let mut broken = Store::new(blocked.join("index.json"), Arc::new(|| {}));
+        broken.save(serde_json::json!({"value":"lost"}));
+        assert!(broken.flush().is_err());
+        assert!(
+            broken.errors.try_recv().is_ok(),
+            "the failure is also surfaced"
+        );
+        drop(broken);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn atomically_replaces_and_flushes_the_index_on_shutdown() {
         let unique = SystemTime::now()

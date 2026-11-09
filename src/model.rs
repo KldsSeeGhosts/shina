@@ -1679,8 +1679,12 @@ pub struct State {
     pub settings_picker: Option<SettingsPicker>,
     pub model_search: TextEdit,
     pub updater: crate::update::Updater,
-    /// Set by the update button; `poll` restarts once no thread is busy.
+    /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
+    /// Why the last restart click waited. Cleared while the update row shows ready.
+    pub restart_notice: Option<String>,
+    /// `prepare_exit` started the save for this exit, so a second quit hook never repeats it.
+    exit_prepared: bool,
     task_waiters: Vec<TaskWaiter>,
     /// Recent projects, the switcher menu, and the clone sheet.
     pub projects: crate::projects::Projects,
@@ -1779,6 +1783,8 @@ impl State {
             model_search: TextEdit::default(),
             updater: Default::default(),
             restart_for_update: false,
+            restart_notice: None,
+            exit_prepared: false,
             task_waiters: vec![],
             projects: Default::default(),
             catalog: Catalog::default(),
@@ -3753,7 +3759,7 @@ impl State {
         self.load_global(wake.clone());
         self.runtime_enabled = true;
         self.refresh_catalog();
-        self.updater.check(wake.clone());
+        self.updater.start(true, Instant::now(), wake.clone());
         self.prewarm_current();
     }
     pub fn leave_demo(&mut self) {
@@ -4123,6 +4129,107 @@ impl State {
             store.save(ui);
         }
     }
+    /// Starts both stores against this state's data folder, as `setup` does, without Pi.
+    #[cfg(test)]
+    pub fn load_global_for_test(&mut self) {
+        self.load_global(self.wake.clone());
+    }
+
+    /// Saves both stores and waits until the writes are on disk. A disabled or failed save
+    /// blocks an update restart.
+    pub fn checkpoint_and_flush(&mut self) -> Result<(), String> {
+        self.checkpoint();
+        self.flush_stores()
+    }
+
+    /// Whether `prepare_exit` already handled this exit.
+    pub fn exit_prepared(&self) -> bool {
+        self.exit_prepared
+    }
+
+    pub fn mark_exit_prepared(&mut self) {
+        self.exit_prepared = true;
+    }
+
+    pub fn take_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.restart_for_update)
+    }
+
+    /// Says why a restart waits, next to the update row rather than as a thread error.
+    pub fn report_restart_blocker(&mut self, reason: String) {
+        self.restart_notice = Some(reason);
+    }
+
+    fn flush_stores(&mut self) -> Result<(), String> {
+        if self.demo {
+            return Err("Demo runs do not save.".into());
+        }
+        let (Some(store), Some(ui)) = (self.store.as_ref(), self.ui_store.as_ref()) else {
+            return Err("Shina is not saving this session.".into());
+        };
+        store.flush()?;
+        ui.flush()
+    }
+
+    /// Why a restart to update must wait, or `None` when nothing is active. It checks every
+    /// thread, including delegated, settled and archived ones.
+    pub fn update_restart_blocker(&self) -> Option<&'static str> {
+        if self.threads.iter().any(|t| {
+            t.status.busy()
+                || t.configuring
+                || t.session_started.is_some()
+                || t.queued()
+                || t.request.is_some()
+        }) {
+            return Some("A thread is still working. Restart when it finishes.");
+        }
+        if self.projects.cloning() {
+            return Some("A repository is still cloning.");
+        }
+        if self.rename_thread.is_some() || self.captain_editor.is_some() {
+            return Some("Finish editing before restarting.");
+        }
+        None
+    }
+
+    /// Records a prepared update for installation after Rune exits. An explicit restart also
+    /// requires the work guard and a successful save. A normal quit installs a ready update
+    /// with `relaunch = false` and never waits for a download or a running thread.
+    pub fn prepared_exit(
+        &mut self,
+        explicit: bool,
+        quit_reply: Option<&mut String>,
+    ) -> Result<(), String> {
+        let blocker = self.update_restart_blocker();
+        if explicit && let Some(blocker) = blocker {
+            if let Some(reply) = quit_reply {
+                *reply = blocker.to_owned();
+            }
+            return Err("The update cannot restart yet.".into());
+        }
+        let update = self
+            .updater
+            .prepared_update()
+            .filter(|_| !self.demo && blocker.is_none())
+            .cloned();
+        let Some(update) = update else {
+            if explicit {
+                if let Some(reply) = quit_reply {
+                    *reply = "The update is not ready yet.".into();
+                }
+                return Err("The update is not ready yet.".into());
+            }
+            return Ok(());
+        };
+        // A failed save blocks the install. The verified download stays for the next quit.
+        self.checkpoint_and_flush()?;
+        crate::update::record_exit(crate::update::ExitUpdate {
+            update,
+            relaunch: explicit,
+        });
+        Ok(())
+    }
+
     fn snapshot(&self) -> Value {
         json!({
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
@@ -4310,7 +4417,10 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    let mut changed = state.updater.poll();
+    let mut changed = state.updater.poll(Instant::now(), state.wake.clone());
+    if let Some(remaining) = state.updater.remaining(Instant::now()) {
+        tx.wake_after(remaining);
+    }
     changed |= state.poll_projects();
     if state.catalog.poll() {
         state.apply_catalog();
@@ -4329,17 +4439,22 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
+    // A restart click only asks for one. The guard is rechecked here, after Pi events have
+    // drained, and a blocked request is dropped rather than restarting later on its own.
+    if matches!(state.updater.status(), crate::update::Status::Ready { .. }) {
+        state.restart_notice = None;
+    }
     if state.restart_for_update {
-        state.restart_for_update = false;
-        changed = true;
-        if state.threads.iter().any(|t| t.status.busy()) {
-            state.current_mut().error =
-                Some("Stop running threads before restarting to update.".into());
-        } else {
-            state.checkpoint();
-            match state.updater.install_and_relaunch() {
-                Ok(()) => tx.quit(),
-                Err(error) => state.current_mut().error = Some(error),
+        let mut reply = String::new();
+        match state.prepared_exit(true, Some(&mut reply)) {
+            Ok(()) => {
+                state.restart_for_update = false;
+                tx.quit();
+            }
+            Err(_) => {
+                state.restart_for_update = false;
+                state.report_restart_blocker(reply);
+                changed = true;
             }
         }
     }
@@ -5193,6 +5308,259 @@ mod tests {
             },
         );
         assert_eq!(restored.selected_threads.len(), 2);
+    }
+
+    /// A verified update, as the updater would have prepared it.
+    fn prepared(tag: &str) -> crate::update::PreparedUpdate {
+        let root = crate::store::directory().unwrap().join("prepared");
+        crate::update::PreparedUpdate {
+            tag: tag.into(),
+            target: crate::install::InstalledTarget::Windows {
+                exe: root.join("shina.exe"),
+            },
+            asset: "shina.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: root.join("download.exe"),
+            prepared: root.join("prepared.exe"),
+        }
+    }
+
+    fn ready_state() -> State {
+        let mut state = State::new(PathBuf::new(), false);
+        state.runtime_enabled = true;
+        state
+    }
+
+    #[test]
+    fn running_waiting_queued_and_cloning_threads_block_an_update_restart() {
+        let mut state = ready_state();
+        assert_eq!(state.update_restart_blocker(), None);
+        for status in [Status::Running, Status::Waiting] {
+            state.threads[0].status = status;
+            assert!(
+                state.update_restart_blocker().is_some(),
+                "{status:?} blocks"
+            );
+        }
+        state.threads[0].status = Status::Ready;
+        state.threads[0].configuring = true;
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].configuring = false;
+        state.threads[0].session_started = Some(Instant::now());
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].session_started = None;
+        state.threads[0].queued_prompt = Some((
+            Prompt {
+                text: "queued".into(),
+                images: Default::default(),
+            },
+            0,
+        ));
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].queued_prompt = None;
+        state.threads[0].request = Some(json!({"id":"1","method":"confirm"}));
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].request = None;
+        // Delegated and hidden threads count too.
+        let mut hidden = Thread::new(2);
+        hidden.status = Status::Running;
+        hidden.delegated = true;
+        hidden.life.settle(lifecycle::now());
+        state.threads.push(hidden);
+        assert!(state.update_restart_blocker().is_some());
+        state.threads.pop();
+        // A clone in progress is active work.
+        state.projects.clone_job = Some(crate::projects::CloneJob::test_idle());
+        assert!(state.update_restart_blocker().is_some());
+        state.projects.clone_job = None;
+        state.rename_thread = Some(1);
+        assert!(state.update_restart_blocker().is_some());
+        state.rename_thread = None;
+        // A composer draft is saved, so it never blocks.
+        state.threads[0].draft.replace_text("unsent");
+        assert_eq!(state.update_restart_blocker(), None);
+    }
+
+    #[test]
+    fn becoming_idle_never_restarts_on_its_own() {
+        let mut state = ready_state();
+        fake_pi(&mut state.threads[0], Status::Running);
+        state.threads[0].draft.replace_text("work");
+        state.threads[0].queued_prompt = Some((
+            Prompt {
+                text: "work".into(),
+                images: Default::default(),
+            },
+            0,
+        ));
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert!(!state.take_restart_request());
+        // The run settles; a normal poll must not restart the app.
+        state.threads[0].queued_prompt = None;
+        state.threads[0].pi = None;
+        state.threads[0].status = Status::Ready;
+        let mut tx = Tx::default();
+        poll(&mut state, 0.0, &mut tx);
+        assert!(!state.take_restart_request());
+        assert_eq!(state.threads[0].status, Status::Ready);
+        assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn a_restart_needs_a_successful_save_and_a_normal_quit_does_not_relaunch() {
+        let _ = crate::update::take_exit();
+        let mut state = State::new(PathBuf::new(), false);
+        // No stores were started, so the save fails and nothing is recorded.
+        state.updater = crate::update::Updater::test_ready(prepared("v0.10.0"));
+        assert!(state.prepared_exit(true, None).is_err());
+        assert!(crate::update::take_exit().is_none());
+        // With stores saving successfully, a normal quit records an install without relaunch.
+        let mut state = ready_state();
+        state.load_global_for_test();
+        let update = prepared("v0.10.1");
+        state.updater = crate::update::Updater::test_ready(update);
+        state
+            .prepared_exit(false, None)
+            .expect("a ready update with no work saves");
+        let exit = crate::update::take_exit().expect("a normal quit installs the update");
+        assert!(!exit.relaunch);
+        assert_eq!(exit.update.tag, "v0.10.1");
+        // A running thread keeps a normal quit from installing anything.
+        state.threads[0].status = Status::Running;
+        state.updater = crate::update::Updater::test_ready(prepared("v0.10.2"));
+        state.prepared_exit(false, None).unwrap();
+        assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn an_explicit_restart_requires_no_active_work_and_relaunches() {
+        let _ = crate::update::take_exit();
+        let mut state = ready_state();
+        state.load_global_for_test();
+        state.updater = crate::update::Updater::test_ready(prepared("v0.11.0"));
+        state.threads[0].status = Status::Waiting;
+        let mut reply = String::new();
+        assert!(state.prepared_exit(true, Some(&mut reply)).is_err());
+        assert!(reply.contains("thread"));
+        assert!(crate::update::take_exit().is_none());
+        state.threads[0].status = Status::Ready;
+        state
+            .prepared_exit(true, Some(&mut reply))
+            .expect("an idle app restarts");
+        let exit = crate::update::take_exit().expect("the restart is recorded");
+        assert!(exit.relaunch);
+    }
+
+    #[test]
+    fn a_blocked_restart_click_is_dropped_instead_of_restarting_later() {
+        let _ = crate::update::take_exit();
+        let mut state = ready_state();
+        state.load_global_for_test();
+        state.updater = crate::update::Updater::test_ready(prepared("v0.11.1"));
+        state.threads[0].status = Status::Running;
+        state.restart_for_update = true;
+        let mut tx = Tx::default();
+        poll(&mut state, 0.0, &mut tx);
+        assert!(!state.restart_for_update);
+        assert!(state.restart_notice.is_some());
+        assert!(crate::update::take_exit().is_none());
+        // Finishing the run does not restart on its own.
+        state.threads[0].status = Status::Ready;
+        poll(&mut state, 0.0, &mut tx);
+        assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn saved_state_round_trips_drafts_images_tabs_projects_captains_and_sessions() {
+        let mut state = State::new(PathBuf::new(), false);
+        let base = crate::store::directory().unwrap().join("round-trip");
+        std::fs::create_dir_all(&base).unwrap();
+        // Two projects, three threads, two drafts, one image reference and two tabs.
+        state.projects.entries = vec![
+            Project::new(1, base.join("one")),
+            Project::new(2, base.join("two")),
+        ];
+        state.projects.next_id = 3;
+        let mut first = Thread::new(1);
+        first.title = "First".into();
+        first.project = Some(1);
+        first.captain = Some(1);
+        first.session = Some("one.jsonl".into());
+        first.draft.replace_text("unsent draft");
+        // Draft images are references to the deduplicated attachment store.
+        let attachments = crate::attachments::directory().unwrap();
+        std::fs::create_dir_all(&attachments).unwrap();
+        std::fs::write(attachments.join("image-1.png"), b"png").unwrap();
+        first.draft_images.push(Attachment {
+            id: "image-1.png".into(),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            width: 4,
+            height: 4,
+            bytes: 3,
+        });
+        let mut second = Thread::new(2);
+        second.title = "Second".into();
+        second.project = Some(2);
+        second.session = Some("two.jsonl".into());
+        second.draft.replace_text("second draft");
+        let mut third = Thread::new(3);
+        third.title = "Third".into();
+        third.delegated = true;
+        third.project = Some(1);
+        third.parent = Some(1);
+        third.session = Some("three.jsonl".into());
+        state.threads = vec![first, second, third];
+        state.tabs = vec![1, 2];
+        state.active = 1;
+        state.captains[0].name = "Renamed captain".into();
+        let index = state.snapshot();
+        let ui = state.ui_snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&index).unwrap();
+        restored.restore_ui(&ui).unwrap();
+        let draft = |state: &State, id: usize| {
+            let thread = state.threads.iter().find(|t| t.id == id).unwrap();
+            (
+                thread.draft.text.clone(),
+                thread.draft_images.len(),
+                thread.session.clone(),
+                thread.project,
+                thread.title.clone(),
+            )
+        };
+        assert_eq!(
+            draft(&restored, 1),
+            (
+                "unsent draft".to_owned(),
+                1,
+                Some("one.jsonl".into()),
+                Some(1),
+                "First".into()
+            )
+        );
+        assert_eq!(
+            draft(&restored, 2),
+            (
+                "second draft".to_owned(),
+                0,
+                Some("two.jsonl".into()),
+                Some(2),
+                "Second".into()
+            )
+        );
+        assert_eq!(draft(&restored, 3).2, Some("three.jsonl".into()));
+        assert_eq!(restored.tabs, vec![1, 2]);
+        assert_eq!(restored.current().id, 2);
+        assert_eq!(restored.projects.entries.len(), 2);
+        assert_eq!(restored.captains[0].name, "Renamed captain");
+        assert!(
+            restored
+                .threads
+                .iter()
+                .any(|t| t.delegated && t.parent == Some(1))
+        );
     }
 
     fn fake_pi(

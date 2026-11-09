@@ -433,6 +433,22 @@ pub fn clone_command(source: &Source, target: &Path) -> Command {
     command
 }
 
+#[cfg(test)]
+impl CloneJob {
+    /// A clone that is running but never finishes, for guards and UI tests.
+    pub fn test_idle() -> Self {
+        let (tx, events) = channel();
+        std::mem::forget(tx);
+        Self {
+            events,
+            child: Arc::new(Mutex::new(None)),
+            canceled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            target: PathBuf::new(),
+            parent: PathBuf::new(),
+        }
+    }
+}
+
 enum CloneEvent {
     Progress(String),
     Done(Result<(), String>),

@@ -303,9 +303,63 @@ fn main() {
         ],
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
-    .on_close(|state: &mut State, _| state.checkpoint())
-    .on_quit(|state: &mut State, _| state.checkpoint())
+    .on_close(quit_hook)
+    .on_quit(quit_hook)
     .titlebar(rune::Titlebar::new(44.0))
     .run();
     backend::shutdown_all();
+    install_recorded_update();
+}
+
+/// Runs from both quit hooks and is idempotent, so whichever Rune calls first saves and
+/// records. An install is recorded only for an explicit restart or a normal quit with a ready
+/// update and no active work. A window that only hides never installs anything.
+fn quit_hook(state: &mut State, _: &mut Tx) {
+    let quit = rune::quitting();
+    prepare_exit(state, quit);
+}
+
+fn prepare_exit(state: &mut State, quitting: bool) {
+    let explicit = state.take_restart_request();
+    if quitting && explicit {
+        // The click's own quit already saved and recorded the restart.
+        return;
+    }
+    if state.exit_prepared() {
+        return;
+    }
+    state.mark_exit_prepared();
+    if explicit {
+        let mut reply = String::new();
+        if state.prepared_exit(true, Some(&mut reply)).is_err() {
+            state.report_restart_blocker(reply);
+        }
+        return;
+    }
+    state.checkpoint();
+}
+
+/// After Rune and Pi have exited, replace the installed app with a prepared update. A normal
+/// quit installs it without reopening Shina.
+fn install_recorded_update() {
+    let Some(exit) = update::take_exit() else {
+        return;
+    };
+    match update::apply_prepared_update(&exit.update) {
+        Ok(installed) => {
+            if exit.relaunch
+                && let Err(error) = update::relaunch(&installed, &exit.update.target)
+            {
+                eprintln!("Could not reopen Shina: {error}");
+            }
+        }
+        Err(error) => {
+            // The previous app is back in place, and the download stays for the next quit.
+            eprintln!("Could not install the Shina update: {error}");
+            if exit.relaunch {
+                let launcher = exit.update.launcher();
+                let _ = update::relaunch(&launcher, &exit.update.target);
+            }
+        }
+    }
 }

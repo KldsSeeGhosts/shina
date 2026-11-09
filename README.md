@@ -47,7 +47,7 @@ On macOS, install a native app bundle with:
 sh tools/install-macos.sh
 ```
 
-This builds a release executable, installs `/Applications/Shina.app` and registers it with Launch Services. Set `SHINA_MACOS_APP_DIR` to another writable applications folder if needed. The launcher uses the existing Pi/CPA environment without embedding credentials. Mac app updates are manual for now. Reinstalling retains the previous app in `~/Library/Application Support/Shina/App Backups` and preserves conversation data.
+This builds a release executable, installs `/Applications/Shina.app` and registers it with Launch Services. Set `SHINA_MACOS_APP_DIR` to another writable applications folder if needed. The launcher uses the existing Pi/CPA environment without embedding credentials. An update keeps the replaced app beside it as `Shina-app.previous`, and a reinstall retains the previous app in `~/Library/Application Support/Shina/App Backups` when no update copy exists. Conversation data is kept either way.
 
 Install Shina for your Windows account:
 
@@ -58,13 +58,31 @@ cargo build --release
 
 This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start Menu shortcut, registers an Apps & Features entry, and starts the installed copy. The path never changes, so a Start pin or the Caelestia launcher keeps working across updates and development rebuilds. The installed app restores the global project list, threads, tabs and selected thread. Run `shina.exe --uninstall`, or remove Shina in Settings > Apps, to uninstall it. Your data in `%LOCALAPPDATA%\Shina` is kept.
 
-The installed app checks GitHub Releases on startup through the GitHub CLI, using your existing `gh` login, because the repository is private. When a newer version exists, the sidebar shows **Update to vX.Y.Z**. After the download it offers **Restart to install**, which swaps the executable and reopens your workspace. Development builds never update themselves.
+### Automatic updates
 
-To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, then run this from a clean `main`:
+An installed copy of Shina updates itself without a download step. It checks GitHub Releases 15 seconds after start and every 4 minutes after each check, through the GitHub CLI and your existing `gh` login, because the repository is private. When a newer version exists, Shina downloads it in the background, checks its size and SHA-256 against the release (the asset digest, or the release's `SHA256SUMS` file) and prepares the replacement next to the installed app. The sidebar shows a passive **Downloading update vX.Y.Z** row meanwhile, then one **Restart to update to vX.Y.Z** button and nothing else.
+
+The button is disabled while any thread is running, waiting for you, configuring Pi, or has queued messages or an open question, while a repository is cloning, and while a rename or captain editor is open. Composer drafts never block, because they are saved. A restart saves and flushes everything first, swaps the executable or app bundle, and reopens Shina on your last workspace.
+
+You can also just quit normally. If an update is prepared and nothing is active, quitting saves, installs it, and does not reopen Shina. Otherwise the download stays ready for the next quit. A failed install restores the previous build and keeps the verified download for the next attempt.
+
+Checks and downloads that fail quietly retry at the next interval: a missing `gh`, no network, a release without this platform's asset, a partial download or a checksum mismatch never shows an error in a thread. A real authentication denial stops update attempts until you restart Shina and shows the manual remedy, `gh auth login`. Shina never runs a login or stores a token. Development builds, `--demo` runs and snapshot runs never update themselves.
+
+macOS updates need release assets that `release.ps1` did not publish before: a complete `Shina.app` zipped per architecture, as `Shina-macos-aarch64.zip` (Apple silicon) and `Shina-macos-x86_64.zip` (Intel), plus a `SHA256SUMS` file covering every asset. Build a Mac zip on the matching Mac:
+
+```sh
+sh tools/package-macos.sh
+```
+
+It reuses the installer's bundle construction without installing anything and writes `target/release-package/Shina-macos-<arch>.zip`. A Mac app in a folder it cannot write to leaves the update downloaded and never asks for elevation.
+
+To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, build each Mac zip on the matching Mac, then run this from a clean `main`:
 
 ```powershell
-.\tools\release.ps1 -Install
+.\tools\release.ps1 -MacZips <path to>\Shina-macos-aarch64.zip -Install
 ```
+
+The release gets `shina.exe`, the Mac zips and a `SHA256SUMS` file. Without the Mac zips the release still publishes, but installed Macs have no asset to update from.
 
 An optional flag adds or focuses a project on launch without replacing the other projects:
 
