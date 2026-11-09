@@ -95,6 +95,37 @@ pub struct Tool {
     pub done: bool,
     pub failed: bool,
     pub output: String,
+    /// Position in the transcript, including tool calls between text blocks in one message.
+    pub anchor: ToolAnchor,
+    pub expanded: bool,
+    pub group_expanded: bool,
+    pub started: Option<Instant>,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolAnchor {
+    pub message: usize,
+    /// UTF-8 byte offset into the message text. Zero also anchors tool-only messages.
+    pub offset: usize,
+}
+
+impl Tool {
+    fn new(id: &str, name: &str, args: &Value, anchor: ToolAnchor) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            detail: tool_detail(args),
+            done: false,
+            failed: false,
+            output: String::new(),
+            anchor,
+            expanded: false,
+            group_expanded: false,
+            started: None,
+            duration_ms: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +164,6 @@ pub struct Thread {
     pub session: Option<String>,
     pub archived: bool,
     pub unread: bool,
-    pub expanded_tools: bool,
     pub started: Option<Instant>,
     pub elapsed: Option<u64>,
     pub captain: Option<usize>,
@@ -182,7 +212,6 @@ impl Thread {
             session: None,
             archived: false,
             unread: false,
-            expanded_tools: false,
             started: None,
             elapsed: None,
             captain: None,
@@ -471,6 +500,45 @@ impl Thread {
         &mut self.messages[index]
     }
 
+    /// Reuse Pi's content-block order for both restored history and completed live messages.
+    /// Keep Thread.tools flat for existing consumers and record its transcript positions.
+    fn anchor_content_tools(&mut self, content: &Value, message: usize, restored: bool) {
+        let Some(blocks) = content.as_array() else {
+            return;
+        };
+        let mut offset = 0;
+        let mut texts = 0;
+        for block in blocks {
+            if block["type"] == "text" {
+                if let Some(text) = block["text"].as_str() {
+                    offset += text.len() + usize::from(texts > 0);
+                    texts += 1;
+                }
+            } else if block["type"] == "toolCall" {
+                let anchor = ToolAnchor { message, offset };
+                let id = string(block, "id");
+                if !restored
+                    && let Some(tool) = self
+                        .tools
+                        .iter_mut()
+                        .rev()
+                        .find(|tool| tool.id == id && tool.anchor.message == message)
+                {
+                    tool.anchor = anchor;
+                } else {
+                    let mut tool =
+                        Tool::new(id, string(block, "name"), &block["arguments"], anchor);
+                    if restored {
+                        tool.done = true;
+                        tool.failed = true;
+                        tool.output = "No saved result for this tool call.".into();
+                    }
+                    self.tools.push(tool);
+                }
+            }
+        }
+    }
+
     pub fn apply(&mut self, record: Value) {
         match string(&record, "type") {
             "response" => {
@@ -584,6 +652,7 @@ impl Thread {
                             self.assistant = None;
                             for message in messages {
                                 let role = string(message, "role");
+                                let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
                                     let text = content_text(&message["content"]);
                                     if !text.is_empty() {
@@ -599,19 +668,8 @@ impl Thread {
                                         });
                                     }
                                 }
-                                if role == "assistant"
-                                    && let Some(blocks) = message["content"].as_array()
-                                {
-                                    for block in blocks.iter().filter(|b| b["type"] == "toolCall") {
-                                        self.tools.push(Tool {
-                                            id: string(block, "id").into(),
-                                            name: string(block, "name").into(),
-                                            detail: tool_detail(&block["arguments"]),
-                                            done: true,
-                                            failed: true,
-                                            output: "No saved result for this tool call.".into(),
-                                        });
-                                    }
+                                if role == "assistant" {
+                                    self.anchor_content_tools(&message["content"], index, true);
                                 }
                                 if role == "toolResult"
                                     && let Some(tool) = self
@@ -623,6 +681,7 @@ impl Thread {
                                     tool.failed = message["isError"] == true;
                                     tool.output =
                                         truncate(&content_text(&message["content"]), 6000);
+                                    tool.duration_ms = message["durationMs"].as_u64();
                                 }
                             }
                             // A process can accept a prompt before its response reaches us.
@@ -701,10 +760,12 @@ impl Thread {
             "message_end" if record["message"]["role"] == "assistant" => {
                 let message = &record["message"];
                 let text = content_text(&message["content"]);
+                let index = self.assistant.unwrap_or(self.messages.len());
                 if !text.is_empty() {
                     self.assistant().text = text;
                     self.error = None;
                 }
+                self.anchor_content_tools(&message["content"], index, false);
                 if message["stopReason"] != "aborted"
                     && let Some(error) = message["errorMessage"].as_str().filter(|s| !s.is_empty())
                 {
@@ -714,14 +775,19 @@ impl Thread {
             }
             "tool_execution_start" => {
                 self.phase = format!("Running {}", string(&record, "toolName"));
-                self.tools.push(Tool {
-                    id: string(&record, "toolCallId").into(),
-                    name: string(&record, "toolName").into(),
-                    detail: tool_detail(&record["args"]),
-                    done: false,
-                    failed: false,
-                    output: String::new(),
-                });
+                let id = string(&record, "toolCallId");
+                if let Some(tool) = self.tools.iter_mut().rev().find(|tool| tool.id == id) {
+                    tool.started.get_or_insert_with(Instant::now);
+                } else {
+                    let anchor = ToolAnchor {
+                        message: self.assistant.unwrap_or(self.messages.len()),
+                        offset: self.assistant.map_or(0, |i| self.messages[i].text.len()),
+                    };
+                    let mut tool =
+                        Tool::new(id, string(&record, "toolName"), &record["args"], anchor);
+                    tool.started = Some(Instant::now());
+                    self.tools.push(tool);
+                }
             }
             "auto_retry_start" => {
                 self.phase = format!("Retrying, attempt {}", record["attempt"]);
@@ -747,10 +813,16 @@ impl Thread {
                 if let Some(tool) = self
                     .tools
                     .iter_mut()
+                    .rev()
                     .find(|tool| tool.id == string(&record, "toolCallId"))
                 {
                     tool.done = ending;
                     tool.failed = record["isError"] == true;
+                    if ending {
+                        tool.duration_ms = record["durationMs"].as_u64().or_else(|| {
+                            tool.started.map(|start| start.elapsed().as_millis() as u64)
+                        });
+                    }
                     tool.output = truncate(
                         &content_text(if ending {
                             &record["result"]["content"]
@@ -821,6 +893,7 @@ pub struct State {
     /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
     pub zoom: f32,
     pub show_activity: bool,
+    pub activity_full: bool,
     pub show_archive: bool,
     pub sidebar: bool,
     /// Whether the sidebar is shown while the window is too narrow for it to stay docked.
@@ -856,6 +929,7 @@ impl State {
             dark: false,
             zoom: 1.0,
             show_activity: false,
+            activity_full: false,
             show_archive: false,
             sidebar: true,
             compact_sidebar: false,
@@ -1558,7 +1632,8 @@ impl State {
         thread.messages = vec![
             Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into() },
             Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into() },
-            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before the next attempt, so a reconnect cannot register it twice.\n\n1. **Order.** `socket.on(\"reconnect\")` runs before `socket.open()`, so the first event cannot be missed.\n2. **Cleanup.** `teardown()` removes the listener before each retry.\n3. **Test.** `reconnect.test.ts` covers a disconnect during initialization and a second reconnect. Both keep one listener.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe thread is settled. There is no queued follow-up work.".into() },
+            Message { role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into() },
+            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into() },
         ];
         thread.tools = vec![
             Tool {
@@ -1568,6 +1643,11 @@ impl State {
                 done: true,
                 failed: false,
                 output: "Example activity, not a real tool execution.".into(),
+                anchor: ToolAnchor { message: 2, offset: 0 },
+                expanded: false,
+                group_expanded: false,
+                started: None,
+                duration_ms: Some(180),
             },
             Tool {
                 id: "example-2".into(),
@@ -1576,6 +1656,37 @@ impl State {
                 done: true,
                 failed: false,
                 output: "Example activity, not a real tool execution.".into(),
+                anchor: ToolAnchor { message: 2, offset: 0 },
+                expanded: false,
+                group_expanded: false,
+                started: None,
+                duration_ms: Some(120),
+            },
+            Tool {
+                id: "example-3".into(),
+                name: "edit".into(),
+                detail: "src/transport/socket.ts".into(),
+                done: true,
+                failed: false,
+                output: "Example output\nReplaced 2 lines in src/transport/socket.ts.".into(),
+                anchor: ToolAnchor { message: 3, offset: 0 },
+                expanded: false,
+                group_expanded: true,
+                started: None,
+                duration_ms: Some(240),
+            },
+            Tool {
+                id: "example-4".into(),
+                name: "powershell".into(),
+                detail: "npm test -- reconnect.test.ts".into(),
+                done: true,
+                failed: false,
+                output: "Example output\nPASS tests/reconnect.test.ts\n  reconnect lifecycle\n    attaches before opening the socket\n    removes the listener before retrying\n\nTests: 2 passed, 2 total".into(),
+                anchor: ToolAnchor { message: 3, offset: 0 },
+                expanded: false,
+                group_expanded: false,
+                started: None,
+                duration_ms: Some(1100),
             },
         ];
         self.threads.push(thread);
@@ -2322,6 +2433,117 @@ mod tests {
         assert_eq!(thread.tools[0].detail, "example.txt");
         assert_eq!(thread.tools[0].output, "saved output");
         assert!(thread.tools[0].done && !thread.tools[0].failed);
+    }
+    #[test]
+    fn live_tools_stay_between_the_messages_where_they_ran() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Looking now."},{"type":"toolCall","id":"read","name":"read","arguments":{"path":"README.md"}}]}}));
+        thread.apply(json!({"type":"tool_execution_start","toolCallId":"read","toolName":"read","args":{"path":"README.md"}}));
+        thread.apply(json!({"type":"tool_execution_update","toolCallId":"read","partialResult":{"content":[{"type":"text","text":"partial"}]}}));
+        assert_eq!(
+            thread.tools.len(),
+            1,
+            "message blocks and execution events share one call"
+        );
+        assert_eq!(thread.tools[0].output, "partial");
+        assert!(!thread.tools[0].done);
+        thread.apply(json!({"type":"tool_execution_end","toolCallId":"read","durationMs":75,"result":{"content":[{"type":"text","text":"contents"}]},"isError":false}));
+        thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Here is the answer."}]}}));
+        thread.apply(json!({"type":"tool_execution_start","toolCallId":"command","toolName":"powershell","args":{"command":"Get-ChildItem"}}));
+        assert_eq!(
+            thread.tools[0].anchor,
+            ToolAnchor {
+                message: 0,
+                offset: "Looking now.".len()
+            }
+        );
+        assert_eq!(thread.tools[0].duration_ms, Some(75));
+        assert_eq!(
+            thread.tools[1].anchor,
+            ToolAnchor {
+                message: 2,
+                offset: 0
+            }
+        );
+        assert_eq!(thread.messages[1].text, "Here is the answer.");
+    }
+    #[test]
+    fn live_tools_can_anchor_inside_a_streamed_unicode_message() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"message_start","message":{"role":"assistant"}}));
+        thread.apply(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"日本語"}}));
+        thread.apply(json!({"type":"tool_execution_start","toolCallId":"read","toolName":"read","args":{"path":"例.txt"}}));
+        thread.apply(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"\nFinished"}}));
+        thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"日本語"},{"type":"toolCall","id":"read","name":"read","arguments":{"path":"例.txt"}},{"type":"text","text":"Finished"}]}}));
+        assert_eq!(thread.tools.len(), 1);
+        assert_eq!(
+            thread.tools[0].anchor,
+            ToolAnchor {
+                message: 0,
+                offset: "日本語".len()
+            }
+        );
+        assert_eq!(thread.messages[0].text, "日本語\nFinished");
+        thread.apply(json!({"type":"tool_execution_end","toolCallId":"read","result":{"content":[]},"isError":true}));
+        assert!(thread.tools[0].done && thread.tools[0].failed);
+        assert!(thread.tools[0].duration_ms.is_some());
+    }
+    #[test]
+    fn restored_tools_preserve_block_order_and_tool_only_turns() {
+        let mut thread = Thread::new(1);
+        let history = json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[
+            {"role":"user","content":"Read the files"},
+            {"role":"assistant","content":[
+                {"type":"text","text":"First"},
+                {"type":"toolCall","id":"a","name":"read","arguments":{"path":"a.txt"}},
+                {"type":"toolCall","id":"b","name":"read","arguments":{"path":"b.txt"}},
+                {"type":"text","text":"Then"},
+                {"type":"toolCall","id":"c","name":"bash","arguments":{"command":"pwd"}},
+                {"type":"text","text":"Done"}
+            ]},
+            {"role":"toolResult","toolCallId":"b","content":[{"type":"text","text":"b contents"}],"isError":false,"durationMs":40},
+            {"role":"toolResult","toolCallId":"a","content":[{"type":"text","text":"a contents"}],"isError":false},
+            {"role":"assistant","content":[{"type":"toolCall","id":"d","name":"read","arguments":{"path":"d.txt"}}]},
+            {"role":"assistant","content":[{"type":"text","text":"Final reply"}]}
+        ]}});
+        thread.apply(history.clone());
+        thread.tools[0].expanded = true;
+        thread.apply(history);
+        assert_eq!(thread.messages.len(), 3);
+        assert_eq!(thread.messages[1].text, "First\nThen\nDone");
+        let anchors: Vec<_> = thread.tools.iter().map(|tool| tool.anchor).collect();
+        assert_eq!(
+            anchors,
+            vec![
+                ToolAnchor {
+                    message: 1,
+                    offset: 5
+                },
+                ToolAnchor {
+                    message: 1,
+                    offset: 5
+                },
+                ToolAnchor {
+                    message: 1,
+                    offset: 10
+                },
+                ToolAnchor {
+                    message: 2,
+                    offset: 0
+                },
+            ]
+        );
+        assert_eq!(thread.tools[1].output, "b contents");
+        assert_eq!(thread.tools[1].duration_ms, Some(40));
+        assert_eq!(
+            thread.tools[0].duration_ms, None,
+            "restored timings are not invented"
+        );
+        assert!(thread.tools[2].failed, "missing saved results stay visible");
+        assert!(
+            !thread.tools[0].expanded,
+            "restoring rebuilds transient disclosure state"
+        );
     }
     #[test]
     fn rejected_prompt_returns_to_the_draft_and_does_not_claim_it_was_sent() {
