@@ -215,7 +215,7 @@ fn command_for(path: &Path) -> Result<Command, String> {
     }
 }
 
-fn cpa_extension() -> Result<PathBuf, String> {
+fn cpa_extension() -> Result<Option<PathBuf>, String> {
     let agent_directory = env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -223,14 +223,37 @@ fn cpa_extension() -> Result<PathBuf, String> {
                 .map(|home| PathBuf::from(home).join(".pi/agent"))
         })
         .ok_or("Could not find Pi's agent directory. Set PI_CODING_AGENT_DIR.")?;
+    cpa_extension_in(&agent_directory)
+}
+
+fn cpa_extension_in(agent_directory: &Path) -> Result<Option<PathBuf>, String> {
     let extension = agent_directory.join("extensions/cpa-provider.ts");
-    if !extension.is_file() {
-        return Err(format!(
-            "The CPA provider extension is missing at {}. Enroll Pi in cpa-catalog, then retry. Shina will not fall back to a direct provider.",
-            extension.display()
-        ));
+    if extension.is_file() {
+        return Ok(Some(extension));
     }
-    Ok(extension)
+    // Some enrolled hosts use Pi's generated models.json instead of an extension.
+    // Read only enrollment metadata. Pi still owns the routes and credentials, and
+    // Shina's catalog and prompt guards continue to reject every non-CPA provider.
+    let registry = std::fs::read(agent_directory.join("models.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if registry.as_ref().is_some_and(|registry| {
+        let provider = &registry["providers"]["cpa"];
+        provider["baseUrl"]
+            .as_str()
+            .is_some_and(|url| !url.trim().is_empty())
+            && provider["models"].as_array().is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|model| model["id"].as_str().is_some_and(|id| !id.trim().is_empty()))
+            })
+    }) {
+        return Ok(None);
+    }
+    Err(format!(
+        "Pi has no CPA provider extension at {} and no configured CPA models in models.json. Enroll Pi in cpa-catalog, then retry. Shina will not fall back to a direct provider.",
+        extension.display()
+    ))
 }
 
 fn run(
@@ -255,7 +278,9 @@ fn run(
         .stderr(Stdio::piped());
     // Explicit extensions still load with --no-extensions. Load only the user's
     // catalog-backed provider, not unrelated packages, project extensions or MCP.
-    command.arg("--extension").arg(cpa_extension()?);
+    if let Some(extension) = cpa_extension()? {
+        command.arg("--extension").arg(extension);
+    }
     #[cfg(test)]
     {
         std::fs::create_dir_all(&launch.session_directory).map_err(|e| e.to_string())?;
@@ -430,6 +455,33 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpa_enrollment_accepts_generated_models_without_loading_other_extensions() {
+        let directory = crate::store::directory().unwrap();
+        for registry in [
+            json!({}),
+            json!({"providers":{"direct":{"baseUrl":"https://example.invalid","models":[{"id":"x"}]}}}),
+            json!({"providers":{"cpa":{"baseUrl":"http://127.0.0.1:8317/v1","models":[]}}}),
+        ] {
+            std::fs::write(directory.join("models.json"), registry.to_string()).unwrap();
+            assert!(cpa_extension_in(&directory).is_err());
+        }
+        std::fs::write(
+            directory.join("models.json"),
+            json!({
+                "providers":{"cpa":{"baseUrl":"http://127.0.0.1:8317/v1","models":[{"id":"proxy"}]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(cpa_extension_in(&directory).unwrap(), None);
+        let extensions = directory.join("extensions");
+        std::fs::create_dir(&extensions).unwrap();
+        let provider = extensions.join("cpa-provider.ts");
+        std::fs::write(&provider, "// Existing owner-managed provider").unwrap();
+        assert_eq!(cpa_extension_in(&directory).unwrap(), Some(provider));
+    }
 
     #[test]
     fn framing_preserves_unicode_and_accepts_crlf() {

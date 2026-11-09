@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Finder does not inherit the user's Terminal PATH.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+if [[ -z "${SHINA_PI_CLI:-}" ]]; then
+    if [[ -x "$HOME/.local/bin/pi-cpa" ]]; then
+        export SHINA_PI_CLI="$HOME/.local/bin/pi-cpa"
+    elif [[ -x /opt/homebrew/bin/pi ]]; then
+        export SHINA_PI_CLI=/opt/homebrew/bin/pi
+    fi
+fi
+# Use the existing owner-managed environment file. Never copy a credential into the app.
+if [[ -z "${CPA_API_KEY:-}" && -r "$HOME/.config/environment.d/cpa.conf" ]]; then
+    set -a
+    source "$HOME/.config/environment.d/cpa.conf"
+    set +a
+fi
+# An installed Mac app restores its global index instead of opening Finder's working folder.
+exec "${0:A:h}/shina" --workspace "" "$@"

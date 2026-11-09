@@ -41,6 +41,14 @@ cargo build --release
 
 ## Install and update
 
+On macOS, install a native app bundle with:
+
+```sh
+sh tools/install-macos.sh
+```
+
+This builds a release executable, installs `/Applications/Shina.app` and registers it with Launch Services. Set `SHINA_MACOS_APP_DIR` to another writable applications folder if needed. The launcher uses the existing Pi/CPA environment without embedding credentials. Mac app updates are manual for now. Reinstalling retains the previous app in `~/Library/Application Support/Shina/App Backups` and preserves conversation data.
+
 Install Shina for your Windows account:
 
 ```powershell
@@ -120,9 +128,9 @@ Pi reaches the server through a small bridge extension, [`assets/pi/shina-mcp-ex
 
 Pi tools can edit files and execute commands with your account's permissions. This prototype has no sandbox, worktree isolation, or built-in tool approval policy. Do not point it at an untrusted project.
 
-Pi launches with automatic extension discovery, MCP, skills, and prompt templates disabled. Shina explicitly loads only your existing `extensions/cpa-provider.ts` from Pi's agent directory. That extension reads your existing CPA catalog enrollment and credentials and supplies the proxy routes, transport metadata, and reasoning capabilities. No model list or credential is copied into this repository. **Do not use this version if you depend on another Pi extension for safety checks or tool approvals.** The adapter does not rewrite provider configuration or authentication.
+Pi launches with automatic extension discovery, MCP, skills, and prompt templates disabled. When present, Shina explicitly loads your existing `extensions/cpa-provider.ts` from Pi's agent directory. Hosts without that extension can use their existing catalog-generated CPA provider in Pi's `models.json`. Pi's enrollment supplies proxy routes, transport metadata, reasoning capabilities and credentials. No model list or credential is copied into this repository. **Do not use this version if you depend on another Pi extension for safety checks or tool approvals.** The adapter does not rewrite provider configuration or authentication.
 
-Pi must already be enrolled in CPA with `~/.pi/agent/cpa-catalog.json`, its catalog client, and `extensions/cpa-provider.ts`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports a missing provider extension instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. Opening a picker refreshes catalog metadata after five minutes. Running processes read changed provider definitions when Shina next starts them, or after an app restart.
+Pi must already be enrolled in CPA through its provider extension or a configured CPA provider with models in `~/.pi/agent/models.json`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports missing CPA enrollment instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. Opening a picker refreshes catalog metadata after five minutes. Running processes read changed provider definitions when Shina next starts them, or after an app restart.
 
 ### Connection errors after moving CPA
 
