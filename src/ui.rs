@@ -800,13 +800,18 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
                 let mut any = false;
                 for (index, _) in s.threads.iter().enumerate().filter(|(_, t)| {
-                    t.captain == Some(captain)
+                    (t.captain == Some(captain)
+                        || sidebar_parent(s, t).is_some_and(|parent| {
+                            s.threads[parent].captain_home
+                                && s.threads[parent].captain == Some(captain)
+                        }))
                         && !t.captain_home
-                        && !t.pinned
+                        && (!t.pinned || sidebar_parent(s, t).is_some())
                         && !t.archived
-                        && t.title.to_lowercase().contains(&search)
+                        && thread_matches(s, t, &search)
+                        && sidebar_parent(s, t).is_none_or(|parent| s.threads[parent].captain_home)
                 }) {
-                    nested = nested.child(thread_row(s, index, p, true));
+                    nested = nested.child(thread_group(s, index, p, true, &search));
                     any = true;
                 }
                 if any {
@@ -831,7 +836,8 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             t.pinned
                 && t.archived == s.show_archive
                 && !t.captain_home
-                && t.title.to_lowercase().contains(&search)
+                && sidebar_parent(s, t).is_none()
+                && thread_matches(s, t, &search)
         })
         .map(|(i, _)| i)
         .collect();
@@ -851,7 +857,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 ))),
         );
         for index in pinned {
-            content = content.child(thread_row(s, index, p, false));
+            content = content.child(thread_group(s, index, p, false, &search));
         }
     }
     content = content.child(
@@ -884,13 +890,14 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         t.archived == s.show_archive
             && !t.captain_home
             && !t.pinned
-            && t.title.to_lowercase().contains(&search)
+            && sidebar_parent(s, t).is_none()
+            && thread_matches(s, t, &search)
     }) {
         if thread.captain == s.current().captain && thread.captain.is_some() && !s.show_archive {
             continue;
         }
         count += 1;
-        content = content.child(thread_row(s, index, p, false));
+        content = content.child(thread_group(s, index, p, false, &search));
     }
     if count == 0 && !search.is_empty() {
         content = content.child(label("No matching threads", SMALL, p.muted).padding(8.0));
@@ -1144,6 +1151,46 @@ fn counter(count: usize, p: Palette) -> El {
             Color::WHITE,
         ))
 }
+fn sidebar_parent(s: &State, thread: &crate::model::Thread) -> Option<usize> {
+    s.threads.iter().position(|parent| {
+        Some(parent.id) == thread.parent
+            && parent.archived == s.show_archive
+            && (!parent.captain_home || (!s.show_archive && parent.captain == s.current().captain))
+    })
+}
+
+fn thread_matches(s: &State, thread: &crate::model::Thread, search: &str) -> bool {
+    thread.title.to_lowercase().contains(search)
+        || s.threads.iter().any(|child| {
+            child.parent == Some(thread.id)
+                && child.archived == s.show_archive
+                && child.title.to_lowercase().contains(search)
+        })
+}
+
+fn thread_group(s: &State, index: usize, p: Palette, nested: bool, search: &str) -> El {
+    let mut group = col().child(thread_row(s, index, p, nested));
+    let mut children = col()
+        .ml(19.0)
+        .pl(13.0)
+        .gap(1.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
+    let mut any = false;
+    for (child, thread) in s.threads.iter().enumerate() {
+        if sidebar_parent(s, thread) == Some(index)
+            && thread.archived == s.show_archive
+            && thread.title.to_lowercase().contains(search)
+        {
+            children = children.child(thread_row(s, child, p, true));
+            any = true;
+        }
+    }
+    if any {
+        group = group.child(children);
+    }
+    group
+}
+
 fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let thread = &s.threads[index];
     let selected = index == s.active;
@@ -1734,6 +1781,19 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                         .radius(10.0)
                         .fill(if s.dark { p.card } else { color("#ededf0") }),
                 )
+            } else if message.role == "Shina" {
+                col()
+                    .gap(4.0)
+                    .px(12.0)
+                    .py(8.0)
+                    .radius(6.0)
+                    .fill(p.teal_bg)
+                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.teal))
+                    .child(
+                        label(message.display_text(), body_style(wide), p.ink)
+                            .wrap_anywhere()
+                            .selectable(true),
+                    )
             } else {
                 let style = MarkdownStyle::neutral(s.dark)
                     .text(p.ink)
@@ -2382,6 +2442,52 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn delegated_children_follow_their_parent_in_the_sidebar() {
+        let mut rt = runtime(1280.0);
+        rt.state.threads[0].title = "Parent".into();
+        rt.state.threads[0].pinned = true;
+        let mut child = crate::model::Thread::new(2);
+        child.title = "Delegated child".into();
+        child.parent = Some(1);
+        child.delegated = true;
+        child.captain = Some(2);
+        child.pinned = true;
+        rt.state.threads.push(child);
+        rt.frame(0.0);
+        let (parent, _) = rt.presented("thread-1").unwrap();
+        let (child, _) = rt.presented("thread-2").unwrap();
+        assert!(child[0] > parent[0] && child[1] > parent[1]);
+        rt.state.search.replace_text("Delegated");
+        rt.frame(0.0);
+        assert!(
+            rt.presented("thread-1").is_some(),
+            "a matching child keeps its parent visible"
+        );
+        press(&mut rt, "thread-2");
+        assert_eq!(rt.state.current().id, 2);
+        assert!(rt.presented("thread-2").is_some());
+    }
+
+    #[test]
+    fn cross_captain_children_of_a_home_are_visible_and_archived_children_still_have_rows() {
+        let mut rt = runtime(1280.0);
+        rt.state.open_captain(0);
+        let parent = rt.state.current().id;
+        let mut child = crate::model::Thread::new(3);
+        child.title = "Cross captain child".into();
+        child.parent = Some(parent);
+        child.delegated = true;
+        child.captain = Some(1);
+        rt.state.threads.push(child);
+        rt.frame(0.0);
+        assert!(rt.presented("thread-3").is_some());
+        rt.state.threads.last_mut().unwrap().archived = true;
+        rt.state.show_archive = true;
+        rt.frame(0.0);
+        assert!(rt.presented("thread-3").is_some());
+    }
+
     #[test]
     fn pinned_captain_child_has_one_row_and_retains_its_draft() {
         let mut rt = runtime(1280.0);

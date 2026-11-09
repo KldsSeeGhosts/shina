@@ -35,8 +35,13 @@ Ordinary coding tasks need no Shina tools.
 captain unless you name another. Use it for parallel, self-contained work, and give the new \
 thread a complete brief: it has no access to this conversation. A delegated thread cannot \
 delegate further.
-- `mcp__shina__task_status` reports a delegated thread's status and latest reply. It returns \
-immediately; check again later instead of calling it in a tight loop.
+- After delegating, end your turn to await results. Shina wakes you with each child's final \
+status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
+after your current work. These messages are labeled Shina, not user instructions.
+- `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
+A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop.
+- `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
+corrections or follow-up work. Only the parent may control a child.
 - `mcp__shina__list_threads`, `mcp__shina__read_thread`, and `mcp__shina__list_captains` read \
 the user's other conversations and crew. Read a thread before you answer a question about it.";
 
@@ -160,10 +165,11 @@ impl Server {
 
 pub fn tools() -> Value {
     let id = json!({"type":"integer","description":"A Shina thread id from list_threads or delegate_task."});
+    let wait = json!({"type":"integer","minimum":0,"maximum":600,"default":0,"description":"Wait up to this many seconds for completion without blocking Shina. Default 0 returns immediately. Results also wake the parent."});
     json!([
         {
             "name": "list_threads",
-            "description": "List the user's Shina threads with their ids, titles, captains, and status.",
+            "description": "List the user's Shina threads with their ids, titles, parents, captains, and status.",
             "inputSchema": {"type":"object","properties":{
                 "include_archived": {"type":"boolean","description":"Include archived threads. Default false."}
             }},
@@ -186,18 +192,32 @@ pub fn tools() -> Value {
         },
         {
             "name": "delegate_task",
-            "description": "Start independent work in a new Shina thread. The new thread does not see this conversation, so write a complete brief. Returns its thread_id at once; use task_status to follow it.",
+            "description": "Delegate independent work to a new child with a complete brief and no parent history. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
-                "captain": {"type":"string","description":"A captain's name from list_captains. Defaults to this thread's captain."}
+                "captain": {"type":"string","description":"A captain's name from list_captains. Defaults to this thread's captain."},
+                "wait_seconds": wait
             },"required":["prompt"]}
         },
         {
             "name": "task_status",
-            "description": "Report a thread's status (connecting, working, needs input, failed, done, idle) and its latest reply. Returns immediately.",
-            "inputSchema": {"type":"object","properties":{"thread_id": id},"required":["thread_id"]},
+            "description": "Read a thread's parent, status, latest reply and error. Optionally wait for completion or timeout. Do not poll running children in a loop; completion wakes their parent.",
+            "inputSchema": {"type":"object","properties":{"thread_id": id,"wait_seconds":wait},"required":["thread_id"]},
             "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "task_cancel",
+            "description": "Clear queued work and abort a child you delegated. Only its parent may cancel it.",
+            "inputSchema": {"type":"object","properties":{"thread_id":id},"required":["thread_id"]}
+        },
+        {
+            "name": "task_send",
+            "description": "Send corrections or follow-up work to a child you delegated. Starts idle children; queues after current work for busy children. Only its parent may send.",
+            "inputSchema": {"type":"object","properties":{
+                "thread_id":id,
+                "message":{"type":"string","description":"The correction or follow-up brief."}
+            },"required":["thread_id","message"]}
         }
     ])
 }
@@ -294,8 +314,8 @@ fn serve(stream: TcpStream, server: &Server, requests: &Sender<Request>) -> std:
             } else {
                 (server.wake.lock().expect("mcp waker"))();
                 let outcome = answer
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap_or_else(|_| Err("Shina did not answer within 60 seconds.".into()));
+                    .recv_timeout(Duration::from_secs(630))
+                    .unwrap_or_else(|_| Err("Shina did not answer within 630 seconds.".into()));
                 Ok(match outcome {
                     Ok(value) => json!({
                         "content": [{"type":"text","text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
@@ -388,7 +408,7 @@ mod tests {
 
     #[test]
     fn authenticates_lists_tools_and_routes_calls_to_the_ui_thread() {
-        let server = server(Arc::new(|| {})).unwrap();
+        let server = start().unwrap();
         let token = server.token_for(7);
         assert_eq!(server.token_for(7), token);
         let (status, _) = post(
