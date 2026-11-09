@@ -51,14 +51,9 @@ const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 /// Writes the Pi bridge extension under `%LOCALAPPDATA%\Shina\pi` and returns its path.
 /// The file is rewritten only when this build's copy differs.
 pub fn extension_path() -> Result<std::path::PathBuf, String> {
-    let base = std::env::var_os(if cfg!(windows) {
-        "LOCALAPPDATA"
-    } else {
-        "HOME"
-    })
-    .map(std::path::PathBuf::from)
-    .ok_or("Could not find a folder for Shina's Pi extension.")?;
-    let dir = base.join("Shina").join("pi");
+    let base =
+        crate::store::directory().ok_or("Could not find a folder for Shina's Pi extension.")?;
+    let dir = base.join("pi");
     let path = dir.join("shina-mcp-extension.ts");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(EXTENSION) {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

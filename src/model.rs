@@ -166,6 +166,7 @@ pub enum ProjectScope {
 pub enum ProjectPicker {
     NewThread,
     Scope,
+    AssignCaptain,
 }
 
 pub struct Thread {
@@ -1240,7 +1241,7 @@ impl State {
         let workspace = if workspace.as_os_str().is_empty() {
             workspace
         } else {
-            workspace.canonicalize().unwrap_or(workspace)
+            crate::projects::normalize_path(&workspace)
         };
         let artwork = crate::visuals::Artwork::load(&workspace);
         let mut state = Self {
@@ -2170,14 +2171,14 @@ impl State {
     }
     pub fn add_project(&mut self, path: PathBuf) -> Result<ProjectId, String> {
         let path = match path.canonicalize() {
-            Ok(path) if path.is_dir() => path,
+            Ok(path) if path.is_dir() => crate::projects::clean_path(&path),
             _ => return Err("That project folder could not be opened.".into()),
         };
         let id = if let Some(project) = self
             .projects
             .entries
             .iter_mut()
-            .find(|p| p.path == path && p.machine == "local")
+            .find(|p| crate::projects::same_path(&p.path, &path) && p.machine == "local")
         {
             project.hidden = false;
             project.updated = crate::projects::now();
@@ -2291,7 +2292,31 @@ impl State {
             .iter()
             .map(Project::from_value)
             .collect();
-        let projects = projects.ok_or("Invalid project record.")?;
+        let mut canonical_projects: Vec<Project> = Vec::new();
+        let mut project_remap = std::collections::HashMap::new();
+        let mut maximum_project_id = 0;
+        for project in projects.ok_or("Invalid project record.")? {
+            maximum_project_id = maximum_project_id.max(project.id);
+            if project_remap.contains_key(&project.id) {
+                return Err("Duplicate project ids.".into());
+            }
+            if let Some(existing) = canonical_projects.iter_mut().find(|existing| {
+                existing.machine == project.machine
+                    && crate::projects::same_path(&existing.path, &project.path)
+            }) {
+                project_remap.insert(project.id, existing.id);
+                existing.hidden &= project.hidden;
+                existing.updated = existing.updated.max(project.updated);
+                if existing.captain.is_none() {
+                    existing.captain = project.captain;
+                    existing.captain_thread = project.captain_thread;
+                }
+            } else {
+                project_remap.insert(project.id, project.id);
+                canonical_projects.push(project);
+            }
+        }
+        let projects = canonical_projects;
         let project_ids: std::collections::HashSet<_> = projects.iter().map(|p| p.id).collect();
         if project_ids.len() != projects.len() {
             return Err("Duplicate project ids.".into());
@@ -2308,7 +2333,8 @@ impl State {
                     thread.project = if record["project"].is_null() {
                         None
                     } else {
-                        Some(usize::try_from(record["project"].as_u64()?).ok()?)
+                        let original = usize::try_from(record["project"].as_u64()?).ok()?;
+                        Some(*project_remap.get(&original)?)
                     };
                     thread.machine = record["machine"].as_str()?.into();
                     thread.updated = record["updated"].as_u64().unwrap_or(0);
@@ -2394,10 +2420,7 @@ impl State {
                 &index["nextId"],
                 restored.iter().map(|t| t.id).max().unwrap_or(0),
             )?;
-            let next_project = next_counter(
-                &index["nextProjectId"],
-                projects.iter().map(|p| p.id).max().unwrap_or(0),
-            )?;
+            let next_project = next_counter(&index["nextProjectId"], maximum_project_id)?;
             self.threads = restored;
             self.captains = captains;
             self.projects.entries = projects;
@@ -2439,6 +2462,7 @@ impl State {
             _ => index["projectScope"]
                 .as_u64()
                 .and_then(|id| usize::try_from(id).ok())
+                .and_then(|id| project_remap.get(&id).copied())
                 .filter(|id| project_ids.contains(id))
                 .map(ProjectScope::Project)
                 .unwrap_or(ProjectScope::All),
@@ -4105,6 +4129,7 @@ mod tests {
         let missing = directory.join("disconnected-drive");
         fs::create_dir(&a).unwrap();
         fs::create_dir(&b).unwrap();
+        fs::create_dir(&missing).unwrap();
         fs::write(
             directory.join("projects.json"),
             json!({"projects":[{"path":a},{"path":b}]}).to_string(),
@@ -4342,6 +4367,30 @@ mod tests {
         assert!(ids(&state).is_empty());
         state.show_archive = true;
         assert_eq!(ids(&state), vec![3]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restoring_and_focusing_verbatim_paths_keeps_one_project_and_its_threads() {
+        let state = State::new(".".into(), false);
+        let clean = state.projects.entries[0].path.clone();
+        let verbatim = clean.canonicalize().unwrap();
+        let mut index = state.snapshot();
+        let mut duplicate = index["projects"][0].clone();
+        duplicate["id"] = 2.into();
+        duplicate["path"] = verbatim.to_string_lossy().as_ref().into();
+        index["projects"].as_array_mut().unwrap().push(duplicate);
+        index["threads"][0]["project"] = 2.into();
+        index["projectScope"] = 2.into();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&index).unwrap();
+        assert_eq!(restored.projects.entries.len(), 1);
+        assert_eq!(restored.projects.entries[0].path, clean);
+        assert_eq!(restored.current().project, Some(1));
+        assert_eq!(restored.project_scope, ProjectScope::Project(1));
+        assert_eq!(restored.add_project(verbatim).unwrap(), 1);
+        assert_eq!(restored.projects.entries.len(), 1);
+        assert!(restored.projects.next_id > 2);
     }
 
     #[test]

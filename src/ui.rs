@@ -758,7 +758,13 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     let mut content = col().pb(12.0).gap(1.0);
     let search = s.search.text.to_lowercase();
     if !s.show_archive {
-        content = content.child(section_title("Captains", p));
+        content = content.child(section_title("Captains", p).child(icon_button(
+            "assign-captain",
+            "Assign captain to a project",
+            "plus",
+            p,
+            |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
+        )));
         for id in s.sorted_projects() {
             let project = s.project(Some(id)).expect("sorted project");
             if let Some(captain) = project.captain {
@@ -780,16 +786,6 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                         .child(status_mark(status, p, 6.0)),
                     );
                 }
-            } else {
-                content = content.child(
-                    menu_item(
-                        &format!("choose-project-captain-{id}"),
-                        &format!("Choose Captain · {}", project.name),
-                        "grid",
-                        p,
-                    )
-                    .on_press(move |s: &mut State| s.choose_project_captain(id)),
-                );
             }
         }
     }
@@ -1447,7 +1443,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     if thread.status.busy() || thread.status == Status::Failed {
         meta = meta.child(status_mark(thread.status, p, 5.0));
     }
-    meta = meta.child(label(relative_time(thread.updated), SMALL, p.muted));
+    if let Some(age) = relative_time(thread.updated) {
+        meta = meta.child(label(age, SMALL, p.muted).key(format!("thread-age-{id}")));
+    }
     if let Some(parent) = thread.parent {
         meta = meta.child(label(format!("#{parent}"), SMALL, p.muted));
     } else if let Some(captain) = thread.captain.filter(|_| !s.is_captain_home(thread)) {
@@ -1456,14 +1454,17 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     item.child(title).child(meta)
 }
 
-fn relative_time(updated: u64) -> String {
+fn relative_time(updated: u64) -> Option<String> {
+    if updated == 0 {
+        return None;
+    }
     let seconds = crate::projects::now().saturating_sub(updated);
-    match seconds {
+    Some(match seconds {
         0..60 => "now".into(),
         60..3600 => format!("{}m", seconds / 60),
         3600..86400 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86400),
-    }
+    })
 }
 
 fn captain_picker(s: &State, p: Palette) -> El {
@@ -2098,10 +2099,10 @@ fn project_picker(s: &State, p: Palette) -> El {
                 .center_y()
                 .child(
                     label(
-                        if mode == ProjectPicker::Scope {
-                            "Show threads in"
-                        } else {
-                            "New thread in"
+                        match mode {
+                            ProjectPicker::Scope => "Show threads in",
+                            ProjectPicker::NewThread => "New thread in",
+                            ProjectPicker::AssignCaptain => "Assign captain to",
                         },
                         LABEL,
                         p.ink,
@@ -2124,22 +2125,26 @@ fn project_picker(s: &State, p: Palette) -> El {
             }),
         );
     }
-    card = card.child(
-        menu_item("choose-no-project", "No project", "thread", p).on_press(move |s: &mut State| {
-            if mode == ProjectPicker::NewThread {
-                s.new_thread_in(None);
-            } else {
-                s.project_scope = ProjectScope::NoProject;
-                s.project_picker = None;
-            }
-        }),
-    );
+    if mode != ProjectPicker::AssignCaptain {
+        card = card.child(
+            menu_item("choose-no-project", "No project", "thread", p).on_press(
+                move |s: &mut State| {
+                    if mode == ProjectPicker::NewThread {
+                        s.new_thread_in(None);
+                    } else {
+                        s.project_scope = ProjectScope::NoProject;
+                        s.project_picker = None;
+                    }
+                },
+            ),
+        );
+    }
     let mut choices = col().min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
     for id in s.sorted_projects() {
         let project = s.project(Some(id)).expect("sorted project");
-        if project.hidden {
+        if project.hidden || (mode == ProjectPicker::AssignCaptain && project.captain.is_some()) {
             continue;
         }
         let target = RowTarget::Project(id);
@@ -2153,11 +2158,11 @@ fn project_picker(s: &State, p: Palette) -> El {
                         .grow(1.0)
                         .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
                         .on_press(move |s: &mut State| {
-                            if mode == ProjectPicker::NewThread {
-                                s.new_thread_in(Some(id));
-                            } else {
-                                s.project_scope = ProjectScope::Project(id);
-                                s.project_picker = None;
+                            s.project_picker = None;
+                            match mode {
+                                ProjectPicker::NewThread => s.new_thread_in(Some(id)),
+                                ProjectPicker::Scope => s.project_scope = ProjectScope::Project(id),
+                                ProjectPicker::AssignCaptain => s.choose_project_captain(id),
                             }
                         }),
                 )
@@ -3684,10 +3689,56 @@ pub(crate) mod tests {
         assert!(rt.state.current().work[0].expanded);
     }
     #[test]
+    fn captain_assignment_has_one_control_and_no_per_project_placeholders() {
+        let mut rt = runtime(1280.0);
+        for id in 2..=8 {
+            rt.state
+                .projects
+                .entries
+                .push(crate::projects::Project::new(
+                    id,
+                    rt.state.data_dir.join(format!("project-{id}")),
+                ));
+        }
+        rt.state.projects.next_id = 9;
+        rt.frame(0.0);
+        assert!(rt.find("assign-captain").is_some());
+        for id in 1..=8 {
+            assert!(rt.find(&format!("choose-project-captain-{id}")).is_none());
+        }
+        press(&mut rt, "assign-captain");
+        assert_eq!(rt.state.project_picker, Some(ProjectPicker::AssignCaptain));
+        assert!(rt.find("choose-no-project").is_none());
+        press(&mut rt, "choose-project-3");
+        press(&mut rt, "choose-captain-0");
+        assert_eq!(rt.state.project(Some(3)).unwrap().captain, Some(0));
+        assert_eq!(rt.state.current().project, Some(3));
+        assert!(rt.find("thread-2").is_some());
+        press(&mut rt, "assign-captain");
+        assert!(rt.find("choose-project-3").is_none());
+        assert!(rt.find("choose-project-1").is_some());
+    }
+
+    #[test]
+    fn unknown_activity_does_not_render_an_epoch_age() {
+        assert_eq!(relative_time(0), None);
+        assert_eq!(relative_time(crate::projects::now()), Some("now".into()));
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().updated = 0;
+        rt.frame(0.0);
+        assert!(rt.find("thread-age-1").is_none());
+        rt.state.current_mut().updated = crate::projects::now();
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.find("thread-age-1").is_some());
+    }
+
+    #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
-        press(&mut rt, "choose-project-captain-1");
+        press(&mut rt, "assign-captain");
+        press(&mut rt, "choose-project-1");
         assert!(rt.state.captain_picker);
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-captain-2");
@@ -3705,7 +3756,8 @@ pub(crate) mod tests {
     fn fourth_captain_opens_from_the_picker() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
-        press(&mut rt, "choose-project-captain-1");
+        press(&mut rt, "assign-captain");
+        press(&mut rt, "choose-project-1");
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-captain-3");
         assert_eq!(rt.state.current().captain, Some(3));
@@ -3717,7 +3769,8 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.state.current_mut().draft.replace_text("Keep this draft");
         rt.frame(0.0);
-        press(&mut rt, "choose-project-captain-1");
+        press(&mut rt, "assign-captain");
+        press(&mut rt, "choose-project-1");
         rt.frame(1.0);
         press(&mut rt, "picker-new-captain");
         assert!(rt.state.captain_editor.is_some());

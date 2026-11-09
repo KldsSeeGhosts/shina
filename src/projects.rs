@@ -41,6 +41,7 @@ pub struct Project {
 
 impl Project {
     pub fn new(id: ProjectId, path: PathBuf) -> Self {
+        let path = normalize_path(&path);
         Self {
             id,
             name: display_name(&path),
@@ -107,6 +108,35 @@ pub fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Strip only filesystem verbatim disk/UNC prefixes, not Windows device namespaces.
+pub fn clean_path(path: &Path) -> PathBuf {
+    if let Some(text) = path.to_str() {
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(disk) = text.strip_prefix(r"\\?\")
+            && disk.as_bytes().get(1..3) == Some(b":\\")
+        {
+            return PathBuf::from(disk);
+        }
+    }
+    path.to_path_buf()
+}
+
+pub fn normalize_path(path: &Path) -> PathBuf {
+    clean_path(&path.canonicalize().unwrap_or_else(|_| clean_path(path)))
+}
+
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    let left = normalize_path(left);
+    let right = normalize_path(right);
+    if cfg!(windows) {
+        left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+    } else {
+        left == right
+    }
 }
 
 pub fn now() -> u64 {
@@ -734,6 +764,22 @@ pub fn pick_clone_parent(s: &mut State, tx: &mut Tx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_paths_drop_verbatim_prefixes_without_changing_devices() {
+        assert_eq!(
+            clean_path(Path::new(r"\\?\D:\AiStack\shina")),
+            PathBuf::from(r"D:\AiStack\shina")
+        );
+        assert_eq!(
+            clean_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            clean_path(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume1")),
+            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1")
+        );
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir =
