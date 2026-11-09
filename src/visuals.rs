@@ -14,6 +14,8 @@ use std::{
 };
 
 /// Display names, in the same order as the captain indices used by threads.
+/// Portrait names in the captain editor describe the art, not a captain identity.
+pub const PORTRAIT_NAMES: [&str; 4] = ["Copper", "Mint", "Indigo", "Gold"];
 pub const CAPTAIN_NAMES: [&str; 4] = ["Ember", "Juniper", "Sable", "Pip"];
 /// Folder names used by the sprite-set loader.
 pub const CAPTAIN_KEYS: [&str; 4] = ["ember", "juniper", "sable", "pip"];
