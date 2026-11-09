@@ -438,19 +438,37 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
     let zoom = s.zoom.clamp(0.5, 2.0);
+    let leading = if chrome.leading > 0.0 {
+        (chrome.leading + 8.0) / zoom
+    } else {
+        8.0
+    };
     let frame = cx.layout_with("zoom-frame", |r| (r[2], r[3]));
     // One strip at the titlebar's height holds the sidebar header, tabs, actions, and the
     // window's caption buttons, so they share a centre line and never overlap the pane.
     let mut top = row()
         .key("top-strip")
+        // Native controls move immediately on fullscreen and chrome changes.
+        // Titlebar content must not animate through their reserved area.
+        .instant_changes()
         .h(chrome.height.max(40.0 * zoom) / zoom)
         .window_drag()
         .center_y()
         .pl(8.0)
         .pr((chrome.trailing / zoom).max(8.0));
     if docked {
-        top = top.child(sidebar_header(s, p, compact).w(sidebar_width).pr(16.0));
+        // Keep tabs aligned with the pane while reserving native controls inside
+        // the sidebar header. At small zoom levels, keep actions and omit the logo.
+        let padding = (leading - 8.0).max(8.0);
+        let show_logo = sidebar_width - padding - 16.0 >= 72.0;
+        top = top.child(
+            sidebar_header(s, p, compact, show_logo)
+                .w(sidebar_width)
+                .pl(padding)
+                .pr(16.0),
+        );
     } else {
+        top = top.pl(leading.max(8.0));
         top = top.child(sidebar_toggle(p, compact));
     }
     top = top.child(header(s, p, narrow, compact).grow(1.0).min_w(0.0));
@@ -739,12 +757,10 @@ fn sidebar_toggle(p: Palette, compact: bool) -> El {
 }
 
 /// Sidebar controls share the title strip's centre line with tabs and window controls.
-fn sidebar_header(s: &State, p: Palette, compact: bool) -> El {
-    row()
-        .h(36.0)
-        .center_y()
-        .px(8.0)
-        .child(
+fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
+    let mut header = row().h(36.0).center_y().px(8.0);
+    if show_logo {
+        header = header.child(
             el().key("shina-logo")
                 .size(24.0, 24.0)
                 .radius(6.0)
@@ -758,7 +774,9 @@ fn sidebar_header(s: &State, p: Palette, compact: bool) -> El {
                     }
                     .pixels(),
                 ),
-        )
+        );
+    }
+    header
         .child(spacer())
         .child(icon_button(
             "search-toggle",
@@ -4948,6 +4966,63 @@ pub(crate) mod tests {
         rt.frame(10.0);
         assert!(rt.presented("sidebar").is_some());
     }
+
+    #[test]
+    fn native_traffic_light_space_is_reserved_across_sidebar_modes_and_zoom() {
+        for width in [620.0, 1280.0] {
+            for zoom in [0.67, 1.0, 1.25, 2.0] {
+                for sidebar in [false, true] {
+                    let mut rt = runtime(width);
+                    rt.state.populate_demo();
+                    rt.state.zoom = zoom;
+                    rt.state.sidebar = sidebar;
+                    rt.state.compact_sidebar = sidebar;
+                    let mut chrome = rune::ChromeInsets::default();
+                    chrome.leading = 80.0;
+                    chrome.height = 44.0;
+                    rt.set_chrome_insets(chrome);
+                    rt.frame(0.0);
+                    rt.frame(0.25);
+                    for key in [
+                        "shina-logo",
+                        "search-toggle",
+                        "sidebar-toggle",
+                        "active-tab",
+                    ] {
+                        if let Some((rect, _)) = rt.presented(key) {
+                            assert!(
+                                rect[0] >= 87.5,
+                                "{key} overlaps traffic lights at width {width}, zoom {zoom}, sidebar {sidebar}: {rect:?}"
+                            );
+                        }
+                    }
+                    assert!(rt.presented("sidebar-toggle").is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_controls_keep_docked_tabs_aligned_and_release_space_in_fullscreen() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        let original_logo = rt.presented("shina-logo").unwrap().0;
+        let original_tab = rt.presented("active-tab").unwrap().0;
+        let original_pane = rt.presented("chat-pane").unwrap().0;
+        let mut chrome = rune::ChromeInsets::default();
+        chrome.leading = 80.0;
+        chrome.height = 44.0;
+        rt.set_chrome_insets(chrome);
+        rt.frame(0.25);
+        assert!(rt.presented("shina-logo").unwrap().0[0] >= 88.0);
+        assert_eq!(rt.presented("active-tab").unwrap().0[0], original_tab[0]);
+        assert_eq!(rt.presented("chat-pane").unwrap().0[0], original_pane[0]);
+        rt.set_chrome_insets(rune::ChromeInsets::default());
+        rt.frame(0.5);
+        assert_eq!(rt.presented("shina-logo").unwrap().0[0], original_logo[0]);
+    }
+
     #[test]
     fn narrow_session_panel_can_close_without_hiding_the_composer_permanently() {
         let mut rt = runtime(620.0);
