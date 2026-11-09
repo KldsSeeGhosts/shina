@@ -27,7 +27,7 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#191919"),
+            bg: color("#161616"),
             panel: color("#242424"),
             card: color("#2d2d2d"),
             line: Color::WHITE.alpha(0.10),
@@ -39,7 +39,7 @@ fn palette(dark: bool) -> Palette {
             gold: color("#d3ba6b"),
             danger: color("#f0a39c"),
             on_teal: color("#0d1f1e"),
-            badge_ring: color("#191919"),
+            badge_ring: color("#161616"),
             field_line: color("#56565c"),
         }
     } else {
@@ -217,6 +217,9 @@ fn icon(kind: &str, ink: Color) -> El {
     };
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
 }
+fn tool_icon(kind: &str, ink: Color) -> El {
+    icon(kind, ink).size(16.0, 16.0)
+}
 fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
     row()
         .key(key)
@@ -283,7 +286,7 @@ fn icon_button(
         .radius(5.0)
         .hover(p.selected)
         .on_press(action)
-        .child(icon(glyph, p.muted))
+        .child(tool_icon(glyph, p.muted))
 }
 fn status_ink(status: Status, p: Palette) -> Color {
     match status {
@@ -618,7 +621,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     s.begin_new_captain()
                 })),
         );
-        for captain in (0..s.captains.len()).rev() {
+        for captain in 0..s.captains.len() {
             let state = s.captain_status(captain);
             let selected = s.current().captain == Some(captain);
             let unread = s
@@ -664,17 +667,9 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     move |s| s.edit_captain(captain),
                 ));
             }
-            captain_row = captain_row.child(match state {
-                Status::Waiting => icon("alert", p.gold),
-                Status::Running => el()
-                    .size(6.0, 6.0)
-                    .radius(3.0)
-                    .mr(4.0)
-                    .fill(status_ink(state, p)),
-                Status::Failed => icon("close", p.danger),
-                Status::Settled => icon("check", p.teal),
-                _ => el(),
-            });
+            if state == Status::Settled {
+                captain_row = captain_row.child(icon("check", p.teal));
+            }
             content = content.child(captain_row);
             if selected {
                 let mut nested = col()
@@ -921,12 +916,14 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
         .radius(radius)
         .clip_rounded(radius)
         .border(
-            if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+            if size >= 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed)
+            {
                 1.0
             } else {
                 0.5
             },
-            if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+            if size >= 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed)
+            {
                 status_ink(status, p)
             } else {
                 p.line
@@ -945,15 +942,27 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
         portrait = portrait.opacity(0.62);
     }
     if size < 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed) {
-        let dot = (size * 0.36).clamp(6.0, 8.0);
-        return el().size(size, size).child(portrait).child(
-            el().absolute(size - dot + 1.5, size - dot + 1.5)
-                .size(dot, dot)
+        // Working is a filled dot, Needs you a hollow ring, Failed a square.
+        let dot = (size * 0.32).clamp(6.0, 7.5);
+        let badge = el()
+            .absolute(size - dot + 1.0, size - dot + 1.0)
+            .size(dot, dot)
+            .a11y_hidden();
+        let badge = match status {
+            Status::Waiting => badge
+                .radius(dot / 2.0)
+                .fill(p.badge_ring)
+                .border(2.0, status_ink(status, p)),
+            Status::Failed => badge
+                .radius(1.5)
+                .fill(status_ink(status, p))
+                .border(1.0, p.badge_ring),
+            _ => badge
                 .radius(dot / 2.0)
                 .fill(status_ink(status, p))
-                .border(1.5, p.badge_ring)
-                .a11y_hidden(),
-        );
+                .border(1.0, p.badge_ring),
+        };
+        return el().size(size, size).child(portrait).child(badge);
     }
     portrait
 }
@@ -1086,7 +1095,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     |s| s.captain_picker = false,
                 )),
         );
-    for captain in (0..s.captains.len()).rev() {
+    for captain in 0..s.captains.len() {
         let state = s.captain_status(captain);
         let open = s.current().captain == Some(captain);
         card = card.child(
@@ -1365,17 +1374,7 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 .fill(p.card)
                 .border(0.5, p.line)
                 .child(if let Some(captain) = s.current().captain {
-                    avatar(
-                        s,
-                        p,
-                        captain,
-                        20.0,
-                        if s.current().captain_home {
-                            s.captain_status(captain)
-                        } else {
-                            s.current().status
-                        },
-                    )
+                    avatar(s, p, captain, 20.0, s.current().status)
                 } else {
                     icon("thread", p.muted)
                 })
@@ -1518,11 +1517,6 @@ fn conversation(s: &State, p: Palette) -> El {
                                 ),
                                 SMALL,
                                 p.muted,
-                            ))
-                            .child(label(
-                                "A separate Pi conversation for this workspace",
-                                SMALL,
-                                p.muted,
                             )),
                     ),
             );
@@ -1589,13 +1583,22 @@ fn conversation(s: &State, p: Palette) -> El {
                         .px(14.0)
                         .py(9.0)
                         .radius(10.0)
-                        .fill(if s.dark { p.card } else { p.selected }),
+                        .fill(if s.dark { p.card } else { color("#ededf0") }),
                 )
             } else {
                 let style = MarkdownStyle::neutral(s.dark)
                     .text(p.ink)
                     .muted(p.muted)
-                    .body_font(BODY)
+                    .body_font(if s.dark {
+                        TextStyle::new(13.0, 380.0).lh(19.5).tracking(-0.13)
+                    } else {
+                        BODY
+                    })
+                    .inline_code_bg(if s.dark {
+                        Color::WHITE.alpha(0.07)
+                    } else {
+                        Color::BLACK.alpha(0.055)
+                    })
                     .selection(p.teal_bg)
                     .code_block(p.card, p.line)
                     .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))

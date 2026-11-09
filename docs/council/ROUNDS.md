@@ -16,6 +16,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 4 | 7.9 | 8.7 | 8.1 (Capy 7.7) | 3 of 3 approve |
 | 5 | 8.1 | 8.7 | 8.1 (Capy 7.9) | 3 of 3 approve |
 | 6 | 8.1 | 8.6 | 8.3 (Capy 7.8) | 3 of 3 approve |
+| 7 | 8.0 | 8.6 | 7.7 (Capy 7.7) | 3 of 3 approve |
 
 ## Round 1
 
@@ -81,3 +82,16 @@ Shipped in round 6: status badges on small avatars with clean head crops; an ale
 | **Average** | 6.4 | 7.8 | **8.1** | 8.6 | 8.0 / **8.3** / 7.8 | 3 of 3 |
 
 All three judges flagged the same remaining issue: captain rows show status twice, as an avatar badge and a trailing mark. Round 7 keeps only the badge.
+
+Shipped in round 7: one status mark per captain row; dot, ring, and square badge shapes; tab shows the open conversation's status; three-line captain home; one captain order everywhere; 16 px toolbar glyphs, borderless inline code, lighter dark body text, a darker dark sidebar, and a crisper light user bubble.
+
+## Round 7 (`r7/`)
+
+| Judge | Baseline | Round 6 | Round 7 | Capy | Crew art r6 / r7 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.5 | 7.2 | 7.5 | 8.2 | 7.0 / 7.0 / 6.0 | yes |
+| GPT 6.1 Sol | 6.2 | 7.7 | 7.9 | 8.5 | 7.7 / 7.7 / 8.0 | yes |
+| Gemini 4 Argon | 6.8 | 8.5 | 8.7 | 9.2 | 8.4 / 8.4 / 9.0 | yes |
+| **Average** | 6.2 | 7.8 | **8.0** | 8.6 | 7.7 / **7.7** / 7.7 | 3 of 3 |
+
+Crew art was unchanged this round. Judges asked for larger badges whose shapes read at 1x, one status vocabulary across badges, chips, and thread rows, and a captain home whose status agrees with the sidebar.
