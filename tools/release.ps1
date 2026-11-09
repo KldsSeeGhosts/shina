@@ -31,7 +31,7 @@ cargo build --release --target-dir target/publish
 if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
 $exe = Resolve-Path target/publish/release/shina.exe
 
-$notes = git log -1 --format=%B
+$notes = (git log -1 --format=%B) -join "`n"
 gh release create $tag $exe --repo KldsSeeGhosts/shina --target (git rev-parse HEAD) --title "Shina $version" --notes $notes
 if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub release failed.' }
 Write-Host "Published $tag."
