@@ -2049,11 +2049,11 @@ mod tests {
     #[test]
     fn a_prepared_update_from_a_previous_run_is_revalidated_before_ready() {
         let (mut updater, checks, _) = installed(Scripted::new(|| Ok(None)));
-        let saved = saved_update(&updater, "v0.10.0");
+        let saved = saved_update(&updater, "v99.0.0");
         let start = Instant::now();
         updater.start(true, start, wake());
         settle(&mut updater, start, |u| u.prepared_update().is_some());
-        assert_eq!(updater.prepared_update().unwrap().tag, "v0.10.0");
+        assert_eq!(updater.prepared_update().unwrap().tag, "v99.0.0");
         assert_eq!(checks.load(Ordering::SeqCst), 0, "recovery needs no check");
         assert!(saved.prepared.exists(), "the recovered download stays");
         assert_eq!(
@@ -2220,7 +2220,7 @@ mod tests {
         let mut host = Scripted::new(|| Ok(None));
         host.reverify_fails = true;
         let (mut updater, _, _) = installed(host);
-        let saved = saved_update(&updater, "v0.10.0");
+        let saved = saved_update(&updater, "v99.0.0");
         let start = Instant::now();
         updater.start(true, start, wake());
         settle(&mut updater, start, |u| u.diagnostics().next().is_some());
@@ -2243,7 +2243,7 @@ mod tests {
     #[test]
     fn a_manifest_for_another_app_folder_is_never_installed() {
         let (mut updater, _, _) = installed(Scripted::new(|| Ok(None)));
-        let mut saved = saved_update(&updater, "v0.10.0");
+        let mut saved = saved_update(&updater, "v99.0.0");
         saved.target = InstalledTarget::Windows {
             exe: updater.storage.root.join("elsewhere").join("shina.exe"),
         };
@@ -2331,7 +2331,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mac.name,
-            if cfg!(target_arch = "x86_64") {
+            if cfg!(all(not(windows), target_arch = "x86_64")) {
                 "Shina-macos-x86_64.zip"
             } else {
                 "Shina-macos-aarch64.zip"
