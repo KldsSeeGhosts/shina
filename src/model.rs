@@ -1,6 +1,7 @@
 use crate::attachments::{self, Attachment, Prompt};
 use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
+use crate::context::ContextMeter;
 use crate::lifecycle::{
     self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep, Working,
 };
@@ -217,12 +218,16 @@ pub struct Thread {
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
     pub pi: Option<Pi>,
-    /// What the current Pi model reports for `input`. `None` until Pi answers with metadata.
+    /// Image input support from Pi or the catalog. `None` when metadata is unavailable.
     pub supports_images: Option<bool>,
     pub model: String,
     pub thinking: String,
     pub model_provider: String,
     pub model_id: String,
+    /// Capacity reported by the selected model's metadata, when known.
+    pub context_window: Option<u64>,
+    /// Live context-window usage and its refresh state, kept separate from cumulative tokens.
+    pub context: ContextMeter,
     pub models: Vec<AgentModel>,
     pub thinking_levels: Vec<String>,
     pub configuring: bool,
@@ -257,6 +262,7 @@ pub struct Thread {
     startup_thinking_applied: bool,
     startup_selection_check: Option<String>,
     startup_selection_verified: bool,
+    context_startup_requested: bool,
     queued_prompt: Option<(Prompt, usize)>,
     retry_prompt: Option<Prompt>,
     pending_thinking: Option<String>,
@@ -372,6 +378,8 @@ impl Thread {
             thinking: String::new(),
             model_provider: String::new(),
             model_id: String::new(),
+            context_window: None,
+            context: ContextMeter::default(),
             models: vec![],
             thinking_levels: vec![],
             configuring: false,
@@ -404,6 +412,7 @@ impl Thread {
             startup_thinking_applied: false,
             startup_selection_check: None,
             startup_selection_verified: false,
+            context_startup_requested: false,
             queued_prompt: None,
             retry_prompt: None,
             pending_thinking: None,
@@ -456,6 +465,8 @@ impl Thread {
         self.startup_thinking_applied = false;
         self.startup_selection_check = None;
         self.startup_selection_verified = false;
+        self.context_startup_requested = false;
+        self.context.begin_model_change();
         self.pi = Some(backend.start(
             path,
             self.session.clone(),
@@ -475,20 +486,31 @@ impl Thread {
         if self.status.busy() || self.configuring {
             return;
         }
-        // The old model's capability says nothing about the new one. Ask Pi again when the
-        // session starts or its set_model response arrives.
-        self.supports_images = None;
         self.attachment_error = None;
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
-            self.model_provider = provider;
-            self.model_id = model_id;
-            self.model = self
+            let known = self
                 .models
                 .iter()
-                .find(|m| m.id == self.model_id)
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| self.model_id.clone());
+                .find(|m| m.id == model_id)
+                .map(|m| (m.name.clone(), m.context_window, m.supports_images));
+            if self.model_id != model_id {
+                self.context.begin_model_change();
+                self.context_window = None;
+                self.supports_images = None;
+            }
+            self.model_provider = provider;
+            self.model_id = model_id;
+            match known {
+                Some((name, window, images)) => {
+                    self.model = name;
+                    if window.is_some() {
+                        self.context_window = window;
+                    }
+                    self.supports_images = images;
+                }
+                None => self.model = self.model_id.clone(),
+            }
             self.refresh_thinking_levels();
         } else if self.command("set_model", json!({"provider":provider,"modelId":model_id})) {
             self.configuring = true;
@@ -563,6 +585,27 @@ impl Thread {
             return false;
         }
         self.last_activity = Instant::now();
+        true
+    }
+
+    /// Asks Pi for the current context window. Event-driven only: startup, a completed turn,
+    /// a model change and compaction completion call this. Nothing polls on a timer.
+    fn refresh_context_usage(&mut self) -> bool {
+        if self.pi.is_none()
+            || self.configuring
+            || self.context.is_pending()
+            || self.context.phase == crate::context::ContextPhase::Compacting
+        {
+            return false;
+        }
+        // Telemetry transport errors must not replace the conversation's error.
+        let previous_error = self.error.clone();
+        if !self.command("get_session_stats", json!({})) {
+            self.error = previous_error;
+            return false;
+        }
+        self.context
+            .requested(format!("{}-{}", self.id, self.serial));
         true
     }
 
@@ -688,6 +731,7 @@ impl Thread {
         self.configuring = false;
         self.pending_thinking = None;
         self.injection_id = None;
+        self.context.cancel_request();
         self.started = None;
         self.phase.clear();
     }
@@ -859,6 +903,12 @@ impl Thread {
                 self.status = Status::Ready;
                 self.phase.clear();
             }
+        }
+        // Pi has answered its session handshake, so it can report the context window it
+        // resumed. A directly wired transport in a test has not answered that handshake.
+        if !self.context_startup_requested && self.state_loaded && self.history_loaded {
+            self.context_startup_requested = true;
+            self.refresh_context_usage();
         }
         let Some((prompt, index)) = self.queued_prompt.take() else {
             return;
@@ -1065,6 +1115,13 @@ impl Thread {
                         self.pending_injections.pop_front();
                     }
                 }
+                // Context stats are optional telemetry. A rejected or stale request must never
+                // surface as a conversation error, and it must not disturb configuring.
+                if command == "get_session_stats" {
+                    self.context.accept_response(&record);
+                    self.drive_session();
+                    return;
+                }
                 if record["success"] == false {
                     self.error = Some(string(&record, "error").to_owned());
                     if self.initializing {
@@ -1168,6 +1225,8 @@ impl Thread {
                         self.command("get_state", json!({}));
                         self.command("get_available_thinking_levels", json!({}));
                         self.configuring = false;
+                        // Capacity and the previous percentage belonged to the old model.
+                        self.refresh_context_usage();
                     }
                     "set_thinking_level" => {
                         if let Some(level) = self.pending_thinking.take() {
@@ -1294,6 +1353,9 @@ impl Thread {
                 } else {
                     status_word(self.status)
                 });
+                // The turn that just finished is what changed the live context window.
+                self.context.cancel_request();
+                self.refresh_context_usage();
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
@@ -1373,11 +1435,19 @@ impl Thread {
                     self.error = Some(string(&record, "finalError").into());
                 }
             }
-            "compaction_start" => self.phase = "Compacting context".into(),
+            "compaction_start" => {
+                self.phase = "Compacting context".into();
+                // The old percentage describes the context that is being replaced.
+                self.context.begin_compaction();
+            }
             "compaction_end" => {
                 if let Some(error) = record["errorMessage"].as_str() {
                     self.error = Some(error.into());
                 }
+                self.context.finish_compaction();
+                // Pi reports null usage until its next assistant response, so this request
+                // legitimately leaves the ring unknown rather than reusing the old figure.
+                self.refresh_context_usage();
             }
             "thinking_level_changed" => self.thinking = string(&record, "level").into(),
             "tool_execution_update" | "tool_execution_end" => {
@@ -1426,12 +1496,38 @@ impl Thread {
 
     fn update_model(&mut self, model: &Value) {
         if let Some(id) = model["id"].as_str() {
+            let provider = string(model, "provider").to_owned();
+            let known = self
+                .models
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| (m.name.clone(), m.context_window, m.supports_images));
+            if self.model_id != id || self.model_provider != provider {
+                // Pi changed models: the old context percentage is not a measurement of the
+                // new model's window, so it stays unknown until the next stats response.
+                self.context.begin_model_change();
+                self.context_window = None;
+                self.supports_images = None;
+            }
             self.model_id = id.into();
-            self.model_provider = string(model, "provider").into();
-            self.model = model["name"].as_str().unwrap_or(id).into();
-            self.supports_images = model["input"]
-                .as_array()
-                .map(|input| input.iter().any(|kind| kind == "image"));
+            self.model_provider = provider;
+            self.model = model["name"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| known.as_ref().map(|(name, _, _)| name.clone()))
+                .unwrap_or_else(|| id.into());
+            let window = model["contextWindow"]
+                .as_u64()
+                .filter(|window| *window > 0)
+                .or_else(|| known.as_ref().and_then(|(_, window, _)| *window));
+            if window.is_some() {
+                self.context_window = window;
+            }
+            if let Some(input) = model["input"].as_array() {
+                self.supports_images = Some(input.iter().any(|kind| kind == "image"));
+            } else if let Some((_, _, Some(images))) = known {
+                self.supports_images = Some(images);
+            }
         }
     }
 
@@ -3456,12 +3552,25 @@ impl State {
                 thread.model_provider = model.provider.clone();
                 thread.model_id = model.id.clone();
                 thread.model = model.name.clone();
+                thread.context_window = model.context_window;
+                thread.supports_images = model.supports_images;
                 if thread.selected_thinking.is_none() {
                     thread.thinking = self.catalog.default_thinking.clone();
                 }
             }
-            if let Some(model) = thread.models.iter().find(|m| m.id == thread.model_id) {
-                thread.model = model.name.clone();
+            let metadata = thread
+                .models
+                .iter()
+                .find(|m| m.id == thread.model_id)
+                .map(|m| (m.name.clone(), m.context_window, m.supports_images));
+            if let Some((name, window, images)) = metadata {
+                thread.model = name;
+                if window.is_some() {
+                    thread.context_window = window;
+                }
+                if images.is_some() {
+                    thread.supports_images = images;
+                }
             }
             thread.refresh_thinking_levels();
         }
@@ -4904,7 +5013,10 @@ mod tests {
         events.send(Event::Record(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}))).unwrap();
         events.send(Event::Record(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"test"}}}))).unwrap();
         poll(&mut state, 0.0, &mut Tx::default());
-        let prompt = commands.try_recv().unwrap();
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("completion prompt after the handshake");
         assert!(
             prompt["message"]
                 .as_str()
@@ -5032,12 +5144,11 @@ mod tests {
         events.send(Event::Record(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"test"}}}))).unwrap();
         events.send(Event::Record(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}))).unwrap();
         poll(&mut state, 0.0, &mut Tx::default());
-        assert!(
-            commands.try_recv().unwrap()["message"]
-                .as_str()
-                .unwrap()
-                .contains("Ping")
-        );
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("queued result prompt");
+        assert!(prompt["message"].as_str().unwrap().contains("Ping"));
     }
 
     #[test]
@@ -5636,6 +5747,7 @@ mod tests {
             };
             thread.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":messages}}));
             thread.apply(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"test"}}}));
+            assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
             assert_eq!(thread.flush_injection(), !accepted);
             assert_eq!(commands.try_recv().is_ok(), !accepted);
             assert_eq!(thread.messages.len(), 1);
@@ -5706,7 +5818,10 @@ mod tests {
         );
         state.threads[index].apply(json!({"type":"agent_settled","aborted":true}));
         state.poll_tasks(Instant::now());
-        let prompt = commands.try_recv().unwrap();
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("new work prompt");
         assert!(prompt["message"].as_str().unwrap().contains("New work"));
         assert!(state.threads[index].task_result.is_none());
         assert!(!state.threads[index].completion_notified);
@@ -6129,6 +6244,7 @@ mod tests {
             .replace_text("Revised before connection");
         events.send(Event::Record(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"model-a"}}}))).unwrap();
         poll(&mut state, 0.0, &mut tx);
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         let prompt = commands.try_recv().unwrap();
         assert_eq!(prompt["type"], "prompt");
         assert_eq!(prompt["message"], "Original draft");
@@ -6170,7 +6286,11 @@ mod tests {
         poll(&mut state, 0.0, &mut Tx::default());
         assert_eq!(state.current().status, Status::Ready);
         assert_eq!(state.current().draft.text, "Do not send this");
-        assert!(commands.try_recv().is_err());
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
+        assert!(
+            commands.try_recv().is_err(),
+            "startup stats never send a model prompt"
+        );
     }
     #[test]
     fn direct_provider_models_are_hidden_and_cannot_receive_prompts() {
@@ -6256,6 +6376,11 @@ mod tests {
             commands.try_recv().unwrap()["type"],
             "get_available_thinking_levels"
         );
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "get_session_stats",
+            "a model change refreshes the live context window"
+        );
         let thinking = commands.try_recv().unwrap();
         assert_eq!(thinking["type"], "set_thinking_level");
         assert_eq!(thinking["level"], "high");
@@ -6268,6 +6393,240 @@ mod tests {
         assert_eq!(commands.try_recv().unwrap()["type"], "prompt");
         assert!(!thread.initializing);
         assert_eq!(thread.session.as_deref(), Some("saved.jsonl"));
+    }
+
+    fn next_stats_request(commands: &mpsc::Receiver<Value>) -> Value {
+        let request = commands
+            .try_recv()
+            .expect("expected a context stats request");
+        assert_eq!(request["type"], "get_session_stats");
+        request
+    }
+
+    fn answer_stats(thread: &mut Thread, request: &Value, context_usage: Value) {
+        thread.apply(json!({
+            "type": "response",
+            "id": request["id"],
+            "command": "get_session_stats",
+            "success": true,
+            "data": {"contextUsage": context_usage}
+        }));
+    }
+
+    #[test]
+    fn context_stats_refresh_on_startup_turns_and_model_changes() {
+        let mut thread = Thread::new(1);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.context_startup_requested = false;
+        thread.apply(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{
+            "isStreaming":false,
+            "model":{"provider":"cpa","id":"vision","name":"Vision","contextWindow":200000,"input":["text","image"]},
+            "sessionFile":"saved.jsonl"
+        }}));
+        thread.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}));
+
+        let startup = next_stats_request(&commands);
+        assert!(thread.context.is_pending());
+        assert_eq!(thread.context_window, Some(200000));
+        assert_eq!(thread.supports_images, Some(true));
+        answer_stats(
+            &mut thread,
+            &startup,
+            json!({"tokens":60000,"contextWindow":200000,"percent":30}),
+        );
+        assert_eq!(thread.context.usage.tokens, Some(60000));
+        assert_eq!(thread.context.usage.percent, Some(30.0));
+        assert!(!thread.context.is_pending());
+
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        let turn = next_stats_request(&commands);
+        answer_stats(
+            &mut thread,
+            &turn,
+            json!({"tokens":90000,"contextWindow":200000,"percent":45}),
+        );
+        assert_eq!(thread.context.usage.percent, Some(45.0));
+
+        thread.models = vec![
+            AgentModel::from_value(&json!({
+                "provider":"cpa","id":"other","name":"Other","contextWindow":100000,"input":["text"]
+            }))
+            .unwrap(),
+        ];
+        thread.set_model("cpa".into(), "other".into());
+        assert_eq!(commands.try_recv().unwrap()["type"], "set_model");
+        thread.apply(
+            json!({"type":"response","command":"set_model","success":true,"data":{
+                "provider":"cpa","id":"other","name":"Other","contextWindow":100000,"input":["text"]
+            }}),
+        );
+        assert!(
+            thread.context.usage.percent.is_none(),
+            "the old model's percentage must not survive a model change"
+        );
+        assert_eq!(thread.context_window, Some(100000));
+        assert_eq!(thread.supports_images, Some(false));
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_state");
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "get_available_thinking_levels"
+        );
+        let changed = next_stats_request(&commands);
+        answer_stats(
+            &mut thread,
+            &changed,
+            json!({"tokens":20000,"contextWindow":100000,"percent":20}),
+        );
+        assert_eq!(thread.context.usage.percent, Some(20.0));
+    }
+
+    #[test]
+    fn compaction_marks_context_unknown_until_fresh_usage_arrives() {
+        let mut thread = Thread::new(1);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.context_window = Some(200000);
+        thread.context.absorb(&json!({
+            "contextUsage":{"tokens":120000,"contextWindow":200000,"percent":60}
+        }));
+        thread.apply(json!({"type":"compaction_start"}));
+        assert_eq!(
+            thread.context.phase,
+            crate::context::ContextPhase::Compacting
+        );
+        assert_eq!(thread.context.usage.tokens, None);
+        assert_eq!(thread.context.usage.percent, None);
+        assert_eq!(thread.context.usage.context_window, Some(200000));
+        assert!(
+            commands.try_recv().is_err(),
+            "compaction start must not start a polling loop"
+        );
+
+        thread.apply(json!({"type":"compaction_end"}));
+        assert_eq!(
+            thread.context.phase,
+            crate::context::ContextPhase::AwaitingUsage
+        );
+        let after_compaction = next_stats_request(&commands);
+        answer_stats(
+            &mut thread,
+            &after_compaction,
+            json!({"tokens":null,"contextWindow":200000,"percent":null}),
+        );
+        assert_eq!(thread.context.usage.tokens, None);
+        assert_eq!(thread.context.usage.percent, None);
+        assert!(
+            thread
+                .context
+                .accessible_label(None)
+                .contains("unknown after compaction")
+        );
+
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        let fresh = next_stats_request(&commands);
+        answer_stats(
+            &mut thread,
+            &fresh,
+            json!({"tokens":5000,"contextWindow":200000,"percent":2.5}),
+        );
+        assert_eq!(thread.context.phase, crate::context::ContextPhase::Idle);
+        assert_eq!(thread.context.usage.percent, Some(2.5));
+    }
+
+    #[test]
+    fn rejected_context_stats_never_become_a_conversation_error() {
+        let mut thread = Thread::new(1);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.context.requested("1-9".into());
+        thread.apply(json!({
+            "type":"response","id":"1-9","command":"get_session_stats","success":false,
+            "error":"get_session_stats is unavailable"
+        }));
+        assert!(!thread.context.is_pending());
+        assert!(thread.error.is_none());
+        assert!(!thread.configuring);
+        assert_eq!(thread.status, Status::Ready);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_context_transport_preserves_the_conversation_error() {
+        let mut thread = Thread::new(1);
+        let (pi, commands, _events) = Pi::test_connection();
+        drop(commands);
+        thread.pi = Some(pi);
+        thread.error = Some("Preserve this provider error".into());
+        assert!(!thread.refresh_context_usage());
+        assert_eq!(
+            thread.error.as_deref(),
+            Some("Preserve this provider error")
+        );
+        assert!(!thread.context.is_pending());
+        assert!(!thread.configuring);
+        assert_eq!(thread.status, Status::Ready);
+    }
+
+    #[test]
+    fn a_completed_turn_invalidates_an_older_in_flight_context_measurement() {
+        let mut thread = Thread::new(1);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        assert!(thread.refresh_context_usage());
+        let old = next_stats_request(&commands);
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        let current = next_stats_request(&commands);
+        assert_ne!(old["id"], current["id"]);
+        answer_stats(
+            &mut thread,
+            &old,
+            json!({"tokens":10,"contextWindow":100,"percent":10}),
+        );
+        assert!(thread.context.usage.percent.is_none());
+        assert!(thread.context.is_pending());
+        answer_stats(
+            &mut thread,
+            &current,
+            json!({"tokens":30,"contextWindow":100,"percent":30}),
+        );
+        assert_eq!(thread.context.usage.percent, Some(30.0));
+        assert!(!thread.context.is_pending());
+    }
+
+    #[test]
+    fn catalog_image_metadata_and_rejected_model_changes_preserve_actual_support() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().model_id = "vision".into();
+        state.catalog.models = vec![
+            AgentModel::from_value(&json!({
+                "provider":"cpa","id":"vision","input":["text","image"],"contextWindow":200000
+            }))
+            .unwrap(),
+        ];
+        state.apply_catalog();
+        assert_eq!(state.current().supports_images, Some(true));
+        assert_eq!(state.current().context_window, Some(200000));
+        // An incomplete discovery record must not erase Pi's already-known capability.
+        state.catalog.models = vec![
+            AgentModel::from_value(&json!({
+                "provider":"cpa","id":"vision"
+            }))
+            .unwrap(),
+        ];
+        state.apply_catalog();
+        assert_eq!(state.current().supports_images, Some(true));
+        let (commands, _events) = fake_pi(state.current_mut(), Status::Ready);
+        state
+            .current_mut()
+            .set_model("cpa".into(), "missing".into());
+        assert_eq!(commands.try_recv().unwrap()["type"], "set_model");
+        state.current_mut().apply(json!({
+            "type":"response","command":"set_model","success":false,"error":"Unavailable"
+        }));
+        assert_eq!(state.current().model_id, "vision");
+        assert_eq!(state.current().supports_images, Some(true));
     }
 
     #[test]
@@ -6311,6 +6670,7 @@ mod tests {
                 "model":{"provider":"cpa","id":"restored"},"sessionFile":"saved.jsonl"
             }}),
         );
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         assert_eq!(commands.try_recv().unwrap()["message"], "Continue");
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.messages[0].text, "Previous answer");
@@ -6345,8 +6705,11 @@ mod tests {
             events.send(Event::Record(record)).unwrap();
         }
         poll(&mut state, 0.0, &mut Tx::default());
-        assert_eq!(commands.try_recv().unwrap()["message"], "Try this");
-        assert!(commands.try_recv().is_err());
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("retried prompt after the handshake");
+        assert_eq!(prompt["message"], "Try this");
         assert!(state.current().error.is_none());
     }
 
@@ -7314,8 +7677,13 @@ mod tests {
         thread.send();
         thread.connect(workspace.clone(), Arc::new(|| {}));
         receive_until(&mut thread, |t| {
-            t.status == Status::Completed && t.session.is_some()
+            t.status == Status::Completed
+                && t.session.is_some()
+                && !t.context.is_pending()
+                && t.context.usage.percent.is_some()
         });
+        assert!(thread.context.usage.tokens.is_some_and(|tokens| tokens > 0));
+        assert_eq!(thread.context.usage.context_window, thread.context_window);
         let reply = thread
             .messages
             .iter()
@@ -7329,7 +7697,10 @@ mod tests {
         resumed.session = session;
         resumed.connect(workspace, Arc::new(|| {}));
         receive_until(&mut resumed, |t| {
-            !t.restoring_history() && !t.messages.is_empty()
+            !t.restoring_history()
+                && !t.messages.is_empty()
+                && !t.context.is_pending()
+                && t.context.usage.percent.is_some()
         });
         let user = resumed.messages.iter().find(|m| m.role == "You").unwrap();
         assert_eq!(user.images.len(), 1);
@@ -7649,7 +8020,7 @@ mod tests {
             events.send(Event::Record(record)).unwrap();
         }
         poll(&mut state, 0.0, &mut Tx::default());
-        let prompt = commands.try_recv().unwrap();
+        let prompt = commands.try_iter().find(|c| c["type"] == "prompt").unwrap();
         assert_eq!(prompt["message"], "");
         assert_eq!(prompt["images"][0]["type"], "image");
         assert_eq!(

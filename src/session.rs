@@ -17,6 +17,10 @@ pub struct AgentModel {
     pub id: String,
     pub name: String,
     pub thinking_levels: Vec<String>,
+    /// The model's real context capacity, from Pi's model metadata. `None` when unknown.
+    pub context_window: Option<u64>,
+    /// Whether the model's `input` metadata accepts images.
+    pub supports_images: Option<bool>,
 }
 
 impl AgentModel {
@@ -45,6 +49,10 @@ impl AgentModel {
             id: id.into(),
             name: model["name"].as_str().unwrap_or(id).into(),
             thinking_levels,
+            context_window: model["contextWindow"].as_u64().filter(|window| *window > 0),
+            supports_images: model["input"]
+                .as_array()
+                .map(|input| input.iter().any(|kind| kind == "image")),
         })
     }
 }
@@ -167,8 +175,8 @@ mod tests {
             }}),
             json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
                 {"provider":"direct","id":"hidden"},
-                {"provider":"cpa","id":"default","reasoning":true,"thinkingLevelMap":{"minimal":null,"xhigh":"xhigh","max":"max"}},
-                {"provider":"cpa","id":"plain","reasoning":false}
+                {"provider":"cpa","id":"default","reasoning":true,"thinkingLevelMap":{"minimal":null,"xhigh":"xhigh","max":"max"},"contextWindow":200000,"input":["text","image"]},
+                {"provider":"cpa","id":"plain","reasoning":false,"contextWindow":32000,"input":["text"]}
             ]}}),
         ] {
             events.send(Event::Record(record)).unwrap();
@@ -184,6 +192,10 @@ mod tests {
             ["off", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(catalog.models[1].thinking_levels, ["off"]);
+        assert_eq!(catalog.models[0].context_window, Some(200000));
+        assert_eq!(catalog.models[0].supports_images, Some(true));
+        assert_eq!(catalog.models[1].context_window, Some(32000));
+        assert_eq!(catalog.models[1].supports_images, Some(false));
         assert!(catalog.loaded.is_some());
     }
 
@@ -197,6 +209,38 @@ mod tests {
             ["off", "minimal", "low", "medium", "high"]
         );
         assert!(AgentModel::from_value(&json!({"provider":"direct","id":"hidden"})).is_none());
+    }
+
+    #[test]
+    fn model_metadata_keeps_known_capacity_and_vision_support() {
+        let model = AgentModel::from_value(&json!({
+            "provider":"cpa","id":"vision","name":"Vision","contextWindow":1000000,
+            "input":["text","image"]
+        }))
+        .unwrap();
+        assert_eq!(model.context_window, Some(1000000));
+        assert_eq!(model.supports_images, Some(true));
+
+        let text = AgentModel::from_value(&json!({
+            "provider":"cpa","id":"text","contextWindow":128000,"input":["text"]
+        }))
+        .unwrap();
+        assert_eq!(text.context_window, Some(128000));
+        assert_eq!(text.supports_images, Some(false));
+
+        for bad in [
+            json!({"provider":"cpa","id":"missing"}),
+            json!({"provider":"cpa","id":"zero","contextWindow":0,"input":[]}),
+            json!({"provider":"cpa","id":"null","contextWindow":null,"input":null}),
+        ] {
+            let model = AgentModel::from_value(&bad).unwrap();
+            assert_eq!(model.context_window, None, "{bad}");
+            assert_eq!(
+                model.supports_images,
+                bad["input"].as_array().map(|_| false),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

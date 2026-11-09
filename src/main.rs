@@ -3,6 +3,7 @@
 mod attachments;
 mod backend;
 mod captains;
+mod context;
 mod install;
 mod lifecycle;
 mod mcp;

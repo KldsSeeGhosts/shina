@@ -1,9 +1,13 @@
 use crate::attachments::Attachment;
+use crate::context::{ContextMeter, ContextPhase};
 use crate::lifecycle::{self, Section};
 use crate::model::{
     ProjectPicker, ProjectScope, RowTarget, SettingsPicker, State, Status, Thread, Tool, truncate,
 };
-use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, Tx, col, el, memo, row, text};
+use rune::{
+    Color, Cx, El, Icon, LineCap, ScrollSpec, Shape, TextStyle, Tx, canvas, col, el, memo, row,
+    text,
+};
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 
@@ -3686,12 +3690,13 @@ fn image_preview(
         .radius((width.min(height) / 6.0).clamp(4.0, 10.0))
         .clip_rounded((width.min(height) / 6.0).clamp(4.0, 10.0))
         .border(0.5, p.line);
-    if let Some(path) = crate::attachments::path_for(image) {
-        preview = preview.pixels(
-            s.attachment_cache
-                .file(path, width.max(height), 2.0)
-                .pixels(),
-        );
+    if let Some(path) = crate::attachments::preview_path_for(image) {
+        let handle = s.attachment_cache.file(path, width.max(height), 2.0);
+        // Headless fixtures have no window waker to rebuild after asynchronous decode.
+        if rune::is_headless() {
+            let _ = handle.wait();
+        }
+        preview = preview.pixels(handle.pixels());
     } else {
         preview = preview
             .center()
@@ -3816,6 +3821,163 @@ fn pick_attachment(s: &mut State, tx: &mut Tx) {
     );
 }
 
+const CONTEXT_RING_SIZE: f32 = 26.0;
+
+fn context_limit(t: &Thread) -> Option<u64> {
+    t.context.usage.limit(t.context_window)
+}
+
+/// The ring appears once Pi or the model catalog knows a capacity, or once Pi reports usage.
+fn context_available(t: &Thread) -> bool {
+    t.context.usage.has_usage() || context_limit(t).is_some()
+}
+
+fn context_ink(percent: f64, p: Palette) -> Color {
+    if percent >= 90.0 {
+        p.danger
+    } else if percent >= 70.0 {
+        p.gold
+    } else {
+        p.teal_text
+    }
+}
+
+/// Rune strokes a polyline, so a circle is a ring of points in the element's own points.
+fn circle_points(cx: f32, cy: f32, radius: f32, steps: usize) -> Vec<[f32; 2]> {
+    (0..steps.max(8))
+        .map(|step| {
+            let angle = std::f32::consts::TAU * step as f32 / steps.max(8) as f32;
+            [cx + radius * angle.cos(), cy + radius * angle.sin()]
+        })
+        .collect()
+}
+
+fn arc_points(
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_degrees: f32,
+    sweep_degrees: f32,
+    steps: usize,
+) -> Vec<[f32; 2]> {
+    let steps = steps.max(2);
+    (0..=steps)
+        .map(|step| {
+            let degrees = start_degrees + sweep_degrees * step as f32 / steps as f32;
+            let angle = degrees.to_radians();
+            [cx + radius * angle.cos(), cy + radius * angle.sin()]
+        })
+        .collect()
+}
+
+/// A real circular progress ring drawn with Rune's vector canvas. The track stays visible when
+/// usage is unknown, so looking full is never implied by empty data.
+fn context_ring_shape(context: &ContextMeter, p: Palette) -> Shape {
+    let center = CONTEXT_RING_SIZE / 2.0;
+    let radius = 9.4;
+    let width = 2.4;
+    let track = if context.phase == ContextPhase::Compacting {
+        p.gold.alpha(0.65)
+    } else {
+        p.field_line.alpha(0.55)
+    };
+    let measured = context.phase != ContextPhase::Compacting && context.usage.percent.is_some();
+    let mut shape = Shape::new();
+    if measured {
+        shape = shape.stroke_with(
+            circle_points(center, center, radius, 64),
+            true,
+            width,
+            LineCap::Round,
+            track,
+        );
+    } else {
+        // A dashed track reads as "no measurement", not as a genuine zero.
+        for dash in 0..10 {
+            shape = shape.stroke(
+                arc_points(center, center, radius, -90.0 + dash as f32 * 36.0, 24.0, 6),
+                width,
+                track,
+            );
+        }
+    }
+    if let Some(percent) = context.usage.percent
+        && measured
+    {
+        let sweep = (percent as f32).clamp(0.0, 100.0) * 3.6;
+        if sweep >= 359.99 {
+            shape = shape.stroke_with(
+                circle_points(center, center, radius, 64),
+                true,
+                width,
+                LineCap::Round,
+                context_ink(percent, p),
+            );
+        } else if sweep > 0.0 {
+            let steps = (sweep / 6.0).ceil().clamp(8.0, 96.0) as usize;
+            shape = shape.stroke(
+                arc_points(center, center, radius, -90.0, sweep, steps),
+                width,
+                context_ink(percent, p),
+            );
+        }
+    }
+    shape
+}
+
+fn context_ring(t: &Thread, p: Palette) -> El {
+    let limit = context_limit(t);
+    let open = t.context.details_open;
+    el().key("context-usage-ring")
+        .role("button")
+        .label(t.context.accessible_label(limit))
+        .help(t.context.help_text(limit))
+        .help_above()
+        .focusable(true)
+        .expanded(open)
+        .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
+        .center()
+        .radius(CONTEXT_RING_SIZE / 2.0)
+        .fill(if open { p.selected } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .on_press(|s: &mut State| s.current_mut().context.toggle_details())
+        .child(
+            canvas(context_ring_shape(&t.context, p))
+                .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
+                .a11y_hidden(),
+        )
+}
+
+fn context_details(t: &Thread, p: Palette) -> El {
+    let limit = context_limit(t);
+    let mut details = row()
+        .key("context-details")
+        .role("group")
+        .label("Context usage details")
+        .w_full()
+        .center_y()
+        .gap(7.0)
+        .flex_wrap()
+        .pt(1.0)
+        .child(label("Context", TextStyle::new(11.5, 500.0), p.muted))
+        .child(label(t.context.usage.usage_text(limit), SMALL, p.ink).key("context-details-usage"));
+    if let Some(percent) = t.context.usage.percent_text() {
+        details = details.child(
+            label(
+                percent,
+                TextStyle::new(12.0, 620.0),
+                context_ink(t.context.usage.percent.unwrap_or(0.0), p),
+            )
+            .key("context-details-percent"),
+        );
+    }
+    if let Some(state) = t.context.state_text() {
+        details = details
+            .child(label(state, TextStyle::new(11.5, 420.0), p.muted).key("context-details-state"));
+    }
+    details
+}
+
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let t = s.current();
     let mut area = col()
@@ -3936,69 +4098,72 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     if let Some(tray) = tray {
         card = card.child(tray);
     }
-    card = card
+    card = card.child(
+        text_input(&t.draft, body_style(wide))
+            .key("composer-input")
+            .label("Message Pi")
+            .placeholder(
+                if s.demo {
+                    "Open a real workspace to send messages"
+                } else {
+                    "Ask anything..."
+                },
+                p.muted,
+            )
+            .color(p.ink)
+            .caret(p.teal, p.teal_bg)
+            .w_full()
+            .min_h(24.0)
+            .max_h(170.0)
+            .on_edit(|s: &mut State| &mut s.current_mut().draft)
+            .on_input_paste(|s: &mut State, content, _| {
+                let has_image = content.image().is_some();
+                if let Some(image) = content.image() {
+                    s.attach_image("Pasted image.png", image.png());
+                }
+                if !content.files().is_empty() {
+                    s.attach_paths(content.files());
+                }
+                (has_image || !content.files().is_empty()) && content.text().is_empty()
+            })
+            .on_submit(|s: &mut State, _| {
+                if !s.demo && !s.current().archived() {
+                    s.send();
+                }
+            }),
+    );
+    if t.context.details_open && context_available(t) {
+        card = card.child(context_details(t, p));
+    }
+    let mut actions = row()
+        .key("composer-actions")
+        .center_y()
+        .gap(5.0)
+        .child(identity)
         .child(
-            text_input(&t.draft, body_style(wide))
-                .key("composer-input")
-                .label("Message Pi")
-                .placeholder(
-                    if s.demo {
-                        "Open a real workspace to send messages"
-                    } else {
-                        "Ask anything..."
-                    },
-                    p.muted,
-                )
-                .color(p.ink)
-                .caret(p.teal, p.teal_bg)
-                .w_full()
-                .min_h(24.0)
-                .max_h(170.0)
-                .on_edit(|s: &mut State| &mut s.current_mut().draft)
-                .on_input_paste(|s: &mut State, content, _| {
-                    let has_image = content.image().is_some();
-                    if let Some(image) = content.image() {
-                        s.attach_image("Pasted image.png", image.png());
-                    }
-                    if !content.files().is_empty() {
-                        s.attach_paths(content.files());
-                    }
-                    (has_image || !content.files().is_empty()) && content.text().is_empty()
-                })
-                .on_submit(|s: &mut State, _| {
-                    if !s.demo && !s.current().archived() {
-                        s.send();
-                    }
-                }),
+            dropdown("choose-pi-model", &t.model, p, |s| {
+                s.model_search.replace_text("");
+                s.settings_picker = Some(SettingsPicker::Model);
+                s.refresh_catalog();
+            })
+            .max_w(if narrow { 112.0 } else { 230.0 })
+            .opacity(if locked { 0.65 } else { 1.0 })
+            .disabled(locked),
         )
         .child(
-            row()
-                .center_y()
-                .gap(5.0)
-                .child(identity)
-                .child(
-                    dropdown("choose-pi-model", &t.model, p, |s| {
-                        s.model_search.replace_text("");
-                        s.settings_picker = Some(SettingsPicker::Model);
-                        s.refresh_catalog();
-                    })
-                    .max_w(if narrow { 112.0 } else { 230.0 })
-                    .opacity(if locked { 0.65 } else { 1.0 })
-                    .disabled(locked),
-                )
-                .child(
-                    dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
-                        s.settings_picker = Some(SettingsPicker::Thinking);
-                        s.refresh_catalog();
-                    })
-                    .opacity(if locked { 0.65 } else { 1.0 })
-                    .disabled(locked),
-                )
-                .child(attach_control(locked, p))
-                .child(spacer())
-                .child(action),
-        );
-    area = area.child(card);
+            dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
+                s.settings_picker = Some(SettingsPicker::Thinking);
+                s.refresh_catalog();
+            })
+            .opacity(if locked { 0.65 } else { 1.0 })
+            .disabled(locked),
+        )
+        .child(attach_control(locked, p))
+        .child(spacer());
+    if context_available(t) {
+        actions = actions.child(context_ring(t, p));
+    }
+    area = area.child(card.child(actions.child(action)));
     area = area.child(
         row()
             .h(20.0)
@@ -4216,6 +4381,7 @@ fn dialog(s: &State, p: Palette) -> El {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::context::ContextUsage;
     use rune::{Env, Runtime};
     fn runtime(width: f32) -> Runtime<State> {
         Runtime::new(
@@ -4496,6 +4662,215 @@ pub(crate) mod tests {
         assert!(!rt.state.compact_sidebar, "sidebar toggle did not close it");
         assert!(rt.presented("sidebar").is_none());
     }
+    #[test]
+    fn context_ring_reports_real_usage_and_opens_details_by_keyboard() {
+        let mut rt = runtime(1280.0);
+        let thread = rt.state.current_mut();
+        thread.model = "Vision".into();
+        thread.context_window = Some(200_000);
+        thread.supports_images = Some(true);
+        thread.context.usage = ContextUsage {
+            tokens: Some(60_000),
+            context_window: Some(200_000),
+            percent: Some(30.0),
+        };
+        thread.draft.replace_text("Ready");
+        rt.invalidate();
+        rt.frame(0.0);
+
+        let ring = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("context-usage-ring"))
+            .expect("context ring");
+        assert_eq!(ring.role, "button");
+        assert!(ring.focusable);
+        assert_eq!(ring.expanded, Some(false));
+        let label = ring.label.as_deref().unwrap();
+        assert!(
+            label.contains("60,000 of 200,000 tokens") && label.contains("30%"),
+            "{label}"
+        );
+        let help = ring.help.as_deref().unwrap();
+        assert!(
+            help.contains("60,000 of 200,000 tokens")
+                && help.contains("30%")
+                && help.contains("Updates after each turn and after compaction."),
+            "{help}"
+        );
+
+        let (ring_rect, _) = rt.presented("context-usage-ring").unwrap();
+        let (send_rect, _) = rt.presented("send-message").unwrap();
+        assert!(
+            ring_rect[0] + ring_rect[2] <= send_rect[0],
+            "ring must sit beside, not over, send"
+        );
+        assert!(
+            (ring_rect[1] + ring_rect[3] / 2.0 - (send_rect[1] + send_rect[3] / 2.0)).abs() < 2.0,
+            "ring and send share a centre line"
+        );
+
+        let mut tabs = 0;
+        while tabs < 120 {
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            tabs += 1;
+            if rt.elements().into_iter().any(|element| {
+                element.key.as_deref() == Some("context-usage-ring") && element.focused
+            }) {
+                break;
+            }
+        }
+        assert!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-usage-ring"))
+                .unwrap()
+                .focused,
+            "the ring must be reachable by keyboard after {tabs} tabs"
+        );
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-usage-ring"))
+                .unwrap()
+                .expanded,
+            Some(true)
+        );
+        assert!(rt.find("context-details").is_some());
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-details-usage"))
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("60,000 of 200,000 tokens")
+        );
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-details-percent"))
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("30%")
+        );
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.focused)
+                .and_then(|element| element.key),
+            Some("context-usage-ring".to_owned()),
+            "opening details keeps keyboard focus on the ring"
+        );
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.5);
+        assert!(
+            rt.find("context-details").is_none(),
+            "Space toggles the same disclosure as a press"
+        );
+        assert!(!rt.state.current().context.details_open);
+
+        press(&mut rt, "context-usage-ring");
+        rt.frame(0.0);
+        assert!(
+            rt.state.current().context.details_open,
+            "pointer activation remains available too"
+        );
+    }
+
+    #[test]
+    fn unknown_after_compaction_stays_inside_a_narrow_composer() {
+        let mut rt = runtime(620.0);
+        let thread = rt.state.current_mut();
+        thread.model = "Vision".into();
+        thread.context_window = Some(200_000);
+        thread.context.usage = ContextUsage {
+            tokens: None,
+            context_window: Some(200_000),
+            percent: None,
+        };
+        thread.context.phase = ContextPhase::AwaitingUsage;
+        thread.draft.replace_text("Ready");
+        rt.invalidate();
+        rt.frame(0.0);
+
+        let ring = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("context-usage-ring"))
+            .expect("unknown context still shows its track");
+        assert!(
+            ring.label
+                .as_deref()
+                .unwrap()
+                .contains("unknown after compaction")
+        );
+        assert!(
+            ring.help
+                .as_deref()
+                .unwrap()
+                .contains("unknown after compaction")
+        );
+        let (ring_rect, _) = rt.presented("context-usage-ring").unwrap();
+        let (send_rect, _) = rt.presented("send-message").unwrap();
+        assert!(ring_rect[0] >= 0.0 && ring_rect[0] + ring_rect[2] <= 620.0);
+        assert!(ring_rect[0] + ring_rect[2] <= send_rect[0]);
+
+        press(&mut rt, "context-usage-ring");
+        rt.frame(0.5);
+        let (composer, _) = rt.presented("composer").unwrap();
+        let (details, _) = rt.presented("context-details").unwrap();
+        assert!(
+            details[0] >= composer[0] && details[0] + details[2] <= composer[0] + composer[2] + 0.5,
+            "details row must stay inside the composer: {details:?} in {composer:?}"
+        );
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-details-usage"))
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("Limit 200,000 tokens")
+        );
+        assert_eq!(
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-details-state"))
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("Waiting for Pi to report usage")
+        );
+    }
+
+    #[test]
+    fn context_ring_geometry_is_a_real_circle_and_arc() {
+        let circle = circle_points(13.0, 13.0, 9.4, 64);
+        assert_eq!(circle.len(), 64);
+        for point in &circle {
+            let distance = (point[0] - 13.0).hypot(point[1] - 13.0);
+            assert!((distance - 9.4).abs() < 0.001, "{point:?}");
+        }
+        let quarter = arc_points(13.0, 13.0, 9.4, -90.0, 90.0, 16);
+        assert!((quarter[0][0] - 13.0).abs() < 0.001 && quarter[0][1] < 4.0);
+        let last = quarter.last().unwrap();
+        assert!(last[0] > 22.0 && (last[1] - 13.0).abs() < 0.001);
+    }
+
     #[test]
     fn tool_groups_and_individual_outputs_expand_independently() {
         let mut rt = runtime(1280.0);
@@ -5070,6 +5445,7 @@ pub(crate) mod tests {
             commands.try_recv().unwrap()["type"],
             "get_available_thinking_levels"
         );
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         rt.frame(0.0);
         press(&mut rt, "choose-pi-thinking");
         rt.frame(1.0 / 60.0);

@@ -114,6 +114,11 @@ pub fn path_for(attachment: &Attachment) -> Option<PathBuf> {
     path_for_id(&attachment.id)
 }
 
+pub fn preview_path_for(attachment: &Attachment) -> Option<PathBuf> {
+    let path = path_for_id(&format!("preview-{}.png", attachment.id))?;
+    path.is_file().then_some(path)
+}
+
 fn path_for_id(id: &str) -> Option<PathBuf> {
     safe_id(id).then(|| directory().map(|directory| directory.join(id)))?
 }
@@ -137,13 +142,13 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Image".into());
-    let file = fs::File::open(path).map_err(|error| {
+    let read_error = |error| {
         format!(
             "Could not read {}. Check that it still exists and is a file: {error}",
             clean_name(&name)
         )
-    })?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    };
+    let metadata = fs::metadata(path).map_err(&read_error)?;
     if !metadata.is_file() {
         return Err("Choose an image file, not a folder or device.".into());
     }
@@ -154,6 +159,7 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
             MAX_IMAGE_BYTES / (1024 * 1024)
         ));
     }
+    let file = fs::File::open(path).map_err(read_error)?;
     // Bound the read as well as checking metadata, since the file can grow while we read it.
     let mut bytes = Vec::new();
     file.take(MAX_IMAGE_BYTES + 1)
@@ -165,9 +171,10 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
 /// Validate and store image bytes, with the name shown in the composer chip.
 pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     let name = clean_name(name);
-    let validated = validate(&bytes).map_err(|error| format!("{name}: {error}"))?;
+    let (validated, decoded) = validate(&bytes).map_err(|error| format!("{name}: {error}"))?;
     let bytes_len = bytes.len() as u64;
     let id = store_blob(&bytes, validated.format)?;
+    store_preview(&id, decoded)?;
     Ok(Attachment {
         id,
         name,
@@ -261,7 +268,7 @@ struct Validated {
     height: u32,
 }
 
-fn validate(bytes: &[u8]) -> Result<Validated, String> {
+fn validate(bytes: &[u8]) -> Result<(Validated, image::DynamicImage), String> {
     let size = bytes.len() as u64;
     if size == 0 {
         return Err("The file is empty.".into());
@@ -292,13 +299,44 @@ fn validate(bytes: &[u8]) -> Result<Validated, String> {
     }
     // A header alone can look valid while the rest of the file is truncated. Decode once here,
     // off the prompt path, so malformed images fail before they reach Pi.
-    image::load_from_memory_with_format(bytes, format)
+    let decoded = image::load_from_memory_with_format(bytes, format)
         .map_err(|_| "The image is damaged or incomplete. Choose a valid image.".to_owned())?;
-    Ok(Validated {
-        format,
-        width,
-        height,
-    })
+    Ok((
+        Validated {
+            format,
+            width,
+            height,
+        },
+        decoded,
+    ))
+}
+
+/// Rune decodes raster files at full resolution, regardless of their display size.
+/// Store a small display copy so a transcript of large screenshots cannot fill RAM.
+fn store_preview(id: &str, decoded: image::DynamicImage) -> Result<(), String> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let path = path_for_id(&format!("preview-{id}.png"))
+        .ok_or("Could not find Shina's image preview folder.")?;
+    if path.is_file() {
+        return Ok(());
+    }
+    let thumbnail = decoded.thumbnail(512, 512);
+    let mut bytes = Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(|error| format!("Could not prepare the image preview: {error}"))?;
+    let temporary = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result =
+        fs::write(&temporary, bytes.into_inner()).and_then(|_| fs::rename(&temporary, &path));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not save the image preview: {error}"));
+    }
+    Ok(())
 }
 
 fn mime(format: ImageFormat) -> &'static str {
@@ -584,6 +622,20 @@ mod tests {
             encode_images(std::slice::from_ref(&restored)).unwrap()[0]["mimeType"],
             "image/png"
         );
+    }
+
+    #[test]
+    fn display_thumbnails_are_bounded_and_do_not_replace_the_original_payload() {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1024, 640)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let original = encoded.into_inner();
+        let attached = attach_bytes("large.png", original.clone()).unwrap();
+        assert_eq!((attached.width, attached.height), (1024, 640));
+        let thumbnail = image::open(preview_path_for(&attached).unwrap()).unwrap();
+        assert!(thumbnail.width() <= 512 && thumbnail.height() <= 512);
+        assert_eq!(read(&attached).unwrap(), original);
     }
     #[test]
     fn png_jpeg_gif_and_webp_are_detected_from_bytes() {

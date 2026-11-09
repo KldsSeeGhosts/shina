@@ -31,7 +31,7 @@ own role and instructions. Shina shows the user every thread, its status, and it
 
 Ordinary coding tasks need no Shina tools.
 
-- `mcp__shina__orchestrator_capabilities` reports Shina's delegation surface: exact CPA model \
+- `mcp__shina__orchestrator_capabilities` reports Shina's delegation capabilities: exact CPA model \
 ids, each model's supported reasoning levels, the default and caller selections, and the \
 runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
 exact entry from that model's `reasoning_levels`. `ready: false` means model discovery \
