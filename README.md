@@ -81,13 +81,19 @@ Agents running in Shina know they are in Shina and can use its tools, the way ha
 
 | Tool | What it does |
 |---|---|
-| `list_threads` | Lists the workspace's threads with their ids, titles, captains, and status. |
+| `list_threads` | Lists the workspace's threads with their ids, titles, parents, captains, and status. |
 | `read_thread` | Returns a thread's most recent messages. |
 | `list_captains` | Lists the crew with their roles and current status. |
-| `delegate_task` | Starts a new thread, under the caller's captain or a named one, and sends it a brief. A delegated thread cannot delegate again. |
-| `task_status` | Reports a thread's status and latest reply without waiting. |
+| `delegate_task` | Starts a child under the caller's captain or a named one with a complete brief and no parent history. Children cannot delegate. Accepts `wait_seconds`. |
+| `task_status` | Reports a thread's parent, status, completion flag, latest reply and error. Accepts `wait_seconds`. |
+| `task_cancel` | Clears queued work and aborts a child. Only the parent that delegated it may cancel. |
+| `task_send` | Sends a correction or follow-up brief to a child. Only its parent may send. Starts an idle child or queues after its current work. |
 
-Tool calls run on Shina's UI thread, so they see and change exactly what the window shows. A delegated thread appears in the sidebar with an unread badge.
+After delegating, a captain can end its turn. When a child settles, fails or is cancelled, Shina sends its parent one completion message with the child's id, title, final status, last reply and any error. Replies are capped at 6,000 characters and errors at 2,000. Results start a new parent turn if idle, queue after current work if busy, or reconnect a disconnected parent before delivery. Multiple results retain separate queue entries. Messages appear as Shina in the transcript, including after restoring Pi history, and never replace the user's composer draft.
+
+`wait_seconds` is an integer from 0 to 600, default 0. A nonzero value holds the tool reply until completion or the deadline, then returns the current task status. Shina parks these replies without blocking its UI. Completion wake-ups still arrive when a tool waits, so captains should not poll in a loop.
+
+Tool calls run on Shina's UI thread, so they see and change exactly what the window shows. Delegated threads retain their parent in the saved index and appear nested beneath it with an unread badge. Pending injections and completion tracking are in memory, not durable across app restarts. If reconnecting or sending fails, Shina retains the injection for a manual reconnect rather than retrying continuously.
 
 Pi reaches the server through a small bridge extension, [`assets/pi/shina-mcp-extension.ts`](assets/pi/shina-mcp-extension.ts). Shina writes it to `%LOCALAPPDATA%\Shina\pi` and loads it with `--extension`, passing the endpoint and token in `SHINA_MCP_URL` and `SHINA_MCP_TOKEN`. The extension registers each tool as `mcp__shina__<tool>` and adds a "Shina" section to the system prompt. Other harnesses can connect to the same endpoint with a bearer header. Only Pi needs the bridge.
 
@@ -110,9 +116,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test installed_pi_answers_state_and_history_without_a_prompt -- --ignored
 cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
+cargo test installed_pi_parent_is_woken_by_child_completion -- --ignored --nocapture
 ```
 
-The first opt-in integration test starts the installed Pi and verifies CPA model discovery, reasoning levels, state, and history. It sends no model prompt. The second sends one prompt through the configured CPA model, reads and edits a disposable text fixture, waits for settlement, and reconnects to verify saved messages and tool results. It consumes upstream quota and leaves Pi's test session in its normal session directory.
+The first opt-in integration test starts the installed Pi and verifies CPA model discovery, reasoning levels, state, and history. It sends no model prompt. The second sends one prompt through the configured CPA model, reads and edits a disposable text fixture, waits for settlement, and reconnects to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota and leave Pi's test sessions in its normal session directory.
 
 Render with Rune's actual GPU renderer, without opening a window:
 

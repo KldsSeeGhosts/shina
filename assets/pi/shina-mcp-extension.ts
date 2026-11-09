@@ -3,6 +3,7 @@
 // SHINA_MCP_TOKEN, registers its tools as mcp__shina__<tool>, and tells the model it is
 // running inside Shina. Modeled on T3 Code's Pi MCP bridge.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { request as httpRequest } from "node:http";
 import { Type } from "typebox";
 
 const PROTOCOL = "2025-06-18";
@@ -47,16 +48,27 @@ function client(endpoint: string, token: string) {
     ...(session ? { "mcp-session-id": session } : {}),
   });
   const request = async (method: string, params?: unknown, signal?: AbortSignal) => {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: nextId++, method, params }),
-      signal,
+    // node:http has no fetch/undici five-minute header timeout. A Shina task wait can
+    // hold this request for ten minutes; Pi's abort signal still cancels it immediately.
+    const response = await new Promise<{ status: number; session?: string; body: string }>((resolve, reject) => {
+      const req = httpRequest(endpoint, { method: "POST", headers: headers(), signal }, (res) => {
+        const parts: string[] = [];
+        res.setEncoding("utf8");
+        res.on("data", (part: string) => parts.push(part));
+        res.on("error", reject);
+        res.on("end", () => resolve({
+          status: res.statusCode ?? 500,
+          session: res.headers["mcp-session-id"] as string | undefined,
+          body: parts.join(""),
+        }));
+      });
+      req.on("error", reject);
+      req.end(JSON.stringify({ jsonrpc: "2.0", id: nextId++, method, params }));
     });
-    session = response.headers.get("mcp-session-id") ?? session;
-    const body = await response.text();
-    if (!response.ok) throw new Error(`Shina MCP ${method} failed (${response.status}): ${body.slice(0, 300)}`);
-    const parsed = JSON.parse(body);
+    session = response.session ?? session;
+    if (response.status < 200 || response.status >= 300)
+      throw new Error(`Shina MCP ${method} failed (${response.status}): ${response.body.slice(0, 300)}`);
+    const parsed = JSON.parse(response.body);
     if (parsed.error) throw new Error(parsed.error.message ?? `Shina MCP ${method} failed`);
     return parsed.result;
   };
