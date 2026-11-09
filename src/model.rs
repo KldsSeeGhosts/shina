@@ -246,6 +246,8 @@ pub struct Thread {
     pub selected_thinking: Option<String>,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
+    startup_selection_check: Option<String>,
+    startup_selection_verified: bool,
     queued_prompt: Option<(String, usize)>,
     retry_prompt: Option<String>,
     pending_thinking: Option<String>,
@@ -337,6 +339,8 @@ impl Thread {
             selected_thinking: None,
             startup_model_applied: false,
             startup_thinking_applied: false,
+            startup_selection_check: None,
+            startup_selection_verified: false,
             queued_prompt: None,
             retry_prompt: None,
             pending_thinking: None,
@@ -387,6 +391,8 @@ impl Thread {
         self.history_loaded = false;
         self.startup_model_applied = false;
         self.startup_thinking_applied = false;
+        self.startup_selection_check = None;
+        self.startup_selection_verified = false;
         self.pi = Some(backend.start(
             path,
             self.session.clone(),
@@ -732,6 +738,22 @@ impl Thread {
                     return;
                 }
             }
+            // Pi acknowledges set_thinking_level without returning the applied level.
+            // Verify its state before delivering a delegated brief, since Pi can clamp it.
+            if self.delegated && self.selected_model.is_some() && !self.startup_selection_verified {
+                if self.startup_selection_check.is_none() {
+                    if self.command("get_state", json!({})) {
+                        self.startup_selection_check = Some(format!("{}-{}", self.id, self.serial));
+                    } else {
+                        self.fail_session(
+                            self.error.clone().unwrap_or_else(|| {
+                                "Pi did not accept selection verification.".into()
+                            }),
+                        );
+                    }
+                }
+                return;
+            }
             self.initializing = false;
             self.session_started = None;
             if self.queued_prompt.is_none()
@@ -961,6 +983,37 @@ impl Thread {
                 match command {
                     "get_state" => {
                         let data = &record["data"];
+                        if self
+                            .startup_selection_check
+                            .as_ref()
+                            .is_some_and(|id| record["id"] == *id)
+                        {
+                            self.startup_selection_check = None;
+                            let model_matches =
+                                self.selected_model
+                                    .as_ref()
+                                    .is_none_or(|(provider, model)| {
+                                        data["model"]["provider"] == *provider
+                                            && data["model"]["id"] == *model
+                                    });
+                            let reasoning_matches = self
+                                .selected_thinking
+                                .as_ref()
+                                .is_none_or(|level| data["thinkingLevel"] == *level);
+                            if !model_matches || !reasoning_matches {
+                                self.fail_session(format!(
+                                    "Pi applied model {}/{} with reasoning {} instead of the delegated selection {}/{} with reasoning {}. Shina did not send the task.",
+                                    string(&data["model"], "provider"),
+                                    string(&data["model"], "id"),
+                                    string(data, "thinkingLevel"),
+                                    self.selected_model.as_ref().map_or("", |v| v.0.as_str()),
+                                    self.selected_model.as_ref().map_or("", |v| v.1.as_str()),
+                                    self.selected_thinking.as_deref().unwrap_or("default"),
+                                ));
+                                return;
+                            }
+                            self.startup_selection_verified = true;
+                        }
                         if !self.initializing || self.selected_model.is_none() {
                             self.update_model(&data["model"]);
                         }
@@ -2525,7 +2578,7 @@ impl State {
         self.checkpoint();
     }
     /// Models Shina can validate against, preferring the live catalog over the caller's last
-    /// handshake metadata. The bool records which source was used.
+    /// handshake metadata. The string records which source was used.
     fn delegation_models(&self, caller: &Thread) -> (Vec<AgentModel>, &'static str) {
         let mut models = self.catalog.models.clone();
         if let Some(default) = &self.catalog.default_model
@@ -2860,7 +2913,7 @@ impl State {
                 let (models, _) = self.delegation_models(&self.threads[caller_index]);
                 let selection = match &target {
                     Some(target) => {
-                        let inherited = self.threads[caller_index].inherited_selection();
+                        let inherited = self.inherited_selection(caller_index);
                         Some(Selection {
                             provider: "cpa".into(),
                             model: target.model.clone(),
@@ -4809,12 +4862,24 @@ mod tests {
         );
         state.threads[index]
             .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        let verification_commands: Vec<_> = commands.try_iter().collect();
         assert!(
-            commands
-                .try_iter()
+            verification_commands
+                .iter()
                 .all(|command| command["type"] != "prompt"),
             "the prompt must wait for startup to finish"
         );
+        let verification = verification_commands
+            .iter()
+            .rev()
+            .find(|command| command["type"] == "get_state")
+            .expect("Pi must confirm its actual selection");
+        state.poll_tasks(Instant::now());
+        assert!(commands.try_recv().is_err());
+        state.threads[index].apply(json!({
+            "type":"response","id":verification["id"],"command":"get_state","success":true,
+            "data":{"model":{"provider":"cpa","id":"deep"},"thinkingLevel":"max"}
+        }));
         state.poll_tasks(Instant::now());
         let prompt = commands.try_recv().unwrap();
         assert_eq!(prompt["type"], "prompt");
@@ -4826,6 +4891,51 @@ mod tests {
         );
         assert_eq!(state.threads[index].model_id, "deep");
         assert_eq!(state.threads[index].thinking, "max");
+    }
+
+    #[test]
+    fn delegated_briefs_are_not_sent_when_pi_changes_the_requested_selection() {
+        for data in [
+            json!({"model":{"provider":"cpa","id":"deep"},"thinkingLevel":"high"}),
+            json!({"model":{"provider":"cpa","id":"other"},"thinkingLevel":"max"}),
+            json!({"model":{"provider":"direct","id":"deep"},"thinkingLevel":"max"}),
+            json!({"model":{"provider":"cpa","id":"deep"}}),
+        ] {
+            let mut thread = Thread::new(2);
+            thread.delegated = true;
+            thread.selected_model = Some(("cpa".into(), "deep".into()));
+            thread.selected_thinking = Some("max".into());
+            thread.arm_task();
+            thread.enqueue_injection("Do not send under another selection".into());
+            let (commands, _events) = preparing_pi(&mut thread);
+            thread.state_loaded = true;
+            thread.history_loaded = true;
+            thread.startup_model_applied = true;
+            thread.startup_thinking_applied = true;
+            thread.drive_session();
+            let verification = commands.try_recv().unwrap();
+            assert_eq!(verification["type"], "get_state");
+            assert!(!thread.flush_injection());
+            thread.apply(json!({
+                "type":"response","id":verification["id"],
+                "command":"get_state","success":true,"data":data
+            }));
+            assert_eq!(thread.status, Status::Failed);
+            assert_eq!(thread.task_result, Some("failed"));
+            assert!(thread.pi.is_none());
+            assert!(
+                thread
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Shina did not send the task")
+            );
+            assert!(
+                commands
+                    .try_iter()
+                    .all(|command| command["type"] != "prompt")
+            );
+        }
     }
 
     #[test]
