@@ -435,11 +435,11 @@ pub fn clone_command(source: &Source, target: &Path) -> Command {
 
 #[cfg(test)]
 impl CloneJob {
-    /// A clone that reported `result` after `progress`, so one poll reads both.
+    /// Completion followed by late progress, so one poll reads both in this order.
     pub fn test_finished(progress: &str, result: Result<(), String>) -> Self {
         let (tx, events) = channel();
-        let _ = tx.send(CloneEvent::Progress(progress.into()));
         let _ = tx.send(CloneEvent::Done(result));
+        let _ = tx.send(CloneEvent::Progress(progress.into()));
         Self::test_idle_with(events)
     }
 

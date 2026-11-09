@@ -64,9 +64,9 @@ An installed copy of Shina updates itself without a download step. It checks Git
 
 The button is disabled while any thread is running, waiting for you, configuring Pi, or has queued messages or an open question, while a repository is cloning, and while a rename or captain editor is open. Composer drafts never block, because they are saved. A restart saves and flushes everything first, swaps the executable or app bundle, and reopens Shina on your last workspace.
 
-You can also just quit normally. If an update is prepared and nothing is active, quitting saves, installs it, and does not reopen Shina. Otherwise the download stays ready for the next quit. A failed install restores the previous build and keeps the verified download for the next attempt.
+A normal quit always saves and flushes, but does not install an update. The download stays ready for the next launch. Only the restart button approves installation. This avoids stale install approvals when Windows cancels a session end. macOS uses an atomic bundle exchange. Windows starts a copy of the previous executable as a helper, waits for the UI process to exit, then replaces the executable with `ReplaceFileW`. A failed launch restores and reopens the previous build when the platform reports the failure.
 
-Checks and downloads that fail quietly retry at the next interval: a missing `gh`, no network, a release without this platform's asset, a partial download or a checksum mismatch never shows an error in a thread. A real authentication denial stops update attempts until you restart Shina and shows the manual remedy, `gh auth login`. Shina never runs a login or stores a token. Development builds, `--demo` runs and snapshot runs never update themselves.
+Checks and downloads that fail quietly retry at the next interval: a missing `gh`, no network, a release without this platform's asset, a partial download or a checksum mismatch never shows an error in a thread. A real authentication denial stops update attempts until you restart Shina and records the manual remedy, `gh auth login`, in updater diagnostics. Shina never runs a login or stores a token. Development builds, `--demo` runs and snapshot runs never update themselves.
 
 macOS updates need release assets that `release.ps1` did not publish before: a complete `Shina.app` zipped per architecture, as `Shina-macos-aarch64.zip` (Apple silicon) and `Shina-macos-x86_64.zip` (Intel), plus a `SHA256SUMS` file covering every asset. Build a Mac zip on the matching Mac:
 
@@ -74,7 +74,7 @@ macOS updates need release assets that `release.ps1` did not publish before: a c
 sh tools/package-macos.sh
 ```
 
-It reuses the installer's bundle construction without installing anything and writes `target/release-package/Shina-macos-<arch>.zip`. A Mac app in a folder it cannot write to leaves the update downloaded and never asks for elevation.
+It reuses the installer's bundle construction without installing anything and writes `target/release-package/Shina-macos-<arch>.zip`. An unwritable applications folder or a filesystem without atomic exchange defers installation without asking for elevation. Failed preparation removes that attempt and retries at the next interval.
 
 To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, build each Mac zip on the matching Mac, then run this from a clean `main`:
 

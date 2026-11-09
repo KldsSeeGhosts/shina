@@ -2,8 +2,8 @@
 //! the user's existing `gh` CLI login; Shina never reads or stores a GitHub token.
 //!
 //! An installed copy checks in the background, downloads and verifies a newer build into its
-//! own staging area, and offers one restart. A plain quit installs a prepared update without
-//! reopening the app. Failures stay quiet: the status returns to idle and the next interval
+//! own staging area, and offers one restart. A plain quit keeps the prepared update.
+//! Failures stay quiet: the status returns to idle and the next interval
 //! retries.
 use rune::Waker;
 use serde_json::Value;
@@ -47,7 +47,7 @@ pub enum Status {
     Checking,
     /// Downloading, verifying and preparing a newer release.
     Downloading { tag: String },
-    /// A verified replacement waits for the restart or the next normal quit.
+    /// A verified replacement waits for an explicit restart.
     Ready { update: PreparedUpdate },
 }
 
@@ -78,6 +78,9 @@ impl PreparedUpdate {
     }
 
     fn from_value(value: &Value) -> Option<Self> {
+        if value["version"] != 1 {
+            return None;
+        }
         let target = if let Some(exe) = value["target"]["windows"].as_str() {
             InstalledTarget::Windows {
                 exe: PathBuf::from(exe),
@@ -105,24 +108,17 @@ impl PreparedUpdate {
             InstalledTarget::MacBundle { app } => app.clone(),
         }
     }
-
-    /// The installed app this update replaces, or the recovered one when the install was
-    /// moved aside. A relaunch that fails reopens this.
-    fn previous_app(&self) -> Option<PathBuf> {
-        match &self.target {
-            InstalledTarget::Windows { .. } => None,
-            InstalledTarget::MacBundle { app } => app
-                .parent()
-                .map(|directory| directory.join("Shina-app.previous"))
-                .filter(|previous| previous.is_dir()),
-        }
-    }
 }
 
 /// Why a manifest's update cannot install itself here, or `None` when it can. A manifest
 /// from a test folder, another app folder or another platform is never installed.
 fn update_reaches_the_installed_app(update: &PreparedUpdate, target: &InstalledTarget) -> bool {
-    update.target == *target && update.prepared.exists() && update.download.is_file()
+    update.target == *target
+        && update.asset == target.asset()
+        && hex_sha256(&update.sha256).is_some()
+        && is_newer(&update.tag, env!("CARGO_PKG_VERSION"))
+        && update.prepared.exists()
+        && update.download.is_file()
 }
 
 /// A newer release tag and the asset this build installs from.
@@ -233,11 +229,6 @@ impl Storage {
         }
     }
 
-    /// Removes every attempt directory a previous run left behind.
-    pub fn discard_all_attempts(&self) {
-        self.discard_attempts(&None);
-    }
-
     /// Removes one attempt's files after preparation failed.
     fn discard(&self, attempt: &Path) {
         if attempt.starts_with(&self.root) {
@@ -254,8 +245,152 @@ pub struct ExitUpdate {
 
 static EXIT: std::sync::Mutex<Option<ExitUpdate>> = std::sync::Mutex::new(None);
 
+/// Every test that touches EXIT must hold this single process-wide guard.
+#[cfg(test)]
+pub fn test_exit_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: Mutex<()> = Mutex::new(());
+    let guard = GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    take_exit();
+    guard
+}
+
 fn exit_slot() -> std::sync::MutexGuard<'static, Option<ExitUpdate>> {
     EXIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Clean only the updater's fixed staging paths, and only after reading the manifest.
+fn cleanup_prepared(target: &InstalledTarget, keep: Option<&PreparedUpdate>) {
+    match target {
+        InstalledTarget::Windows { exe } => {
+            if let Some(directory) = exe.parent() {
+                let staged = directory.join("shina.new.exe");
+                if !keep.is_some_and(|update| update.prepared == staged) {
+                    let _ = fs::remove_file(staged);
+                }
+            }
+        }
+        InstalledTarget::MacBundle { app } => {
+            let staged = install::bundle_staging(app);
+            if !keep.is_some_and(|update| update.prepared.starts_with(&staged)) {
+                install::discard_prepared(app);
+            }
+        }
+    }
+}
+
+/// The helper runs the previous known-working executable, not the untested download.
+/// It waits for this process to exit before touching a mapped Windows executable.
+#[cfg(windows)]
+pub fn start_windows_helper(update: &PreparedUpdate) -> Result<(), String> {
+    if update.target.path()
+        != &install::install_dir()
+            .ok_or("No install folder.")?
+            .join("shina.exe")
+    {
+        return Err("The update target is not the installed Shina.".into());
+    }
+    let storage = Storage::default_storage();
+    let helper = storage.root.join("update-helper.exe");
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&storage.root).map_err(|e| e.to_string())?;
+    fs::copy(&current, &helper).map_err(|e| format!("Could not prepare update helper: {e}"))?;
+    if file_sha256(&helper)? != file_sha256(&current)? {
+        return Err("The update helper copy is incomplete.".into());
+    }
+    // The helper can open this process before the parent returns from main.
+    let parent = std::process::id().to_string();
+    let handshake = storage.root.join("helper-started");
+    match fs::remove_file(&handshake) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not reset the helper handshake: {error}")),
+    }
+    install::launch_with(&helper, &["--apply-update", &parent])?;
+    let deadline = Instant::now() + METADATA_TIMEOUT;
+    while !handshake.is_file() {
+        if Instant::now() >= deadline {
+            return Err("The update helper did not start in time.".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn run_windows_helper() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    let result = (|| -> Result<(), String> {
+        let storage = Storage::default_storage();
+        if std::env::current_exe().map_err(|e| e.to_string())?
+            != storage.root.join("update-helper.exe")
+        {
+            return Err("Only the staged helper may apply an update.".into());
+        }
+        let parent = std::env::args()
+            .nth(2)
+            .and_then(|arg| arg.parse::<u32>().ok())
+            .ok_or("The helper has no parent process.")?;
+        // Validate before acknowledging. On failure the parent retains its old executable
+        // and handles reopening it. After acknowledgment the helper owns the handoff.
+        let bytes = fs::read(storage.manifest()).map_err(|e| e.to_string())?;
+        let update = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| PreparedUpdate::from_value(&value))
+            .ok_or("Invalid update manifest.")?;
+        let target = InstalledTarget::Windows {
+            exe: install::install_dir()
+                .ok_or("No install folder.")?
+                .join("shina.exe"),
+        };
+        if !update_reaches_the_installed_app(&update, &target)
+            || update.prepared != target.path().with_file_name("shina.new.exe")
+        {
+            return Err("The update does not belong to this install.".into());
+        }
+        Gh.reverify(&update)?;
+        let handle = unsafe { OpenProcess(0x00100000, 0, parent) }; // SYNCHRONIZE
+        if handle.is_null() {
+            return Err("Could not wait for Shina to exit.".into());
+        }
+        let acknowledged = fs::write(storage.root.join("helper-started"), b"ready");
+        let waited = if acknowledged.is_ok() {
+            unsafe { WaitForSingleObject(handle, 30_000) }
+        } else {
+            u32::MAX
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if waited != 0 {
+            return Err("Shina did not exit; no update was installed.".into());
+        }
+        match apply_prepared_update(&update) {
+            Ok(installed) => {
+                let outcome = relaunch_or_restore(
+                    &update,
+                    &installed,
+                    &std::env::current_exe().map_err(|e| e.to_string())?,
+                );
+                let _ = fs::remove_file(storage.manifest());
+                outcome
+            }
+            Err(error) => {
+                let reopened = relaunch(&update.launcher(), &target);
+                Err(format!("{error}. Reopening the previous app: {reopened:?}"))
+            }
+        }
+    })();
+    if let Err(error) = result {
+        eprintln!("Shina update helper: {error}");
+    }
 }
 
 /// Hands a prepared update from `State` to `main`, which installs it once Rune has exited.
@@ -277,20 +412,15 @@ pub fn exit_recorded() -> bool {
 /// Installs a prepared update by replacing the installed app. The caller has already shut
 /// Rune and Pi down. Returns the path an explicit restart should open.
 pub fn apply_prepared_update(update: &PreparedUpdate) -> Result<PathBuf, String> {
+    Gh.reverify(update)?;
     match &update.target {
         InstalledTarget::Windows { exe } => {
-            if file_sha256(&update.prepared)? != update.sha256 {
-                return Err("The prepared update no longer matches its download.".into());
-            }
             let dir = exe
                 .parent()
                 .ok_or("The installed executable has no folder.")?;
             install::commit_exe(&update.prepared, dir)
         }
         InstalledTarget::MacBundle { app } => {
-            if let Some(problem) = mac_bundle_problem(&update.prepared, &update.tag) {
-                return Err(problem);
-            }
             install::commit_macos_bundle(&update.prepared, app)?;
             register_mac_bundle(app);
             Ok(app.clone())
@@ -326,7 +456,16 @@ pub fn relaunch_or_restore(
     installed: &Path,
     running: &Path,
 ) -> Result<(), String> {
-    let launch_error = match relaunch(installed, &update.target) {
+    relaunch_or_restore_with(update, installed, running, relaunch)
+}
+
+fn relaunch_or_restore_with(
+    update: &PreparedUpdate,
+    installed: &Path,
+    running: &Path,
+    mut launch: impl FnMut(&Path, &InstalledTarget) -> Result<(), String>,
+) -> Result<(), String> {
+    let launch_error = match launch(installed, &update.target) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
@@ -336,10 +475,8 @@ pub fn relaunch_or_restore(
         ));
     }
     // macOS reopens the restored bundle; Windows reopens the restored installed path.
-    let reopened = update
-        .previous_app()
-        .unwrap_or_else(|| installed.to_path_buf());
-    match relaunch(&reopened, &update.target) {
+    let reopened = update.launcher();
+    match launch(&reopened, &update.target) {
         Ok(()) => Ok(()),
         Err(error) => Err(format!(
             "{launch_error}. The previous Shina was restored; reopen {} ({error}).",
@@ -369,13 +506,13 @@ trait UpdateHost: Send + 'static {
     fn download_release(
         &mut self,
         release: &Release,
-        target: &InstalledTarget,
+        _target: &InstalledTarget,
         attempt: &Path,
     ) -> Result<(PathBuf, String), Failure>;
     fn prepare(
         &mut self,
         release: &Release,
-        target: &InstalledTarget,
+        _target: &InstalledTarget,
         download: &Path,
     ) -> Result<PathBuf, Failure>;
     fn reverify(&mut self, update: &PreparedUpdate) -> Result<(), String>;
@@ -414,13 +551,15 @@ impl UpdateHost for Gh {
     fn download_release(
         &mut self,
         release: &Release,
-        target: &InstalledTarget,
+        _target: &InstalledTarget,
         attempt: &Path,
     ) -> Result<(PathBuf, String), Failure> {
         let dir = attempt.join("asset");
         let download = dir.join(&release.asset.name);
         let result = run_gh_download(&release.tag, &release.asset.name, &dir, &download)
-            .and_then(|()| verify_download(&release.tag, &release.asset, target, &download))
+            .and_then(|()| {
+                verify_download(&release.tag, &release.asset, &download, fetch_checksums)
+            })
             .map(|sha256| (download, sha256));
         if result.is_err() {
             let _ = fs::remove_dir_all(attempt);
@@ -459,8 +598,21 @@ impl UpdateHost for Gh {
                         return Err(Failure::quiet(problem));
                     }
                     // Staged beside the installed app, so commit is a rename on one volume.
-                    install::prepare_macos_bundle(&bundle, &install::bundle_staging(app))
-                        .map_err(Failure::quiet)
+                    let staged =
+                        install::prepare_macos_bundle(&bundle, &install::bundle_staging(app))
+                            .map_err(Failure::quiet)?;
+                    let mut sign = Command::new("/usr/bin/codesign");
+                    sign.args(["--force", "--deep", "--sign", "-"])
+                        .arg(&staged)
+                        .stdin(Stdio::null());
+                    if !run_bounded(sign, METADATA_TIMEOUT)?.0.success() {
+                        return Err(Failure::quiet("Could not sign the prepared Shina bundle."));
+                    }
+                    if let Some(problem) = mac_bundle_problem(&staged, &release.tag) {
+                        return Err(Failure::quiet(problem));
+                    }
+                    install::sync_prepared_bundle(&staged).map_err(Failure::quiet)?;
+                    Ok(staged)
                 })();
                 if prepared.is_err() {
                     install::discard_prepared(app);
@@ -471,7 +623,21 @@ impl UpdateHost for Gh {
     }
 
     fn reverify(&mut self, update: &PreparedUpdate) -> Result<(), String> {
-        if file_sha256(&update.download)? != update.sha256 {
+        let owned = match &update.target {
+            InstalledTarget::Windows { exe } => exe.with_file_name("shina.new.exe"),
+            InstalledTarget::MacBundle { app } => {
+                install::bundle_staging(app).join(install::MACOS_APP_NAME)
+            }
+        };
+        if update.prepared != owned || update.prepared.is_symlink() {
+            return Err("The prepared update is outside its staging location.".into());
+        }
+        if fs::metadata(&update.download)
+            .map_err(|e| e.to_string())?
+            .len()
+            != update.size
+            || file_sha256(&update.download)? != update.sha256
+        {
             return Err("The downloaded update no longer matches its checksum.".into());
         }
         match &update.target {
@@ -524,6 +690,12 @@ impl Default for Updater {
     }
 }
 
+#[cfg(test)]
+fn gh() -> Command {
+    panic!("Unit tests must inject GitHub responses, not run gh.");
+}
+
+#[cfg(not(test))]
 fn gh() -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new("gh");
@@ -633,8 +805,8 @@ fn bytes_sha256(bytes: &[u8]) -> String {
 fn verify_download(
     tag: &str,
     asset: &ReleaseAsset,
-    _target: &InstalledTarget,
     download: &Path,
+    checksums: impl FnOnce(&str) -> Result<String, Failure>,
 ) -> Result<String, Failure> {
     let quiet = |message: String| Err(Failure::Quiet(message));
     let size = match fs::metadata(download) {
@@ -647,7 +819,7 @@ fn verify_download(
             asset.name, size, asset.size
         ));
     }
-    let expected = expected_sha256(tag, asset, fetch_checksums)?;
+    let expected = expected_sha256(tag, asset, checksums)?;
     let actual = match file_sha256(download) {
         Ok(actual) => actual,
         Err(error) => return quiet(error),
@@ -696,8 +868,16 @@ fn fetch_checksums(tag: &str) -> Result<String, Failure> {
     ));
     let file = dir.join(SHA256SUMS);
     let result = run_gh_download(tag, SHA256SUMS, &dir, &file).and_then(|()| {
-        fs::read_to_string(&file)
-            .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))
+        let file = fs::File::open(&file)
+            .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))?;
+        let mut text = String::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))?;
+        if text.len() > 1024 * 1024 {
+            return Err(Failure::quiet("The checksum file is too large."));
+        }
+        Ok(text)
     });
     let _ = fs::remove_dir_all(&dir);
     result
@@ -801,18 +981,31 @@ pub fn redact(text: &str) -> String {
 
 /// Runs a command to completion, or kills and reaps it at the deadline.
 fn run_bounded(
+    command: Command,
+    timeout: Duration,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Failure> {
+    run_bounded_with_limit(command, timeout, 1024 * 1024)
+}
+
+fn run_bounded_with_limit(
     mut command: Command,
     timeout: Duration,
+    output_limit: usize,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Failure> {
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GH_PROMPT_DISABLED", "1");
-    let mut child: Child = command.spawn().map_err(|_| {
-        Failure::quiet("GitHub CLI (gh) is not installed, so Shina cannot check for updates.")
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child: Child = command.spawn().map_err(|error| {
+        if program == "gh" && error.kind() == std::io::ErrorKind::NotFound {
+            Failure::quiet("Install the GitHub CLI (gh) so Shina can check for updates.")
+        } else {
+            Failure::quiet(format!("Could not start update command {program}: {error}"))
+        }
     })?;
-    let stdout = child.stdout.take().map(read_on_thread);
-    let stderr = child.stderr.take().map(read_on_thread);
+    let stdout = read_on_thread(child.stdout.take().expect("piped stdout"), output_limit);
+    let stderr = read_on_thread(child.stderr.take().expect("piped stderr"), 64 * 1024);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -820,35 +1013,59 @@ fn run_bounded(
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(reader) = stdout {
-                    let _ = reader.join();
-                }
-                if let Some(reader) = stderr {
-                    let _ = reader.join();
-                }
-                return Err(Failure::quiet("GitHub did not answer in time."));
+                return Err(Failure::quiet("The update command did not finish in time."));
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => return Err(Failure::quiet("GitHub request failed.")),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Failure::quiet("Could not wait for the update command."));
+            }
         }
     };
-    let mut out = stdout
-        .map(|reader| reader.join().unwrap_or_default())
-        .unwrap_or_default();
-    let mut err = stderr
-        .map(|reader| reader.join().unwrap_or_default())
-        .unwrap_or_default();
-    out.truncate(1024 * 1024);
-    err.truncate(4096);
+    let receive = |reader: Receiver<Result<Vec<u8>, Failure>>| {
+        reader
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| Failure::quiet("The update command's output did not close in time."))?
+    };
+    let out = receive(stdout)?;
+    let err = receive(stderr)?;
     Ok((status, out, err))
 }
 
-fn read_on_thread<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<Vec<u8>> {
+fn read_on_thread<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+) -> Receiver<Result<Vec<u8>, Failure>> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut out = Vec::new();
-        let _ = reader.read_to_end(&mut out);
-        out
-    })
+        let mut buffer = [0u8; 8192];
+        let mut overflow = false;
+        let result = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    break if overflow {
+                        Err(Failure::quiet("The update command's output is too large."))
+                    } else {
+                        Ok(out)
+                    };
+                }
+                Ok(count) => {
+                    let keep = count.min(limit.saturating_sub(out.len()));
+                    out.extend_from_slice(&buffer[..keep]);
+                    overflow |= keep < count;
+                }
+                Err(error) => {
+                    break Err(Failure::quiet(format!(
+                        "Could not read update output: {error}"
+                    )));
+                }
+            }
+        };
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 /// Whether `dir` accepts new entries. An unwritable applications folder fails quietly.
@@ -872,18 +1089,12 @@ fn writable(dir: &Path) -> bool {
 fn unpack_macos_zip(zip: &Path, destination: &Path) -> Result<(), Failure> {
     let mut list = Command::new("/usr/bin/zipinfo");
     list.arg("-l").arg(zip);
-    let (status, listing, _) = run_bounded(list, METADATA_TIMEOUT)?;
+    let (status, listing, _) = run_bounded_with_limit(list, METADATA_TIMEOUT, MAX_ARCHIVE_LISTING)?;
     if !status.success() {
         return Err(Failure::quiet("The update archive could not be read."));
     }
-    if listing.len() >= MAX_ARCHIVE_LISTING {
-        return Err(Failure::quiet("The update archive listing is too large."));
-    }
-    let listing = String::from_utf8_lossy(&listing);
-    // A truncated listing would leave later entries unchecked, so it fails closed.
-    if zipinfo_complete(&listing) != Some(true) {
-        return Err(Failure::quiet("The update archive listing is incomplete."));
-    }
+    let listing = String::from_utf8(listing)
+        .map_err(|_| Failure::quiet("The update archive listing is not UTF-8."))?;
     if let Some(problem) = archive_entry_problem(&listing) {
         return Err(Failure::quiet(problem));
     }
@@ -909,47 +1120,86 @@ fn unpack_macos_zip(zip: &Path, destination: &Path) -> Result<(), Failure> {
 /// and the time. Only the path holds spaces, so a spaced path is what follows the time
 /// column, which always holds a `:`.
 fn zipinfo_entry(line: &str) -> Option<(char, &str)> {
-    // The mode is the entry type and nine permission characters, all single bytes.
-    let mode = line.get(..10)?;
-    let chars: Vec<char> = mode.chars().collect();
-    let kind = chars[0];
-    let known_type = matches!(kind, '-' | 'd' | 'l' | 'p');
-    let permissions = chars[1..].iter().all(|c| "-rwxst".contains(*c));
-    let rest = line.get(10..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // A line is only an entry when it starts with a real mode.
-    if !(known_type && permissions) || fields.len() < 9 || !fields[7].contains(':') {
+    if line.chars().any(char::is_control) {
         return None;
     }
-    let time = fields[7];
-    let at = rest.rfind(time)? + time.len();
-    let path = rest.get(at..)?.trim();
+    let mut rest = line;
+    let mut fields = Vec::new();
+    for _ in 0..9 {
+        rest = rest.trim_start_matches(' ');
+        let end = rest.find(' ')?;
+        fields.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    let mode = fields[0];
+    if mode.len() != 10 || !mode.is_ascii() {
+        return None;
+    }
+    let kind = mode.as_bytes()[0] as char;
+    if !matches!(kind, '-' | 'd' | 'l' | 'p' | 'c' | 'b' | 's')
+        || !mode[1..].chars().all(|c| "-rwxstST".contains(c))
+        || fields[1].parse::<f32>().is_err()
+        || fields[2] != "unx"
+        || fields[3].parse::<u64>().is_err()
+        || fields[5].parse::<u64>().is_err()
+        || fields[7].split('-').count() != 3
+        || fields[8].len() != 5
+        || fields[8].as_bytes()[2] != b':'
+        || !fields[8].chars().all(|c| c.is_ascii_digit() || c == ':')
+    {
+        return None;
+    }
+    let path = rest.trim_start_matches(' ');
     (!path.is_empty()).then_some((kind, path))
 }
 
-/// Whether a `zipinfo -l` listing reached its end-of-archive footer.
-pub fn zipinfo_complete(listing: &str) -> Option<bool> {
-    let footer = |line: &str| -> Option<bool> {
-        let line = line.trim();
-        let (count, rest) = line.split_once(' ')?;
-        if !count.chars().all(|c| c.is_ascii_digit()) || !rest.starts_with("file") {
-            return None;
-        }
-        Some(rest.contains(" bytes uncompressed, "))
-    };
-    if listing.lines().any(|line| line.trim() == "Empty zipfile.") {
-        return Some(true);
+/// Parse the complete listing, including both independently reported entry counts.
+fn archive_entries(listing: &str) -> Option<Vec<(char, &str)>> {
+    if listing.len() > MAX_ARCHIVE_LISTING || listing.chars().any(|c| c.is_control() && c != '\n') {
+        return None;
     }
-    Some(listing.lines().filter_map(footer).any(|complete| complete))
+    let lines: Vec<_> = listing.lines().collect();
+    if lines.len() < 4 || !lines[0].starts_with("Archive:  ") {
+        return None;
+    }
+    let (size, count) = lines[1]
+        .strip_prefix("Zip file size: ")?
+        .split_once(" bytes, number of entries: ")?;
+    size.parse::<u64>().ok()?;
+    let count = count.parse::<usize>().ok()?;
+    let footer: Vec<_> = lines.last()?.split_whitespace().collect();
+    if footer.len() != 9
+        || footer[0].parse::<usize>().ok()? != count
+        || !matches!(footer[1], "file," | "files,")
+        || footer[2].parse::<u64>().is_err()
+        || footer[3] != "bytes"
+        || footer[4] != "uncompressed,"
+        || footer[5].parse::<u64>().is_err()
+        || footer[6] != "bytes"
+        || footer[7] != "compressed:"
+        || footer[8].strip_suffix('%')?.parse::<f64>().is_err()
+        || lines.len().checked_sub(3)? != count
+        || count == 0
+    {
+        return None;
+    }
+    lines[2..lines.len() - 1]
+        .iter()
+        .map(|line| zipinfo_entry(line))
+        .collect()
+}
+
+#[cfg(test)]
+fn zipinfo_complete(listing: &str) -> Option<bool> {
+    Some(archive_entries(listing).is_some())
 }
 
 /// Rejects absolute paths, parent links, links and entries outside the bundle before
 /// extraction. `listing` is a `zipinfo -l` listing, whose first column gives each entry type.
 pub fn archive_entry_problem(listing: &str) -> Option<String> {
-    let entries: Vec<_> = listing.lines().filter_map(zipinfo_entry).collect();
-    if entries.is_empty() {
-        return Some("The update archive is empty.".into());
-    }
+    let Some(entries) = archive_entries(listing) else {
+        return Some("The update archive listing is incomplete or malformed.".into());
+    };
     for (kind, entry) in entries {
         if kind == 'l' {
             return Some(format!("The update archive contains a link: {entry}"));
@@ -959,7 +1209,7 @@ pub fn archive_entry_problem(listing: &str) -> Option<String> {
                 "The update archive contains a special file: {entry}"
             ));
         }
-        let path = entry.trim_start_matches("./");
+        let path = entry.strip_prefix("./").unwrap_or(entry);
         // Only the Shina bundle itself: no other App bundle, no loose file.
         let inside_app = path
             .split('/')
@@ -994,11 +1244,15 @@ pub fn mac_bundle_problem(bundle: &Path, tag: &str) -> Option<String> {
     if !executable.is_file() || !bundle.join("Contents/MacOS/launch-shina").is_file() {
         return Some("The downloaded app is incomplete.".into());
     }
-    let architectures = Command::new("/usr/bin/lipo")
+    let mut architecture = Command::new("/usr/bin/lipo");
+    architecture
         .arg("-archs")
         .arg(&executable)
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .stdin(Stdio::null());
+    let architectures = run_bounded(architecture, METADATA_TIMEOUT)
+        .ok()
+        .filter(|output| output.0.success())
+        .map(|output| String::from_utf8_lossy(&output.1).trim().to_owned())
         .unwrap_or_default();
     if !architectures
         .split_whitespace()
@@ -1006,14 +1260,13 @@ pub fn mac_bundle_problem(bundle: &Path, tag: &str) -> Option<String> {
     {
         return Some("The downloaded app is built for another processor.".into());
     }
-    let signed = Command::new("/usr/bin/codesign")
+    let mut signature = Command::new("/usr/bin/codesign");
+    signature
         .args(["--verify", "--deep", "--strict"])
         .arg(bundle)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+        .stdin(Stdio::null());
+    let signed = run_bounded(signature, METADATA_TIMEOUT)
+        .map(|output| output.0.success())
         .unwrap_or(false);
     if !signed {
         return Some("The downloaded app is not signed correctly.".into());
@@ -1064,7 +1317,14 @@ impl Updater {
         if self.diagnostics.len() == MAX_DIAGNOSTICS {
             self.diagnostics.pop_front();
         }
-        self.diagnostics.push_back(redact(&message.into()));
+        let message = redact(&message.into());
+        self.diagnostics.push_back(
+            message
+                .chars()
+                .take(300)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        );
     }
 
     fn idle_from(&mut self, now: Instant) {
@@ -1108,8 +1368,10 @@ impl Updater {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|value| PreparedUpdate::from_value(&value))
-            .filter(|update| update_reaches_the_installed_app(update, &target));
-        self.storage.discard_attempts(&update);
+            .filter(|update| {
+                update_reaches_the_installed_app(update, &target)
+                    && update.download.starts_with(&self.storage.root)
+            });
         if let Some(update) = update {
             self.spawn(wake, move |host| {
                 let outcome = host.reverify(&update).map_err(|error| redact(&error));
@@ -1117,6 +1379,9 @@ impl Updater {
             });
             return;
         }
+        self.storage.discard_attempts(&None);
+        cleanup_prepared(&target, None);
+        self.clear_manifest();
         self.next_check = Some(now + FIRST_CHECK);
     }
 
@@ -1251,19 +1516,15 @@ impl Updater {
             Event::Recovered { update, outcome } => {
                 match outcome {
                     Ok(()) => {
-                        self.write_manifest(&update);
+                        self.storage.discard_attempts(&Some(update.clone()));
+                        cleanup_prepared(&update.target, Some(&update));
                         self.ready(update);
                     }
                     Err(error) => {
-                        // The download may be damaged; drop it with its staging folder.
-                        if let Some(attempt) = update.download.ancestors().find(|path| {
-                            path.file_name()
-                                .is_some_and(|name| name.to_string_lossy().starts_with("attempt-"))
-                        }) {
-                            self.storage.discard(attempt);
-                        }
+                        self.storage.discard_attempts(&None);
                         self.record(error);
                         self.clear_manifest();
+                        cleanup_prepared(&update.target, None);
                         self.idle_from(now);
                     }
                 }
@@ -1285,8 +1546,14 @@ impl Updater {
                 outcome: Ok(update),
                 ..
             } => {
-                self.write_manifest(&update);
-                self.ready(update);
+                match self.write_manifest(&update) {
+                    Ok(()) => self.ready(update),
+                    Err(error) => {
+                        self.storage.discard_attempts(&None);
+                        cleanup_prepared(&update.target, None);
+                        self.failed(Failure::quiet(error), now);
+                    }
+                }
                 true
             }
             Event::Downloaded {
@@ -1295,6 +1562,9 @@ impl Updater {
             } => {
                 // Nothing of a failed attempt is kept, so no complete download piles up.
                 self.storage.discard(&attempt);
+                if let Some(target) = &self.target {
+                    cleanup_prepared(target, None);
+                }
                 self.failed(failure, now);
                 true
             }
@@ -1319,10 +1589,8 @@ impl Updater {
         self.idle_from(now);
     }
 
-    fn write_manifest(&self, update: &PreparedUpdate) {
-        if fs::create_dir_all(&self.storage.root).is_err() {
-            return;
-        }
+    fn write_manifest(&self, update: &PreparedUpdate) -> Result<(), String> {
+        fs::create_dir_all(&self.storage.root).map_err(|e| e.to_string())?;
         let manifest = self.storage.manifest();
         let temporary = manifest.with_extension("json.tmp");
         let written = fs::File::create(&temporary)
@@ -1331,7 +1599,7 @@ impl Updater {
                 file.sync_all()
             })
             .and_then(|()| fs::rename(&temporary, &manifest));
-        let _ = written;
+        written.map_err(|e| format!("Could not save the prepared update: {e}"))
     }
 
     fn clear_manifest(&self) {
@@ -1433,22 +1701,14 @@ mod tests {
             // The fixture's SHA256SUMS stands in for the release's, so nothing is fetched.
             let denied = self.deny_checksums.load(Ordering::SeqCst);
             let sums = sums.clone();
-            let sha256 = verify_download(&release.tag, &release.asset, &target(), &download)
-                .or_else(|_| {
-                    let expected = expected_sha256(&release.tag, &release.asset, |_| {
-                        if denied {
-                            return Err(Failure::Auth(
-                                "Run `gh auth login` so Shina can download updates.".into(),
-                            ));
-                        }
-                        Ok(sums.clone())
-                    })?;
-                    if file_sha256(&download).ok().as_deref() == Some(expected.as_str()) {
-                        Ok(expected)
-                    } else {
-                        Err(Failure::quiet("The download does not match its SHA-256."))
-                    }
-                })?;
+            let sha256 = verify_download(&release.tag, &release.asset, &download, |_| {
+                if denied {
+                    return Err(Failure::Auth(
+                        "Run `gh auth login` so Shina can download updates.".into(),
+                    ));
+                }
+                Ok(sums.clone())
+            })?;
             Ok((download, sha256))
         }
         fn prepare(
@@ -1507,8 +1767,7 @@ mod tests {
 
     /// An updater that believes it runs from an installed copy, with isolated storage.
     fn installed(host: Scripted) -> (Updater, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        // Every updater keeps its own folder: Rust reads `start` as a unique counter, so no
-        // two tests share a manifest or an attempt.
+        // Each updater in a test gets a separate manifest and attempts.
         static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (checks, downloads) = (Arc::clone(&host.checks), Arc::clone(&host.downloads));
@@ -1533,16 +1792,6 @@ mod tests {
             updater.status(),
             updater.diagnostics().collect::<Vec<_>>()
         );
-    }
-
-    /// Waits for the worker to report its result, which can land after `settle` sampled it.
-    fn sleep_until(condition: impl Fn(&Updater) -> bool, updater: &Updater) {
-        for _ in 0..200 {
-            if condition(updater) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
     }
 
     fn newer() -> Scripted {
@@ -1663,7 +1912,6 @@ mod tests {
         settle(&mut updater, start + FIRST_CHECK, |u| {
             u.status() == &Status::Idle
         });
-        sleep_until(|u| u.remaining(start + FIRST_CHECK).is_some(), &updater);
         assert!(updater.diagnostics().next().is_none());
         let remaining = updater.remaining(start + FIRST_CHECK).unwrap();
         assert!(
@@ -1685,7 +1933,6 @@ mod tests {
             u.status() == &Status::Idle
         });
         assert_eq!(updater.diagnostics().count(), 1);
-        sleep_until(|u| u.remaining(start + FIRST_CHECK).is_some(), &updater);
         let next = start + FIRST_CHECK + INTERVAL + Duration::from_secs(1);
         updater.poll(next, wake());
         assert_eq!(
@@ -1749,7 +1996,6 @@ mod tests {
         updater.start(true, start, wake());
         updater.poll(start + FIRST_CHECK, wake());
         settle(&mut updater, start + FIRST_CHECK, |u| u.events.is_none());
-        sleep_until(|u| u.suspended().is_some(), &updater);
         assert_eq!(
             updater.suspended(),
             Some("Run `gh auth login` so Shina can download updates.")
@@ -1825,6 +2071,151 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_keeps_a_verified_prepared_exe_and_deletes_only_orphans() {
+        let (mut updater, _, _) = installed(Scripted::new(|| panic!("recovery must not fetch")));
+        updater.host = Arc::new(Mutex::new(Box::new(Gh)));
+        let mut saved = saved_update(&updater, "v99.0.0");
+        let InstalledTarget::Windows { exe } = &saved.target else {
+            unreachable!()
+        };
+        saved.prepared = install::prepare_exe(&saved.download, exe.parent().unwrap()).unwrap();
+        updater.write_manifest(&saved).unwrap();
+        let orphan = updater.storage.root.join("attempt-orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("partial"), b"partial").unwrap();
+        let start = Instant::now();
+        updater.start(true, start, wake());
+        assert!(
+            saved.download.is_file(),
+            "read the manifest before deleting downloads"
+        );
+        assert!(
+            saved.prepared.is_file(),
+            "read the manifest before deleting shina.new.exe"
+        );
+        settle(&mut updater, start, |u| u.prepared_update().is_some());
+        assert!(!orphan.exists());
+        assert_eq!(updater.prepared_update(), Some(&saved));
+        assert_eq!(updater.remaining(start + INTERVAL), None);
+    }
+
+    #[test]
+    fn startup_removes_an_unreferenced_prepared_bundle() {
+        let root = storage("orphan-bundle").root;
+        let app = root.join("Applications/Shina.app");
+        let staging = install::bundle_staging(&app);
+        fs::create_dir_all(staging.join("Shina.app/Contents")).unwrap();
+        let mut updater = Updater {
+            installed: true,
+            target: Some(InstalledTarget::MacBundle { app }),
+            storage: Storage::at(root.join("updates")),
+            ..Updater::default()
+        };
+        updater.start(true, Instant::now(), wake());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_failed_mac_launch_restores_and_reopens_the_installed_bundle_not_the_failed_backup() {
+        let root = storage("launch-restore").root;
+        let app = root.join("Applications/Shina.app");
+        let executable = |path: &Path| path.join("Contents/MacOS/shina");
+        fs::create_dir_all(executable(&app).parent().unwrap()).unwrap();
+        fs::write(executable(&app), b"old").unwrap();
+        let source = root.join("incoming/Shina.app");
+        fs::create_dir_all(executable(&source).parent().unwrap()).unwrap();
+        fs::write(executable(&source), b"broken").unwrap();
+        let prepared =
+            install::prepare_macos_bundle(&source, &install::bundle_staging(&app)).unwrap();
+        install::commit_macos_bundle(&prepared, &app).unwrap();
+        let update = PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: InstalledTarget::MacBundle { app: app.clone() },
+            asset: "fixture.zip".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: root.join("fixture.zip"),
+            prepared,
+        };
+        let mut launches = Vec::new();
+        relaunch_or_restore_with(&update, &app, &executable(&app), |path, _| {
+            launches.push(path.to_path_buf());
+            let contents = fs::read(executable(path)).unwrap();
+            if launches.len() == 1 {
+                assert_eq!(contents, b"broken");
+                Err("Launch Services rejected the build".into())
+            } else {
+                assert_eq!(contents, b"old");
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(launches, vec![app.clone(), app]);
+    }
+
+    #[test]
+    fn a_failed_exe_launch_restores_and_reopens_the_original_build() {
+        let root = storage("exe-launch-restore").root;
+        let exe = root.join("install/shina.exe");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"old").unwrap();
+        let download = root.join("download");
+        fs::write(&download, b"broken").unwrap();
+        let prepared = install::prepare_exe(&download, exe.parent().unwrap()).unwrap();
+        install::commit_exe(&prepared, exe.parent().unwrap()).unwrap();
+        let update = PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: InstalledTarget::Windows { exe: exe.clone() },
+            asset: "shina.exe".into(),
+            size: 6,
+            sha256: bytes_sha256(b"broken"),
+            download,
+            prepared,
+        };
+        let mut launches = 0;
+        relaunch_or_restore_with(&update, &exe, &root.join("helper.exe"), |path, _| {
+            launches += 1;
+            assert_eq!(path, exe);
+            if launches == 1 {
+                assert_eq!(fs::read(path).unwrap(), b"broken");
+                Err("The executable cannot start".into())
+            } else {
+                assert_eq!(fs::read(path).unwrap(), b"old");
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(launches, 2);
+        assert!(update.download.is_file(), "keep the downloaded asset");
+    }
+
+    #[test]
+    fn a_failed_launch_without_a_backup_does_not_retry_the_failed_build() {
+        let root = storage("missing-relaunch-backup").root;
+        let exe = root.join("shina.exe");
+        fs::write(&exe, b"broken").unwrap();
+        let update = PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: InstalledTarget::Windows { exe: exe.clone() },
+            asset: "shina.exe".into(),
+            size: 6,
+            sha256: bytes_sha256(b"broken"),
+            download: root.join("download"),
+            prepared: root.join("prepared"),
+        };
+        let mut launches = 0;
+        let error = relaunch_or_restore_with(&update, &exe, &root.join("helper.exe"), |_, _| {
+            launches += 1;
+            Err("launch failed".into())
+        })
+        .unwrap_err();
+        assert_eq!(launches, 1);
+        assert!(error.contains("no previous"), "{error}");
+        assert_eq!(fs::read(exe).unwrap(), b"broken");
+    }
+
+    #[test]
     fn a_damaged_prepared_update_is_dropped_instead_of_offered() {
         let mut host = Scripted::new(|| Ok(None));
         host.reverify_fails = true;
@@ -1875,10 +2266,7 @@ mod tests {
         updater.start(true, start, wake());
         updater.poll(start + FIRST_CHECK, wake());
         settle(&mut updater, start + FIRST_CHECK, |u| u.events.is_none());
-        sleep_until(
-            |u| u.status() == &Status::Idle && u.diagnostics().next().is_some(),
-            &updater,
-        );
+        assert_eq!(updater.status(), &Status::Idle);
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
         let attempts: Vec<_> = fs::read_dir(&updater.storage.root)
             .unwrap()
@@ -1980,20 +2368,21 @@ mod tests {
             size: 5,
             digest: Some(format!("sha256:{}", bytes_sha256(b"asset"))),
         };
-        assert!(verify_download("v1", &asset, &target(), &file).is_ok());
+        let offline = |_: &str| -> Result<String, Failure> { panic!("unexpected checksum fetch") };
+        assert!(verify_download("v1", &asset, &file, offline).is_ok());
         asset.size = 99;
         assert!(matches!(
-            verify_download("v1", &asset, &target(), &file),
+            verify_download("v1", &asset, &file, offline),
             Err(Failure::Quiet(_))
         ));
         asset.size = 5;
         asset.digest = Some(format!("sha256:{}", "0".repeat(64)));
-        assert!(verify_download("v1", &asset, &target(), &file).is_err());
+        assert!(verify_download("v1", &asset, &file, offline).is_err());
         asset.digest = Some("sha256:nothex".into());
-        assert!(verify_download("v1", &asset, &target(), &file).is_err());
+        assert!(verify_download("v1", &asset, &file, offline).is_err());
         fs::write(&file, b"ass").unwrap();
         assert!(
-            verify_download("v1", &asset, &target(), &file).is_err(),
+            verify_download("v1", &asset, &file, offline).is_err(),
             "a partial file fails its size"
         );
     }
@@ -2013,7 +2402,7 @@ mod tests {
         let sums = root.join(SHA256SUMS);
         let serve = |text: &str| {
             fs::write(&sums, text).unwrap();
-            expected_sha256("v1", &asset, |_| {
+            verify_download("v1", &asset, &file, |_| {
                 fs::read_to_string(&sums)
                     .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))
             })
@@ -2070,13 +2459,12 @@ mod tests {
     const BIN: &str =
         "-rwxr-xr-x  3.0 unx  1234 tx     567 defN 26-Nov-09 14:55 Shina.app/Contents/MacOS/shina";
     const LINK: &str = "lrwxr-xr-x  3.0 unx       11 bx       11 stor 26-Nov-09 14:55 Shina.app/lib -> /etc/passwd";
-    const FOOTER: &str = "3 files, 1234 bytes uncompressed, 567 bytes compressed:  53.8%";
-
     fn listing(entries: &[&str]) -> String {
         format!(
-            "Archive:  Shina-macos-aarch64.zip\nZip file size: 900 bytes, number of entries: {}\n{}\n{FOOTER}\n",
+            "Archive:  Shina-macos-aarch64.zip\nZip file size: 900 bytes, number of entries: {}\n{}\n{} files, 1234 bytes uncompressed, 567 bytes compressed:  53.8%\n",
             entries.len(),
-            entries.join("\n")
+            entries.join("\n"),
+            entries.len()
         )
     }
 
@@ -2116,7 +2504,7 @@ mod tests {
         );
         assert_eq!(
             zipinfo_complete("Archive:  empty.zip\nEmpty zipfile.\n"),
-            Some(true)
+            Some(false)
         );
     }
 
@@ -2132,5 +2520,102 @@ mod tests {
         assert_eq!(zipinfo_entry(MACOS_DIR).map(|(kind, _)| kind), Some('d'));
         assert_eq!(zipinfo_entry("Archive:  Shina-macos-aarch64.zip"), None);
         assert_eq!(zipinfo_entry("3 files, 1234 bytes uncompressed"), None);
+        let timestamp_in_name = format!("{BIN} 14:55 extra");
+        assert_eq!(
+            zipinfo_entry(&timestamp_in_name).unwrap().1,
+            "Shina.app/Contents/MacOS/shina 14:55 extra"
+        );
+    }
+
+    #[test]
+    fn archive_validation_rejects_unparsed_records_wrong_counts_trailing_data_and_controls() {
+        let valid = listing(&[DIR, MACOS_DIR, BIN]);
+        for invalid in [
+            valid.replace(BIN, "not an archive entry"),
+            valid.replace("3 files,", "2 files,"),
+            valid.replace("number of entries: 3", "number of entries: 4"),
+            format!("{valid}{BIN}\n"),
+            valid.replace("shina\n", "shina\tunsafe\n"),
+            valid.replace("shina\n", "shina\u{1b}unsafe\n"),
+        ] {
+            assert!(archive_entry_problem(&invalid).is_some(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_output_limits_fail_instead_of_silently_truncating_metadata() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '0123456789abcdef'"]);
+        assert!(
+            matches!(run_bounded_with_limit(command, Duration::from_secs(2), 8),
+            Err(Failure::Quiet(message)) if message.contains("too large"))
+        );
+        let read = read_on_thread(std::io::Cursor::new(vec![b'x'; 1024 * 1024]), 32);
+        assert!(matches!(read.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(Failure::Quiet(message)) if message.contains("too large")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_timed_out_command_is_killed_and_reaped_without_waiting_for_its_sleep() {
+        let pid_file = storage("timeout-process").root.join("pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 10",
+                "shina-timeout-fixture",
+            ])
+            .arg(&pid_file);
+        let start = Instant::now();
+        assert!(matches!(run_bounded(command, Duration::from_millis(500)),
+            Err(Failure::Quiet(message)) if message.contains("did not finish in time")));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        // Signal zero changes nothing. It also finds zombies, so a nonzero result proves
+        // the child neither kept running nor remained as an unreaped child.
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "the timed-out child still exists");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_real_system_zip_listing_passes_preflight_and_extracts_only_the_fixture_bundle() {
+        let root = storage("native-archive").root;
+        let stage = root.join("stage");
+        let binary = stage.join("Shina.app/Contents/MacOS/shina");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"offline fixture").unwrap();
+        let zip = root.join("fixture.zip");
+        let status = Command::new("/usr/bin/ditto")
+            .args([
+                "--norsrc",
+                "--noextattr",
+                "--noqtn",
+                "-c",
+                "-k",
+                "--keepParent",
+            ])
+            .arg(stage.join("Shina.app"))
+            .arg(&zip)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let destination = root.join("extracted");
+        unpack_macos_zip(&zip, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("Shina.app/Contents/MacOS/shina")).unwrap(),
+            b"offline fixture"
+        );
     }
 }

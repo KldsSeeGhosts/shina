@@ -43,7 +43,7 @@ mkdir -p "$stage"
 sh "$root/tools/install-macos.sh" --bundle-only "$stage" "$binary" "$version" "$revision"
 asset="$out/Shina-macos-$arch.zip"
 rm -f "$asset"
-(cd "$stage" && /usr/bin/ditto -c -k --keepParent Shina.app "$asset")
+(cd "$stage" && /usr/bin/ditto --norsrc --noextattr --noqtn -c -k --keepParent Shina.app "$asset")
 /usr/bin/codesign --verify --deep --strict "$stage/Shina.app"
 (cd "$out" && shasum -a 256 "$(basename "$asset")" > SHA256SUMS)
 printf 'Packaged Shina %s for %s: %s\n' "$version" "$arch" "$asset"

@@ -150,13 +150,10 @@ fn main() {
         }
         return;
     }
-    // A crash between an update's two renames may leave only the previous build.
-    install::recover_install();
-    if let Some(target) = install::installed_target() {
-        // A clean start means no prepared update is left waiting for a commit.
-        update::Storage::default_storage().discard_all_attempts();
-        remove_stale_prepared(&target);
-        install::remove_replaced_exe();
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--apply-update") {
+        update::run_windows_helper();
+        return;
     }
     if install::is_installed() {
         install::adopt_app_id();
@@ -318,50 +315,45 @@ fn main() {
     install_recorded_update();
 }
 
-/// Closing a window while the app keeps running saves, and a closed window installs nothing.
+/// This app does not enable Rune's keep_running. Closing its window terminates the host,
+/// which Rune removes before running quit hooks. Save here too, including session end.
 fn close_hook(state: &mut State) {
-    if !rune::quitting() {
-        state.checkpoint();
-    }
+    quit_hook(state);
 }
 
-/// Runs when the app quits, whether the last window closed, macOS sent Quit, or an update
-/// restart called `Tx::quit`. A quit for an explicit restart is already prepared. Any other
-/// quit records a prepared update for installation without relaunching, after the wait for
-/// both stores' queued writes, so nothing is lost to the async writers.
+/// Always save on each quit attempt. Windows can cancel session end and call this again.
+/// Normal quits never approve an install, so cancellation cannot leave a stale approval.
 fn quit_hook(state: &mut State) {
-    if state.exit_prepared() {
-        return;
-    }
-    state.mark_exit_prepared();
-    if state.take_restart_request() {
-        return;
-    }
-    let mut reply = String::new();
-    if let Err(error) = state.prepared_exit(false, Some(&mut reply)) {
-        eprintln!("Shina saved this session, but not the update: {error}");
+    if let Err(error) = state.checkpoint_and_flush() {
+        state.cancel_update_exit();
+        eprintln!("Could not save Shina before quitting: {error}");
     }
 }
 
-/// Deletes a prepared copy left beside the previous build that a manifest no longer names.
-fn remove_stale_prepared(target: &install::InstalledTarget) {
-    if let install::InstalledTarget::Windows { exe } = target
-        && let Some(dir) = exe.parent()
-    {
-        let _ = std::fs::remove_file(dir.join("shina.new.exe"));
-    }
-}
-
-/// After Rune and Pi have exited, replace the installed app with a prepared update. A normal
-/// quit installs it without reopening Shina.
+/// After Rune and Pi shut down, apply only an explicitly approved update restart.
 fn install_recorded_update() {
     let Some(exit) = update::take_exit() else {
         return;
     };
+    #[cfg(windows)]
+    {
+        if let Err(error) = update::start_windows_helper(&exit.update) {
+            eprintln!("Could not start the update helper: {error}");
+            let _ = update::relaunch(&exit.update.launcher(), &exit.update.target);
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    install_exit_update(exit);
+}
+
+#[cfg(not(windows))]
+fn install_exit_update(exit: update::ExitUpdate) {
     // This exited process, which a failed relaunch may replace with the previous build.
     let running = std::env::current_exe().unwrap_or_else(|_| exit.update.launcher());
     match update::apply_prepared_update(&exit.update) {
         Ok(installed) => {
+            let _ = std::fs::remove_file(update::Storage::default_storage().manifest());
             if exit.relaunch
                 && let Err(error) = update::relaunch_or_restore(&exit.update, &installed, &running)
             {
@@ -384,17 +376,6 @@ fn install_recorded_update() {
 mod tests {
     use super::*;
     use crate::install::InstalledTarget;
-    use std::sync::{Mutex, MutexGuard};
-
-    /// The one exit record is process-wide, so these tests take turns. Rust reads `start` as
-    /// a comparison key exactly (the startup-time hint), so `start` cannot be poisoned.
-    static EXIT_RECORD: Mutex<()> = Mutex::new(());
-
-    fn exclusive_exit_record() -> MutexGuard<'static, ()> {
-        EXIT_RECORD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     /// A verified update for an app in a fixture folder.
     fn prepared(root: &std::path::Path, target: InstalledTarget) -> update::PreparedUpdate {
@@ -410,33 +391,41 @@ mod tests {
     }
 
     #[test]
-    fn a_normal_quit_records_a_prepared_update_and_a_close_hides_without_one() {
-        let _quit = exclusive_exit_record();
-        let _ = update::take_exit();
-        let mut state = State::new(PathBuf::new(), false);
-        state.load_global_for_test();
-        state.updater = update::Updater::test_ready(prepared(
-            &crate::store::directory().unwrap(),
-            InstalledTarget::Windows {
-                exe: PathBuf::from("C:/fixture/Shina/shina.exe"),
-            },
-        ));
-        // Closing a window that keeps the app running installs nothing.
-        close_hook(&mut state);
-        assert!(!state.exit_prepared());
-        assert!(!update::exit_recorded());
-        quit_hook(&mut state);
-        let exit = update::take_exit().expect("a normal quit installs the ready update");
-        assert!(!exit.relaunch, "a normal quit never reopens Shina");
-        // The hook runs once, so a second close or quit installs nothing either.
-        quit_hook(&mut state);
-        close_hook(&mut state);
-        assert!(!update::exit_recorded());
+    fn close_and_quit_flush_actual_drafts_without_an_update_or_while_busy() {
+        let _quit = update::test_exit_guard();
+        for close in [true, false] {
+            for busy in [true, false] {
+                let root = crate::store::directory().unwrap();
+                let mut state = State::new(PathBuf::new(), false);
+                state.load_global_for_test();
+                if busy {
+                    state.updater = update::Updater::test_ready(prepared(
+                        &root,
+                        InstalledTarget::Windows {
+                            exe: root.join("install/shina.exe"),
+                        },
+                    ));
+                    state.current_mut().status = model::Status::Running;
+                }
+                let draft = format!("final unsent draft, close={close}, busy={busy}");
+                state.current_mut().draft.replace_text(&draft);
+                if close {
+                    close_hook(&mut state);
+                } else {
+                    quit_hook(&mut state);
+                }
+                let ui = store::load(&root.join("ui-state.json")).unwrap().unwrap();
+                let id = state.current().id.to_string();
+                assert_eq!(ui["drafts"][&id], draft);
+                assert!(root.join("index.json").is_file());
+                assert!(!update::exit_recorded());
+            }
+        }
     }
 
     #[test]
     fn a_quit_after_an_approved_restart_keeps_the_restart_record() {
-        let _quit = exclusive_exit_record();
+        let _quit = update::test_exit_guard();
         let _ = update::take_exit();
         let mut state = State::new(PathBuf::new(), false);
         state.load_global_for_test();
@@ -452,5 +441,38 @@ mod tests {
         quit_hook(&mut state);
         let exit = update::take_exit().expect("the restart stays recorded");
         assert!(exit.relaunch);
+    }
+
+    #[test]
+    fn a_cancelled_session_end_does_not_reuse_an_approval_or_skip_a_later_save() {
+        let _quit = update::test_exit_guard();
+        let root = store::directory().unwrap();
+        let mut state = State::new(PathBuf::new(), false);
+        state.load_global_for_test();
+        state.updater = update::Updater::test_ready(prepared(
+            &root,
+            InstalledTarget::Windows {
+                exe: root.join("install/shina.exe"),
+            },
+        ));
+        // WM_QUERYENDSESSION saves, then WM_ENDSESSION(false) leaves the app running.
+        state
+            .current_mut()
+            .draft
+            .replace_text("before cancelled logoff");
+        quit_hook(&mut state);
+        assert!(!update::exit_recorded());
+        model::poll(&mut state, 0.0, &mut Tx::default());
+        state
+            .current_mut()
+            .draft
+            .replace_text("after cancelled logoff");
+        quit_hook(&mut state);
+        let ui = store::load(&root.join("ui-state.json")).unwrap().unwrap();
+        assert_eq!(
+            ui["drafts"][state.current().id.to_string()],
+            "after cancelled logoff"
+        );
+        assert!(!update::exit_recorded());
     }
 }

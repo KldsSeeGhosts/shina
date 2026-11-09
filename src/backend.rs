@@ -91,8 +91,15 @@ struct Launch {
 impl Pi {
     #[cfg(test)]
     pub fn test_connection() -> (Self, Receiver<Value>, SyncSender<Event>) {
+        Self::test_connection_with_capacity(256)
+    }
+
+    #[cfg(test)]
+    pub fn test_connection_with_capacity(
+        capacity: usize,
+    ) -> (Self, Receiver<Value>, SyncSender<Event>) {
         let (commands, input) = mpsc::sync_channel(32);
-        let (output, events) = mpsc::sync_channel(256);
+        let (output, events) = mpsc::sync_channel(capacity);
         (Self { commands, events }, input, output)
     }
 

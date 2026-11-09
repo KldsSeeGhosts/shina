@@ -2,9 +2,9 @@
 //! updates all point at the same executable. Nothing here needs administrator rights.
 //!
 //! Each platform has the same two update steps. Prepare copies a verified download next to the
-//! installed app before the update is offered. Commit runs once this process and Pi are gone:
-//! it renames the installed app aside, moves the prepared one into place, and restores the old
-//! one if the move fails. The previous app stays as a recovery copy.
+//! installed app before the update is offered. Commit runs after Rune and Pi shut down.
+//! Windows waits for the original process to exit, then uses ReplaceFileW with a backup.
+//! macOS exchanges whole bundles atomically. Neither removes the installed path first.
 use std::{
     env, fs,
     io::Read,
@@ -195,64 +195,14 @@ fn start_menu_shortcut() -> Option<PathBuf> {
         .map(|base| PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs\Shina.lnk"))
 }
 
-/// Repairs an install a crash between an update's two renames left without its executable.
-/// Runs before anything reads the installed path, so the recovery copy is back in place for
-/// the rest of the launch. It starts nothing when this process already runs from the
-/// installed path, so a repaired app does not spawn a second copy.
-#[cfg(windows)]
-pub fn recover_install() {
-    restore_replaced_exe(env::current_exe().ok().as_deref());
-}
-
-#[cfg(not(windows))]
-pub fn recover_install() {}
-
-/// Removes the previous executable a replacement kept, once the installed path is healthy.
-#[cfg(windows)]
-pub fn remove_replaced_exe() {
-    if let Some(dir) = env::current_exe().ok().as_deref().and_then(Path::parent) {
-        let _ = fs::remove_file(previous_exe(dir));
-    }
-}
-
-#[cfg(not(windows))]
-pub fn remove_replaced_exe() {}
-
-#[cfg(windows)]
-fn restore_replaced_exe(current: Option<&Path>) {
-    let Some(current) = current else { return };
-    let Some(dir) = current.parent() else { return };
-    let target = dir.join("shina.exe");
-    let old = previous_exe(dir);
-    if (target.exists() || target.is_symlink()) || !old.is_file() {
-        return;
-    }
-    // This run itself may hold the lock, so a held lock only skips this launch.
-    let Ok(_lock) = InstallLock::acquire(dir) else {
-        return;
-    };
-    if fs::rename(&old, &target).is_ok() && !same_file(current, &target) {
-        // Restored while another copy runs: -install hands over to the installed app.
-        let _ = launch_with(&target, &["-install"]);
-    }
-}
-
-/// Unsupported platforms never replace a running app.
-#[cfg(not(any(windows, target_os = "macos")))]
-fn restore_replaced_exe(_: Option<&Path>) {}
-
-#[cfg(test)]
-type Restore = dyn Fn(Option<&Path>, &Path) -> Result<(), PathBuf>;
 #[cfg(test)]
 type Rename = dyn Fn(&Path) -> std::io::Result<()>;
 
 #[cfg(test)]
 thread_local! {
-    /// Replaces the second rename of a commit, so a test can make it fail.
+    /// Fails the atomic replacement before it changes either path.
     static FINAL_RENAME: std::cell::RefCell<Option<Box<Rename>>> =
         const { std::cell::RefCell::new(None) };
-    /// Replaces the rollback's restore, so a test can check the error that reports it.
-    static RESTORE: std::cell::RefCell<Option<Box<Restore>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Windows: the installed build renamed aside during a replacement, in the same folder as
@@ -286,13 +236,16 @@ pub fn prepare_exe(source: &Path, dir: &Path) -> Result<PathBuf, String> {
         let _ = fs::remove_file(&staged);
         return Err("The prepared Shina copy does not match its download.".into());
     }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("Could not flush the prepared Shina: {e}"))?;
     Ok(staged)
 }
 
-/// Windows commit: rename the running build aside, then move the prepared one into place.
-/// A failed move puts the previous build back. Windows allows renaming a running executable
-/// but not overwriting it. A crash between the two renames leaves the installed path empty
-/// and `shina.old.exe` in place; the next launch's `remove_replaced_exe` restores it.
+/// Replace the executable without removing its launch path first. On Windows a helper
+/// runs this after the UI process exits, so the mapped executable does not block replacement.
 pub fn commit_exe(prepared: &Path, dir: &Path) -> Result<PathBuf, String> {
     let target = dir.join("shina.exe");
     if same_file(prepared, &target) {
@@ -305,78 +258,82 @@ pub fn commit_exe(prepared: &Path, dir: &Path) -> Result<PathBuf, String> {
         );
     }
     let old = previous_exe(dir);
-    let installed = target.exists() || target.is_symlink();
-    if installed {
-        let _ = fs::remove_file(&old);
-        fs::rename(&target, &old)
-            .map_err(|e| format!("Could not move the previous Shina aside: {e}"))?;
-        // The moved name is visible at once, but its contents reach the disk only later.
-        sync_directory(dir);
-    }
-    // Tests replace this move, so the rollback below runs for a real second-rename failure.
     #[cfg(test)]
-    let installed_by = FINAL_RENAME.with(|rename| {
-        rename
-            .borrow()
-            .as_ref()
-            .map_or_else(|| fs::rename(prepared, &target), |rename| rename(prepared))
-    });
-    #[cfg(not(test))]
-    let installed_by = fs::rename(prepared, &target);
-    match installed_by {
-        Ok(()) => Ok(target),
-        Err(error) => {
-            let detail = format!("Could not install Shina: {error}");
-            let restored = installed.then_some(old.as_path());
-            #[cfg(test)]
-            let restored = RESTORE.with(|restore| {
-                let restore = restore.borrow();
-                match restore.as_ref() {
-                    Some(fail) => match fail(restored, &target) {
-                        Ok(()) => Ok(()),
-                        Err(path) => Err(path),
-                    },
-                    None => restore_prepared(restored, &target),
-                }
-            });
-            #[cfg(not(test))]
-            let restored = restore_prepared(restored, &target);
-            match restored {
-                Ok(()) => Err(detail),
-                Err(still) => Err(format!(
-                    "{detail}. The previous Shina is still at {}",
-                    still.display()
-                )),
-            }
-        }
+    FINAL_RENAME
+        .with(|rename| {
+            rename
+                .borrow()
+                .as_ref()
+                .map_or(Ok(()), |fail| fail(prepared))
+        })
+        .map_err(|e| format!("Could not install Shina: {e}"))?;
+    replace_exe(prepared, &target, &old).map_err(|e| format!("Could not install Shina: {e}"))?;
+    sync_directory(dir);
+    Ok(target)
+}
+
+#[cfg(windows)]
+fn replace_exe(source: &Path, target: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    if !target.exists() {
+        return fs::rename(source, target);
+    }
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    let (source, target, backup) = (wide(source), wide(target), wide(backup));
+    // ReplaceFileW preserves a backup and does not expose a two-rename launch-path gap.
+    let result = unsafe {
+        ReplaceFileW(
+            target.as_ptr(),
+            source.as_ptr(),
+            backup.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
-/// Windows: puts the previous executable back after a replacement that could not start. The
-/// process that relaunched has exited, so nothing holds `shina.exe` open.
-pub fn restore_exe(dir: &Path, running: &Path) -> Result<(), String> {
+#[cfg(not(windows))]
+fn replace_exe(source: &Path, target: &Path, backup: &Path) -> std::io::Result<()> {
+    if target.exists() {
+        fs::copy(target, backup)?;
+    }
+    fs::rename(source, target)
+}
+
+/// Restore by replacing the failed executable atomically, preserving it separately.
+pub fn restore_exe(dir: &Path, _running: &Path) -> Result<(), String> {
     let _lock = InstallLock::acquire(dir)?;
     let target = dir.join("shina.exe");
     let old = previous_exe(dir);
-    // A copy that did not start becomes the recovery copy when possible. Whatever runs from
-    // the installed path keeps `shina.exe` in place, and a restore below overwrites it.
-    if target.exists() && !same_file(running, &target) && fs::rename(&target, &old).is_err() {
-        let _ = fs::remove_file(&target);
+    if !old.is_file() {
+        return Err("There is no previous Shina executable to restore.".into());
     }
-    // A rename only reaches the disk with this, and a build that did not start may be gone.
+    replace_exe(&old, &target, &dir.join("shina.failed.exe"))
+        .map_err(|e| format!("Could not restore the previous Shina: {e}"))?;
     sync_directory(dir);
-    let restored = if old.is_file() {
-        restore_prepared(Some(&old), &target)
-    } else {
-        Ok(())
-    };
-    sync_directory(dir);
-    restored.map_err(|path| {
-        format!(
-            "Could not put the previous Shina back; it is still at {}",
-            path.display()
-        )
-    })
+    Ok(())
 }
 
 /// Makes a folder's renames durable. Without it a rename survives in memory but not after a
@@ -385,18 +342,6 @@ pub fn sync_directory(dir: &Path) {
     if let Ok(directory) = fs::File::open(dir) {
         let _ = directory.sync_all();
     }
-}
-
-/// Replaces `target` with `source`, when there is one. Returns the last path either side
-/// ended at when the move fails, so the caller can say where to find it.
-fn restore_prepared(source: Option<&Path>, target: &Path) -> Result<(), PathBuf> {
-    let Some(source) = source.filter(|source| source.is_file()) else {
-        return Ok(());
-    };
-    if target.exists() && fs::remove_file(target).is_err() {
-        return Err(source.to_path_buf());
-    }
-    fs::rename(source, target).map_err(|_| source.to_path_buf())
 }
 
 fn same_contents(a: &Path, b: &Path) -> bool {
@@ -413,7 +358,7 @@ fn same_contents(a: &Path, b: &Path) -> bool {
             return false;
         }
         if read == 0 {
-            return true;
+            return b.read(&mut right[..1]).is_ok_and(|read| read == 0);
         }
         if left[..read] != right[..read] {
             return false;
@@ -662,13 +607,35 @@ pub fn prepare_macos_bundle(source: &Path, staging: &Path) -> Result<PathBuf, St
     copy_tree(source, &incoming)?;
     fs::rename(&incoming, &prepared)
         .map_err(|e| format!("Could not prepare {}: {e}", prepared.display()))?;
+    sync_prepared_bundle(&prepared)?;
     Ok(prepared)
+}
+
+/// Flush payload files before an atomic exchange can make this bundle the installed app.
+pub fn sync_prepared_bundle(bundle: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(bundle).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_symlink() {
+            return Err("The prepared bundle contains a link.".into());
+        }
+        if kind.is_dir() {
+            sync_prepared_bundle(&entry.path())?;
+        } else {
+            fs::File::open(entry.path())
+                .and_then(|file| file.sync_all())
+                .map_err(|e| format!("Could not flush the prepared bundle: {e}"))?;
+        }
+    }
+    fs::File::open(bundle)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("Could not flush the prepared bundle folder: {e}"))
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     fs::create_dir_all(destination)
         .map_err(|e| format!("Could not create {}: {e}", destination.display()))?;
-    // A copy has to stay executable: fs::copy alone would keep only the read and write bits.
+    // Preserve directory permissions as well as the file permissions copied by fs::copy.
     let mode_of = |path: &Path| fs::metadata(path).map(|meta| meta.permissions());
     let set_mode = |permissions, path: &Path| fs::set_permissions(path, permissions);
     if let Ok(permissions) = mode_of(source) {
@@ -709,9 +676,8 @@ fn remove_tree(path: &Path) -> Result<(), String> {
 /// The name of the previous bundle a macOS commit keeps beside the installed app.
 const MACOS_PREVIOUS: &str = "Shina-app.previous";
 
-/// macOS commit: move the installed bundle aside and the prepared one into its place.
-/// The previous bundle stays as `Shina-app.previous` for recovery. A failed move restores it,
-/// and a crash between the two moves is repaired by the next commit.
+/// macOS commit keeps the installed path present throughout. Before the atomic exchange,
+/// previous contains the new build; after it, previous contains the old build.
 pub fn commit_macos_bundle(prepared: &Path, installed: &Path) -> Result<(), String> {
     let directory =
         mac_bundle_directory(installed).ok_or("The installed app has no parent folder.")?;
@@ -722,38 +688,54 @@ pub fn commit_macos_bundle(prepared: &Path, installed: &Path) -> Result<(), Stri
         );
     }
     let previous = directory.join(MACOS_PREVIOUS);
-    if !installed.exists() && previous.is_dir() {
-        // An interrupted commit left the app moved aside: put it back first.
-        fs::rename(&previous, installed)
-            .map_err(|e| format!("Could not restore the previous Shina: {e}"))?;
+    if !installed.is_dir() {
+        return Err("The installed Shina bundle is missing; no replacement was attempted.".into());
     }
-    let existing = installed.exists();
-    if existing {
-        remove_tree(&previous)?;
-        fs::rename(installed, &previous)
-            .map_err(|e| format!("Could not move the previous Shina aside: {e}"))?;
-    }
-    match fs::rename(prepared, installed) {
-        Ok(()) => Ok(()),
+    remove_tree(&previous)?;
+    fs::rename(prepared, &previous)
+        .map_err(|e| format!("Could not stage the replacement Shina: {e}"))?;
+    match exchange_paths(&previous, installed) {
+        Ok(()) => {
+            sync_directory(&directory);
+            Ok(())
+        }
         Err(error) => {
-            let restored = !existing || fs::rename(&previous, installed).is_ok();
-            let detail = format!("Could not install Shina: {error}");
-            Err(if restored {
-                detail
-            } else {
-                format!(
-                    "{detail}. The new app is {}. Move {} back to {} by hand.",
-                    prepared.display(),
-                    previous.display(),
-                    installed.display()
-                )
-            })
+            let retained = fs::rename(&previous, prepared);
+            Err(format!(
+                "Could not exchange Shina bundles: {error}. The installed app is unchanged.{}",
+                if retained.is_err() {
+                    " The prepared update remains at Shina-app.previous."
+                } else {
+                    ""
+                }
+            ))
         }
     }
 }
 
-/// macOS: puts the previous bundle back when a replacement could not start. The new bundle
-/// takes the previous one's place, so the recovery copy is never lost.
+#[cfg(target_os = "macos")]
+fn exchange_paths(left: &Path, right: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let left = CString::new(left.as_os_str().as_bytes())?;
+    let right = CString::new(right.as_os_str().as_bytes())?;
+    // Fail closed on filesystems without atomic exchange. Never fall back to two renames.
+    let result = unsafe { libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exchange_paths(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Atomic bundle exchange requires macOS",
+    ))
+}
+
+/// Atomically puts the previous bundle back, keeping the failed build at previous.
 pub fn restore_mac_bundle(app: &Path) -> Result<(), String> {
     let directory = mac_bundle_directory(app).ok_or("The installed app has no parent folder.")?;
     let _lock = InstallLock::acquire(&directory.join(MACOS_STAGING))?;
@@ -761,20 +743,7 @@ pub fn restore_mac_bundle(app: &Path) -> Result<(), String> {
     if !previous.is_dir() {
         return Err("There is no previous Shina to restore.".into());
     }
-    let failed = directory.join(".Shina-update.failed");
-    remove_tree(&failed)?;
-    if app.exists() && fs::rename(app, &failed).is_err() {
-        return Err("Could not move the new Shina aside.".into());
-    }
-    if let Err(error) = fs::rename(&previous, app) {
-        let _ = fs::rename(&failed, app);
-        return Err(format!("Could not restore the previous Shina: {error}"));
-    }
-    let kept = fs::rename(&failed, &previous);
-    if kept.is_err() {
-        remove_tree(&failed)?;
-    }
-    Ok(())
+    exchange_paths(&previous, app).map_err(|e| format!("Could not restore the previous Shina: {e}"))
 }
 
 /// Opens the replaced bundle, as an explicit update restart does. `open` exits nonzero when
@@ -924,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_second_rename_restores_the_previous_build() {
+    fn a_failed_atomic_replacement_keeps_the_launch_path_and_prepared_build() {
         let root = temporary("rollback");
         let dir = root.join("install");
         let target = dir.join("shina.exe");
@@ -932,8 +901,7 @@ mod tests {
         let download = root.join("download");
         write(&download, b"new");
         let staged = prepare_exe(&download, &dir).unwrap();
-        // The second rename fails after the previous build is aside, as a locked or full
-        // folder makes it fail. The restore runs for real and puts the old build back.
+        // Fail the actual commit operation after preparation, before any path changes.
         let locked = |_: &Path| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -944,19 +912,18 @@ mod tests {
         let error = commit_exe(&staged, &dir).unwrap_err();
         FINAL_RENAME.with(|rename| *rename.borrow_mut() = None);
         assert!(error.contains("Could not install Shina"), "{error}");
-        assert!(!error.contains("by hand"), "the restore succeeded: {error}");
         assert_eq!(
             fs::read(&target).unwrap(),
             b"old",
-            "the previous build is back"
+            "the previous build never left its launch path"
         );
         assert!(
             !dir.join("shina.old.exe").exists(),
-            "the restore moved it back into place"
+            "no rename-aside operation occurred"
         );
         assert!(
             staged.is_file(),
-            "the prepared copy is kept for the next quit"
+            "the prepared copy is kept for another restart attempt"
         );
         assert_eq!(commit_exe(&staged, &dir).unwrap(), target);
         assert_eq!(fs::read(&target).unwrap(), b"new");
@@ -964,32 +931,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rollback_that_also_fails_says_where_the_previous_build_is() {
-        let dir = temporary("rollback-failed");
+    fn restoring_without_a_backup_fails_and_leaves_the_current_executable_unchanged() {
+        let dir = temporary("missing-backup");
         let target = dir.join("shina.exe");
-        write(&target, b"old");
-        write(&dir.join("download"), b"new");
-        let staged = prepare_exe(&dir.join("download"), &dir).unwrap();
-        FINAL_RENAME.with(|rename| {
-            *rename.borrow_mut() = Some(Box::new(|_: &Path| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "locked",
-                ))
-            }));
-        });
-        // Both moves are denied, so the error has to name the recovery copy.
-        RESTORE.with(|restore| {
-            *restore.borrow_mut() = Some(Box::new(|_: Option<&Path>, _: &Path| {
-                Err(PathBuf::from("C:/fixture/Shina/shina.old.exe"))
-            }));
-        });
-        let error = commit_exe(&staged, &dir).unwrap_err();
-        FINAL_RENAME.with(|rename| *rename.borrow_mut() = None);
-        RESTORE.with(|restore| *restore.borrow_mut() = None);
-        assert!(error.contains("Could not install Shina"), "{error}");
-        assert!(error.contains("shina.old.exe"), "{error}");
-        assert!(staged.is_file());
+        write(&target, b"current");
+        let error = restore_exe(&dir, &target).unwrap_err();
+        assert!(error.contains("no previous"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"current");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1028,6 +976,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn mac_bundles_swap_as_whole_directories_and_keep_the_previous_one() {
         let root = temporary("mac");
         let applications = root.join("Applications");
@@ -1050,16 +999,15 @@ mod tests {
             .unwrap(),
             b"old"
         );
-        // The next commit repairs an install a crash left moved aside.
-        write(
-            &applications.join("Shina-app.previous/Contents/stale"),
-            b"old",
-        );
+        // Simulate interruption after staging the incoming bundle at previous, before
+        // atomic exchange. The original app must still be directly launchable.
         let next = root.join("next/Shina.app");
         write(&next.join(executable_path()), b"newer");
         let prepared = prepare_macos_bundle(&next, &bundle_staging(&installed)).unwrap();
         fs::remove_dir_all(applications.join("Shina-app.previous")).unwrap();
-        commit_macos_bundle(&prepared, &installed).unwrap();
+        fs::rename(&prepared, applications.join("Shina-app.previous")).unwrap();
+        assert_eq!(fs::read(installed.join(executable_path())).unwrap(), b"new");
+        exchange_paths(&applications.join("Shina-app.previous"), &installed).unwrap();
         assert_eq!(
             fs::read(installed.join(executable_path())).unwrap(),
             b"newer"
@@ -1085,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_broken_mac_bundle_is_replaced_by_the_previous_one() {
         let root = temporary("restore-mac");
         let applications = root.join("Applications");
