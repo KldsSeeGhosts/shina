@@ -19,6 +19,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 7 | 8.0 | 8.6 | 7.7 (Capy 7.7) | 3 of 3 approve |
 | 8 | 8.1 | 8.8 | 8.0 (Capy 8.1) | 3 of 3 approve |
 | 9 | 8.3 | 9.0 | 8.2 (Capy 8.5) | 3 of 3 approve |
+| 10 | 8.4 | 8.9 | 8.3 (Capy 8.2) | 3 of 3 approve |
 
 ## Round 1
 
@@ -123,3 +124,16 @@ Shipped in round 9: an 832px measure with 14px body text on wide windows, a tab 
 | **Average** | 5.9 | 8.0 | **8.3** | 9.0 | 8.2 / **8.2** / 8.5 | 3 of 3 |
 
 Window chrome & alignment, round 8 to round 9: Sonnet 7.0 to 7.8, GPT 8.0 to 8.7, Gemini 8.7 to 9.0. No judge found a pixel-level chrome break. Open items: sidebar text starts drift by a few pixels, user bubbles stay 13px on wide windows, hidden header buttons leave phantom gaps, Juniper's Needs you state is easy to miss, and the light theme's composer border is faint.
+
+Shipped in round 10: header actions without phantom gaps and with on states, a balanced caption divider, one sidebar text column, a Needs you label, 14px user prompts on wide windows, 12px small text, firmer light edges, readable locked settings, portrait names that describe the art, and per-size avatar keys.
+
+## Round 10 (`r10/`)
+
+| Judge | Baseline | Round 9 | Round 10 | Capy | Crew art r9 / r10 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.4 | 7.4 | 7.9 | 8.5 | 7.8 / 7.8 / 7.0 | yes |
+| GPT 6.1 Sol | 6.3 | 8.1 | 8.3 | 8.8 | 8.3 / 8.3 / 8.5 | yes |
+| Gemini 4 Argon | 6.3 | 8.8 | 9.1 | 9.4 | 8.7 / 8.7 / 9.2 | yes |
+| **Average** | 6.0 | 8.1 | **8.4** | 8.9 | 8.3 / **8.3** / 8.2 | 3 of 3 |
+
+Consistency & polish, round 9 to round 10: Sonnet 7.3 to 7.9, GPT 8.2 to 8.4, Gemini 8.7 to 9.1. Judges split on portrait names (Gemini and GPT prefer the new look names, Sonnet finds them confusing). Open items: empty space between transcript and composer, chevrons on disclosures that open the activity pane, the Threads nav never shows active, the captain home composer floats mid-pane, and dark surfaces separate faintly.
