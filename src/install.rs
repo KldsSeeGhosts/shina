@@ -58,25 +58,10 @@ fn start_menu_shortcut() -> Option<PathBuf> {
         .map(|base| PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs\Shina.lnk"))
 }
 
-fn settings_dir() -> Option<PathBuf> {
-    env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Shina"))
-}
-
-/// The workspace the installed app reopens when launched without `--workspace`.
+/// The workspace the installed app reopens when launched without `--workspace`: the most
+/// recent project whose folder still exists.
 pub fn last_workspace() -> Option<PathBuf> {
-    let text = fs::read_to_string(settings_dir()?.join("last-workspace.txt")).ok()?;
-    let path = PathBuf::from(text.trim());
-    path.is_dir().then_some(path)
-}
-
-pub fn remember_workspace(path: &Path) {
-    if let Some(dir) = settings_dir() {
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(
-            dir.join("last-workspace.txt"),
-            path.to_string_lossy().as_bytes(),
-        );
-    }
+    crate::projects::load().last_existing()
 }
 
 /// Removes the executable an update or reinstall replaced. It could not be deleted while it

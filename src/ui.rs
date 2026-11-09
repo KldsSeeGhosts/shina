@@ -469,6 +469,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(settings_picker(s, p));
     } else if s.captain_picker {
         root = root.child(captain_picker(s, p));
+    } else if s.projects.clone_open {
+        root = root.child(clone_dialog(s, p));
+    } else if s.projects.menu.is_some() && docked {
+        root = root.child(project_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -860,31 +864,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             content = content.child(thread_group(s, index, p, false, &search));
         }
     }
-    content = content.child(
-        row()
-            .h(31.0)
-            .center_y()
-            .gap(8.0)
-            .px(8.0)
-            .child(icon("folder", p.muted))
-            .child(
-                label(
-                    if s.demo {
-                        "native-workspace".into()
-                    } else {
-                        s.workspace
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    },
-                    SMALL,
-                    p.muted,
-                )
-                .truncate()
-                .grow(1.0),
-            ),
-    );
+    content = content.child(project_switcher(s, p));
     let mut count = 0;
     for (index, thread) in s.threads.iter().enumerate().filter(|(_, t)| {
         t.archived == s.show_archive
@@ -921,34 +901,6 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             .gap(8.0)
             .center_y()
             .child(
-                el().key("open-workspace")
-                    .role("button")
-                    .label("Open folder")
-                    .focusable(true)
-                    .size(28.0, 28.0)
-                    .radius(7.0)
-                    .fill(p.teal_bg)
-                    .center()
-                    .on_press_tx(|s: &mut State, tx| {
-                        tx.open_folder(
-                            rune::FileDialogOptions {
-                                title: "Open a project folder".into(),
-                                directory: Some(s.workspace.clone()),
-                                ..Default::default()
-                            },
-                            |s: &mut State, result, _| match result {
-                                Ok(Some(path)) => s.switch_workspace(path),
-                                Ok(None) => {}
-                                Err(error) => {
-                                    s.current_mut().error =
-                                        Some(format!("Could not open the folder picker: {error}"))
-                                }
-                            },
-                        )
-                    })
-                    .child(icon("folder", p.teal)),
-            )
-            .child(
                 col()
                     .gap(1.0)
                     .grow(1.0)
@@ -980,6 +932,313 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             )),
     );
     side
+}
+
+/// The sidebar's one entry point for changing project: shows the open folder, opens the menu.
+fn project_switcher(s: &State, p: Palette) -> El {
+    let name = s.project_name();
+    let open = s.projects.menu.is_some();
+    row()
+        .key("project-switcher")
+        .role("button")
+        .label(format!("Switch project, current project {name}"))
+        .focusable(true)
+        .h(31.0)
+        .center_y()
+        .gap(8.0)
+        .px(8.0)
+        .radius(6.0)
+        .fill(if open { p.selected } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .on_press(|s: &mut State| {
+            if s.projects.menu.is_some() {
+                s.close_project_menu();
+            } else {
+                s.open_project_menu();
+            }
+        })
+        .child(icon("folder", p.muted))
+        .child(
+            label(name, TextStyle::new(12.0, 520.0), p.ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted))
+}
+
+fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
+    row()
+        .key(key)
+        .role("menuitem")
+        .label(title)
+        .focusable(true)
+        .h(30.0)
+        .px(8.0)
+        .gap(8.0)
+        .center_y()
+        .radius(5.0)
+        .hover(p.selected)
+        .child(icon(glyph, p.muted))
+        .child(label(title, TextStyle::new(12.5, 450.0), p.ink).grow(1.0))
+}
+
+/// Recent projects plus the two ways to add one, under the switcher.
+fn project_menu(s: &State, p: Palette) -> El {
+    let projects = s.projects.menu.as_deref().unwrap_or_default();
+    let mut list = col().gap(1.0).shrink().min_h(0.0).scroll(ScrollSpec {
+        stick_bottom: false,
+    });
+    for (index, project) in projects.iter().enumerate() {
+        let current = if s.demo {
+            index == 0
+        } else {
+            project.path == s.workspace
+        };
+        let path = project.path.clone();
+        let mut item = row()
+            .key(format!("project-{index}"))
+            .role("menuitem")
+            .label(if current {
+                format!("{}, current project", project.name)
+            } else {
+                format!("Open {}", project.name)
+            })
+            .focusable(true)
+            .px(8.0)
+            .py(5.0)
+            .gap(8.0)
+            .center_y()
+            .radius(5.0)
+            .hover(p.selected)
+            .on_press(move |s: &mut State| s.open_project(path.clone()))
+            .child(
+                col()
+                    .gap(1.0)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(
+                        label(&project.name, TextStyle::new(12.5, 520.0), p.ink)
+                            .truncate()
+                            .min_w(0.0),
+                    )
+                    .child(
+                        label(project.path.display().to_string(), SMALL, p.muted)
+                            .truncate()
+                            .min_w(0.0),
+                    ),
+            );
+        if current {
+            item = item.fill(p.selected).child(icon("check", p.teal));
+        }
+        list = list.child(item);
+    }
+    if projects.is_empty() {
+        list = list.child(
+            label("No other recent projects", SMALL, p.muted)
+                .px(8.0)
+                .py(6.0),
+        );
+    }
+    let mut menu = col()
+        .key("project-menu")
+        .role("menu")
+        .label("Projects")
+        .w(280.0)
+        .max_h(440.0)
+        .padding(5.0)
+        .gap(1.0)
+        .radius(8.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
+        .anchored_fit(
+            "project-switcher",
+            rune::Side::Bottom,
+            rune::Align::Start,
+            4.0,
+        )
+        .modal(true, |s: &mut State| s.close_project_menu())
+        .child(row().h(24.0).px(8.0).center_y().child(label(
+            "Recent projects",
+            TextStyle::new(11.5, 520.0),
+            p.muted,
+        )))
+        .child(list)
+        .child(el().h(1.0).w_full().my(4.0).fill(p.line))
+        .child(
+            menu_item("project-open-folder", "Open folder...", "folder", p)
+                .on_press_tx(crate::projects::pick_folder)
+                .child(label("Ctrl+O", SMALL, p.muted)),
+        )
+        .child(
+            menu_item("project-clone", "Clone repository...", "branch", p)
+                .on_press(|s: &mut State| s.open_clone_dialog()),
+        );
+    if let Some(error) = &s.projects.menu_error {
+        menu = menu.child(label(error, SMALL, p.danger).wrap().px(8.0).py(6.0));
+    }
+    menu
+}
+
+/// Clone a repository into a new folder and open it.
+fn clone_dialog(s: &State, p: Palette) -> El {
+    let projects = &s.projects;
+    let cloning = projects.cloning();
+    let field = if s.dark { p.bg } else { p.panel };
+    let mut card = col()
+        .key("clone-dialog")
+        .role("dialog")
+        .label("Clone repository")
+        .w(460.0)
+        .padding(16.0)
+        .gap(12.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .on_press(|_: &mut State| {})
+        .child(
+            row()
+                .center_y()
+                .child(
+                    col()
+                        .gap(2.0)
+                        .child(label(
+                            "Clone repository",
+                            TextStyle::new(14.0, 560.0),
+                            p.ink,
+                        ))
+                        .child(label(
+                            "Uses your existing git and GitHub CLI login.",
+                            SMALL,
+                            p.muted,
+                        )),
+                )
+                .child(spacer())
+                .child(icon_button(
+                    "close-clone",
+                    if cloning { "Stop the clone" } else { "Close" },
+                    "close",
+                    p,
+                    |s| s.close_clone_dialog(),
+                )),
+        )
+        .child(
+            col()
+                .gap(5.0)
+                .child(label("Repository", SMALL, p.muted))
+                .child(
+                    text_input(&projects.clone_source, BODY)
+                        .key("clone-source")
+                        .label("Repository URL or owner/repo")
+                        .placeholder("owner/repo or https://github.com/owner/repo", p.muted)
+                        .single_line()
+                        .color(p.ink)
+                        .caret(p.teal, p.teal_bg)
+                        .w_full()
+                        .padding(8.0)
+                        .radius(6.0)
+                        .fill(field)
+                        .border(1.0, p.field_line)
+                        .disabled(cloning)
+                        .on_edit(|s: &mut State| &mut s.projects.clone_source)
+                        .on_submit(|s: &mut State, _| s.start_clone()),
+                ),
+        )
+        .child(
+            col()
+                .gap(5.0)
+                .child(label("Clone into", SMALL, p.muted))
+                .child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            row()
+                                .h(34.0)
+                                .px(8.0)
+                                .center_y()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .radius(6.0)
+                                .fill(field)
+                                .border(1.0, p.field_line)
+                                .child(
+                                    label(projects.clone_parent.display().to_string(), BODY, p.ink)
+                                        .truncate()
+                                        .min_w(0.0),
+                                ),
+                        )
+                        .child(
+                            button("clone-choose-parent", "Choose...", p, |_| {})
+                                .h(34.0)
+                                .border(0.5, p.line)
+                                .on_press_tx(crate::projects::pick_clone_parent)
+                                .disabled(cloning),
+                        ),
+                ),
+        );
+    let hint = match s.clone_target() {
+        Ok((_, target)) => format!("Creates {}", target.display()),
+        Err(_) if projects.clone_source.text.trim().is_empty() => {
+            "Shorthand clones with gh. Other URLs clone with git.".into()
+        }
+        Err(error) => error,
+    };
+    card = card.child(label(hint, SMALL, p.muted).wrap_anywhere());
+    if !projects.clone_progress.is_empty() {
+        card = card.child(
+            row()
+                .key("clone-progress")
+                .gap(6.0)
+                .center_y()
+                .child(status_mark(Status::Running, p, 8.0))
+                .child(
+                    label(&projects.clone_progress, SMALL, p.ink)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                ),
+        );
+    }
+    if let Some(error) = &projects.clone_error {
+        card = card.child(
+            label(error, SMALL, p.danger)
+                .key("clone-error")
+                .wrap_anywhere(),
+        );
+    }
+    let mut actions = row().gap(8.0).center_y().child(spacer());
+    actions = actions.child(
+        button(
+            "clone-cancel",
+            if cloning { "Stop" } else { "Cancel" },
+            p,
+            |s| s.close_clone_dialog(),
+        )
+        .h(32.0)
+        .border(0.5, p.line),
+    );
+    actions = actions.child(if cloning {
+        primary_button("clone-start", "Cloning...", p, |_| {}).disabled(true)
+    } else {
+        primary_button("clone-start", "Clone", p, |s| s.start_clone())
+    });
+    card = card.child(actions);
+    el().key("clone-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
+        .center()
+        .modal(false, |s: &mut State| {
+            if !s.projects.cloning() {
+                s.close_clone_dialog();
+            }
+        })
+        .child(card)
 }
 
 /// Shown only when there is something to do: an update to fetch, one downloading, or one
