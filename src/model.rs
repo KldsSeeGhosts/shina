@@ -1828,8 +1828,7 @@ impl State {
         self.selected_threads.clear();
         let id = self.current().id;
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
-            let listed = self.current().is_draft() && self.current().has_draft_content();
-            self.opened_draft = Some((id, listed));
+            self.capture_opened_draft();
         }
         if !self.tabs.contains(&id) {
             self.tabs.push(id);
@@ -1954,8 +1953,14 @@ impl State {
         }
         match self.opened_draft {
             Some((id, listed)) if id == t.id && id == self.current().id => listed,
-            _ => t.has_draft_content(),
+            _ => t.has_draft_content() || t.renamed,
         }
+    }
+    /// Records whether the open thread is a listed draft as it is opened or restored.
+    fn capture_opened_draft(&mut self) {
+        let t = self.current();
+        let listed = t.is_draft() && (t.has_draft_content() || t.renamed);
+        self.opened_draft = Some((t.id, listed));
     }
     pub fn in_scope(&self, t: &Thread) -> bool {
         match self.project_scope {
@@ -4013,6 +4018,7 @@ impl State {
                 .map(ProjectScope::Project)
                 .unwrap_or(ProjectScope::All),
         };
+        self.capture_opened_draft();
         Ok(())
     }
     fn ui_snapshot(&self) -> Value {
@@ -4101,6 +4107,7 @@ impl State {
                 };
             }
         }
+        self.capture_opened_draft();
         Ok(())
     }
     pub fn checkpoint(&mut self) {
@@ -5012,6 +5019,39 @@ mod tests {
         let mut restored = State::new(PathBuf::new(), false);
         restored.restore_global(&saved).unwrap();
         assert_eq!(restored.current().id, draft);
+    }
+
+    #[test]
+    fn restored_blank_draft_stays_unlisted_and_named_drafts_keep_a_row() {
+        let state = State::new(".".into(), false);
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&state.snapshot()).unwrap();
+        restored.restore_ui(&state.ui_snapshot()).unwrap();
+        restored
+            .current_mut()
+            .draft
+            .replace_text("Typing after launch");
+        assert!(
+            restored.sidebar_threads().is_empty(),
+            "a restored blank draft's row does not pop in while typing"
+        );
+
+        let mut state = State::new(".".into(), false);
+        let named = state.current().id;
+        state.current_mut().title = "Plan the release".into();
+        state.current_mut().renamed = true;
+        state.current_mut().draft.replace_text("x");
+        state.new_thread_in(None);
+        state.threads[0].draft.replace_text("");
+        state.close_tab(named);
+        assert!(state.threads.iter().any(|t| t.id == named));
+        assert!(
+            state
+                .sidebar_threads()
+                .iter()
+                .any(|&i| state.threads[i].id == named),
+            "a named empty thread stays reachable from the sidebar"
+        );
     }
 
     #[test]
