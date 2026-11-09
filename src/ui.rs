@@ -1,4 +1,4 @@
-use crate::model::{State, Status, truncate};
+use crate::model::{SettingsPicker, State, Status, truncate};
 use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, col, el, memo, row, text, text_input};
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
@@ -17,6 +17,7 @@ struct Palette {
     teal_bg: Color,
     gold: Color,
     danger: Color,
+    on_teal: Color,
 }
 fn color(hex: &str) -> Color {
     rune::color::hex(hex).expect("palette color")
@@ -24,17 +25,18 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: rune::color::oklch(0.1403, 0.0022, 286.1),
-            panel: rune::color::oklch(0.1826, 0.002, 286.2),
-            card: rune::color::oklch(0.2182, 0.0019, 286.2),
-            line: Color::WHITE.alpha(0.08),
+            bg: color("#191919"),
+            panel: color("#242424"),
+            card: color("#2d2d2d"),
+            line: Color::WHITE.alpha(0.10),
             ink: rune::color::oklch(0.9404, 0.0013, 286.4),
-            muted: color("#929293"),
+            muted: color("#a1a1a4"),
             selected: Color::WHITE.alpha(0.08),
             teal: color("#329f98"),
-            teal_bg: color("#183b39"),
+            teal_bg: color("#1d3b39"),
             gold: color("#d3ba6b"),
             danger: color("#f0a39c"),
+            on_teal: color("#0d1f1e"),
         }
     } else {
         Palette {
@@ -43,18 +45,19 @@ fn palette(dark: bool) -> Palette {
             card: Color::WHITE,
             line: Color::BLACK.alpha(0.08),
             ink: color("#202022"),
-            muted: color("#79797d"),
+            muted: color("#6a6a70"),
             selected: Color::BLACK.alpha(0.055),
-            teal: color("#168d87"),
+            teal: color("#11827c"),
             teal_bg: color("#e0efed"),
             gold: color("#8a701f"),
             danger: color("#a33e38"),
+            on_teal: Color::WHITE,
         }
     }
 }
-const BODY: TextStyle = TextStyle::new(13.0, 450.0).lh(19.5).tracking(-0.13);
-const LABEL: TextStyle = TextStyle::new(13.0, 450.0).tracking(-0.13);
-const SMALL: TextStyle = TextStyle::new(11.0, 450.0);
+const BODY: TextStyle = TextStyle::new(13.0, 400.0).lh(19.5).tracking(-0.13);
+const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
+const SMALL: TextStyle = TextStyle::new(11.5, 420.0);
 
 fn label(value: impl Into<String>, style: TextStyle, ink: Color) -> El {
     text(value).font(style).color(ink)
@@ -138,12 +141,44 @@ fn icon(kind: &str, ink: Color) -> El {
         ARCHIVE,
         r#"<rect x="2.5" y="3" width="11" height="3" rx=".5" stroke="currentColor"/><path d="M3.5 6v7h9V6M6.5 9h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
+    glyph!(
+        BUBBLE,
+        r#"<path d="M3 3.5h10a1 1 0 0 1 1 1V10a1 1 0 0 1-1 1H7l-3 2.5V11H3a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        PANEL,
+        r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" fill="none"/><path d="M10 2.5v11" stroke="currentColor"/>"#
+    );
+    glyph!(
+        ISSUE,
+        r#"<circle cx="8" cy="8" r="5.5" stroke="currentColor" fill="none"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/>"#
+    );
+    glyph!(
+        BOLT,
+        r#"<path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
+    );
+    glyph!(DOT, r#"<circle cx="8" cy="8" r="3" fill="currentColor"/>"#);
+    glyph!(
+        THEME,
+        r#"<circle cx="8" cy="8" r="5.5" stroke="currentColor" fill="none"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/>"#
+    );
+    glyph!(
+        PENCIL,
+        r#"<path d="M10.5 2.5 13.5 5.5 6 13H3v-3z" fill="none" stroke="currentColor" stroke-linejoin="round"/><path d="m9 4 3 3" stroke="currentColor"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
         "sidebar" => &SIDEBAR,
         "compose" => &COMPOSE,
+        "edit" => &PENCIL,
         "send" => &SEND,
-        "thread" | "cloud" => &CLOUD,
+        "thread" => &BUBBLE,
+        "cloud" => &CLOUD,
+        "panel" => &PANEL,
+        "issue" => &ISSUE,
+        "bolt" => &BOLT,
+        "dot" => &DOT,
+        "theme" => &THEME,
         "pin" => &PIN,
         "more" => &MORE,
         "list" => &LIST,
@@ -156,10 +191,24 @@ fn icon(kind: &str, ink: Color) -> El {
         "chevron" => &rune_kit::glyphs::CHEVRON_DOWN,
         "lock" => &rune_kit::glyphs::LOCK,
         "close" => &rune_kit::glyphs::CLOSE,
-        "activity" => &LIST,
+        "activity" => &PANEL,
         _ => &rune_kit::glyphs::CHECK_SMALL,
     };
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
+}
+fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(title)
+        .focusable(true)
+        .center_y()
+        .h(32.0)
+        .px(14.0)
+        .radius(6.0)
+        .fill(p.teal)
+        .on_press(action)
+        .child(label(title, TextStyle::new(13.0, 560.0), p.on_teal))
 }
 fn icon_button(
     key: &str,
@@ -203,6 +252,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let narrow = cx
         .layout_with("workspace-root", |r| r[2] < 1050.0)
         .unwrap_or(false);
+    // Below this width the sidebar stops docking and opens on demand instead.
+    let compact = cx
+        .layout_with("workspace-root", |r| r[2] < 760.0)
+        .unwrap_or(false);
     let mut root = row()
         .key("workspace-root")
         .w_full()
@@ -210,7 +263,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.bg)
         .padding(8.0)
         .gap(0.0);
-    if s.sidebar {
+    if (s.sidebar && !compact) || (compact && s.compact_sidebar) {
         root = root.child(sidebar(s, p, narrow));
     }
     let mut pane = col()
@@ -224,7 +277,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .border(0.5, p.line)
         .clip_rounded(12.0);
     pane = pane
-        .child(header(s, p, narrow).pr(cx.chrome_insets().trailing.max(6.0)))
+        .child(header(s, p, narrow, compact).pr(cx.chrome_insets().trailing.max(6.0)))
         .child(rule(p));
     if s.show_activity && narrow {
         pane = pane.child(activity(s, p, true));
@@ -249,11 +302,157 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         pane = pane.child(body);
     }
     let root = root.child(pane);
-    if s.captain_picker {
+    if s.captain_editor.is_some() {
+        let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
+        root.child(captain_editor(s, p, height))
+    } else if s.settings_picker.is_some() {
+        root.child(settings_picker(s, p))
+    } else if s.captain_picker {
         root.child(captain_picker(s, p))
     } else {
         root
     }
+}
+
+fn settings_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let is_model = s.settings_picker == Some(SettingsPicker::Model);
+    let title = if is_model {
+        "Choose CPA model"
+    } else {
+        "Choose reasoning level"
+    };
+    let mut card = col()
+        .key("pi-settings-picker")
+        .role("dialog")
+        .label(title)
+        .w(392.0)
+        .max_h(460.0)
+        .padding(16.0)
+        .gap(10.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .on_press(|_: &mut State| {})
+        .child(
+            row()
+                .center_y()
+                .child(label(title, LABEL, p.ink))
+                .child(spacer())
+                .child(icon_button(
+                    "close-pi-settings",
+                    "Close Pi settings",
+                    "close",
+                    p,
+                    |s| s.settings_picker = None,
+                )),
+        );
+    if is_model {
+        card = card.child(
+            text_input(&s.model_search, BODY)
+                .key("model-search")
+                .label("Filter Pi models")
+                .placeholder("Filter by model or provider", p.muted)
+                .color(p.ink)
+                .w_full()
+                .on_edit(|s: &mut State| &mut s.model_search),
+        );
+    }
+    let mut choices = col().w_full().max_h(300.0).gap(4.0).scroll(ScrollSpec {
+        stick_bottom: false,
+    });
+    let can_choose = !t.status.busy() && !t.configuring && t.pi.is_some();
+    if is_model {
+        let query = s.model_search.text.to_lowercase();
+        let mut count = 0;
+        for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
+            format!("{} {} {}", m.provider, m.id, m.name)
+                .to_lowercase()
+                .contains(&query)
+        }) {
+            count += 1;
+            let provider = model.provider.clone();
+            let id = model.id.clone();
+            let selected = t.model_provider == model.provider && t.model_id == model.id;
+            choices = choices.child(
+                button(
+                    &format!("choose-model-{index}"),
+                    &format!("{} / {}", model.provider, model.name),
+                    p,
+                    move |s| {
+                        s.current_mut().set_model(provider.clone(), id.clone());
+                        s.settings_picker = None;
+                    },
+                )
+                .h(32.0)
+                .w_full()
+                .clip_rounded(5.0)
+                .fill(if selected { p.teal_bg } else { p.card })
+                .disabled(!can_choose),
+            );
+        }
+        if count == 0 {
+            choices = choices.child(
+                label(
+                    if t.status == Status::Connecting {
+                        "Reading Pi's configured models..."
+                    } else if t.pi.is_none() {
+                        "Connect Pi to read its configured models."
+                    } else {
+                        "No matching configured models."
+                    },
+                    BODY,
+                    p.muted,
+                )
+                .wrap(),
+            );
+        }
+    } else {
+        for (index, level) in t.thinking_levels.iter().enumerate() {
+            let value = level.clone();
+            choices = choices.child(
+                button(&format!("choose-thinking-{index}"), level, p, move |s| {
+                    s.current_mut().set_thinking(value.clone());
+                    s.settings_picker = None;
+                })
+                .fill(if *level == t.thinking {
+                    p.teal_bg
+                } else {
+                    p.card
+                })
+                .disabled(!can_choose),
+            );
+        }
+        if t.thinking_levels.is_empty() {
+            choices = choices.child(label(
+                "Reading the model's supported levels...",
+                BODY,
+                p.muted,
+            ));
+        }
+    }
+    card = card.child(choices).child(
+        label(
+            "Models come from your shared CPA catalog. Credentials stay in Pi.",
+            SMALL,
+            p.muted,
+        )
+        .wrap(),
+    );
+    if let Some(error) = &t.error {
+        card = card.child(label(error, SMALL, p.danger).wrap_anywhere());
+    }
+    el().key("pi-settings-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(Color::BLACK.alpha(0.40))
+        .center()
+        .modal(false, |s: &mut State| s.settings_picker = None)
+        .on_press(|s: &mut State| s.settings_picker = None)
+        .child(card)
 }
 
 fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
@@ -277,13 +476,6 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             )
             .child(spacer())
             .child(icon_button(
-                "workspace-overview",
-                "Show activity",
-                "grid",
-                p,
-                |s| s.show_activity = !s.show_activity,
-            ))
-            .child(icon_button(
                 "search-toggle",
                 "Search threads",
                 "search",
@@ -298,21 +490,34 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 "Toggle sidebar",
                 "sidebar",
                 p,
-                |s| s.sidebar = !s.sidebar,
+                |s| {
+                    if s.compact_sidebar {
+                        s.compact_sidebar = false;
+                    } else {
+                        s.sidebar = !s.sidebar;
+                    }
+                },
             )),
     );
     side = side
-        .child(nav("new-thread", "New thread", "compose", p, |s| {
+        .child(nav("new-thread", "New thread", "compose", p, false, |s| {
             s.new_thread()
         }))
-        .child(nav("threads-nav", "Threads", "list", p, |s| {
-            s.show_archive = false;
-        }));
+        .child(nav(
+            "threads-nav",
+            "Threads",
+            "list",
+            p,
+            !s.show_archive,
+            |s| {
+                s.show_archive = false;
+            },
+        ));
     // Match the reference navigation without pretending that unbuilt integrations work.
     for (key, title, glyph) in [
-        ("issues-nav", "Issues", "activity"),
+        ("issues-nav", "Issues", "issue"),
         ("pulls-nav", "Pull requests", "branch"),
-        ("automations-nav", "Automations", "grid"),
+        ("automations-nav", "Automations", "bolt"),
     ] {
         side = side.child(
             row()
@@ -324,6 +529,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .gap(8.0)
                 .center_y()
                 .disabled(true)
+                .opacity(0.6)
                 .child(icon(glyph, p.muted))
                 .child(label(title, LABEL, p.muted)),
         );
@@ -337,6 +543,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         },
         "archive",
         p,
+        s.show_archive,
         |s| s.show_archive = !s.show_archive,
     ));
     if s.search_open {
@@ -365,14 +572,20 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     let mut content = col().pb(12.0).gap(1.0);
     let search = s.search.text.to_lowercase();
     if !s.show_archive {
-        content = content.child(section_title("Captains", p).child(icon_button(
-            "new-captain",
-            "Open Captain",
-            "plus",
-            p,
-            |s| s.captain_picker = true,
-        )));
-        for captain in [2, 1, 0] {
+        content = content.child(
+            section_title("Captains", p)
+                .child(icon_button(
+                    "browse-captains",
+                    "Open captains",
+                    "more",
+                    p,
+                    |s| s.captain_picker = true,
+                ))
+                .child(icon_button("new-captain", "New Captain", "plus", p, |s| {
+                    s.begin_new_captain()
+                })),
+        );
+        for captain in (0..s.captains.len()).rev() {
             let state = s.captain_status(captain);
             let selected = s.current().captain == Some(captain);
             let unread = s
@@ -385,7 +598,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .role("button")
                 .label(format!(
                     "Open Captain {}, {}",
-                    crate::visuals::CAPTAIN_NAMES[captain],
+                    s.captains[captain].name,
                     state.label()
                 ))
                 .focusable(true)
@@ -398,7 +611,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .on_press(move |s: &mut State| s.open_captain(captain))
                 .child(avatar(s, p, captain, 24.0, state))
                 .child(label(
-                    crate::visuals::CAPTAIN_NAMES[captain],
+                    &s.captains[captain].name,
                     TextStyle::new(13.0, if selected { 560.0 } else { 450.0 }),
                     p.ink,
                 ))
@@ -406,14 +619,28 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             if unread > 0 {
                 captain_row = captain_row.child(counter(unread, p));
             }
-            captain_row =
-                captain_row.child(if matches!(state, Status::Running | Status::Waiting) {
-                    icon("activity", status_ink(state, p))
-                } else if state == Status::Failed {
-                    icon("close", p.danger)
-                } else {
-                    icon("lock", p.muted)
-                });
+            if selected && s.current().captain_home {
+                captain_row = captain_row.fill(p.selected);
+            }
+            if selected {
+                captain_row = captain_row.child(icon_button(
+                    &format!("rename-captain-{captain}"),
+                    &format!("Rename or edit {}", s.captains[captain].name),
+                    "edit",
+                    p,
+                    move |s| s.edit_captain(captain),
+                ));
+            }
+            captain_row = captain_row.child(match state {
+                Status::Running | Status::Waiting => el()
+                    .size(6.0, 6.0)
+                    .radius(3.0)
+                    .mr(4.0)
+                    .fill(status_ink(state, p)),
+                Status::Failed => icon("close", p.danger),
+                Status::Settled => icon("check", p.teal),
+                _ => el(),
+            });
             content = content.child(captain_row);
             if selected {
                 for (index, _) in s.threads.iter().enumerate().filter(|(_, t)| {
@@ -428,17 +655,14 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             }
         }
     }
-    content = content.child(
-        section_title(
-            if s.show_archive {
-                "Archived threads"
-            } else {
-                "Threads"
-            },
-            p,
-        )
-        .child(label(if s.demo { "Example" } else { "Local" }, SMALL, p.muted).pr(6.0)),
-    );
+    content = content.child(section_title(
+        if s.show_archive {
+            "Archived threads"
+        } else {
+            "Threads"
+        },
+        p,
+    ));
     let pinned: Vec<_> = s
         .threads
         .iter()
@@ -458,8 +682,9 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .center_y()
                 .gap(6.0)
                 .px(8.0)
-                .child(icon("pin", p.muted))
-                .child(label(format!("Pinned {}", pinned.len()), SMALL, p.muted)),
+                .child(label("Pinned", TextStyle::new(11.5, 520.0), p.muted))
+                .child(spacer())
+                .child(label(pinned.len().to_string(), SMALL, p.muted.alpha(0.7)).pr(6.0)),
         );
         for index in pinned {
             content = content.child(thread_row(s, index, p, false));
@@ -488,8 +713,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 )
                 .truncate()
                 .grow(1.0),
-            )
-            .child(icon("chevron", p.muted)),
+            ),
     );
     let mut count = 0;
     for (index, thread) in s.threads.iter().enumerate().filter(|(_, t)| {
@@ -558,7 +782,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     .child(label("Shina", TextStyle::new(12.0, 560.0), p.ink))
                     .child(label(
                         if s.demo {
-                            "Example workspace"
+                            "Demo workspace"
                         } else {
                             "Local workspace"
                         },
@@ -566,18 +790,20 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                         p.muted,
                     )),
             )
-            .child(
-                button(
-                    "theme-toggle",
-                    if s.dark { "Light" } else { "Dark" },
-                    p,
-                    |s| {
-                        s.dark = !s.dark;
-                        s.checkpoint();
-                    },
-                )
-                .px(5.0),
-            ),
+            .child(icon_button(
+                "theme-toggle",
+                if s.dark {
+                    "Switch to light theme"
+                } else {
+                    "Switch to dark theme"
+                },
+                "theme",
+                p,
+                |s| {
+                    s.dark = !s.dark;
+                    s.checkpoint();
+                },
+            )),
     );
     side
 }
@@ -587,6 +813,7 @@ fn nav(
     title: &str,
     glyph: &str,
     p: Palette,
+    active: bool,
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     row()
@@ -599,10 +826,23 @@ fn nav(
         .gap(8.0)
         .center_y()
         .radius(6.0)
+        .fill(if active {
+            p.selected
+        } else {
+            Color::TRANSPARENT
+        })
         .hover(p.selected)
         .on_press(action)
-        .child(icon(glyph, p.muted))
-        .child(label(title, LABEL, p.muted))
+        .child(icon(glyph, if active { p.ink } else { p.muted }))
+        .child(label(
+            title,
+            if active {
+                TextStyle::new(13.0, 520.0).tracking(-0.13)
+            } else {
+                LABEL
+            },
+            if active { p.ink } else { p.muted },
+        ))
 }
 fn section_title(title: &str, p: Palette) -> El {
     row()
@@ -625,7 +865,11 @@ fn face_for(status: Status) -> crate::visuals::Face {
     }
 }
 fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
-    let captain = captain.min(2);
+    let portrait = s.captains.get(captain).map(|c| c.portrait).unwrap_or(0);
+    portrait_avatar(s, p, portrait, size, status)
+}
+fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
+    let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let radius = if size >= 30.0 { 9.0 } else { 4.0 };
     let mut portrait = el()
         .key(format!("avatar-{captain}"))
@@ -644,7 +888,14 @@ fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> E
                 p.line
             },
         )
-        .pixels(s.artwork.face(captain, face_for(status)).pixels())
+        .pixels(
+            if size < 30.0 {
+                s.artwork.small_face(captain, face_for(status))
+            } else {
+                s.artwork.face(captain, face_for(status))
+            }
+            .pixels(),
+        )
         .a11y_hidden();
     if status == Status::Offline {
         portrait = portrait.opacity(0.62);
@@ -655,7 +906,11 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
     row()
         .center_y()
         .gap(5.0)
-        .child(el().size(5.0, 5.0).radius(2.5).fill(status_ink(status, p)))
+        .child(if status == Status::Settled {
+            icon("check", p.teal)
+        } else {
+            el().size(5.0, 5.0).radius(2.5).fill(status_ink(status, p))
+        })
         .child(label(
             if status == Status::Offline {
                 "Not started"
@@ -691,6 +946,8 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .py(if nested { 5.0 } else { 6.0 })
         .gap(2.0)
         .radius(6.0)
+        .min_h(30.0)
+        .justify_center()
         .fill(if selected {
             p.selected
         } else {
@@ -722,15 +979,22 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     if thread.unread {
         title = title.child(counter(1, p));
     }
+    let detailed = selected
+        || matches!(
+            thread.status,
+            Status::Running | Status::Waiting | Status::Failed | Status::Connecting
+        );
+    if !detailed {
+        return item.child(title);
+    }
     let mut meta = row()
         .gap(5.0)
         .center_y()
         .pl(if nested { 0.0 } else { 20.0 });
     meta = meta
-        .child(label(format!("ST-{:03}", thread.id), SMALL, p.muted))
         .child(
-            el().size(3.0, 3.0)
-                .radius(1.5)
+            el().size(5.0, 5.0)
+                .radius(2.5)
                 .fill(status_ink(thread.status, p)),
         )
         .child(label(
@@ -776,21 +1040,23 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     |s| s.captain_picker = false,
                 )),
         );
-    for captain in 0..3 {
+    for captain in (0..s.captains.len()).rev() {
         let state = s.captain_status(captain);
+        let open = s.current().captain == Some(captain);
         card = card.child(
             row()
                 .key(format!("choose-captain-{captain}"))
                 .role("button")
                 .label(format!(
                     "Open Captain {}, {}",
-                    crate::visuals::CAPTAIN_NAMES[captain],
+                    s.captains[captain].name,
                     state.label()
                 ))
                 .focusable(true)
                 .gap(11.0)
                 .padding(9.0)
                 .radius(6.0)
+                .fill(if open { p.selected } else { Color::TRANSPARENT })
                 .hover(p.selected)
                 .center_y()
                 .on_press(move |s: &mut State| s.open_captain(captain))
@@ -801,20 +1067,42 @@ fn captain_picker(s: &State, p: Palette) -> El {
                         .grow(1.0)
                         .min_w(0.0)
                         .child(label(
-                            crate::visuals::CAPTAIN_NAMES[captain],
+                            &s.captains[captain].name,
                             TextStyle::new(13.0, 560.0),
                             p.ink,
                         ))
-                        .child(label(
-                            crate::visuals::CAPTAIN_ROLE_DETAIL[captain],
-                            SMALL,
-                            p.muted,
-                        )),
+                        .child(label(&s.captains[captain].role, SMALL, p.muted)),
                 )
-                .child(captain_status_chip(state, p)),
+                .child(captain_status_chip(state, p))
+                .child(icon_button(
+                    &format!("edit-captain-{captain}"),
+                    &format!("Rename or edit {}", s.captains[captain].name),
+                    "edit",
+                    p,
+                    move |s| {
+                        s.captain_picker = false;
+                        s.edit_captain(captain);
+                    },
+                )),
         );
     }
-    card = card.child(rule(p)).child(
+    card = card.child(
+        row()
+            .key("picker-new-captain")
+            .role("button")
+            .label("New Captain")
+            .focusable(true)
+            .h(36.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(6.0)
+            .border(0.5, p.line)
+            .hover(p.selected)
+            .on_press(|s: &mut State| s.begin_new_captain())
+            .child(icon("plus", p.muted))
+            .child(label("New Captain", LABEL, p.ink)),
+    ).child(rule(p)).child(
         label(
             "Each Captain is a separate Pi conversation. Automatic crew delegation is not connected.",
             SMALL,
@@ -827,25 +1115,194 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(0.28))
+        .fill(Color::BLACK.alpha(0.40))
         .center()
         .modal(false, |s: &mut State| s.captain_picker = false)
         .on_press(|s: &mut State| s.captain_picker = false)
         .child(card)
 }
 
-fn header(s: &State, p: Palette, narrow: bool) -> El {
+fn captain_editor(s: &State, p: Palette, height: f32) -> El {
+    let editor = s.captain_editor.as_ref().unwrap();
+    let editing = editor.editing.is_some();
+    let profile = editor.profile();
+    let mut portraits = row().gap(8.0).w_full();
+    for portrait in 0..crate::visuals::CAPTAIN_NAMES.len() {
+        portraits = portraits.child(
+            col()
+                .key(format!("captain-portrait-{portrait}"))
+                .role("button")
+                .label(format!(
+                    "Use {} portrait",
+                    crate::visuals::CAPTAIN_NAMES[portrait]
+                ))
+                .focusable(true)
+                .grow(1.0)
+                .padding(7.0)
+                .gap(5.0)
+                .items_center()
+                .radius(7.0)
+                .border(
+                    if editor.portrait == portrait {
+                        1.5
+                    } else {
+                        0.5
+                    },
+                    if editor.portrait == portrait {
+                        p.teal
+                    } else {
+                        p.line
+                    },
+                )
+                .fill(if editor.portrait == portrait {
+                    p.teal_bg
+                } else {
+                    p.card
+                })
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    s.captain_editor.as_mut().unwrap().portrait = portrait;
+                })
+                .child(portrait_avatar(s, p, portrait, 48.0, Status::Ready))
+                .child(label(crate::visuals::CAPTAIN_NAMES[portrait], SMALL, p.ink)),
+        );
+    }
+    let mut body = col().key("captain-form-body").gap(12.0).min_h(0.0)
+        .max_h((height - 180.0).max(180.0))
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(col().gap(6.0).child(label("Portrait", SMALL, p.muted)).child(portraits))
+        .child(col().gap(5.0).child(label("Name", SMALL, p.muted))
+            .child(text_input(&editor.name, BODY).key("captain-name").label("Captain name")
+                .placeholder("e.g. Atlas", p.muted).single_line().color(p.ink)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(p.bg).border(1.0, p.line)
+                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name)))
+        .child(col().gap(5.0).child(label("Role", SMALL, p.muted))
+            .child(text_input(&editor.role, BODY).key("captain-role").label("Captain role")
+                .placeholder("e.g. Code review", p.muted).single_line().color(p.ink)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(p.bg).border(1.0, p.line)
+                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role)))
+        .child(col().gap(5.0).child(label("Instructions for Pi", SMALL, p.muted))
+            .child(text_input(&editor.instructions, BODY).key("captain-instructions").label("Captain instructions")
+                .placeholder("What should this captain focus on? Optional.", p.muted).color(p.ink)
+                .caret(p.teal, p.teal_bg).w_full().min_h(76.0).max_h(140.0).padding(8.0)
+                .radius(6.0).fill(p.bg).border(1.0, p.line)
+                .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().instructions)))
+        .child(label(
+            "Saved to this workspace. Each conversation uses these instructions and Pi's configured CPA model. Choose a different model in the composer.",
+            SMALL, p.muted).wrap());
+    if let Some(error) = &editor.error {
+        body = body.child(label(error, SMALL, p.danger).wrap());
+    }
+    let title = if editing {
+        "Edit Captain"
+    } else {
+        "New Captain"
+    };
+    let card = col()
+        .key("captain-editor")
+        .role("dialog")
+        .label(title)
+        .w(432.0)
+        .max_h((height - 32.0).max(240.0))
+        .padding(16.0)
+        .gap(14.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .on_press(|_: &mut State| {})
+        .child(
+            row()
+                .center_y()
+                .gap(12.0)
+                .child(portrait_avatar(s, p, editor.portrait, 40.0, Status::Ready))
+                .child(
+                    col()
+                        .gap(3.0)
+                        .child(label(title, TextStyle::new(16.0, 560.0), p.ink))
+                        .child(label("Give a captain a name and a job.", SMALL, p.muted)),
+                )
+                .child(spacer())
+                .child(icon_button(
+                    "close-captain-editor",
+                    "Close",
+                    "close",
+                    p,
+                    |s| s.captain_editor = None,
+                )),
+        )
+        .child(body)
+        .child(rule(p))
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(button("cancel-captain", "Cancel", p, |s| {
+                    s.captain_editor = None
+                }))
+                .child(spacer())
+                .child(if profile.validate().is_ok() {
+                    primary_button(
+                        "save-captain",
+                        if editing {
+                            "Save changes"
+                        } else {
+                            "Create Captain"
+                        },
+                        p,
+                        |s| s.save_captain(),
+                    )
+                } else {
+                    button(
+                        "save-captain",
+                        if editing {
+                            "Save changes"
+                        } else {
+                            "Create Captain"
+                        },
+                        p,
+                        |_| {},
+                    )
+                    .h(32.0)
+                    .px(14.0)
+                    .opacity(0.5)
+                    .disabled(true)
+                }),
+        );
+    el().key("captain-editor-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .padding(16.0)
+        .fill(Color::BLACK.alpha(0.40))
+        .center()
+        .modal(false, |s: &mut State| s.captain_editor = None)
+        .on_press(|s: &mut State| s.captain_editor = None)
+        .child(card)
+}
+
+fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
+    let docked = if compact {
+        s.compact_sidebar
+    } else {
+        s.sidebar
+    };
     row()
         .h(36.0)
         .window_drag()
         .px(6.0)
         .center_y()
         .gap(6.0)
-        .child(if s.sidebar {
+        .child(if docked {
             el()
         } else {
-            icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, |s| {
-                s.sidebar = !s.sidebar
+            icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, move |s| {
+                if compact {
+                    s.compact_sidebar = true;
+                } else {
+                    s.sidebar = true;
+                }
             })
         })
         .child(
@@ -855,25 +1312,32 @@ fn header(s: &State, p: Palette, narrow: bool) -> El {
                 .gap(8.0)
                 .px(10.0)
                 .h(26.0)
-                .radius(5.0)
+                .radius(6.0)
                 .shrink()
-                .max_w(if narrow { 100.0 } else { 300.0 })
-                .fill(p.bg)
+                .max_w(if narrow { 220.0 } else { 320.0 })
+                .fill(p.card)
+                .border(0.5, p.line)
                 .child(if let Some(captain) = s.current().captain {
                     avatar(s, p, captain, 20.0, s.current().status)
                 } else {
                     icon("thread", p.muted)
                 })
-                .child(label(&s.current().title, TextStyle::new(12.0, 450.0), p.ink).truncate()),
+                .child(label(&s.current().title, TextStyle::new(12.0, 520.0), p.ink).truncate()),
         )
         .child(icon_button("new-tab", "New thread", "plus", p, |s| {
             s.new_thread()
         }))
         .child(spacer())
-        .child(if narrow {
-            el()
-        } else if s.demo {
-            label("Example", SMALL, p.muted)
+        .child(if s.demo {
+            row()
+                .key("demo-badge")
+                .h(20.0)
+                .px(8.0)
+                .radius(10.0)
+                .center_y()
+                .fill(p.gold.alpha(0.12))
+                .label("Demo data, read-only")
+                .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
         } else {
             status(s.current().status, p)
         })
@@ -920,11 +1384,11 @@ fn conversation(s: &State, p: Palette) -> El {
     let t = s.current();
     let mut messages = col()
         .w_full()
-        .max_w(896.0)
+        .max_w(768.0)
         .px(16.0)
         .pt(20.0)
         .pb(24.0)
-        .gap(24.0);
+        .gap(18.0);
     if t.messages.is_empty() {
         let mut introduction = col()
             .key("empty-state")
@@ -947,10 +1411,7 @@ fn conversation(s: &State, p: Palette) -> El {
                                     .gap(8.0)
                                     .center_y()
                                     .child(label(
-                                        format!(
-                                            "Captain {}",
-                                            crate::visuals::CAPTAIN_NAMES[captain]
-                                        ),
+                                        format!("Captain {}", s.captains[captain].name),
                                         TextStyle::new(16.0, 560.0),
                                         p.ink,
                                     ))
@@ -959,8 +1420,12 @@ fn conversation(s: &State, p: Palette) -> El {
                             .child(label(
                                 format!(
                                     "{} · {}",
-                                    crate::visuals::CAPTAIN_ROLES[captain],
-                                    crate::visuals::CAPTAIN_ROLE_DETAIL[captain]
+                                    s.captains[captain].role,
+                                    s.captains[captain]
+                                        .instructions
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
                                 ),
                                 SMALL,
                                 p.muted,
@@ -990,8 +1455,7 @@ fn conversation(s: &State, p: Palette) -> El {
                         },
                         SMALL,
                         p.muted,
-                    ))
-                    .child(icon("chevron", p.muted)),
+                    )),
             );
         }
         if t.session.is_some() {
@@ -1033,9 +1497,9 @@ fn conversation(s: &State, p: Palette) -> El {
                         .shrink()
                         .selectable(true)
                         .max_w(620.0)
-                        .px(11.0)
-                        .py(7.0)
-                        .radius(6.0)
+                        .px(12.0)
+                        .py(8.0)
+                        .radius(10.0)
                         .fill(p.selected),
                 )
             } else {
@@ -1045,6 +1509,7 @@ fn conversation(s: &State, p: Palette) -> El {
                     .body_font(BODY)
                     .selection(p.teal_bg)
                     .code_block(p.card, p.line)
+                    .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))
                     .code_block_font(
                         TextStyle::new(12.0, 400.0)
                             .family(rune::Family::SystemMono)
@@ -1060,26 +1525,20 @@ fn conversation(s: &State, p: Palette) -> El {
                     heading = heading
                         .child(label(
                             t.captain
-                                .map(|id| format!("Captain {}", crate::visuals::CAPTAIN_NAMES[id]))
+                                .map(|id| format!("Captain {}", s.captains[id].name))
                                 .unwrap_or("Pi".into()),
-                            TextStyle::new(12.0, 560.0),
+                            TextStyle::new(13.0, 600.0),
                             p.ink,
                         ))
                         .child(label(&t.model, SMALL, p.muted));
                     response = response.child(heading);
                 } else if let Some(seconds) = t.elapsed {
-                    response = response.child(
-                        button(
-                            "worked-summary",
-                            &format!("Worked for {seconds}s"),
-                            p,
-                            |s| s.show_activity = !s.show_activity,
-                        )
-                        .self_start()
-                        .px(0.0)
-                        .h(20.0)
-                        .child(icon("chevron", p.muted)),
-                    );
+                    response = response.child(disclosure(
+                        "worked-summary",
+                        &format!("Worked for {seconds}s"),
+                        p,
+                        |s| s.show_activity = !s.show_activity,
+                    ));
                 }
                 response.child(memo(
                     format!("{key}-body"),
@@ -1096,15 +1555,12 @@ fn conversation(s: &State, p: Palette) -> El {
         }
         if !t.tools.is_empty() {
             let count = t.tools.len();
-            messages = messages.child(
-                button("tool-summary", &format!("{count} tool calls"), p, |s| {
-                    s.show_activity = true
-                })
-                .self_start()
-                .px(0.0)
-                .h(22.0)
-                .child(icon("chevron", p.muted)),
-            );
+            messages = messages.child(disclosure(
+                "tool-summary",
+                &format!("{count} tool calls"),
+                p,
+                |s| s.show_activity = true,
+            ));
         }
         if t.status == Status::Settled {
             messages = messages.child(
@@ -1116,7 +1572,11 @@ fn conversation(s: &State, p: Palette) -> El {
             );
         } else if t.status == Status::Running {
             messages = messages.child(label(
-                "Pi is working. This thread has not settled.",
+                if t.phase.is_empty() {
+                    "Pi is working"
+                } else {
+                    &t.phase
+                },
                 SMALL,
                 p.muted,
             ));
@@ -1138,8 +1598,32 @@ fn suggestion(key: &str, title: &str, prompt: &'static str, p: Palette) -> El {
         s.current_mut().draft.replace_text(prompt)
     })
     .self_start()
-    .h(24.0)
-    .px(0.0)
+    .h(30.0)
+    .px(12.0)
+    .radius(15.0)
+    .fill(p.card)
+    .border(0.5, p.line)
+}
+
+/// A secondary, collapsible summary such as "Worked for 42s".
+fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(title)
+        .focusable(true)
+        .self_start()
+        .center_y()
+        .gap(4.0)
+        .h(22.0)
+        .pl(6.0)
+        .pr(4.0)
+        .ml(-6.0)
+        .radius(6.0)
+        .hover(p.selected)
+        .on_press(action)
+        .child(label(title, TextStyle::new(12.0, 500.0), p.muted))
+        .child(icon("chevron", p.muted))
 }
 
 fn composer(s: &State, p: Palette, narrow: bool) -> El {
@@ -1148,7 +1632,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
         .w_full()
         .max_w(768.0)
         .px(if narrow { 12.0 } else { 16.0 })
-        .pb(8.0)
+        .pb(12.0)
         .gap(6.0);
     if let Some(error) = &s.storage_error {
         area = area.child(label(error, SMALL, p.danger).wrap_anywhere());
@@ -1173,24 +1657,22 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
     let can_send = !s.demo
         && !t.archived
         && !t.status.busy()
-        && t.pi.is_some()
+        && !t.configuring
         && !t.draft.text.trim().is_empty();
     let mut send = el()
         .key("send-message")
         .role("button")
         .label("Send message")
-        .size(24.0, 24.0)
-        .radius(5.0)
+        .size(28.0, 28.0)
+        .radius(7.0)
         .center()
         .fill(if can_send { p.teal } else { p.selected })
         .child(icon("send", if can_send { p.card } else { p.muted }))
         .disabled(!can_send);
     if can_send {
-        send = send
-            .focusable(true)
-            .on_press(|s: &mut State| s.current_mut().send());
+        send = send.focusable(true).on_press(|s: &mut State| s.send());
     }
-    let action = if matches!(t.status, Status::Running | Status::Waiting) {
+    let action = if t.status.busy() && !s.demo {
         icon_button("stop-agent", "Stop agent", "stop", p, |s| {
             s.current_mut().stop()
         })
@@ -1208,7 +1690,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
     area = area.child(
         col()
             .key("composer")
-            .radius(8.0)
+            .radius(12.0)
             .fill(p.card)
             .border(0.5, p.line)
             .shadow(
@@ -1232,7 +1714,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                     .on_edit(|s: &mut State| &mut s.current_mut().draft)
                     .on_submit(|s: &mut State, _| {
                         if !s.demo && !s.current().archived {
-                            s.current_mut().send();
+                            s.send();
                         }
                     }),
             )
@@ -1246,26 +1728,46 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                             .child(icon("plus", p.muted))
                             .role("button")
                             .label("Attachments are not implemented")
+                            .opacity(0.4)
                             .disabled(true),
                     )
                     .child(identity)
                     .child(
-                        label(&t.model, TextStyle::new(12.0, 450.0), p.muted)
-                            .truncate()
-                            .shrink()
-                            .max_w(if narrow { 90.0 } else { 230.0 }),
+                        button("choose-pi-model", &t.model, p, |s| {
+                            s.model_search.replace_text("");
+                            s.settings_picker = Some(SettingsPicker::Model);
+                            s.connect();
+                        })
+                        .shrink()
+                        .min_w(0.0)
+                        .max_w(if narrow { 90.0 } else { 230.0 })
+                        .clip_rounded(5.0)
+                        .pl(4.0)
+                        .pr(3.0)
+                        .gap(3.0)
+                        .child(icon("chevron", p.muted))
+                        .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
                     )
-                    .child(icon("chevron", p.muted))
-                    .child(label(
-                        if t.thinking.is_empty() {
-                            "Default"
-                        } else {
-                            &t.thinking
-                        },
-                        SMALL,
-                        p.muted,
-                    ))
-                    .child(icon("chevron", p.muted))
+                    .child(
+                        button(
+                            "choose-pi-thinking",
+                            if t.thinking.is_empty() {
+                                "Default"
+                            } else {
+                                &t.thinking
+                            },
+                            p,
+                            |s| {
+                                s.settings_picker = Some(SettingsPicker::Thinking);
+                                s.connect();
+                            },
+                        )
+                        .pl(4.0)
+                        .pr(3.0)
+                        .gap(3.0)
+                        .child(icon("chevron", p.muted))
+                        .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
+                    )
                     .child(spacer())
                     .child(if s.demo {
                         el()
@@ -1286,16 +1788,12 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
             .h(20.0)
             .center_y()
             .gap(5.0)
-            .child(icon("thread", p.muted))
+            .child(icon("folder", p.muted))
             .child(label("Local", SMALL, p.muted))
-            .child(el().size(4.0, 4.0).radius(2.0).fill(if t.pi.is_some() {
-                p.teal
-            } else {
-                p.muted
-            }))
+            .child(label("·", SMALL, p.muted))
             .child(
                 label(
-                    if s.demo { "Example" } else { "No sandbox" },
+                    if s.demo { "Demo data" } else { "No sandbox" },
                     SMALL,
                     p.muted,
                 )
@@ -1303,12 +1801,25 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                 .grow(1.0),
             )
             .child(if s.demo {
-                button("leave-example", "Use local workspace", p, |s| {
-                    let path = s.workspace.clone();
-                    s.switch_workspace(path);
-                })
-                .px(4.0)
-                .h(18.0)
+                row()
+                    .key("leave-example")
+                    .role("button")
+                    .label("Open a real workspace")
+                    .focusable(true)
+                    .center_y()
+                    .h(20.0)
+                    .px(6.0)
+                    .radius(5.0)
+                    .hover(p.teal_bg)
+                    .on_press(|s: &mut State| {
+                        let path = s.workspace.clone();
+                        s.switch_workspace(path);
+                    })
+                    .child(label(
+                        "Open a real workspace",
+                        TextStyle::new(12.0, 500.0),
+                        p.teal,
+                    ))
             } else {
                 label("Shift Enter for newline", SMALL, p.muted)
             }),
@@ -1394,7 +1905,7 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                 row()
                     .center_y()
                     .gap(7.0)
-                    .child(icon(if tool.done { "check" } else { "activity" }, ink))
+                    .child(icon(if tool.done { "check" } else { "dot" }, ink))
                     .child(label(&tool.name, LABEL, p.ink))
                     .child(spacer())
                     .child(label(
@@ -1561,15 +2072,29 @@ mod tests {
         }
         let (bubble, _) = rt.presented("message-1-0-text").unwrap();
         assert!(
-            bubble[0] >= 224.0 && bubble[0] + bubble[2] <= 620.0,
+            bubble[0] >= 0.0 && bubble[0] + bubble[2] <= 620.0,
             "user message overflows its pane: {bubble:?}"
         );
+        // A compact window gives the conversation the full width until the sidebar is asked for.
+        assert!(rt.presented("sidebar").is_none());
+        press(&mut rt, "toggle-sidebar");
+        // Layout changes animate; let them settle before hit-testing the new sidebar.
+        rt.frame(2.0);
+        assert!(
+            rt.state.compact_sidebar,
+            "toggle did not request the sidebar"
+        );
+        assert!(rt.presented("sidebar").is_some());
+        press(&mut rt, "sidebar-toggle");
+        rt.frame(4.0);
+        assert!(!rt.state.compact_sidebar, "sidebar toggle did not close it");
+        assert!(rt.presented("sidebar").is_none());
     }
     #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
-        press(&mut rt, "new-captain");
+        press(&mut rt, "browse-captains");
         assert!(rt.state.captain_picker);
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-captain-2");
@@ -1580,6 +2105,61 @@ mod tests {
         press(&mut rt, "new-thread");
         assert_eq!(rt.state.current().captain, Some(2));
         assert!(!rt.state.current().captain_home);
+    }
+    #[test]
+    fn fourth_captain_opens_from_the_picker() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        press(&mut rt, "browse-captains");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "choose-captain-3");
+        assert_eq!(rt.state.current().captain, Some(3));
+        assert!(rt.state.current().captain_home);
+        assert_eq!(rt.state.current().title, "Pip");
+    }
+    #[test]
+    fn new_captain_button_creates_a_profile_instead_of_reopening_a_preset() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("Keep this draft");
+        rt.frame(0.0);
+        press(&mut rt, "new-captain");
+        assert!(rt.state.captain_editor.is_some());
+        assert!(!rt.state.captain_picker);
+        let editor = rt.state.captain_editor.as_mut().unwrap();
+        editor.name.replace_text("Atlas");
+        editor.role.replace_text("Code review");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "captain-portrait-2");
+        press(&mut rt, "save-captain");
+        assert!(rt.state.captain_editor.is_none());
+        assert_eq!(rt.state.captains[4].portrait, 2);
+        assert_eq!(rt.state.current().captain, Some(4));
+        assert_eq!(rt.state.current().title, "Atlas");
+        assert!(rt.state.current().pi.is_none());
+        assert_eq!(rt.state.threads[0].draft.text, "Keep this draft");
+        assert!(rt.find("captain-4").is_some());
+    }
+    #[test]
+    fn captain_editor_footer_stays_visible_at_minimum_window_size() {
+        let mut rt = Runtime::new(
+            State::new(".".into(), false),
+            view,
+            (620.0, 480.0),
+            Env::new(false, 1.0),
+        );
+        rt.state.begin_new_captain();
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        for key in ["captain-editor", "save-captain", "cancel-captain"] {
+            let (rect, _) = rt.presented(key).unwrap();
+            assert!(
+                rect[0] >= 0.0
+                    && rect[1] >= 0.0
+                    && rect[0] + rect[2] <= 620.5
+                    && rect[1] + rect[3] <= 480.5,
+                "{key} is outside the window: {rect:?}"
+            );
+        }
     }
     #[test]
     fn pinned_captain_child_has_one_row_and_retains_its_draft() {
@@ -1603,5 +2183,43 @@ mod tests {
             "composer width was {}",
             rect[2]
         );
+    }
+    #[test]
+    fn native_model_and_reasoning_pickers_send_real_rpc_commands() {
+        let mut rt = runtime(1280.0);
+        let (pi, commands, _events) = crate::backend::Pi::test_connection();
+        rt.state.current_mut().pi = Some(pi);
+        rt.state.current_mut().status = Status::Ready;
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"provider":"cpa","id":"model-a","name":"Model A"}
+        ]}}));
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","high"]}}));
+        rt.frame(0.0);
+        press(&mut rt, "choose-pi-model");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("pi-settings-picker").is_some());
+        press(&mut rt, "choose-model-0");
+        let model = commands.try_recv().unwrap();
+        assert_eq!(model["type"], "set_model");
+        assert_eq!(model["provider"], "cpa");
+        assert_eq!(model["modelId"], "model-a");
+        assert!(rt.state.current().configuring);
+        rt.state.current_mut().apply(json!({"type":"response","command":"set_model","success":true,"data":{"provider":"cpa","id":"model-a","name":"Model A"}}));
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_state");
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "get_available_thinking_levels"
+        );
+        rt.frame(0.0);
+        press(&mut rt, "choose-pi-thinking");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "choose-thinking-1");
+        let thinking = commands.try_recv().unwrap();
+        assert_eq!(thinking["type"], "set_thinking_level");
+        assert_eq!(thinking["level"], "high");
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert_eq!(rt.state.current().thinking, "high");
     }
 }

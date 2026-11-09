@@ -1,4 +1,5 @@
 use crate::backend::{Event, Pi};
+use crate::captains::{Captain, CaptainEditor};
 use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -58,6 +59,19 @@ pub struct Tool {
     pub output: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentModel {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPicker {
+    Model,
+    Thinking,
+}
+
 pub struct Thread {
     pub id: usize,
     pub title: String,
@@ -68,6 +82,12 @@ pub struct Thread {
     pub pi: Option<Pi>,
     pub model: String,
     pub thinking: String,
+    pub model_provider: String,
+    pub model_id: String,
+    pub models: Vec<AgentModel>,
+    pub thinking_levels: Vec<String>,
+    pub configuring: bool,
+    pub phase: String,
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
@@ -85,6 +105,9 @@ pub struct Thread {
     serial: usize,
     state_loaded: bool,
     history_loaded: bool,
+    send_when_ready: bool,
+    pending_thinking: Option<String>,
+    pending_prompt: Option<(String, String, usize)>,
 }
 
 impl Thread {
@@ -97,8 +120,14 @@ impl Thread {
             tools: vec![],
             draft: TextEdit::default(),
             pi: None,
-            model: "Pi default model".into(),
+            model: "Default model".into(),
             thinking: String::new(),
+            model_provider: String::new(),
+            model_id: String::new(),
+            models: vec![],
+            thinking_levels: vec![],
+            configuring: false,
+            phase: String::new(),
             error: None,
             diagnostics: vec![],
             request: None,
@@ -116,10 +145,22 @@ impl Thread {
             serial: 0,
             state_loaded: false,
             history_loaded: false,
+            send_when_ready: false,
+            pending_thinking: None,
+            pending_prompt: None,
         }
     }
 
     pub fn connect(&mut self, path: PathBuf, wake: Waker) {
+        self.connect_with_instructions(path, wake, None);
+    }
+
+    pub fn connect_with_instructions(
+        &mut self,
+        path: PathBuf,
+        wake: Waker,
+        instructions: Option<String>,
+    ) {
         if self.pi.is_some() {
             return;
         }
@@ -127,7 +168,39 @@ impl Thread {
         self.status = Status::Connecting;
         self.state_loaded = false;
         self.history_loaded = false;
-        self.pi = Some(Pi::start(path, self.session.clone(), wake));
+        self.models.clear();
+        self.thinking_levels.clear();
+        self.pi = Some(match instructions {
+            Some(instructions) => {
+                Pi::start_with_instructions(path, self.session.clone(), wake, Some(instructions))
+            }
+            None => Pi::start(path, self.session.clone(), wake),
+        });
+    }
+
+    pub fn set_model(&mut self, provider: String, model_id: String) {
+        if provider != "cpa" {
+            self.error = Some(
+                "Shina uses CPA proxy models only. Choose a model from the CPA catalog.".into(),
+            );
+            return;
+        }
+        if !self.status.busy()
+            && !self.configuring
+            && self.command("set_model", json!({"provider":provider,"modelId":model_id}))
+        {
+            self.configuring = true;
+        }
+    }
+
+    pub fn set_thinking(&mut self, level: String) {
+        if !self.status.busy()
+            && !self.configuring
+            && self.command("set_thinking_level", json!({"level":level}))
+        {
+            self.configuring = true;
+            self.pending_thinking = Some(level);
+        }
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
@@ -147,13 +220,26 @@ impl Thread {
     }
 
     pub fn send(&mut self) {
-        if self.status.busy() || self.pi.is_none() || self.draft.text.trim().is_empty() {
+        if self.status.busy()
+            || self.configuring
+            || self.pi.is_none()
+            || self.draft.text.trim().is_empty()
+        {
+            return;
+        }
+        if self.model_provider != "cpa" {
+            self.error = Some("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
         let prompt = self.draft.text.trim().to_owned();
         if !self.command("prompt", json!({"message":prompt})) {
             return;
         }
+        self.pending_prompt = Some((
+            format!("{}-{}", self.id, self.serial),
+            prompt.clone(),
+            self.messages.len(),
+        ));
         if self.messages.is_empty() && !self.captain_home {
             self.title = prompt.chars().take(45).collect();
         }
@@ -167,12 +253,22 @@ impl Thread {
         self.elapsed = None;
         self.assistant = None;
         self.error = None;
+        self.phase = "Waiting for Pi".into();
     }
 
     pub fn stop(&mut self) {
+        if self.status == Status::Connecting {
+            self.disconnect();
+            return;
+        }
         if self.status == Status::Running || self.status == Status::Waiting {
+            // Release a blocking extension dialog before asking Pi to wait for idle.
+            if self.request.is_some() {
+                self.respond(json!({"cancelled":true}));
+            }
             self.command("clear_queue", json!({}));
             self.command("abort", json!({}));
+            self.phase = "Stopping".into();
         }
     }
 
@@ -197,10 +293,17 @@ impl Thread {
     }
 
     pub fn disconnect(&mut self) {
+        if let Some((_, prompt, _)) = self.pending_prompt.take() {
+            self.restore_prompt(&prompt);
+        }
         self.pi = None;
         self.status = Status::Offline;
         self.assistant = None;
         self.request = None;
+        self.send_when_ready = false;
+        self.configuring = false;
+        self.pending_thinking = None;
+        self.phase.clear();
     }
 
     fn assistant(&mut self) -> &mut Message {
@@ -220,20 +323,37 @@ impl Thread {
                 let command = string(&record, "command");
                 if record["success"] == false {
                     self.error = Some(string(&record, "error").to_owned());
+                    if matches!(command, "set_model" | "set_thinking_level") {
+                        self.configuring = false;
+                        self.pending_thinking = None;
+                    }
+                    if command == "prompt"
+                        && self
+                            .pending_prompt
+                            .as_ref()
+                            .is_some_and(|(id, _, _)| record["id"] == *id)
+                        && let Some((_, prompt, index)) = self.pending_prompt.take()
+                    {
+                        self.restore_prompt(&prompt);
+                        if self
+                            .messages
+                            .get(index)
+                            .is_some_and(|m| m.role == "You" && m.text == prompt)
+                        {
+                            self.messages.remove(index);
+                        }
+                    }
                     if matches!(command, "prompt" | "get_state" | "get_messages") {
                         self.status = Status::Failed;
+                        self.send_when_ready = false;
+                        self.started = None;
                     }
                     return;
                 }
                 match command {
                     "get_state" => {
                         let data = &record["data"];
-                        if let Some(model) = data["model"]["name"]
-                            .as_str()
-                            .or(data["model"]["id"].as_str())
-                        {
-                            self.model = model.to_owned();
-                        }
+                        self.update_model(&data["model"]);
                         self.thinking = string(data, "thinkingLevel").to_owned();
                         self.session = data["sessionFile"].as_str().map(str::to_owned);
                         if record["id"] == "state" {
@@ -245,9 +365,56 @@ impl Thread {
                             }
                         }
                     }
-                    "get_messages" => {
+                    "get_available_models" => {
+                        self.models = record["data"]["models"]
+                            .as_array()
+                            .map(|models| {
+                                models
+                                    .iter()
+                                    .filter(|model| model["provider"] == "cpa")
+                                    .filter_map(|model| {
+                                        Some(AgentModel {
+                                            provider: model["provider"].as_str()?.into(),
+                                            id: model["id"].as_str()?.into(),
+                                            name: model["name"]
+                                                .as_str()
+                                                .or(model["id"].as_str())?
+                                                .into(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    "get_available_thinking_levels" => {
+                        self.thinking_levels = record["data"]["levels"]
+                            .as_array()
+                            .map(|levels| {
+                                levels
+                                    .iter()
+                                    .filter_map(|level| level.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    "set_model" => {
+                        self.update_model(&record["data"]);
+                        // Refresh the effective level too. Pi may clamp it for the new model.
+                        self.command("get_state", json!({}));
+                        self.command("get_available_thinking_levels", json!({}));
+                        self.configuring = false;
+                    }
+                    "set_thinking_level" => {
+                        if let Some(level) = self.pending_thinking.take() {
+                            self.thinking = level;
+                        }
+                        self.command("get_state", json!({}));
+                        self.configuring = false;
+                    }
+                    "get_messages" if record["id"] == "history" => {
                         if let Some(messages) = record["data"]["messages"].as_array() {
                             self.messages.clear();
+                            self.tools.clear();
                             self.assistant = None;
                             for message in messages {
                                 let role = string(message, "role");
@@ -260,6 +427,31 @@ impl Thread {
                                         });
                                     }
                                 }
+                                if role == "assistant"
+                                    && let Some(blocks) = message["content"].as_array()
+                                {
+                                    for block in blocks.iter().filter(|b| b["type"] == "toolCall") {
+                                        self.tools.push(Tool {
+                                            id: string(block, "id").into(),
+                                            name: string(block, "name").into(),
+                                            detail: tool_detail(&block["arguments"]),
+                                            done: true,
+                                            failed: true,
+                                            output: "No saved result for this tool call.".into(),
+                                        });
+                                    }
+                                }
+                                if role == "toolResult"
+                                    && let Some(tool) = self
+                                        .tools
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|t| t.id == string(message, "toolCallId"))
+                                {
+                                    tool.failed = message["isError"] == true;
+                                    tool.output =
+                                        truncate(&content_text(&message["content"]), 6000);
+                                }
                             }
                         }
                         self.history_loaded = true;
@@ -267,10 +459,15 @@ impl Thread {
                             self.status = Status::Ready;
                         }
                     }
-                    "prompt" if record["data"]["disposition"] == "handled" => {
-                        self.status = Status::Ready
-                    }
                     "prompt" => {
+                        self.pending_prompt = None;
+                        if record["data"]["disposition"] == "handled"
+                            && self.status == Status::Running
+                        {
+                            self.status = Status::Ready;
+                            self.started = None;
+                            self.phase.clear();
+                        }
                         // Capture the newly created session path before a long first run finishes.
                         self.command("get_state", json!({}));
                     }
@@ -280,17 +477,12 @@ impl Thread {
             "agent_start" => {
                 self.status = Status::Running;
                 self.assistant = None;
+                self.phase = "Waiting for the model".into();
             }
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
                 self.request = None;
-                self.status = if self.error.is_some() {
-                    Status::Failed
-                } else {
-                    Status::Settled
-                };
-                self.elapsed = self.started.take().map(|start| start.elapsed().as_secs());
-                self.assistant = None;
+                self.finish_run();
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
@@ -301,6 +493,9 @@ impl Thread {
                 let update = &record["assistantMessageEvent"];
                 if update["type"] == "text_delta" {
                     self.assistant().text.push_str(string(update, "delta"));
+                    self.phase = "Writing".into();
+                } else if update["type"] == "thinking_delta" {
+                    self.phase = "Thinking".into();
                 }
             }
             "message_end" if record["message"]["role"] == "assistant" => {
@@ -310,12 +505,15 @@ impl Thread {
                     self.assistant().text = text;
                     self.error = None;
                 }
-                if let Some(error) = message["errorMessage"].as_str().filter(|s| !s.is_empty()) {
+                if message["stopReason"] != "aborted"
+                    && let Some(error) = message["errorMessage"].as_str().filter(|s| !s.is_empty())
+                {
                     self.error = Some(error.to_owned());
                 }
                 self.assistant = None;
             }
             "tool_execution_start" => {
+                self.phase = format!("Running {}", string(&record, "toolName"));
                 self.tools.push(Tool {
                     id: string(&record, "toolCallId").into(),
                     name: string(&record, "toolName").into(),
@@ -325,6 +523,25 @@ impl Thread {
                     output: String::new(),
                 });
             }
+            "auto_retry_start" => {
+                self.phase = format!("Retrying, attempt {}", record["attempt"]);
+                self.diagnostics
+                    .push(string(&record, "errorMessage").into());
+            }
+            "auto_retry_end" => {
+                if record["success"] == true {
+                    self.error = None;
+                } else {
+                    self.error = Some(string(&record, "finalError").into());
+                }
+            }
+            "compaction_start" => self.phase = "Compacting context".into(),
+            "compaction_end" => {
+                if let Some(error) = record["errorMessage"].as_str() {
+                    self.error = Some(error.into());
+                }
+            }
+            "thinking_level_changed" => self.thinking = string(&record, "level").into(),
             "tool_execution_update" | "tool_execution_end" => {
                 let ending = record["type"] == "tool_execution_end";
                 if let Some(tool) = self
@@ -361,6 +578,38 @@ impl Thread {
             _ => {}
         }
     }
+
+    fn update_model(&mut self, model: &Value) {
+        if let Some(id) = model["id"].as_str() {
+            self.model_id = id.into();
+            self.model_provider = string(model, "provider").into();
+            self.model = model["name"].as_str().unwrap_or(id).into();
+        }
+    }
+
+    fn restore_prompt(&mut self, prompt: &str) {
+        let text = if self.draft.text.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("{prompt}\n\n{}", self.draft.text)
+        };
+        self.draft.replace_text(&text);
+    }
+
+    fn finish_run(&mut self) {
+        self.status = if self.error.is_some() {
+            Status::Failed
+        } else {
+            Status::Settled
+        };
+        self.elapsed = self
+            .started
+            .take()
+            .map(|start| start.elapsed().as_secs())
+            .or(self.elapsed);
+        self.assistant = None;
+        self.phase.clear();
+    }
 }
 
 pub struct State {
@@ -372,6 +621,8 @@ pub struct State {
     pub show_activity: bool,
     pub show_archive: bool,
     pub sidebar: bool,
+    /// Whether the sidebar is shown while the window is too narrow for it to stay docked.
+    pub compact_sidebar: bool,
     pub search: TextEdit,
     pub demo: bool,
     pub wake: Waker,
@@ -379,11 +630,16 @@ pub struct State {
     pub storage_error: Option<String>,
     pub artwork: Arc<crate::visuals::Artwork>,
     pub captain_picker: bool,
+    pub captains: Vec<Captain>,
+    pub captain_editor: Option<CaptainEditor>,
     pub search_open: bool,
+    pub settings_picker: Option<SettingsPicker>,
+    pub model_search: TextEdit,
 }
 
 impl State {
     pub fn new(workspace: PathBuf, demo: bool) -> Self {
+        let artwork = crate::visuals::Artwork::load(&workspace);
         let mut state = Self {
             workspace,
             threads: vec![Thread::new(1)],
@@ -393,14 +649,19 @@ impl State {
             show_activity: false,
             show_archive: false,
             sidebar: true,
+            compact_sidebar: false,
             search: TextEdit::default(),
             demo,
             wake: Arc::new(|| {}),
             store: None,
             storage_error: None,
-            artwork: crate::visuals::Artwork::load(),
+            artwork,
             captain_picker: false,
+            captains: Captain::defaults(),
+            captain_editor: None,
             search_open: false,
+            settings_picker: None,
+            model_search: TextEdit::default(),
         };
         if demo {
             state.populate_demo();
@@ -423,7 +684,7 @@ impl State {
         self.checkpoint();
     }
     pub fn open_captain(&mut self, captain: usize) {
-        if captain >= crate::visuals::CAPTAIN_NAMES.len() {
+        if captain >= self.captains.len() {
             return;
         }
         if let Some(index) = self.threads.iter().position(|thread| {
@@ -434,7 +695,7 @@ impl State {
         } else {
             let mut thread = Thread::new(self.next_id);
             self.next_id += 1;
-            thread.title = crate::visuals::CAPTAIN_NAMES[captain].into();
+            thread.title = self.captains[captain].name.clone();
             thread.captain = Some(captain);
             thread.captain_home = true;
             self.threads.push(thread);
@@ -443,6 +704,83 @@ impl State {
         self.show_archive = false;
         self.captain_picker = false;
         self.checkpoint();
+    }
+
+    pub fn begin_new_captain(&mut self) {
+        self.captain_picker = false;
+        self.captain_editor = Some(CaptainEditor::new());
+    }
+
+    pub fn edit_captain(&mut self, captain: usize) {
+        let Some(profile) = self.captains.get(captain) else {
+            return;
+        };
+        let mut editor = CaptainEditor::new();
+        editor.editing = Some(captain);
+        editor.name.replace_text(&profile.name);
+        editor.role.replace_text(&profile.role);
+        editor.instructions.replace_text(&profile.instructions);
+        editor.portrait = profile.portrait;
+        self.captain_editor = Some(editor);
+    }
+
+    pub fn save_captain(&mut self) {
+        let Some(editor) = &self.captain_editor else {
+            return;
+        };
+        let profile = editor.profile();
+        let editing = editor.editing;
+        let error = profile
+            .validate()
+            .err()
+            .or_else(|| {
+                self.captains
+                    .iter()
+                    .enumerate()
+                    .any(|(i, existing)| {
+                        Some(i) != editing
+                            && existing.name.to_lowercase() == profile.name.to_lowercase()
+                    })
+                    .then(|| {
+                        "That captain name is already in this workspace. Choose a different name."
+                            .into()
+                    })
+            })
+            .or_else(|| {
+                editing
+                    .filter(|&id| {
+                        self.threads
+                            .iter()
+                            .any(|t| t.captain == Some(id) && t.status.busy())
+                    })
+                    .map(|_| {
+                        "Stop this captain's running threads before editing its profile.".into()
+                    })
+            });
+        if let Some(error) = error {
+            self.captain_editor.as_mut().unwrap().error = Some(error);
+            return;
+        }
+        let id = if let Some(id) = editing {
+            if id >= self.captains.len() {
+                return;
+            }
+            self.captains[id] = profile;
+            // Restart idle connections on demand so the next send uses the edited profile.
+            for thread in self.threads.iter_mut().filter(|t| t.captain == Some(id)) {
+                thread.disconnect();
+                if thread.captain_home {
+                    thread.title = self.captains[id].name.clone();
+                }
+            }
+            id
+        } else {
+            self.captains.push(profile);
+            self.captains.len() - 1
+        };
+        self.captain_editor = None;
+        self.open_captain(id);
+        self.current_mut().draft.focused = true;
     }
     /// The captain's most urgent live thread. Archived conversations do not vote.
     pub fn captain_status(&self, captain: usize) -> Status {
@@ -463,7 +801,34 @@ impl State {
         }
         let path = self.workspace.clone();
         let wake = self.wake.clone();
-        self.current_mut().connect(path, wake);
+        let instructions = self
+            .current()
+            .captain
+            .and_then(|id| self.captains.get(id))
+            .map(Captain::prompt);
+        if instructions.is_none() {
+            self.current_mut().connect(path, wake);
+        } else {
+            self.current_mut()
+                .connect_with_instructions(path, wake, instructions);
+        }
+    }
+    pub fn send(&mut self) {
+        if self.demo
+            || self.current().archived
+            || self.current().status.busy()
+            || self.current().configuring
+            || self.current().draft.text.trim().is_empty()
+        {
+            return;
+        }
+        if self.current().pi.is_none() {
+            self.connect();
+            self.current_mut().send_when_ready = true;
+        } else {
+            self.current_mut().send();
+        }
+        self.checkpoint();
     }
     pub fn switch_workspace(&mut self, path: PathBuf) {
         if self
@@ -512,7 +877,21 @@ impl State {
             return;
         };
         match crate::store::load(&path) {
-            Ok(Some(index)) if index["version"] == 1 => {
+            Ok(Some(index)) if index["version"] == 1 || index["version"] == 2 => {
+                if index["version"] == 2 {
+                    let Some(profiles) = index["captains"].as_array().filter(|p| !p.is_empty())
+                    else {
+                        self.storage_error = Some("The saved captain profiles are invalid. The index has not been overwritten.".into());
+                        return;
+                    };
+                    let restored: Option<Vec<Captain>> =
+                        profiles.iter().map(Captain::from_value).collect();
+                    let Some(restored) = restored else {
+                        self.storage_error = Some("A saved captain profile is invalid. The index has not been overwritten.".into());
+                        return;
+                    };
+                    self.captains = restored;
+                }
                 if let Some(threads) = index["threads"]
                     .as_array()
                     .filter(|threads| !threads.is_empty())
@@ -528,14 +907,19 @@ impl State {
                             thread.title = record["title"].as_str()?.into();
                             thread.session = record["session"].as_str().map(str::to_owned);
                             thread.archived = record["archived"] == true;
-                            thread.captain = record["captain"]
-                                .as_u64()
-                                .and_then(|id| usize::try_from(id).ok())
-                                .filter(|&id| id < crate::visuals::CAPTAIN_NAMES.len());
+                            thread.captain = if record["captain"].is_null() {
+                                None
+                            } else {
+                                let id = usize::try_from(record["captain"].as_u64()?).ok()?;
+                                if id >= self.captains.len() {
+                                    return None;
+                                }
+                                Some(id)
+                            };
                             thread.captain_home = record["captainHome"] == true;
                             if let (true, Some(captain)) = (thread.captain_home, thread.captain) {
                                 // Older indexes stored the role name as the home title.
-                                thread.title = crate::visuals::CAPTAIN_NAMES[captain].into();
+                                thread.title = self.captains[captain].name.clone();
                             }
                             thread.pinned = record["pinned"] == true;
                             Some(thread)
@@ -576,7 +960,8 @@ impl State {
             return;
         }
         let snapshot = json!({
-            "version":1, "dark":self.dark,
+            "version":2, "dark":self.dark,
+            "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "threads":self.threads.iter().map(|thread|json!({
                 "id":thread.id, "title":thread.title, "session":thread.session, "archived":thread.archived,
                 "captain":thread.captain, "captainHome":thread.captain_home, "pinned":thread.pinned
@@ -593,7 +978,7 @@ impl State {
         thread.title = "Fix the reconnect listener".into();
         thread.captain = Some(0);
         thread.status = Status::Settled;
-        thread.model = "Pi".into();
+        thread.model = "Default model".into();
         thread.thinking = "medium".into();
         thread.elapsed = Some(42);
         thread.messages = vec![
@@ -621,7 +1006,7 @@ impl State {
         ];
         self.threads.push(thread);
         for (id, title, status) in [
-            (2, "Review sidebar keyboard navigation", Status::Ready),
+            (2, "Review sidebar keyboard navigation", Status::Running),
             (3, "Reduce cold-start work", Status::Settled),
             (4, "Add a native file picker", Status::Settled),
             (5, "Plan the Pi session adapter", Status::Settled),
@@ -636,11 +1021,12 @@ impl State {
             }
             self.threads.push(thread);
         }
-        // One home per captain, in three different states, so the crew shows its range.
+        // One home per captain, in different states, so the crew shows its range.
         for (id, captain, status) in [
-            (7, 0, Status::Running),
+            (7, 0, Status::Ready),
             (8, 1, Status::Waiting),
             (9, 2, Status::Settled),
+            (10, 3, Status::Ready),
         ] {
             let mut thread = Thread::new(id);
             thread.title = crate::visuals::CAPTAIN_NAMES[captain].into();
@@ -649,7 +1035,7 @@ impl State {
             thread.status = status;
             self.threads.push(thread);
         }
-        self.next_id = 10;
+        self.next_id = 11;
         self.active = 0;
     }
 }
@@ -673,10 +1059,14 @@ pub fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                         thread.unread = true;
                     }
                 }
-                Event::Error(error) => thread.error = Some(error),
+                Event::Error(error) => {
+                    thread.disconnect();
+                    thread.error = Some(error);
+                    thread.status = Status::Failed;
+                }
                 Event::Diagnostic(diagnostic) => thread.diagnostics.push(diagnostic),
                 Event::Exited => {
-                    thread.pi = None;
+                    thread.disconnect();
                     thread.status = if thread.error.is_some() {
                         Status::Failed
                     } else {
@@ -684,6 +1074,11 @@ pub fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                     };
                 }
             }
+        }
+        if thread.send_when_ready && thread.status == Status::Ready {
+            thread.send_when_ready = false;
+            thread.send();
+            changed = true;
         }
     }
     if let Some(error) = state
@@ -804,5 +1199,458 @@ mod tests {
         assert_eq!(thread.request.as_ref().unwrap()["id"], "permission");
         thread.apply(json!({"type":"agent_settled","aborted":false}));
         assert!(thread.request.is_none());
+    }
+    #[test]
+    fn reconnect_restores_tool_calls_and_results_without_duplicates() {
+        let mut thread = Thread::new(1);
+        let history = json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[
+            {"role":"user","content":"Check the file"},
+            {"role":"assistant","content":[{"type":"toolCall","id":"read-1","name":"read","arguments":{"path":"example.txt"}}]},
+            {"role":"toolResult","toolCallId":"read-1","toolName":"read","content":[{"type":"text","text":"saved output"}],"isError":false},
+            {"role":"assistant","content":[{"type":"text","text":"Done"}]}
+        ]}});
+        thread.apply(history.clone());
+        thread.apply(history);
+        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(thread.tools.len(), 1);
+        assert_eq!(thread.tools[0].detail, "example.txt");
+        assert_eq!(thread.tools[0].output, "saved output");
+        assert!(thread.tools[0].done && !thread.tools[0].failed);
+    }
+    #[test]
+    fn rejected_prompt_returns_to_the_draft_and_does_not_claim_it_was_sent() {
+        let mut thread = Thread::new(1);
+        thread.messages.push(Message {
+            role: "You",
+            text: "Try this".into(),
+        });
+        thread.pending_prompt = Some(("1-1".into(), "Try this".into(), 0));
+        thread.status = Status::Running;
+        thread.apply(json!({"type":"response","id":"1-1","command":"prompt","success":false,"error":"No model configured"}));
+        assert_eq!(thread.status, Status::Failed);
+        assert_eq!(thread.draft.text, "Try this");
+        assert!(thread.messages.is_empty());
+        assert!(!thread.send_when_ready);
+    }
+    #[test]
+    fn failed_settings_leave_the_effective_model_and_level_unchanged() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"response","command":"set_model","success":true,"data":{"provider":"test","id":"actual","name":"Actual model"}}));
+        thread.configuring = true;
+        thread.pending_thinking = Some("high".into());
+        thread.thinking = "low".into();
+        thread.apply(json!({"type":"response","command":"set_thinking_level","success":false,"error":"Unsupported level"}));
+        assert_eq!(thread.model_id, "actual");
+        assert_eq!(thread.model_provider, "test");
+        assert_eq!(thread.thinking, "low");
+        assert!(!thread.configuring);
+        assert!(thread.pending_thinking.is_none());
+    }
+    #[test]
+    fn aborted_message_is_not_a_provider_failure() {
+        let mut thread = Thread::new(1);
+        thread.status = Status::Running;
+        thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted","errorMessage":"Request was aborted"}}));
+        thread.apply(json!({"type":"agent_settled","aborted":true}));
+        assert_eq!(thread.status, Status::Settled);
+        assert!(thread.error.is_none());
+        thread.apply(json!({"type":"response","command":"abort","success":true}));
+        assert_eq!(thread.status, Status::Settled);
+    }
+    #[test]
+    fn successful_retry_clears_the_transient_provider_error() {
+        let mut thread = Thread::new(1);
+        thread.status = Status::Running;
+        thread.error = Some("Temporary provider error".into());
+        thread.apply(json!({"type":"auto_retry_end","success":true}));
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        assert_eq!(thread.status, Status::Settled);
+        assert!(thread.error.is_none());
+    }
+    #[test]
+    fn first_send_waits_for_both_handshake_records_and_uses_the_active_draft() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().status = Status::Connecting;
+        state.current_mut().send_when_ready = true;
+        state.current_mut().draft.replace_text("Original draft");
+        events.send(Event::Record(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}))).unwrap();
+        let mut tx = Tx::default();
+        poll(&mut state, 0.0, &mut tx);
+        assert!(
+            commands.try_recv().is_err(),
+            "history alone must not start work"
+        );
+        state
+            .current_mut()
+            .draft
+            .replace_text("Revised before connection");
+        events.send(Event::Record(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"model-a"}}}))).unwrap();
+        poll(&mut state, 0.0, &mut tx);
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["message"], "Revised before connection");
+        assert_eq!(state.current().status, Status::Running);
+        assert!(state.current().draft.text.is_empty());
+        assert!(!state.current().send_when_ready);
+        poll(&mut state, 0.0, &mut tx);
+        assert!(commands.try_recv().is_err(), "submit exactly once");
+    }
+    #[test]
+    fn stopping_cancels_a_dialog_clears_the_queue_and_then_aborts() {
+        let (pi, commands, _events) = Pi::test_connection();
+        let mut thread = Thread::new(1);
+        thread.pi = Some(pi);
+        thread.apply(json!({"type":"extension_ui_request","id":"dialog-1","method":"confirm"}));
+        thread.stop();
+        let cancel = commands.try_recv().unwrap();
+        assert_eq!(cancel["type"], "extension_ui_response");
+        assert_eq!(cancel["id"], "dialog-1");
+        assert_eq!(cancel["cancelled"], true);
+        assert_eq!(commands.try_recv().unwrap()["type"], "clear_queue");
+        assert_eq!(commands.try_recv().unwrap()["type"], "abort");
+        assert!(thread.request.is_none());
+    }
+    #[test]
+    fn connect_alone_never_sends_a_model_prompt() {
+        let (pi, commands, events) = Pi::test_connection();
+        let mut state = State::new(".".into(), false);
+        state.current_mut().pi = Some(pi);
+        state.current_mut().status = Status::Connecting;
+        state.current_mut().draft.replace_text("Do not send this");
+        for record in [
+            json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false}}),
+            json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}),
+        ] {
+            events.send(Event::Record(record)).unwrap();
+        }
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.current().status, Status::Ready);
+        assert_eq!(state.current().draft.text, "Do not send this");
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn direct_provider_models_are_hidden_and_cannot_receive_prompts() {
+        let (pi, commands, _events) = Pi::test_connection();
+        let mut thread = Thread::new(1);
+        thread.pi = Some(pi);
+        thread.status = Status::Ready;
+        thread.apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"provider":"google","id":"direct","name":"Direct Google"},
+            {"provider":"cpa","id":"proxy","name":"CPA proxy"}
+        ]}}));
+        assert_eq!(thread.models.len(), 1);
+        assert_eq!(thread.models[0].id, "proxy");
+        thread.model_provider = "google".into();
+        thread.draft.replace_text("Do not send directly");
+        thread.send();
+        assert!(commands.try_recv().is_err());
+        assert_eq!(thread.draft.text, "Do not send directly");
+        assert!(thread.error.as_ref().unwrap().contains("CPA model"));
+        thread.set_model("google".into(), "direct".into());
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn rejected_prompt_preserves_a_newer_draft_too() {
+        let mut thread = Thread::new(1);
+        thread.pending_prompt = Some(("1-1".into(), "Rejected prompt".into(), 0));
+        thread.draft.replace_text("New draft");
+        thread.apply(json!({"type":"response","id":"1-1","command":"prompt","success":false,"error":"Rejected"}));
+        assert_eq!(thread.draft.text, "Rejected prompt\n\nNew draft");
+    }
+    #[test]
+    fn stopping_connection_cancels_the_deferred_first_send() {
+        let (pi, commands, _events) = Pi::test_connection();
+        let mut thread = Thread::new(1);
+        thread.pi = Some(pi);
+        thread.status = Status::Connecting;
+        thread.send_when_ready = true;
+        thread.draft.replace_text("Keep this draft");
+        thread.stop();
+        assert_eq!(thread.status, Status::Offline);
+        assert!(thread.pi.is_none());
+        assert!(!thread.send_when_ready);
+        assert_eq!(thread.draft.text, "Keep this draft");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn creating_and_editing_a_captain_preserves_conversations_and_drafts() {
+        let mut state = State::new(".".into(), false);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Original thread draft");
+        state.begin_new_captain();
+        let editor = state.captain_editor.as_mut().unwrap();
+        editor.name.replace_text("Atlas");
+        editor.role.replace_text("Review");
+        editor.instructions.replace_text("Cite failing tests.");
+        editor.portrait = 2;
+        state.save_captain();
+        assert_eq!(state.captains.len(), 5);
+        assert_eq!(state.current().captain, Some(4));
+        assert_eq!(state.current().title, "Atlas");
+        assert!(
+            state.current().pi.is_none(),
+            "creation must not start agent work"
+        );
+        assert_eq!(state.threads[0].draft.text, "Original thread draft");
+        let home_id = state.current().id;
+        state.new_thread();
+        state.current_mut().draft.replace_text("Crew draft");
+        let crew_id = state.current().id;
+        assert_eq!(state.current().captain, Some(4));
+        state.edit_captain(4);
+        state
+            .captain_editor
+            .as_mut()
+            .unwrap()
+            .name
+            .replace_text("Atlas Review");
+        state.save_captain();
+        assert_eq!(state.current().id, home_id);
+        assert_eq!(state.current().title, "Atlas Review");
+        assert_eq!(
+            state
+                .threads
+                .iter()
+                .find(|t| t.id == crew_id)
+                .unwrap()
+                .draft
+                .text,
+            "Crew draft"
+        );
+        assert!(state.captains[4].prompt().contains("Cite failing tests."));
+    }
+
+    #[test]
+    fn duplicate_names_and_busy_captain_edits_do_not_save() {
+        let mut state = State::new(".".into(), false);
+        state.begin_new_captain();
+        state
+            .captain_editor
+            .as_mut()
+            .unwrap()
+            .name
+            .replace_text(" ember ");
+        state.save_captain();
+        assert_eq!(state.captains.len(), 4);
+        assert!(
+            state
+                .captain_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("already")
+        );
+        state.captain_editor = None;
+        state.open_captain(2);
+        state.current_mut().status = Status::Running;
+        state.edit_captain(2);
+        state
+            .captain_editor
+            .as_mut()
+            .unwrap()
+            .name
+            .replace_text("Changed");
+        state.save_captain();
+        assert_eq!(state.captains[2].name, "Sable");
+        assert_eq!(state.current().status, Status::Running);
+        assert!(
+            state
+                .captain_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Stop")
+        );
+    }
+
+    #[test]
+    fn workspace_index_migrates_and_restores_custom_captains() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("shina-profile-{}-{unique}", std::process::id()));
+        let index_path = crate::store::path(&workspace).unwrap();
+        assert!(
+            !index_path.exists(),
+            "test must not overwrite an existing index"
+        );
+        let wake: Waker = Arc::new(|| {});
+        {
+            let mut store = crate::store::Store::new(index_path.clone(), wake.clone());
+            store.save(json!({"version":1,"dark":true,"threads":[
+                {"id":10,"title":"Old Captain","captain":2,"captainHome":true,"archived":false,"session":"saved-session"}
+            ]}));
+        }
+        {
+            let mut state = State::new(workspace.clone(), false);
+            state.setup(wake.clone());
+            assert!(state.storage_error.is_none());
+            assert_eq!(state.captains.len(), 4);
+            assert_eq!(state.current().title, "Sable");
+            assert_eq!(state.current().session.as_deref(), Some("saved-session"));
+            state.begin_new_captain();
+            state
+                .captain_editor
+                .as_mut()
+                .unwrap()
+                .name
+                .replace_text("Atlas");
+            state.captain_editor.as_mut().unwrap().portrait = 2;
+            state.save_captain();
+        }
+        assert_eq!(
+            crate::store::load(&index_path).unwrap().unwrap()["version"],
+            2
+        );
+        {
+            let mut restored = State::new(workspace, false);
+            restored.setup(wake);
+            assert!(restored.storage_error.is_none());
+            assert_eq!(restored.captains.len(), 5);
+            assert_eq!(restored.captains[4].name, "Atlas");
+            assert_eq!(restored.captains[4].portrait, 2);
+            restored.open_captain(4);
+            assert_eq!(restored.current().title, "Atlas");
+            assert!(restored.current().pi.is_none());
+        }
+        fs::remove_file(index_path).unwrap();
+    }
+
+    fn receive_until(thread: &mut Thread, done: impl Fn(&Thread) -> bool) {
+        use std::time::Duration;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done(thread) {
+            assert!(
+                Instant::now() < deadline,
+                "Pi timed out: {:?}, {:?}",
+                thread.status,
+                thread.error
+            );
+            let event = thread
+                .pi
+                .as_ref()
+                .expect("connected Pi")
+                .events
+                .recv_timeout(Duration::from_secs(1));
+            match event {
+                Ok(Event::Record(record)) => {
+                    let settled = record["type"] == "agent_settled";
+                    thread.apply(record);
+                    if settled {
+                        thread.command("get_state", json!({}));
+                    }
+                    assert_ne!(
+                        thread.status,
+                        Status::Failed,
+                        "Pi run failed: {:?}",
+                        thread.error
+                    );
+                }
+                Ok(Event::Error(error)) => panic!("Pi failed: {error}"),
+                Ok(Event::Exited) => panic!("Pi exited during integration test"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Sends one prompt through CPA to verify the captain system instructions"]
+    fn installed_pi_uses_captain_system_instructions() {
+        let profile = Captain {
+            name: "Test Captain".into(), role: "Validation".into(), portrait: 2,
+            instructions: "When asked for the validation phrase, reply exactly SHINA_CAPTAIN_OK. Do not use tools.".into(),
+        };
+        let mut thread = Thread::new(1);
+        thread.connect_with_instructions(
+            std::env::temp_dir(),
+            Arc::new(|| {}),
+            Some(profile.prompt()),
+        );
+        receive_until(&mut thread, |t| t.status == Status::Ready);
+        assert_eq!(thread.model_provider, "cpa");
+        thread.draft.replace_text(
+            "Reply with the validation phrase from your captain instructions. Do not use tools.",
+        );
+        thread.send();
+        receive_until(&mut thread, |t| t.status == Status::Settled);
+        assert_eq!(
+            thread.messages.last().unwrap().text.trim(),
+            "SHINA_CAPTAIN_OK"
+        );
+        assert!(thread.tools.is_empty());
+        thread.disconnect();
+        crate::backend::shutdown_all();
+    }
+
+    #[test]
+    #[ignore = "Sends a paid prompt to the configured Pi model, edits only a temporary fixture"]
+    fn installed_pi_edits_a_file_and_restores_the_session() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("shina-live-{}-{unique}", std::process::id()));
+        fs::create_dir(&workspace).unwrap();
+        let fixture = workspace.join("fixture.txt");
+        fs::write(&fixture, "answer=0\n").unwrap();
+        let mut thread = Thread::new(1);
+        thread.connect(workspace.clone(), Arc::new(|| {}));
+        receive_until(&mut thread, |t| t.status == Status::Ready);
+        thread.draft.replace_text(
+            "This is an integration test in a disposable folder. Use your file tools to read fixture.txt, then change its entire contents to exactly answer=42 followed by one newline. Do not run shell commands, access any other file, or delegate. After the edit, reply briefly that it is done."
+        );
+        thread.send();
+        receive_until(&mut thread, |t| {
+            t.status == Status::Settled && t.session.is_some()
+        });
+        assert_eq!(fs::read_to_string(&fixture).unwrap(), "answer=42\n");
+        assert!(
+            thread
+                .tools
+                .iter()
+                .any(|t| t.done && !t.failed && matches!(t.name.as_str(), "edit" | "write"))
+        );
+        assert!(
+            thread
+                .messages
+                .iter()
+                .any(|m| m.role == "Pi" && !m.text.is_empty())
+        );
+        let session = thread.session.clone().unwrap();
+        let tool_count = thread.tools.len();
+        let message_count = thread.messages.len();
+        thread.disconnect();
+        crate::backend::shutdown_all();
+        let mut restored = Thread::new(2);
+        restored.session = Some(session);
+        restored.connect(workspace.clone(), Arc::new(|| {}));
+        receive_until(&mut restored, |t| t.status == Status::Ready);
+        assert_eq!(restored.messages.len(), message_count);
+        assert_eq!(restored.tools.len(), tool_count);
+        assert!(restored.tools.iter().all(|t| t.done && !t.failed));
+        restored.disconnect();
+        crate::backend::shutdown_all();
+        fs::remove_file(fixture).unwrap();
+        fs::remove_dir(workspace).unwrap();
     }
 }
