@@ -32,6 +32,15 @@ pub fn shutdown_all() {
     }
 }
 
+/// How a Pi process reaches the Shina MCP: the endpoint, this thread's bearer token, and the
+/// bridge extension that registers Shina's tools inside Pi.
+#[derive(Clone, Debug)]
+pub struct HostLink {
+    pub url: String,
+    pub token: String,
+    pub extension: PathBuf,
+}
+
 pub struct Pi {
     commands: SyncSender<Value>,
     pub events: Receiver<Event>,
@@ -45,15 +54,12 @@ impl Pi {
         (Self { commands, events }, input, output)
     }
 
-    pub fn start(workspace: PathBuf, session: Option<String>, wake: Waker) -> Self {
-        Self::start_with_instructions(workspace, session, wake, None)
-    }
-
     pub fn start_with_instructions(
         workspace: PathBuf,
         session: Option<String>,
         wake: Waker,
         instructions: Option<String>,
+        host: Option<HostLink>,
     ) -> Self {
         let (commands, input) = mpsc::sync_channel::<Value>(32);
         let (events, output) = mpsc::sync_channel(256);
@@ -62,6 +68,7 @@ impl Pi {
                 &workspace,
                 session.as_deref(),
                 instructions.as_deref(),
+                host.as_ref(),
                 input,
                 &events,
                 &wake,
@@ -167,6 +174,7 @@ fn run(
     workspace: &Path,
     session: Option<&str>,
     instructions: Option<&str>,
+    host: Option<&HostLink>,
     input: Receiver<Value>,
     output: &SyncSender<Event>,
     wake: &Waker,
@@ -188,6 +196,17 @@ fn run(
     // Explicit extensions still load with --no-extensions. Load only the user's
     // catalog-backed provider, not unrelated packages, project extensions or MCP.
     command.arg("--extension").arg(cpa_extension()?);
+    // Shina's credentials belong to this thread only; never pass along inherited ones.
+    command
+        .env_remove(crate::mcp::URL_ENV)
+        .env_remove(crate::mcp::TOKEN_ENV);
+    if let Some(host) = host {
+        command
+            .arg("--extension")
+            .arg(&host.extension)
+            .env(crate::mcp::URL_ENV, &host.url)
+            .env(crate::mcp::TOKEN_ENV, &host.token);
+    }
     if let Some(instructions) = instructions {
         command.arg("--append-system-prompt").arg(instructions);
     }
@@ -372,7 +391,8 @@ mod tests {
     #[test]
     #[ignore = "Starts the installed Pi, but sends no model prompt"]
     fn installed_pi_answers_state_and_history_without_a_prompt() {
-        let pi = Pi::start(std::env::temp_dir(), None, Arc::new(|| {}));
+        let pi =
+            Pi::start_with_instructions(std::env::temp_dir(), None, Arc::new(|| {}), None, None);
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut state = false;
         let mut history = false;

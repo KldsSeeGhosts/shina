@@ -73,7 +73,23 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 
 Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
 
-Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working, settled, and offline states. Autonomous crew delegation is not connected. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
+Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working, settled, and offline states. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
+
+## Shina MCP
+
+Agents running in Shina know they are in Shina and can use its tools, the way harnesses in T3 Code use T3's. Shina hosts a local [MCP](https://modelcontextprotocol.io) server at `http://127.0.0.1:<random port>/mcp`, using Streamable HTTP with JSON responses. Each connected thread gets its own random bearer token. The token tells Shina which thread is calling, and Shina keeps it only in memory.
+
+| Tool | What it does |
+|---|---|
+| `list_threads` | Lists the workspace's threads with their ids, titles, captains, and status. |
+| `read_thread` | Returns a thread's most recent messages. |
+| `list_captains` | Lists the crew with their roles and current status. |
+| `delegate_task` | Starts a new thread, under the caller's captain or a named one, and sends it a brief. A delegated thread cannot delegate again. |
+| `task_status` | Reports a thread's status and latest reply without waiting. |
+
+Tool calls run on Shina's UI thread, so they see and change exactly what the window shows. A delegated thread appears in the sidebar with an unread badge.
+
+Pi reaches the server through a small bridge extension, [`assets/pi/shina-mcp-extension.ts`](assets/pi/shina-mcp-extension.ts). Shina writes it to `%LOCALAPPDATA%\Shina\pi` and loads it with `--extension`, passing the endpoint and token in `SHINA_MCP_URL` and `SHINA_MCP_TOKEN`. The extension registers each tool as `mcp__shina__<tool>` and adds a "Shina" section to the system prompt. Other harnesses can connect to the same endpoint with a bearer header. Only Pi needs the bridge.
 
 ## Safety and storage
 

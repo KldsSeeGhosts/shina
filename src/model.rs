@@ -1,4 +1,4 @@
-use crate::backend::{Event, Pi};
+use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
 use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
@@ -104,6 +104,10 @@ pub struct Thread {
     pub captain: Option<usize>,
     pub captain_home: bool,
     pub pinned: bool,
+    /// Started by another thread through the Shina MCP. Delegated threads cannot delegate.
+    pub delegated: bool,
+    /// How this thread's Pi reaches the Shina MCP, set when it connects.
+    pub host: Option<HostLink>,
     assistant: Option<usize>,
     serial: usize,
     state_loaded: bool,
@@ -144,6 +148,8 @@ impl Thread {
             captain: None,
             captain_home: false,
             pinned: false,
+            delegated: false,
+            host: None,
             assistant: None,
             serial: 0,
             state_loaded: false,
@@ -154,6 +160,7 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     pub fn connect(&mut self, path: PathBuf, wake: Waker) {
         self.connect_with_instructions(path, wake, None);
     }
@@ -174,10 +181,20 @@ impl Thread {
         self.models.clear();
         self.thinking_levels.clear();
         self.pi = Some(match instructions {
-            Some(instructions) => {
-                Pi::start_with_instructions(path, self.session.clone(), wake, Some(instructions))
-            }
-            None => Pi::start(path, self.session.clone(), wake),
+            Some(instructions) => Pi::start_with_instructions(
+                path,
+                self.session.clone(),
+                wake,
+                Some(instructions),
+                self.host.clone(),
+            ),
+            None => Pi::start_with_instructions(
+                path,
+                self.session.clone(),
+                wake,
+                None,
+                self.host.clone(),
+            ),
         });
     }
 
@@ -825,21 +842,190 @@ impl State {
         self.checkpoint();
     }
     pub fn connect(&mut self) {
-        if self.demo {
+        self.connect_thread(self.active);
+    }
+    /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
+    pub fn connect_thread(&mut self, index: usize) {
+        if self.demo || index >= self.threads.len() {
             return;
         }
         let path = self.workspace.clone();
         let wake = self.wake.clone();
-        let instructions = self
-            .current()
+        let thread_id = self.threads[index].id;
+        let instructions = self.threads[index]
             .captain
             .and_then(|id| self.captains.get(id))
             .map(Captain::prompt);
-        if instructions.is_none() {
-            self.current_mut().connect(path, wake);
-        } else {
-            self.current_mut()
-                .connect_with_instructions(path, wake, instructions);
+        // Shina's tools are an addition. If the MCP cannot start, Pi still works without them.
+        let host = crate::mcp::server(wake.clone()).and_then(|server| {
+            Ok(HostLink {
+                url: server.url.clone(),
+                token: server.token_for(thread_id),
+                extension: crate::mcp::extension_path()?,
+            })
+        });
+        let thread = &mut self.threads[index];
+        match host {
+            Ok(host) => thread.host = Some(host),
+            Err(error) => {
+                thread.host = None;
+                thread.diagnostics.push(error);
+            }
+        }
+        thread.connect_with_instructions(path, wake, instructions);
+    }
+    /// Answers a Shina MCP tool call on the UI thread. `caller` is the calling thread's id.
+    fn mcp_call(&mut self, caller: usize, tool: &str, args: &Value) -> Result<Value, String> {
+        let caller_index = self
+            .threads
+            .iter()
+            .position(|t| t.id == caller)
+            .ok_or("The calling thread no longer exists.")?;
+        let find = |state: &Self| -> Result<usize, String> {
+            let id = args["thread_id"]
+                .as_u64()
+                .ok_or("thread_id must be a thread id from list_threads.")?;
+            state
+                .threads
+                .iter()
+                .position(|t| t.id as u64 == id)
+                .ok_or_else(|| format!("There is no thread {id}."))
+        };
+        let captain_name = |state: &Self, captain: Option<usize>| -> Value {
+            captain
+                .and_then(|id| state.captains.get(id))
+                .map(|c| Value::from(c.name.clone()))
+                .unwrap_or(Value::Null)
+        };
+        match tool {
+            "list_threads" => {
+                let archived = args["include_archived"] == true;
+                let threads: Vec<Value> = self
+                    .threads
+                    .iter()
+                    .filter(|t| archived || !t.archived)
+                    .map(|t| {
+                        json!({
+                            "thread_id": t.id,
+                            "title": t.title,
+                            "captain": captain_name(self, t.captain),
+                            "captain_home": t.captain_home,
+                            "status": status_word(t.status),
+                            "archived": t.archived,
+                            "delegated": t.delegated,
+                            "is_caller": t.id == caller,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "threads": threads }))
+            }
+            "read_thread" => {
+                let thread = &self.threads[find(self)?];
+                let limit = args["max_messages"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+                let start = thread.messages.len().saturating_sub(limit);
+                let messages: Vec<Value> = thread.messages[start..]
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "role": if m.role == "You" { "user" } else { "assistant" },
+                            "text": truncate(&m.text, 6000),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "thread_id": thread.id,
+                    "title": thread.title,
+                    "status": status_word(thread.status),
+                    "message_count": thread.messages.len(),
+                    "messages": messages,
+                }))
+            }
+            "list_captains" => {
+                let captains: Vec<Value> = self
+                    .captains
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        json!({
+                            "name": c.name,
+                            "role": c.role,
+                            "status": status_word(self.captain_status(i)),
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "captains": captains }))
+            }
+            "delegate_task" => {
+                if self.threads[caller_index].delegated {
+                    return Err(
+                        "Delegated threads cannot delegate further. Do the work in this thread."
+                            .into(),
+                    );
+                }
+                let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
+                if prompt.is_empty() {
+                    return Err("prompt must describe the task.".into());
+                }
+                let captain = match args["captain"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    Some(name) => Some(
+                        self.captains
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(|| format!("There is no captain named {name}."))?,
+                    ),
+                    None => self.threads[caller_index].captain,
+                };
+                let mut thread = Thread::new(self.next_id);
+                self.next_id += 1;
+                thread.title = args["title"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(prompt)
+                    .chars()
+                    .take(45)
+                    .collect();
+                thread.captain = captain;
+                thread.delegated = true;
+                thread.unread = true;
+                thread.draft.replace_text(prompt);
+                let id = thread.id;
+                let title = thread.title.clone();
+                self.threads.push(thread);
+                let index = self.threads.len() - 1;
+                self.connect_thread(index);
+                self.threads[index].send_when_ready = true;
+                self.checkpoint();
+                Ok(json!({
+                    "thread_id": id,
+                    "title": title,
+                    "captain": captain_name(self, captain),
+                    "status": "connecting",
+                }))
+            }
+            "task_status" => {
+                let thread = &self.threads[find(self)?];
+                let reply = thread
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "Pi")
+                    .map(|m| truncate(&m.text, 6000));
+                Ok(json!({
+                    "thread_id": thread.id,
+                    "title": thread.title,
+                    "status": status_word(thread.status),
+                    "finished": matches!(thread.status, Status::Settled | Status::Failed),
+                    "phase": thread.phase,
+                    "error": thread.error,
+                    "latest_reply": reply,
+                }))
+            }
+            _ => Err(format!("Shina has no tool named {tool}.")),
         }
     }
     pub fn send(&mut self) {
@@ -906,6 +1092,10 @@ impl State {
             crate::install::remember_workspace(&self.workspace);
         }
         self.updater.check(wake.clone());
+        // Thread ids restart per workspace, so tokens from a previous workspace must not carry over.
+        if let Ok(server) = crate::mcp::server(wake.clone()) {
+            server.reset();
+        }
         let Some(path) = crate::store::path(&self.workspace) else {
             return;
         };
@@ -955,6 +1145,7 @@ impl State {
                                 thread.title = self.captains[captain].name.clone();
                             }
                             thread.pinned = record["pinned"] == true;
+                            thread.delegated = record["delegated"] == true;
                             Some(thread)
                         })
                         .collect();
@@ -1000,7 +1191,7 @@ impl State {
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "threads":self.threads.iter().map(|thread|json!({
                 "id":thread.id, "title":thread.title, "session":thread.session, "archived":thread.archived,
-                "captain":thread.captain, "captainHome":thread.captain_home, "pinned":thread.pinned
+                "captain":thread.captain, "captainHome":thread.captain_home, "pinned":thread.pinned, "delegated":thread.delegated
             })).collect::<Vec<_>>()
         });
         if let Some(store) = &mut self.store {
@@ -1078,6 +1269,15 @@ impl State {
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = state.updater.poll();
+    if !state.demo
+        && let Ok(server) = crate::mcp::server(state.wake.clone())
+    {
+        while let Some(request) = server.next_request() {
+            let result = state.mcp_call(request.thread, &request.tool, &request.args);
+            let _ = request.reply.send(result);
+            changed = true;
+        }
+    }
     if state.restart_for_update {
         state.restart_for_update = false;
         changed = true;
@@ -1153,6 +1353,19 @@ pub fn snap_zoom(zoom: f32) -> f32 {
         .copied()
         .min_by(|a, b| (a - zoom).abs().total_cmp(&(b - zoom).abs()))
         .unwrap_or(1.0)
+}
+
+/// The words the Shina MCP uses for a thread's status.
+fn status_word(status: Status) -> &'static str {
+    match status {
+        Status::Offline => "offline",
+        Status::Connecting => "connecting",
+        Status::Ready => "idle",
+        Status::Running => "working",
+        Status::Waiting => "needs input",
+        Status::Failed => "failed",
+        Status::Settled => "done",
+    }
 }
 
 pub fn string<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -1671,6 +1884,72 @@ mod tests {
         );
         assert!(thread.tools.is_empty());
         thread.disconnect();
+        crate::backend::shutdown_all();
+    }
+
+    #[test]
+    #[ignore = "Sends one prompt through CPA to verify Pi calls Shina's MCP tools through the bridge"]
+    fn installed_pi_calls_shina_mcp_tools() {
+        use std::time::Duration;
+        let mut state = State::new(std::env::temp_dir(), false);
+        state.threads[0].captain = Some(1);
+        state.connect_thread(0);
+        assert!(
+            state.threads[0].host.is_some(),
+            "{:?}",
+            state.threads[0].diagnostics
+        );
+        let server = crate::mcp::server(state.wake.clone()).unwrap();
+        let pump = |state: &mut State, done: &dyn Fn(&State) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while !done(state) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out: {:?}",
+                    state.threads[0].error
+                );
+                while let Some(request) = server.next_request() {
+                    let result = state.mcp_call(request.thread, &request.tool, &request.args);
+                    let _ = request.reply.send(result);
+                }
+                let event = state.threads[0]
+                    .pi
+                    .as_ref()
+                    .expect("connected Pi")
+                    .events
+                    .recv_timeout(Duration::from_millis(50));
+                match event {
+                    Ok(Event::Record(record)) => state.threads[0].apply(record),
+                    Ok(Event::Error(error)) => panic!("Pi failed: {error}"),
+                    Ok(Event::Exited) => panic!("Pi exited"),
+                    _ => {}
+                }
+                assert_ne!(
+                    state.threads[0].status,
+                    Status::Failed,
+                    "{:?}",
+                    state.threads[0].error
+                );
+            }
+        };
+        pump(&mut state, &|s| s.threads[0].status == Status::Ready);
+        state.threads[0].draft.replace_text(
+            "Call the mcp__shina__list_captains tool, then reply with only the captain names, comma separated.",
+        );
+        state.threads[0].send();
+        pump(&mut state, &|s| s.threads[0].status == Status::Settled);
+        let thread = &state.threads[0];
+        assert!(
+            thread
+                .tools
+                .iter()
+                .any(|t| t.name == "mcp__shina__list_captains" && !t.failed),
+            "tools: {:?}",
+            thread.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        let reply = &thread.messages.last().unwrap().text;
+        assert!(reply.contains("Ember") && reply.contains("Pip"), "{reply}");
+        state.threads[0].disconnect();
         crate::backend::shutdown_all();
     }
 
