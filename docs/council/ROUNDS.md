@@ -15,6 +15,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 3 | 7.8 | 8.5 | 7.6 (Capy 7.7) | 3 of 3 approve |
 | 4 | 7.9 | 8.7 | 8.1 (Capy 7.7) | 3 of 3 approve |
 | 5 | 8.1 | 8.7 | 8.1 (Capy 7.9) | 3 of 3 approve |
+| 6 | 8.1 | 8.6 | 8.3 (Capy 7.8) | 3 of 3 approve |
 
 ## Round 1
 
@@ -67,3 +68,16 @@ Shipped in round 5: unbuilt Issues, Pull requests, and Automations removed; Thre
 | Gemini 4 Argon | 7.0 | 8.2 | 8.5 | 9.0 | 8.1 / 8.5 / 8.8 | yes |
 
 Round 5 regressed one thing: the tighter head crop cuts through the new "..." and "z" corner marks, so a Working captain looks like a Ready one at sidebar size. Round 6 fixes it.
+
+Shipped in round 6: status badges on small avatars with clean head crops; an alert mark for Needs you; one sidebar selection and a detached nested-thread guide line; grid and sun/moon icons; truthful picker wording and a separate working-thread line; quieter disclosures, visible field borders, a raised dark user bubble; a demo reply with a list and inline code.
+
+## Round 6 (`r6/`)
+
+| Judge | Baseline | Round 5 | Round 6 | Capy | Crew art r5 / r6 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.4 | 7.0 | 7.4 | 8.2 | 7.3 / 7.7 / 6.5 | yes |
+| GPT 6.1 Sol | 6.6 | 8.0 | 8.2 | 8.7 | 8.0 / 8.3 / 8.0 | yes |
+| Gemini 4 Argon | 7.1 | 8.4 | 8.6 | 9.0 | 8.6 / 8.8 / 8.9 | yes |
+| **Average** | 6.4 | 7.8 | **8.1** | 8.6 | 8.0 / **8.3** / 7.8 | 3 of 3 |
+
+All three judges flagged the same remaining issue: captain rows show status twice, as an avatar badge and a trailing mark. Round 7 keeps only the badge.
