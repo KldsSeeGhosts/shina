@@ -483,6 +483,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(clone_dialog(s, p));
     } else if s.projects.menu.is_some() && docked {
         root = root.child(project_menu(s, p));
+    } else if s.thread_menu {
+        root = root.child(thread_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -1830,98 +1832,123 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     } else {
         s.sidebar
     };
-    row()
+    // The tab strip already names the thread, so the header only holds thread actions:
+    // status, a labeled "More actions" menu and the session panel toggle.
+    let mut header = row()
         .key("chat-header")
         .w_full()
         .h(36.0)
         .px(10.0)
         .center_y()
-        .gap(6.0)
-        .child(if docked {
-            el()
-        } else {
-            icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, move |s| {
+        .gap(4.0);
+    if !docked {
+        header = header.child(icon_button(
+            "toggle-sidebar",
+            "Show sidebar",
+            "sidebar",
+            p,
+            move |s| {
                 if compact {
                     s.compact_sidebar = true;
                 } else {
                     s.sidebar = true;
                 }
-            })
-        })
-        .child(
-            row()
-                .key("shell-thread")
-                .center_y()
-                .gap(8.0)
-                .px(10.0)
-                .h(26.0)
-                .radius(6.0)
-                .shrink()
-                .max_w(if narrow { 220.0 } else { 320.0 })
-                .fill(p.card)
-                .border(0.5, p.line)
-                .child(if let Some(captain) = s.current().captain {
-                    avatar(s, p, captain, 20.0, shown_status(s))
+            },
+        ));
+    }
+    header = header.child(spacer()).child(if s.demo {
+        row()
+            .key("demo-badge")
+            .h(20.0)
+            .px(8.0)
+            .mr(4.0)
+            .radius(10.0)
+            .center_y()
+            .fill(p.gold.alpha(0.12))
+            .label("Demo data, read-only")
+            .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
+    } else {
+        status(s.current().status, p)
+    });
+    if !(narrow && s.current().captain_home) {
+        header = header.child(toggle_button(
+            "thread-actions",
+            "More actions",
+            "more",
+            s.thread_menu,
+            p,
+            |s| s.thread_menu = !s.thread_menu,
+        ));
+    }
+    if !s.show_activity {
+        header = header.child(icon_button(
+            "open-session-panel",
+            "Show session details",
+            "panel",
+            p,
+            |s| {
+                s.show_activity = true;
+                s.activity_full = false;
+            },
+        ));
+    }
+    header
+}
+
+/// Pin and archive, with their names, under the header's "More actions" button.
+fn thread_menu(s: &State, p: Palette) -> El {
+    let thread = s.current();
+    let mut menu = col()
+        .key("thread-menu")
+        .role("menu")
+        .label("Thread actions")
+        .w(200.0)
+        .padding(5.0)
+        .gap(1.0)
+        .radius(8.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
+        .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
+        .modal(true, |s: &mut State| s.thread_menu = false);
+    if !thread.captain_home {
+        menu = menu.child(
+            menu_item(
+                "menu-pin-thread",
+                if thread.pinned {
+                    "Unpin thread"
                 } else {
-                    icon("thread", p.muted)
-                })
-                .child(label(&s.current().title, TextStyle::new(12.0, 520.0), p.ink).truncate()),
-        )
-        .child(spacer())
-        .child(if s.demo {
-            row()
-                .key("demo-badge")
-                .h(20.0)
-                .px(8.0)
-                .radius(10.0)
-                .center_y()
-                .fill(p.gold.alpha(0.12))
-                .label("Demo data, read-only")
-                .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
+                    "Pin thread"
+                },
+                "pin",
+                p,
+            )
+            .on_press(|s: &mut State| {
+                s.thread_menu = false;
+                s.toggle_pin();
+            }),
+        );
+    }
+    let busy = thread.status.busy();
+    let mut archive = menu_item(
+        "menu-archive-thread",
+        if thread.archived {
+            "Restore thread"
         } else {
-            status(s.current().status, p)
+            "Archive thread"
+        },
+        "archive",
+        p,
+    );
+    archive = if busy {
+        archive.child(label("Working", SMALL, p.muted))
+    } else {
+        archive.on_press(|s: &mut State| {
+            s.thread_menu = false;
+            s.archive();
         })
-        .child({
-            // Thread actions share one 4 px rhythm; optional ones are left out, not padded.
-            let mut actions = row().center_y().gap(4.0);
-            if !(narrow || s.current().captain_home) {
-                let pinned = s.current().pinned;
-                actions = actions.child(toggle_button(
-                    "pin-thread",
-                    if pinned { "Unpin thread" } else { "Pin thread" },
-                    "pin",
-                    pinned,
-                    p,
-                    |s| s.toggle_pin(),
-                ));
-            }
-            if !s.current().status.busy() {
-                actions = actions.child(icon_button(
-                    "archive-thread",
-                    if s.current().archived {
-                        "Restore thread"
-                    } else {
-                        "Archive thread"
-                    },
-                    "archive",
-                    p,
-                    |s| s.archive(),
-                ));
-            }
-            if !s.show_activity {
-                actions = actions.child(icon_button(
-                    "open-session-panel",
-                    "Show session details",
-                    "panel",
-                    p,
-                    |s| {
-                        s.show_activity = true;
-                        s.activity_full = false;
-                    },
-                ));
-            }
-            actions
-        })
+    };
+    menu.child(archive)
 }
 
 fn tool_kind(name: &str) -> (&'static str, &'static str, &'static str) {
@@ -2867,7 +2894,7 @@ mod tests {
         let (rect, _) = rt.presented("composer").unwrap();
         assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5);
         assert!(rect[2] > 200.0);
-        for key in ["open-session-panel", "archive-thread", "leave-example"] {
+        for key in ["open-session-panel", "thread-actions", "leave-example"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5,
@@ -2921,7 +2948,7 @@ mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let (strip, _) = rt.presented("top-strip").unwrap();
-        for key in ["sidebar-toggle", "archive-thread", "open-session-panel"] {
+        for key in ["sidebar-toggle", "thread-actions", "open-session-panel"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[1] >= strip[1] + strip[3],
@@ -3112,7 +3139,14 @@ mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         rt.state.current_mut().draft.replace_text("Keep this draft");
-        press(&mut rt, "pin-thread");
+        press(&mut rt, "thread-actions");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.thread_menu, "the menu opens");
+        assert!(
+            rt.find("menu-pin-thread").is_some(),
+            "the pin item is shown"
+        );
+        press(&mut rt, "menu-pin-thread");
         assert!(rt.state.current().pinned);
         assert_eq!(rt.state.current().draft.text, "Keep this draft");
         assert!(rt.find("thread-1").is_some());

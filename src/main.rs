@@ -143,6 +143,11 @@ fn main() {
                 state.populate_demo();
                 state.open_captain(0);
             }),
+            ("thread-menu", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.thread_menu = true;
+            }),
             ("projects", |state| {
                 state.populate_demo();
                 state.open_project_menu();
