@@ -6,6 +6,27 @@ use std::{
     process::Command,
 };
 
+/// Windows identifies the installed app by this ID, not by its path, so pins survive moves.
+pub const APP_ID: &str = "KldsSeeGhosts.Shina";
+const SET_APP_ID: &str = include_str!("../assets/windows/set-app-id.ps1");
+
+/// Gives this process the installed app's ID, so its taskbar button matches the Start
+/// shortcut and anything pinned from the running window points at the installed copy.
+pub fn adopt_app_id() {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SetCurrentProcessExplicitAppUserModelID(id: *const u16) -> i32;
+        }
+        let id: Vec<u16> = APP_ID.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `id` is a NUL-terminated UTF-16 string that outlives the call.
+        unsafe {
+            SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+        }
+    }
+}
+
 const UNINSTALL_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Shina";
 
 /// `%LOCALAPPDATA%\Programs\Shina`, where the installed copy lives.
@@ -91,12 +112,9 @@ pub fn place_exe(source: &Path) -> Result<PathBuf, String> {
 
 /// Starts Shina without sharing this process's console or pipes, so a script that ran
 /// `--install` (or the app that relaunched for an update) is never held open by it.
-pub fn launch(exe: &Path, workspace: Option<&Path>) -> Result<(), String> {
-    let mut command = Command::new(exe);
-    if let Some(workspace) = workspace {
-        command.arg("--workspace").arg(workspace);
-    }
-    command
+pub fn launch_with(exe: &Path, args: &[&str]) -> Result<(), String> {
+    Command::new(exe)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -143,6 +161,25 @@ pub fn install() -> Result<PathBuf, String> {
     .map_err(|e| format!("Could not create the Start Menu shortcut: {e}"))?;
     if !status.success() {
         return Err("Could not create the Start Menu shortcut.".into());
+    }
+    let helper = target.with_file_name("set-app-id.ps1");
+    fs::write(&helper, SET_APP_ID)
+        .map_err(|e| format!("Could not write {}: {e}", helper.display()))?;
+    let status = hidden(Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ]))
+    .arg(&helper)
+    .arg("-Shortcut")
+    .arg(&shortcut)
+    .args(["-AppId", APP_ID])
+    .status()
+    .map_err(|e| format!("Could not set the shortcut's app ID: {e}"))?;
+    if !status.success() {
+        return Err("Could not set the shortcut's app ID.".into());
     }
     let exe = target.to_string_lossy().into_owned();
     let dir = target

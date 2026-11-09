@@ -192,13 +192,15 @@ impl Updater {
     }
 
     /// Swaps the downloaded executable into place and starts it. The caller quits afterwards.
-    pub fn install_and_relaunch(&mut self, workspace: &std::path::Path) -> Result<(), String> {
+    pub fn install_and_relaunch(&mut self) -> Result<(), String> {
         let Status::Ready { exe, .. } = &self.status else {
             return Err("No update is ready.".into());
         };
         let installed = crate::install::place_exe(exe)?;
         let _ = std::fs::remove_file(exe);
-        crate::install::launch(&installed, Some(workspace))?;
+        // `--install` refreshes the shortcut, app ID and Apps & Features version for the new
+        // build, then starts it on the last workspace.
+        crate::install::launch_with(&installed, &["--install"])?;
         Ok(())
     }
 }

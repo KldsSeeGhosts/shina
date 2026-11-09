@@ -1286,7 +1286,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                 Some("Stop running threads before restarting to update.".into());
         } else {
             state.checkpoint();
-            match state.updater.install_and_relaunch(&state.workspace) {
+            match state.updater.install_and_relaunch() {
                 Ok(()) => tx.quit(),
                 Err(error) => state.current_mut().error = Some(error),
             }
