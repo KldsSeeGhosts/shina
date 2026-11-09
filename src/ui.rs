@@ -2016,28 +2016,74 @@ fn duration(ms: u64) -> String {
     }
 }
 
-/// Equal anchors are consecutive calls. Sorting also handles parallel calls and late results.
-fn tool_runs(t: &Thread, message: usize) -> Vec<(usize, Vec<usize>)> {
-    let mut tools: Vec<usize> = t
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptPart {
+    Text {
+        message: usize,
+        from: usize,
+        to: usize,
+    },
+    Tools(Vec<usize>),
+    Thought(usize),
+}
+
+/// Content indices preserve thinking/tool order even when neither adds visible message text.
+fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
+    let mut events: Vec<_> = t
         .tools
         .iter()
         .enumerate()
-        .filter(|(_, tool)| tool.anchor.message == message)
-        .map(|(index, _)| index)
+        .filter(|(_, tool)| (start..end).contains(&tool.anchor.message))
+        .map(|(index, tool)| (tool.anchor, tool.block, false, index))
         .collect();
-    tools.sort_by_key(|index| t.tools[*index].anchor);
-    let mut runs: Vec<(usize, Vec<usize>)> = vec![];
-    for index in tools {
-        let offset = t.tools[index].anchor.offset;
-        if let Some((last_offset, indices)) = runs.last_mut()
-            && *last_offset == offset
+    events.extend(
+        t.thoughts
+            .iter()
+            .enumerate()
+            .filter(|(_, thought)| (start..end).contains(&thought.anchor.message))
+            .map(|(index, thought)| (thought.anchor, thought.block, true, index)),
+    );
+    events.sort_by_key(|(anchor, block, _, _)| (*anchor, *block));
+    let mut events = events.into_iter().peekable();
+    let mut parts = vec![];
+    for message in start..end {
+        let text = &t.messages[message].text;
+        let mut from = 0;
+        let mut previous_anchor = None;
+        while events
+            .peek()
+            .is_some_and(|event| event.0.message == message)
         {
-            indices.push(index);
-        } else {
-            runs.push((offset, vec![index]));
+            let (anchor, _, thinking, index) = events.next().unwrap();
+            let to = if anchor.offset >= from && text.is_char_boundary(anchor.offset) {
+                anchor.offset
+            } else {
+                from
+            };
+            if to > from {
+                parts.push(TranscriptPart::Text { message, from, to });
+            }
+            if thinking {
+                parts.push(TranscriptPart::Thought(index));
+            } else if previous_anchor == Some(anchor)
+                && let Some(TranscriptPart::Tools(indices)) = parts.last_mut()
+            {
+                indices.push(index);
+            } else {
+                parts.push(TranscriptPart::Tools(vec![index]));
+            }
+            previous_anchor = Some(anchor);
+            from = to;
+        }
+        if from < text.len() {
+            parts.push(TranscriptPart::Text {
+                message,
+                from,
+                to: text.len(),
+            });
         }
     }
-    runs
+    parts
 }
 
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
@@ -2214,6 +2260,242 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
+fn inline_thought(s: &State, p: Palette, index: usize) -> El {
+    let t = s.current();
+    let thought = &t.thoughts[index];
+    let timing = thought.duration_ms.or_else(|| {
+        (!thought.done)
+            .then(|| {
+                thought
+                    .started
+                    .map(|start| start.elapsed().as_millis() as u64)
+            })
+            .flatten()
+    });
+    let title = match (thought.done, timing) {
+        (true, Some(ms)) => format!("Thought for {}s", ms / 1000),
+        (false, Some(ms)) => format!("Thinking for {}s", ms / 1000),
+        (true, None) => "Thought".into(),
+        (false, None) => "Thinking".into(),
+    };
+    let mut content = col().gap(5.0).child(
+        row()
+            .key(format!("inline-thought-{}-{index}", t.id))
+            .role("button")
+            .label(format!(
+                "{} thinking text",
+                if thought.expanded { "Hide" } else { "Show" }
+            ))
+            .focusable(true)
+            .center_y()
+            .gap(7.0)
+            .min_h(28.0)
+            .px(6.0)
+            .radius(5.0)
+            .hover(p.selected)
+            .on_press(move |s: &mut State| {
+                let thought = &mut s.current_mut().thoughts[index];
+                thought.expanded = !thought.expanded;
+            })
+            .child(icon("dot", p.muted))
+            .child(label(title, SMALL, p.muted).grow(1.0))
+            .child(icon(
+                if thought.expanded { "chevron" } else { "open" },
+                p.muted,
+            )),
+    );
+    if thought.expanded {
+        content = content.child(
+            col()
+                .key(format!("thought-output-{}-{index}", t.id))
+                .role("group")
+                .label("Thinking text")
+                .ml(28.0)
+                .padding(10.0)
+                .radius(6.0)
+                .fill(p.card)
+                .border(0.5, p.line)
+                .max_h(220.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: !thought.done,
+                })
+                .child(
+                    label(
+                        if thought.text.is_empty() {
+                            "Pi did not provide visible thinking text."
+                        } else {
+                            &thought.text
+                        },
+                        SMALL.lh(18.0),
+                        p.muted,
+                    )
+                    .wrap_anywhere()
+                    .selectable(true),
+                ),
+        );
+    }
+    content
+}
+
+fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
+    let t = s.current();
+    match part {
+        TranscriptPart::Tools(indices) => inline_tools(s, p, indices),
+        TranscriptPart::Thought(index) => inline_thought(s, p, *index),
+        TranscriptPart::Text { message, from, to } => {
+            let chunk = &t.messages[*message].text[*from..*to];
+            let streaming = t.status == Status::Running && message + 1 == t.messages.len();
+            let style = MarkdownStyle::neutral(s.dark)
+                .text(p.ink)
+                .muted(p.muted)
+                .body_font(body_style(wide))
+                .inline_code_bg(if s.dark {
+                    Color::WHITE.alpha(0.07)
+                } else {
+                    Color::BLACK.alpha(0.055)
+                })
+                .selection(p.teal_bg)
+                .code_block(p.card, p.line)
+                .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))
+                .code_block_font(
+                    TextStyle::new(12.0, 400.0)
+                        .family(rune::Family::SystemMono)
+                        .lh(18.0),
+                );
+            memo(
+                format!("message-{}-{message}-body-{from}", t.id),
+                (chunk, s.dark, streaming),
+                || {
+                    Markdown::new(chunk)
+                        .streaming(streaming)
+                        .scroll_wide(true)
+                        .render(&style)
+                },
+            )
+        }
+    }
+}
+
+fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
+    let t = s.current();
+    let parts = turn_parts(t, start, end);
+    let last_work = parts
+        .iter()
+        .rposition(|part| !matches!(part, TranscriptPart::Text { .. }));
+    // Initial thinking may precede the preamble on the wire. Keep that thinking in
+    // the work section, and the first text before subsequent work above its heading.
+    let preamble = last_work.and_then(|last| {
+        parts[..last]
+            .iter()
+            .position(|part| matches!(part, TranscriptPart::Text { .. }))
+    });
+    let live = end == t.messages.len() && t.status.busy();
+    let work = t.work.iter().find(|work| work.start == start);
+    let expanded = work.is_none_or(|work| work.expanded);
+    let mut response = col()
+        .key(format!("assistant-turn-{}-{start}", t.id))
+        .gap(16.0);
+    let mut heading = row().center_y().gap(7.0);
+    if let Some(captain) = t.captain {
+        heading = heading.child(avatar(s, p, captain, 20.0, t.status));
+    }
+    response = response.child(
+        heading.child(label(
+            t.captain
+                .map(|id| format!("Captain {}", s.captains[id].name))
+                .unwrap_or("Pi".into()),
+            TextStyle::new(13.0, 600.0),
+            p.ink,
+        )),
+    );
+    if let Some(index) = preamble {
+        response = response.child(transcript_part(s, p, wide, &parts[index]));
+    } else if live && last_work.is_none() {
+        // Until Pi emits work, streamed text is the preamble. Keep the live
+        // heading after it so the first tool does not move that text.
+        for part in &parts {
+            response = response.child(transcript_part(s, p, wide, part));
+        }
+    }
+    if last_work.is_some() || live {
+        let seconds = if live {
+            t.started.map(|start| start.elapsed().as_secs())
+        } else {
+            work.and_then(|work| work.elapsed)
+        };
+        let title = match (live, seconds) {
+            (true, Some(seconds)) => format!("Working for {seconds}s"),
+            (true, None) => "Working".into(),
+            (false, Some(seconds)) => format!("Worked for {seconds}s"),
+            (false, None) => "Worked".into(),
+        };
+        let mut section = col()
+            .key(format!("work-section-{}-{start}", t.id))
+            .gap(8.0)
+            .child(
+                row()
+                    .key(format!("toggle-work-{}-{start}", t.id))
+                    .role("button")
+                    .label(format!(
+                        "{} work section. {title}",
+                        if expanded { "Collapse" } else { "Expand" }
+                    ))
+                    .focusable(true)
+                    .center_y()
+                    .gap(10.0)
+                    .min_h(28.0)
+                    .radius(5.0)
+                    .hover(p.selected)
+                    .on_press(move |s: &mut State| {
+                        if let Some(work) = s
+                            .current_mut()
+                            .work
+                            .iter_mut()
+                            .find(|work| work.start == start)
+                        {
+                            work.expanded = !work.expanded;
+                        }
+                    })
+                    .child(el().h(0.5).grow(1.0).fill(p.line))
+                    .child(label(title, TextStyle::new(11.0, 420.0), p.muted))
+                    .child(icon(if expanded { "chevron" } else { "open" }, p.muted))
+                    .child(el().h(0.5).grow(1.0).fill(p.line)),
+            );
+        if expanded {
+            let mut rows = col().key(format!("work-rows-{}-{start}", t.id)).gap(4.0);
+            if let Some(last) = last_work {
+                for (index, part) in parts[..=last].iter().enumerate() {
+                    if Some(index) != preamble {
+                        rows = rows.child(transcript_part(s, p, wide, part));
+                    }
+                }
+            }
+            if live {
+                rows = rows.child(
+                    label(
+                        if t.phase.is_empty() {
+                            "Waiting for the model"
+                        } else {
+                            &t.phase
+                        },
+                        SMALL,
+                        p.muted,
+                    )
+                    .px(6.0),
+                );
+            }
+            section = section.child(rows);
+        }
+        response = response.child(section);
+    }
+    if !live || last_work.is_some() {
+        for part in &parts[last_work.map_or(0, |index| index + 1)..] {
+            response = response.child(transcript_part(s, p, wide, part));
+        }
+    }
+    response
+}
+
 fn conversation(s: &State, p: Palette, wide: bool) -> El {
     let t = s.current();
     let mut messages = col()
@@ -2223,7 +2505,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         .pt(20.0)
         .pb(24.0)
         .gap(18.0);
-    if t.messages.is_empty() && t.tools.is_empty() {
+    if t.messages.is_empty() && t.tools.is_empty() && !t.status.busy() {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
@@ -2343,17 +2625,28 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                 .disabled(s.demo)),
         );
     } else {
-        let start = t.messages.len().saturating_sub(100);
+        let cutoff = t.messages.len().saturating_sub(100);
+        // Do not cut through an assistant turn and hide the tools that led to its answer.
+        let start = t.messages[..cutoff]
+            .iter()
+            .rposition(|message| message.role != "Pi")
+            .unwrap_or(0);
         if start > 0 {
-            messages = messages.child(label("Showing the latest 100 messages.", SMALL, p.muted));
+            messages = messages.child(label("Showing recent turns.", SMALL, p.muted));
         }
-        for (index, message) in t.messages.iter().enumerate().skip(start) {
-            let key = format!("message-{}-{index}", t.id);
-            if message.role != "Pi" {
-                for (_, indices) in tool_runs(t, index) {
-                    messages = messages.child(inline_tools(s, p, &indices));
-                }
+        let mut index = start;
+        while index < t.messages.len() {
+            let message = &t.messages[index];
+            if message.role == "Pi" {
+                let end = t.messages[index..]
+                    .iter()
+                    .position(|message| message.role != "Pi")
+                    .map_or(t.messages.len(), |offset| index + offset);
+                messages = messages.child(assistant_turn(s, p, wide, index, end));
+                index = end;
+                continue;
             }
+            let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
                 row().justify_end().child(
                     label(&message.text, body_style(wide), p.ink)
@@ -2367,7 +2660,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                         .radius(10.0)
                         .fill(if s.dark { p.card } else { color("#ededf0") }),
                 )
-            } else if message.role == "Shina" {
+            } else {
                 col()
                     .gap(4.0)
                     .px(12.0)
@@ -2380,105 +2673,17 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                             .wrap_anywhere()
                             .selectable(true),
                     )
-            } else {
-                let style = MarkdownStyle::neutral(s.dark)
-                    .text(p.ink)
-                    .muted(p.muted)
-                    .body_font(body_style(wide))
-                    .inline_code_bg(if s.dark {
-                        Color::WHITE.alpha(0.07)
-                    } else {
-                        Color::BLACK.alpha(0.055)
-                    })
-                    .selection(p.teal_bg)
-                    .code_block(p.card, p.line)
-                    .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))
-                    .code_block_font(
-                        TextStyle::new(12.0, 400.0)
-                            .family(rune::Family::SystemMono)
-                            .lh(18.0),
-                    );
-                let streaming = t.status == Status::Running && index + 1 == t.messages.len();
-                let mut response = col().gap(10.0);
-                if index == 0 || t.messages[index - 1].role != "Pi" {
-                    let mut heading = row().center_y().gap(7.0);
-                    if let Some(captain) = t.captain {
-                        heading = heading.child(avatar(s, p, captain, 20.0, t.status));
-                    }
-                    heading = heading.child(label(
-                        t.captain
-                            .map(|id| format!("Captain {}", s.captains[id].name))
-                            .unwrap_or("Pi".into()),
-                        TextStyle::new(13.0, 600.0),
-                        p.ink,
-                    ));
-                    response = response.child(heading);
-                }
-                let mut offset = 0;
-                for (end, indices) in tool_runs(t, index) {
-                    // Recorded offsets come from complete UTF-8 text blocks. Ignore invalid
-                    // offsets defensively instead of slicing through a character.
-                    let end = if message.text.is_char_boundary(end) {
-                        end
-                    } else {
-                        offset
-                    };
-                    if end > offset {
-                        let chunk = &message.text[offset..end];
-                        response = response.child(memo(
-                            format!("{key}-body-{offset}"),
-                            (chunk, s.dark, false),
-                            || Markdown::new(chunk).scroll_wide(true).render(&style),
-                        ));
-                    }
-                    response = response.child(inline_tools(s, p, &indices));
-                    offset = end;
-                }
-                if offset < message.text.len() {
-                    let chunk = &message.text[offset..];
-                    response = response.child(memo(
-                        format!("{key}-body-{offset}"),
-                        (chunk, s.dark, streaming),
-                        || {
-                            Markdown::new(chunk)
-                                .streaming(streaming)
-                                .scroll_wide(true)
-                                .render(&style)
-                        },
-                    ));
-                }
-                response
             };
             messages = messages.child(body.key(key));
+            index += 1;
         }
-        for (_, indices) in tool_runs(t, t.messages.len()) {
-            messages = messages.child(inline_tools(s, p, &indices));
-        }
-        if let Some(seconds) = t.elapsed
-            && t.status == Status::Settled
-        {
-            messages = messages.child(
-                row()
-                    .center_y()
-                    .gap(10.0)
-                    .child(el().h(0.5).grow(1.0).fill(p.line))
-                    .child(label(
-                        format!("Worked for {seconds}s"),
-                        TextStyle::new(11.0, 420.0),
-                        p.muted,
-                    ))
-                    .child(el().h(0.5).grow(1.0).fill(p.line)),
-            );
-        }
-        if t.status == Status::Running {
-            messages = messages.child(label(
-                if t.phase.is_empty() {
-                    "Pi is working"
-                } else {
-                    &t.phase
-                },
-                SMALL,
-                p.muted,
+        if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
+            messages = messages.child(assistant_turn(
+                s,
+                p,
+                wide,
+                t.messages.len(),
+                t.messages.len(),
             ));
         }
     }
@@ -2852,7 +3057,7 @@ fn dialog(s: &State, p: Palette) -> El {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rune::{Env, Runtime};
     fn runtime(width: f32) -> Runtime<State> {
@@ -2868,6 +3073,61 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
+    }
+
+    /// Exercise the actual renderer with the messages from an opt-in live Pi run.
+    pub(crate) fn verify_tool_rows(thread: Thread) -> Thread {
+        let mut rt = runtime(1280.0);
+        rt.state.threads[0] = thread;
+        rt.state.demo = true;
+        rt.frame(0.0);
+        let id = rt.state.current().id;
+        for work in &mut rt.state.current_mut().work {
+            assert!(
+                work.expanded,
+                "settled work rows must be discoverable by default"
+            );
+        }
+        // Each batch summary must exist before its constituent rows are requested.
+        let t = rt.state.current();
+        for work in &t.work {
+            let end = t.messages[work.start..]
+                .iter()
+                .position(|message| message.role != "Pi")
+                .map_or(t.messages.len(), |offset| work.start + offset);
+            for part in turn_parts(t, work.start, end) {
+                if let TranscriptPart::Tools(indices) = part {
+                    let key = if indices.len() > 1 {
+                        format!("toggle-tool-group-{id}-{}", indices[0])
+                    } else {
+                        format!("inline-tool-{id}-{}", indices[0])
+                    };
+                    assert!(
+                        rt.presented(&key).is_some(),
+                        "missing visible activity {key}"
+                    );
+                }
+            }
+        }
+        for tool in &mut rt.state.current_mut().tools {
+            tool.group_expanded = true;
+        }
+        rt.invalidate();
+        rt.frame(1.0);
+        for index in 0..rt.state.current().tools.len() {
+            let (rect, _) = rt.presented(&format!("inline-tool-{id}-{index}")).unwrap();
+            assert!(
+                rect[2] > 100.0 && rect[3] >= 28.0,
+                "tool row has no usable layout"
+            );
+        }
+        for index in 0..rt.state.current().thoughts.len() {
+            assert!(
+                rt.presented(&format!("inline-thought-{id}-{index}"))
+                    .is_some()
+            );
+        }
+        std::mem::replace(&mut rt.state.threads[0], Thread::new(1))
     }
     #[test]
     fn new_thread_and_suggestion_are_native_interactions() {
@@ -2990,8 +3250,12 @@ mod tests {
         let mut s = State::new(".".into(), false);
         s.populate_demo();
         let t = s.current();
-        assert_eq!(tool_runs(t, 2), vec![(0, vec![0, 1])]);
-        assert_eq!(tool_runs(t, 3), vec![(0, vec![2, 3])]);
+        assert!(
+            matches!(&turn_parts(t, 2, 3)[0], TranscriptPart::Tools(indices) if *indices == vec![0, 1])
+        );
+        assert!(
+            matches!(&turn_parts(t, 3, 4)[0], TranscriptPart::Tools(indices) if *indices == vec![2, 3])
+        );
         assert_eq!(
             tool_summary(&t.tools[..2].iter().collect::<Vec<_>>()),
             "Read 2 files"
@@ -3001,6 +3265,34 @@ mod tests {
             "Edited 1 file, ran 1 command"
         );
         assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
+    }
+
+    #[test]
+    fn thinking_between_tools_at_the_same_offset_separates_the_groups() {
+        let mut thread = Thread::new(1);
+        thread.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,
+                "data":{"messages":[{"role":"assistant","content":[
+                    {"type":"toolCall","id":"a","name":"read","arguments":{}},
+                    {"type":"thinking","thinking":"Then check the second file."},
+                    {"type":"toolCall","id":"b","name":"read","arguments":{}},
+                    {"type":"text","text":"Done"}
+                ]}]}
+            }),
+        );
+        assert_eq!(
+            turn_parts(&thread, 0, 1),
+            vec![
+                TranscriptPart::Tools(vec![0]),
+                TranscriptPart::Thought(0),
+                TranscriptPart::Tools(vec![1]),
+                TranscriptPart::Text {
+                    message: 0,
+                    from: 0,
+                    to: 4
+                },
+            ]
+        );
     }
     #[test]
     fn tool_only_activity_remains_visible_before_a_shina_notice() {
@@ -3015,6 +3307,100 @@ mod tests {
         });
         rt.frame(0.0);
         assert!(rt.presented("inline-tool-1-0").is_some());
+    }
+
+    #[test]
+    fn settled_work_heads_activity_and_leaves_the_answer_visible_when_collapsed() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
+        assert!(y(&rt, "message-1-1-body-0") < y(&rt, "toggle-work-1-1"));
+        assert!(y(&rt, "toggle-work-1-1") < y(&rt, "toggle-tool-group-1-0"));
+        assert!(y(&rt, "toggle-tool-group-1-0") < y(&rt, "inline-thought-1-0"));
+        assert!(y(&rt, "inline-thought-1-0") < y(&rt, "message-1-3-body-0"));
+        press(&mut rt, "inline-thought-1-0");
+        assert!(rt.presented("thought-output-1-0").is_some());
+        press(&mut rt, "toggle-work-1-1");
+        rt.frame(2.0);
+        assert!(!rt.state.current().work[0].expanded);
+        assert!(rt.presented("work-rows-1-1").is_none());
+        assert!(rt.presented("message-1-3-body-0").is_some());
+        press(&mut rt, "toggle-work-1-1");
+        rt.frame(4.0);
+        assert!(rt.state.current().thoughts[0].expanded);
+        assert!(rt.presented("thought-output-1-0").is_some());
+    }
+
+    #[test]
+    fn plain_answers_have_no_trailing_work_divider() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().apply(json!({"type":"agent_start"}));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"message_end","message":{
+                "role":"assistant","content":[{"type":"text","text":"Hello."}]
+            }}));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"agent_settled"}));
+        rt.frame(0.0);
+        assert!(rt.presented("message-1-0-body-0").is_some());
+        assert!(rt.presented("work-section-1-0").is_none());
+    }
+
+    #[test]
+    fn streamed_preamble_stays_above_the_heading_when_the_first_tool_arrives() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().apply(json!({"type":"agent_start"}));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"message_update","assistantMessageEvent":{
+                "type":"text_delta","contentIndex":0,"delta":"I'll check the file."
+            }}));
+        rt.frame(0.0);
+        let header_y = rt.presented("toggle-work-1-0").unwrap().0[1];
+        assert!(rt.presented("message-1-0-body-0").unwrap().0[1] < header_y);
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"message_end","message":{
+                "role":"assistant","content":[
+                    {"type":"text","text":"I'll check the file."},
+                    {"type":"toolCall","id":"read","name":"read","arguments":{"path":"file.txt"}}
+                ]
+            }}));
+        rt.invalidate();
+        rt.frame(1.0);
+        rt.frame(2.0);
+        assert_eq!(rt.presented("toggle-work-1-0").unwrap().0[1], header_y);
+        assert!(rt.presented("inline-tool-1-0").is_some());
+    }
+
+    #[test]
+    fn a_running_turn_keeps_the_same_work_header_after_settlement() {
+        let mut rt = runtime(620.0);
+        rt.state.current_mut().apply(json!({"type":"agent_start"}));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"message_update","assistantMessageEvent":{
+                "type":"thinking_start","contentIndex":0
+            }}));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"message_update","assistantMessageEvent":{
+                "type":"thinking_delta","contentIndex":0,"delta":"Checking the file."
+            }}));
+        rt.frame(0.0);
+        let (header, _) = rt.presented("toggle-work-1-0").unwrap();
+        let (thought, _) = rt.presented("inline-thought-1-0").unwrap();
+        assert!(header[1] < thought[1]);
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"agent_settled"}));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert_eq!(rt.presented("toggle-work-1-0").unwrap().0[1], header[1]);
+        assert!(rt.state.current().work[0].expanded);
     }
     #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {
