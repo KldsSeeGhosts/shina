@@ -20,8 +20,12 @@ if ((git rev-parse HEAD) -ne (git rev-parse origin/main)) { throw 'Pull or push 
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
 $tag = "v$version"
-gh release view $tag --repo KldsSeeGhosts/shina *> $null
-if ($LASTEXITCODE -eq 0) { throw "$tag is already released. Bump the version in Cargo.toml first." }
+# "release not found" on stderr is the expected answer; don't let it stop the script.
+$ErrorActionPreference = 'Continue'
+gh release view $tag --repo KldsSeeGhosts/shina 2>&1 | Out-Null
+$released = $LASTEXITCODE -eq 0
+$ErrorActionPreference = 'Stop'
+if ($released) { throw "$tag is already released. Bump the version in Cargo.toml first." }
 
 cargo build --release --target-dir target/publish
 if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
