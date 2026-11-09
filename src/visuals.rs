@@ -41,8 +41,8 @@ pub enum Face {
 }
 
 impl Face {
-    pub const COUNT: usize = 6;
-    pub fn index(self) -> usize {
+    pub const COUNT: usize = Self::Sad.index() + 1;
+    pub const fn index(self) -> usize {
         match self {
             Self::Normal => 0,
             Self::Happy => 1,
