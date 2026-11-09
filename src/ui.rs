@@ -2330,10 +2330,12 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         }
         for (index, message) in t.messages.iter().enumerate().skip(start) {
             let key = format!("message-{}-{index}", t.id);
-            let body = if message.role == "You" {
+            if message.role != "Pi" {
                 for (_, indices) in tool_runs(t, index) {
                     messages = messages.child(inline_tools(s, p, &indices));
                 }
+            }
+            let body = if message.role == "You" {
                 row().justify_end().child(
                     label(&message.text, body_style(wide), p.ink)
                         .key(format!("{key}-text"))
@@ -2986,6 +2988,20 @@ mod tests {
             "Edited 1 file, ran 1 command"
         );
         assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
+    }
+    #[test]
+    fn tool_only_activity_remains_visible_before_a_shina_notice() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().apply(json!({
+            "type":"tool_execution_start","toolCallId":"read","toolName":"read",
+            "args":{"path":"README.md"}
+        }));
+        rt.state.current_mut().messages.push(crate::model::Message {
+            role: "Shina",
+            text: "A delegated task finished.".into(),
+        });
+        rt.frame(0.0);
+        assert!(rt.presented("inline-tool-1-0").is_some());
     }
     #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {

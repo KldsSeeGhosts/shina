@@ -501,7 +501,7 @@ impl Thread {
     }
 
     /// Reuse Pi's content-block order for both restored history and completed live messages.
-    /// Keep Thread.tools flat for existing consumers; only its transcript anchor is new.
+    /// Keep Thread.tools flat for existing consumers and record its transcript positions.
     fn anchor_content_tools(&mut self, content: &Value, message: usize, restored: bool) {
         let Some(blocks) = content.as_array() else {
             return;
@@ -518,9 +518,11 @@ impl Thread {
                 let anchor = ToolAnchor { message, offset };
                 let id = string(block, "id");
                 if !restored
-                    && let Some(tool) = self.tools.iter_mut().rev().find(|tool| {
-                        tool.id == id && tool.anchor.message == message
-                    })
+                    && let Some(tool) = self
+                        .tools
+                        .iter_mut()
+                        .rev()
+                        .find(|tool| tool.id == id && tool.anchor.message == message)
                 {
                     tool.anchor = anchor;
                 } else {
