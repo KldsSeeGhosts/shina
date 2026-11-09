@@ -46,10 +46,10 @@ fn palette(dark: bool) -> Palette {
         }
     } else {
         Palette {
-            bg: rune::color::oklch(0.962, 0.0025, 290.0),
+            bg: color("#ededf0"),
             panel: rune::color::oklch(0.985, 0.0015, 290.0),
             card: Color::WHITE,
-            line: Color::BLACK.alpha(0.08),
+            line: Color::BLACK.alpha(0.10),
             ink: color("#202022"),
             muted: color("#6a6a70"),
             selected: Color::BLACK.alpha(0.055),
@@ -65,6 +65,19 @@ fn palette(dark: bool) -> Palette {
     }
 }
 const BODY: TextStyle = TextStyle::new(13.0, 400.0).lh(19.5).tracking(-0.13);
+/// Wide windows (1600 px and up) get a longer measure and larger body text.
+const WIDE_WINDOW: f32 = 1600.0;
+fn body_style(dark: bool, wide: bool) -> TextStyle {
+    let weight = if dark { 380.0 } else { 400.0 };
+    if wide {
+        TextStyle::new(14.0, weight).lh(21.0).tracking(-0.14)
+    } else {
+        TextStyle::new(13.0, weight).lh(19.5).tracking(-0.13)
+    }
+}
+fn measure(wide: bool) -> f32 {
+    if wide { 832.0 } else { 768.0 }
+}
 const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
 const SMALL: TextStyle = TextStyle::new(11.5, 420.0);
 
@@ -187,6 +200,10 @@ fn icon(kind: &str, ink: Color) -> El {
         ALERT,
         r#"<circle cx="8" cy="8" r="5.75" stroke="currentColor" fill="none"/><path d="M8 5v3.5" stroke="currentColor" stroke-linecap="round"/><circle cx="8" cy="11" r=".8" fill="currentColor"/>"#
     );
+    glyph!(
+        PULSE,
+        r#"<path d="M1.5 8.5h3l1.75-4 3.5 8 1.75-4h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
         "sidebar" => &SIDEBAR,
@@ -215,7 +232,7 @@ fn icon(kind: &str, ink: Color) -> El {
         "chevron" => &rune_kit::glyphs::CHEVRON_DOWN,
         "lock" => &rune_kit::glyphs::LOCK,
         "close" => &rune_kit::glyphs::CLOSE,
-        "activity" => &PANEL,
+        "activity" => &PULSE,
         _ => &rune_kit::glyphs::CHECK_SMALL,
     };
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
@@ -347,6 +364,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let compact = cx
         .layout_with("workspace-root", |r| r[2] < 760.0)
         .unwrap_or(false);
+    let wide = cx
+        .layout_with("workspace-root", |r| r[2] >= WIDE_WINDOW)
+        .unwrap_or(false);
     let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
     let chrome = cx.chrome_insets();
     // One strip at the titlebar's height holds the sidebar header, tabs, actions, and the
@@ -388,11 +408,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let main = if s.current().messages.is_empty() {
             main.items_center()
                 .child(spacer())
-                .child(conversation(s, p))
-                .child(composer(s, p, narrow))
+                .child(conversation(s, p, wide))
+                .child(composer(s, p, narrow, wide))
                 .child(spacer())
         } else {
-            main.child(conversation(s, p)).child(composer(s, p, narrow))
+            main.child(conversation(s, p, wide))
+                .child(composer(s, p, narrow, wide))
         };
         body = body.child(main);
         if s.show_activity {
@@ -568,16 +589,20 @@ fn sidebar_header(s: &State, p: Palette) -> El {
         .h(36.0)
         .window_drag()
         .center_y()
-        .px(6.0)
+        .px(8.0)
         .child(
-            el().size(24.0, 24.0).radius(6.0).clip_rounded(6.0).pixels(
-                if s.dark {
-                    &s.artwork.mark_dark
-                } else {
-                    &s.artwork.mark
-                }
-                .pixels(),
-            ),
+            el().size(24.0, 24.0)
+                .radius(6.0)
+                .clip_rounded(6.0)
+                .border(0.5, p.line)
+                .pixels(
+                    if s.dark {
+                        &s.artwork.mark_dark
+                    } else {
+                        &s.artwork.mark
+                    }
+                    .pixels(),
+                ),
         )
         .child(spacer())
         .child(icon_button(
@@ -688,7 +713,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 ))
                 .focusable(true)
                 .h(32.0)
-                .px(7.0)
+                .px(8.0)
                 .gap(8.0)
                 .center_y()
                 .radius(6.0)
@@ -717,7 +742,8 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 ));
             }
             if state == Status::Settled {
-                captain_row = captain_row.child(icon("check", p.teal));
+                captain_row =
+                    captain_row.child(el().size(24.0, 24.0).center().child(icon("check", p.teal)));
             }
             content = content.child(captain_row);
             if selected {
@@ -772,7 +798,11 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .px(8.0)
                 .child(label("Pinned", TextStyle::new(11.5, 520.0), p.muted))
                 .child(spacer())
-                .child(label(pinned.len().to_string(), SMALL, p.muted.alpha(0.7)).pr(6.0)),
+                .child(el().w(24.0).center().child(label(
+                    pinned.len().to_string(),
+                    SMALL,
+                    p.muted.alpha(0.7),
+                ))),
         );
         for index in pinned {
             content = content.child(thread_row(s, index, p, false));
@@ -831,7 +861,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     side = side.child(rule(p)).child(
         row()
             .h(48.0)
-            .px(6.0)
+            .px(8.0)
             .gap(8.0)
             .center_y()
             .child(
@@ -979,7 +1009,9 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
     }
     if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
         // A backing disc in the surface color keeps the mark readable over the artwork.
-        let (backing, mark) = if size >= 30.0 {
+        let (backing, mark) = if size <= 16.0 {
+            (8.0, 5.0)
+        } else if size >= 30.0 {
             (13.0, 9.0)
         } else {
             (10.0, 7.0)
@@ -1369,11 +1401,11 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     row()
         .h(36.0)
         .window_drag()
-        .px(6.0)
         .center_y()
         .gap(6.0)
         .child(if docked {
-            el()
+            // Cancel the row gap so the tab starts exactly at the pane's left edge.
+            el().ml(-6.0)
         } else {
             icon_button("toggle-sidebar", "Toggle sidebar", "sidebar", p, move |s| {
                 if compact {
@@ -1456,13 +1488,14 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 |s| s.archive(),
             )
         })
+        .child(el().w(1.0).h(16.0).ml(6.0).fill(p.line))
 }
 
-fn conversation(s: &State, p: Palette) -> El {
+fn conversation(s: &State, p: Palette, wide: bool) -> El {
     let t = s.current();
     let mut messages = col()
         .w_full()
-        .max_w(768.0)
+        .max_w(measure(wide))
         .px(16.0)
         .pt(20.0)
         .pb(24.0)
@@ -1471,7 +1504,7 @@ fn conversation(s: &State, p: Palette) -> El {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
-            .max_w(768.0)
+            .max_w(measure(wide))
             .px(16.0)
             .pb(12.0)
             .gap(16.0);
@@ -1493,40 +1526,39 @@ fn conversation(s: &State, p: Palette) -> El {
                                         TextStyle::new(16.0, 560.0),
                                         p.ink,
                                     ))
-                                    .child(status(shown_status(s), p)),
+                                    .child({
+                                        let working = s
+                                            .threads
+                                            .iter()
+                                            .filter(|thread| {
+                                                thread.captain == Some(captain)
+                                                    && !thread.captain_home
+                                                    && !thread.archived
+                                                    && thread.status.busy()
+                                            })
+                                            .count();
+                                        if working == 0 {
+                                            status(shown_status(s), p)
+                                        } else {
+                                            row()
+                                                .center_y()
+                                                .gap(6.0)
+                                                .child(status_mark(Status::Running, p, 6.0))
+                                                .child(label(
+                                                    format!(
+                                                        "{working} {} working",
+                                                        if working == 1 {
+                                                            "thread"
+                                                        } else {
+                                                            "threads"
+                                                        }
+                                                    ),
+                                                    SMALL,
+                                                    status_ink(Status::Running, p),
+                                                ))
+                                        }
+                                    }),
                             )
-                            .child({
-                                let working = s
-                                    .threads
-                                    .iter()
-                                    .filter(|thread| {
-                                        thread.captain == Some(captain)
-                                            && !thread.captain_home
-                                            && !thread.archived
-                                            && thread.status.busy()
-                                    })
-                                    .count();
-                                if working == 0 {
-                                    el()
-                                } else {
-                                    row()
-                                        .gap(6.0)
-                                        .center_y()
-                                        .child(el().size(5.0, 5.0).radius(2.5).fill(p.teal))
-                                        .child(label(
-                                            format!(
-                                                "{working} {} working",
-                                                if working == 1 {
-                                                    "thread is"
-                                                } else {
-                                                    "threads are"
-                                                }
-                                            ),
-                                            SMALL,
-                                            p.teal,
-                                        ))
-                                }
-                            })
                             .child(label(
                                 format!(
                                     "{} · {}",
@@ -1611,11 +1643,7 @@ fn conversation(s: &State, p: Palette) -> El {
                 let style = MarkdownStyle::neutral(s.dark)
                     .text(p.ink)
                     .muted(p.muted)
-                    .body_font(if s.dark {
-                        TextStyle::new(13.0, 380.0).lh(19.5).tracking(-0.13)
-                    } else {
-                        BODY
-                    })
+                    .body_font(body_style(s.dark, wide))
                     .inline_code_bg(if s.dark {
                         Color::WHITE.alpha(0.07)
                     } else {
@@ -1732,11 +1760,11 @@ fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 
         .child(icon("chevron", p.muted))
 }
 
-fn composer(s: &State, p: Palette, narrow: bool) -> El {
+fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let t = s.current();
     let mut area = col()
         .w_full()
-        .max_w(768.0)
+        .max_w(measure(wide))
         .px(if narrow { 12.0 } else { 16.0 })
         .pb(12.0)
         .gap(6.0);
@@ -1786,6 +1814,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
     } else {
         send
     };
+    let locked = s.demo || t.archived || t.status.busy() || t.configuring;
     let identity = if let Some(captain) = t.captain {
         avatar(s, p, captain, 16.0, shown_status(s))
     } else {
@@ -1809,7 +1838,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
             .pb(10.0)
             .gap(10.0)
             .child(
-                text_input(&t.draft, BODY)
+                text_input(&t.draft, body_style(s.dark, wide))
                     .key("composer-input")
                     .label("Message Pi")
                     .placeholder(
@@ -1836,15 +1865,6 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                 row()
                     .center_y()
                     .gap(5.0)
-                    .child(
-                        el().size(20.0, 24.0)
-                            .center()
-                            .child(icon("plus", p.muted))
-                            .role("button")
-                            .label("Attachments are not implemented")
-                            .opacity(0.4)
-                            .disabled(true),
-                    )
                     .child(identity)
                     .child(
                         dropdown("choose-pi-model", &t.model, p, |s| {
@@ -1853,14 +1873,16 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                             s.connect();
                         })
                         .max_w(if narrow { 112.0 } else { 230.0 })
-                        .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
+                        .opacity(if locked { 0.5 } else { 1.0 })
+                        .disabled(locked),
                     )
                     .child(
                         dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
                             s.settings_picker = Some(SettingsPicker::Thinking);
                             s.connect();
                         })
-                        .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
+                        .opacity(if locked { 0.5 } else { 1.0 })
+                        .disabled(locked),
                     )
                     .child(spacer())
                     .child(if s.demo {
