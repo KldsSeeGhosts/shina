@@ -99,11 +99,12 @@ fn main() {
     if install::is_installed() {
         install::adopt_app_id();
     }
-    // The installed app reopens the last workspace; development builds use the current folder.
-    let mut workspace = install::is_installed()
-        .then(install::last_workspace)
-        .flatten()
-        .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+    // Installed launches restore the whole global index. Development launches also focus cwd.
+    let mut workspace = if install::is_installed() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().expect("current directory")
+    };
     let mut demo = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -122,11 +123,15 @@ fn main() {
             }
         }
     }
-    let workspace = workspace.canonicalize().unwrap_or_else(|error| {
-        eprintln!("Could not open workspace {}: {error}", workspace.display());
-        std::process::exit(2);
-    });
-    if !workspace.is_dir() {
+    let workspace = if workspace.as_os_str().is_empty() {
+        workspace
+    } else {
+        workspace.canonicalize().unwrap_or_else(|error| {
+            eprintln!("Could not open workspace {}: {error}", workspace.display());
+            std::process::exit(2);
+        })
+    };
+    if !workspace.as_os_str().is_empty() && !workspace.is_dir() {
         eprintln!("The workspace must be a directory.");
         std::process::exit(2);
     }
@@ -143,6 +148,14 @@ fn main() {
             ("dark", |state| {
                 state.populate_demo();
                 state.dark = true;
+            }),
+            ("sidebar-narrow", |state| {
+                state.populate_demo();
+                state.compact_sidebar = true;
+            }),
+            ("collapsed", |state| {
+                state.populate_demo();
+                state.sidebar = false;
             }),
             ("work-running", running_demo),
             ("work-running-dark", |state| {

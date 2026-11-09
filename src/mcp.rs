@@ -32,7 +32,7 @@ own role and instructions. Shina shows the user every thread, its status, and it
 Ordinary coding tasks need no Shina tools.
 
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, under the same \
-captain unless you name another. Use it for parallel, self-contained work, and give the new \
+project, machine and project captain. Use it for parallel, self-contained work, and give the new \
 thread a complete brief: it has no access to this conversation. A delegated thread cannot \
 delegate further.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
@@ -43,21 +43,17 @@ A nonzero wait returns when the child finishes or the timeout passes. Do not pol
 - `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
 corrections or follow-up work. Only the parent may control a child.
 - `mcp__shina__list_threads`, `mcp__shina__read_thread`, and `mcp__shina__list_captains` read \
-the user's other conversations and crew. Read a thread before you answer a question about it.";
+the user's conversations and crew. list_threads defaults to this thread's project. Pass \
+all_projects:true to include other projects and project-less chats. Read a thread before you answer a question about it.";
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 
 /// Writes the Pi bridge extension under `%LOCALAPPDATA%\Shina\pi` and returns its path.
 /// The file is rewritten only when this build's copy differs.
 pub fn extension_path() -> Result<std::path::PathBuf, String> {
-    let base = std::env::var_os(if cfg!(windows) {
-        "LOCALAPPDATA"
-    } else {
-        "HOME"
-    })
-    .map(std::path::PathBuf::from)
-    .ok_or("Could not find a folder for Shina's Pi extension.")?;
-    let dir = base.join("Shina").join("pi");
+    let base =
+        crate::store::directory().ok_or("Could not find a folder for Shina's Pi extension.")?;
+    let dir = base.join("pi");
     let path = dir.join("shina-mcp-extension.ts");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(EXTENSION) {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -84,8 +80,7 @@ pub struct Server {
 
 static SERVER: OnceLock<Result<Arc<Server>, String>> = OnceLock::new();
 
-/// The process-wide server, started on first use. Workspaces share it; `reset` clears the
-/// previous workspace's tokens.
+/// The process-wide server, started on first use. All projects share it.
 pub fn server(wake: Waker) -> Result<Arc<Server>, String> {
     let server = SERVER
         .get_or_init(|| start().map_err(|e| format!("Could not start the Shina MCP: {e}")))
@@ -137,6 +132,12 @@ fn start() -> std::io::Result<Arc<Server>> {
 }
 
 impl Server {
+    pub fn revoke(&self, thread: usize) {
+        self.tokens
+            .lock()
+            .expect("mcp tokens")
+            .retain(|_, id| *id != thread);
+    }
     /// The bearer token for a thread, created on first use.
     pub fn token_for(&self, thread: usize) -> String {
         let mut tokens = self.tokens.lock().expect("mcp tokens");
@@ -146,11 +147,6 @@ impl Server {
         let token = random_hex(4);
         tokens.insert(token.clone(), thread);
         token
-    }
-
-    /// Drops every token, for example when another workspace replaces the threads.
-    pub fn reset(&self) {
-        self.tokens.lock().expect("mcp tokens").clear();
     }
 
     pub fn next_request(&self) -> Option<Request> {
@@ -169,9 +165,10 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "list_threads",
-            "description": "List the user's Shina threads with their ids, titles, parents, captains, and status.",
+            "description": "List threads in the caller's project, including project and machine. Use all_projects for every project and project-less chats.",
             "inputSchema": {"type":"object","properties":{
-                "include_archived": {"type":"boolean","description":"Include archived threads. Default false."}
+                "include_archived": {"type":"boolean","description":"Include archived threads. Default false."},
+                "all_projects": {"type":"boolean","description":"Include all projects and project-less threads. Default false."}
             }},
             "annotations": {"readOnlyHint": true}
         },
@@ -186,7 +183,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "list_captains",
-            "description": "List the crew captains in this workspace with their roles and current status.",
+            "description": "List the captain roster with roles and status in the caller's project.",
             "inputSchema": {"type":"object","properties":{}},
             "annotations": {"readOnlyHint": true}
         },
@@ -196,7 +193,7 @@ pub fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
-                "captain": {"type":"string","description":"A captain's name from list_captains. Defaults to this thread's captain."},
+                "captain": {"type":"string","description":"Optional assertion of the project's assigned captain. Children cannot choose a different captain."},
                 "wait_seconds": wait
             },"required":["prompt"]}
         },

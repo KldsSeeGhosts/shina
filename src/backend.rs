@@ -46,12 +46,46 @@ pub struct Pi {
     pub events: Receiver<Event>,
 }
 
+/// Machine dispatch lives here, not in the UI or orchestration reducer. A remote host
+/// can implement the same session transport without changing project/thread ownership.
+pub enum BackendHost {
+    Local,
+}
+
+impl BackendHost {
+    pub fn resolve(machine: &str) -> Result<Self, String> {
+        match machine {
+            "local" => Ok(Self::Local),
+            _ => Err(format!(
+                "Machine {machine} is unavailable. Only local hosts are supported."
+            )),
+        }
+    }
+
+    pub fn start(
+        &self,
+        directory: PathBuf,
+        session: Option<String>,
+        wake: Waker,
+        instructions: Option<String>,
+        link: Option<HostLink>,
+    ) -> Pi {
+        match self {
+            Self::Local => {
+                Pi::start_with_instructions(directory, session, wake, instructions, link)
+            }
+        }
+    }
+}
+
 struct Launch {
     workspace: PathBuf,
     session: Option<String>,
     instructions: Option<String>,
     host: Option<HostLink>,
     ephemeral: bool,
+    #[cfg(test)]
+    session_directory: PathBuf,
 }
 
 impl Pi {
@@ -87,6 +121,10 @@ impl Pi {
     ) -> Self {
         let (commands, input) = mpsc::sync_channel::<Value>(32);
         let (events, output) = mpsc::sync_channel(256);
+        #[cfg(test)]
+        let session_directory = crate::store::directory()
+            .expect("test profile")
+            .join("pi-sessions");
         let worker = thread::spawn(move || {
             let launch = Launch {
                 workspace,
@@ -94,6 +132,8 @@ impl Pi {
                 instructions,
                 host,
                 ephemeral,
+                #[cfg(test)]
+                session_directory,
             };
             if let Err(error) = run(&launch, input, &events, &wake) {
                 publish(&events, &wake, Event::Error(error));
@@ -216,6 +256,11 @@ fn run(
     // Explicit extensions still load with --no-extensions. Load only the user's
     // catalog-backed provider, not unrelated packages, project extensions or MCP.
     command.arg("--extension").arg(cpa_extension()?);
+    #[cfg(test)]
+    {
+        std::fs::create_dir_all(&launch.session_directory).map_err(|e| e.to_string())?;
+        command.arg("--session-dir").arg(&launch.session_directory);
+    }
     // Shina's credentials belong to this thread only; never pass along inherited ones.
     command
         .env_remove(crate::mcp::URL_ENV)

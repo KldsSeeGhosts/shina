@@ -1,7 +1,7 @@
-//! Recent projects and cloning, behind the sidebar's project switcher.
+//! Global project records, legacy recents, and background cloning.
 //!
-//! The list lives in `%LOCALAPPDATA%\Shina\projects.json`. It replaces the single path in
-//! `last-workspace.txt`, which is read once to seed the list. Cloning runs `gh` or `git` on a
+//! Projects persist in Shina's global index. The old `projects.json` and
+//! `last-workspace.txt` are migration inputs only. Cloning runs `gh` or `git` on a
 //! worker thread with no console window and no stdin; it relies on the user's existing
 //! login and never asks for, reads, or stores a credential.
 use crate::model::State;
@@ -20,10 +20,75 @@ use std::{
 };
 
 /// How many projects the list keeps. Older entries fall off the end.
+#[cfg(test)]
 const LIMIT: usize = 20;
 
-#[derive(Clone, Debug, PartialEq)]
+pub type ProjectId = usize;
+
+#[derive(Clone, Debug)]
 pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    pub path: PathBuf,
+    pub machine: String,
+    /// Removing a project hides its picker entry, not its threads or files.
+    pub hidden: bool,
+    pub updated: u64,
+    pub captain: Option<usize>,
+    /// The designated coordinator. Older home flags remain historical metadata.
+    pub captain_thread: Option<usize>,
+}
+
+impl Project {
+    pub fn new(id: ProjectId, path: PathBuf) -> Self {
+        let path = normalize_path(&path);
+        Self {
+            id,
+            name: display_name(&path),
+            path,
+            machine: "local".into(),
+            hidden: false,
+            updated: now(),
+            captain: None,
+            captain_thread: None,
+        }
+    }
+    pub fn to_value(&self) -> Value {
+        json!({
+            "id": self.id, "name": self.name, "path": self.path, "machine": self.machine,
+            "hidden": self.hidden, "updated": self.updated,
+            "captain": self.captain, "captainThread": self.captain_thread,
+        })
+    }
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let id = usize::try_from(value["id"].as_u64()?).ok()?;
+        if id == 0 || id == usize::MAX {
+            return None;
+        }
+        let mut project = Self::new(id, PathBuf::from(value["path"].as_str()?));
+        project.name = value["name"].as_str()?.into();
+        project.machine = value["machine"].as_str()?.into();
+        if project.path.as_os_str().is_empty() || project.machine.is_empty() {
+            return None;
+        }
+        project.hidden = value["hidden"] == true;
+        project.updated = value["updated"].as_u64().unwrap_or(0);
+        project.captain = optional_id(&value["captain"])?;
+        project.captain_thread = optional_id(&value["captainThread"])?;
+        Some(project)
+    }
+}
+
+fn optional_id(value: &Value) -> Option<Option<usize>> {
+    if value.is_null() {
+        Some(None)
+    } else {
+        Some(Some(usize::try_from(value.as_u64()?).ok()?))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecentProject {
     pub path: PathBuf,
     pub name: String,
     /// Seconds since the Unix epoch.
@@ -33,7 +98,8 @@ pub struct Project {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Recents {
     /// Most recently opened first.
-    pub projects: Vec<Project>,
+    #[cfg(test)]
+    pub projects: Vec<RecentProject>,
     /// The parent folder the last successful clone went into.
     pub clone_parent: Option<PathBuf>,
 }
@@ -44,7 +110,36 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn now() -> u64 {
+/// Strip only filesystem verbatim disk/UNC prefixes, not Windows device namespaces.
+pub fn clean_path(path: &Path) -> PathBuf {
+    if let Some(text) = path.to_str() {
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(disk) = text.strip_prefix(r"\\?\")
+            && disk.as_bytes().get(1..3) == Some(b":\\")
+        {
+            return PathBuf::from(disk);
+        }
+    }
+    path.to_path_buf()
+}
+
+pub fn normalize_path(path: &Path) -> PathBuf {
+    clean_path(&path.canonicalize().unwrap_or_else(|_| clean_path(path)))
+}
+
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    let left = normalize_path(left);
+    let right = normalize_path(right);
+    if cfg!(windows) {
+        left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+    } else {
+        left == right
+    }
+}
+
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -53,11 +148,12 @@ fn now() -> u64 {
 
 impl Recents {
     /// Moves `path` to the front, adding it if it is new.
+    #[cfg(test)]
     pub fn touch(&mut self, path: &Path, opened: u64) {
         self.projects.retain(|project| project.path != path);
         self.projects.insert(
             0,
-            Project {
+            RecentProject {
                 path: path.to_path_buf(),
                 name: display_name(path),
                 opened,
@@ -67,19 +163,22 @@ impl Recents {
     }
     /// The projects whose folders still exist. Missing ones stay in the file, so a folder on
     /// an unplugged drive comes back when the drive does.
-    pub fn available(&self) -> Vec<Project> {
+    #[cfg(test)]
+    pub fn available(&self) -> Vec<RecentProject> {
         self.projects
             .iter()
             .filter(|project| project.path.is_dir())
             .cloned()
             .collect()
     }
+    #[cfg(test)]
     pub fn last_existing(&self) -> Option<PathBuf> {
         self.projects
             .iter()
             .map(|project| project.path.clone())
             .find(|path| path.is_dir())
     }
+    #[cfg(test)]
     fn to_value(&self) -> Value {
         json!({
             "version": 1,
@@ -89,6 +188,7 @@ impl Recents {
             })).collect::<Vec<_>>(),
         })
     }
+    #[cfg(test)]
     fn from_value(value: &Value) -> Self {
         let projects = value["projects"]
             .as_array()
@@ -96,7 +196,7 @@ impl Recents {
             .flatten()
             .filter_map(|record| {
                 let path = PathBuf::from(record["path"].as_str()?);
-                Some(Project {
+                Some(RecentProject {
                     name: record["name"]
                         .as_str()
                         .map(str::to_owned)
@@ -114,11 +214,8 @@ impl Recents {
     }
 }
 
-pub fn settings_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Shina"))
-}
-
 /// Reads the list from `dir`, seeding it from `last-workspace.txt` the first time.
+#[cfg(test)]
 pub fn load_from(dir: &Path) -> Recents {
     if let Ok(text) = fs::read_to_string(dir.join("projects.json")) {
         return serde_json::from_str(&text)
@@ -143,38 +240,12 @@ pub fn load_from(dir: &Path) -> Recents {
 }
 
 /// Writes the list through a temporary file, so a crash never leaves half a file.
+#[cfg(test)]
 pub fn save_to(dir: &Path, recents: &Recents) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let staged = dir.join("projects.json.tmp");
     fs::write(&staged, serde_json::to_vec_pretty(&recents.to_value())?)?;
     fs::rename(staged, dir.join("projects.json"))
-}
-
-pub fn load() -> Recents {
-    settings_dir()
-        .map(|dir| load_from(&dir))
-        .unwrap_or_default()
-}
-
-/// Records `path` as just opened and returns the updated list.
-pub fn record(path: &Path) -> Recents {
-    let Some(dir) = settings_dir() else {
-        return Recents::default();
-    };
-    let mut recents = load_from(&dir);
-    recents.touch(path, now());
-    let _ = save_to(&dir, &recents);
-    recents
-}
-
-fn remember_clone_parent(parent: &Path) -> Recents {
-    let Some(dir) = settings_dir() else {
-        return Recents::default();
-    };
-    let mut recents = load_from(&dir);
-    recents.clone_parent = Some(parent.to_path_buf());
-    let _ = save_to(&dir, &recents);
-    recents
 }
 
 /// What the clone field holds.
@@ -467,9 +538,12 @@ impl CloneJob {
 /// The switcher menu and the clone sheet.
 #[derive(Default)]
 pub struct Projects {
+    pub entries: Vec<Project>,
+    pub next_id: ProjectId,
+    pub captain_target: Option<ProjectId>,
     pub recents: Recents,
     /// The projects the open menu lists, checked for existence when it opened.
-    pub menu: Option<Vec<Project>>,
+    pub menu: Option<Vec<RecentProject>>,
     pub clone_open: bool,
     pub clone_source: TextEdit,
     pub clone_parent: PathBuf,
@@ -483,22 +557,9 @@ pub struct Projects {
 impl Projects {
     /// A fixed list for headless renders.
     pub fn demo() -> Self {
-        let recents = Recents {
-            projects: ["native-workspace", "rune", "pi-mono", "ksgcode"]
-                .iter()
-                .enumerate()
-                .map(|(i, name)| Project {
-                    path: PathBuf::from(format!(r"D:\AiStack\{name}")),
-                    name: (*name).into(),
-                    opened: 1_790_000_000 - i as u64 * 86_400,
-                })
-                .collect(),
-            clone_parent: None,
-        };
         Self {
             menu: None,
             clone_parent: PathBuf::from(r"D:\AiStack"),
-            recents,
             ..Default::default()
         }
     }
@@ -509,19 +570,29 @@ impl Projects {
 
 impl State {
     pub fn project_name(&self) -> String {
-        if self.demo {
-            "native-workspace".into()
-        } else {
-            display_name(&self.workspace)
-        }
+        self.project(self.current().project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "No project".into())
     }
     pub fn open_project_menu(&mut self) {
         self.projects.menu_error = None;
-        self.projects.menu = Some(if self.demo {
-            self.projects.recents.projects.clone()
-        } else {
-            self.projects.recents.available()
-        });
+        self.projects.menu = Some(
+            self.projects
+                .entries
+                .iter()
+                .filter(|p| p.hidden)
+                .map(|p| RecentProject {
+                    name: p.name.clone(),
+                    path: p.path.clone(),
+                    opened: p.updated,
+                })
+                .collect(),
+        );
+        self.projects
+            .menu
+            .as_mut()
+            .unwrap()
+            .sort_by_key(|p| std::cmp::Reverse(p.opened));
     }
     pub fn close_project_menu(&mut self) {
         self.projects.menu = None;
@@ -529,16 +600,10 @@ impl State {
     }
     /// Opens a project from the menu, keeping the menu open with the reason if it cannot.
     pub fn open_project(&mut self, path: PathBuf) {
-        if self.demo {
-            self.close_project_menu();
-            return;
-        }
-        if path == self.workspace {
-            self.close_project_menu();
-            return;
-        }
-        if let Err(error) = self.try_switch_workspace(path) {
+        if let Err(error) = self.add_project(path) {
             self.projects.menu_error = Some(error);
+        } else {
+            self.close_project_menu();
         }
     }
     pub fn open_clone_dialog(&mut self) {
@@ -556,8 +621,8 @@ impl State {
             .clone_parent
             .clone()
             .filter(|p| p.is_dir())
-            .or_else(|| self.workspace.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| self.workspace.clone());
+            .or_else(|| self.working_directory().parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.data_dir.clone());
     }
     pub fn close_clone_dialog(&mut self) {
         if let Some(job) = &self.projects.clone_job {
@@ -621,15 +686,18 @@ impl State {
         let job = self.projects.clone_job.take().unwrap();
         match result {
             Ok(()) => {
-                self.projects.recents = remember_clone_parent(&job.parent);
+                self.projects.recents.clone_parent = Some(job.parent.clone());
                 let target = job.target.clone();
-                if let Err(error) = self.try_switch_workspace(target) {
-                    self.projects.recents = record(&job.target);
+                if let Err(error) = self.add_project(target) {
                     self.projects.clone_progress.clear();
                     self.projects.clone_error = Some(format!(
                         "Cloned into {}, but Shina could not open it yet. {error}",
                         job.target.display()
                     ));
+                } else {
+                    self.projects.clone_open = false;
+                    self.projects.clone_source.focused = false;
+                    self.checkpoint();
                 }
             }
             Err(error) => {
@@ -655,12 +723,12 @@ pub fn pick_folder(s: &mut State, tx: &mut Tx) {
     tx.open_folder(
         rune::FileDialogOptions {
             title: "Open a project folder".into(),
-            directory: Some(s.workspace.clone()),
+            directory: Some(s.working_directory()),
             ..Default::default()
         },
         |s: &mut State, result, _| match result {
             Ok(Some(path)) => {
-                if let Err(error) = s.try_switch_workspace(path) {
+                if let Err(error) = s.add_project(path) {
                     s.current_mut().error = Some(error);
                 }
             }
@@ -696,6 +764,22 @@ pub fn pick_clone_parent(s: &mut State, tx: &mut Tx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_paths_drop_verbatim_prefixes_without_changing_devices() {
+        assert_eq!(
+            clean_path(Path::new(r"\\?\D:\AiStack\shina")),
+            PathBuf::from(r"D:\AiStack\shina")
+        );
+        assert_eq!(
+            clean_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            clean_path(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume1")),
+            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1")
+        );
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir =
@@ -906,27 +990,22 @@ mod tests {
     }
 
     #[test]
-    fn switching_names_the_thread_that_blocks_it() {
+    fn adding_a_project_keeps_busy_threads_and_unsent_drafts() {
         let mut state = State::new(".".into(), false);
         state.current_mut().title = "Port the parser".into();
         state.current_mut().status = crate::model::Status::Running;
-        let error = state
-            .try_switch_workspace(std::env::temp_dir())
-            .unwrap_err();
-        assert!(
-            error.contains("\"Port the parser\" is still working"),
-            "{error}"
-        );
-        state.current_mut().status = crate::model::Status::Ready;
         state.current_mut().draft.replace_text("half a thought");
-        let error = state
-            .try_switch_workspace(std::env::temp_dir())
-            .unwrap_err();
-        assert!(
-            error.contains("\"Port the parser\" has an unsent draft"),
-            "{error}"
-        );
-        assert_eq!(state.workspace, PathBuf::from("."));
+        let id = state.add_project(std::env::temp_dir()).unwrap();
+        assert_eq!(state.projects.entries.len(), 2);
+        assert_eq!(state.current().project, Some(id));
+        assert_eq!(state.threads[0].status, crate::model::Status::Running);
+        assert_eq!(state.threads[0].draft.text, "half a thought");
+        state.remove_project(id);
+        assert!(state.project(Some(id)).unwrap().hidden);
+        assert!(std::env::temp_dir().is_dir());
+        assert!(state.threads.iter().any(|t| t.project == Some(id)));
+        assert_eq!(state.add_project(std::env::temp_dir()).unwrap(), id);
+        assert!(!state.project(Some(id)).unwrap().hidden);
     }
 
     /// Clones a small public repository over the network with both tools. Run it on demand:

@@ -58,12 +58,6 @@ fn start_menu_shortcut() -> Option<PathBuf> {
         .map(|base| PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs\Shina.lnk"))
 }
 
-/// The workspace the installed app reopens when launched without `--workspace`: the most
-/// recent project whose folder still exists.
-pub fn last_workspace() -> Option<PathBuf> {
-    crate::projects::load().last_existing()
-}
-
 /// Removes the executable an update or reinstall replaced. It could not be deleted while it
 /// was running, so the next launch cleans it up.
 pub fn remove_replaced_exe() {
