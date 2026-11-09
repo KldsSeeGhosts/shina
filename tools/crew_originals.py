@@ -41,8 +41,10 @@ def shade(rgb, amount):
 
 
 class Canvas:
-    def __init__(self):
+    def __init__(self, marks=True):
         self.g = [["." for _ in range(N)] for _ in range(N)]
+        # Corner marks ("...", "z") only on full busts; small tiles get a UI status badge.
+        self.marks = marks
 
     def put(self, x, y, c):
         if 0 <= x < N and 0 <= y < N and c is not None:
@@ -138,7 +140,7 @@ def expression(cv, face):
         eyes_open(cv)
         brows(cv, [(12, 13), (13, 13), (14, 13), (15, 13)], [(24, 13), (25, 13), (26, 13), (27, 13)])
         cv.span(24, 19, 20, "M")
-        for x in (32, 34, 36):
+        for x in (32, 34, 36) if cv.marks else ():
             cv.put(x, 4, "w")
     elif face == "Surprised":
         for x0 in EYES:
@@ -169,7 +171,8 @@ def expression(cv, face):
             cv.mask(18, x0, "lllll", None)
             cv.mask(19, x0, ".l.l.", None)
         cv.span(24, 19, 20, "m")
-        for x, y in ((32, 2), (33, 2), (34, 2), (35, 2), (34, 3), (33, 4), (32, 5), (33, 5), (34, 5), (35, 5)):
+        z = ((32, 2), (33, 2), (34, 2), (35, 2), (34, 3), (33, 4), (32, 5), (33, 5), (34, 5), (35, 5))
+        for x, y in z if cv.marks else ():
             cv.put(x, y, "w")
 
 
@@ -355,8 +358,8 @@ def finish(cv):
         g[y][x] = "o" + source
 
 
-def render(draw, extra, tile, colors, face):
-    cv = Canvas()
+def render(draw, extra, tile, colors, face, marks=True):
+    cv = Canvas(marks)
     draw(cv)
     expression(cv, face)
     if extra:
@@ -390,7 +393,8 @@ def main():
             full = render(draw, extra, tile, colors, face)
             full.save(out / name / f"{face}.png", optimize=True)
             box = tuple(v * SCALE for v in SMALL_CROP)
-            full.crop(box).save(out / name / f"{face}.small.png", optimize=True)
+            plain = render(draw, extra, tile, colors, face, marks=False)
+            plain.crop(box).save(out / name / f"{face}.small.png", optimize=True)
 
 
 if __name__ == "__main__":

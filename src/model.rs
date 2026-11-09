@@ -984,7 +984,7 @@ impl State {
         thread.messages = vec![
             Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into() },
             Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into() },
-            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before the next attempt, so a reconnect cannot register it twice.\n\nThe example regression test covers a disconnect during initialization and a second reconnect. Both paths keep a single listener.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe thread is settled. There is no queued follow-up work.".into() },
+            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before the next attempt, so a reconnect cannot register it twice.\n\n1. **Order.** `socket.on(\"reconnect\")` runs before `socket.open()`, so the first event cannot be missed.\n2. **Cleanup.** `teardown()` removes the listener before each retry.\n3. **Test.** `reconnect.test.ts` covers a disconnect during initialization and a second reconnect. Both keep one listener.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe thread is settled. There is no queued follow-up work.".into() },
         ];
         thread.tools = vec![
             Tool {

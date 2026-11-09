@@ -18,6 +18,8 @@ struct Palette {
     gold: Color,
     danger: Color,
     on_teal: Color,
+    badge_ring: Color,
+    field_line: Color,
 }
 fn color(hex: &str) -> Color {
     rune::color::hex(hex).expect("palette color")
@@ -37,6 +39,8 @@ fn palette(dark: bool) -> Palette {
             gold: color("#d3ba6b"),
             danger: color("#f0a39c"),
             on_teal: color("#0d1f1e"),
+            badge_ring: color("#191919"),
+            field_line: color("#56565c"),
         }
     } else {
         Palette {
@@ -52,6 +56,8 @@ fn palette(dark: bool) -> Palette {
             gold: color("#8a701f"),
             danger: color("#a33e38"),
             on_teal: Color::WHITE,
+            badge_ring: color("#f4f4f6"),
+            field_line: color("#c4c4ca"),
         }
     }
 }
@@ -166,6 +172,18 @@ fn icon(kind: &str, ink: Color) -> El {
         PENCIL,
         r#"<path d="M10.5 2.5 13.5 5.5 6 13H3v-3z" fill="none" stroke="currentColor" stroke-linejoin="round"/><path d="m9 4 3 3" stroke="currentColor"/>"#
     );
+    glyph!(
+        SUN,
+        r#"<circle cx="8" cy="8" r="2.75" stroke="currentColor" fill="none"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06" stroke="currentColor" stroke-linecap="round"/>"#
+    );
+    glyph!(
+        MOON,
+        r#"<path d="M13 9.5A5.5 5.5 0 0 1 6.5 3a5.5 5.5 0 1 0 6.5 6.5z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        ALERT,
+        r#"<circle cx="8" cy="8" r="5.75" stroke="currentColor" fill="none"/><path d="M8 5v3.5" stroke="currentColor" stroke-linecap="round"/><circle cx="8" cy="11" r=".8" fill="currentColor"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
         "sidebar" => &SIDEBAR,
@@ -179,6 +197,9 @@ fn icon(kind: &str, ink: Color) -> El {
         "bolt" => &BOLT,
         "dot" => &DOT,
         "theme" => &THEME,
+        "sun" => &SUN,
+        "moon" => &MOON,
+        "alert" => &ALERT,
         "pin" => &PIN,
         "more" => &MORE,
         "list" => &LIST,
@@ -543,16 +564,9 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         .child(nav("new-thread", "New thread", "compose", p, false, |s| {
             s.new_thread()
         }))
-        .child(nav(
-            "threads-nav",
-            "Threads",
-            "list",
-            p,
-            !s.show_archive && s.current().captain.is_none(),
-            |s| {
-                s.show_archive = false;
-            },
-        ));
+        .child(nav("threads-nav", "Threads", "list", p, false, |s| {
+            s.show_archive = false;
+        }));
     side = side.child(nav(
         "show-archive",
         if s.show_archive {
@@ -595,8 +609,8 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             section_title("Captains", p)
                 .child(icon_button(
                     "browse-captains",
-                    "Open captains",
-                    "more",
+                    "Browse captains",
+                    "grid",
                     p,
                     |s| s.captain_picker = true,
                 ))
@@ -651,7 +665,8 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 ));
             }
             captain_row = captain_row.child(match state {
-                Status::Running | Status::Waiting => el()
+                Status::Waiting => icon("alert", p.gold),
+                Status::Running => el()
                     .size(6.0, 6.0)
                     .radius(3.0)
                     .mr(4.0)
@@ -662,6 +677,12 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             });
             content = content.child(captain_row);
             if selected {
+                let mut nested = col()
+                    .ml(19.0)
+                    .pl(6.0)
+                    .gap(1.0)
+                    .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
+                let mut any = false;
                 for (index, _) in s.threads.iter().enumerate().filter(|(_, t)| {
                     t.captain == Some(captain)
                         && !t.captain_home
@@ -669,7 +690,11 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                         && !t.archived
                         && t.title.to_lowercase().contains(&search)
                 }) {
-                    content = content.child(thread_row(s, index, p, true));
+                    nested = nested.child(thread_row(s, index, p, true));
+                    any = true;
+                }
+                if any {
+                    content = content.child(nested);
                 }
             }
         }
@@ -816,7 +841,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 } else {
                     "Switch to dark theme"
                 },
-                "theme",
+                if s.dark { "sun" } else { "moon" },
                 p,
                 |s| {
                     s.dark = !s.dark;
@@ -919,6 +944,17 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
     if status == Status::Offline {
         portrait = portrait.opacity(0.62);
     }
+    if size < 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+        let dot = (size * 0.36).clamp(6.0, 8.0);
+        return el().size(size, size).child(portrait).child(
+            el().absolute(size - dot + 1.5, size - dot + 1.5)
+                .size(dot, dot)
+                .radius(dot / 2.0)
+                .fill(status_ink(status, p))
+                .border(1.5, p.badge_ring)
+                .a11y_hidden(),
+        );
+    }
     portrait
 }
 fn captain_status_chip(status: Status, p: Palette) -> El {
@@ -956,7 +992,7 @@ fn counter(count: usize, p: Palette) -> El {
 fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let thread = &s.threads[index];
     let selected = index == s.active;
-    let mut item = col()
+    let item = col()
         .key(format!("thread-{}", thread.id))
         .role("button")
         .label(format!("{}, {}", thread.title, thread.status.label()))
@@ -977,12 +1013,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             s.active = index;
             s.current_mut().unread = false;
         });
-    if nested {
-        item = item
-            .ml(19.0)
-            .pl(12.0)
-            .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
-    }
+
     let mut title = row().gap(6.0).center_y();
     if !nested {
         title = title.child(icon(
@@ -1044,11 +1075,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     col()
                         .gap(2.0)
                         .child(label("Open Captain", TextStyle::new(14.0, 560.0), p.ink))
-                        .child(label(
-                            "Choose who takes the next piece of work.",
-                            SMALL,
-                            p.muted,
-                        )),
+                        .child(label("Open a captain's conversation.", SMALL, p.muted)),
                 )
                 .child(spacer())
                 .child(icon_button(
@@ -1194,18 +1221,18 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(col().gap(5.0).child(label("Name", SMALL, p.muted))
             .child(text_input(&editor.name, BODY).key("captain-name").label("Captain name")
                 .placeholder("e.g. Atlas", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.line)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.field_line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name)))
         .child(col().gap(5.0).child(label("Role", SMALL, p.muted))
             .child(text_input(&editor.role, BODY).key("captain-role").label("Captain role")
                 .placeholder("e.g. Code review", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.line)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.field_line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role)))
         .child(col().gap(5.0).child(label("Instructions for Pi", SMALL, p.muted))
             .child(text_input(&editor.instructions, BODY).key("captain-instructions").label("Captain instructions")
                 .placeholder("What should this captain focus on? Optional.", p.muted).color(p.ink)
                 .caret(p.teal, p.teal_bg).w_full().min_h(76.0).max_h(140.0).padding(8.0)
-                .radius(6.0).fill(field).border(1.0, p.line)
+                .radius(6.0).fill(field).border(1.0, p.field_line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().instructions)))
         .child(label(
             "Saved to this workspace. Each conversation uses these instructions and Pi's configured CPA model. Choose a different model in the composer.",
@@ -1445,32 +1472,40 @@ fn conversation(s: &State, p: Palette) -> El {
                                         TextStyle::new(16.0, 560.0),
                                         p.ink,
                                     ))
-                                    .child(status(t.status, p))
-                                    .child({
-                                        let working = s
-                                            .threads
-                                            .iter()
-                                            .filter(|thread| {
-                                                thread.captain == Some(captain)
-                                                    && !thread.captain_home
-                                                    && !thread.archived
-                                                    && thread.status.busy()
-                                            })
-                                            .count();
-                                        if working == 0 {
-                                            el()
-                                        } else {
-                                            label(
-                                                format!(
-                                                    "· {working} {} working",
-                                                    if working == 1 { "thread" } else { "threads" }
-                                                ),
-                                                SMALL,
-                                                p.teal,
-                                            )
-                                        }
-                                    }),
+                                    .child(status(t.status, p)),
                             )
+                            .child({
+                                let working = s
+                                    .threads
+                                    .iter()
+                                    .filter(|thread| {
+                                        thread.captain == Some(captain)
+                                            && !thread.captain_home
+                                            && !thread.archived
+                                            && thread.status.busy()
+                                    })
+                                    .count();
+                                if working == 0 {
+                                    el()
+                                } else {
+                                    row()
+                                        .gap(6.0)
+                                        .center_y()
+                                        .child(el().size(5.0, 5.0).radius(2.5).fill(p.teal))
+                                        .child(label(
+                                            format!(
+                                                "{working} other {} working",
+                                                if working == 1 {
+                                                    "thread is"
+                                                } else {
+                                                    "threads are"
+                                                }
+                                            ),
+                                            SMALL,
+                                            p.teal,
+                                        ))
+                                }
+                            })
                             .child(label(
                                 format!(
                                     "{} · {}",
@@ -1551,10 +1586,10 @@ fn conversation(s: &State, p: Palette) -> El {
                         .shrink()
                         .selectable(true)
                         .max_w(620.0)
-                        .px(12.0)
-                        .py(8.0)
+                        .px(14.0)
+                        .py(9.0)
                         .radius(10.0)
-                        .fill(p.selected),
+                        .fill(if s.dark { p.card } else { p.selected }),
                 )
             } else {
                 let style = MarkdownStyle::neutral(s.dark)
@@ -1668,7 +1703,7 @@ fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 
         .radius(6.0)
         .hover(p.selected)
         .on_press(action)
-        .child(label(title, TextStyle::new(12.0, 500.0), p.muted))
+        .child(label(title, TextStyle::new(12.0, 420.0), p.muted))
         .child(icon("chevron", p.muted))
 }
 
@@ -1844,7 +1879,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                     })
                     .child(label(
                         "Open a real workspace",
-                        TextStyle::new(12.0, 500.0),
+                        TextStyle::new(11.5, 500.0),
                         p.teal,
                     ))
             } else {
