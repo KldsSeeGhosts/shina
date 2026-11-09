@@ -126,6 +126,15 @@ fn main() {
                 state.populate_demo();
                 state.dark = true;
             }),
+            ("tool-output", |state| {
+                state.populate_demo();
+                state.current_mut().tools[3].expanded = true;
+            }),
+            ("session-details", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.show_activity = true;
+            }),
             ("zoomed", |state| {
                 state.populate_demo();
                 state.zoom = 1.25;
