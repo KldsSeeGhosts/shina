@@ -1,3 +1,4 @@
+use crate::attachments::{self, Attachment, Prompt};
 use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
 use crate::lifecycle::{
@@ -93,6 +94,9 @@ impl Status {
 pub struct Message {
     pub role: &'static str,
     pub text: String,
+    /// Images shown with this message. Only the local reference is kept; Pi gets the typed
+    /// `image` parts when the prompt is submitted.
+    pub images: Vec<Attachment>,
 }
 
 impl Message {
@@ -209,7 +213,12 @@ pub struct Thread {
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
     pub draft: TextEdit,
+    /// Images selected for the next send, kept separate from text undo history.
+    pub draft_images: Vec<Attachment>,
+    pub attachment_error: Option<String>,
     pub pi: Option<Pi>,
+    /// What the current Pi model reports for `input`. `None` until Pi answers with metadata.
+    pub supports_images: Option<bool>,
     pub model: String,
     pub thinking: String,
     pub model_provider: String,
@@ -248,10 +257,10 @@ pub struct Thread {
     startup_thinking_applied: bool,
     startup_selection_check: Option<String>,
     startup_selection_verified: bool,
-    queued_prompt: Option<(String, usize)>,
-    retry_prompt: Option<String>,
+    queued_prompt: Option<(Prompt, usize)>,
+    retry_prompt: Option<Prompt>,
     pending_thinking: Option<String>,
-    pending_prompt: Option<(String, String, usize)>,
+    pending_prompt: Option<(String, Prompt, usize)>,
     pending_injections: VecDeque<Injection>,
     injection_id: Option<String>,
     task_result: Option<&'static str>,
@@ -290,6 +299,57 @@ impl Thread {
             || self.pending_prompt.is_some()
             || !self.pending_injections.is_empty()
     }
+    pub fn has_draft_content(&self) -> bool {
+        !self.draft.text.trim().is_empty() || !self.draft_images.is_empty()
+    }
+    fn attachment_bytes(&self) -> u64 {
+        self.draft_images.iter().map(|image| image.bytes).sum()
+    }
+    /// Add a validated attachment while preserving the text draft and its undo history.
+    pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
+        if self
+            .draft_images
+            .iter()
+            .any(|current| current.id == image.id)
+        {
+            return Err(format!("{} is already attached.", image.name));
+        }
+        if self.draft_images.len() >= attachments::MAX_IMAGES {
+            return Err(format!(
+                "A message can carry up to {} images. Remove one before attaching another.",
+                attachments::MAX_IMAGES
+            ));
+        }
+        if self.attachment_bytes() + image.bytes > attachments::MAX_TOTAL_BYTES {
+            return Err(format!(
+                "The images total more than {} MB. Remove one before attaching another.",
+                attachments::MAX_TOTAL_BYTES / (1024 * 1024)
+            ));
+        }
+        self.draft_images.push(image);
+        self.attachment_error = None;
+        Ok(())
+    }
+    pub fn remove_attachment(&mut self, id: &str) {
+        self.draft_images.retain(|image| image.id != id);
+        self.attachment_error = None;
+    }
+    fn image_model_error(&self) -> String {
+        let model = if self.model.is_empty() {
+            "The selected model"
+        } else {
+            &self.model
+        };
+        if self.supports_images == Some(false) {
+            format!(
+                "{model} does not accept image input. Remove the images or choose a model that supports images."
+            )
+        } else {
+            format!(
+                "{model} does not declare image input. Remove the images or choose a model that supports images."
+            )
+        }
+    }
     pub fn new(id: usize) -> Self {
         Self {
             id,
@@ -304,7 +364,10 @@ impl Thread {
             thoughts: vec![],
             work: vec![],
             draft: TextEdit::default(),
+            draft_images: Vec::new(),
+            attachment_error: None,
             pi: None,
+            supports_images: None,
             model: DEFAULT_MODEL.into(),
             thinking: String::new(),
             model_provider: String::new(),
@@ -412,6 +475,10 @@ impl Thread {
         if self.status.busy() || self.configuring {
             return;
         }
+        // The old model's capability says nothing about the new one. Ask Pi again when the
+        // session starts or its set_model response arrives.
+        self.supports_images = None;
+        self.attachment_error = None;
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
             self.model_provider = provider;
@@ -500,25 +567,43 @@ impl Thread {
     }
 
     pub fn send(&mut self) {
-        if self.status.busy() || self.configuring || self.draft.text.trim().is_empty() {
+        if self.status.busy() || self.configuring || !self.has_draft_content() {
             return;
         }
         if !self.model_provider.is_empty() && self.model_provider != "cpa" {
             self.error = Some("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
-        let prompt = self.draft.text.trim().to_owned();
+        if !self.draft_images.is_empty() && self.supports_images == Some(false) {
+            self.attachment_error = Some(self.image_model_error());
+            return;
+        }
+        let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
         self.retry_prompt = Some(prompt.clone());
         self.arm_task();
         if self.messages.is_empty() && !self.captain_home && !self.renamed {
-            self.title = prompt.chars().take(45).collect();
+            self.title = if prompt.text.is_empty() {
+                prompt
+                    .images
+                    .first()
+                    .map(|image| format!("Image: {}", image.name))
+                    .unwrap_or_else(|| "New thread".into())
+                    .chars()
+                    .take(45)
+                    .collect()
+            } else {
+                prompt.text.chars().take(45).collect()
+            };
         }
         self.messages.push(Message {
             role: "You",
-            text: prompt,
+            text: prompt.text.clone(),
+            images: prompt.images.to_vec(),
         });
         self.draft.replace_text("");
+        self.draft_images.clear();
+        self.attachment_error = None;
         self.status = Status::Running;
         self.updated = crate::projects::now();
         self.life.user_sent(lifecycle::now());
@@ -673,6 +758,7 @@ impl Thread {
             self.messages.push(Message {
                 role: "Shina",
                 text,
+                images: Vec::new(),
             });
             self.pending_injections[0].shown = true;
         }
@@ -689,14 +775,24 @@ impl Thread {
         true
     }
 
-    fn remove_optimistic_prompt(&mut self, prompt: &str, index: usize) {
-        if self
-            .messages
-            .get(index)
-            .is_some_and(|m| m.role == "You" && m.text == prompt)
-        {
+    fn remove_optimistic_prompt(&mut self, prompt: &Prompt, index: usize) {
+        if self.messages.get(index).is_some_and(|message| {
+            message.role == "You"
+                && message.text == prompt.text
+                && message.images.as_slice() == prompt.images.as_ref()
+        }) {
             self.messages.remove(index);
         }
+    }
+    fn reject_images(&mut self, prompt: &Prompt, index: usize, error: String) {
+        self.restore_prompt(prompt);
+        self.remove_optimistic_prompt(prompt, index);
+        self.attachment_error = Some(error);
+        self.status = Status::Ready;
+        self.started = None;
+        self.elapsed = None;
+        self.assistant = None;
+        self.phase.clear();
     }
 
     fn fail_session(&mut self, error: String) {
@@ -772,7 +868,22 @@ impl Thread {
             self.fail_session("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
-        if self.command("prompt", json!({"message":prompt})) {
+        if !prompt.images.is_empty() && self.supports_images != Some(true) {
+            let error = self.image_model_error();
+            self.reject_images(&prompt, index, error);
+            return;
+        }
+        let mut record = json!({"message": prompt.text.clone()});
+        if !prompt.images.is_empty() {
+            match attachments::encode_images(&prompt.images) {
+                Ok(images) => record["images"] = Value::Array(images),
+                Err(error) => {
+                    self.reject_images(&prompt, index, error);
+                    return;
+                }
+            }
+        }
+        if self.command("prompt", record) {
             self.pending_prompt = Some((format!("{}-{}", self.id, self.serial), prompt, index));
         } else {
             self.queued_prompt = Some((prompt, index));
@@ -821,6 +932,7 @@ impl Thread {
             self.messages.push(Message {
                 role: "Pi",
                 text: String::new(),
+                images: Vec::new(),
             });
             self.messages.len() - 1
         });
@@ -1076,7 +1188,13 @@ impl Thread {
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
                                     let text = content_text(&message["content"]);
-                                    if role == "assistant" || !text.is_empty() {
+                                    let images = if role == "user" {
+                                        content_images(&message["content"])
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    if role == "assistant" || !text.is_empty() || !images.is_empty()
+                                    {
                                         if role == "assistant" {
                                             self.ensure_work();
                                         }
@@ -1089,6 +1207,7 @@ impl Thread {
                                                 "You"
                                             },
                                             text,
+                                            images,
                                         });
                                     }
                                 }
@@ -1123,7 +1242,8 @@ impl Thread {
                             *index = self.messages.len();
                             self.messages.push(Message {
                                 role: "You",
-                                text: prompt.clone(),
+                                text: prompt.text.clone(),
+                                images: prompt.images.to_vec(),
                             });
                         }
                         self.history_loaded = true;
@@ -1309,16 +1429,35 @@ impl Thread {
             self.model_id = id.into();
             self.model_provider = string(model, "provider").into();
             self.model = model["name"].as_str().unwrap_or(id).into();
+            self.supports_images = model["input"]
+                .as_array()
+                .map(|input| input.iter().any(|kind| kind == "image"));
         }
     }
 
-    fn restore_prompt(&mut self, prompt: &str) {
-        let text = if self.draft.text.is_empty() {
-            prompt.to_owned()
+    fn restore_prompt(&mut self, prompt: &Prompt) {
+        let text = if prompt.text.is_empty() {
+            self.draft.text.clone()
+        } else if self.draft.text.is_empty() {
+            prompt.text.clone()
         } else {
-            format!("{prompt}\n\n{}", self.draft.text)
+            format!("{}\n\n{}", prompt.text, self.draft.text)
         };
         self.draft.replace_text(&text);
+        // Keep submitted images first. A newer draft may have added images while the process was
+        // starting, so merge those after the snapshot without duplicating either set.
+        let mut images = prompt.images.to_vec();
+        for image in &self.draft_images {
+            if !images.iter().any(|current| current.id == image.id) {
+                images.push(image.clone());
+            }
+        }
+        self.draft_images.clear();
+        for image in images {
+            // Capacity was valid when the prompt was submitted. If a newer draft filled it,
+            // keep as many submitted images as still fit rather than dropping the draft.
+            let _ = self.add_attachment(image);
+        }
     }
 
     fn finish_run(&mut self) {
@@ -1408,6 +1547,10 @@ pub struct State {
     pub store: Option<crate::store::Store>,
     pub storage_error: Option<String>,
     pub artwork: Arc<crate::visuals::Artwork>,
+    /// Decodes composer and conversation thumbnails off the UI thread.
+    pub attachment_cache: rune::ImageCache,
+    /// The composer is showing a valid drop highlight.
+    pub attachment_drop_hover: bool,
     pub captain_picker: bool,
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
@@ -1451,6 +1594,7 @@ impl State {
             crate::projects::normalize_path(&workspace)
         };
         let artwork = crate::visuals::Artwork::load(&workspace);
+        let attachment_cache = rune::ImageCache::new(Arc::new(|| {}));
         let mut state = Self {
             data_dir: crate::store::directory()
                 .unwrap_or_else(|| std::env::temp_dir().join("Shina")),
@@ -1503,6 +1647,8 @@ impl State {
             store: None,
             storage_error: None,
             artwork,
+            attachment_cache,
+            attachment_drop_hover: false,
             captain_picker: false,
             captain_project: None,
             captains: Captain::defaults(),
@@ -2205,6 +2351,8 @@ impl State {
         };
         self.remember(Action::Discard, i);
         self.threads[i].draft.replace_text("");
+        self.threads[i].draft_images.clear();
+        self.threads[i].attachment_error = None;
         if self.threads[i].messages.is_empty() && self.threads[i].session.is_none() {
             self.threads[i].life.archived_at = Some(lifecycle::now());
             self.advance_parked(id);
@@ -3169,12 +3317,73 @@ impl State {
         }
         changed
     }
+    fn attachment_guard(&self) -> Option<String> {
+        if self.demo {
+            Some("Open a real workspace before attaching images.".into())
+        } else if self.current().archived() {
+            Some("Restore this thread before attaching images.".into())
+        } else if self.current().status.busy() {
+            Some("Wait for Pi to finish before attaching images.".into())
+        } else if self.current().configuring {
+            Some("Wait for the model change to finish before attaching images.".into())
+        } else {
+            None
+        }
+    }
+    /// Attach one or more picked or dropped files. A failure leaves the text draft untouched.
+    pub fn attach_paths(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(error) = self.attachment_guard() {
+            self.current_mut().attachment_error = Some(error);
+            return;
+        }
+        let mut errors = Vec::new();
+        let mut attached = 0;
+        for path in paths {
+            match attachments::attach_file(path) {
+                Ok(image) => match self.current_mut().add_attachment(image) {
+                    Ok(()) => attached += 1,
+                    Err(error) => errors.push(error),
+                },
+                Err(error) => errors.push(error),
+            }
+        }
+        self.current_mut().attachment_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" "))
+        };
+        if attached > 0 {
+            self.checkpoint();
+        }
+    }
+    /// Attach a pasted PNG image without touching the text draft.
+    pub fn attach_image(&mut self, name: &str, bytes: &[u8]) {
+        if let Some(error) = self.attachment_guard() {
+            self.current_mut().attachment_error = Some(error);
+            return;
+        }
+        match attachments::attach_bytes(name, bytes.to_vec()) {
+            Ok(image) => {
+                let result = self.current_mut().add_attachment(image);
+                self.current_mut().attachment_error = result.err();
+            }
+            Err(error) => self.current_mut().attachment_error = Some(error),
+        }
+        self.checkpoint();
+    }
+    pub fn remove_attachment(&mut self, id: &str) {
+        self.current_mut().remove_attachment(id);
+        self.checkpoint();
+    }
     pub fn send(&mut self) {
         if self.demo
             || self.current().archived()
             || self.current().status.busy()
             || self.current().configuring
-            || self.current().draft.text.trim().is_empty()
+            || !self.current().has_draft_content()
         {
             return;
         }
@@ -3191,12 +3400,12 @@ impl State {
         if self.demo || self.current().archived() || self.current().status.busy() {
             return;
         }
-        if self.current().draft.text.trim().is_empty()
+        if !self.current().has_draft_content()
             && let Some(prompt) = self.current().retry_prompt.clone()
         {
-            self.current_mut().draft.replace_text(&prompt);
+            self.current_mut().restore_prompt(&prompt);
         }
-        if self.current().draft.text.trim().is_empty() {
+        if !self.current().has_draft_content() {
             self.current_mut().disconnect();
             self.current_mut().error = None;
             self.current_mut().status = Status::Ready;
@@ -3245,8 +3454,7 @@ impl State {
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
-            && (!thread.draft.text.trim().is_empty()
-                || (thread.session.is_some() && !thread.history_loaded))
+            && (thread.has_draft_content() || (thread.session.is_some() && !thread.history_loaded))
         {
             self.connect_thread(self.active);
             return true;
@@ -3297,6 +3505,7 @@ impl State {
     }
     pub fn setup(&mut self, wake: Waker) {
         self.wake = wake.clone();
+        self.attachment_cache = rune::ImageCache::new(wake.clone());
         if self.demo {
             return;
         }
@@ -3580,7 +3789,17 @@ impl State {
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
-            "drafts":self.threads.iter().map(|t| (t.id.to_string(), json!(t.draft.text))).collect::<serde_json::Map<_,_>>(),
+            "drafts":self.threads.iter().map(|t| {
+                let value = if t.draft_images.is_empty() {
+                    json!(t.draft.text)
+                } else {
+                    json!({
+                        "text": t.draft.text,
+                        "images": t.draft_images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                    })
+                };
+                (t.id.to_string(), value)
+            }).collect::<serde_json::Map<_,_>>(),
         })
     }
     fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
@@ -3622,13 +3841,26 @@ impl State {
             self.project_scope = ProjectScope::All;
         }
         for (id, draft) in ui["drafts"].as_object().ok_or("Invalid saved drafts.")? {
-            let draft = draft.as_str().ok_or("Invalid draft text.")?;
+            let (text, images) = if let Some(text) = draft.as_str() {
+                (text, Vec::new())
+            } else {
+                let text = draft["text"].as_str().ok_or("Invalid draft text.")?;
+                let images = draft["images"]
+                    .as_array()
+                    .map(|images| images.iter().filter_map(Attachment::from_value).collect())
+                    .unwrap_or_default();
+                (text, images)
+            };
             if let Some(t) = id
                 .parse::<usize>()
                 .ok()
                 .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
             {
-                t.draft.replace_text(draft);
+                t.draft.replace_text(text);
+                t.draft_images.clear();
+                for image in images {
+                    let _ = t.add_attachment(image);
+                }
             }
         }
         Ok(())
@@ -3679,10 +3911,10 @@ impl State {
             elapsed: Some(42),
         });
         thread.messages = vec![
-            Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into() },
-            Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into() },
-            Message { role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into() },
-            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into() },
+            Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new() },
+            Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into(), images: Vec::new() },
+            Message { role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into(), images: Vec::new() },
+            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into(), images: Vec::new() },
         ];
         thread.tools = vec![
             Tool {
@@ -4188,6 +4420,20 @@ fn content_text(content: &Value) -> String {
         })
         .unwrap_or_default()
 }
+/// Pi keeps user images as typed content blocks. Import each into the local store so the
+/// conversation can draw it again without retaining Pi's base64 copy in Shina state.
+fn content_images(content: &Value) -> Vec<Attachment> {
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .filter_map(attachments::from_history_part)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 fn tool_detail(args: &Value) -> String {
     ["path", "file_path", "command", "pattern", "query"]
         .iter()
@@ -4650,6 +4896,7 @@ mod tests {
             state.threads[index].messages.push(Message {
                 role: "Pi",
                 text: "界".repeat(6100),
+                images: Vec::new(),
             });
             if exit {
                 events
@@ -5740,6 +5987,7 @@ mod tests {
             thread.messages.push(Message {
                 role: "You",
                 text: prompt.into(),
+                images: Vec::new(),
             });
             thread.apply(json!({"type":"agent_start"}));
             thread.started = Some(Instant::now() - Duration::from_secs(3));
@@ -5768,8 +6016,9 @@ mod tests {
         thread.messages.push(Message {
             role: "You",
             text: "Try this".into(),
+            images: Vec::new(),
         });
-        thread.pending_prompt = Some(("1-1".into(), "Try this".into(), 0));
+        thread.pending_prompt = Some(("1-1".into(), Prompt::new("Try this".into(), vec![]), 0));
         thread.status = Status::Running;
         thread.apply(json!({"type":"response","id":"1-1","command":"prompt","success":false,"error":"No model configured"}));
         assert_eq!(thread.status, Status::Failed);
@@ -5920,7 +6169,11 @@ mod tests {
     #[test]
     fn rejected_prompt_preserves_a_newer_draft_too() {
         let mut thread = Thread::new(1);
-        thread.pending_prompt = Some(("1-1".into(), "Rejected prompt".into(), 0));
+        thread.pending_prompt = Some((
+            "1-1".into(),
+            Prompt::new("Rejected prompt".into(), vec![]),
+            0,
+        ));
         thread.draft.replace_text("New draft");
         thread.apply(json!({"type":"response","id":"1-1","command":"prompt","success":false,"error":"Rejected"}));
         assert_eq!(thread.draft.text, "Rejected prompt\n\nNew draft");
@@ -6000,6 +6253,7 @@ mod tests {
         thread.messages.push(Message {
             role: "Pi",
             text: "Previous answer".into(),
+            images: Vec::new(),
         });
         thread.status = Status::Completed;
         let idle = thread.last_activity + IDLE_TIMEOUT;
@@ -6087,7 +6341,14 @@ mod tests {
         poll(&mut state, 0.0, &mut Tx::default());
         assert_eq!(state.current().status, Status::Failed);
         assert!(state.current().draft.text.is_empty());
-        assert_eq!(state.current().retry_prompt.as_deref(), Some("Edit a file"));
+        assert_eq!(
+            state
+                .current()
+                .retry_prompt
+                .as_ref()
+                .map(|prompt| prompt.text.as_str()),
+            Some("Edit a file")
+        );
         assert!(state.current().pi.is_none());
         assert_eq!(state.current().messages.len(), 1);
     }
@@ -6982,5 +7243,267 @@ mod tests {
         crate::backend::shutdown_all();
         fs::remove_file(fixture).unwrap();
         fs::remove_dir(workspace).unwrap();
+    }
+    fn test_png(width: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([20, 40, 60, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+        bytes.into_inner()
+    }
+
+    fn test_attachment(name: &str, width: u32) -> Attachment {
+        crate::attachments::attach_bytes(name, test_png(width)).unwrap()
+    }
+
+    #[test]
+    fn image_only_prompts_send_typed_pi_images_without_file_paths() {
+        let mut thread = Thread::new(1);
+        thread.model_provider = "cpa".into();
+        thread.supports_images = Some(true);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        let image = test_attachment("screen.png", 1);
+        thread.add_attachment(image.clone()).unwrap();
+        thread.send();
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["message"], "");
+        assert_eq!(prompt["images"][0]["type"], "image");
+        assert_eq!(prompt["images"][0]["mimeType"], "image/png");
+        assert_eq!(
+            crate::attachments::decode_base64(prompt["images"][0]["data"].as_str().unwrap())
+                .unwrap(),
+            crate::attachments::read(&image).unwrap()
+        );
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].text, "");
+        assert_eq!(thread.messages[0].images, vec![image]);
+        assert_eq!(thread.title, "Image: screen.png");
+    }
+
+    #[test]
+    fn non_vision_models_refuse_images_without_sending_or_clearing_the_draft() {
+        let mut thread = Thread::new(1);
+        thread.model = "Text Only".into();
+        thread.model_provider = "cpa".into();
+        thread.supports_images = Some(false);
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        let image = test_attachment("screen.png", 1);
+        thread.add_attachment(image.clone()).unwrap();
+        thread.draft.replace_text("Keep this text");
+        thread.send();
+        assert!(commands.try_recv().is_err(), "no prompt may be sent");
+        assert!(thread.messages.is_empty());
+        assert!(thread.queued_prompt.is_none());
+        assert_eq!(thread.status, Status::Ready);
+        assert_eq!(thread.draft.text, "Keep this text");
+        assert_eq!(thread.draft_images, vec![image]);
+        assert!(
+            thread
+                .attachment_error
+                .as_ref()
+                .unwrap()
+                .contains("Text Only")
+        );
+    }
+
+    #[test]
+    fn an_undeclared_vision_capability_blocks_before_pi_receives_the_prompt() {
+        let mut thread = Thread::new(1);
+        thread.model = "Unknown Model".into();
+        thread.model_provider = "cpa".into();
+        thread.supports_images = None;
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        let image = test_attachment("screen.png", 1);
+        thread.add_attachment(image.clone()).unwrap();
+        thread.send();
+        assert!(commands.try_recv().is_err());
+        assert!(thread.messages.is_empty());
+        assert_eq!(thread.status, Status::Ready);
+        assert_eq!(thread.draft_images, vec![image.clone()]);
+        assert!(
+            thread
+                .attachment_error
+                .as_ref()
+                .unwrap()
+                .contains("does not declare")
+        );
+        assert_eq!(
+            thread.retry_prompt.as_ref().unwrap().images.as_ref(),
+            &[image]
+        );
+    }
+
+    #[test]
+    fn pi_model_metadata_drives_the_image_capability_checked_before_sending() {
+        let mut thread = Thread::new(1);
+        thread.apply(
+            json!({"type":"response","command":"get_state","success":true,"data":{
+                "model":{"provider":"cpa","id":"text-only","name":"Text Only","input":["text"]}
+            }}),
+        );
+        assert_eq!(thread.supports_images, Some(false));
+        thread.apply(
+            json!({"type":"response","command":"get_state","success":true,"data":{
+                "model":{"provider":"cpa","id":"vision","name":"Vision","input":["text","image"]}
+            }}),
+        );
+        assert_eq!(thread.supports_images, Some(true));
+    }
+
+    #[test]
+    fn stopping_a_queued_image_send_restores_the_submitted_snapshot_and_new_edits() {
+        let mut thread = Thread::new(1);
+        thread.model_provider = "cpa".into();
+        thread.supports_images = Some(true);
+        let original = test_attachment("original.png", 1);
+        let later = test_attachment("later.png", 2);
+        thread.draft.replace_text("First");
+        thread.add_attachment(original.clone()).unwrap();
+        thread.send();
+        assert_eq!(
+            thread.queued_prompt.as_ref().unwrap().0.images.as_ref(),
+            std::slice::from_ref(&original)
+        );
+        assert_eq!(thread.messages[0].images, vec![original.clone()]);
+        thread.draft.replace_text("Edited during startup");
+        thread.add_attachment(later.clone()).unwrap();
+        thread.stop();
+        assert_eq!(thread.status, Status::Ready);
+        assert!(thread.messages.is_empty());
+        assert!(thread.queued_prompt.is_none());
+        assert_eq!(thread.draft.text, "First\n\nEdited during startup");
+        assert_eq!(thread.draft_images, vec![original.clone(), later]);
+        assert_eq!(
+            thread.retry_prompt.as_ref().unwrap().images.as_ref(),
+            &[original]
+        );
+    }
+
+    #[test]
+    fn a_rejected_image_prompt_returns_its_images_to_the_draft() {
+        let mut thread = Thread::new(1);
+        let image = test_attachment("screen.png", 1);
+        let prompt = Prompt::new("Try this".into(), vec![image.clone()]);
+        thread.messages.push(Message {
+            role: "You",
+            text: prompt.text.clone(),
+            images: prompt.images.to_vec(),
+        });
+        thread.pending_prompt = Some(("1-1".into(), prompt, 0));
+        thread.status = Status::Running;
+        thread.apply(json!({"type":"response","id":"1-1","command":"prompt","success":false,"error":"No model configured"}));
+        assert_eq!(thread.status, Status::Failed);
+        assert_eq!(thread.draft.text, "Try this");
+        assert_eq!(thread.draft_images, vec![image]);
+        assert!(thread.messages.is_empty());
+        assert!(thread.queued_prompt.is_none());
+    }
+
+    #[test]
+    fn history_user_images_are_imported_into_the_local_store_without_base64_state() {
+        let png = test_png(1);
+        let thread = &mut Thread::new(1);
+        thread.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[
+            {"role":"user","content":[
+                {"type":"image","data":crate::attachments::encode_base64(&png),"mimeType":"image/png"},
+                {"type":"text","text":"What is this?"}
+            ]},
+            {"role":"assistant","content":[{"type":"text","text":"A test image."}]}
+        ]}}));
+        assert_eq!(thread.messages[0].text, "What is this?");
+        assert_eq!(thread.messages[0].images.len(), 1);
+        assert_eq!(
+            crate::attachments::read(&thread.messages[0].images[0]).unwrap(),
+            png
+        );
+        assert_eq!(thread.messages[1].text, "A test image.");
+        assert!(thread.messages[1].images.is_empty());
+    }
+
+    #[test]
+    fn draft_images_persist_as_references_and_restore_without_inline_base64() {
+        let mut state = State::new(".".into(), false);
+        let image = test_attachment("draft.png", 1);
+        state.current_mut().draft.replace_text("Keep this draft");
+        state.current_mut().add_attachment(image.clone()).unwrap();
+        let snapshot = state.ui_snapshot();
+        assert!(snapshot["drafts"]["1"]["images"][0].get("data").is_none());
+        assert!(
+            !snapshot
+                .to_string()
+                .contains(&crate::attachments::encode_base64(&test_png(1)))
+        );
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&snapshot).unwrap();
+        assert_eq!(restored.current().draft.text, "Keep this draft");
+        assert_eq!(restored.current().draft_images, vec![image]);
+    }
+
+    #[test]
+    fn attachment_count_and_size_limits_keep_the_text_draft_untouched() {
+        let mut thread = Thread::new(1);
+        thread.draft.replace_text("Keep me");
+        for width in 0..8 {
+            thread
+                .add_attachment(test_attachment("image.png", width + 1))
+                .unwrap();
+        }
+        let error = thread
+            .add_attachment(test_attachment("extra.png", 20))
+            .unwrap_err();
+        assert!(error.contains("up to 8"));
+        assert_eq!(thread.draft.text, "Keep me");
+        thread.draft_images.clear();
+        let mut oversized = test_attachment("ok.png", 20);
+        oversized.bytes = crate::attachments::MAX_TOTAL_BYTES + 1;
+        assert!(thread.add_attachment(oversized).is_err());
+        assert_eq!(thread.draft.text, "Keep me");
+    }
+    #[test]
+    fn retry_after_a_crash_resends_the_snapshotted_image_message() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().supports_images = Some(true);
+        state.current_mut().session = Some("saved.jsonl".into());
+        let image = test_attachment("retry.png", 1);
+        state.current_mut().add_attachment(image.clone()).unwrap();
+        let (pi, _commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.send();
+        events.send(Event::Exited).unwrap();
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.current().status, Status::Failed);
+        assert!(state.current().messages.is_empty());
+        assert_eq!(state.current().draft_images, vec![image.clone()]);
+        let (pi, commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().initializing = true;
+        state.retry();
+        for record in [
+            json!({"type":"response","id":"state","command":"get_state","success":true,"data":{
+                "model":{"provider":"cpa","id":"vision","input":["text","image"]},"sessionFile":"saved.jsonl"
+            }}),
+            json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}),
+        ] {
+            events.send(Event::Record(record)).unwrap();
+        }
+        poll(&mut state, 0.0, &mut Tx::default());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["message"], "");
+        assert_eq!(prompt["images"][0]["type"], "image");
+        assert_eq!(
+            crate::attachments::decode_base64(prompt["images"][0]["data"].as_str().unwrap())
+                .unwrap(),
+            crate::attachments::read(&image).unwrap()
+        );
+        assert!(commands.try_recv().is_err());
     }
 }

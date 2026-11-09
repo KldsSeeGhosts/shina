@@ -11,6 +11,7 @@ rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a7f276c3630f85a06
 serde_json = "1"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 chrono-tz = "0.10"

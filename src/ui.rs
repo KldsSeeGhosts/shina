@@ -1,8 +1,9 @@
+use crate::attachments::Attachment;
 use crate::lifecycle::{self, Section};
 use crate::model::{
     ProjectPicker, ProjectScope, RowTarget, SettingsPicker, State, Status, Thread, Tool, truncate,
 };
-use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, col, el, memo, row, text};
+use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, Tx, col, el, memo, row, text};
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 
@@ -225,6 +226,10 @@ fn icon(kind: &str, ink: Color) -> El {
         EXPAND,
         r#"<path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
+    glyph!(
+        IMAGE,
+        r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" fill="none" stroke="currentColor"/><circle cx="5.5" cy="6" r="1.3" fill="currentColor"/><path d="m2.5 11 3-3 2.5 2.5 2-2 3 3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
         "sidebar" => &SIDEBAR,
@@ -258,6 +263,7 @@ fn icon(kind: &str, ink: Color) -> El {
         "file" => &FILE,
         "terminal" => &TERMINAL,
         "expand" => &EXPAND,
+        "image" => &IMAGE,
         _ => &rune_kit::glyphs::CHECK_SMALL,
     };
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
@@ -3592,18 +3598,30 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
             }
             let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
-                row().justify_end().child(
-                    label(&message.text, body_style(wide), p.ink)
-                        .key(format!("{key}-text"))
-                        .wrap_anywhere()
-                        .shrink()
-                        .selectable(true)
-                        .max_w(if wide { 660.0 } else { 620.0 })
-                        .px(14.0)
-                        .py(9.0)
-                        .radius(10.0)
-                        .fill(if s.dark { p.card } else { color("#ededf0") }),
-                )
+                let max_width = if wide { 660.0 } else { 620.0 };
+                let mut user = col()
+                    .items_end()
+                    .gap(6.0)
+                    .max_w(max_width)
+                    .shrink()
+                    .min_w(0.0);
+                if !message.images.is_empty() {
+                    user = user.child(message_images(s, p, &message.images, &key));
+                }
+                if !message.text.trim().is_empty() {
+                    user = user.child(
+                        label(&message.text, body_style(wide), p.ink)
+                            .key(format!("{key}-text"))
+                            .wrap_anywhere()
+                            .selectable(true)
+                            .max_w(max_width)
+                            .px(14.0)
+                            .py(9.0)
+                            .radius(10.0)
+                            .fill(if s.dark { p.card } else { color("#ededf0") }),
+                    );
+                }
+                row().justify_end().child(user)
             } else {
                 col()
                     .gap(4.0)
@@ -3654,6 +3672,147 @@ fn suggestion(key: &str, title: &str, prompt: &'static str, p: Palette) -> El {
     .border(0.5, p.line)
 }
 
+fn image_preview(
+    s: &State,
+    p: Palette,
+    image: &Attachment,
+    width: f32,
+    height: f32,
+    key: String,
+) -> El {
+    let mut preview = el()
+        .key(key)
+        .size(width, height)
+        .radius((width.min(height) / 6.0).clamp(4.0, 10.0))
+        .clip_rounded((width.min(height) / 6.0).clamp(4.0, 10.0))
+        .border(0.5, p.line);
+    if let Some(path) = crate::attachments::path_for(image) {
+        preview = preview.pixels(
+            s.attachment_cache
+                .file(path, width.max(height), 2.0)
+                .pixels(),
+        );
+    } else {
+        preview = preview
+            .center()
+            .fill(p.selected)
+            .child(icon("image", p.muted));
+    }
+    preview
+}
+
+fn image_size(image: &Attachment, maximum: f32) -> (f32, f32) {
+    let ratio = image.width.max(1) as f32 / image.height.max(1) as f32;
+    if ratio >= 1.0 {
+        (maximum, (maximum / ratio).max(40.0))
+    } else {
+        ((maximum * ratio).max(40.0), maximum)
+    }
+}
+
+fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
+    let id = image.id.clone();
+    row()
+        .key(format!("attachment-{}", image.id))
+        .role("group")
+        .label(format!("Attached image: {}", image.name))
+        .center_y()
+        .h(36.0)
+        .pl(4.0)
+        .pr(3.0)
+        .gap(7.0)
+        .radius(8.0)
+        .fill(if s.dark {
+            Color::WHITE.alpha(0.05)
+        } else {
+            Color::BLACK.alpha(0.035)
+        })
+        .border(0.5, p.line)
+        .shrink()
+        .min_w(0.0)
+        .child(
+            image_preview(s, p, image, 28.0, 28.0, format!("attachment-thumb-{id}")).a11y_hidden(),
+        )
+        .child(
+            label(&image.name, TextStyle::new(11.5, 450.0), p.ink)
+                .truncate()
+                .max_w(140.0)
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(
+            el().key(format!("remove-attachment-{id}"))
+                .role("button")
+                .label(format!("Remove {}", image.name))
+                .focusable(true)
+                .size(22.0, 22.0)
+                .center()
+                .radius(4.0)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| s.remove_attachment(&id))
+                .child(icon("close", p.muted)),
+        )
+}
+
+fn message_images(s: &State, p: Palette, images: &[Attachment], key: &str) -> El {
+    let mut strip = row()
+        .justify_end()
+        .items_end()
+        .flex_wrap()
+        .gap(6.0)
+        .max_w(620.0);
+    for (index, image) in images.iter().enumerate() {
+        let (width, height) = image_size(image, if images.len() == 1 { 220.0 } else { 132.0 });
+        strip = strip.child(
+            image_preview(s, p, image, width, height, format!("{key}-image-{index}"))
+                .role("group")
+                .label(format!("Attached image: {}", image.name)),
+        );
+    }
+    strip
+}
+
+fn attach_control(locked: bool, p: Palette) -> El {
+    let mut control = el()
+        .key("attach-image")
+        .role("button")
+        .label("Attach image")
+        .size(24.0, 24.0)
+        .center()
+        .radius(5.0)
+        .opacity(if locked { 0.65 } else { 1.0 })
+        .hover(p.selected)
+        .disabled(locked)
+        .child(icon("image", p.muted));
+    if !locked {
+        control = control
+            .focusable(true)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| pick_attachment(s, tx));
+    }
+    control
+}
+
+fn pick_attachment(_: &mut State, tx: &mut Tx) {
+    tx.open_file(
+        rune::FileDialogOptions {
+            title: "Attach an image".into(),
+            ..Default::default()
+        }
+        .filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]),
+        |s: &mut State, result, _| {
+            match result {
+                Ok(Some(path)) => s.attach_paths(&[path]),
+                Ok(None) => {}
+                Err(error) => {
+                    s.current_mut().attachment_error =
+                        Some(format!("Could not open the image picker: {error}"));
+                }
+            }
+            s.checkpoint();
+        },
+    );
+}
+
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let t = s.current();
     let mut area = col()
@@ -3684,14 +3843,18 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 }),
         );
     }
+    if let Some(error) = &t.attachment_error {
+        area = area.child(
+            label(error, SMALL, p.danger)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
     if t.request.is_some() {
         area = area.child(dialog(s, p));
     }
-    let can_send = !s.demo
-        && !t.archived()
-        && !t.status.busy()
-        && !t.configuring
-        && !t.draft.text.trim().is_empty();
+    let can_send =
+        !s.demo && !t.archived() && !t.status.busy() && !t.configuring && t.has_draft_content();
     let mut send = el()
         .key("send-message")
         .role("button")
@@ -3727,72 +3890,112 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             .center()
             .child(icon("thread", p.muted))
     };
-    area = area.child(
-        col()
-            .key("composer")
-            .radius(12.0)
-            .fill(p.card)
-            .border(if s.dark { 1.0 } else { 0.5 }, p.line)
-            .shadow(
-                2.0,
-                6.0,
-                Color::BLACK.alpha(if s.dark { 0.12 } else { 0.06 }),
-            )
-            .px(14.0)
-            .pt(12.0)
-            .pb(10.0)
-            .gap(10.0)
-            .child(
-                text_input(&t.draft, body_style(wide))
-                    .key("composer-input")
-                    .label("Message Pi")
-                    .placeholder(
-                        if s.demo {
-                            "Open a real workspace to send messages"
-                        } else {
-                            "Ask anything..."
-                        },
-                        p.muted,
-                    )
-                    .color(p.ink)
-                    .caret(p.teal, p.teal_bg)
-                    .w_full()
-                    .min_h(24.0)
-                    .max_h(170.0)
-                    .on_edit(|s: &mut State| &mut s.current_mut().draft)
-                    .on_submit(|s: &mut State, _| {
-                        if !s.demo && !s.current().archived() {
-                            s.send();
-                        }
-                    }),
-            )
-            .child(
-                row()
-                    .center_y()
-                    .gap(5.0)
-                    .child(identity)
-                    .child(
-                        dropdown("choose-pi-model", &t.model, p, |s| {
-                            s.model_search.replace_text("");
-                            s.settings_picker = Some(SettingsPicker::Model);
-                            s.refresh_catalog();
-                        })
-                        .max_w(if narrow { 112.0 } else { 230.0 })
-                        .opacity(if locked { 0.65 } else { 1.0 })
-                        .disabled(locked),
-                    )
-                    .child(
-                        dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
-                            s.settings_picker = Some(SettingsPicker::Thinking);
-                            s.refresh_catalog();
-                        })
-                        .opacity(if locked { 0.65 } else { 1.0 })
-                        .disabled(locked),
-                    )
-                    .child(spacer())
-                    .child(action),
-            ),
-    );
+    let tray = if t.draft_images.is_empty() {
+        None
+    } else {
+        let mut chips = row().gap(6.0).flex_wrap();
+        for image in &t.draft_images {
+            chips = chips.child(attachment_chip(s, p, image));
+        }
+        Some(chips)
+    };
+    let mut card = col()
+        .key("composer")
+        .radius(12.0)
+        .fill(p.card)
+        .border(
+            if s.attachment_drop_hover || s.dark {
+                1.0
+            } else {
+                0.5
+            },
+            if s.attachment_drop_hover {
+                p.teal
+            } else {
+                p.line
+            },
+        )
+        .shadow(
+            2.0,
+            6.0,
+            Color::BLACK.alpha(if s.dark { 0.12 } else { 0.06 }),
+        )
+        .px(14.0)
+        .pt(12.0)
+        .pb(10.0)
+        .gap(10.0)
+        .on_drop_files(|s: &mut State, files, _| {
+            s.attachment_drop_hover = false;
+            s.attach_paths(files);
+            s.checkpoint();
+        })
+        .on_drop_hover(|s: &mut State, over, _| s.attachment_drop_hover = over);
+    if let Some(tray) = tray {
+        card = card.child(tray);
+    }
+    card = card
+        .child(
+            text_input(&t.draft, body_style(wide))
+                .key("composer-input")
+                .label("Message Pi")
+                .placeholder(
+                    if s.demo {
+                        "Open a real workspace to send messages"
+                    } else {
+                        "Ask anything..."
+                    },
+                    p.muted,
+                )
+                .color(p.ink)
+                .caret(p.teal, p.teal_bg)
+                .w_full()
+                .min_h(24.0)
+                .max_h(170.0)
+                .on_edit(|s: &mut State| &mut s.current_mut().draft)
+                .on_input_paste(|s: &mut State, content, _| {
+                    let has_image = content.image().is_some();
+                    if let Some(image) = content.image() {
+                        s.attach_image("Pasted image.png", image.png());
+                    }
+                    if !content.files().is_empty() {
+                        s.attach_paths(content.files());
+                    }
+                    (has_image || !content.files().is_empty()) && content.text().is_empty()
+                })
+                .on_submit(|s: &mut State, _| {
+                    if !s.demo && !s.current().archived() {
+                        s.send();
+                    }
+                }),
+        )
+        .child(
+            row()
+                .center_y()
+                .gap(5.0)
+                .child(identity)
+                .child(
+                    dropdown("choose-pi-model", &t.model, p, |s| {
+                        s.model_search.replace_text("");
+                        s.settings_picker = Some(SettingsPicker::Model);
+                        s.refresh_catalog();
+                    })
+                    .max_w(if narrow { 112.0 } else { 230.0 })
+                    .opacity(if locked { 0.65 } else { 1.0 })
+                    .disabled(locked),
+                )
+                .child(
+                    dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
+                        s.settings_picker = Some(SettingsPicker::Thinking);
+                        s.refresh_catalog();
+                    })
+                    .opacity(if locked { 0.65 } else { 1.0 })
+                    .disabled(locked),
+                )
+                .child(attach_control(locked, p))
+                .child(spacer())
+                .child(action),
+        );
+    area = area.child(card);
     area = area.child(
         row()
             .h(20.0)
@@ -4438,6 +4641,7 @@ pub(crate) mod tests {
         rt.state.current_mut().messages.push(crate::model::Message {
             role: "Shina",
             text: "A delegated task finished.".into(),
+            images: Vec::new(),
         });
         rt.frame(0.0);
         assert!(rt.presented("inline-tool-1-0").is_some());
@@ -4874,5 +5078,93 @@ pub(crate) mod tests {
             .current_mut()
             .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
         assert_eq!(rt.state.current().thinking, "high");
+    }
+    fn ui_png(width: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([20, 40, 60, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn composer_attachment_control_adds_and_removes_named_chips_without_losing_text() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        assert!(rt.find("attach-image").is_some());
+        rt.state.current_mut().draft.replace_text("Keep this text");
+        rt.state.attach_image("pasted.png", &ui_png(1));
+        rt.frame(0.0);
+        let id = rt.state.current().draft_images[0].id.clone();
+        assert!(rt.find(&format!("attachment-{id}")).is_some());
+        assert!(rt.find(&format!("attachment-thumb-{id}")).is_some());
+        assert_eq!(rt.state.current().draft.text, "Keep this text");
+        press(&mut rt, &format!("remove-attachment-{id}"));
+        assert!(rt.state.current().draft_images.is_empty());
+        assert_eq!(rt.state.current().draft.text, "Keep this text");
+        assert!(rt.find(&format!("attachment-{id}")).is_none());
+    }
+
+    #[test]
+    fn paste_attaches_clipboard_images_without_inserting_placeholder_text() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        let image = rune::ClipboardImage::from_png(ui_png(1)).unwrap();
+        rt.paste_content(rune::ClipboardContent::new("").with_image(image));
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft_images.len(), 1);
+        assert!(rt.state.current().draft.text.is_empty());
+        assert!(rt.state.current().has_draft_content());
+        assert!(rt.find("send-message").is_some());
+        let id = rt.state.current().draft_images[0].id.clone();
+        assert!(rt.find(&format!("attachment-{id}")).is_some());
+    }
+
+    #[test]
+    fn dropping_an_image_file_attaches_it_from_the_composer() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let path = std::env::temp_dir().join(format!(
+            "shina-ui-drop-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, ui_png(2)).unwrap();
+        let (rect, _) = rt.presented("composer").unwrap();
+        rt.drop_files(
+            vec![path.clone()],
+            Some((rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)),
+        );
+        rt.frame(0.0);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(rt.state.current().draft_images.len(), 1);
+        assert_eq!(
+            rt.state.current().draft_images[0].name,
+            path.file_name().unwrap().to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn attachment_chips_stay_inside_a_narrow_composer() {
+        let mut rt = runtime(620.0);
+        rt.frame(0.0);
+        rt.state.attach_image("wide screenshot.png", &ui_png(40));
+        rt.frame(0.0);
+        let (rect, _) = rt.presented("composer").unwrap();
+        assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5);
+        let id = rt.state.current().draft_images[0].id.clone();
+        let (chip, _) = rt.presented(&format!("attachment-{id}")).unwrap();
+        assert!(
+            chip[0] >= rect[0] && chip[0] + chip[2] <= rect[0] + rect[2] + 0.5,
+            "attachment chip overflows the composer: {chip:?} in {rect:?}"
+        );
     }
 }
