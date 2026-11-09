@@ -4,6 +4,9 @@ use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
+/// The label shown when a thread uses whatever model Pi is configured with.
+pub const DEFAULT_MODEL: &str = "Default model";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Offline,
@@ -120,7 +123,7 @@ impl Thread {
             tools: vec![],
             draft: TextEdit::default(),
             pi: None,
-            model: "Default model".into(),
+            model: DEFAULT_MODEL.into(),
             thinking: String::new(),
             model_provider: String::new(),
             model_id: String::new(),
@@ -978,7 +981,7 @@ impl State {
         thread.title = "Fix the reconnect listener".into();
         thread.captain = Some(0);
         thread.status = Status::Settled;
-        thread.model = "Default model".into();
+        thread.model = DEFAULT_MODEL.into();
         thread.thinking = "medium".into();
         thread.elapsed = Some(42);
         thread.messages = vec![
