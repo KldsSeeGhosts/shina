@@ -21,6 +21,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 9 | 8.3 | 9.0 | 8.2 (Capy 8.5) | 3 of 3 approve |
 | 10 | 8.4 | 8.9 | 8.3 (Capy 8.2) | 3 of 3 approve |
 | 11 | 8.4 | 9.0 | 8.4 (Capy 8.0) | 2 of 3 approve |
+| 12 | 8.6 | 9.0 | 8.4 (Capy 8.4) | 3 of 3 approve |
 
 ## Round 1
 
@@ -151,3 +152,16 @@ Shipped in round 11: right-pointing disclosure chevrons that open the activity p
 | **Average** | 6.0 | 8.2 | **8.4** | 9.0 | 8.4 / **8.4** / 8.0 | 2 of 3 |
 
 GPT found the gain too small to count as a whole-product advance; the orchestrator merged on the strength of the corrections. All three flag Sable's sidebar check, still teal while Settled is muted elsewhere. Open items: the native-width column leaves a large empty pane, the sidebar footer rule runs past the row column, the captain row stays selected while a nested thread is open, and demo suggestion pills look enabled.
+
+Shipped in round 12: one muted settled check, captain selection only on the captain home, a contained sidebar footer rule, an 896px native measure, a firmer dark composer and send button, 0.28 light scrims, no placeholder model label, and disabled demo suggestions.
+
+## Round 12 (`r12/`)
+
+| Judge | Baseline | Round 11 | Round 12 | Capy | Crew art r11 / r12 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 6.0 | 8.0 | 8.2 | 8.5 | 8.0 / 8.0 / 7.5 | yes |
+| GPT 6.1 Sol | 6.9 | 8.4 | 8.6 | 9.0 | 8.3 / 8.3 / 8.5 | yes |
+| Gemini 4 Argon | 6.2 | 8.6 | 8.9 | 9.4 | 8.9 / 8.9 / 9.2 | yes |
+| **Average** | 6.4 | 8.3 | **8.6** | 9.0 | 8.4 / **8.4** / 8.4 | 3 of 3 |
+
+Gains are now about 0.2 a round; the remaining gaps are structural. All three ask for wide-window code and heading sizes to scale with the 14px body. Gemini finds the 50% demo suggestion pills washed out, while GPT approves them. Open items: an in-pane header, relative times on sidebar rows, the nested selection touching the guide line, dark tonal steps, and a demo composer that still accepts typing.

@@ -75,7 +75,7 @@ fn body_style(wide: bool) -> TextStyle {
     }
 }
 fn measure(wide: bool) -> f32 {
-    if wide { 832.0 } else { 768.0 }
+    if wide { 896.0 } else { 768.0 }
 }
 const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
@@ -601,7 +601,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
         .center()
         .modal(false, |s: &mut State| s.settings_picker = None)
         .on_press(|s: &mut State| s.settings_picker = None)
@@ -747,7 +747,14 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                 .child(avatar(s, p, captain, 24.0, state))
                 .child(label(
                     &s.captains[captain].name,
-                    TextStyle::new(13.0, if selected { 560.0 } else { 450.0 }),
+                    TextStyle::new(
+                        13.0,
+                        if selected && s.current().captain_home {
+                            560.0
+                        } else {
+                            450.0
+                        },
+                    ),
                     p.ink,
                 ))
                 .child(spacer());
@@ -769,8 +776,11 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             if state == Status::Waiting {
                 captain_row = captain_row.child(label("Needs you", SMALL, status_ink(state, p)));
             } else if state == Status::Settled {
-                captain_row =
-                    captain_row.child(el().size(24.0, 24.0).center().child(icon("check", p.teal)));
+                captain_row = captain_row.child(
+                    el().size(24.0, 24.0)
+                        .center()
+                        .child(icon("check", status_ink(state, p))),
+                );
             }
             content = content.child(captain_row);
             if selected {
@@ -839,7 +849,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         row()
             .h(31.0)
             .center_y()
-            .gap(6.0)
+            .gap(8.0)
             .px(8.0)
             .child(icon("folder", p.muted))
             .child(
@@ -885,7 +895,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             })
             .child(content),
     );
-    side = side.child(rule(p)).child(
+    side = side.child(row().px(8.0).w_full().child(rule(p))).child(
         row()
             .h(48.0)
             .px(8.0)
@@ -1177,7 +1187,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         );
     for captain in 0..s.captains.len() {
         let state = s.captain_status(captain);
-        let open = s.current().captain == Some(captain);
+        let open = s.current().captain == Some(captain) && s.current().captain_home;
         card = card.child(
             row()
                 .key(format!("choose-captain-{captain}"))
@@ -1250,7 +1260,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
         .center()
         .modal(false, |s: &mut State| s.captain_picker = false)
         .on_press(|s: &mut State| s.captain_picker = false)
@@ -1415,7 +1425,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .w_full()
         .h_full()
         .padding(16.0)
-        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
         .center()
         .modal(false, |s: &mut State| s.captain_editor = None)
         .on_press(|s: &mut State| s.captain_editor = None)
@@ -1643,13 +1653,17 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     "Understand project",
                     "Read this project and explain its architecture. Do not change any files.",
                     p,
-                ))
+                )
+                .opacity(if s.demo { 0.5 } else { 1.0 })
+                .disabled(s.demo))
                 .child(suggestion(
                     "suggest-plan",
                     "Plan a change",
                     "Help me plan a change to this project. Start by asking what I want to build.",
                     p,
-                )),
+                )
+                .opacity(if s.demo { 0.5 } else { 1.0 })
+                .disabled(s.demo)),
         );
     } else {
         let start = t.messages.len().saturating_sub(100);
@@ -1704,7 +1718,11 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                             TextStyle::new(13.0, 600.0),
                             p.ink,
                         ))
-                        .child(label(&t.model, SMALL, p.muted));
+                        .child(if t.model == crate::model::DEFAULT_MODEL {
+                            el()
+                        } else {
+                            label(&t.model, SMALL, p.muted)
+                        });
                     response = response.child(heading);
                 } else if let Some(seconds) = t.elapsed {
                     response = response.child(disclosure(
@@ -1832,7 +1850,13 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .size(28.0, 28.0)
         .radius(7.0)
         .center()
-        .fill(if can_send { p.teal } else { p.selected })
+        .fill(if can_send {
+            p.teal
+        } else if s.dark {
+            Color::WHITE.alpha(0.12)
+        } else {
+            p.selected
+        })
         .child(icon("send", if can_send { p.card } else { p.muted }))
         .disabled(!can_send);
     if can_send {
@@ -1859,7 +1883,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             .key("composer")
             .radius(12.0)
             .fill(p.card)
-            .border(0.5, p.line)
+            .border(if s.dark { 1.0 } else { 0.5 }, p.line)
             .shadow(
                 2.0,
                 6.0,
