@@ -134,10 +134,12 @@ def expression(cv, face):
         cv.span(23, 18, 21, "M")
         cv.span(24, 19, 20, "m")
     elif face == "Determined":
-        lidded(cv)
-        brows(cv, [(11, 12), (12, 12), (13, 13), (14, 13), (15, 14), (16, 14)],
-              [(23, 14), (24, 14), (25, 13), (26, 13), (27, 12), (28, 12)])
-        cv.span(24, 18, 21, "M")
+        # Working: focused, not angry. Level brows, open eyes, a "..." in the tile corner.
+        eyes_open(cv)
+        brows(cv, [(12, 13), (13, 13), (14, 13), (15, 13)], [(24, 13), (25, 13), (26, 13), (27, 13)])
+        cv.span(24, 19, 20, "M")
+        for x in (32, 34, 36):
+            cv.put(x, 4, "w")
     elif face == "Surprised":
         for x0 in EYES:
             cv.mask(14, x0, ".lll.", None)
@@ -326,7 +328,7 @@ CREW = [
         "a": "#ef7a62", "A": "#b0503e", "d": "#3a2a30", "q": "#ef7a62", "Q": "#ef7a62",
     }),
     ("pip", pip, None, "#8a76b0", {
-        "h": "#f2e2b0", "H": "#c9b27a", "g": "#fffae6",
+        "h": "#ecd28a", "H": "#c2a45e", "g": "#fff4cf",
         "i": "#3f78d8", "I": "#1f3f8c", "j": "#8cb8f4",
         "c": "#2f5a44", "C": "#1f3e2f", "e": "#f4f0e6", "E": "#cfc8b8",
         "a": "#e2607a", "A": "#a83a52", "d": "#5a3e2c", "q": "#5a3e2c", "Q": "#5a3e2c",
@@ -377,7 +379,7 @@ def render(draw, extra, tile, colors, face):
 
 
 # The face occupies roughly x 6..33 and y 3..30; this square crop fills small tiles with it.
-SMALL_CROP = (5, 3, 35, 33)
+SMALL_CROP = (6, 4, 34, 32)
 
 
 def main():

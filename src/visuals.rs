@@ -59,6 +59,8 @@ pub struct Artwork {
     /// Head crops for tiles of 24 px and below, where the full bust is too small to read.
     small: [Set; CAPTAIN_NAMES.len()],
     pub mark: Image,
+    /// The same mark with a light badge, for the dark theme.
+    pub mark_dark: Image,
 }
 
 impl Artwork {
@@ -70,17 +72,23 @@ impl Artwork {
             std::array::from_fn(|captain| portraits(&cache, captain, root.as_deref()));
         let [(c0, s0), (c1, s1), (c2, s2), (c3, s3)] = sets;
         let (crew, small) = ([c0, c1, c2, c3], [s0, s1, s2, s3]);
-        let mark = mark(&cache);
+        let mark_dark = mark(&cache, true);
+        let mark = mark(&cache, false);
         // Startup only. Decode off-thread before the first frame, including headless fixtures.
         for image in crew
             .iter()
             .chain(&small)
             .flatten()
-            .chain(std::iter::once(&mark))
+            .chain([&mark, &mark_dark])
         {
             image.wait().expect("valid crew artwork");
         }
-        Arc::new(Self { crew, small, mark })
+        Arc::new(Self {
+            crew,
+            small,
+            mark,
+            mark_dark,
+        })
     }
 
     pub fn face(&self, captain: usize, face: Face) -> &Image {
@@ -206,15 +214,18 @@ fn embedded(cache: &ImageCache, captain: usize) -> (Set, Set) {
 }
 
 /// A small original pixel mark: a dark crew badge with a cream "S" and three service dots.
-fn mark(cache: &ImageCache) -> Image {
+fn mark(cache: &ImageCache, light: bool) -> Image {
     const SIZE: usize = 24;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     let mut put = |x: usize, y: usize, color: [u8; 4]| {
         let at = (y * SIZE + x) * 4;
         rgba[at..at + 4].copy_from_slice(&color);
     };
-    let ink = [35, 35, 31, 255];
-    let cream = [244, 239, 227, 255];
+    let (ink, cream) = if light {
+        ([236, 236, 238, 255], [30, 30, 32, 255])
+    } else {
+        ([35, 35, 31, 255], [244, 239, 227, 255])
+    };
     let green = [143, 188, 106, 255];
     let orange = [224, 122, 84, 255];
     let blue = [106, 168, 200, 255];
