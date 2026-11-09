@@ -2,9 +2,11 @@
 
 mod backend;
 mod captains;
+mod install;
 mod model;
 mod store;
 mod ui;
+mod update;
 mod visuals;
 
 use model::State;
@@ -50,7 +52,32 @@ fn main() {
         eprintln!("Could not set the Shina window icon: {error}");
     }
     let args = rune::extra_args();
-    let mut workspace = std::env::current_dir().expect("current directory");
+    if args.iter().any(|a| a == "--install") {
+        // Install this build, then hand over to the installed copy.
+        match install::install() {
+            Ok(installed) => {
+                let _ = std::process::Command::new(installed).spawn();
+            }
+            Err(error) => {
+                eprintln!("Could not install Shina: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--uninstall") {
+        if let Err(error) = install::uninstall() {
+            eprintln!("Could not uninstall Shina: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    install::remove_replaced_exe();
+    // The installed app reopens the last workspace; development builds use the current folder.
+    let mut workspace = install::is_installed()
+        .then(install::last_workspace)
+        .flatten()
+        .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
     let mut demo = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {

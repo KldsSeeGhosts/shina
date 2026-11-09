@@ -645,6 +645,9 @@ pub struct State {
     pub search_open: bool,
     pub settings_picker: Option<SettingsPicker>,
     pub model_search: TextEdit,
+    pub updater: crate::update::Updater,
+    /// Set by the update button; `poll` restarts once no thread is busy.
+    pub restart_for_update: bool,
 }
 
 impl State {
@@ -673,6 +676,8 @@ impl State {
             search_open: false,
             settings_picker: None,
             model_search: TextEdit::default(),
+            updater: Default::default(),
+            restart_for_update: false,
         };
         if demo {
             state.populate_demo();
@@ -897,6 +902,10 @@ impl State {
         if self.demo {
             return;
         }
+        if crate::install::is_installed() {
+            crate::install::remember_workspace(&self.workspace);
+        }
+        self.updater.check(wake.clone());
         let Some(path) = crate::store::path(&self.workspace) else {
             return;
         };
@@ -1067,8 +1076,22 @@ impl State {
     }
 }
 
-pub fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
-    let mut changed = false;
+pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    let mut changed = state.updater.poll();
+    if state.restart_for_update {
+        state.restart_for_update = false;
+        changed = true;
+        if state.threads.iter().any(|t| t.status.busy()) {
+            state.current_mut().error =
+                Some("Stop running threads before restarting to update.".into());
+        } else {
+            state.checkpoint();
+            match state.updater.install_and_relaunch(&state.workspace) {
+                Ok(()) => tx.quit(),
+                Err(error) => state.current_mut().error = Some(error),
+            }
+        }
+    }
     for (index, thread) in state.threads.iter_mut().enumerate() {
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for _ in 0..256 {
