@@ -382,7 +382,7 @@ fn status_mark(status: Status, p: Palette, size: f32) -> El {
 /// A status chip for states that need attention. A finished or idle thread shows nothing:
 /// the reply itself says it is done, and background completions use the unread badge.
 fn status(status: Status, p: Palette) -> El {
-    if matches!(status, Status::Ready | Status::Settled | Status::Offline) {
+    if matches!(status, Status::Ready | Status::Settled) {
         return el();
     }
     row()
@@ -544,7 +544,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
     let mut choices = col().w_full().max_h(300.0).gap(4.0).scroll(ScrollSpec {
         stick_bottom: false,
     });
-    let can_choose = !t.status.busy() && !t.configuring && t.pi.is_some();
+    let can_choose = !t.status.busy() && !t.configuring;
     if is_model {
         let query = s.model_search.text.to_lowercase();
         let mut count = 0;
@@ -565,6 +565,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
                     move |s| {
                         s.current_mut().set_model(provider.clone(), id.clone());
                         s.settings_picker = None;
+                        s.checkpoint();
                     },
                 )
                 .h(32.0)
@@ -577,10 +578,10 @@ fn settings_picker(s: &State, p: Palette) -> El {
         if count == 0 {
             choices = choices.child(
                 label(
-                    if t.status == Status::Connecting {
-                        "Reading Pi's configured models..."
-                    } else if t.pi.is_none() {
-                        "Connect Pi to read its configured models."
+                    if t.models.is_empty() && s.catalog.remaining().is_some() {
+                        "Reading the CPA catalog..."
+                    } else if t.models.is_empty() {
+                        "No CPA models are available."
                     } else {
                         "No matching configured models."
                     },
@@ -597,6 +598,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 button(&format!("choose-thinking-{index}"), level, p, move |s| {
                     s.current_mut().set_thinking(value.clone());
                     s.settings_picker = None;
+                    s.checkpoint();
                 })
                 .fill(if *level == t.thinking {
                     p.teal_bg
@@ -624,6 +626,11 @@ fn settings_picker(s: &State, p: Palette) -> El {
     );
     if let Some(error) = &t.error {
         card = card.child(label(error, SMALL, p.danger).wrap_anywhere());
+    }
+    if let Some(error) = &s.catalog.error {
+        card = card
+            .child(label(error, SMALL, p.danger).wrap_anywhere())
+            .child(button("retry-catalog", "Retry", p, |s| s.refresh_catalog()));
     }
     el().key("pi-settings-backdrop")
         .instant_changes()
@@ -1337,8 +1344,7 @@ fn section_title(title: &str, p: Palette) -> El {
 fn face_for(status: Status) -> crate::visuals::Face {
     use crate::visuals::Face;
     match status {
-        Status::Offline => Face::Sad,
-        Status::Connecting | Status::Ready => Face::Normal,
+        Status::Ready => Face::Normal,
         Status::Running => Face::Determined,
         Status::Waiting => Face::Surprised,
         Status::Settled => Face::Happy,
@@ -1352,7 +1358,7 @@ fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> E
 fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let radius = if size >= 30.0 { 9.0 } else { 4.0 };
-    let mut portrait = el()
+    let portrait = el()
         .key(format!("avatar-{captain}-{}", size as u32))
         .size(size, size)
         .radius(radius)
@@ -1367,9 +1373,6 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
             .pixels(),
         )
         .a11y_hidden();
-    if status == Status::Offline {
-        portrait = portrait.opacity(0.62);
-    }
     if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
         // A backing disc in the surface color keeps the mark readable over the artwork.
         let (backing, mark) = if size <= 16.0 {
@@ -1397,15 +1400,7 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .center_y()
         .gap(5.0)
         .child(status_mark(status, p, 6.0))
-        .child(label(
-            if status == Status::Offline {
-                "Not started"
-            } else {
-                status.label()
-            },
-            SMALL,
-            status_ink(status, p),
-        ))
+        .child(label(status.label(), SMALL, status_ink(status, p)))
 }
 fn counter(count: usize, p: Palette) -> El {
     el().min_w(16.0)
@@ -1502,7 +1497,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     }
     let detailed = matches!(
         thread.status,
-        Status::Running | Status::Waiting | Status::Failed | Status::Connecting
+        Status::Running | Status::Waiting | Status::Failed
     );
     if !detailed {
         return item.child(title);
@@ -2295,12 +2290,8 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     )),
             );
         }
-        if t.session.is_some() {
-            introduction = introduction.child(label(
-                "Connect Pi to resume this conversation.",
-                SMALL,
-                p.muted,
-            ));
+        if t.restoring_history() {
+            introduction = introduction.child(label("Restoring conversation...", SMALL, p.muted));
         }
         return introduction.child(
             row()
@@ -2508,7 +2499,12 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                     label(error, BODY, p.danger)
                         .wrap_anywhere()
                         .selectable(true),
-                ),
+                )
+                .child(if !t.status.busy() {
+                    button("retry-session", "Retry", p, |s| s.retry())
+                } else {
+                    el()
+                }),
         );
     }
     if t.request.is_some() {
@@ -2602,7 +2598,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                         dropdown("choose-pi-model", &t.model, p, |s| {
                             s.model_search.replace_text("");
                             s.settings_picker = Some(SettingsPicker::Model);
-                            s.connect();
+                            s.refresh_catalog();
                         })
                         .max_w(if narrow { 112.0 } else { 230.0 })
                         .opacity(if locked { 0.65 } else { 1.0 })
@@ -2611,23 +2607,12 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                     .child(
                         dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
                             s.settings_picker = Some(SettingsPicker::Thinking);
-                            s.connect();
+                            s.refresh_catalog();
                         })
                         .opacity(if locked { 0.65 } else { 1.0 })
                         .disabled(locked),
                     )
                     .child(spacer())
-                    .child(if s.demo {
-                        el()
-                    } else if t.pi.is_none() {
-                        button("connect-pi", "Connect Pi", p, |s| s.connect()).fill(p.teal_bg)
-                    } else if !t.status.busy() {
-                        button("disconnect-pi", "Disconnect", p, |s| {
-                            s.current_mut().disconnect()
-                        })
-                    } else {
-                        el()
-                    })
                     .child(action),
             ),
     );
@@ -3144,13 +3129,37 @@ mod tests {
         );
     }
     #[test]
+    fn composer_has_no_connection_controls_and_pickers_work_without_a_process() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true,
+             "thinkingLevelMap":{"minimal":null,"low":null,"medium":null}}
+        ]}}));
+        rt.frame(0.0);
+        assert!(rt.find("connect-pi").is_none());
+        assert!(rt.find("disconnect-pi").is_none());
+        press(&mut rt, "choose-pi-model");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "choose-model-0");
+        assert!(rt.state.current().pi.is_none());
+        assert_eq!(rt.state.current().model_id, "model-a");
+        rt.frame(0.0);
+        press(&mut rt, "choose-pi-thinking");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "choose-thinking-1");
+        assert_eq!(rt.state.current().thinking, "high");
+        assert!(rt.state.current().pi.is_none());
+    }
+
+    #[test]
     fn native_model_and_reasoning_pickers_send_real_rpc_commands() {
         let mut rt = runtime(1280.0);
         let (pi, commands, _events) = crate::backend::Pi::test_connection();
         rt.state.current_mut().pi = Some(pi);
         rt.state.current_mut().status = Status::Ready;
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
-            {"provider":"cpa","id":"model-a","name":"Model A"}
+            {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true,
+             "thinkingLevelMap":{"minimal":null,"low":null,"medium":null}}
         ]}}));
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","high"]}}));
         rt.frame(0.0);

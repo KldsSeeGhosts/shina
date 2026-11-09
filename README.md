@@ -12,9 +12,9 @@ The development tools and Pi are already installed on this workstation.
 cargo run
 ```
 
-Click the project name at the top of the thread list to open the project switcher. It lists your recent projects and has **Open folder...** (Ctrl+O) and **Clone repository...**. Choose a project, then send a message. Shina connects Pi first, waits for its state and history, and submits your current draft once. **Connect Pi** is still available for a read-only connection. Sending a message starts agent work and can consume your CPA upstream quota.
+Click the project name at the top of the thread list to open the project switcher. It lists your recent projects and has **Open folder...** and **Clone repository...**. Choose a project, then send a message. Your message appears immediately and the thread shows Working until Pi responds. Shina prepares Pi in the background when you start a draft, or on send if needed. There is no connection step. Sending a message starts agent work and can consume your CPA upstream quota.
 
-The model and reasoning controls in the composer are live Pi RPC controls. The model picker shows only your shared CPA catalog models. It supports filtering by model name, ID, or provider. Shina refuses to send prompts through a direct provider, including when an older session restores one.
+The model and reasoning controls work before a thread has a Pi process. A separate, short-lived Pi discovery process reads your shared CPA catalog and model-specific thinking levels without sending a prompt or saving a session. Choices stay on the thread and apply before its next prompt. The model picker supports filtering by model name, ID, or provider. Shina refuses to send prompts through a direct provider, including when an older session restores one.
 
 For an example conversation without an agent connection:
 
@@ -58,16 +58,17 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 
 ## What works
 
-- Native chat with streamed text, selectable Markdown, syntax-highlighted code blocks, and a bottom composer. The first send connects automatically without clearing the draft until Pi is ready.
+- Native chat with streamed text, selectable Markdown, syntax-highlighted code blocks, and a bottom composer. Sending immediately adds the submitted message without waiting for process startup.
 - CPA catalog model selection and model-specific reasoning levels through Pi RPC. Pi's existing CPA default is used for new sessions.
 - A native sidebar and chat reconstruction with variable Inter typography, light/dark palettes, compact tabs, search, and an optional overview pane.
-- Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, Happy when settled, and Sad when offline. The set is Ember, Juniper, Sable, and Pip.
+- Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, and Happy when settled. The set is Ember, Juniper, Sable, and Pip.
 - Captain conversation groups with nested threads, a native Captain picker that shows each captain's live status, and thread pinning.
-- Independent Pi processes for connected threads. Switching threads preserves their drafts and leaves other work running.
+- Independent Pi processes for active threads. Switching threads preserves their drafts and leaves other work running. Shina releases processes after 30 idle minutes and resumes their saved session on the next send.
 - Running, needs-input, and failed states. `agent_end` does not finish a run; the adapter waits for `agent_settled`. A finished thread goes quiet instead of showing a status, and a stopped run returns to idle. Background threads that finish get an unread badge.
 - Canceling a run clears the queue before requesting an abort.
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
-- An atomic per-workspace index remembers thread titles, archive state, and Pi session paths. Reconnect to load a saved transcript, tool summaries, and tool results.
+- An atomic per-workspace index remembers thread titles, archive state, model/thinking choices, and Pi session paths. Opening a saved thread restores its transcript, tool summaries, and tool results automatically.
+- Process crashes show an inline error with Retry. Shina never automatically replays a prompt that might already have run tools. Retrying an accepted run can repeat tool actions, so check any partial result first.
 - Live progress distinguishes model thinking, text generation, tool execution, retries, and compaction. Rejected prompts return to the draft; cancellation releases a pending dialog before clearing the queue and aborting.
 - A project switcher with recent projects, native folder selection, and cloning. Switching folders refuses to discard unsent drafts or interrupt busy threads, and names the thread that blocks it.
 - Recent projects are saved in `%LOCALAPPDATA%\Shina\projects.json`, which replaces `last-workspace.txt` (read once to seed the list). Projects whose folder is missing are hidden from the menu but kept in the file.
@@ -75,7 +76,7 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 
 Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+O to open a folder, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
 
-Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working, settled, and offline states. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
+Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working and idle states. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
 
 ## Shina MCP
 
@@ -105,7 +106,7 @@ Pi tools can edit files and execute commands with your account's permissions. Th
 
 Pi launches with automatic extension discovery, MCP, skills, and prompt templates disabled. Shina explicitly loads only your existing `extensions/cpa-provider.ts` from Pi's agent directory. That extension reads your existing CPA catalog enrollment and credentials and supplies the proxy routes, transport metadata, and reasoning capabilities. No model list or credential is copied into this repository. **Do not use this version if you depend on another Pi extension for safety checks or tool approvals.** The adapter does not rewrite provider configuration or authentication.
 
-Pi must already be enrolled in CPA with `~/.pi/agent/cpa-catalog.json`, its catalog client, and `extensions/cpa-provider.ts`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports a missing provider extension instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. If model definitions change, disconnect and reconnect the thread to load the latest catalog.
+Pi must already be enrolled in CPA with `~/.pi/agent/cpa-catalog.json`, its catalog client, and `extensions/cpa-provider.ts`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports a missing provider extension instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. Opening a picker refreshes catalog metadata after five minutes. Running processes read changed provider definitions when Shina next starts them, or after an app restart.
 
 On Windows, Shina's small workspace index lives under `%LOCALAPPDATA%\Shina`. A Still-era index is copied over on first launch, so renaming the app does not lose saved threads. Pi keeps its own session files and credentials in its normal locations outside this repository. Drafts currently survive thread switches, but not app restarts. Run one Shina instance per workspace to avoid competing index writes.
 
@@ -117,12 +118,14 @@ Closing Shina closes the agent input pipes and waits for shutdown. After a short
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test installed_pi_answers_state_and_history_without_a_prompt -- --ignored
+cargo test installed_pi_uses_captain_system_instructions -- --ignored
+cargo test installed_pi_calls_shina_mcp_tools -- --ignored
 cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
 cargo test installed_pi_parent_is_woken_by_child_completion -- --ignored --nocapture
 cargo test real_clone_of_a_public_repository -- --ignored
 ```
 
-The first opt-in integration test starts the installed Pi and verifies CPA model discovery, reasoning levels, state, and history. It sends no model prompt. The second sends one prompt through the configured CPA model, reads and edits a disposable text fixture, waits for settlement, and reconnects to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota and leave Pi's test sessions in its normal session directory.
+The first opt-in integration test verifies CPA model discovery, reasoning levels, state, and history without a model prompt. The captain and MCP tests send real CPA prompts through automatic startup. The file-edit test edits a disposable fixture and resumes its session to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota and leave Pi's test sessions in its normal session directory.
 
 The clone test clones two small public GitHub repositories, one with `gh` and one with `git`, into a temporary folder and deletes them afterwards.
 
@@ -140,13 +143,13 @@ cargo run -- --demo --scene clone --snap artifacts\shina-clone.png --size 1280x8
 
 ## Implementation and limits
 
-`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns thread state. `src/backend.rs` handles subprocesses and JSONL framing on worker threads. `src/store.rs` saves the workspace index off the render thread. `src/projects.rs` keeps the recent projects list and runs clones.
+`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns thread state and automatic session lifetimes. `src/session.rs` caches provider metadata independently of thread runtimes. `src/backend.rs` handles subprocesses and JSONL framing on worker threads. `src/store.rs` saves the workspace index off the render thread. `src/projects.rs` keeps the recent projects list and runs clones.
 
-Rune is pre-release and pinned to revision `a7f276c3630f85a06a0230295da4d2bd172d8d3b`. The app batches incoming records, bounds pipe queues, memoizes rendered Markdown, and uses Rune's event-driven redraw behavior. These are design choices, not proof of production performance. Each connected thread still has the memory cost of its Pi process.
+Rune is pre-release and pinned to revision `a7f276c3630f85a06a0230295da4d2bd172d8d3b`. The app batches incoming records, bounds pipe queues, memoizes rendered Markdown, and uses Rune's event-driven redraw behavior. These are design choices, not proof of production performance. Each active thread has the memory cost of its Pi process until idle reclaim.
 
 The earlier layout's release build reported forced at-rest CPU times below 0.15 ms at p95 for a small static example. That measurement predates the crew portrait pass and is not a benchmark of this revised layout, interactive frame rate, or live Pi work.
 
-This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees, multi-project concurrent work, crash recovery, and packaging/installers remain unfinished. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
+This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees, multi-project concurrent work, and packaging/installers remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
 
 The supplied `assets/project-icon.png` is the T3 Code project favicon and the source for Shina's executable, taskbar, and window icons. The build generates Windows icon sizes without smoothing the pixel art. This user-supplied artwork is separate from the code's MIT license.
 

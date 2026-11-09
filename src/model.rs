@@ -1,5 +1,6 @@
 use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
+use crate::session::{AgentModel, Catalog, IDLE_TIMEOUT, START_TIMEOUT};
 use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 use std::{
@@ -28,8 +29,6 @@ struct TaskWaiter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    Offline,
-    Connecting,
     Ready,
     Running,
     Waiting,
@@ -40,8 +39,6 @@ pub enum Status {
 impl Status {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Offline => "Offline",
-            Self::Connecting => "Connecting",
             Self::Ready => "Ready",
             Self::Running => "Working",
             Self::Waiting => "Needs you",
@@ -50,19 +47,17 @@ impl Status {
         }
     }
     pub fn busy(self) -> bool {
-        matches!(self, Self::Connecting | Self::Running | Self::Waiting)
+        matches!(self, Self::Running | Self::Waiting)
     }
     /// Which state a captain's portrait should show when its threads disagree. Attention
-    /// outranks work, work outranks a ready conversation, and an empty crew is offline.
+    /// outranks work, and work outranks a ready conversation.
     pub fn urgency(self) -> u8 {
         match self {
             Self::Failed => 6,
             Self::Waiting => 5,
             Self::Running => 4,
-            Self::Connecting => 3,
             Self::Ready => 2,
             Self::Settled => 1,
-            Self::Offline => 0,
         }
     }
 }
@@ -128,13 +123,6 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentModel {
-    pub provider: String,
-    pub id: String,
-    pub name: String,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPicker {
     Model,
@@ -178,7 +166,16 @@ pub struct Thread {
     serial: usize,
     state_loaded: bool,
     history_loaded: bool,
-    send_when_ready: bool,
+    initializing: bool,
+    session_started: Option<Instant>,
+    last_activity: Instant,
+    prewarm_attempted: bool,
+    pub selected_model: Option<(String, String)>,
+    pub selected_thinking: Option<String>,
+    startup_model_applied: bool,
+    startup_thinking_applied: bool,
+    queued_prompt: Option<(String, usize)>,
+    retry_prompt: Option<String>,
     pending_thinking: Option<String>,
     pending_prompt: Option<(String, String, usize)>,
     pending_injections: VecDeque<Injection>,
@@ -192,7 +189,7 @@ impl Thread {
         Self {
             id,
             title: "New thread".into(),
-            status: Status::Offline,
+            status: Status::Ready,
             messages: vec![],
             tools: vec![],
             draft: TextEdit::default(),
@@ -224,7 +221,16 @@ impl Thread {
             serial: 0,
             state_loaded: false,
             history_loaded: false,
-            send_when_ready: false,
+            initializing: false,
+            session_started: None,
+            last_activity: Instant::now(),
+            prewarm_attempted: false,
+            selected_model: None,
+            selected_thinking: None,
+            startup_model_applied: false,
+            startup_thinking_applied: false,
+            queued_prompt: None,
+            retry_prompt: None,
             pending_thinking: None,
             pending_prompt: None,
             pending_injections: VecDeque::new(),
@@ -249,27 +255,29 @@ impl Thread {
             return;
         }
         self.error = None;
-        self.status = Status::Connecting;
+        if !self.pending_injections.is_empty() && !self.status.busy() {
+            self.arm_task();
+            self.status = Status::Running;
+            self.started = None;
+            self.phase = "Working".into();
+        } else if self.status == Status::Failed {
+            self.status = Status::Ready;
+        }
+        self.initializing = true;
+        self.prewarm_attempted = true;
+        self.session_started = Some(Instant::now());
+        self.last_activity = Instant::now();
         self.state_loaded = false;
         self.history_loaded = false;
-        self.models.clear();
-        self.thinking_levels.clear();
-        self.pi = Some(match instructions {
-            Some(instructions) => Pi::start_with_instructions(
-                path,
-                self.session.clone(),
-                wake,
-                Some(instructions),
-                self.host.clone(),
-            ),
-            None => Pi::start_with_instructions(
-                path,
-                self.session.clone(),
-                wake,
-                None,
-                self.host.clone(),
-            ),
-        });
+        self.startup_model_applied = false;
+        self.startup_thinking_applied = false;
+        self.pi = Some(Pi::start_with_instructions(
+            path,
+            self.session.clone(),
+            wake,
+            instructions,
+            self.host.clone(),
+        ));
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
@@ -279,19 +287,33 @@ impl Thread {
             );
             return;
         }
-        if !self.status.busy()
-            && !self.configuring
-            && self.command("set_model", json!({"provider":provider,"modelId":model_id}))
-        {
+        if self.status.busy() || self.configuring {
+            return;
+        }
+        self.selected_model = Some((provider.clone(), model_id.clone()));
+        if self.pi.is_none() || self.initializing {
+            self.model_provider = provider;
+            self.model_id = model_id;
+            self.model = self
+                .models
+                .iter()
+                .find(|m| m.id == self.model_id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| self.model_id.clone());
+            self.refresh_thinking_levels();
+        } else if self.command("set_model", json!({"provider":provider,"modelId":model_id})) {
             self.configuring = true;
         }
     }
 
     pub fn set_thinking(&mut self, level: String) {
-        if !self.status.busy()
-            && !self.configuring
-            && self.command("set_thinking_level", json!({"level":level}))
-        {
+        if self.status.busy() || self.configuring {
+            return;
+        }
+        self.selected_thinking = Some(level.clone());
+        if self.pi.is_none() || self.initializing {
+            self.thinking = level;
+        } else if self.command("set_thinking_level", json!({"level":level})) {
             self.configuring = true;
             self.pending_thinking = Some(level);
         }
@@ -304,37 +326,28 @@ impl Thread {
         let result = self
             .pi
             .as_ref()
-            .ok_or_else(|| "Connect Pi before sending a message.".to_owned())
+            .ok_or_else(|| "The session is unavailable. Retry to resume it.".to_owned())
             .and_then(|pi| pi.send(data));
         if let Err(error) = result {
             self.error = Some(error);
             return false;
         }
+        self.last_activity = Instant::now();
         true
     }
 
     pub fn send(&mut self) {
-        if self.status.busy()
-            || self.configuring
-            || self.pi.is_none()
-            || self.draft.text.trim().is_empty()
-        {
+        if self.status.busy() || self.configuring || self.draft.text.trim().is_empty() {
             return;
         }
-        if self.model_provider != "cpa" {
+        if !self.model_provider.is_empty() && self.model_provider != "cpa" {
             self.error = Some("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
         let prompt = self.draft.text.trim().to_owned();
-        if !self.command("prompt", json!({"message":prompt})) {
-            return;
-        }
+        self.queued_prompt = Some((prompt.clone(), self.messages.len()));
+        self.retry_prompt = Some(prompt.clone());
         self.arm_task();
-        self.pending_prompt = Some((
-            format!("{}-{}", self.id, self.serial),
-            prompt.clone(),
-            self.messages.len(),
-        ));
         if self.messages.is_empty() && !self.captain_home {
             self.title = prompt.chars().take(45).collect();
         }
@@ -348,7 +361,9 @@ impl Thread {
         self.elapsed = None;
         self.assistant = None;
         self.error = None;
-        self.phase = "Waiting for Pi".into();
+        self.phase = "Working".into();
+        self.last_activity = Instant::now();
+        self.drive_session();
     }
 
     pub fn stop(&mut self) {
@@ -358,7 +373,7 @@ impl Thread {
     fn stop_task(&mut self) -> Result<(), String> {
         self.pending_injections.clear();
         self.injection_id = None;
-        if self.status == Status::Connecting {
+        if self.initializing || self.queued_prompt.is_some() {
             self.disconnect();
             self.complete_task("cancelled");
             return Ok(());
@@ -390,7 +405,7 @@ impl Thread {
         let result = self
             .pi
             .as_ref()
-            .ok_or_else(|| "Pi is disconnected.".to_owned())
+            .ok_or_else(|| "The session is unavailable. Retry to resume it.".to_owned())
             .and_then(|pi| pi.send(response));
         match result {
             Ok(()) => {
@@ -402,17 +417,24 @@ impl Thread {
     }
 
     pub fn disconnect(&mut self) {
-        if let Some((_, prompt, _)) = self.pending_prompt.take() {
+        if let Some((prompt, index)) = self.queued_prompt.take() {
+            self.remove_optimistic_prompt(&prompt, index);
+            self.restore_prompt(&prompt);
+        }
+        if let Some((_, prompt, index)) = self.pending_prompt.take() {
+            self.remove_optimistic_prompt(&prompt, index);
             self.restore_prompt(&prompt);
         }
         self.pi = None;
-        self.status = Status::Offline;
+        self.status = Status::Ready;
         self.assistant = None;
         self.request = None;
-        self.send_when_ready = false;
+        self.initializing = false;
+        self.session_started = None;
         self.configuring = false;
         self.pending_thinking = None;
         self.injection_id = None;
+        self.started = None;
         self.phase.clear();
     }
 
@@ -446,6 +468,9 @@ impl Thread {
 
     fn flush_injection(&mut self) -> bool {
         if self.pending_injections.is_empty()
+            || self.pi.is_none()
+            || self.initializing
+            || self.queued_prompt.is_some()
             || self.injection_id.is_some()
             || self.configuring
             || self.phase == "Stopping"
@@ -487,6 +512,115 @@ impl Thread {
             self.phase = "Waiting for Pi".into();
         }
         true
+    }
+
+    fn remove_optimistic_prompt(&mut self, prompt: &str, index: usize) {
+        if self
+            .messages
+            .get(index)
+            .is_some_and(|m| m.role == "You" && m.text == prompt)
+        {
+            self.messages.remove(index);
+        }
+    }
+
+    fn fail_session(&mut self, error: String) {
+        self.disconnect();
+        self.error = Some(error);
+        self.status = Status::Failed;
+        self.complete_task("failed");
+    }
+
+    /// Settings and history are transport details, never conversation states.
+    fn drive_session(&mut self) {
+        if self.pi.is_none() || self.configuring || self.status == Status::Failed {
+            return;
+        }
+        if self.initializing {
+            if !(self.state_loaded && self.history_loaded) {
+                return;
+            }
+            if !self.startup_model_applied {
+                self.startup_model_applied = true;
+                if let Some((provider, id)) = self.selected_model.clone() {
+                    self.configuring =
+                        self.command("set_model", json!({"provider":provider,"modelId":id}));
+                    if !self.configuring {
+                        self.fail_session(self.error.clone().unwrap());
+                    }
+                    return;
+                }
+            }
+            if !self.startup_thinking_applied {
+                self.startup_thinking_applied = true;
+                if let Some(level) = self.selected_thinking.clone() {
+                    self.pending_thinking = Some(level.clone());
+                    self.configuring = self.command("set_thinking_level", json!({"level":level}));
+                    if !self.configuring {
+                        self.fail_session(self.error.clone().unwrap());
+                    }
+                    return;
+                }
+            }
+            self.initializing = false;
+            self.session_started = None;
+            if self.queued_prompt.is_none()
+                && self.started.is_none()
+                && self.status == Status::Running
+            {
+                self.status = Status::Ready;
+                self.phase.clear();
+            }
+        }
+        let Some((prompt, index)) = self.queued_prompt.take() else {
+            return;
+        };
+        if self.model_provider != "cpa" {
+            self.queued_prompt = Some((prompt, index));
+            self.fail_session("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
+            return;
+        }
+        if self.command("prompt", json!({"message":prompt})) {
+            self.pending_prompt = Some((format!("{}-{}", self.id, self.serial), prompt, index));
+        } else {
+            self.queued_prompt = Some((prompt, index));
+            self.fail_session(
+                self.error
+                    .clone()
+                    .unwrap_or_else(|| "Pi did not accept the message. Retry to resume.".into()),
+            );
+        }
+    }
+
+    fn refresh_thinking_levels(&mut self) {
+        if let Some(model) = self
+            .models
+            .iter()
+            .find(|m| m.provider == self.model_provider && m.id == self.model_id)
+        {
+            self.thinking_levels = model.thinking_levels.clone();
+        }
+    }
+
+    pub fn restoring_history(&self) -> bool {
+        self.initializing && !self.history_loaded
+    }
+
+    fn reclaim_idle(&mut self, now: Instant) -> bool {
+        if self.pi.is_some()
+            && !self.initializing
+            && !self.configuring
+            && !self.status.busy()
+            && self.pending_injections.is_empty()
+            && self.injection_id.is_none()
+            && now.duration_since(self.last_activity) >= IDLE_TIMEOUT
+        {
+            let status = self.status;
+            self.disconnect();
+            self.status = status;
+            return true;
+        }
+        false
     }
 
     fn assistant(&mut self) -> &mut Message {
@@ -540,6 +674,7 @@ impl Thread {
     }
 
     pub fn apply(&mut self, record: Value) {
+        self.last_activity = Instant::now();
         match string(&record, "type") {
             "response" => {
                 let command = string(&record, "command");
@@ -556,6 +691,10 @@ impl Thread {
                 }
                 if record["success"] == false {
                     self.error = Some(string(&record, "error").to_owned());
+                    if self.initializing {
+                        self.fail_session(self.error.clone().unwrap());
+                        return;
+                    }
                     if matches!(command, "set_model" | "set_thinking_level") {
                         self.configuring = false;
                         self.pending_thinking = None;
@@ -568,17 +707,10 @@ impl Thread {
                         && let Some((_, prompt, index)) = self.pending_prompt.take()
                     {
                         self.restore_prompt(&prompt);
-                        if self
-                            .messages
-                            .get(index)
-                            .is_some_and(|m| m.role == "You" && m.text == prompt)
-                        {
-                            self.messages.remove(index);
-                        }
+                        self.remove_optimistic_prompt(&prompt, index);
                     }
                     if matches!(command, "prompt" | "get_state" | "get_messages") {
                         self.status = Status::Failed;
-                        self.send_when_ready = false;
                         self.started = None;
                         self.complete_task("failed");
                     }
@@ -587,15 +719,18 @@ impl Thread {
                 match command {
                     "get_state" => {
                         let data = &record["data"];
-                        self.update_model(&data["model"]);
-                        self.thinking = string(data, "thinkingLevel").to_owned();
+                        if !self.initializing || self.selected_model.is_none() {
+                            self.update_model(&data["model"]);
+                        }
+                        if !self.initializing || self.selected_thinking.is_none() {
+                            self.thinking = string(data, "thinkingLevel").to_owned();
+                        }
                         self.session = data["sessionFile"].as_str().map(str::to_owned);
                         if record["id"] == "state" {
                             self.state_loaded = true;
                             if data["isStreaming"] == true {
                                 self.status = Status::Running;
-                            } else if self.history_loaded && self.status == Status::Connecting {
-                                self.status = Status::Ready;
+                                self.started.get_or_insert_with(Instant::now);
                             }
                         }
                     }
@@ -603,22 +738,10 @@ impl Thread {
                         self.models = record["data"]["models"]
                             .as_array()
                             .map(|models| {
-                                models
-                                    .iter()
-                                    .filter(|model| model["provider"] == "cpa")
-                                    .filter_map(|model| {
-                                        Some(AgentModel {
-                                            provider: model["provider"].as_str()?.into(),
-                                            id: model["id"].as_str()?.into(),
-                                            name: model["name"]
-                                                .as_str()
-                                                .or(model["id"].as_str())?
-                                                .into(),
-                                        })
-                                    })
-                                    .collect()
+                                models.iter().filter_map(AgentModel::from_value).collect()
                             })
                             .unwrap_or_default();
+                        self.refresh_thinking_levels();
                     }
                     "get_available_thinking_levels" => {
                         self.thinking_levels = record["data"]["levels"]
@@ -633,6 +756,7 @@ impl Thread {
                     }
                     "set_model" => {
                         self.update_model(&record["data"]);
+                        self.refresh_thinking_levels();
                         // Refresh the effective level too. Pi may clamp it for the new model.
                         self.command("get_state", json!({}));
                         self.command("get_available_thinking_levels", json!({}));
@@ -695,10 +819,14 @@ impl Thread {
                             });
                             self.injection_id = None;
                         }
-                        self.history_loaded = true;
-                        if self.state_loaded && self.status == Status::Connecting {
-                            self.status = Status::Ready;
+                        if let Some((prompt, index)) = &mut self.queued_prompt {
+                            *index = self.messages.len();
+                            self.messages.push(Message {
+                                role: "You",
+                                text: prompt.clone(),
+                            });
                         }
+                        self.history_loaded = true;
                     }
                     "prompt" => {
                         if !injection
@@ -849,6 +977,7 @@ impl Thread {
             }
             _ => {}
         }
+        self.drive_session();
     }
 
     fn update_model(&mut self, model: &Value) {
@@ -881,6 +1010,9 @@ impl Thread {
             .or(self.elapsed);
         self.assistant = None;
         self.phase.clear();
+        if self.error.is_none() {
+            self.retry_prompt = None;
+        }
     }
 }
 
@@ -916,6 +1048,8 @@ pub struct State {
     task_waiters: Vec<TaskWaiter>,
     /// Recent projects, the switcher menu, and the clone sheet.
     pub projects: crate::projects::Projects,
+    pub catalog: Catalog,
+    runtime_enabled: bool,
 }
 
 impl State {
@@ -949,6 +1083,8 @@ impl State {
             restart_for_update: false,
             task_waiters: vec![],
             projects: Default::default(),
+            catalog: Catalog::default(),
+            runtime_enabled: false,
         };
         if demo {
             state.populate_demo();
@@ -968,6 +1104,9 @@ impl State {
         self.next_id += 1;
         self.active = self.threads.len() - 1;
         self.show_archive = false;
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
         self.checkpoint();
     }
     pub fn open_captain(&mut self, captain: usize) {
@@ -990,6 +1129,9 @@ impl State {
         }
         self.show_archive = false;
         self.captain_picker = false;
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
         self.checkpoint();
     }
 
@@ -1076,7 +1218,7 @@ impl State {
             .filter(|thread| thread.captain == Some(captain) && !thread.archived)
             .map(|thread| thread.status)
             .max_by_key(|status| status.urgency())
-            .unwrap_or(Status::Offline)
+            .unwrap_or(Status::Ready)
     }
     /// Steps the zoom one notch in (`1`), out (`-1`), or back to 100% (`0`).
     pub fn step_zoom(&mut self, direction: i32) {
@@ -1094,9 +1236,6 @@ impl State {
     pub fn toggle_pin(&mut self) {
         self.current_mut().pinned = !self.current().pinned;
         self.checkpoint();
-    }
-    pub fn connect(&mut self) {
-        self.connect_thread(self.active);
     }
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
     pub fn connect_thread(&mut self, index: usize) {
@@ -1432,13 +1571,78 @@ impl State {
         {
             return;
         }
-        if self.current().pi.is_none() {
-            self.connect();
-            self.current_mut().send_when_ready = true;
-        } else {
-            self.current_mut().send();
+        self.current_mut().send();
+        if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
+            self.connect_thread(self.active);
         }
         self.checkpoint();
+    }
+
+    pub fn retry(&mut self) {
+        if self.demo || self.current().archived || self.current().status.busy() {
+            return;
+        }
+        if self.current().draft.text.trim().is_empty()
+            && let Some(prompt) = self.current().retry_prompt.clone()
+        {
+            self.current_mut().draft.replace_text(&prompt);
+        }
+        if self.current().draft.text.trim().is_empty() {
+            self.current_mut().disconnect();
+            self.current_mut().error = None;
+            self.current_mut().status = Status::Ready;
+            self.connect_thread(self.active);
+        } else {
+            self.send();
+        }
+    }
+
+    pub fn refresh_catalog(&mut self) {
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh(self.workspace.clone(), self.wake.clone());
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    fn apply_catalog(&mut self) {
+        for thread in &mut self.threads {
+            thread.models = self.catalog.models.clone();
+            if thread.model_id.is_empty()
+                && thread.session.is_none()
+                && let Some(model) = &self.catalog.default_model
+            {
+                thread.model_provider = model.provider.clone();
+                thread.model_id = model.id.clone();
+                thread.model = model.name.clone();
+                if thread.selected_thinking.is_none() {
+                    thread.thinking = self.catalog.default_thinking.clone();
+                }
+            }
+            if let Some(model) = thread.models.iter().find(|m| m.id == thread.model_id) {
+                thread.model = model.name.clone();
+            }
+            thread.refresh_thinking_levels();
+        }
+    }
+
+    fn prewarm_current(&mut self) -> bool {
+        let thread = self.current();
+        if self.runtime_enabled
+            && !self.demo
+            && !thread.archived
+            && thread.pi.is_none()
+            && !thread.prewarm_attempted
+            && thread.status != Status::Failed
+            && (!thread.draft.text.trim().is_empty()
+                || (thread.session.is_some() && !thread.history_loaded))
+        {
+            self.connect_thread(self.active);
+            return true;
+        }
+        false
     }
     pub fn switch_workspace(&mut self, path: PathBuf) {
         if let Err(error) = self.try_switch_workspace(path) {
@@ -1453,7 +1657,6 @@ impl State {
                 thread.title,
                 match thread.status {
                     Status::Waiting => "waiting for your reply",
-                    Status::Connecting => "still connecting",
                     _ => "still working",
                 }
             ));
@@ -1496,11 +1699,18 @@ impl State {
             return;
         }
         self.projects.recents = crate::projects::record(&self.workspace);
+        self.runtime_enabled = true;
+        self.refresh_catalog();
         self.updater.check(wake.clone());
         // Thread ids restart per workspace, so tokens from a previous workspace must not carry over.
         if let Ok(server) = crate::mcp::server(wake.clone()) {
             server.reset();
         }
+        self.load_workspace(wake);
+        self.prewarm_current();
+    }
+
+    fn load_workspace(&mut self, wake: Waker) {
         let Some(path) = crate::store::path(&self.workspace) else {
             return;
         };
@@ -1534,6 +1744,18 @@ impl State {
                             let mut thread = Thread::new(id);
                             thread.title = record["title"].as_str()?.into();
                             thread.session = record["session"].as_str().map(str::to_owned);
+                            if let Some(model) = record["model"].as_str() {
+                                // Only CPA choices survive restart, even in hand-edited indexes.
+                                thread.selected_model = Some(("cpa".into(), model.into()));
+                                thread.model_provider = "cpa".into();
+                                thread.model_id = model.into();
+                                thread.model = model.into();
+                            }
+                            thread.selected_thinking =
+                                record["thinking"].as_str().map(str::to_owned);
+                            if let Some(level) = &thread.selected_thinking {
+                                thread.thinking = level.clone();
+                            }
                             thread.archived = record["archived"] == true;
                             thread.captain = if record["captain"].is_null() {
                                 None
@@ -1612,7 +1834,8 @@ impl State {
             "threads":self.threads.iter().map(|thread|json!({
                 "id":thread.id, "title":thread.title, "session":thread.session, "archived":thread.archived,
                 "captain":thread.captain, "captainHome":thread.captain_home, "pinned":thread.pinned, "delegated":thread.delegated,
-                "parent":thread.parent
+                "parent":thread.parent,
+                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
             })).collect::<Vec<_>>()
         });
         if let Some(store) = &mut self.store {
@@ -1729,6 +1952,14 @@ impl State {
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = state.updater.poll();
     changed |= state.poll_projects();
+    if state.catalog.poll() {
+        state.apply_catalog();
+        changed = true;
+    }
+    if let Some(remaining) = state.catalog.remaining() {
+        tx.wake_after(remaining);
+    }
+    changed |= state.prewarm_current();
     if !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
     {
@@ -1769,31 +2000,36 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                     }
                 }
                 Event::Error(error) => {
-                    thread.disconnect();
-                    thread.error = Some(error);
-                    thread.status = Status::Failed;
-                    thread.complete_task("failed");
+                    thread.fail_session(error);
                 }
                 Event::Diagnostic(diagnostic) => thread.diagnostics.push(diagnostic),
                 Event::Exited => {
-                    thread.disconnect();
-                    thread.status = if thread.error.is_some() {
-                        Status::Failed
-                    } else {
-                        Status::Offline
-                    };
-                    thread.complete_task(if thread.error.is_some() {
-                        "failed"
-                    } else {
-                        "cancelled"
-                    });
+                    thread.fail_session(
+                        "Pi stopped unexpectedly. Retry to resume the saved conversation.".into(),
+                    );
                 }
             }
         }
-        if thread.send_when_ready && thread.status == Status::Ready {
-            thread.send_when_ready = false;
-            thread.send();
+        thread.drive_session();
+        if thread
+            .session_started
+            .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
+        {
+            thread.fail_session(
+                "Pi did not finish preparing the session. Retry to resume it.".into(),
+            );
             changed = true;
+        }
+        changed |= thread.reclaim_idle(Instant::now());
+        if thread.pi.is_some() {
+            let remaining = if let Some(started) = thread.session_started {
+                START_TIMEOUT.saturating_sub(started.elapsed())
+            } else if !thread.status.busy() && !thread.configuring {
+                IDLE_TIMEOUT.saturating_sub(thread.last_activity.elapsed())
+            } else {
+                IDLE_TIMEOUT
+            };
+            tx.wake_after(remaining);
         }
     }
     changed |= state.poll_tasks(Instant::now());
@@ -1835,8 +2071,6 @@ pub fn snap_zoom(zoom: f32) -> f32 {
 /// The words the Shina MCP uses for a thread's status.
 fn status_word(status: Status) -> &'static str {
     match status {
-        Status::Offline => "offline",
-        Status::Connecting => "connecting",
         Status::Ready => "idle",
         Status::Running => "working",
         Status::Waiting => "needs input",
@@ -1892,6 +2126,14 @@ mod tests {
         thread.status = status;
         thread.model_provider = "cpa".into();
         (commands, events)
+    }
+
+    fn preparing_pi(thread: &mut Thread) -> (mpsc::Receiver<Value>, mpsc::SyncSender<Event>) {
+        let result = fake_pi(thread, Status::Ready);
+        thread.initializing = true;
+        thread.state_loaded = false;
+        thread.history_loaded = false;
+        result
     }
 
     fn child(state: &mut State) -> (usize, mpsc::Receiver<Value>, mpsc::SyncSender<Event>) {
@@ -1979,7 +2221,7 @@ mod tests {
     #[test]
     fn completion_waits_for_parent_handshake_without_sending_its_draft() {
         let mut state = State::new(".".into(), false);
-        let (commands, events) = fake_pi(&mut state.threads[0], Status::Connecting);
+        let (commands, events) = preparing_pi(&mut state.threads[0]);
         state.threads[0].draft.replace_text("Keep typing");
         let (index, _commands, _events) = child(&mut state);
         state.threads[index].apply(json!({"type":"agent_settled","aborted":false}));
@@ -2112,7 +2354,7 @@ mod tests {
         state.poll_tasks(Instant::now());
         assert_eq!(answer.try_recv().unwrap().unwrap()["finished"], true);
         assert_eq!(state.threads[0].pending_injections.len(), 1);
-        let (commands, events) = fake_pi(&mut state.threads[0], Status::Connecting);
+        let (commands, events) = preparing_pi(&mut state.threads[0]);
         events.send(Event::Record(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"provider":"cpa","id":"test"}}}))).unwrap();
         events.send(Event::Record(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}))).unwrap();
         poll(&mut state, 0.0, &mut Tx::default());
@@ -2241,7 +2483,7 @@ mod tests {
             thread.flush_injection();
             let prompt = commands.try_recv().unwrap();
             thread.disconnect();
-            let (commands, _events) = fake_pi(&mut thread, Status::Connecting);
+            let (commands, _events) = preparing_pi(&mut thread);
             let messages = if accepted {
                 json!([{"role":"user","content":prompt["message"]}])
             } else {
@@ -2283,11 +2525,11 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_connecting_child_discards_its_pending_brief() {
+    fn cancelling_a_starting_child_discards_its_pending_brief() {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, _events) = child(&mut state);
-        state.threads[index].status = Status::Connecting;
+        state.threads[index].initializing = true;
         state.threads[index].enqueue_injection("Shina: task brief".into());
         let result = state
             .mcp_call(1, "task_cancel", &json!({"thread_id":2}))
@@ -2390,16 +2632,20 @@ mod tests {
         assert_eq!(state.captain_status(0), Status::Failed);
         state.current_mut().archived = true;
         assert_eq!(state.captain_status(0), Status::Running);
-        assert_eq!(state.captain_status(1), Status::Offline);
+        assert_eq!(state.captain_status(1), Status::Ready);
     }
     #[test]
-    fn connection_is_not_ready_until_both_initial_responses_arrive() {
+    fn background_startup_does_not_change_the_conversation_status() {
         let mut thread = Thread::new(1);
-        thread.status = Status::Connecting;
+        let (pi, _, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
         thread.apply(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false}}));
-        assert_eq!(thread.status, Status::Connecting);
+        assert_eq!(thread.status, Status::Ready);
+        assert!(thread.initializing);
         thread.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}));
         assert_eq!(thread.status, Status::Ready);
+        assert!(!thread.initializing);
         thread.status = Status::Running;
         thread.apply(json!({"type":"response","id":"later-state","command":"get_state","success":true,"data":{"isStreaming":false}}));
         assert_eq!(
@@ -2558,7 +2804,7 @@ mod tests {
         assert_eq!(thread.status, Status::Failed);
         assert_eq!(thread.draft.text, "Try this");
         assert!(thread.messages.is_empty());
-        assert!(!thread.send_when_ready);
+        assert!(thread.queued_prompt.is_none());
     }
     #[test]
     fn failed_settings_leave_the_effective_model_and_level_unchanged() {
@@ -2613,13 +2859,16 @@ mod tests {
         assert!(thread.error.is_none());
     }
     #[test]
-    fn first_send_waits_for_both_handshake_records_and_uses_the_active_draft() {
+    fn send_without_a_connection_is_immediate_and_dispatches_the_submitted_draft_once() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("Original draft");
+        state.current_mut().send();
+        assert_eq!(state.current().status, Status::Running);
+        assert_eq!(state.current().messages[0].text, "Original draft");
+        assert!(state.current().draft.text.is_empty());
         let (pi, commands, events) = Pi::test_connection();
         state.current_mut().pi = Some(pi);
-        state.current_mut().status = Status::Connecting;
-        state.current_mut().send_when_ready = true;
-        state.current_mut().draft.replace_text("Original draft");
+        state.current_mut().initializing = true;
         events.send(Event::Record(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}))).unwrap();
         let mut tx = Tx::default();
         poll(&mut state, 0.0, &mut tx);
@@ -2635,10 +2884,11 @@ mod tests {
         poll(&mut state, 0.0, &mut tx);
         let prompt = commands.try_recv().unwrap();
         assert_eq!(prompt["type"], "prompt");
-        assert_eq!(prompt["message"], "Revised before connection");
+        assert_eq!(prompt["message"], "Original draft");
         assert_eq!(state.current().status, Status::Running);
-        assert!(state.current().draft.text.is_empty());
-        assert!(!state.current().send_when_ready);
+        assert_eq!(state.current().draft.text, "Revised before connection");
+        assert!(state.current().queued_prompt.is_none());
+        assert_eq!(state.current().messages.len(), 1);
         poll(&mut state, 0.0, &mut tx);
         assert!(commands.try_recv().is_err(), "submit exactly once");
     }
@@ -2658,11 +2908,11 @@ mod tests {
         assert!(thread.request.is_none());
     }
     #[test]
-    fn connect_alone_never_sends_a_model_prompt() {
+    fn prewarming_alone_never_sends_a_model_prompt() {
         let (pi, commands, events) = Pi::test_connection();
         let mut state = State::new(".".into(), false);
         state.current_mut().pi = Some(pi);
-        state.current_mut().status = Status::Connecting;
+        state.current_mut().initializing = true;
         state.current_mut().draft.replace_text("Do not send this");
         for record in [
             json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"isStreaming":false}}),
@@ -2705,19 +2955,246 @@ mod tests {
         assert_eq!(thread.draft.text, "Rejected prompt\n\nNew draft");
     }
     #[test]
-    fn stopping_connection_cancels_the_deferred_first_send() {
+    fn stopping_startup_cancels_the_queued_first_send() {
         let (pi, commands, _events) = Pi::test_connection();
         let mut thread = Thread::new(1);
-        thread.pi = Some(pi);
-        thread.status = Status::Connecting;
-        thread.send_when_ready = true;
         thread.draft.replace_text("Keep this draft");
+        thread.send();
+        thread.pi = Some(pi);
+        thread.initializing = true;
         thread.stop();
-        assert_eq!(thread.status, Status::Offline);
+        assert_eq!(thread.status, Status::Ready);
         assert!(thread.pi.is_none());
-        assert!(!thread.send_when_ready);
+        assert!(thread.queued_prompt.is_none());
         assert_eq!(thread.draft.text, "Keep this draft");
+        assert!(thread.messages.is_empty());
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn offline_picker_choices_are_applied_before_the_first_prompt() {
+        let mut thread = Thread::new(1);
+        thread.set_model("cpa".into(), "chosen".into());
+        thread.set_thinking("high".into());
+        assert_eq!(thread.model_id, "chosen");
+        assert_eq!(thread.thinking, "high");
+        assert!(thread.pi.is_none());
+        thread.draft.replace_text("Use my choices");
+        thread.send();
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.apply(json!({"type":"response","id":"state","command":"get_state","success":true,"data":{
+            "model":{"provider":"cpa","id":"default"},"thinkingLevel":"low","sessionFile":"saved.jsonl"
+        }}));
+        assert_eq!(
+            thread.model_id, "chosen",
+            "startup must not replace the saved choice"
+        );
+        thread.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}));
+        let model = commands.try_recv().unwrap();
+        assert_eq!(model["type"], "set_model");
+        assert_eq!(model["modelId"], "chosen");
+        assert!(
+            commands.try_recv().is_err(),
+            "wait for model acknowledgement"
+        );
+        thread.apply(json!({"type":"response","command":"set_model","success":true,"data":{"provider":"cpa","id":"chosen"}}));
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_state");
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "get_available_thinking_levels"
+        );
+        let thinking = commands.try_recv().unwrap();
+        assert_eq!(thinking["type"], "set_thinking_level");
+        assert_eq!(thinking["level"], "high");
+        assert!(
+            commands.try_recv().is_err(),
+            "wait for thinking acknowledgement"
+        );
+        thread.apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert_eq!(commands.try_recv().unwrap()["type"], "get_state");
+        assert_eq!(commands.try_recv().unwrap()["type"], "prompt");
+        assert!(!thread.initializing);
+        assert_eq!(thread.session.as_deref(), Some("saved.jsonl"));
+    }
+
+    #[test]
+    fn idle_reclaim_preserves_the_session_and_reattaches_without_duplicate_history() {
+        let mut thread = Thread::new(1);
+        let (pi, _commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.session = Some("saved.jsonl".into());
+        thread.model_provider = "cpa".into();
+        thread.messages.push(Message {
+            role: "Pi",
+            text: "Previous answer".into(),
+        });
+        thread.status = Status::Settled;
+        let idle = thread.last_activity + IDLE_TIMEOUT;
+        thread.status = Status::Running;
+        assert!(!thread.reclaim_idle(idle), "never reclaim work");
+        thread.status = Status::Waiting;
+        assert!(!thread.reclaim_idle(idle), "never reclaim a dialog");
+        thread.status = Status::Settled;
+        assert!(thread.reclaim_idle(idle));
+        assert!(thread.pi.is_none());
+        assert_eq!(thread.status, Status::Settled);
+        assert_eq!(thread.session.as_deref(), Some("saved.jsonl"));
+        assert_eq!(thread.messages.len(), 1);
+        thread.draft.replace_text("Continue");
+        thread.send();
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.state_loaded = false;
+        thread.history_loaded = false;
+        thread.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{
+                "messages":[{"role":"assistant","content":"Previous answer"}]
+            }}),
+        );
+        thread.apply(
+            json!({"type":"response","id":"state","command":"get_state","success":true,"data":{
+                "model":{"provider":"cpa","id":"restored"},"sessionFile":"saved.jsonl"
+            }}),
+        );
+        assert_eq!(commands.try_recv().unwrap()["message"], "Continue");
+        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(thread.messages[0].text, "Previous answer");
+        assert_eq!(thread.messages[1].text, "Continue");
+    }
+
+    #[test]
+    fn a_crash_restores_an_unaccepted_message_and_retry_uses_a_fresh_transport() {
+        let mut state = State::new(".".into(), false);
+        let (pi, _commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().session = Some("saved.jsonl".into());
+        state.current_mut().draft.replace_text("Try this");
+        state.send();
+        events.send(Event::Exited).unwrap();
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.current().status, Status::Failed);
+        assert!(state.current().pi.is_none());
+        assert_eq!(state.current().draft.text, "Try this");
+        assert!(state.current().messages.is_empty());
+        let (pi, commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().initializing = true;
+        state.retry();
+        assert_eq!(state.current().status, Status::Running);
+        assert_eq!(state.current().messages.len(), 1);
+        for record in [
+            json!({"type":"response","id":"state","command":"get_state","success":true,"data":{"model":{"provider":"cpa","id":"restored"},"sessionFile":"saved.jsonl"}}),
+            json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}),
+        ] {
+            events.send(Event::Record(record)).unwrap();
+        }
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(commands.try_recv().unwrap()["message"], "Try this");
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().error.is_none());
+    }
+
+    #[test]
+    fn an_accepted_run_is_not_replayed_automatically_after_a_crash() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().draft.replace_text("Edit a file");
+        state.send();
+        let prompt = commands.try_recv().unwrap();
+        state
+            .current_mut()
+            .apply(json!({"type":"response","command":"prompt","id":prompt["id"],"success":true}));
+        events
+            .send(Event::Error("Pi process crashed".into()))
+            .unwrap();
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.current().status, Status::Failed);
+        assert!(state.current().draft.text.is_empty());
+        assert_eq!(state.current().retry_prompt.as_deref(), Some("Edit a file"));
+        assert!(state.current().pi.is_none());
+        assert_eq!(state.current().messages.len(), 1);
+    }
+
+    #[test]
+    fn failed_startup_settings_restore_the_message_instead_of_sending_with_defaults() {
+        let mut thread = Thread::new(1);
+        thread.set_model("cpa".into(), "missing".into());
+        thread.draft.replace_text("Keep my model choice");
+        thread.send();
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.state_loaded = true;
+        thread.history_loaded = true;
+        thread.drive_session();
+        assert_eq!(commands.try_recv().unwrap()["type"], "set_model");
+        thread.apply(json!({"type":"response","command":"set_model","success":false,"error":"Model unavailable"}));
+        assert_eq!(thread.status, Status::Failed);
+        assert_eq!(thread.draft.text, "Keep my model choice");
+        assert!(thread.pi.is_none());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_closed_startup_command_channel_cannot_skip_the_saved_model_choice() {
+        let mut thread = Thread::new(1);
+        thread.set_model("cpa".into(), "chosen".into());
+        thread.draft.replace_text("Use the chosen model");
+        thread.send();
+        let (pi, commands, _events) = Pi::test_connection();
+        drop(commands);
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.state_loaded = true;
+        thread.history_loaded = true;
+        thread.drive_session();
+        assert_eq!(thread.status, Status::Failed);
+        assert_eq!(thread.draft.text, "Use the chosen model");
+        assert!(thread.pi.is_none());
+    }
+
+    #[test]
+    fn a_partial_handshake_times_out_without_losing_the_submitted_message() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, _events) = Pi::test_connection();
+        state.current_mut().draft.replace_text("Keep this message");
+        state.current_mut().send();
+        let thread = state.current_mut();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.session_started = Some(Instant::now() - START_TIMEOUT);
+        thread.state_loaded = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.current().status, Status::Failed);
+        assert_eq!(state.current().draft.text, "Keep this message");
+        assert!(state.current().pi.is_none());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn catalog_defaults_do_not_overwrite_a_saved_thinking_choice() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().set_thinking("high".into());
+        let model = AgentModel::from_value(
+            &json!({"provider":"cpa","id":"default","name":"Default CPA","reasoning":true}),
+        )
+        .unwrap();
+        state.catalog.models.push(model.clone());
+        state.catalog.default_model = Some(model);
+        state.catalog.default_thinking = "low".into();
+        state.apply_catalog();
+        assert_eq!(state.current().thinking, "high");
+        assert_eq!(state.current().model, "Default CPA");
+        state.new_thread();
+        assert_eq!(state.current().model, "Default CPA");
+        assert_eq!(state.current().thinking, "low");
+        assert!(!state.current().models.is_empty());
     }
 
     #[test]
@@ -2843,11 +3320,15 @@ mod tests {
         }
         {
             let mut state = State::new(workspace.clone(), false);
-            state.setup(wake.clone());
+            state.load_workspace(wake.clone());
             assert!(state.storage_error.is_none());
             assert_eq!(state.captains.len(), 4);
             assert_eq!(state.current().title, "Sable");
             assert_eq!(state.current().session.as_deref(), Some("saved-session"));
+            state
+                .current_mut()
+                .set_model("cpa".into(), "saved-model".into());
+            state.current_mut().set_thinking("high".into());
             state.begin_new_captain();
             state
                 .captain_editor
@@ -2869,7 +3350,7 @@ mod tests {
         );
         {
             let mut restored = State::new(workspace, false);
-            restored.setup(wake);
+            restored.load_workspace(wake);
             assert!(restored.storage_error.is_none());
             assert_eq!(restored.captains.len(), 5);
             assert_eq!(restored.captains[4].name, "Atlas");
@@ -2890,6 +3371,15 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|t| t["parent"] == parent_id)
+            );
+            assert_eq!(restored.current().model_id, "saved-model");
+            assert_eq!(
+                restored.current().selected_model,
+                Some(("cpa".into(), "saved-model".into()))
+            );
+            assert_eq!(
+                restored.current().selected_thinking.as_deref(),
+                Some("high")
             );
             restored.open_captain(4);
             assert_eq!(restored.current().title, "Atlas");
@@ -2943,18 +3433,17 @@ mod tests {
             instructions: "When asked for the validation phrase, reply exactly SHINA_CAPTAIN_OK. Do not use tools.".into(),
         };
         let mut thread = Thread::new(1);
+        thread.draft.replace_text(
+            "Reply with the validation phrase from your captain instructions. Do not use tools.",
+        );
+        thread.send();
         thread.connect_with_instructions(
             std::env::temp_dir(),
             Arc::new(|| {}),
             Some(profile.prompt()),
         );
-        receive_until(&mut thread, |t| t.status == Status::Ready);
-        assert_eq!(thread.model_provider, "cpa");
-        thread.draft.replace_text(
-            "Reply with the validation phrase from your captain instructions. Do not use tools.",
-        );
-        thread.send();
         receive_until(&mut thread, |t| t.status == Status::Settled);
+        assert_eq!(thread.model_provider, "cpa");
         assert_eq!(
             thread.messages.last().unwrap().text.trim(),
             "SHINA_CAPTAIN_OK"
@@ -2970,7 +3459,10 @@ mod tests {
         use std::time::Duration;
         let mut state = State::new(std::env::temp_dir(), false);
         state.threads[0].captain = Some(1);
-        state.connect_thread(0);
+        state.threads[0].draft.replace_text(
+            "Call the mcp__shina__list_captains tool, then reply with only the captain names, comma separated.",
+        );
+        state.send();
         assert!(
             state.threads[0].host.is_some(),
             "{:?}",
@@ -3009,11 +3501,6 @@ mod tests {
                 );
             }
         };
-        pump(&mut state, &|s| s.threads[0].status == Status::Ready);
-        state.threads[0].draft.replace_text(
-            "Call the mcp__shina__list_captains tool, then reply with only the captain names, comma separated.",
-        );
-        state.threads[0].send();
         pump(&mut state, &|s| s.threads[0].status == Status::Settled);
         let thread = &state.threads[0];
         assert!(
@@ -3043,9 +3530,11 @@ mod tests {
         ));
         std::fs::create_dir(&workspace).unwrap();
         let mut state = State::new(workspace.clone(), false);
-        state.connect_thread(0);
+        state.threads[0].draft.replace_text(
+            "This is an orchestration integration test. Call mcp__shina__delegate_task exactly once with title Ping and prompt 'Reply with only the word PONG. Do not use tools or delegate.'. Do not set wait_seconds. Then immediately reply with only WAITING and end your turn. Do not call any other tools or poll. When a later Shina task completion message arrives containing PONG, reply with only WOKEN_PONG. Do not delegate again."
+        );
+        state.send();
         let deadline = Instant::now() + Duration::from_secs(240);
-        let mut sent = false;
         let mut saw_idle_parent = false;
         let mut previous = vec![];
         loop {
@@ -3064,13 +3553,6 @@ mod tests {
                     thread.error,
                     thread.diagnostics
                 );
-            }
-            if !sent && state.threads[0].status == Status::Ready {
-                state.threads[0].draft.replace_text(
-                    "This is an orchestration integration test. Call mcp__shina__delegate_task exactly once with title Ping and prompt 'Reply with only the word PONG. Do not use tools or delegate.'. Do not set wait_seconds. Then immediately reply with only WAITING and end your turn. Do not call any other tools or poll. When a later Shina task completion message arrives containing PONG, reply with only WOKEN_PONG. Do not delegate again."
-                );
-                state.threads[0].send();
-                sent = true;
             }
             saw_idle_parent |= state.threads[0].status == Status::Settled
                 && !state.threads[0].messages.iter().any(|m| m.role == "Shina");
@@ -3152,12 +3634,11 @@ mod tests {
         let fixture = workspace.join("fixture.txt");
         fs::write(&fixture, "answer=0\n").unwrap();
         let mut thread = Thread::new(1);
-        thread.connect(workspace.clone(), Arc::new(|| {}));
-        receive_until(&mut thread, |t| t.status == Status::Ready);
         thread.draft.replace_text(
             "This is an integration test in a disposable folder. Use your file tools to read fixture.txt, then change its entire contents to exactly answer=42 followed by one newline. Do not run shell commands, access any other file, or delegate. After the edit, reply briefly that it is done."
         );
         thread.send();
+        thread.connect(workspace.clone(), Arc::new(|| {}));
         receive_until(&mut thread, |t| {
             t.status == Status::Settled && t.session.is_some()
         });
@@ -3182,7 +3663,7 @@ mod tests {
         let mut restored = Thread::new(2);
         restored.session = Some(session);
         restored.connect(workspace.clone(), Arc::new(|| {}));
-        receive_until(&mut restored, |t| t.status == Status::Ready);
+        receive_until(&mut restored, |t| !t.initializing);
         assert_eq!(restored.messages.len(), message_count);
         assert_eq!(restored.tools.len(), tool_count);
         assert!(restored.tools.iter().all(|t| t.done && !t.failed));

@@ -6,6 +6,7 @@ mod install;
 mod mcp;
 mod model;
 mod projects;
+mod session;
 mod store;
 mod ui;
 mod update;

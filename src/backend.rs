@@ -24,7 +24,7 @@ pub enum Event {
 
 static WORKERS: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
-/// Only called after Rune's window closes. Disconnect itself never waits on the UI thread.
+/// Only called after Rune's window closes. Releasing a session never waits on the UI thread.
 pub fn shutdown_all() {
     let workers = std::mem::take(&mut *WORKERS.lock().expect("worker registry"));
     for worker in workers {
@@ -46,6 +46,14 @@ pub struct Pi {
     pub events: Receiver<Event>,
 }
 
+struct Launch {
+    workspace: PathBuf,
+    session: Option<String>,
+    instructions: Option<String>,
+    host: Option<HostLink>,
+    ephemeral: bool,
+}
+
 impl Pi {
     #[cfg(test)]
     pub fn test_connection() -> (Self, Receiver<Value>, SyncSender<Event>) {
@@ -61,18 +69,33 @@ impl Pi {
         instructions: Option<String>,
         host: Option<HostLink>,
     ) -> Self {
+        Self::start(workspace, session, wake, instructions, host, false)
+    }
+
+    /// Read provider metadata without creating a saved conversation or exposing Shina tools.
+    pub fn discover(workspace: PathBuf, wake: Waker) -> Self {
+        Self::start(workspace, None, wake, None, None, true)
+    }
+
+    fn start(
+        workspace: PathBuf,
+        session: Option<String>,
+        wake: Waker,
+        instructions: Option<String>,
+        host: Option<HostLink>,
+        ephemeral: bool,
+    ) -> Self {
         let (commands, input) = mpsc::sync_channel::<Value>(32);
         let (events, output) = mpsc::sync_channel(256);
         let worker = thread::spawn(move || {
-            if let Err(error) = run(
-                &workspace,
-                session.as_deref(),
-                instructions.as_deref(),
-                host.as_ref(),
-                input,
-                &events,
-                &wake,
-            ) {
+            let launch = Launch {
+                workspace,
+                session,
+                instructions,
+                host,
+                ephemeral,
+            };
+            if let Err(error) = run(&launch, input, &events, &wake) {
                 publish(&events, &wake, Event::Error(error));
             }
             publish(&events, &wake, Event::Exited);
@@ -125,7 +148,7 @@ fn command() -> Result<Command, String> {
                 }
             }
         }
-        Err("Pi was not found. Install Pi, or set SHINA_PI_CLI to its CLI .js or .exe path, then reconnect.".into())
+        Err("Pi was not found. Install Pi, or set SHINA_PI_CLI to its CLI .js or .exe path, then retry.".into())
     }
     #[cfg(not(windows))]
     Ok(Command::new("pi"))
@@ -163,7 +186,7 @@ fn cpa_extension() -> Result<PathBuf, String> {
     let extension = agent_directory.join("extensions/cpa-provider.ts");
     if !extension.is_file() {
         return Err(format!(
-            "The CPA provider extension is missing at {}. Enroll Pi in cpa-catalog before connecting. Shina will not fall back to a direct provider.",
+            "The CPA provider extension is missing at {}. Enroll Pi in cpa-catalog, then retry. Shina will not fall back to a direct provider.",
             extension.display()
         ));
     }
@@ -171,10 +194,7 @@ fn cpa_extension() -> Result<PathBuf, String> {
 }
 
 fn run(
-    workspace: &Path,
-    session: Option<&str>,
-    instructions: Option<&str>,
-    host: Option<&HostLink>,
+    launch: &Launch,
     input: Receiver<Value>,
     output: &SyncSender<Event>,
     wake: &Waker,
@@ -189,7 +209,7 @@ fn run(
             "--no-skills",
             "--no-prompt-templates",
         ])
-        .current_dir(workspace)
+        .current_dir(&launch.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -200,18 +220,20 @@ fn run(
     command
         .env_remove(crate::mcp::URL_ENV)
         .env_remove(crate::mcp::TOKEN_ENV);
-    if let Some(host) = host {
+    if let Some(host) = &launch.host {
         command
             .arg("--extension")
             .arg(&host.extension)
             .env(crate::mcp::URL_ENV, &host.url)
             .env(crate::mcp::TOKEN_ENV, &host.token);
     }
-    if let Some(instructions) = instructions {
+    if let Some(instructions) = &launch.instructions {
         command.arg("--append-system-prompt").arg(instructions);
     }
-    if let Some(session) = session {
+    if let Some(session) = &launch.session {
         command.args(["--session", session]);
+    } else if launch.ephemeral {
+        command.args(["--no-session", "--offline"]);
     }
     #[cfg(windows)]
     {
@@ -289,7 +311,7 @@ fn run(
         )?;
         loop {
             if !ready.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(15) {
-                return Err("Pi did not answer within 15 seconds. Check its CLI configuration and workspace trust, then reconnect.".into());
+                return Err("Pi did not answer within 15 seconds. Check its CLI configuration and workspace trust, then retry.".into());
             }
             match input.recv_timeout(Duration::from_millis(100)) {
                 Ok(record) => write_record(&mut stdin, &record)?,
@@ -301,7 +323,7 @@ fn run(
                     Ok(())
                 } else {
                     Err(format!(
-                        "Pi exited with {status}. Check the connection details and reconnect."
+                        "Pi exited with {status}. Retry to resume the saved conversation."
                     ))
                 };
             }
@@ -349,7 +371,8 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
     }
     if count as u64 > LIMIT {
         return Err(
-            "Pi sent a protocol record larger than 8 MiB. Disconnect and reconnect.".into(),
+            "Pi sent a protocol record larger than 8 MiB. Retry to resume the saved conversation."
+                .into(),
         );
     }
     serde_json::from_slice(&bytes)
@@ -391,56 +414,67 @@ mod tests {
     #[test]
     #[ignore = "Starts the installed Pi, but sends no model prompt"]
     fn installed_pi_answers_state_and_history_without_a_prompt() {
-        let pi =
-            Pi::start_with_instructions(std::env::temp_dir(), None, Arc::new(|| {}), None, None);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut state = false;
-        let mut history = false;
-        let mut models = false;
-        let mut levels = false;
-        while Instant::now() < deadline && !(state && history && models && levels) {
-            match pi.events.recv_timeout(Duration::from_secs(1)) {
-                Ok(Event::Record(record)) if record["type"] == "response" => {
-                    assert_ne!(
-                        record["success"], false,
-                        "Pi rejected the read-only handshake"
-                    );
-                    if record["command"] == "get_state" {
-                        assert_eq!(
-                            record["data"]["model"]["provider"], "cpa",
-                            "Pi must load the CPA provider instead of falling back to a direct provider"
+        for ephemeral in [false, true] {
+            let pi = if ephemeral {
+                Pi::discover(std::env::temp_dir(), Arc::new(|| {}))
+            } else {
+                Pi::start_with_instructions(std::env::temp_dir(), None, Arc::new(|| {}), None, None)
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut state = false;
+            let mut history = false;
+            let mut models = false;
+            let mut levels = false;
+            while Instant::now() < deadline && !(state && history && models && levels) {
+                match pi.events.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Event::Record(record)) if record["type"] == "response" => {
+                        assert_ne!(
+                            record["success"], false,
+                            "Pi rejected the read-only handshake"
                         );
-                        state = true;
+                        if record["command"] == "get_state" {
+                            if ephemeral {
+                                assert!(
+                                    record["data"]["sessionFile"].is_null(),
+                                    "discovery must not save a session"
+                                );
+                            }
+                            assert_eq!(
+                                record["data"]["model"]["provider"], "cpa",
+                                "Pi must load the CPA provider instead of falling back to a direct provider"
+                            );
+                            state = true;
+                        }
+                        if record["command"] == "get_messages" {
+                            history = true;
+                        }
+                        if record["command"] == "get_available_models" {
+                            assert!(
+                                record["data"]["models"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|model| model["provider"] == "cpa"),
+                                "CPA catalog must populate model discovery"
+                            );
+                            models = true;
+                        }
+                        if record["command"] == "get_available_thinking_levels" {
+                            assert!(!record["data"]["levels"].as_array().unwrap().is_empty());
+                            levels = true;
+                        }
                     }
-                    if record["command"] == "get_messages" {
-                        history = true;
-                    }
-                    if record["command"] == "get_available_models" {
-                        assert!(
-                            record["data"]["models"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .any(|model| model["provider"] == "cpa"),
-                            "CPA catalog must populate model discovery"
-                        );
-                        models = true;
-                    }
-                    if record["command"] == "get_available_thinking_levels" {
-                        assert!(!record["data"]["levels"].as_array().unwrap().is_empty());
-                        levels = true;
-                    }
+                    Ok(Event::Error(error)) => panic!("Pi handshake failed: {error}"),
+                    Ok(Event::Exited) => panic!("Pi exited before answering the handshake"),
+                    _ => {}
                 }
-                Ok(Event::Error(error)) => panic!("Pi handshake failed: {error}"),
-                Ok(Event::Exited) => panic!("Pi exited before answering the handshake"),
-                _ => {}
             }
+            drop(pi);
+            shutdown_all();
+            assert!(
+                state && history && models && levels,
+                "Pi did not return state, history, models and reasoning levels"
+            );
         }
-        drop(pi);
-        shutdown_all();
-        assert!(
-            state && history && models && levels,
-            "Pi did not return state, history, models and reasoning levels"
-        );
     }
 }
