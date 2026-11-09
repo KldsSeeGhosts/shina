@@ -12,7 +12,9 @@ The development tools and Pi are already installed on this workstation.
 cargo run
 ```
 
-Click **Open folder** to choose a project, then **Connect Pi**. Connect only reads agent state and history. Sending a message starts agent work and can incur provider charges.
+Click **Open folder** to choose a project, then send a message. Shina connects Pi first, waits for its state and history, and submits your current draft once. **Connect Pi** is still available for a read-only connection. Sending a message starts agent work and can consume your CPA upstream quota.
+
+The model and reasoning controls in the composer are live Pi RPC controls. The model picker shows only your shared CPA catalog models. It supports filtering by model name, ID, or provider. Shina refuses to send prompts through a direct provider, including when an older session restores one.
 
 For an example conversation without an agent connection:
 
@@ -37,15 +39,17 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 
 ## What works
 
-- Native chat with streamed text, selectable Markdown, syntax-highlighted code blocks, and a bottom composer.
+- Native chat with streamed text, selectable Markdown, syntax-highlighted code blocks, and a bottom composer. The first send connects automatically without clearing the draft until Pi is ready.
+- CPA catalog model selection and model-specific reasoning levels through Pi RPC. Pi's existing CPA default is used for new sessions.
 - A native sidebar and chat reconstruction with variable Inter typography, light/dark palettes, compact tabs, search, and an optional overview pane.
-- Three crew captains, each a Pokémon Mystery Dungeon portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, Happy when settled, and Sad when offline.
+- Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, Happy when settled, and Sad when offline. The set is Ember, Juniper, Sable, and Pip.
 - Captain conversation groups with nested threads, a native Captain picker that shows each captain's live status, and thread pinning.
 - Independent Pi processes for connected threads. Switching threads preserves their drafts and leaves other work running.
 - Running, needs-input, failed, and settled states. `agent_end` does not settle a thread. The adapter waits for `agent_settled`.
 - Canceling a run clears the queue before requesting an abort.
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
-- An atomic per-workspace index remembers thread titles, archive state, and Pi session paths. Reconnect to load a saved transcript.
+- An atomic per-workspace index remembers thread titles, archive state, and Pi session paths. Reconnect to load a saved transcript, tool summaries, and tool results.
+- Live progress distinguishes model thinking, text generation, tool execution, retries, and compaction. Rejected prompts return to the draft; cancellation releases a pending dialog before clearing the queue and aborting.
 - Native folder selection. Switching folders refuses to discard unsent drafts or interrupt busy threads.
 
 Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+B for the sidebar, Ctrl+L for the composer, and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
@@ -56,7 +60,9 @@ Ctrl+K opens thread search. Captain entries currently organize separate Pi conve
 
 Pi tools can edit files and execute commands with your account's permissions. This prototype has no sandbox, worktree isolation, or built-in tool approval policy. Do not point it at an untrusted project.
 
-For this first adapter, Pi launches with extensions, MCP, skills, and prompt-template discovery disabled. This prevents startup integrations from running before the client supports their full behavior. **Do not use this version if you depend on a Pi extension for safety checks or tool approvals.** The adapter does not modify your Pi configuration or authentication. It uses Pi's configured default model.
+Pi launches with automatic extension discovery, MCP, skills, and prompt templates disabled. Shina explicitly loads only your existing `extensions/cpa-provider.ts` from Pi's agent directory. That extension reads your existing CPA catalog enrollment and credentials and supplies the proxy routes, transport metadata, and reasoning capabilities. No model list or credential is copied into this repository. **Do not use this version if you depend on another Pi extension for safety checks or tool approvals.** The adapter does not rewrite provider configuration or authentication.
+
+Pi must already be enrolled in CPA with `~/.pi/agent/cpa-catalog.json`, its catalog client, and `extensions/cpa-provider.ts`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports a missing provider extension instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. If model definitions change, disconnect and reconnect the thread to load the latest catalog.
 
 On Windows, Shina's small workspace index lives under `%LOCALAPPDATA%\Shina`. A Still-era index is copied over on first launch, so renaming the app does not lose saved threads. Pi keeps its own session files and credentials in its normal locations outside this repository. Drafts currently survive thread switches, but not app restarts. Run one Shina instance per workspace to avoid competing index writes.
 
@@ -68,9 +74,10 @@ Closing Shina closes the agent input pipes and waits for shutdown. After a short
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test installed_pi_answers_state_and_history_without_a_prompt -- --ignored
+cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
 ```
 
-The opt-in integration test starts the installed Pi and requests state and history. It sends no model prompt and performs no coding-agent tool calls.
+The first opt-in integration test starts the installed Pi and verifies CPA model discovery, reasoning levels, state, and history. It sends no model prompt. The second sends one prompt through the configured CPA model, reads and edits a disposable text fixture, waits for settlement, and reconnects to verify saved messages and tool results. It consumes upstream quota and leaves Pi's test session in its normal session directory.
 
 Render with Rune's actual GPU renderer, without opening a window:
 
@@ -90,10 +97,28 @@ Rune is pre-release and pinned to revision `a7f276c3630f85a06a0230295da4d2bd172d
 
 The earlier layout's release build reported forced at-rest CPU times below 0.15 ms at p95 for a small static example. That measurement predates the crew portrait pass and is not a benchmark of this revised layout, interactive frame rate, or live Pi work.
 
-This is an initial desktop prototype. Model selection and login UI, attachments, restored tool histories, git diffs, worktrees, multi-project concurrent work, crash recovery, and packaging/installers remain unfinished. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
+This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees, multi-project concurrent work, crash recovery, and packaging/installers remain unfinished. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
+
+The supplied `assets/project-icon.png` is the T3 Code project favicon and the source for Shina's executable, taskbar, and window icons. The build generates Windows icon sizes without smoothing the pixel art. This user-supplied artwork is separate from the code's MIT license.
 
 ## Crew artwork
 
-The three captain portraits are Pokémon Mystery Dungeon artwork from [PMDCollab SpriteCollab](https://github.com/PMDCollab/SpriteCollab): Bulbasaur, Charmander, and Squirtle. They are licensed CC BY-NC 4.0, with the base portraits credited to CHUNSOFT. The files are not covered by this repository's [MIT license](LICENSE). They are included for a private, non-commercial experiment; see [the artwork provenance](assets/sprites/README.md) before redistributing or publishing a build. Pokémon and the related character names are trademarks of Nintendo, Creatures, and GAME FREAK. This project is not affiliated with or endorsed by them.
+The four captains are original characters drawn as 40x40 pixel art by [`tools/crew_originals.py`](tools/crew_originals.py), framed like a Pokémon Mystery Dungeon bust and presented on the square crew tiles Capy uses. See [the artwork notes](assets/crew/README.md).
 
 Each portrait is a static image selected by thread state. There is no frame timer and no extra redraw loop; the portrait changes when the crew's state changes.
+
+### Drop-in portrait sets
+
+Shina can load a different set without a rebuild. Point `SHINA_SPRITES` at a folder containing six PNGs per captain, or put the folder at `<workspace>/assets/crew`:
+
+```text
+assets/crew/ember/Normal.png
+assets/crew/ember/Happy.png
+assets/crew/ember/Determined.png
+assets/crew/ember/Surprised.png
+assets/crew/ember/Dizzy.png
+assets/crew/ember/Sad.png
+...same six for juniper, sable, and pip
+```
+
+A numeric folder (`assets/crew/0/Normal.png`) also works. `SHINA_SPRITES` wins over the workspace folder. All six faces must exist for a captain to use the override; otherwise that captain keeps the embedded artwork. The loader accepts any square PNG size and the app scales it into the 24 px and 40 px tiles.

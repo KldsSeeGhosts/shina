@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod backend;
+mod captains;
 mod model;
 mod store;
 mod ui;
@@ -28,12 +29,7 @@ fn key(state: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
     } else if event.is_command('k') {
         state.search_open = true;
         state.search.focused = true;
-    } else if event.key == Key::Escape
-        && matches!(
-            state.current().status,
-            model::Status::Running | model::Status::Waiting
-        )
-    {
+    } else if event.key == Key::Escape && state.current().status.busy() {
         state.current_mut().stop();
     } else {
         return false;
@@ -42,6 +38,11 @@ fn key(state: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
 }
 
 fn main() {
+    if let Err(error) =
+        rune::set_app_icon(include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon.png")).to_vec())
+    {
+        eprintln!("Could not set the Shina window icon: {error}");
+    }
     let args = rune::extra_args();
     let mut workspace = std::env::current_dir().expect("current directory");
     let mut demo = false;
@@ -91,6 +92,15 @@ fn main() {
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
+            }),
+            ("new-captain", |state| {
+                state.populate_demo();
+                state.begin_new_captain();
+                let editor = state.captain_editor.as_mut().unwrap();
+                editor.name.replace_text("Atlas");
+                editor.role.replace_text("Code review");
+                editor.instructions.replace_text("Review changes for correctness and regressions. Cite the files and tests that support each finding.");
+                editor.portrait = 2;
             }),
         ],
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
