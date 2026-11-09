@@ -46,6 +46,38 @@ pub struct Pi {
     pub events: Receiver<Event>,
 }
 
+/// Machine dispatch lives here, not in the UI or orchestration reducer. A remote host
+/// can implement the same session transport without changing project/thread ownership.
+pub enum BackendHost {
+    Local,
+}
+
+impl BackendHost {
+    pub fn resolve(machine: &str) -> Result<Self, String> {
+        match machine {
+            "local" => Ok(Self::Local),
+            _ => Err(format!(
+                "Machine {machine} is unavailable. Only local hosts are supported."
+            )),
+        }
+    }
+
+    pub fn start(
+        &self,
+        directory: PathBuf,
+        session: Option<String>,
+        wake: Waker,
+        instructions: Option<String>,
+        link: Option<HostLink>,
+    ) -> Pi {
+        match self {
+            Self::Local => {
+                Pi::start_with_instructions(directory, session, wake, instructions, link)
+            }
+        }
+    }
+}
+
 struct Launch {
     workspace: PathBuf,
     session: Option<String>,

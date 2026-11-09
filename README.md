@@ -12,7 +12,9 @@ The development tools and Pi are already installed on this workstation.
 cargo run
 ```
 
-Click the project name at the top of the thread list to open the project switcher. It lists your recent projects and has **Open folder...** and **Clone repository...**. Choose a project, then send a message. Your message appears immediately and the thread shows Working until Pi responds. Shina prepares Pi in the background when you start a draft, or on send if needed. There is no connection step. Sending a message starts agent work and can consume your CPA upstream quota.
+Shina 0.8 keeps all your projects and chats in one window. Use Add project for **Open folder...** or **Clone repository...**. New thread opens a project picker, including **No project**. Threads from different projects run concurrently and can share the tab strip. The sidebar lists Pinned threads first, then other threads by recent activity. Each row shows its project, status and unread badge. The scope picker filters the list without stopping any agents.
+
+Send a message to start work. Shina prepares Pi in the background when you start a draft, or on send if needed. There is no connection step. Sending a message can consume your CPA upstream quota.
 
 The model and reasoning controls work before a thread has a Pi process. A separate, short-lived Pi discovery process reads your shared CPA catalog and model-specific thinking levels without sending a prompt or saving a session. Choices stay on the thread and apply before its next prompt. The model picker supports filtering by model name, ID, or provider. Shina refuses to send prompts through a direct provider, including when an older session restores one.
 
@@ -38,7 +40,7 @@ cargo build --release
 .\target\release\shina.exe --install
 ```
 
-This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start Menu shortcut, registers an Apps & Features entry, and starts the installed copy. The path never changes, so a Start pin or the Caelestia launcher keeps working across updates and development rebuilds. The installed app reopens the last workspace you used. Run `shina.exe --uninstall`, or remove Shina in Settings > Apps, to uninstall it. Your thread indexes in `%LOCALAPPDATA%\Shina` are kept.
+This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start Menu shortcut, registers an Apps & Features entry, and starts the installed copy. The path never changes, so a Start pin or the Caelestia launcher keeps working across updates and development rebuilds. The installed app restores the global project list, threads, tabs and selected thread. Run `shina.exe --uninstall`, or remove Shina in Settings > Apps, to uninstall it. Your data in `%LOCALAPPDATA%\Shina` is kept.
 
 The installed app checks GitHub Releases on startup through the GitHub CLI, using your existing `gh` login, because the repository is private. When a newer version exists, the sidebar shows **Update to vX.Y.Z**. After the download it offers **Restart to install**, which swaps the executable and reopens your workspace. Development builds never update themselves.
 
@@ -48,7 +50,7 @@ To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, then run
 .\tools\release.ps1 -Install
 ```
 
-An optional development flag selects a project on launch:
+An optional flag adds or focuses a project on launch without replacing the other projects:
 
 ```powershell
 cargo run -- --workspace C:\path\to\project
@@ -62,21 +64,22 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 - CPA catalog model selection and model-specific reasoning levels through Pi RPC. Pi's existing CPA default is used for new sessions.
 - A native sidebar and chat reconstruction with variable Inter typography, light/dark palettes, compact tabs, search, and an optional overview pane.
 - Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, and Happy when settled. The set is Ember, Juniper, Sable, and Pip.
-- Captain conversation groups with nested threads, a native Captain picker that shows each captain's live status, and thread pinning.
+- One persistent Captain per project, chosen from the editable persona roster. Captains have their own sidebar section above Threads. Crew threads inherit the project's captain and folder. Project-less chats have no captain.
 - Independent Pi processes for active threads. Switching threads preserves their drafts and leaves other work running. Shina releases processes after 30 idle minutes and resumes their saved session on the next send.
 - Running, needs-input, and failed states. `agent_end` does not finish a run; the adapter waits for `agent_settled`. A finished thread goes quiet instead of showing a status, and a stopped run returns to idle. Background threads that finish get an unread badge.
 - Canceling a run clears the queue before requesting an abort.
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
-- An atomic per-workspace index remembers thread titles, archive state, model/thinking choices, and Pi session paths. Opening a saved thread restores its transcript, tool summaries, and tool results automatically.
+- One atomic global index remembers projects, thread ownership, titles, pins, archive state, model/thinking choices, tabs and Pi session paths. Opening a saved thread restores its transcript, tool summaries and tool results automatically.
 - Process crashes show an inline error with Retry. Shina never automatically replays a prompt that might already have run tools. Retrying an accepted run can repeat tool actions, so check any partial result first.
 - Live progress distinguishes model thinking, text generation, tool execution, retries, and compaction. Rejected prompts return to the draft; cancellation releases a pending dialog before clearing the queue and aborting.
-- A project switcher with recent projects, native folder selection, and cloning. Switching folders refuses to discard unsent drafts or interrupt busy threads, and names the thread that blocks it.
-- Recent projects are saved in `%LOCALAPPDATA%\Shina\projects.json`, which replaces `last-workspace.txt` (read once to seed the list). Projects whose folder is missing are hidden from the menu but kept in the file.
+- Projects are thread attributes, not folder groups. A project scope filter narrows the sidebar. Adding or focusing a project keeps all running threads and unsent drafts.
+- Right-click a sidebar row or use its hover actions for rename, pin/unpin, archive/restore and confirmed deletion. The chat header offers the same actions. Deletion stops that thread and all its delegated descendants, then removes them from the index and tabs. The confirmation names this policy. Project files and Pi session files stay on disk.
+- Project actions in the project picker remove a project from the list without deleting its folder or threads. Add project lists removed projects for restoration. Existing tabs and agents keep working.
 - **Clone repository...** accepts `owner/repo`, a GitHub URL, or any git URL. Shorthand runs `gh repo clone`; URLs run `git clone`. Both run in the background without a console window, with prompts turned off, and use your existing git or `gh` login. Shina never asks for or stores credentials. The destination defaults to the current project's parent folder and remembers the last one used. Shina refuses a destination that exists and is not empty, then opens the new clone when it finishes.
 
 Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+O to open a folder, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
 
-Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working and idle states. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
+Ctrl+K opens thread search. Ctrl+N starts a thread in the current project, while the New thread button offers a project picker. The logo, search and sidebar toggle share the title strip with the tabs. Collapsing the sidebar keeps its toggle at the top-left of that strip. A captain's portrait reflects the most urgent live thread in its project's crew.
 
 ## Shina MCP
 
@@ -84,11 +87,11 @@ Agents running in Shina know they are in Shina and can use its tools, the way ha
 
 | Tool | What it does |
 |---|---|
-| `list_threads` | Lists the workspace's threads with their ids, titles, parents, captains, and status. |
+| `list_threads` | Lists the caller's project's threads with ids, project, machine, titles, parents, captains and status. `all_projects: true` includes every project and project-less chats. |
 | `read_thread` | Returns a thread's most recent messages. |
 | `list_captains` | Lists the crew with their roles and current status. |
-| `delegate_task` | Starts a child under the caller's captain or a named one with a complete brief and no parent history. Children cannot delegate. Accepts `wait_seconds`. |
-| `task_status` | Reports a thread's parent, status, completion flag, latest reply and error. Accepts `wait_seconds`. |
+| `delegate_task` | Starts a child in the caller's project and machine, under that project's captain, with a complete brief and no parent history. Children cannot delegate. A named captain must match the project's assigned captain. Accepts `wait_seconds`. |
+| `task_status` | Reports a thread's project, machine, parent, status, completion flag, latest reply and error. Accepts `wait_seconds`. |
 | `task_cancel` | Clears queued work and aborts a child. Only the parent that delegated it may cancel. |
 | `task_send` | Sends a correction or follow-up brief to a child. Only its parent may send. Starts an idle child or queues after its current work. |
 
@@ -108,7 +111,11 @@ Pi launches with automatic extension discovery, MCP, skills, and prompt template
 
 Pi must already be enrolled in CPA with `~/.pi/agent/cpa-catalog.json`, its catalog client, and `extensions/cpa-provider.ts`. `PI_CODING_AGENT_DIR` can select a different Pi agent directory. Shina reports a missing provider extension instead of silently using a direct provider. The workstation's existing `CPA_API_KEY` and local proxy remain outside Shina. Pi inherits Shina's environment, so the key must be present when Shina starts; a key set only in another shell will not reach an already-running app. Opening a picker refreshes catalog metadata after five minutes. Running processes read changed provider definitions when Shina next starts them, or after an app restart.
 
-On Windows, Shina's small workspace index lives under `%LOCALAPPDATA%\Shina`. A Still-era index is copied over on first launch, so renaming the app does not lose saved threads. Pi keeps its own session files and credentials in its normal locations outside this repository. Drafts currently survive thread switches, but not app restarts. Run one Shina instance per workspace to avoid competing index writes.
+On Windows, Shina stores its global index in `%LOCALAPPDATA%\Shina\index.json`. First launch imports the per-workspace indexes for every path in legacy `projects.json` and `last-workspace.txt`, including missing folders. It also checks Still-era indexes. Colliding thread ids and parent links are remapped together. Sessions, pins, archived state, delegation and captain profiles survive. Migration preserves historical captain-home flags, but designates only one coordinator home per project. Other former homes remain ordinary threads with their original metadata. Shina never deletes or rewrites the legacy indexes. A damaged index blocks saving instead of overwriting it with a partial import.
+
+Each thread starts Pi in its own project's folder. A project-less thread uses `%LOCALAPPDATA%\Shina\chats\<thread-id>`, isolated from other chats and reused on resume. Projects and threads record a machine id. The backend dispatch currently supports only `local`; unknown machines fail instead of running locally. Project notes/context and a remote `shina serve` host are follow-up work.
+
+Pi keeps its session files and credentials in its normal locations outside this repository. Drafts survive thread and project switches, but not app restarts. Run only one Shina instance at a time to avoid competing global-index writes.
 
 Closing Shina closes the agent input pipes and waits for shutdown. After a short grace period, it terminates any remaining agent process. This is cleanup, not process-tree isolation.
 
@@ -122,12 +129,13 @@ cargo test installed_pi_uses_captain_system_instructions -- --ignored
 cargo test installed_pi_calls_shina_mcp_tools -- --ignored
 cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
 cargo test installed_pi_parent_is_woken_by_child_completion -- --ignored --nocapture
+cargo test installed_pi_runs_projects_and_scratch_concurrently -- --ignored --nocapture
 cargo test real_clone_of_a_public_repository -- --ignored
 ```
 
 The first opt-in integration test verifies CPA model discovery, reasoning levels, state, and history without a model prompt. The captain and MCP tests send real CPA prompts through automatic startup. The file-edit test edits a disposable fixture and resumes its session to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota and leave Pi's test sessions in its normal session directory.
 
-The clone test clones two small public GitHub repositories, one with `gh` and one with `git`, into a temporary folder and deletes them afterwards.
+The multi-project live test runs two projects and a project-less chat concurrently. Each reads a different relative-path fixture to verify its working directory. The clone test clones two small public GitHub repositories, one with `gh` and one with `git`, into a temporary folder and deletes them afterwards.
 
 Render with Rune's actual GPU renderer, without opening a window:
 
@@ -139,17 +147,21 @@ cargo run -- --demo --scene captain --snap artifacts\shina-captain.png --size 12
 cargo run -- --demo --scene picker --snap artifacts\shina-picker.png --size 1280x840 --scale 1
 cargo run -- --demo --scene projects --snap artifacts\shina-projects.png --size 1280x840 --scale 1
 cargo run -- --demo --scene clone --snap artifacts\shina-clone.png --size 1280x840 --scale 1
+cargo run -- --demo --scene sidebar-narrow --snap artifacts\shina-sidebar-narrow.png --size 620x720 --scale 1
+cargo run -- --demo --scene collapsed --snap artifacts\shina-collapsed.png --size 1280x840 --scale 1
 ```
 
 ## Implementation and limits
 
-`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns thread state and automatic session lifetimes. `src/session.rs` caches provider metadata independently of thread runtimes. `src/backend.rs` handles subprocesses and JSONL framing on worker threads. `src/store.rs` saves the workspace index off the render thread. `src/projects.rs` keeps the recent projects list and runs clones.
+`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns global project/thread state and automatic session lifetimes. `src/session.rs` caches provider metadata independently of thread runtimes. `src/backend.rs` dispatches machine hosts and handles local subprocesses and JSONL framing on worker threads. `src/store.rs` migrates legacy data and saves the global index off the render thread. `src/projects.rs` holds project records, project actions and background clones.
 
 Rune is pre-release and pinned to revision `a7f276c3630f85a06a0230295da4d2bd172d8d3b`. The app batches incoming records, bounds pipe queues, memoizes rendered Markdown, and uses Rune's event-driven redraw behavior. These are design choices, not proof of production performance. Each active thread has the memory cost of its Pi process until idle reclaim.
 
 The earlier layout's release build reported forced at-rest CPU times below 0.15 ms at p95 for a small static example. That measurement predates the crew portrait pass and is not a benchmark of this revised layout, interactive frame rate, or live Pi work.
 
-This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees, multi-project concurrent work, and packaging/installers remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
+The full T3 thread-management port is on hold for a separate spec. Snooze and auto-wake, settle/unsettle rules, collapsible and paged settled shelves, drag between sections and undo notices are not implemented in this release. `Status::Settled` still means the Pi run finished, not that the user settled the thread. Future thread-list lifecycle fields must remain separate from process status.
+
+This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
 
 The supplied `assets/project-icon.png` is the T3 Code project favicon and the source for Shina's executable, taskbar, and window icons. The build generates Windows icon sizes without smoothing the pixel art. This user-supplied artwork is separate from the code's MIT license.
 
