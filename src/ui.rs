@@ -1832,6 +1832,7 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     };
     row()
         .key("chat-header")
+        .w_full()
         .h(36.0)
         .px(10.0)
         .center_y()
