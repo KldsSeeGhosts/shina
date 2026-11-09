@@ -20,6 +20,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 8 | 8.1 | 8.8 | 8.0 (Capy 8.1) | 3 of 3 approve |
 | 9 | 8.3 | 9.0 | 8.2 (Capy 8.5) | 3 of 3 approve |
 | 10 | 8.4 | 8.9 | 8.3 (Capy 8.2) | 3 of 3 approve |
+| 11 | 8.4 | 9.0 | 8.4 (Capy 8.0) | 2 of 3 approve |
 
 ## Round 1
 
@@ -137,3 +138,16 @@ Shipped in round 10: header actions without phantom gaps and with on states, a b
 | **Average** | 6.0 | 8.1 | **8.4** | 8.9 | 8.3 / **8.3** / 8.2 | 3 of 3 |
 
 Consistency & polish, round 9 to round 10: Sonnet 7.3 to 7.9, GPT 8.2 to 8.4, Gemini 8.7 to 9.1. Judges split on portrait names (Gemini and GPT prefer the new look names, Sonnet finds them confusing). Open items: empty space between transcript and composer, chevrons on disclosures that open the activity pane, the Threads nav never shows active, the captain home composer floats mid-pane, and dark surfaces separate faintly.
+
+Shipped in round 11: right-pointing disclosure chevrons that open the activity pane, muted settled text, 400-weight dark body text, firmer dark hairlines, theme-fit modal scrims, recessed light form fields, and a narrow composer on the transcript edge.
+
+## Round 11 (`r11/`)
+
+| Judge | Baseline | Round 10 | Round 11 | Capy | Crew art r10 / r11 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.4 | 7.4 | 7.7 | 8.6 | 7.8 / 7.8 / 7.0 | yes |
+| GPT 6.1 Sol | 6.4 | 8.3 | 8.4 | 9.0 | 8.5 / 8.5 / 8.3 | no |
+| Gemini 4 Argon | 6.1 | 8.9 | 9.1 | 9.3 | 8.9 / 8.9 / 8.8 | yes |
+| **Average** | 6.0 | 8.2 | **8.4** | 9.0 | 8.4 / **8.4** / 8.0 | 2 of 3 |
+
+GPT found the gain too small to count as a whole-product advance; the orchestrator merged on the strength of the corrections. All three flag Sable's sidebar check, still teal while Settled is muted elsewhere. Open items: the native-width column leaves a large empty pane, the sidebar footer rule runs past the row column, the captain row stays selected while a nested thread is open, and demo suggestion pills look enabled.
