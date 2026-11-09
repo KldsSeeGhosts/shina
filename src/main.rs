@@ -5,6 +5,7 @@ mod captains;
 mod install;
 mod mcp;
 mod model;
+mod projects;
 mod store;
 mod ui;
 mod update;
@@ -21,10 +22,12 @@ fn init() -> State {
     State::new(path.clone(), *demo)
 }
 
-fn key(state: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
+fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if event.is_command('n') {
         state.new_thread();
         state.current_mut().draft.focused = true;
+    } else if event.is_command('o') {
+        projects::pick_folder(state, tx);
     } else if event.is_command('b') {
         state.sidebar = !state.sidebar;
     } else if event.is_command('l') {
@@ -129,6 +132,31 @@ fn main() {
             ("captain", |state| {
                 state.populate_demo();
                 state.open_captain(0);
+            }),
+            ("projects", |state| {
+                state.populate_demo();
+                state.open_project_menu();
+            }),
+            ("projects-dark", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.open_project_menu();
+            }),
+            ("clone", |state| {
+                state.populate_demo();
+                state.open_clone_dialog();
+                state.projects.clone_source.replace_text("anomalyco/rune");
+                state.projects.clone_progress = "Receiving objects:  42% (1234/2938), 3.10 MiB | 4.20 MiB/s".into();
+            }),
+            ("clone-dark", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.open_clone_dialog();
+                state.projects.clone_source.replace_text("https://github.com/anomalyco/rune");
+                state.projects.clone_error = Some(format!(
+                    "{} already exists and is not empty. Choose another destination.",
+                    state.projects.clone_parent.join("rune").display()
+                ));
             }),
             ("picker", |state| {
                 state.populate_demo();

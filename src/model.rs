@@ -841,6 +841,8 @@ pub struct State {
     /// Set by the update button; `poll` restarts once no thread is busy.
     pub restart_for_update: bool,
     task_waiters: Vec<TaskWaiter>,
+    /// Recent projects, the switcher menu, and the clone sheet.
+    pub projects: crate::projects::Projects,
 }
 
 impl State {
@@ -872,6 +874,7 @@ impl State {
             updater: Default::default(),
             restart_for_update: false,
             task_waiters: vec![],
+            projects: Default::default(),
         };
         if demo {
             state.populate_demo();
@@ -1364,26 +1367,38 @@ impl State {
         self.checkpoint();
     }
     pub fn switch_workspace(&mut self, path: PathBuf) {
-        if self
-            .threads
-            .iter()
-            .any(|thread| thread.status.busy() || !thread.draft.text.is_empty())
-        {
-            self.current_mut().error = Some("Stop running threads and clear unsent drafts before opening another folder. Your current workspace has not changed.".into());
-            return;
+        if let Err(error) = self.try_switch_workspace(path) {
+            self.current_mut().error = Some(error);
+        }
+    }
+    /// Rebuilds the state for another folder, or says which thread keeps the current one open.
+    pub fn try_switch_workspace(&mut self, path: PathBuf) -> Result<(), String> {
+        if let Some(thread) = self.threads.iter().find(|thread| thread.status.busy()) {
+            return Err(format!(
+                "\"{}\" is {}. Stop it before opening another folder. Your current workspace has not changed.",
+                thread.title,
+                match thread.status {
+                    Status::Waiting => "waiting for your reply",
+                    Status::Connecting => "still connecting",
+                    _ => "still working",
+                }
+            ));
+        }
+        if let Some(thread) = self.threads.iter().find(|t| !t.draft.text.is_empty()) {
+            return Err(format!(
+                "\"{}\" has an unsent draft. Send or clear it before opening another folder. Your current workspace has not changed.",
+                thread.title
+            ));
         }
         let path = match path.canonicalize() {
             Ok(path) if path.is_dir() => path,
-            _ => {
-                self.current_mut().error =
-                    Some("That workspace folder could not be opened.".into());
-                return;
-            }
+            _ => return Err("That workspace folder could not be opened.".into()),
         };
         self.checkpoint();
         let mut next = State::new(path, false);
         next.setup(self.wake.clone());
         *self = next;
+        Ok(())
     }
     pub fn archive(&mut self) {
         if self.current().status.busy() {
@@ -1406,9 +1421,7 @@ impl State {
         if self.demo {
             return;
         }
-        if crate::install::is_installed() {
-            crate::install::remember_workspace(&self.workspace);
-        }
+        self.projects.recents = crate::projects::record(&self.workspace);
         self.updater.check(wake.clone());
         // Thread ids restart per workspace, so tokens from a previous workspace must not carry over.
         if let Ok(server) = crate::mcp::server(wake.clone()) {
@@ -1598,11 +1611,13 @@ impl State {
         }
         self.next_id = 11;
         self.active = 0;
+        self.projects = crate::projects::Projects::demo();
     }
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = state.updater.poll();
+    changed |= state.poll_projects();
     if !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
     {

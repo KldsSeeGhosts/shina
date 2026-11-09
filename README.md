@@ -12,7 +12,7 @@ The development tools and Pi are already installed on this workstation.
 cargo run
 ```
 
-Click **Open folder** to choose a project, then send a message. Shina connects Pi first, waits for its state and history, and submits your current draft once. **Connect Pi** is still available for a read-only connection. Sending a message starts agent work and can consume your CPA upstream quota.
+Click the project name at the top of the thread list to open the project switcher. It lists your recent projects and has **Open folder...** (Ctrl+O) and **Clone repository...**. Choose a project, then send a message. Shina connects Pi first, waits for its state and history, and submits your current draft once. **Connect Pi** is still available for a read-only connection. Sending a message starts agent work and can consume your CPA upstream quota.
 
 The model and reasoning controls in the composer are live Pi RPC controls. The model picker shows only your shared CPA catalog models. It supports filtering by model name, ID, or provider. Shina refuses to send prompts through a direct provider, including when an older session restores one.
 
@@ -69,9 +69,11 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
 - An atomic per-workspace index remembers thread titles, archive state, and Pi session paths. Reconnect to load a saved transcript, tool summaries, and tool results.
 - Live progress distinguishes model thinking, text generation, tool execution, retries, and compaction. Rejected prompts return to the draft; cancellation releases a pending dialog before clearing the queue and aborting.
-- Native folder selection. Switching folders refuses to discard unsent drafts or interrupt busy threads.
+- A project switcher with recent projects, native folder selection, and cloning. Switching folders refuses to discard unsent drafts or interrupt busy threads, and names the thread that blocks it.
+- Recent projects are saved in `%LOCALAPPDATA%\Shina\projects.json`, which replaces `last-workspace.txt` (read once to seed the list). Projects whose folder is missing are hidden from the menu but kept in the file.
+- **Clone repository...** accepts `owner/repo`, a GitHub URL, or any git URL. Shorthand runs `gh repo clone`; URLs run `git clone`. Both run in the background without a console window, with prompts turned off, and use your existing git or `gh` login. Shina never asks for or stores credentials. The destination defaults to the current project's parent folder and remembers the last one used. Shina refuses a destination that exists and is not empty, then opens the new clone when it finishes.
 
-Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
+Keyboard shortcuts are Ctrl+N for a new thread, Ctrl+O to open a folder, Ctrl+B for the sidebar, Ctrl+L for the composer, Ctrl+= and Ctrl+- to zoom the whole window (Ctrl+0 resets it), and Escape to stop a run. On macOS the primary shortcuts use Command. Shift+Enter inserts a newline.
 
 Ctrl+K opens thread search. Captain entries currently organize separate Pi conversations. A captain's portrait reflects the most urgent live thread in its crew, so a failure outranks a request for help, which outranks working, settled, and offline states. Issues, pull requests, and automation navigation remain disabled until those integrations exist.
 
@@ -117,9 +119,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test installed_pi_answers_state_and_history_without_a_prompt -- --ignored
 cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
 cargo test installed_pi_parent_is_woken_by_child_completion -- --ignored --nocapture
+cargo test real_clone_of_a_public_repository -- --ignored
 ```
 
 The first opt-in integration test starts the installed Pi and verifies CPA model discovery, reasoning levels, state, and history. It sends no model prompt. The second sends one prompt through the configured CPA model, reads and edits a disposable text fixture, waits for settlement, and reconnects to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota and leave Pi's test sessions in its normal session directory.
+
+The clone test clones two small public GitHub repositories, one with `gh` and one with `git`, into a temporary folder and deletes them afterwards.
 
 Render with Rune's actual GPU renderer, without opening a window:
 
@@ -129,11 +134,13 @@ cargo run -- --demo --scene dark --snap artifacts\shina-dark.png --size 1280x840
 cargo run -- --demo --snap artifacts\shina-narrow.png --size 620x720 --scale 1
 cargo run -- --demo --scene captain --snap artifacts\shina-captain.png --size 1280x840 --scale 1
 cargo run -- --demo --scene picker --snap artifacts\shina-picker.png --size 1280x840 --scale 1
+cargo run -- --demo --scene projects --snap artifacts\shina-projects.png --size 1280x840 --scale 1
+cargo run -- --demo --scene clone --snap artifacts\shina-clone.png --size 1280x840 --scale 1
 ```
 
 ## Implementation and limits
 
-`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns thread state. `src/backend.rs` handles subprocesses and JSONL framing on worker threads. `src/store.rs` saves the workspace index off the render thread.
+`src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns thread state. `src/backend.rs` handles subprocesses and JSONL framing on worker threads. `src/store.rs` saves the workspace index off the render thread. `src/projects.rs` keeps the recent projects list and runs clones.
 
 Rune is pre-release and pinned to revision `a7f276c3630f85a06a0230295da4d2bd172d8d3b`. The app batches incoming records, bounds pipe queues, memoizes rendered Markdown, and uses Rune's event-driven redraw behavior. These are design choices, not proof of production performance. Each connected thread still has the memory cost of its Pi process.
 
