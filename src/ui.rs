@@ -904,6 +904,9 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             })
             .child(content),
     );
+    if let Some(row) = update_row(s, p) {
+        side = side.child(row);
+    }
     side = side.child(row().px(8.0).w_full().child(rule(p))).child(
         row()
             .h(48.0)
@@ -972,6 +975,44 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     side
 }
 
+/// Shown only when there is something to do: an update to fetch, one downloading, or one
+/// ready to install with a restart.
+fn update_row(s: &State, p: Palette) -> Option<El> {
+    use crate::update::Status;
+    type Action = Option<fn(&mut State)>;
+    let (key, title, action): (&str, String, Action) = match &s.updater.status {
+        Status::Available { tag } => (
+            "update-download",
+            format!("Update to {tag}"),
+            Some(|s: &mut State| s.updater.download(s.wake.clone())),
+        ),
+        Status::Downloading { tag } => ("update-progress", format!("Downloading {tag}"), None),
+        Status::Ready { tag, .. } => (
+            "update-restart",
+            format!("Restart to install {tag}"),
+            Some(|s: &mut State| s.restart_for_update = true),
+        ),
+        _ => return None,
+    };
+    let mut button = row()
+        .key(key)
+        .role("button")
+        .label(title.clone())
+        .h(30.0)
+        .mx(8.0)
+        .mb(8.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.teal_bg)
+        .child(icon("send", p.teal_text))
+        .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text));
+    if let Some(action) = action {
+        button = button.focusable(true).hover(p.selected).on_press(action);
+    }
+    Some(button)
+}
 fn nav(
     key: &str,
     title: &str,

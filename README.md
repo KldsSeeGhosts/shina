@@ -29,6 +29,25 @@ cargo build --release
 .\target\release\shina.exe
 ```
 
+## Install and update
+
+Install Shina for your Windows account:
+
+```powershell
+cargo build --release
+.\target\release\shina.exe --install
+```
+
+This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start Menu shortcut, registers an Apps & Features entry, and starts the installed copy. The path never changes, so a Start pin or the Caelestia launcher keeps working across updates and development rebuilds. The installed app reopens the last workspace you used. Run `shina.exe --uninstall`, or remove Shina in Settings > Apps, to uninstall it. Your thread indexes in `%LOCALAPPDATA%\Shina` are kept.
+
+The installed app checks GitHub Releases on startup through the GitHub CLI, using your existing `gh` login, because the repository is private. When a newer version exists, the sidebar shows **Update to vX.Y.Z**. After the download it offers **Restart to install**, which swaps the executable and reopens your workspace. Development builds never update themselves.
+
+To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, then run this from a clean `main`:
+
+```powershell
+.\tools\release.ps1 -Install
+```
+
 An optional development flag selects a project on launch:
 
 ```powershell
