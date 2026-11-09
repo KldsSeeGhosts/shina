@@ -1533,28 +1533,33 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
     }
 
+    let captain_home = s.is_captain_home(thread);
+    // T3 cards lead with the project line; Captains lead with their avatar and name.
+    let lead = if nested {
+        None
+    } else if captain_home {
+        Some(avatar(
+            s,
+            p,
+            thread.captain.expect("captain home"),
+            20.0,
+            s.home_status(thread.id),
+        ))
+    } else {
+        Some(icon(
+            if draft {
+                "edit"
+            } else if thread.pinned() {
+                "pin"
+            } else {
+                "thread"
+            },
+            if selected { p.ink } else { p.muted },
+        ))
+    };
     let mut title = row().gap(8.0).center_y();
-    if !nested {
-        title = title.child(if s.is_captain_home(thread) {
-            avatar(
-                s,
-                p,
-                thread.captain.expect("captain home"),
-                20.0,
-                s.home_status(thread.id),
-            )
-        } else {
-            icon(
-                if draft {
-                    "edit"
-                } else if thread.pinned() {
-                    "pin"
-                } else {
-                    "thread"
-                },
-                if selected { p.ink } else { p.muted },
-            )
-        });
+    if captain_home && let Some(lead) = lead.clone() {
+        title = title.child(lead);
     }
     title = title.child(
         label(
@@ -1610,12 +1615,19 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             };
             title = title.child(label(time, SMALL, p.muted));
         }
-        return item.h(36.0).child(title);
+        let mut line = row().gap(8.0).center_y();
+        if !captain_home && let Some(lead) = lead {
+            line = line.child(lead);
+        }
+        return item.h(36.0).child(line.child(title.grow(1.0)));
     }
     let mut meta = row()
-        .gap(5.0)
+        .gap(if captain_home { 5.0 } else { 8.0 })
         .center_y()
-        .pl(if nested { 0.0 } else { 24.0 });
+        .pl(if captain_home { 28.0 } else { 0.0 });
+    if !captain_home && let Some(lead) = lead {
+        meta = meta.child(lead);
+    }
     meta = meta.child(
         label(
             s.project(thread.project)
@@ -1709,7 +1721,11 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     if thread.machine != "local" {
         meta = meta.child(icon("cloud", p.muted));
     }
-    item.child(meta).child(title)
+    if captain_home {
+        item.child(title).child(meta)
+    } else {
+        item.child(meta).child(title)
+    }
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -2151,53 +2167,35 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         .px(10.0)
         .center_y()
         .gap(4.0);
-    let project_id = s.current().project;
-    header = header.child(button(
-        "breadcrumb-project",
-        s.project(project_id)
-            .map(|p| p.name.as_str())
-            .unwrap_or("No project"),
-        p,
-        move |s| s.new_thread_in(project_id),
-    ));
+    // Crew threads link back to the thread that started them; nothing else repeats the tab.
     if let Some(parent) = s
         .current()
         .parent
         .and_then(|id| s.threads.iter().position(|t| t.id == id))
     {
-        header = header.child(label("/", SMALL, p.muted)).child(button(
-            "breadcrumb-parent",
-            &s.threads[parent].title,
-            p,
-            move |s| s.select_thread(parent),
-        ));
-    }
-    header = header
-        .child(label("/", SMALL, p.muted))
-        .child(
-            button("breadcrumb-title", &s.current().title, p, |s| {
-                s.thread_menu = true
+        header = header.child(label("From", SMALL, p.muted)).child(
+            button("breadcrumb-parent", &s.threads[parent].title, p, move |s| {
+                s.select_thread(parent)
             })
-            .max_w(210.0)
+            .max_w(240.0)
             .shrink()
-            .min_w(0.0)
-            .on_double_press(|s: &mut State| s.begin_rename(s.current().id)),
-        )
-        .child(spacer())
-        .child(if s.demo {
-            row()
-                .key("demo-badge")
-                .h(20.0)
-                .px(8.0)
-                .mr(4.0)
-                .radius(10.0)
-                .center_y()
-                .fill(p.gold.alpha(0.12))
-                .label("Demo data, read-only")
-                .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
-        } else {
-            status(s.current().status, p)
-        });
+            .min_w(0.0),
+        );
+    }
+    header = header.child(spacer()).child(if s.demo {
+        row()
+            .key("demo-badge")
+            .h(20.0)
+            .px(8.0)
+            .mr(4.0)
+            .radius(10.0)
+            .center_y()
+            .fill(p.gold.alpha(0.12))
+            .label("Demo data, read-only")
+            .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
+    } else {
+        status(s.current().status, p)
+    });
     header = header.child(toggle_button(
         "thread-actions",
         "More actions",
