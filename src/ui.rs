@@ -19,6 +19,7 @@ struct Palette {
     danger: Color,
     on_teal: Color,
     badge_ring: Color,
+    teal_text: Color,
     field_line: Color,
 }
 fn color(hex: &str) -> Color {
@@ -40,6 +41,7 @@ fn palette(dark: bool) -> Palette {
             danger: color("#f0a39c"),
             on_teal: color("#0d1f1e"),
             badge_ring: color("#161616"),
+            teal_text: color("#55bdb4"),
             field_line: color("#56565c"),
         }
     } else {
@@ -57,6 +59,7 @@ fn palette(dark: bool) -> Palette {
             danger: color("#a33e38"),
             on_teal: Color::WHITE,
             badge_ring: color("#f4f4f6"),
+            teal_text: color("#11827c"),
             field_line: color("#c4c4ca"),
         }
     }
@@ -288,19 +291,47 @@ fn icon_button(
         .on_press(action)
         .child(tool_icon(glyph, p.muted))
 }
+/// The status a view should show for the open tab: a captain's home stands for the whole
+/// captain, so it shows the most urgent of its threads; any other tab shows itself.
+fn shown_status(s: &State) -> Status {
+    let t = s.current();
+    match t.captain {
+        Some(captain) if t.captain_home => s.captain_status(captain),
+        _ => t.status,
+    }
+}
 fn status_ink(status: Status, p: Palette) -> Color {
     match status {
         Status::Failed => p.danger,
         Status::Waiting => p.gold,
-        Status::Running | Status::Settled => p.teal,
+        Status::Running | Status::Settled => p.teal_text,
         _ => p.muted,
     }
+}
+/// One status vocabulary everywhere: a dot for working, a ring for needs you, a square for
+/// failed, and a check for settled. Ready and offline have no mark.
+fn status_mark(status: Status, p: Palette, size: f32) -> El {
+    let ink = status_ink(status, p);
+    match status {
+        Status::Running => el().size(size, size).radius(size / 2.0).fill(ink),
+        Status::Waiting => el()
+            .size(size, size)
+            .radius(size / 2.0)
+            .border((size / 3.5).max(1.5), ink),
+        Status::Failed => el().size(size - 1.0, size - 1.0).radius(1.5).fill(ink),
+        Status::Settled => icon("check", ink).size(size + 5.0, size + 5.0),
+        _ => el()
+            .size(size, size)
+            .radius(size / 2.0)
+            .fill(ink.alpha(0.6)),
+    }
+    .a11y_hidden()
 }
 fn status(status: Status, p: Palette) -> El {
     row()
         .center_y()
         .gap(6.0)
-        .child(el().size(5.0, 5.0).radius(2.5).fill(status_ink(status, p)))
+        .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
 
@@ -316,15 +347,28 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let compact = cx
         .layout_with("workspace-root", |r| r[2] < 760.0)
         .unwrap_or(false);
-    let mut root = row()
-        .key("workspace-root")
-        .w_full()
-        .h_full()
-        .fill(p.bg)
-        .padding(8.0)
-        .gap(0.0);
-    if (s.sidebar && !compact) || (compact && s.compact_sidebar) {
-        root = root.child(sidebar(s, p, narrow));
+    let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
+    let chrome = cx.chrome_insets();
+    // One strip at the titlebar's height holds the sidebar header, tabs, actions, and the
+    // window's caption buttons, so they share a centre line and never overlap the pane.
+    let mut top = row()
+        .key("top-strip")
+        .h(chrome.height.max(40.0))
+        .window_drag()
+        .center_y()
+        .pl(8.0)
+        .pr(chrome.trailing.max(8.0));
+    if docked {
+        top = top.child(
+            sidebar_header(s, p)
+                .w(if narrow { 216.0 } else { 232.0 })
+                .pr(8.0),
+        );
+    }
+    top = top.child(header(s, p, narrow, compact).grow(1.0).min_w(0.0));
+    let mut workspace = row().grow(1.0).min_h(0.0).px(8.0).pb(8.0);
+    if docked {
+        workspace = workspace.child(sidebar(s, p, narrow));
     }
     let mut pane = col()
         .key("chat-pane")
@@ -336,9 +380,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.panel)
         .border(0.5, p.line)
         .clip_rounded(12.0);
-    pane = pane
-        .child(header(s, p, narrow, compact).pr(cx.chrome_insets().trailing.max(6.0)))
-        .child(rule(p));
     if s.show_activity && narrow {
         pane = pane.child(activity(s, p, true));
     } else {
@@ -361,7 +402,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         pane = pane.child(body);
     }
-    let root = root.child(pane);
+    let root = col()
+        .key("workspace-root")
+        .w_full()
+        .h_full()
+        .fill(p.bg)
+        .child(top)
+        .child(workspace.child(pane));
     if s.captain_editor.is_some() {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
         root.child(captain_editor(s, p, height))
@@ -515,6 +562,49 @@ fn settings_picker(s: &State, p: Palette) -> El {
         .child(card)
 }
 
+/// Logo, search, and sidebar toggle. Lives in the window's top strip above the sidebar.
+fn sidebar_header(s: &State, p: Palette) -> El {
+    row()
+        .h(36.0)
+        .window_drag()
+        .center_y()
+        .px(6.0)
+        .child(
+            el().size(24.0, 24.0).radius(6.0).clip_rounded(6.0).pixels(
+                if s.dark {
+                    &s.artwork.mark_dark
+                } else {
+                    &s.artwork.mark
+                }
+                .pixels(),
+            ),
+        )
+        .child(spacer())
+        .child(icon_button(
+            "search-toggle",
+            "Search threads",
+            "search",
+            p,
+            |s| {
+                s.search_open = !s.search_open;
+                s.search.focused = s.search_open;
+            },
+        ))
+        .child(icon_button(
+            "sidebar-toggle",
+            "Toggle sidebar",
+            "sidebar",
+            p,
+            |s| {
+                if s.compact_sidebar {
+                    s.compact_sidebar = false;
+                } else {
+                    s.sidebar = !s.sidebar;
+                }
+            },
+        ))
+}
+
 fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
     let mut side = col()
         .key("sidebar")
@@ -522,47 +612,6 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
         .h_full()
         .min_h(0.0)
         .pr(8.0);
-    side = side.child(
-        row()
-            .h(36.0)
-            .window_drag()
-            .center_y()
-            .px(6.0)
-            .child(
-                el().size(24.0, 24.0).radius(6.0).clip_rounded(6.0).pixels(
-                    if s.dark {
-                        &s.artwork.mark_dark
-                    } else {
-                        &s.artwork.mark
-                    }
-                    .pixels(),
-                ),
-            )
-            .child(spacer())
-            .child(icon_button(
-                "search-toggle",
-                "Search threads",
-                "search",
-                p,
-                |s| {
-                    s.search_open = !s.search_open;
-                    s.search.focused = s.search_open;
-                },
-            ))
-            .child(icon_button(
-                "sidebar-toggle",
-                "Toggle sidebar",
-                "sidebar",
-                p,
-                |s| {
-                    if s.compact_sidebar {
-                        s.compact_sidebar = false;
-                    } else {
-                        s.sidebar = !s.sidebar;
-                    }
-                },
-            )),
-    );
     side = side
         .child(nav("new-thread", "New thread", "compose", p, false, |s| {
             s.new_thread()
@@ -915,20 +964,7 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
         .size(size, size)
         .radius(radius)
         .clip_rounded(radius)
-        .border(
-            if size >= 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed)
-            {
-                1.0
-            } else {
-                0.5
-            },
-            if size >= 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed)
-            {
-                status_ink(status, p)
-            } else {
-                p.line
-            },
-        )
+        .border(0.5, p.line)
         .pixels(
             if size < 30.0 {
                 s.artwork.small_face(captain, face_for(status))
@@ -941,28 +977,23 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
     if status == Status::Offline {
         portrait = portrait.opacity(0.62);
     }
-    if size < 30.0 && matches!(status, Status::Running | Status::Waiting | Status::Failed) {
-        // Working is a filled dot, Needs you a hollow ring, Failed a square.
-        let dot = (size * 0.32).clamp(6.0, 7.5);
-        let badge = el()
-            .absolute(size - dot + 1.0, size - dot + 1.0)
-            .size(dot, dot)
-            .a11y_hidden();
-        let badge = match status {
-            Status::Waiting => badge
-                .radius(dot / 2.0)
-                .fill(p.badge_ring)
-                .border(2.0, status_ink(status, p)),
-            Status::Failed => badge
-                .radius(1.5)
-                .fill(status_ink(status, p))
-                .border(1.0, p.badge_ring),
-            _ => badge
-                .radius(dot / 2.0)
-                .fill(status_ink(status, p))
-                .border(1.0, p.badge_ring),
+    if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+        // A backing disc in the surface color keeps the mark readable over the artwork.
+        let (backing, mark) = if size >= 30.0 {
+            (13.0, 9.0)
+        } else {
+            (10.0, 7.0)
         };
-        return el().size(size, size).child(portrait).child(badge);
+        let offset = size - backing + 2.0;
+        return el().size(size, size).child(portrait).child(
+            el().absolute(offset, offset)
+                .size(backing, backing)
+                .radius(backing / 2.0)
+                .fill(p.badge_ring)
+                .center()
+                .child(status_mark(status, p, mark))
+                .a11y_hidden(),
+        );
     }
     portrait
 }
@@ -970,11 +1001,7 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
     row()
         .center_y()
         .gap(5.0)
-        .child(if status == Status::Settled {
-            icon("check", p.teal)
-        } else {
-            el().size(5.0, 5.0).radius(2.5).fill(status_ink(status, p))
-        })
+        .child(status_mark(status, p, 6.0))
         .child(label(
             if status == Status::Offline {
                 "Not started"
@@ -1050,17 +1077,11 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .gap(5.0)
         .center_y()
         .pl(if nested { 0.0 } else { 20.0 });
-    meta = meta
-        .child(
-            el().size(5.0, 5.0)
-                .radius(2.5)
-                .fill(status_ink(thread.status, p)),
-        )
-        .child(label(
-            thread.status.label(),
-            SMALL,
-            status_ink(thread.status, p),
-        ));
+    meta = meta.child(status_mark(thread.status, p, 6.0)).child(label(
+        thread.status.label(),
+        SMALL,
+        status_ink(thread.status, p),
+    ));
     item.child(title).child(meta)
 }
 
@@ -1200,7 +1221,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .radius(7.0)
                 .border(
                     if editor.portrait == portrait {
-                        1.0
+                        2.0
                     } else {
                         0.5
                     },
@@ -1211,7 +1232,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     },
                 )
                 .fill(if editor.portrait == portrait {
-                    p.teal.alpha(0.10)
+                    p.teal_bg
                 } else {
                     Color::TRANSPARENT
                 })
@@ -1339,6 +1360,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
 }
 
 fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
+    // Placed in the window's top strip; the strip handles dragging and caption-button room.
     let docked = if compact {
         s.compact_sidebar
     } else {
@@ -1374,7 +1396,7 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 .fill(p.card)
                 .border(0.5, p.line)
                 .child(if let Some(captain) = s.current().captain {
-                    avatar(s, p, captain, 20.0, s.current().status)
+                    avatar(s, p, captain, 20.0, shown_status(s))
                 } else {
                     icon("thread", p.muted)
                 })
@@ -1458,7 +1480,7 @@ fn conversation(s: &State, p: Palette) -> El {
                 row()
                     .gap(12.0)
                     .center_y()
-                    .child(avatar(s, p, captain, 40.0, t.status))
+                    .child(avatar(s, p, captain, 40.0, shown_status(s)))
                     .child(
                         col()
                             .gap(3.0)
@@ -1471,7 +1493,7 @@ fn conversation(s: &State, p: Palette) -> El {
                                         TextStyle::new(16.0, 560.0),
                                         p.ink,
                                     ))
-                                    .child(status(t.status, p)),
+                                    .child(status(shown_status(s), p)),
                             )
                             .child({
                                 let working = s
@@ -1493,7 +1515,7 @@ fn conversation(s: &State, p: Palette) -> El {
                                         .child(el().size(5.0, 5.0).radius(2.5).fill(p.teal))
                                         .child(label(
                                             format!(
-                                                "{working} other {} working",
+                                                "{working} {} working",
                                                 if working == 1 {
                                                     "thread is"
                                                 } else {
@@ -1765,7 +1787,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
         send
     };
     let identity = if let Some(captain) = t.captain {
-        avatar(s, p, captain, 16.0, t.status)
+        avatar(s, p, captain, 16.0, shown_status(s))
     } else {
         el().size(16.0, 16.0)
             .center()
@@ -1790,7 +1812,14 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                 text_input(&t.draft, BODY)
                     .key("composer-input")
                     .label("Message Pi")
-                    .placeholder("Ask anything...", p.muted)
+                    .placeholder(
+                        if s.demo {
+                            "Open a real workspace to send messages"
+                        } else {
+                            "Ask anything..."
+                        },
+                        p.muted,
+                    )
                     .color(p.ink)
                     .caret(p.teal, p.teal_bg)
                     .w_full()
