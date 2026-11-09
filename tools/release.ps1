@@ -37,6 +37,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub release failed.' }
 Write-Host "Published $tag."
 
 if ($Install) {
-    Start-Process -FilePath $exe -ArgumentList '--install' -Wait
+    # -Wait would also wait for the app the installer starts; wait for the installer only.
+    (Start-Process -FilePath $exe -ArgumentList '--install' -PassThru).WaitForExit()
     Write-Host 'Installed and started the new build.'
 }
