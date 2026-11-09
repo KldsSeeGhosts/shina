@@ -1006,7 +1006,7 @@ impl State {
         ];
         self.threads.push(thread);
         for (id, title, status) in [
-            (2, "Review sidebar keyboard navigation", Status::Running),
+            (2, "Review sidebar keys", Status::Running),
             (3, "Reduce cold-start work", Status::Settled),
             (4, "Add a native file picker", Status::Settled),
             (5, "Plan the Pi session adapter", Status::Settled),

@@ -49,7 +49,7 @@ fn palette(dark: bool) -> Palette {
             bg: color("#ededf0"),
             panel: rune::color::oklch(0.985, 0.0015, 290.0),
             card: Color::WHITE,
-            line: Color::BLACK.alpha(0.10),
+            line: Color::BLACK.alpha(0.12),
             ink: color("#202022"),
             muted: color("#6a6a70"),
             selected: Color::BLACK.alpha(0.055),
@@ -79,7 +79,7 @@ fn measure(wide: bool) -> f32 {
     if wide { 832.0 } else { 768.0 }
 }
 const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
-const SMALL: TextStyle = TextStyle::new(11.5, 420.0);
+const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
 
 fn label(value: impl Into<String>, style: TextStyle, ink: Color) -> El {
     text(value).font(style).color(ink)
@@ -307,6 +307,27 @@ fn icon_button(
         .hover(p.selected)
         .on_press(action)
         .child(tool_icon(glyph, p.muted))
+}
+/// An icon button that shows when its panel or state is on.
+fn toggle_button(
+    key: &str,
+    title: &str,
+    glyph: &str,
+    on: bool,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    el().key(key)
+        .role("button")
+        .label(title)
+        .focusable(true)
+        .size(24.0, 24.0)
+        .center()
+        .radius(5.0)
+        .fill(if on { p.selected } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .on_press(action)
+        .child(tool_icon(glyph, if on { p.ink } else { p.muted }))
 }
 /// The status a view should show for the open tab: a captain's home stands for the whole
 /// captain, so it shows the most urgent of its threads; any other tab shows itself.
@@ -741,7 +762,9 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
                     move |s| s.edit_captain(captain),
                 ));
             }
-            if state == Status::Settled {
+            if state == Status::Waiting {
+                captain_row = captain_row.child(label("Needs you", SMALL, status_ink(state, p)));
+            } else if state == Status::Settled {
                 captain_row =
                     captain_row.child(el().size(24.0, 24.0).center().child(icon("check", p.teal)));
             }
@@ -749,7 +772,7 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             if selected {
                 let mut nested = col()
                     .ml(19.0)
-                    .pl(6.0)
+                    .pl(13.0)
                     .gap(1.0)
                     .border_sides([0.0, 0.0, 0.0, 1.0], p.line);
                 let mut any = false;
@@ -990,7 +1013,7 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let radius = if size >= 30.0 { 9.0 } else { 4.0 };
     let mut portrait = el()
-        .key(format!("avatar-{captain}"))
+        .key(format!("avatar-{captain}-{}", size as u32))
         .size(size, size)
         .radius(radius)
         .clip_rounded(radius)
@@ -1082,7 +1105,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             s.current_mut().unread = false;
         });
 
-    let mut title = row().gap(6.0).center_y();
+    let mut title = row().gap(8.0).center_y();
     if !nested {
         title = title.child(icon(
             if thread.pinned { "pin" } else { "thread" },
@@ -1108,7 +1131,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let mut meta = row()
         .gap(5.0)
         .center_y()
-        .pl(if nested { 0.0 } else { 20.0 });
+        .pl(if nested { 0.0 } else { 24.0 });
     meta = meta.child(status_mark(thread.status, p, 6.0)).child(label(
         thread.status.label(),
         SMALL,
@@ -1243,7 +1266,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .role("button")
                 .label(format!(
                     "Use {} portrait",
-                    crate::visuals::CAPTAIN_NAMES[portrait]
+                    crate::visuals::PORTRAIT_NAMES[portrait]
                 ))
                 .focusable(true)
                 .grow(1.0)
@@ -1273,7 +1296,11 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     s.captain_editor.as_mut().unwrap().portrait = portrait;
                 })
                 .child(portrait_avatar(s, p, portrait, 48.0, Status::Ready))
-                .child(label(crate::visuals::CAPTAIN_NAMES[portrait], SMALL, p.ink)),
+                .child(label(
+                    crate::visuals::PORTRAIT_NAMES[portrait],
+                    SMALL,
+                    p.ink,
+                )),
         );
     }
     let mut body = col().key("captain-form-body").gap(12.0).min_h(0.0)
@@ -1451,44 +1478,45 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         } else {
             status(s.current().status, p)
         })
-        .child(if narrow || s.current().captain_home {
-            el()
-        } else {
-            icon_button(
-                "pin-thread",
-                if s.current().pinned {
-                    "Unpin thread"
-                } else {
-                    "Pin thread"
-                },
-                "pin",
+        .child({
+            // Thread actions share one 4 px rhythm; optional ones are left out, not padded.
+            let mut actions = row().center_y().gap(4.0);
+            if !(narrow || s.current().captain_home) {
+                let pinned = s.current().pinned;
+                actions = actions.child(toggle_button(
+                    "pin-thread",
+                    if pinned { "Unpin thread" } else { "Pin thread" },
+                    "pin",
+                    pinned,
+                    p,
+                    |s| s.toggle_pin(),
+                ));
+            }
+            actions = actions.child(toggle_button(
+                "toggle-activity",
+                "Toggle activity",
+                "activity",
+                s.show_activity,
                 p,
-                |s| s.toggle_pin(),
-            )
+                |s| s.show_activity = !s.show_activity,
+            ));
+            if !s.current().status.busy() {
+                actions = actions.child(icon_button(
+                    "archive-thread",
+                    if s.current().archived {
+                        "Restore thread"
+                    } else {
+                        "Archive thread"
+                    },
+                    "archive",
+                    p,
+                    |s| s.archive(),
+                ));
+            }
+            actions
         })
-        .child(icon_button(
-            "toggle-activity",
-            "Toggle activity",
-            "activity",
-            p,
-            |s| s.show_activity = !s.show_activity,
-        ))
-        .child(if s.current().status.busy() {
-            el()
-        } else {
-            icon_button(
-                "archive-thread",
-                if s.current().archived {
-                    "Restore thread"
-                } else {
-                    "Archive thread"
-                },
-                "archive",
-                p,
-                |s| s.archive(),
-            )
-        })
-        .child(el().w(1.0).h(16.0).ml(6.0).fill(p.line))
+        // The divider has equal room on both sides before the caption buttons.
+        .child(el().w(1.0).h(16.0).ml(2.0).mr(8.0).fill(p.line))
 }
 
 fn conversation(s: &State, p: Palette, wide: bool) -> El {
@@ -1628,12 +1656,12 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
             let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
                 row().justify_end().child(
-                    label(&message.text, BODY, p.ink)
+                    label(&message.text, body_style(s.dark, wide), p.ink)
                         .key(format!("{key}-text"))
                         .wrap_anywhere()
                         .shrink()
                         .selectable(true)
-                        .max_w(620.0)
+                        .max_w(if wide { 660.0 } else { 620.0 })
                         .px(14.0)
                         .py(9.0)
                         .radius(10.0)
@@ -1831,7 +1859,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             .shadow(
                 2.0,
                 6.0,
-                Color::BLACK.alpha(if s.dark { 0.12 } else { 0.035 }),
+                Color::BLACK.alpha(if s.dark { 0.12 } else { 0.06 }),
             )
             .px(14.0)
             .pt(12.0)
@@ -1873,7 +1901,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                             s.connect();
                         })
                         .max_w(if narrow { 112.0 } else { 230.0 })
-                        .opacity(if locked { 0.5 } else { 1.0 })
+                        .opacity(if locked { 0.65 } else { 1.0 })
                         .disabled(locked),
                     )
                     .child(
@@ -1881,7 +1909,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                             s.settings_picker = Some(SettingsPicker::Thinking);
                             s.connect();
                         })
-                        .opacity(if locked { 0.5 } else { 1.0 })
+                        .opacity(if locked { 0.65 } else { 1.0 })
                         .disabled(locked),
                     )
                     .child(spacer())
