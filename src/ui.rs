@@ -210,6 +210,42 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
         .on_press(action)
         .child(label(title, TextStyle::new(13.0, 560.0), p.on_teal))
 }
+/// A compact picker trigger: the text truncates, the chevron always stays visible.
+fn dropdown(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(title)
+        .focusable(true)
+        .center_y()
+        .gap(3.0)
+        .h(24.0)
+        .pl(5.0)
+        .pr(3.0)
+        .radius(5.0)
+        .shrink()
+        .min_w(0.0)
+        .hover(p.selected)
+        .on_press(action)
+        .child(
+            label(title, TextStyle::new(12.0, 450.0), p.ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted))
+}
+fn thinking_label(level: &str) -> String {
+    if level.is_empty() {
+        return "Default thinking".into();
+    }
+    let mut chars = level.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    format!("{first}{} thinking", chars.as_str())
+}
 fn icon_button(
     key: &str,
     title: &str,
@@ -469,10 +505,14 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             .center_y()
             .px(6.0)
             .child(
-                el().size(24.0, 24.0)
-                    .radius(6.0)
-                    .clip_rounded(6.0)
-                    .pixels(s.artwork.mark.pixels()),
+                el().size(24.0, 24.0).radius(6.0).clip_rounded(6.0).pixels(
+                    if s.dark {
+                        &s.artwork.mark_dark
+                    } else {
+                        &s.artwork.mark
+                    }
+                    .pixels(),
+                ),
             )
             .child(spacer())
             .child(icon_button(
@@ -508,32 +548,11 @@ fn sidebar(s: &State, p: Palette, narrow: bool) -> El {
             "Threads",
             "list",
             p,
-            !s.show_archive,
+            !s.show_archive && s.current().captain.is_none(),
             |s| {
                 s.show_archive = false;
             },
         ));
-    // Match the reference navigation without pretending that unbuilt integrations work.
-    for (key, title, glyph) in [
-        ("issues-nav", "Issues", "issue"),
-        ("pulls-nav", "Pull requests", "branch"),
-        ("automations-nav", "Automations", "bolt"),
-    ] {
-        side = side.child(
-            row()
-                .key(key)
-                .role("button")
-                .label(format!("{title}, not connected"))
-                .h(28.0)
-                .px(8.0)
-                .gap(8.0)
-                .center_y()
-                .disabled(true)
-                .opacity(0.6)
-                .child(icon(glyph, p.muted))
-                .child(label(title, LABEL, p.muted)),
-        );
-    }
     side = side.child(nav(
         "show-archive",
         if s.show_archive {
@@ -1126,6 +1145,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     let editor = s.captain_editor.as_ref().unwrap();
     let editing = editor.editing.is_some();
     let profile = editor.profile();
+    let field = if s.dark { p.bg } else { p.card };
     let mut portraits = row().gap(8.0).w_full();
     for portrait in 0..crate::visuals::CAPTAIN_NAMES.len() {
         portraits = portraits.child(
@@ -1144,7 +1164,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .radius(7.0)
                 .border(
                     if editor.portrait == portrait {
-                        1.5
+                        1.0
                     } else {
                         0.5
                     },
@@ -1155,9 +1175,9 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     },
                 )
                 .fill(if editor.portrait == portrait {
-                    p.teal_bg
+                    p.teal.alpha(0.10)
                 } else {
-                    p.card
+                    Color::TRANSPARENT
                 })
                 .hover(p.selected)
                 .on_press(move |s: &mut State| {
@@ -1174,18 +1194,18 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(col().gap(5.0).child(label("Name", SMALL, p.muted))
             .child(text_input(&editor.name, BODY).key("captain-name").label("Captain name")
                 .placeholder("e.g. Atlas", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(p.bg).border(1.0, p.line)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name)))
         .child(col().gap(5.0).child(label("Role", SMALL, p.muted))
             .child(text_input(&editor.role, BODY).key("captain-role").label("Captain role")
                 .placeholder("e.g. Code review", p.muted).single_line().color(p.ink)
-                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(p.bg).border(1.0, p.line)
+                .caret(p.teal, p.teal_bg).w_full().padding(8.0).radius(6.0).fill(field).border(1.0, p.line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role)))
         .child(col().gap(5.0).child(label("Instructions for Pi", SMALL, p.muted))
             .child(text_input(&editor.instructions, BODY).key("captain-instructions").label("Captain instructions")
                 .placeholder("What should this captain focus on? Optional.", p.muted).color(p.ink)
                 .caret(p.teal, p.teal_bg).w_full().min_h(76.0).max_h(140.0).padding(8.0)
-                .radius(6.0).fill(p.bg).border(1.0, p.line)
+                .radius(6.0).fill(field).border(1.0, p.line)
                 .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().instructions)))
         .child(label(
             "Saved to this workspace. Each conversation uses these instructions and Pi's configured CPA model. Choose a different model in the composer.",
@@ -1318,7 +1338,17 @@ fn header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 .fill(p.card)
                 .border(0.5, p.line)
                 .child(if let Some(captain) = s.current().captain {
-                    avatar(s, p, captain, 20.0, s.current().status)
+                    avatar(
+                        s,
+                        p,
+                        captain,
+                        20.0,
+                        if s.current().captain_home {
+                            s.captain_status(captain)
+                        } else {
+                            s.current().status
+                        },
+                    )
                 } else {
                     icon("thread", p.muted)
                 })
@@ -1415,7 +1445,31 @@ fn conversation(s: &State, p: Palette) -> El {
                                         TextStyle::new(16.0, 560.0),
                                         p.ink,
                                     ))
-                                    .child(status(t.status, p)),
+                                    .child(status(t.status, p))
+                                    .child({
+                                        let working = s
+                                            .threads
+                                            .iter()
+                                            .filter(|thread| {
+                                                thread.captain == Some(captain)
+                                                    && !thread.captain_home
+                                                    && !thread.archived
+                                                    && thread.status.busy()
+                                            })
+                                            .count();
+                                        if working == 0 {
+                                            el()
+                                        } else {
+                                            label(
+                                                format!(
+                                                    "· {working} {} working",
+                                                    if working == 1 { "thread" } else { "threads" }
+                                                ),
+                                                SMALL,
+                                                p.teal,
+                                            )
+                                        }
+                                    }),
                             )
                             .child(label(
                                 format!(
@@ -1555,22 +1609,14 @@ fn conversation(s: &State, p: Palette) -> El {
         }
         if !t.tools.is_empty() {
             let count = t.tools.len();
-            messages = messages.child(disclosure(
-                "tool-summary",
-                &format!("{count} tool calls"),
-                p,
-                |s| s.show_activity = true,
-            ));
-        }
-        if t.status == Status::Settled {
             messages = messages.child(
-                row()
-                    .center_y()
-                    .gap(7.0)
-                    .child(icon("check", p.teal))
-                    .child(label("Thread settled", SMALL, p.muted)),
+                disclosure("tool-summary", &format!("{count} tool calls"), p, |s| {
+                    s.show_activity = true
+                })
+                .mt(-8.0),
             );
-        } else if t.status == Status::Running {
+        }
+        if t.status == Status::Running {
             messages = messages.child(label(
                 if t.phase.is_empty() {
                     "Pi is working"
@@ -1698,9 +1744,10 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                 6.0,
                 Color::BLACK.alpha(if s.dark { 0.12 } else { 0.035 }),
             )
-            .px(12.0)
-            .py(8.0)
-            .gap(6.0)
+            .px(14.0)
+            .pt(12.0)
+            .pb(10.0)
+            .gap(10.0)
             .child(
                 text_input(&t.draft, BODY)
                     .key("composer-input")
@@ -1709,7 +1756,7 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                     .color(p.ink)
                     .caret(p.teal, p.teal_bg)
                     .w_full()
-                    .min_h(20.0)
+                    .min_h(24.0)
                     .max_h(170.0)
                     .on_edit(|s: &mut State| &mut s.current_mut().draft)
                     .on_submit(|s: &mut State, _| {
@@ -1733,39 +1780,19 @@ fn composer(s: &State, p: Palette, narrow: bool) -> El {
                     )
                     .child(identity)
                     .child(
-                        button("choose-pi-model", &t.model, p, |s| {
+                        dropdown("choose-pi-model", &t.model, p, |s| {
                             s.model_search.replace_text("");
                             s.settings_picker = Some(SettingsPicker::Model);
                             s.connect();
                         })
-                        .shrink()
-                        .min_w(0.0)
-                        .max_w(if narrow { 90.0 } else { 230.0 })
-                        .clip_rounded(5.0)
-                        .pl(4.0)
-                        .pr(3.0)
-                        .gap(3.0)
-                        .child(icon("chevron", p.muted))
+                        .max_w(if narrow { 112.0 } else { 230.0 })
                         .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
                     )
                     .child(
-                        button(
-                            "choose-pi-thinking",
-                            if t.thinking.is_empty() {
-                                "Default"
-                            } else {
-                                &t.thinking
-                            },
-                            p,
-                            |s| {
-                                s.settings_picker = Some(SettingsPicker::Thinking);
-                                s.connect();
-                            },
-                        )
-                        .pl(4.0)
-                        .pr(3.0)
-                        .gap(3.0)
-                        .child(icon("chevron", p.muted))
+                        dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
+                            s.settings_picker = Some(SettingsPicker::Thinking);
+                            s.connect();
+                        })
                         .disabled(s.demo || t.archived || t.status.busy() || t.configuring),
                     )
                     .child(spacer())
