@@ -37,6 +37,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub release failed.' }
 Write-Host "Published $tag."
 
 if ($Install) {
-    & $exe --install
+    Start-Process -FilePath $exe -ArgumentList '--install' -Wait
     Write-Host 'Installed and started the new build.'
 }

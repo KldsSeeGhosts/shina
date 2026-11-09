@@ -89,6 +89,22 @@ pub fn place_exe(source: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Starts Shina without sharing this process's console or pipes, so a script that ran
+/// `--install` (or the app that relaunched for an update) is never held open by it.
+pub fn launch(exe: &Path, workspace: Option<&Path>) -> Result<(), String> {
+    let mut command = Command::new(exe);
+    if let Some(workspace) = workspace {
+        command.arg("--workspace").arg(workspace);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Could not start {}: {e}", exe.display()))
+}
+
 fn hidden(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {

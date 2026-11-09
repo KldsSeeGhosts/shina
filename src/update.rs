@@ -198,11 +198,7 @@ impl Updater {
         };
         let installed = crate::install::place_exe(exe)?;
         let _ = std::fs::remove_file(exe);
-        Command::new(installed)
-            .arg("--workspace")
-            .arg(workspace)
-            .spawn()
-            .map_err(|e| format!("Could not start the updated Shina: {e}"))?;
+        crate::install::launch(&installed, Some(workspace))?;
         Ok(())
     }
 }
