@@ -1681,6 +1681,9 @@ pub struct State {
     pub updater: crate::update::Updater,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
+    /// The explicit restart recorded its update, so the quit hook installs it without saving
+    /// again. An approved restart sets it for the next exit request.
+    pub restart_approved: bool,
     /// Why the last restart click waited. Cleared while the update row shows ready.
     pub restart_notice: Option<String>,
     /// `prepare_exit` started the save for this exit, so a second quit hook never repeats it.
@@ -1783,6 +1786,7 @@ impl State {
             model_search: TextEdit::default(),
             updater: Default::default(),
             restart_for_update: false,
+            restart_approved: false,
             restart_notice: None,
             exit_prepared: false,
             task_waiters: vec![],
@@ -4152,7 +4156,7 @@ impl State {
     }
 
     pub fn take_restart_request(&mut self) -> bool {
-        std::mem::take(&mut self.restart_for_update)
+        std::mem::take(&mut self.restart_approved)
     }
 
     /// Says why a restart waits, next to the update row rather than as a thread error.
@@ -4227,6 +4231,7 @@ impl State {
             update,
             relaunch: explicit,
         });
+        self.restart_approved |= explicit;
         Ok(())
     }
 
@@ -4439,25 +4444,6 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
-    // A restart click only asks for one. The guard is rechecked here, after Pi events have
-    // drained, and a blocked request is dropped rather than restarting later on its own.
-    if matches!(state.updater.status(), crate::update::Status::Ready { .. }) {
-        state.restart_notice = None;
-    }
-    if state.restart_for_update {
-        let mut reply = String::new();
-        match state.prepared_exit(true, Some(&mut reply)) {
-            Ok(()) => {
-                state.restart_for_update = false;
-                tx.quit();
-            }
-            Err(_) => {
-                state.restart_for_update = false;
-                state.report_restart_blocker(reply);
-                changed = true;
-            }
-        }
-    }
     let mut run_ended = false;
     let mut crew_questions = Vec::new();
     for (index, thread) in state.threads.iter_mut().enumerate() {
@@ -4548,6 +4534,27 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     changed |= state.poll_tasks(Instant::now());
+    // A restart click only asks for one. The guard runs after Pi events drained and tasks
+    // were delivered, and an approved request stops all further work in this poll.
+    let mut exit = Exit::default();
+    if state.restart_for_update {
+        state.restart_for_update = false;
+        let mut reply = String::new();
+        match state.prepared_exit(true, Some(&mut reply)) {
+            Ok(()) => {
+                exit.quit = true;
+                changed = true;
+            }
+            Err(_) => {
+                state.report_restart_blocker(reply);
+                changed = true;
+            }
+        }
+    }
+    if !exit.quit {
+        exit.prepared = state.restart_approved
+            || matches!(state.updater.status(), crate::update::Status::Ready { .. });
+    }
     let at = lifecycle::now();
     let attention: Vec<_> = state
         .threads
@@ -4627,10 +4634,25 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         state.storage_error = Some(error);
         changed = true;
     }
-    if changed {
+    if exit.prepared {
+        // The exit saves and flushes; this poll schedules nothing more.
+        changed = true;
+    } else if changed {
         state.checkpoint();
     }
+    if exit.quit {
+        tx.quit();
+    }
     changed
+}
+
+/// What an update restart leaves the poll that approved it to do.
+#[derive(Default)]
+struct Exit {
+    /// The restart was approved: quit once this poll's work is done, and start no more.
+    quit: bool,
+    /// An update exit is recorded, so this poll schedules no further work.
+    prepared: bool,
 }
 
 pub const ZOOM_STEPS: [f32; 10] = [0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
@@ -5310,6 +5332,14 @@ mod tests {
         assert_eq!(restored.selected_threads.len(), 2);
     }
 
+    /// The one exit record is process-wide, so tests that use it take turns.
+    fn exit_record_guard() -> std::sync::MutexGuard<'static, ()> {
+        static EXIT_RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        EXIT_RECORD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A verified update, as the updater would have prepared it.
     fn prepared(tag: &str) -> crate::update::PreparedUpdate {
         let root = crate::store::directory().unwrap().join("prepared");
@@ -5384,6 +5414,7 @@ mod tests {
 
     #[test]
     fn becoming_idle_never_restarts_on_its_own() {
+        let _exit_record = exit_record_guard();
         let mut state = ready_state();
         fake_pi(&mut state.threads[0], Status::Running);
         state.threads[0].draft.replace_text("work");
@@ -5409,6 +5440,7 @@ mod tests {
 
     #[test]
     fn a_restart_needs_a_successful_save_and_a_normal_quit_does_not_relaunch() {
+        let _exit_record = exit_record_guard();
         let _ = crate::update::take_exit();
         let mut state = State::new(PathBuf::new(), false);
         // No stores were started, so the save fails and nothing is recorded.
@@ -5431,10 +5463,25 @@ mod tests {
         state.updater = crate::update::Updater::test_ready(prepared("v0.10.2"));
         state.prepared_exit(false, None).unwrap();
         assert!(crate::update::take_exit().is_none());
+        // A normal quit with no ready update still saves and flushes, and records nothing.
+        state.threads[0].status = Status::Ready;
+        state.updater = crate::update::Updater::test_idle();
+        state.mark_exit_prepared();
+        state
+            .prepared_exit(false, None)
+            .expect("a normal quit flushes even without an update");
+        assert!(crate::update::take_exit().is_none());
+        // An approved restart is taken once, so the quit hook does not save it again.
+        state.updater = crate::update::Updater::test_ready(prepared("v0.10.3"));
+        state.prepared_exit(true, None).unwrap();
+        assert!(state.take_restart_request());
+        assert!(!state.take_restart_request());
+        let _ = crate::update::take_exit();
     }
 
     #[test]
     fn an_explicit_restart_requires_no_active_work_and_relaunches() {
+        let _exit_record = exit_record_guard();
         let _ = crate::update::take_exit();
         let mut state = ready_state();
         state.load_global_for_test();
@@ -5454,6 +5501,7 @@ mod tests {
 
     #[test]
     fn a_blocked_restart_click_is_dropped_instead_of_restarting_later() {
+        let _exit_record = exit_record_guard();
         let _ = crate::update::take_exit();
         let mut state = ready_state();
         state.load_global_for_test();
@@ -5469,6 +5517,82 @@ mod tests {
         state.threads[0].status = Status::Ready;
         poll(&mut state, 0.0, &mut tx);
         assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn a_restart_guard_runs_after_pi_events_drain() {
+        let _exit_record = exit_record_guard();
+        let _ = crate::update::take_exit();
+        let mut state = ready_state();
+        state.load_global_for_test();
+        state.updater = crate::update::Updater::test_ready(prepared("v0.12.0"));
+        let (_commands, events) = fake_pi(&mut state.threads[0], Status::Ready);
+        // Pi has started a run, and the app has not read the event yet.
+        events
+            .send(Event::Record(json!({"type":"agent_start"})))
+            .unwrap();
+        state.restart_for_update = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        // Drained first, so the guard sees the work the click could not see.
+        assert_eq!(state.threads[0].status, Status::Running);
+        assert!(
+            !state.restart_for_update,
+            "the request is never kept for later"
+        );
+        assert!(state.restart_notice.is_some(), "the row says why it waits");
+        assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn a_restart_guard_runs_after_task_delivery() {
+        let _exit_record = exit_record_guard();
+        let _ = crate::update::take_exit();
+        let mut state = ready_state();
+        state.load_global_for_test();
+        state.updater = crate::update::Updater::test_ready(prepared("v0.13.0"));
+        // A delegated task finished, and its report is queued for the parent. The parent
+        // itself runs, so it already has a live Pi session.
+        let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Completed);
+        let mut crew = Thread::new(2);
+        crew.parent = Some(state.threads[0].id);
+        crew.delegated = true;
+        crew.status = Status::Completed;
+        crew.task_result = Some("done");
+        crew.completion_notified = false;
+        state.threads.push(crew);
+        state.threads[0].status = Status::Ready;
+        state.restart_for_update = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        // Delivery queued more work, so the approved request could not have run yet.
+        assert!(state.threads[0].queued());
+        assert_eq!(
+            state.update_restart_blocker(),
+            Some("A thread is still working. Restart when it finishes.")
+        );
+        assert!(crate::update::take_exit().is_none());
+    }
+
+    #[test]
+    fn a_restart_click_on_an_idle_app_records_the_restart() {
+        let _exit_record = exit_record_guard();
+        let _ = crate::update::take_exit();
+        let mut state = ready_state();
+        state.load_global_for_test();
+        state.updater = crate::update::Updater::test_ready(prepared("v0.14.0"));
+        state.restart_for_update = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert!(!state.restart_for_update);
+        // The poll approved and recorded the restart; Rune quits after the handler.
+        let exit = crate::update::take_exit().expect("an idle app restarts");
+        assert!(exit.relaunch);
+        assert!(
+            state.take_restart_request(),
+            "the quit hook sees the approval"
+        );
+        assert!(matches!(
+            state.updater.status(),
+            crate::update::Status::Ready { .. }
+        ));
     }
 
     #[test]

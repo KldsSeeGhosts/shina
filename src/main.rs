@@ -150,7 +150,14 @@ fn main() {
         }
         return;
     }
-    install::remove_replaced_exe();
+    // A crash between an update's two renames may leave only the previous build.
+    install::recover_install();
+    if let Some(target) = install::installed_target() {
+        // A clean start means no prepared update is left waiting for a commit.
+        update::Storage::default_storage().discard_all_attempts();
+        remove_stale_prepared(&target);
+        install::remove_replaced_exe();
+    }
     if install::is_installed() {
         install::adopt_app_id();
     }
@@ -303,40 +310,46 @@ fn main() {
         ],
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
-    .on_close(quit_hook)
-    .on_quit(quit_hook)
+    .on_close(|state, _| close_hook(state))
+    .on_quit(|state, _| quit_hook(state))
     .titlebar(rune::Titlebar::new(44.0))
     .run();
     backend::shutdown_all();
     install_recorded_update();
 }
 
-/// Runs from both quit hooks and is idempotent, so whichever Rune calls first saves and
-/// records. An install is recorded only for an explicit restart or a normal quit with a ready
-/// update and no active work. A window that only hides never installs anything.
-fn quit_hook(state: &mut State, _: &mut Tx) {
-    let quit = rune::quitting();
-    prepare_exit(state, quit);
+/// Closing a window while the app keeps running saves, and a closed window installs nothing.
+fn close_hook(state: &mut State) {
+    if !rune::quitting() {
+        state.checkpoint();
+    }
 }
 
-fn prepare_exit(state: &mut State, quitting: bool) {
-    let explicit = state.take_restart_request();
-    if quitting && explicit {
-        // The click's own quit already saved and recorded the restart.
-        return;
-    }
+/// Runs when the app quits, whether the last window closed, macOS sent Quit, or an update
+/// restart called `Tx::quit`. A quit for an explicit restart is already prepared. Any other
+/// quit records a prepared update for installation without relaunching, after the wait for
+/// both stores' queued writes, so nothing is lost to the async writers.
+fn quit_hook(state: &mut State) {
     if state.exit_prepared() {
         return;
     }
     state.mark_exit_prepared();
-    if explicit {
-        let mut reply = String::new();
-        if state.prepared_exit(true, Some(&mut reply)).is_err() {
-            state.report_restart_blocker(reply);
-        }
+    if state.take_restart_request() {
         return;
     }
-    state.checkpoint();
+    let mut reply = String::new();
+    if let Err(error) = state.prepared_exit(false, Some(&mut reply)) {
+        eprintln!("Shina saved this session, but not the update: {error}");
+    }
+}
+
+/// Deletes a prepared copy left beside the previous build that a manifest no longer names.
+fn remove_stale_prepared(target: &install::InstalledTarget) {
+    if let install::InstalledTarget::Windows { exe } = target
+        && let Some(dir) = exe.parent()
+    {
+        let _ = std::fs::remove_file(dir.join("shina.new.exe"));
+    }
 }
 
 /// After Rune and Pi have exited, replace the installed app with a prepared update. A normal
@@ -345,21 +358,99 @@ fn install_recorded_update() {
     let Some(exit) = update::take_exit() else {
         return;
     };
+    // This exited process, which a failed relaunch may replace with the previous build.
+    let running = std::env::current_exe().unwrap_or_else(|_| exit.update.launcher());
     match update::apply_prepared_update(&exit.update) {
         Ok(installed) => {
             if exit.relaunch
-                && let Err(error) = update::relaunch(&installed, &exit.update.target)
+                && let Err(error) = update::relaunch_or_restore(&exit.update, &installed, &running)
+            {
+                eprintln!("{error}");
+            }
+        }
+        Err(error) => {
+            // The previous app was restored where possible, and the download stays staged.
+            eprintln!("Could not install the Shina update: {error}");
+            if exit.relaunch
+                && let Err(error) = update::relaunch(&exit.update.launcher(), &exit.update.target)
             {
                 eprintln!("Could not reopen Shina: {error}");
             }
         }
-        Err(error) => {
-            // The previous app is back in place, and the download stays for the next quit.
-            eprintln!("Could not install the Shina update: {error}");
-            if exit.relaunch {
-                let launcher = exit.update.launcher();
-                let _ = update::relaunch(&launcher, &exit.update.target);
-            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install::InstalledTarget;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The one exit record is process-wide, so these tests take turns. Rust reads `start` as
+    /// a comparison key exactly (the startup-time hint), so `start` cannot be poisoned.
+    static EXIT_RECORD: Mutex<()> = Mutex::new(());
+
+    fn exclusive_exit_record() -> MutexGuard<'static, ()> {
+        EXIT_RECORD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A verified update for an app in a fixture folder.
+    fn prepared(root: &std::path::Path, target: InstalledTarget) -> update::PreparedUpdate {
+        update::PreparedUpdate {
+            tag: "v0.15.0".into(),
+            target,
+            asset: "shina.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: root.join("download.exe"),
+            prepared: root.join("prepared.exe"),
         }
+    }
+
+    #[test]
+    fn a_normal_quit_records_a_prepared_update_and_a_close_hides_without_one() {
+        let _quit = exclusive_exit_record();
+        let _ = update::take_exit();
+        let mut state = State::new(PathBuf::new(), false);
+        state.load_global_for_test();
+        state.updater = update::Updater::test_ready(prepared(
+            &crate::store::directory().unwrap(),
+            InstalledTarget::Windows {
+                exe: PathBuf::from("C:/fixture/Shina/shina.exe"),
+            },
+        ));
+        // Closing a window that keeps the app running installs nothing.
+        close_hook(&mut state);
+        assert!(!state.exit_prepared());
+        assert!(!update::exit_recorded());
+        quit_hook(&mut state);
+        let exit = update::take_exit().expect("a normal quit installs the ready update");
+        assert!(!exit.relaunch, "a normal quit never reopens Shina");
+        // The hook runs once, so a second close or quit installs nothing either.
+        quit_hook(&mut state);
+        close_hook(&mut state);
+        assert!(!update::exit_recorded());
+    }
+
+    #[test]
+    fn a_quit_after_an_approved_restart_keeps_the_restart_record() {
+        let _quit = exclusive_exit_record();
+        let _ = update::take_exit();
+        let mut state = State::new(PathBuf::new(), false);
+        state.load_global_for_test();
+        state.updater = update::Updater::test_ready(prepared(
+            &crate::store::directory().unwrap(),
+            InstalledTarget::Windows {
+                exe: PathBuf::from("C:/fixture/Shina/shina.exe"),
+            },
+        ));
+        // The click's poll saved and recorded the restart; the quit hook must not undo it.
+        state.prepared_exit(true, None).unwrap();
+        close_hook(&mut state);
+        quit_hook(&mut state);
+        let exit = update::take_exit().expect("the restart stays recorded");
+        assert!(exit.relaunch);
     }
 }

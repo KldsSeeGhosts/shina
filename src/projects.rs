@@ -435,10 +435,22 @@ pub fn clone_command(source: &Source, target: &Path) -> Command {
 
 #[cfg(test)]
 impl CloneJob {
+    /// A clone that reported `result` after `progress`, so one poll reads both.
+    pub fn test_finished(progress: &str, result: Result<(), String>) -> Self {
+        let (tx, events) = channel();
+        let _ = tx.send(CloneEvent::Progress(progress.into()));
+        let _ = tx.send(CloneEvent::Done(result));
+        Self::test_idle_with(events)
+    }
+
     /// A clone that is running but never finishes, for guards and UI tests.
     pub fn test_idle() -> Self {
         let (tx, events) = channel();
         std::mem::forget(tx);
+        Self::test_idle_with(events)
+    }
+
+    fn test_idle_with(events: Receiver<CloneEvent>) -> Self {
         Self {
             events,
             child: Arc::new(Mutex::new(None)),
@@ -692,6 +704,8 @@ impl State {
         while let Ok(event) = job.events.try_recv() {
             changed = true;
             match event {
+                // A clone that reported its result has already taken the project in.
+                CloneEvent::Progress(_) if finished.is_some() => {}
                 CloneEvent::Progress(line) => self.projects.clone_progress = line,
                 CloneEvent::Done(result) => finished = Some(result),
             }
@@ -795,6 +809,31 @@ mod tests {
             clean_path(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume1")),
             PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1")
         );
+    }
+
+    #[test]
+    fn a_finished_clone_is_taken_in_once_even_with_progress_behind_its_result() {
+        let dir = temp("clone-finish");
+        let target = dir.join("repo");
+        fs::create_dir_all(&target).unwrap();
+        let mut state = crate::model::State::new(dir.clone(), false);
+        state.projects.entries.clear();
+        let mut job = CloneJob::test_finished("Receiving objects: 100%", Ok(()));
+        job.target = target.clone();
+        job.parent = dir.clone();
+        state.projects.clone_job = Some(job);
+        // The first poll takes the clone in; a late progress line must not repeat that.
+        state.poll_projects();
+        assert!(state.projects.clone_job.is_none());
+        assert!(
+            state
+                .projects
+                .entries
+                .iter()
+                .any(|project| same_path(&project.path, &target))
+        );
+        assert!(!state.poll_projects());
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn temp(name: &str) -> PathBuf {

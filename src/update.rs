@@ -32,6 +32,9 @@ pub const INTERVAL: Duration = Duration::from_secs(4 * 60);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_DIAGNOSTICS: usize = 10;
+/// The most an archive listing may take before the archive is refused, so a listing that
+/// `run_bounded` would cut short can never hide an entry from validation.
+const MAX_ARCHIVE_LISTING: usize = 64 * 1024 * 1024;
 
 /// What an installed copy shows, and what it waits to install.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +105,24 @@ impl PreparedUpdate {
             InstalledTarget::MacBundle { app } => app.clone(),
         }
     }
+
+    /// The installed app this update replaces, or the recovered one when the install was
+    /// moved aside. A relaunch that fails reopens this.
+    fn previous_app(&self) -> Option<PathBuf> {
+        match &self.target {
+            InstalledTarget::Windows { .. } => None,
+            InstalledTarget::MacBundle { app } => app
+                .parent()
+                .map(|directory| directory.join("Shina-app.previous"))
+                .filter(|previous| previous.is_dir()),
+        }
+    }
+}
+
+/// Why a manifest's update cannot install itself here, or `None` when it can. A manifest
+/// from a test folder, another app folder or another platform is never installed.
+fn update_reaches_the_installed_app(update: &PreparedUpdate, target: &InstalledTarget) -> bool {
+    update.target == *target && update.prepared.exists() && update.download.is_file()
 }
 
 /// A newer release tag and the asset this build installs from.
@@ -142,7 +163,8 @@ enum Event {
     },
     Checked(Result<Option<Release>, Failure>),
     Downloaded {
-        tag: String,
+        /// The attempt's private directory, removed when preparation fails.
+        attempt: PathBuf,
         outcome: Result<PreparedUpdate, Failure>,
     },
 }
@@ -156,22 +178,22 @@ pub struct Storage {
 impl Storage {
     /// The updater's data area, outside the repository.
     pub fn default_storage() -> Self {
+        let base = crate::store::directory().unwrap_or_else(|| std::env::temp_dir().join("Shina"));
         #[cfg(test)]
         {
             static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let profile = crate::store::directory()
-                .unwrap_or_else(|| std::env::temp_dir().join("Shina"))
-                .join("updates")
-                .join(format!("profile-{}-{serial}", std::process::id()));
-            Self::at(profile)
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0);
+            Self::at(
+                base.join("updates")
+                    .join(format!("profile-{}-{nanos}-{serial}", std::process::id())),
+            )
         }
         #[cfg(not(test))]
-        {
-            let base =
-                crate::store::directory().unwrap_or_else(|| std::env::temp_dir().join("Shina"));
-            Self::at(base.join("updates"))
-        }
+        Self::at(base.join("updates"))
     }
 
     pub fn at(root: PathBuf) -> Self {
@@ -196,7 +218,7 @@ impl Storage {
 
     /// Removes downloads an interrupted run left behind, keeping the one a prepared update
     /// still verifies against.
-    pub fn discard_attempts(&self, keep: &Option<PreparedUpdate>) {
+    fn discard_attempts(&self, keep: &Option<PreparedUpdate>) {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return;
         };
@@ -208,6 +230,18 @@ impl Storage {
             if !keep && entry.file_name().to_string_lossy().starts_with("attempt-") {
                 let _ = fs::remove_dir_all(path);
             }
+        }
+    }
+
+    /// Removes every attempt directory a previous run left behind.
+    pub fn discard_all_attempts(&self) {
+        self.discard_attempts(&None);
+    }
+
+    /// Removes one attempt's files after preparation failed.
+    fn discard(&self, attempt: &Path) {
+        if attempt.starts_with(&self.root) {
+            let _ = fs::remove_dir_all(attempt);
         }
     }
 }
@@ -232,6 +266,12 @@ pub fn record_exit(update: ExitUpdate) {
 /// Takes the recorded update. Idempotent: a second call installs nothing more.
 pub fn take_exit() -> Option<ExitUpdate> {
     exit_slot().take()
+}
+
+/// Whether an exit recorded an update, without taking it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn exit_recorded() -> bool {
+    exit_slot().is_some()
 }
 
 /// Installs a prepared update by replacing the installed app. The caller has already shut
@@ -276,6 +316,49 @@ pub fn relaunch(installed: &Path, target: &InstalledTarget) -> Result<(), String
     match target {
         InstalledTarget::Windows { .. } => install::launch_with(installed, &[]),
         InstalledTarget::MacBundle { .. } => install::open_mac_bundle(installed),
+    }
+}
+
+/// Relaunches into a just-installed update. A build that cannot start is put back in place
+/// and the previous app is reopened, so a launch failure never leaves the user without Shina.
+pub fn relaunch_or_restore(
+    update: &PreparedUpdate,
+    installed: &Path,
+    running: &Path,
+) -> Result<(), String> {
+    let launch_error = match relaunch(installed, &update.target) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if let Err(error) = restore_previous(update, running) {
+        return Err(format!(
+            "{launch_error}. Restoring the previous app failed: {error}"
+        ));
+    }
+    // macOS reopens the restored bundle; Windows reopens the restored installed path.
+    let reopened = update
+        .previous_app()
+        .unwrap_or_else(|| installed.to_path_buf());
+    match relaunch(&reopened, &update.target) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!(
+            "{launch_error}. The previous Shina was restored; reopen {} ({error}).",
+            reopened.display()
+        )),
+    }
+}
+
+/// Puts the previous app back over a replacement that cannot start. Windows keeps the old
+/// executable as `shina.old.exe`, macOS keeps the bundle as `Shina-app.previous`.
+pub fn restore_previous(update: &PreparedUpdate, running: &Path) -> Result<(), String> {
+    match &update.target {
+        InstalledTarget::Windows { exe } => {
+            let dir = exe
+                .parent()
+                .ok_or("The installed executable has no folder.")?;
+            install::restore_exe(dir, running)
+        }
+        InstalledTarget::MacBundle { app } => install::restore_mac_bundle(app),
     }
 }
 
@@ -337,10 +420,7 @@ impl UpdateHost for Gh {
         let dir = attempt.join("asset");
         let download = dir.join(&release.asset.name);
         let result = run_gh_download(&release.tag, &release.asset.name, &dir, &download)
-            .and_then(|()| {
-                verify_download(&release.tag, &release.asset, target, &download)
-                    .map_err(Failure::quiet)
-            })
+            .and_then(|()| verify_download(&release.tag, &release.asset, target, &download))
             .map(|sha256| (download, sha256));
         if result.is_err() {
             let _ = fs::remove_dir_all(attempt);
@@ -364,21 +444,28 @@ impl UpdateHost for Gh {
                     .ok_or_else(|| Failure::quiet("The app bundle has no folder."))?;
                 if !writable(&directory) {
                     return Err(Failure::quiet(format!(
-                        "{} is not writable, so the update stays downloaded.",
+                        "{} is not writable, so the update cannot be prepared.",
                         directory.display()
                     )));
                 }
-                let extracted = download
-                    .parent()
-                    .map(|dir| dir.join("bundle"))
-                    .ok_or_else(|| Failure::quiet("The download has no folder."))?;
-                unpack_macos_zip(download, &extracted)?;
-                let bundle = extracted.join(install::MACOS_APP_NAME);
-                if let Some(problem) = mac_bundle_problem(&bundle, &release.tag) {
-                    return Err(Failure::quiet(problem));
+                let prepared = (|| {
+                    let archive = download
+                        .parent()
+                        .ok_or_else(|| Failure::quiet("The download has no folder."))?;
+                    let extracted = archive.join("bundle");
+                    unpack_macos_zip(download, &extracted)?;
+                    let bundle = extracted.join(install::MACOS_APP_NAME);
+                    if let Some(problem) = mac_bundle_problem(&bundle, &release.tag) {
+                        return Err(Failure::quiet(problem));
+                    }
+                    // Staged beside the installed app, so commit is a rename on one volume.
+                    install::prepare_macos_bundle(&bundle, &install::bundle_staging(app))
+                        .map_err(Failure::quiet)
+                })();
+                if prepared.is_err() {
+                    install::discard_prepared(app);
                 }
-                install::prepare_macos_bundle(&bundle, &install::bundle_staging())
-                    .map_err(Failure::quiet)
+                prepared
             }
         }
     }
@@ -541,32 +628,32 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Checks a download against its declared size and checksum before preparation.
+/// Checks a download against its declared size and checksum before preparation. An
+/// authentication denial while fetching the checksums stays typed, so it suspends attempts.
 fn verify_download(
     tag: &str,
     asset: &ReleaseAsset,
     _target: &InstalledTarget,
     download: &Path,
-) -> Result<String, String> {
-    let size = fs::metadata(download)
-        .map_err(|_| format!("The {} download is incomplete.", asset.name))?
-        .len();
+) -> Result<String, Failure> {
+    let quiet = |message: String| Err(Failure::Quiet(message));
+    let size = match fs::metadata(download) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return quiet(format!("The {} download is incomplete.", asset.name)),
+    };
     if size != asset.size {
-        return Err(format!(
+        return quiet(format!(
             "The {} download is incomplete ({} of {} bytes).",
             asset.name, size, asset.size
         ));
     }
-    let expected = match &asset.digest {
-        Some(digest) => hex_sha256(digest)
-            .ok_or_else(|| format!("The {} release publishes an invalid SHA-256.", asset.name))?,
-        None => sha256s_entry(&fetch_checksums(tag)?, &asset.name)
-            .and_then(hex_sha256)
-            .ok_or_else(|| format!("The {tag} release publishes no SHA-256 for {}.", asset.name))?,
+    let expected = expected_sha256(tag, asset, fetch_checksums)?;
+    let actual = match file_sha256(download) {
+        Ok(actual) => actual,
+        Err(error) => return quiet(error),
     };
-    let actual = file_sha256(download)?;
     if actual != expected {
-        return Err(format!(
+        return quiet(format!(
             "The {} download does not match its SHA-256.",
             asset.name
         ));
@@ -574,8 +661,31 @@ fn verify_download(
     Ok(actual)
 }
 
+/// The SHA-256 `asset` must match: its published digest, or its `SHA256SUMS` entry.
+fn expected_sha256(
+    tag: &str,
+    asset: &ReleaseAsset,
+    checksums: impl FnOnce(&str) -> Result<String, Failure>,
+) -> Result<String, Failure> {
+    if let Some(digest) = &asset.digest {
+        return hex_sha256(digest).ok_or_else(|| {
+            Failure::quiet(format!(
+                "The {} release publishes an invalid SHA-256.",
+                asset.name
+            ))
+        });
+    }
+    match sha256s_entry(&checksums(tag)?, &asset.name).and_then(hex_sha256) {
+        Some(digest) => Ok(digest),
+        None => Err(Failure::quiet(format!(
+            "The {tag} release publishes no SHA-256 for {}.",
+            asset.name
+        ))),
+    }
+}
+
 /// The release's `SHA256SUMS` file, for releases without per-asset digests.
-fn fetch_checksums(tag: &str) -> Result<String, String> {
+fn fetch_checksums(tag: &str) -> Result<String, Failure> {
     let dir = std::env::temp_dir().join(format!(
         "shina-checksums-{}-{}",
         std::process::id(),
@@ -585,12 +695,10 @@ fn fetch_checksums(tag: &str) -> Result<String, String> {
             .unwrap_or(0)
     ));
     let file = dir.join(SHA256SUMS);
-    let result = run_gh_download(tag, SHA256SUMS, &dir, &file)
-        .and_then(|()| {
-            fs::read_to_string(&file)
-                .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))
-        })
-        .map_err(|failure| redact(&failure_text(&failure)));
+    let result = run_gh_download(tag, SHA256SUMS, &dir, &file).and_then(|()| {
+        fs::read_to_string(&file)
+            .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))
+    });
     let _ = fs::remove_dir_all(&dir);
     result
 }
@@ -760,15 +868,23 @@ fn writable(dir: &Path) -> bool {
             .is_ok()
 }
 
-/// Unpacks a `Shina.app` archive with the system tools after checking every entry.
+/// Unpacks a `Shina.app` archive with the system tools after checking every entry and link.
 fn unpack_macos_zip(zip: &Path, destination: &Path) -> Result<(), Failure> {
-    let mut list = Command::new("/usr/bin/unzip");
-    list.arg("-Z1").arg(zip);
+    let mut list = Command::new("/usr/bin/zipinfo");
+    list.arg("-l").arg(zip);
     let (status, listing, _) = run_bounded(list, METADATA_TIMEOUT)?;
     if !status.success() {
         return Err(Failure::quiet("The update archive could not be read."));
     }
-    if let Some(problem) = archive_entry_problem(&String::from_utf8_lossy(&listing)) {
+    if listing.len() >= MAX_ARCHIVE_LISTING {
+        return Err(Failure::quiet("The update archive listing is too large."));
+    }
+    let listing = String::from_utf8_lossy(&listing);
+    // A truncated listing would leave later entries unchecked, so it fails closed.
+    if zipinfo_complete(&listing) != Some(true) {
+        return Err(Failure::quiet("The update archive listing is incomplete."));
+    }
+    if let Some(problem) = archive_entry_problem(&listing) {
         return Err(Failure::quiet(problem));
     }
     fs::create_dir_all(destination)
@@ -782,19 +898,69 @@ fn unpack_macos_zip(zip: &Path, destination: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Rejects absolute paths, parent links and entries outside the bundle before extraction.
+/// One entry of a `zipinfo -l` listing: the file-type letter of its mode, and its path.
+///
+/// ```text
+/// -rwxr-xr-x  3.0 unx  1234 tx     567 defN 26-Nov-09 14:55 Shina.app/Contents/MacOS/shina
+/// -rwxr-xr-x  3.0 unx  1234 tx     567 defN 26-Nov-09 14:55 Shina.app/My App
+/// ```
+///
+/// The columns after the mode are the version, `unx`, the three sizes, the method, the date
+/// and the time. Only the path holds spaces, so a spaced path is what follows the time
+/// column, which always holds a `:`.
+fn zipinfo_entry(line: &str) -> Option<(char, &str)> {
+    // The mode is the entry type and nine permission characters, all single bytes.
+    let mode = line.get(..10)?;
+    let chars: Vec<char> = mode.chars().collect();
+    let kind = chars[0];
+    let known_type = matches!(kind, '-' | 'd' | 'l' | 'p');
+    let permissions = chars[1..].iter().all(|c| "-rwxst".contains(*c));
+    let rest = line.get(10..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // A line is only an entry when it starts with a real mode.
+    if !(known_type && permissions) || fields.len() < 9 || !fields[7].contains(':') {
+        return None;
+    }
+    let time = fields[7];
+    let at = rest.rfind(time)? + time.len();
+    let path = rest.get(at..)?.trim();
+    (!path.is_empty()).then_some((kind, path))
+}
+
+/// Whether a `zipinfo -l` listing reached its end-of-archive footer.
+pub fn zipinfo_complete(listing: &str) -> Option<bool> {
+    let footer = |line: &str| -> Option<bool> {
+        let line = line.trim();
+        let (count, rest) = line.split_once(' ')?;
+        if !count.chars().all(|c| c.is_ascii_digit()) || !rest.starts_with("file") {
+            return None;
+        }
+        Some(rest.contains(" bytes uncompressed, "))
+    };
+    if listing.lines().any(|line| line.trim() == "Empty zipfile.") {
+        return Some(true);
+    }
+    Some(listing.lines().filter_map(footer).any(|complete| complete))
+}
+
+/// Rejects absolute paths, parent links, links and entries outside the bundle before
+/// extraction. `listing` is a `zipinfo -l` listing, whose first column gives each entry type.
 pub fn archive_entry_problem(listing: &str) -> Option<String> {
-    let entries: Vec<_> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
+    let entries: Vec<_> = listing.lines().filter_map(zipinfo_entry).collect();
     if entries.is_empty() {
         return Some("The update archive is empty.".into());
     }
-    for entry in entries {
+    for (kind, entry) in entries {
+        if kind == 'l' {
+            return Some(format!("The update archive contains a link: {entry}"));
+        }
+        if kind != 'd' && kind != '-' {
+            return Some(format!(
+                "The update archive contains a special file: {entry}"
+            ));
+        }
         let path = entry.trim_start_matches("./");
-        // Only the Shina bundle itself: no other App bundle, no loose file, no link.
+        // Only the Shina bundle itself: no other App bundle, no loose file.
         let inside_app = path
             .split('/')
             .next()
@@ -936,21 +1102,22 @@ impl Updater {
         if self.events.is_some() {
             return;
         }
-        // A prepared update from a previous run is revalidated before it shows as Ready, so
-        // its download is kept.
+        // A prepared update from a previous run is revalidated before it shows as Ready. Its
+        // download is kept, and Ready schedules no check.
         let update = fs::read(self.storage.manifest())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|value| PreparedUpdate::from_value(&value))
-            .filter(|update| update.target == target);
+            .filter(|update| update_reaches_the_installed_app(update, &target));
         self.storage.discard_attempts(&update);
-        self.next_check = Some(now + FIRST_CHECK);
         if let Some(update) = update {
             self.spawn(wake, move |host| {
                 let outcome = host.reverify(&update).map_err(|error| redact(&error));
                 Event::Recovered { update, outcome }
             });
+            return;
         }
+        self.next_check = Some(now + FIRST_CHECK);
     }
 
     /// An updater holding a prepared update, for guards and UI tests.
@@ -1002,20 +1169,18 @@ impl Updater {
             return false;
         };
         self.events = None;
-        if !self.apply(event, now, wake.clone()) {
-            self.start_due_work(now, wake);
-            return false;
-        }
+        let changed = self.apply(event, now, wake.clone());
         self.start_due_work(now, wake);
-        true
+        changed
     }
 
     fn start_due_work(&mut self, now: Instant, wake: Waker) {
-        if self.events.is_some()
-            || self.status == Status::Disabled
-            || self.suspended.is_some()
-            || !matches!(self.status, Status::Idle)
-        {
+        if self.events.is_some() {
+            return;
+        }
+        if self.suspended.is_some() || !matches!(self.status, Status::Idle) {
+            // A suspended updater and a ready update run no timer at all.
+            self.next_check = None;
             return;
         }
         if !self.next_check.is_some_and(|next| now >= next) {
@@ -1041,9 +1206,10 @@ impl Updater {
             tag: release.tag.clone(),
         };
         let downloaded = release.clone();
+        let staged = attempt.clone();
         self.spawn(wake, move |host| {
             let outcome = host
-                .download_release(&downloaded, &target, &attempt)
+                .download_release(&downloaded, &target, &staged)
                 .and_then(|(download, sha256)| {
                     let prepared = host.prepare(&downloaded, &target, &download)?;
                     Ok(PreparedUpdate {
@@ -1056,10 +1222,7 @@ impl Updater {
                         prepared,
                     })
                 });
-            Event::Downloaded {
-                tag: downloaded.tag.clone(),
-                outcome,
-            }
+            Event::Downloaded { attempt, outcome }
         });
     }
 
@@ -1089,9 +1252,16 @@ impl Updater {
                 match outcome {
                     Ok(()) => {
                         self.write_manifest(&update);
-                        self.status = Status::Ready { update };
+                        self.ready(update);
                     }
                     Err(error) => {
+                        // The download may be damaged; drop it with its staging folder.
+                        if let Some(attempt) = update.download.ancestors().find(|path| {
+                            path.file_name()
+                                .is_some_and(|name| name.to_string_lossy().starts_with("attempt-"))
+                        }) {
+                            self.storage.discard(attempt);
+                        }
                         self.record(error);
                         self.clear_manifest();
                         self.idle_from(now);
@@ -1112,29 +1282,39 @@ impl Updater {
                 true
             }
             Event::Downloaded {
-                tag,
                 outcome: Ok(update),
+                ..
             } => {
-                let _ = tag;
                 self.write_manifest(&update);
-                self.status = Status::Ready { update };
+                self.ready(update);
                 true
             }
             Event::Downloaded {
-                tag,
+                attempt,
                 outcome: Err(failure),
             } => {
-                let _ = tag;
+                // Nothing of a failed attempt is kept, so no complete download piles up.
+                self.storage.discard(&attempt);
                 self.failed(failure, now);
                 true
             }
         }
     }
 
+    /// A verified replacement waits for an install, so no timer runs.
+    fn ready(&mut self, update: PreparedUpdate) {
+        self.next_check = None;
+        self.status = Status::Ready { update };
+    }
+
     fn failed(&mut self, failure: Failure, now: Instant) {
         self.record(failure_text(&failure));
         if let Failure::Auth(remedy) = failure {
+            // No networked attempt runs again this session, so no timer is scheduled.
             self.suspended = Some(remedy);
+            self.status = Status::Idle;
+            self.next_check = None;
+            return;
         }
         self.idle_from(now);
     }
@@ -1171,15 +1351,24 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     type Check = dyn Fn() -> Result<Option<Release>, Failure> + Send + Sync;
 
-    /// A host a test scripts, so no test reaches GitHub.
+    /// A host a test scripts, so no test reaches GitHub, and none runs `gh` or an archive
+    /// tool: a real verification path takes its checksums from the fixture.
     struct Scripted {
         checks: Arc<AtomicUsize>,
         downloads: Arc<AtomicUsize>,
         check: Arc<Check>,
+        /// Preparation fails with this message, or succeeds by copying the download.
+        prepare: Option<String>,
+        /// An authentication denial while fetching checksums.
+        deny_checksums: Arc<AtomicBool>,
+        /// Recovery finds the download damaged.
+        reverify_fails: bool,
+        /// Nothing publishes a digest, so verification asks for SHA256SUMS.
+        sums: Option<String>,
     }
 
     impl Scripted {
@@ -1190,6 +1379,32 @@ mod tests {
                 checks: Default::default(),
                 downloads: Default::default(),
                 check: Arc::new(check),
+                prepare: None,
+                deny_checksums: Default::default(),
+                reverify_fails: false,
+                sums: None,
+            }
+        }
+
+        fn failing_prepare(self, message: &str) -> Self {
+            Self {
+                prepare: Some(message.to_owned()),
+                ..self
+            }
+        }
+
+        /// The real download and verification, with `sums` standing in for SHA256SUMS.
+        fn with_sums(self, sums: String) -> Self {
+            Self {
+                sums: Some(sums),
+                ..self
+            }
+        }
+
+        fn deny_checksums(self) -> Self {
+            Self {
+                deny_checksums: Arc::new(AtomicBool::new(true)),
+                ..self
             }
         }
     }
@@ -1209,8 +1424,32 @@ mod tests {
             let dir = attempt.join("asset");
             fs::create_dir_all(&dir).unwrap();
             let download = dir.join(&release.asset.name);
-            fs::write(&download, b"asset").unwrap();
-            Ok((download, bytes_sha256(b"asset")))
+            let Some(sums) = &self.sums else {
+                // A scripted download with a published digest needs no checksum command.
+                fs::write(&download, b"asset").unwrap();
+                return Ok((download, bytes_sha256(b"asset")));
+            };
+            fs::write(&download, "x".repeat(release.asset.size as usize)).unwrap();
+            // The fixture's SHA256SUMS stands in for the release's, so nothing is fetched.
+            let denied = self.deny_checksums.load(Ordering::SeqCst);
+            let sums = sums.clone();
+            let sha256 = verify_download(&release.tag, &release.asset, &target(), &download)
+                .or_else(|_| {
+                    let expected = expected_sha256(&release.tag, &release.asset, |_| {
+                        if denied {
+                            return Err(Failure::Auth(
+                                "Run `gh auth login` so Shina can download updates.".into(),
+                            ));
+                        }
+                        Ok(sums.clone())
+                    })?;
+                    if file_sha256(&download).ok().as_deref() == Some(expected.as_str()) {
+                        Ok(expected)
+                    } else {
+                        Err(Failure::quiet("The download does not match its SHA-256."))
+                    }
+                })?;
+            Ok((download, sha256))
         }
         fn prepare(
             &mut self,
@@ -1218,11 +1457,17 @@ mod tests {
             _: &InstalledTarget,
             download: &Path,
         ) -> Result<PathBuf, Failure> {
+            if let Some(message) = &self.prepare {
+                return Err(Failure::quiet(message.clone()));
+            }
             let prepared = download.with_extension("prepared");
             fs::write(&prepared, fs::read(download).unwrap()).unwrap();
             Ok(prepared)
         }
         fn reverify(&mut self, update: &PreparedUpdate) -> Result<(), String> {
+            if self.reverify_fails {
+                return Err("The downloaded update no longer matches its checksum.".into());
+            }
             (file_sha256(&update.download)? == update.sha256)
                 .then_some(())
                 .ok_or_else(|| "The downloaded update no longer matches its checksum.".into())
@@ -1242,7 +1487,10 @@ mod tests {
 
     fn target() -> InstalledTarget {
         InstalledTarget::Windows {
-            exe: std::env::temp_dir().join("Shina").join("shina.exe"),
+            exe: crate::store::directory()
+                .unwrap()
+                .join("fixture-Shina")
+                .join("shina.exe"),
         }
     }
 
@@ -1250,15 +1498,24 @@ mod tests {
         Arc::new(|| {})
     }
 
+    /// A fixture-local updater folder, so no test writes outside its own profile.
+    fn storage(name: &str) -> Storage {
+        let root = crate::store::directory().unwrap().join(name);
+        fs::create_dir_all(&root).unwrap();
+        Storage::at(root)
+    }
+
     /// An updater that believes it runs from an installed copy, with isolated storage.
     fn installed(host: Scripted) -> (Updater, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        // Every updater keeps its own folder: Rust reads `start` as a unique counter, so no
+        // two tests share a manifest or an attempt.
+        static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (checks, downloads) = (Arc::clone(&host.checks), Arc::clone(&host.downloads));
         let mut updater = Updater::default();
-        let storage = Storage::at(crate::store::directory().unwrap().join("updater"));
-        updater.configure(storage, Box::new(host));
+        updater.configure(storage(&format!("updater-{serial}")), Box::new(host));
         updater.target = Some(target());
         updater.installed = true;
-
         (updater, checks, downloads)
     }
 
@@ -1288,9 +1545,28 @@ mod tests {
         }
     }
 
-    /// A real download: the metadata says "shin.exe", so the test publishes that name.
     fn newer() -> Scripted {
         Scripted::new(|| Ok(Some(release("v99.0.0"))))
+    }
+
+    /// A manifest and its files, as a previous run of `updater` left them.
+    fn saved_update(updater: &Updater, tag: &str) -> PreparedUpdate {
+        let attempt = updater.storage.attempt();
+        fs::create_dir_all(&attempt).unwrap();
+        let download = attempt.join("shina.exe");
+        fs::write(&download, b"asset").unwrap();
+        let update = PreparedUpdate {
+            tag: tag.into(),
+            target: target(),
+            asset: "shina.exe".into(),
+            size: 5,
+            sha256: bytes_sha256(b"asset"),
+            prepared: download.clone(),
+            download,
+        };
+        fs::create_dir_all(&updater.storage.root).unwrap();
+        fs::write(updater.storage.manifest(), update.to_value().to_string()).unwrap();
+        update
     }
 
     #[test]
@@ -1371,7 +1647,6 @@ mod tests {
             1,
             "a check in flight blocks another"
         );
-        // The release is still downloading, so no second check or download began.
         assert_eq!(updater.status(), &Status::Checking);
         settle(&mut updater, start + FIRST_CHECK, |u| {
             u.prepared_update().is_some()
@@ -1445,9 +1720,47 @@ mod tests {
             updater.suspended(),
             Some("Run `gh auth login` so Shina can download updates.")
         );
+        assert_eq!(
+            updater.remaining(start + FIRST_CHECK),
+            None,
+            "a suspended updater schedules no deadline"
+        );
         updater.poll(start + FIRST_CHECK + INTERVAL * 4, wake());
         assert_eq!(checks.load(Ordering::SeqCst), 1);
         assert_eq!(updater.status(), &Status::Idle);
+        assert_eq!(
+            updater.remaining(start + FIRST_CHECK + INTERVAL * 4),
+            None,
+            "the deadline never comes back"
+        );
+    }
+
+    #[test]
+    fn an_authentication_denial_fetching_checksums_suspends_attempts() {
+        // The failure stays typed through verification, so the updater suspends instead of
+        // retrying every interval. The latest release is newer but publishes no digest.
+        let mut latest = release("v99.0.0");
+        latest.asset.digest = None;
+        let host = Scripted::new(move || Ok(Some(latest.clone())))
+            .with_sums(String::new())
+            .deny_checksums();
+        let (mut updater, _, _) = installed(host);
+        let start = Instant::now();
+        updater.start(true, start, wake());
+        updater.poll(start + FIRST_CHECK, wake());
+        settle(&mut updater, start + FIRST_CHECK, |u| u.events.is_none());
+        sleep_until(|u| u.suspended().is_some(), &updater);
+        assert_eq!(
+            updater.suspended(),
+            Some("Run `gh auth login` so Shina can download updates.")
+        );
+        assert_eq!(updater.status(), &Status::Idle);
+        assert_eq!(
+            updater.remaining(start + FIRST_CHECK),
+            None,
+            "suspension schedules nothing"
+        );
+        assert!(updater.prepared_update().is_none());
     }
 
     #[test]
@@ -1490,44 +1803,33 @@ mod tests {
     #[test]
     fn a_prepared_update_from_a_previous_run_is_revalidated_before_ready() {
         let (mut updater, checks, _) = installed(Scripted::new(|| Ok(None)));
-        let attempt = updater.storage.root.join("attempt-restart");
-        fs::create_dir_all(&attempt).unwrap();
-        let download = attempt.join("shina.exe");
-        fs::write(&download, b"asset").unwrap();
-        assert!(download.exists());
-
-        let update = PreparedUpdate {
-            tag: "v0.10.0".into(),
-            target: target(),
-            asset: "shina.exe".into(),
-            size: 5,
-            sha256: bytes_sha256(b"asset"),
-            prepared: download.clone(),
-            download,
-        };
-        fs::write(updater.storage.manifest(), update.to_value().to_string()).unwrap();
+        let saved = saved_update(&updater, "v0.10.0");
         let start = Instant::now();
         updater.start(true, start, wake());
         settle(&mut updater, start, |u| u.prepared_update().is_some());
         assert_eq!(updater.prepared_update().unwrap().tag, "v0.10.0");
         assert_eq!(checks.load(Ordering::SeqCst), 0, "recovery needs no check");
+        assert!(saved.prepared.exists(), "the recovered download stays");
+        assert_eq!(
+            updater.remaining(start),
+            None,
+            "a recovered Ready keeps no startup timer"
+        );
+        updater.poll(start + FIRST_CHECK * 10, wake());
+        assert_eq!(
+            updater.remaining(start + FIRST_CHECK * 10),
+            None,
+            "the startup deadline never comes back"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn a_damaged_prepared_update_is_dropped_instead_of_offered() {
-        let (mut updater, _, _) = installed(Scripted::new(|| Ok(None)));
-        let download = updater.storage.root.join("gone.exe");
-        let update = PreparedUpdate {
-            tag: "v0.10.0".into(),
-            target: target(),
-            asset: "shina.exe".into(),
-            size: 5,
-            sha256: "0".repeat(64),
-            prepared: download.clone(),
-            download,
-        };
-        fs::create_dir_all(&updater.storage.root).unwrap();
-        fs::write(updater.storage.manifest(), update.to_value().to_string()).unwrap();
+        let mut host = Scripted::new(|| Ok(None));
+        host.reverify_fails = true;
+        let (mut updater, _, _) = installed(host);
+        let saved = saved_update(&updater, "v0.10.0");
         let start = Instant::now();
         updater.start(true, start, wake());
         settle(&mut updater, start, |u| u.diagnostics().next().is_some());
@@ -1538,11 +1840,66 @@ mod tests {
             "the manifest is cleared"
         );
         assert_eq!(updater.diagnostics().count(), 1);
-        // The next check is at least the interval out; the later first check is still due.
+        assert!(
+            !saved.prepared.exists(),
+            "the damaged download is removed with its attempt"
+        );
+        // A failed recovery schedules the next check a full interval after it.
+        let next = updater.next_check.expect("a failed recovery retries later");
+        assert!(next >= start + INTERVAL, "the retry waits the interval");
+    }
+
+    #[test]
+    fn a_manifest_for_another_app_folder_is_never_installed() {
+        let (mut updater, _, _) = installed(Scripted::new(|| Ok(None)));
+        let mut saved = saved_update(&updater, "v0.10.0");
+        saved.target = InstalledTarget::Windows {
+            exe: updater.storage.root.join("elsewhere").join("shina.exe"),
+        };
+        fs::write(updater.storage.manifest(), saved.to_value().to_string()).unwrap();
+        let start = Instant::now();
+        updater.start(true, start, wake());
+        assert!(updater.prepared_update().is_none());
+        assert_eq!(
+            updater.remaining(start),
+            Some(FIRST_CHECK),
+            "another folder's manifest is ignored and the first check is kept"
+        );
+    }
+
+    #[test]
+    fn a_failed_preparation_keeps_no_download_and_retries_later() {
+        let host = newer().failing_prepare("The applications folder is not writable.");
+        let (mut updater, _, downloads) = installed(host);
+        let start = Instant::now();
+        updater.start(true, start, wake());
+        updater.poll(start + FIRST_CHECK, wake());
+        settle(&mut updater, start + FIRST_CHECK, |u| u.events.is_none());
+        sleep_until(
+            |u| u.status() == &Status::Idle && u.diagnostics().next().is_some(),
+            &updater,
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        let attempts: Vec<_> = fs::read_dir(&updater.storage.root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("attempt-"))
+            })
+            .collect();
+        assert!(attempts.is_empty(), "the failed attempt is removed");
         assert!(
             updater
-                .next_check
-                .is_some_and(|next| next > start + FIRST_CHECK)
+                .diagnostics()
+                .any(|line| line.contains("not writable")),
+            "the failure is recorded quietly"
+        );
+        assert!(updater.prepared_update().is_none());
+        assert!(
+            updater.remaining(start + FIRST_CHECK).is_some(),
+            "the next interval retries"
         );
     }
 
@@ -1577,7 +1934,7 @@ mod tests {
         .unwrap();
         assert_eq!(windows.size, 2048);
         assert_eq!(windows.digest.as_deref(), Some("sha256:ABCDEF"));
-        let intel = select_asset(
+        let mac = select_asset(
             &release,
             &InstalledTarget::MacBundle {
                 app: PathBuf::from("Shina.app"),
@@ -1585,7 +1942,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            intel.name,
+            mac.name,
             if cfg!(target_arch = "x86_64") {
                 "Shina-macos-x86_64.zip"
             } else {
@@ -1616,7 +1973,7 @@ mod tests {
 
     #[test]
     fn partial_files_a_size_mismatch_and_a_digest_mismatch_are_refused() {
-        let file = crate::store::directory().unwrap().join("download.exe");
+        let file = storage("verify").root.join("download.exe");
         fs::write(&file, b"asset").unwrap();
         let mut asset = ReleaseAsset {
             name: "shina.exe".into(),
@@ -1625,21 +1982,63 @@ mod tests {
         };
         assert!(verify_download("v1", &asset, &target(), &file).is_ok());
         asset.size = 99;
-        assert!(verify_download("v1", &asset, &target(), &file).is_err());
+        assert!(matches!(
+            verify_download("v1", &asset, &target(), &file),
+            Err(Failure::Quiet(_))
+        ));
         asset.size = 5;
         asset.digest = Some(format!("sha256:{}", "0".repeat(64)));
         assert!(verify_download("v1", &asset, &target(), &file).is_err());
         asset.digest = Some("sha256:nothex".into());
         assert!(verify_download("v1", &asset, &target(), &file).is_err());
-        asset.digest = None;
-        // Without a digest there is no SHA256SUMS for an unpublished tag, so it is refused.
-        assert!(verify_download("v0.0.1-unpublished", &asset, &target(), &file).is_err());
         fs::write(&file, b"ass").unwrap();
         assert!(
             verify_download("v1", &asset, &target(), &file).is_err(),
             "a partial file fails its size"
         );
-        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_release_without_digests_verifies_against_its_sha256sums_file() {
+        // The checksums come from a fixture file, so no gh process runs: offline.
+        let root = storage("sums").root;
+        let file = root.join("shina.exe");
+        fs::write(&file, b"asset").unwrap();
+        let asset = ReleaseAsset {
+            name: "shina.exe".into(),
+            size: 5,
+            digest: None,
+        };
+        let digest = bytes_sha256(b"asset");
+        let sums = root.join(SHA256SUMS);
+        let serve = |text: &str| {
+            fs::write(&sums, text).unwrap();
+            expected_sha256("v1", &asset, |_| {
+                fs::read_to_string(&sums)
+                    .map_err(|_| Failure::quiet(format!("Could not read {SHA256SUMS}.")))
+            })
+        };
+        let matching = format!(
+            "{digest}  shina.exe\n{} *Shina-macos-aarch64.zip\n",
+            "0".repeat(64)
+        );
+        assert_eq!(serve(&matching).unwrap(), digest);
+        let other = format!("{}  other.exe\n", "0".repeat(64));
+        assert!(
+            matches!(serve(&other), Err(Failure::Quiet(_))),
+            "a mismatched checksum is quiet"
+        );
+        assert!(matches!(serve(""), Err(Failure::Quiet(_))));
+        // A published digest needs no checksums file at all.
+        let with_digest = ReleaseAsset {
+            digest: Some(format!("sha256:{digest}")),
+            ..asset
+        };
+        let never_fetched = |_: &str| Err::<String, Failure>(Failure::quiet("never fetched"));
+        assert_eq!(
+            expected_sha256("v1", &with_digest, never_fetched).unwrap(),
+            digest
+        );
     }
 
     #[test]
@@ -1664,20 +2063,74 @@ mod tests {
         );
     }
 
+    /// Entry lines as `zipinfo -l` prints them.
+    const DIR: &str = "drwxr-xr-x  3.0 unx        0 bx        0 stor 26-Nov-09 14:55 Shina.app/";
+    const MACOS_DIR: &str =
+        "drwxr-xr-x  3.0 unx        0 bx        0 stor 26-Nov-09 14:55 Shina.app/Contents/MacOS/";
+    const BIN: &str =
+        "-rwxr-xr-x  3.0 unx  1234 tx     567 defN 26-Nov-09 14:55 Shina.app/Contents/MacOS/shina";
+    const LINK: &str = "lrwxr-xr-x  3.0 unx       11 bx       11 stor 26-Nov-09 14:55 Shina.app/lib -> /etc/passwd";
+    const FOOTER: &str = "3 files, 1234 bytes uncompressed, 567 bytes compressed:  53.8%";
+
+    fn listing(entries: &[&str]) -> String {
+        format!(
+            "Archive:  Shina-macos-aarch64.zip\nZip file size: 900 bytes, number of entries: {}\n{}\n{FOOTER}\n",
+            entries.len(),
+            entries.join("\n")
+        )
+    }
+
     #[test]
-    fn archive_entries_outside_the_bundle_are_rejected() {
-        assert!(archive_entry_problem("Shina.app/").is_none());
-        assert!(
-            archive_entry_problem(
-                "Shina.app/\nShina.app/Contents/Info.plist\nShina.app/Contents/MacOS/"
-            )
-            .is_none()
-        );
-        assert!(archive_entry_problem("./Shina.app/Contents/MacOS/shina").is_none());
+    fn archive_entries_outside_the_bundle_and_links_are_rejected() {
+        assert!(archive_entry_problem(&listing(&[DIR, MACOS_DIR, BIN])).is_none());
         assert!(archive_entry_problem("").is_some());
-        assert!(archive_entry_problem("/etc/passwd").is_some());
-        assert!(archive_entry_problem("Shina.app/../evil").is_some());
-        assert!(archive_entry_problem("Other.app/Contents/Info.plist").is_some());
-        assert!(archive_entry_problem("README.txt").is_some());
+        let outside = |path: &str| {
+            let line = format!("-rw-r--r--  3.0 unx  1 tx  1 stor 26-Nov-09 14:55 {path}");
+            archive_entry_problem(&listing(&[line.as_str()]))
+        };
+        assert!(outside("/etc/passwd").is_some());
+        assert!(outside("Shina.app/../evil").is_some());
+        assert!(outside("Other.app/Contents/Info.plist").is_some());
+        assert!(outside("README.txt").is_some());
+        // A symlink's name looks like any other path, so its mode has to reject it.
+        let problem = archive_entry_problem(&listing(&[DIR, LINK])).expect("a link is refused");
+        assert!(problem.contains("link"), "{problem}");
+        let fifo =
+            "prw-r--r--  3.0 unx  0 bx  0 stor 26-Nov-09 14:55 Shina.app/Contents/MacOS/pipe";
+        assert!(archive_entry_problem(&listing(&[fifo])).is_some());
+    }
+
+    #[test]
+    fn an_incomplete_archive_listing_fails_closed() {
+        assert_eq!(
+            zipinfo_complete(&listing(&[DIR, MACOS_DIR, BIN])),
+            Some(true)
+        );
+        // A listing cut off before its footer may hide entries, so it is never accepted.
+        let full = listing(&[DIR, MACOS_DIR, BIN]);
+        let cut_off = &full[..full.find("Shina.app/Contents/MacOS/shina").unwrap()];
+        assert_eq!(zipinfo_complete(cut_off), Some(false));
+        assert_eq!(
+            zipinfo_complete(&listing(&[DIR, MACOS_DIR, BIN]).replace(" uncompressed, ", " ")),
+            Some(false)
+        );
+        assert_eq!(
+            zipinfo_complete("Archive:  empty.zip\nEmpty zipfile.\n"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_read_whole_from_its_column() {
+        let spaced = "-rwxr-xr-x  3.0 unx  1234 tx     567 defN 26-Nov-09 14:55 Shina.app/My App";
+        assert_eq!(
+            zipinfo_entry(spaced),
+            Some(('-', "Shina.app/My App")),
+            "the path ends the line"
+        );
+        assert_eq!(zipinfo_entry(DIR), Some(('d', "Shina.app/")));
+        assert_eq!(zipinfo_entry(MACOS_DIR).map(|(kind, _)| kind), Some('d'));
+        assert_eq!(zipinfo_entry("Archive:  Shina-macos-aarch64.zip"), None);
+        assert_eq!(zipinfo_entry("3 files, 1234 bytes uncompressed"), None);
     }
 }

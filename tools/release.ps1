@@ -48,16 +48,17 @@ if ($zips.Count -eq 0) { Write-Warning 'No macOS assets: installed Macs will not
 
 cargo build --release --target-dir target/publish
 if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
-$exe = Resolve-Path target/publish/release/shina.exe
+# Every asset is a FileInfo, so .FullName and .Name read the same for the exe and the zips.
+$exe = Get-Item -LiteralPath 'target/publish/release/shina.exe' -ErrorAction Stop
 
 # SHA256SUMS covers every asset, so a release without per-asset digests still verifies.
-$sums = Join-Path (Resolve-Path target/publish).Path 'SHA256SUMS'
+$sums = Join-Path $exe.DirectoryName 'SHA256SUMS'
 $lines = foreach ($file in @($exe) + $zips) {
-    "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file.Path).Hash.ToLowerInvariant(), $file.Name
+    "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant(), $file.Name
 }
 Set-Content -NoNewline -Encoding ascii -Path $sums -Value (($lines -join "`n") + "`n")
 
-$assets = @($exe) + $zips + (Get-Item -LiteralPath $sums)
+$assets = @($exe) + $zips + @(Get-Item -LiteralPath $sums)
 $notes = (git log -1 --format=%B) -join "`n"
 gh release create $tag @($assets | ForEach-Object { $_.FullName }) --repo KldsSeeGhosts/shina --target (git rev-parse HEAD) --title "Shina $version" --notes $notes
 if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub release failed.' }
@@ -65,6 +66,6 @@ Write-Host "Published $tag with $(@($assets).Count) assets."
 
 if ($Install) {
     # -Wait would also wait for the app the installer starts; wait for the installer only.
-    (Start-Process -FilePath $exe -ArgumentList '--install' -PassThru).WaitForExit()
+    (Start-Process -FilePath $exe.FullName -ArgumentList '--install' -PassThru).WaitForExit()
     Write-Host 'Installed and started the new build.'
 }
