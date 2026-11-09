@@ -92,6 +92,7 @@ pub struct Tool {
     pub output: String,
     /// Position in the transcript, including tool calls between text blocks in one message.
     pub anchor: ToolAnchor,
+    pub block: usize,
     pub expanded: bool,
     pub group_expanded: bool,
     pub started: Option<Instant>,
@@ -115,12 +116,30 @@ impl Tool {
             failed: false,
             output: String::new(),
             anchor,
+            block: usize::MAX,
             expanded: false,
             group_expanded: false,
             started: None,
             duration_ms: None,
         }
     }
+}
+
+pub struct Thought {
+    pub anchor: ToolAnchor,
+    pub block: usize,
+    pub text: String,
+    pub expanded: bool,
+    pub done: bool,
+    pub started: Option<Instant>,
+    /// Pi saves thinking text, but does not save thinking timings.
+    pub duration_ms: Option<u64>,
+}
+
+pub struct AssistantWork {
+    pub start: usize,
+    pub expanded: bool,
+    pub elapsed: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,6 +154,8 @@ pub struct Thread {
     pub status: Status,
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
+    pub thoughts: Vec<Thought>,
+    pub work: Vec<AssistantWork>,
     pub draft: TextEdit,
     pub pi: Option<Pi>,
     pub model: String,
@@ -192,6 +213,8 @@ impl Thread {
             status: Status::Ready,
             messages: vec![],
             tools: vec![],
+            thoughts: vec![],
+            work: vec![],
             draft: TextEdit::default(),
             pi: None,
             model: DEFAULT_MODEL.into(),
@@ -360,6 +383,7 @@ impl Thread {
         self.started = Some(Instant::now());
         self.elapsed = None;
         self.assistant = None;
+        self.ensure_work();
         self.error = None;
         self.phase = "Working".into();
         self.last_activity = Instant::now();
@@ -417,6 +441,7 @@ impl Thread {
     }
 
     pub fn disconnect(&mut self) {
+        self.finish_thoughts();
         if let Some((prompt, index)) = self.queued_prompt.take() {
             self.remove_optimistic_prompt(&prompt, index);
             self.restore_prompt(&prompt);
@@ -510,6 +535,7 @@ impl Thread {
             self.assistant = None;
             self.error = None;
             self.phase = "Waiting for Pi".into();
+            self.ensure_work();
         }
         true
     }
@@ -624,6 +650,7 @@ impl Thread {
     }
 
     fn assistant(&mut self) -> &mut Message {
+        self.ensure_work();
         let index = *self.assistant.get_or_insert_with(|| {
             self.messages.push(Message {
                 role: "Pi",
@@ -634,15 +661,56 @@ impl Thread {
         &mut self.messages[index]
     }
 
+    fn ensure_work(&mut self) -> &mut AssistantWork {
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| message.role != "Pi")
+            .map_or(0, |index| index + 1);
+        if self.work.last().is_none_or(|work| work.start != start) {
+            self.work.push(AssistantWork {
+                start,
+                expanded: true,
+                elapsed: None,
+            });
+        }
+        self.work.last_mut().unwrap()
+    }
+
+    fn thought(&mut self, block: usize) -> &mut Thought {
+        self.assistant();
+        let message = self.assistant.unwrap();
+        let index = self
+            .thoughts
+            .iter()
+            .position(|thought| thought.anchor.message == message && thought.block == block)
+            .unwrap_or_else(|| {
+                self.thoughts.push(Thought {
+                    anchor: ToolAnchor {
+                        message,
+                        offset: self.messages[message].text.len(),
+                    },
+                    block,
+                    text: String::new(),
+                    expanded: false,
+                    done: false,
+                    started: None,
+                    duration_ms: None,
+                });
+                self.thoughts.len() - 1
+            });
+        &mut self.thoughts[index]
+    }
+
     /// Reuse Pi's content-block order for both restored history and completed live messages.
     /// Keep Thread.tools flat for existing consumers and record its transcript positions.
-    fn anchor_content_tools(&mut self, content: &Value, message: usize, restored: bool) {
+    fn anchor_content_work(&mut self, content: &Value, message: usize, restored: bool) {
         let Some(blocks) = content.as_array() else {
             return;
         };
         let mut offset = 0;
         let mut texts = 0;
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str() {
                     offset += text.len() + usize::from(texts > 0);
@@ -659,9 +727,11 @@ impl Thread {
                         .find(|tool| tool.id == id && tool.anchor.message == message)
                 {
                     tool.anchor = anchor;
+                    tool.block = block_index;
                 } else {
                     let mut tool =
                         Tool::new(id, string(block, "name"), &block["arguments"], anchor);
+                    tool.block = block_index;
                     if restored {
                         tool.done = true;
                         tool.failed = true;
@@ -669,6 +739,34 @@ impl Thread {
                     }
                     self.tools.push(tool);
                 }
+            } else if block["type"] == "thinking" {
+                let index = self
+                    .thoughts
+                    .iter()
+                    .position(|thought| {
+                        thought.anchor.message == message && thought.block == block_index
+                    })
+                    .unwrap_or_else(|| {
+                        self.thoughts.push(Thought {
+                            anchor: ToolAnchor { message, offset },
+                            block: block_index,
+                            text: String::new(),
+                            expanded: false,
+                            done: true,
+                            started: None,
+                            duration_ms: None,
+                        });
+                        self.thoughts.len() - 1
+                    });
+                let thought = &mut self.thoughts[index];
+                thought.anchor = ToolAnchor { message, offset };
+                thought.text = string(block, "thinking").into();
+                thought.done = true;
+                thought.duration_ms = thought.duration_ms.or_else(|| {
+                    thought
+                        .started
+                        .map(|start| start.elapsed().as_millis() as u64)
+                });
             }
         }
     }
@@ -773,13 +871,18 @@ impl Thread {
                         if let Some(messages) = record["data"]["messages"].as_array() {
                             self.messages.clear();
                             self.tools.clear();
+                            self.thoughts.clear();
+                            self.work.clear();
                             self.assistant = None;
                             for message in messages {
                                 let role = string(message, "role");
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
                                     let text = content_text(&message["content"]);
-                                    if !text.is_empty() {
+                                    if role == "assistant" || !text.is_empty() {
+                                        if role == "assistant" {
+                                            self.ensure_work();
+                                        }
                                         self.messages.push(Message {
                                             role: if role != "user" {
                                                 "Pi"
@@ -793,7 +896,7 @@ impl Thread {
                                     }
                                 }
                                 if role == "assistant" {
-                                    self.anchor_content_tools(&message["content"], index, true);
+                                    self.anchor_content_work(&message["content"], index, true);
                                 }
                                 if role == "toolResult"
                                     && let Some(tool) = self
@@ -855,6 +958,8 @@ impl Thread {
                 self.status = Status::Running;
                 self.assistant = None;
                 self.phase = "Waiting for the model".into();
+                self.started.get_or_insert_with(Instant::now);
+                self.ensure_work();
             }
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
@@ -875,25 +980,44 @@ impl Thread {
                 self.assistant = None;
                 self.request = None;
                 self.status = Status::Running;
+                self.assistant();
             }
             "message_update" => {
                 let update = &record["assistantMessageEvent"];
                 if update["type"] == "text_delta" {
                     self.assistant().text.push_str(string(update, "delta"));
                     self.phase = "Writing".into();
-                } else if update["type"] == "thinking_delta" {
+                } else if matches!(
+                    string(update, "type"),
+                    "thinking_start" | "thinking_delta" | "thinking_end"
+                ) {
+                    let thought =
+                        self.thought(update["contentIndex"].as_u64().unwrap_or(0) as usize);
+                    thought.started.get_or_insert_with(Instant::now);
+                    match string(update, "type") {
+                        "thinking_delta" => thought.text.push_str(string(update, "delta")),
+                        "thinking_end" => {
+                            thought.text = string(update, "content").into();
+                            thought.done = true;
+                            thought.duration_ms = thought
+                                .started
+                                .map(|start| start.elapsed().as_millis() as u64);
+                        }
+                        _ => {}
+                    }
                     self.phase = "Thinking".into();
                 }
             }
             "message_end" if record["message"]["role"] == "assistant" => {
                 let message = &record["message"];
                 let text = content_text(&message["content"]);
-                let index = self.assistant.unwrap_or(self.messages.len());
+                self.assistant();
+                let index = self.assistant.unwrap();
                 if !text.is_empty() {
                     self.assistant().text = text;
                     self.error = None;
                 }
-                self.anchor_content_tools(&message["content"], index, false);
+                self.anchor_content_work(&message["content"], index, false);
                 if message["stopReason"] != "aborted"
                     && let Some(error) = message["errorMessage"].as_str().filter(|s| !s.is_empty())
                 {
@@ -907,6 +1031,7 @@ impl Thread {
                 if let Some(tool) = self.tools.iter_mut().rev().find(|tool| tool.id == id) {
                     tool.started.get_or_insert_with(Instant::now);
                 } else {
+                    self.assistant();
                     let anchor = ToolAnchor {
                         message: self.assistant.unwrap_or(self.messages.len()),
                         offset: self.assistant.map_or(0, |i| self.messages[i].text.len()),
@@ -1008,10 +1133,21 @@ impl Thread {
             .take()
             .map(|start| start.elapsed().as_secs())
             .or(self.elapsed);
+        self.ensure_work().elapsed = self.elapsed;
+        self.finish_thoughts();
         self.assistant = None;
         self.phase.clear();
         if self.error.is_none() {
             self.retry_prompt = None;
+        }
+    }
+
+    fn finish_thoughts(&mut self) {
+        for thought in self.thoughts.iter_mut().filter(|thought| !thought.done) {
+            thought.done = true;
+            thought.duration_ms = thought
+                .started
+                .map(|start| start.elapsed().as_millis() as u64);
         }
     }
 }
@@ -1855,6 +1991,11 @@ impl State {
         thread.model = DEFAULT_MODEL.into();
         thread.thinking = "medium".into();
         thread.elapsed = Some(42);
+        thread.work.push(AssistantWork {
+            start: 1,
+            expanded: true,
+            elapsed: Some(42),
+        });
         thread.messages = vec![
             Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into() },
             Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into() },
@@ -1870,6 +2011,7 @@ impl State {
                 failed: false,
                 output: "Example activity, not a real tool execution.".into(),
                 anchor: ToolAnchor { message: 2, offset: 0 },
+                block: 0,
                 expanded: false,
                 group_expanded: false,
                 started: None,
@@ -1883,6 +2025,7 @@ impl State {
                 failed: false,
                 output: "Example activity, not a real tool execution.".into(),
                 anchor: ToolAnchor { message: 2, offset: 0 },
+                block: 1,
                 expanded: false,
                 group_expanded: false,
                 started: None,
@@ -1896,6 +2039,7 @@ impl State {
                 failed: false,
                 output: "Example output\nReplaced 2 lines in src/transport/socket.ts.".into(),
                 anchor: ToolAnchor { message: 3, offset: 0 },
+                block: 0,
                 expanded: false,
                 group_expanded: true,
                 started: None,
@@ -1909,12 +2053,22 @@ impl State {
                 failed: false,
                 output: "Example output\nPASS tests/reconnect.test.ts\n  reconnect lifecycle\n    attaches before opening the socket\n    removes the listener before retrying\n\nTests: 2 passed, 2 total".into(),
                 anchor: ToolAnchor { message: 3, offset: 0 },
+                block: 1,
                 expanded: false,
                 group_expanded: false,
                 started: None,
                 duration_ms: Some(1100),
             },
         ];
+        thread.thoughts.push(Thought {
+            anchor: ToolAnchor { message: 2, offset: 0 },
+            block: 2,
+            text: "Example thinking, not a real model response.\n\nThe listener must attach before socket.open() can emit a reconnect. Cleanup must remove the old listener before another attempt.".into(),
+            expanded: false,
+            done: true,
+            started: None,
+            duration_ms: Some(18000),
+        });
         self.threads.push(thread);
         for (id, title, status) in [
             (2, "Review sidebar keys", Status::Running),
@@ -2024,6 +2178,11 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
         changed |= thread.reclaim_idle(Instant::now());
+        // A quiet RPC stream must not freeze the visible work/thinking clocks.
+        if index == state.active && thread.status.busy() {
+            tx.wake_after(Duration::from_secs(1));
+            changed = true;
+        }
         if thread.pi.is_some() {
             let remaining = if let Some(started) = thread.session_started {
                 START_TIMEOUT.saturating_sub(started.elapsed())
@@ -2677,7 +2836,7 @@ mod tests {
         ]}});
         thread.apply(history.clone());
         thread.apply(history);
-        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(thread.messages.len(), 3);
         assert_eq!(thread.tools.len(), 1);
         assert_eq!(thread.tools[0].detail, "example.txt");
         assert_eq!(thread.tools[0].output, "saved output");
@@ -2758,7 +2917,7 @@ mod tests {
         thread.apply(history.clone());
         thread.tools[0].expanded = true;
         thread.apply(history);
-        assert_eq!(thread.messages.len(), 3);
+        assert_eq!(thread.messages.len(), 4);
         assert_eq!(thread.messages[1].text, "First\nThen\nDone");
         let anchors: Vec<_> = thread.tools.iter().map(|tool| tool.anchor).collect();
         assert_eq!(
@@ -2792,6 +2951,99 @@ mod tests {
         assert!(
             !thread.tools[0].expanded,
             "restoring rebuilds transient disclosure state"
+        );
+    }
+
+    #[test]
+    fn thinking_deltas_use_content_indices_and_completed_blocks_replace_them() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"agent_start"}));
+        thread.apply(json!({"type":"message_start","message":{"role":"assistant"}}));
+        for event in [
+            json!({"type":"thinking_start","contentIndex":0}),
+            json!({"type":"thinking_delta","contentIndex":0,"delta":"Partial reasoning"}),
+            json!({"type":"thinking_end","contentIndex":0,"content":"Complete reasoning"}),
+            json!({"type":"text_delta","contentIndex":1,"delta":"I'll read the file."}),
+            json!({"type":"thinking_start","contentIndex":2}),
+            json!({"type":"thinking_delta","contentIndex":2,"delta":"Second thought"}),
+        ] {
+            thread.apply(json!({"type":"message_update","assistantMessageEvent":event}));
+        }
+        assert_eq!(thread.thoughts.len(), 2);
+        assert_eq!(thread.thoughts[0].text, "Complete reasoning");
+        assert!(thread.thoughts[0].done);
+        assert!(thread.thoughts[0].duration_ms.is_some());
+        assert!(!thread.thoughts[1].done);
+        thread.apply(json!({"type":"message_end","message":{"role":"assistant","content":[
+            {"type":"thinking","thinking":"Authoritative reasoning","thinkingSignature":"opaque"},
+            {"type":"text","text":"I'll read the file."},
+            {"type":"thinking","thinking":"Complete second thought"},
+            {"type":"toolCall","id":"read","name":"read","arguments":{"path":"file.txt"}}
+        ]}}));
+        thread.apply(json!({"type":"tool_execution_start","toolCallId":"read","toolName":"read","args":{"path":"file.txt"}}));
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.thoughts.len(), 2);
+        assert_eq!(thread.thoughts[0].text, "Authoritative reasoning");
+        assert_eq!(thread.thoughts[1].text, "Complete second thought");
+        assert!(thread.thoughts[1].done);
+        assert_eq!(thread.thoughts[1].anchor, thread.tools[0].anchor);
+        assert!(thread.thoughts[1].block < thread.tools[0].block);
+        assert_eq!(thread.tools.len(), 1);
+    }
+
+    #[test]
+    fn restored_thinking_keeps_text_and_redaction_without_inventing_timings() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"response","command":"get_messages","id":"history","success":true,"data":{"messages":[
+            {"role":"user","content":"Check"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"Saved thinking"}]},
+            {"role":"assistant","content":[
+                {"type":"thinking","redacted":true,"thinkingSignature":"never render this"},
+                {"type":"text","text":"Done"}
+            ]}
+        ]}}));
+        assert_eq!(thread.messages.len(), 3);
+        assert_eq!(thread.thoughts.len(), 2);
+        assert_eq!(thread.thoughts[0].text, "Saved thinking");
+        assert!(thread.thoughts[1].text.is_empty());
+        assert!(
+            thread
+                .thoughts
+                .iter()
+                .all(|thought| thought.done && thought.duration_ms.is_none())
+        );
+        assert_eq!(thread.work.len(), 1);
+        assert!(thread.work[0].expanded);
+        assert!(thread.work[0].elapsed.is_none());
+    }
+
+    #[test]
+    fn each_user_turn_keeps_its_own_work_duration_and_disclosure() {
+        let mut thread = Thread::new(1);
+        for prompt in ["First", "Second"] {
+            thread.messages.push(Message {
+                role: "You",
+                text: prompt.into(),
+            });
+            thread.apply(json!({"type":"agent_start"}));
+            thread.started = Some(Instant::now() - Duration::from_secs(3));
+            thread.apply(
+                json!({"type":"message_end","message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"Consider the answer"},
+                    {"type":"text","text":"Answer"}
+                ]}}),
+            );
+            thread.apply(json!({"type":"agent_settled"}));
+            thread.work.last_mut().unwrap().expanded = false;
+        }
+        assert_eq!(thread.work.len(), 2);
+        assert_eq!(thread.work[0].start, 1);
+        assert_eq!(thread.work[1].start, 3);
+        assert!(
+            thread
+                .work
+                .iter()
+                .all(|work| work.elapsed == Some(3) && !work.expanded)
         );
     }
     #[test]
@@ -3643,6 +3895,12 @@ mod tests {
         thread.send();
         thread.connect(workspace.clone(), Arc::new(|| {}));
         receive_until(&mut thread, |t| {
+            t.tools
+                .iter()
+                .any(|tool| tool.started.is_some() && !tool.done)
+        });
+        thread = crate::ui::tests::verify_tool_rows(thread);
+        receive_until(&mut thread, |t| {
             t.status == Status::Settled && t.session.is_some()
         });
         assert_eq!(fs::read_to_string(&fixture).unwrap(), "answer=42\n");
@@ -3661,6 +3919,16 @@ mod tests {
         let session = thread.session.clone().unwrap();
         let tool_count = thread.tools.len();
         let message_count = thread.messages.len();
+        let thinking_text: Vec<_> = thread
+            .thoughts
+            .iter()
+            .map(|thought| thought.text.clone())
+            .collect();
+        println!(
+            "Live Pi tool rows: {tool_count}, thinking rows: {}",
+            thread.thoughts.len()
+        );
+        thread = crate::ui::tests::verify_tool_rows(thread);
         thread.disconnect();
         crate::backend::shutdown_all();
         let mut restored = Thread::new(2);
@@ -3670,6 +3938,16 @@ mod tests {
         assert_eq!(restored.messages.len(), message_count);
         assert_eq!(restored.tools.len(), tool_count);
         assert!(restored.tools.iter().all(|t| t.done && !t.failed));
+        assert_eq!(
+            restored
+                .thoughts
+                .iter()
+                .map(|thought| thought.text.clone())
+                .collect::<Vec<_>>(),
+            thinking_text
+        );
+        restored = crate::ui::tests::verify_tool_rows(restored);
+        println!("Restored {tool_count} rendered tool rows from the saved Pi session.");
         restored.disconnect();
         crate::backend::shutdown_all();
         fs::remove_file(fixture).unwrap();
