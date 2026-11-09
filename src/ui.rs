@@ -31,7 +31,7 @@ fn palette(dark: bool) -> Palette {
             bg: color("#161616"),
             panel: color("#242424"),
             card: color("#2d2d2d"),
-            line: Color::WHITE.alpha(0.10),
+            line: Color::WHITE.alpha(0.12),
             ink: rune::color::oklch(0.9404, 0.0013, 286.4),
             muted: color("#a1a1a4"),
             selected: Color::WHITE.alpha(0.08),
@@ -67,12 +67,11 @@ fn palette(dark: bool) -> Palette {
 const BODY: TextStyle = TextStyle::new(13.0, 400.0).lh(19.5).tracking(-0.13);
 /// Wide windows (1600 px and up) get a longer measure and larger body text.
 const WIDE_WINDOW: f32 = 1600.0;
-fn body_style(dark: bool, wide: bool) -> TextStyle {
-    let weight = if dark { 380.0 } else { 400.0 };
+fn body_style(wide: bool) -> TextStyle {
     if wide {
-        TextStyle::new(14.0, weight).lh(21.0).tracking(-0.14)
+        TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.14)
     } else {
-        TextStyle::new(13.0, weight).lh(19.5).tracking(-0.13)
+        BODY
     }
 }
 fn measure(wide: bool) -> f32 {
@@ -126,6 +125,10 @@ fn icon(kind: &str, ink: Color) -> El {
     glyph!(
         COMPOSE,
         r#"<path d="M8.5 3H4a1.5 1.5 0 0 0-1.5 1.5V12A1.5 1.5 0 0 0 4 13.5h7.5A1.5 1.5 0 0 0 13 12V7.5M8 8l5-5a1.1 1.1 0 0 0-1.5-1.5L6.5 6.5 6 9z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        CHEVRON_RIGHT,
+        r#"<path d="m6.5 4.5 3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
     glyph!(
         SEND,
@@ -230,6 +233,7 @@ fn icon(kind: &str, ink: Color) -> El {
         "folder" => &rune_kit::glyphs::FOLDER,
         "search" => &rune_kit::glyphs::SEARCH,
         "chevron" => &rune_kit::glyphs::CHEVRON_DOWN,
+        "open" => &CHEVRON_RIGHT,
         "lock" => &rune_kit::glyphs::LOCK,
         "close" => &rune_kit::glyphs::CLOSE,
         "activity" => &PULSE,
@@ -342,7 +346,7 @@ fn status_ink(status: Status, p: Palette) -> Color {
     match status {
         Status::Failed => p.danger,
         Status::Waiting => p.gold,
-        Status::Running | Status::Settled => p.teal_text,
+        Status::Running => p.teal_text,
         _ => p.muted,
     }
 }
@@ -597,7 +601,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(0.40))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .center()
         .modal(false, |s: &mut State| s.settings_picker = None)
         .on_press(|s: &mut State| s.settings_picker = None)
@@ -1246,7 +1250,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(Color::BLACK.alpha(0.40))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .center()
         .modal(false, |s: &mut State| s.captain_picker = false)
         .on_press(|s: &mut State| s.captain_picker = false)
@@ -1257,7 +1261,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     let editor = s.captain_editor.as_ref().unwrap();
     let editing = editor.editing.is_some();
     let profile = editor.profile();
-    let field = if s.dark { p.bg } else { p.card };
+    let field = if s.dark { p.bg } else { p.panel };
     let mut portraits = row().gap(8.0).w_full();
     for portrait in 0..crate::visuals::CAPTAIN_NAMES.len() {
         portraits = portraits.child(
@@ -1411,7 +1415,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .w_full()
         .h_full()
         .padding(16.0)
-        .fill(Color::BLACK.alpha(0.40))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .center()
         .modal(false, |s: &mut State| s.captain_editor = None)
         .on_press(|s: &mut State| s.captain_editor = None)
@@ -1656,7 +1660,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
             let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
                 row().justify_end().child(
-                    label(&message.text, body_style(s.dark, wide), p.ink)
+                    label(&message.text, body_style(wide), p.ink)
                         .key(format!("{key}-text"))
                         .wrap_anywhere()
                         .shrink()
@@ -1671,7 +1675,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                 let style = MarkdownStyle::neutral(s.dark)
                     .text(p.ink)
                     .muted(p.muted)
-                    .body_font(body_style(s.dark, wide))
+                    .body_font(body_style(wide))
                     .inline_code_bg(if s.dark {
                         Color::WHITE.alpha(0.07)
                     } else {
@@ -1767,7 +1771,7 @@ fn suggestion(key: &str, title: &str, prompt: &'static str, p: Palette) -> El {
     .border(0.5, p.line)
 }
 
-/// A secondary, collapsible summary such as "Worked for 42s".
+/// A secondary summary such as "Worked for 42s" that opens the activity pane.
 fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
     row()
         .key(key)
@@ -1785,7 +1789,7 @@ fn disclosure(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 
         .hover(p.selected)
         .on_press(action)
         .child(label(title, TextStyle::new(12.0, 420.0), p.muted))
-        .child(icon("chevron", p.muted))
+        .child(icon("open", p.muted))
 }
 
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
@@ -1793,7 +1797,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let mut area = col()
         .w_full()
         .max_w(measure(wide))
-        .px(if narrow { 12.0 } else { 16.0 })
+        .px(16.0)
         .pb(12.0)
         .gap(6.0);
     if let Some(error) = &s.storage_error {
@@ -1866,7 +1870,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             .pb(10.0)
             .gap(10.0)
             .child(
-                text_input(&t.draft, body_style(s.dark, wide))
+                text_input(&t.draft, body_style(wide))
                     .key("composer-input")
                     .label("Message Pi")
                     .placeholder(
