@@ -898,9 +898,15 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let drafts: Vec<_> = visible
         .iter()
         .copied()
-        .filter(|i| s.threads[*i].is_draft())
+        .filter(|i| s.threads[*i].has_draft_row())
         .collect();
-    if !drafts.is_empty() {
+    if drafts.is_empty() {
+        // A blank draft never earns a row, but its row is laid out while it is open so content
+        // typed into it, even as the first change to the window, appears at rest.
+        if s.current().is_draft() {
+            content = content.child(thread_row(s, s.active, p, false));
+        }
+    } else {
         content = content.child(section_title("Drafts", p));
         for i in drafts {
             content = content.child(thread_row(s, i, p, false));
@@ -982,7 +988,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             );
         }
         for index in rows.iter().copied().filter(|i| visible.contains(i)) {
-            if thread_matches(s, &s.threads[index], &search) {
+            if thread_matches(s, index, &search) {
                 content = content.child(thread_row(s, index, p, false));
             }
         }
@@ -1492,9 +1498,10 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
-fn thread_matches(s: &State, thread: &crate::model::Thread, search: &str) -> bool {
+fn thread_matches(s: &State, index: usize, search: &str) -> bool {
+    let thread = &s.threads[index];
     thread.title.to_lowercase().contains(search)
-        || thread.is_draft() && thread.draft.text.to_lowercase().contains(search)
+        || thread.has_draft_row() && thread.draft.text.to_lowercase().contains(search)
         || thread
             .messages
             .iter()
@@ -4547,6 +4554,7 @@ pub(crate) mod tests {
     #[test]
     fn native_pointer_drag_pins_at_the_target_position_and_resizes_the_sidebar() {
         let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("A prompt");
         rt.state.new_thread();
         rt.state.pin_thread(1);
         rt.invalidate();
@@ -5238,6 +5246,7 @@ pub(crate) mod tests {
         assert_eq!(relative_time(0), None);
         assert_eq!(relative_time(crate::projects::now()), Some("now".into()));
         let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("A prompt");
         rt.state.current_mut().updated = 0;
         rt.frame(0.0);
         assert!(rt.find("thread-age-1").is_none());
@@ -5401,6 +5410,7 @@ pub(crate) mod tests {
     #[test]
     fn sidebar_context_and_header_share_rename_pin_archive_and_delete_actions() {
         let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("A prompt");
         rt.frame(0.0);
         let (x, y) = rt.find("thread-1").unwrap();
         rt.secondary_down(x, y);

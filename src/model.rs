@@ -254,6 +254,9 @@ pub struct Thread {
     history_loaded: bool,
     initializing: bool,
     session_started: Option<Instant>,
+    /// This thread is the draft the sidebar froze, so its "Drafts" row stays while the composer is
+    /// empty. Saved so a restored draft keeps its row.
+    draft_frozen: bool,
     last_activity: Instant,
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
@@ -291,11 +294,43 @@ impl Thread {
             && !self.pinned()
             && !self.life.settled()
             && self.life.snoozed_at.is_none()
+            && self.life.failed_at.is_none()
             && self.status == Status::Ready
             && self.session.is_none()
             && self.messages.is_empty()
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
+    }
+    /// A blank slot that already parked a thread is disposable. Saving it would restore one slot
+    /// for every past park, so only the open thread's slot is saved.
+    fn keep_slot(&self) -> bool {
+        !self.blank_draft() || self.life.last_visited_at.is_none() || self.draft_frozen
+    }
+    /// A new thread slot with nothing queued, running, saved or named in it. Its title becomes
+    /// whatever the user types, before any prompt is sent.
+    fn blank_draft(&self) -> bool {
+        !self.captain_home
+            && !self.delegated
+            && !self.archived()
+            && !self.pinned()
+            && !self.life.settled()
+            && self.life.snoozed_at.is_none()
+            && self.life.failed_at.is_none()
+            && self.life.latest_user_message_at.is_none()
+            && self.life.last_completed_at.is_none()
+            && self.status == Status::Ready
+            && self.session.is_none()
+            && self.messages.is_empty()
+            && !self.has_draft_content()
+            && !self.configuring
+            && !self.queued()
+            && !self.renamed
+            && self.parent.is_none()
+    }
+    /// An unsent draft that earns a "Drafts" row in the sidebar. The open draft's row waits while
+    /// the composer is empty so it cannot pop in mid-typing. Captains have their own area.
+    pub fn has_draft_row(&self) -> bool {
+        self.is_draft() && (self.has_draft_content() || self.draft_frozen)
     }
     pub fn actionable(&self) -> bool {
         self.request.is_some() || self.status == Status::Waiting || self.status == Status::Failed
@@ -404,6 +439,7 @@ impl Thread {
             history_loaded: false,
             initializing: false,
             session_started: None,
+            draft_frozen: false,
             last_activity: Instant::now(),
             prewarm_attempted: false,
             selected_model: None,
@@ -1799,6 +1835,7 @@ impl State {
         }
         self.active = index;
         self.selected_threads.clear();
+        self.open_draft();
         let id = self.current().id;
         if !self.tabs.contains(&id) {
             self.tabs.push(id);
@@ -1810,7 +1847,16 @@ impl State {
         }
         self.checkpoint();
     }
+    /// Closing a blank draft's tab closes the draft. Otherwise the selection returns to the last
+    /// remaining tab.
     pub fn close_tab(&mut self, id: usize) {
+        let Some(index) = self.threads.iter().position(|t| t.id == id) else {
+            return;
+        };
+        if self.threads[index].blank_draft() {
+            self.remove_threads(&std::collections::HashSet::from([id]));
+            return;
+        }
         if self.tabs.len() <= 1 {
             return;
         }
@@ -1878,7 +1924,10 @@ impl State {
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                t.archived() == self.show_archive && !t.delegated && !self.is_captain_home(t)
+                t.archived() == self.show_archive
+                    && !t.delegated
+                    && !self.is_captain_home(t)
+                    && !t.blank_draft()
             })
             .filter(|(_, t)| self.in_scope(t))
             .collect();
@@ -1886,8 +1935,8 @@ impl State {
         threads.sort_by(|(_, a), (_, b)| {
             let sa = self.thread_section(a, at);
             let sb = self.thread_section(b, at);
-            b.is_draft()
-                .cmp(&a.is_draft())
+            b.has_draft_row()
+                .cmp(&a.has_draft_row())
                 .then_with(|| sa.cmp(&sb))
                 .then_with(|| {
                     lifecycle::compare(
@@ -1902,6 +1951,14 @@ impl State {
                 .then_with(|| a.machine.cmp(&b.machine))
         });
         threads.into_iter().map(|(i, _)| i).collect()
+    }
+    /// Only the most recently opened thread may hold a frozen draft.
+    fn open_draft(&mut self) {
+        for thread in &mut self.threads {
+            thread.draft_frozen = false;
+        }
+        let draft = self.current().is_draft();
+        self.current_mut().draft_frozen = draft;
     }
     pub fn in_scope(&self, t: &Thread) -> bool {
         match self.project_scope {
@@ -1953,6 +2010,9 @@ impl State {
     }
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
         let id = self.threads[index].id;
+        if !mods.cmd && !mods.shift {
+            self.open_draft();
+        }
         if mods.cmd {
             if let Some(i) = self.selected_threads.iter().position(|t| *t == id) {
                 self.selected_threads.remove(i);
@@ -2020,7 +2080,7 @@ impl State {
                 if !self.search.text.is_empty() {
                     let search = self.search.text.to_lowercase();
                     return t.title.to_lowercase().contains(&search)
-                        || t.is_draft() && t.draft.text.to_lowercase().contains(&search)
+                        || t.has_draft_row() && t.draft.text.to_lowercase().contains(&search)
                         || t.messages
                             .iter()
                             .any(|m| m.text.to_lowercase().contains(&search));
@@ -2177,7 +2237,13 @@ impl State {
         for id in &ids {
             self.invalidate_undo(*id);
         }
+        self.remove_threads(&ids);
+    }
+    /// Removes threads and their records, then selects the survivor and saves. The caller
+    /// handles undo and tab refusals.
+    fn remove_threads(&mut self, ids: &std::collections::HashSet<usize>) {
         let current = self.current().id;
+        let project = self.current().project;
         let mut parents = Vec::new();
         for thread in &mut self.threads {
             if ids.contains(&thread.id) {
@@ -2224,7 +2290,7 @@ impl State {
             .or_else(|| self.threads.iter().position(|t| self.tabs.contains(&t.id)))
             .unwrap_or(0);
         if self.threads.is_empty() {
-            self.new_thread_in(None);
+            self.new_thread_in(project);
         } else {
             self.select_thread(self.active);
         }
@@ -2377,18 +2443,38 @@ impl State {
         for offset in 1..=order.len() {
             let i = order[(start + offset) % order.len()];
             let t = &self.threads[i];
-            if t.id != id
-                && !t.archived()
-                && !matches!(
-                    self.thread_section(t, lifecycle::now()),
-                    Section::Snoozed | Section::Settled
-                )
-            {
+            if self.valid_after_park(t, id) {
                 self.select_thread(i);
                 return;
             }
         }
-        self.new_thread_in(self.current().project);
+        let project = self.current().project;
+        if let Some(index) = self
+            .open_tabs()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .find(|&i| self.valid_after_park(&self.threads[i], id))
+        {
+            self.select_thread(index);
+            return;
+        }
+        self.new_thread_in(project);
+    }
+    fn valid_after_park(&self, t: &Thread, parked: usize) -> bool {
+        t.id != parked
+            && !t.archived()
+            && !matches!(
+                self.thread_section(t, lifecycle::now()),
+                Section::Snoozed | Section::Settled
+            )
+    }
+    /// Tabs whose thread still exists, including drafts and hidden captain homes.
+    fn open_tabs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.tabs.iter().filter_map(|id| {
+            self.threads
+                .iter()
+                .position(|t| t.id == *id && !t.archived())
+        })
     }
     pub fn can_snooze(&self, id: usize) -> bool {
         self.threads.iter().find(|t| t.id == id).is_some_and(|t| {
@@ -2441,6 +2527,15 @@ impl State {
         let Some(i) = self.threads.iter().position(|t| t.id == id) else {
             return;
         };
+        // A blank draft holds nothing to undo and never becomes an archive row.
+        if self.threads[i].blank_draft()
+            && self.threads[i].messages.is_empty()
+            && self.threads[i].session.is_none()
+        {
+            self.invalidate_undo(id);
+            self.remove_threads(&std::collections::HashSet::from([id]));
+            return;
+        }
         self.remember(Action::Discard, i);
         self.threads[i].draft.replace_text("");
         self.threads[i].draft_images.clear();
@@ -2588,10 +2683,23 @@ impl State {
         }
     }
     pub fn new_thread(&mut self) {
-        self.new_thread_in(self.current().project);
+        let project = self.current().project;
+        self.new_thread_in(project);
     }
     pub fn new_thread_in(&mut self, project: Option<ProjectId>) {
         if project.is_some() && self.project(project).is_none() {
+            return;
+        }
+        // T3 keeps one draft thread per logical project and reopens it instead of adding another.
+        let reuse = self.threads.iter().position(|t| {
+            t.project == project && !t.delegated && !t.captain_home && t.blank_draft()
+        });
+        if let Some(index) = reuse {
+            self.active = index;
+            self.selected_threads.clear();
+            self.show_archive = false;
+            self.current_mut().life.last_visited_at = Some(lifecycle::now());
+            self.checkpoint();
             return;
         }
         let mut thread = Thread::new(self.next_id);
@@ -3780,6 +3888,7 @@ impl State {
                     }
                     thread.title = record["title"].as_str()?.into();
                     thread.renamed = record["renamed"] == true;
+                    thread.draft_frozen = record["draftFrozen"] == true;
                     thread.session = record["session"].as_str().map(str::to_owned);
                     if let Some(model) = record["model"].as_str() {
                         // Only CPA choices survive restart, even in hand-edited indexes.
@@ -4022,12 +4131,13 @@ impl State {
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
-            "threads":self.threads.iter().map(|thread|json!({
+            "threads":self.threads.iter().filter(|thread| thread.keep_slot()).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
-                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
+                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking,
+                "draftFrozen":thread.draft_frozen
             })).collect::<Vec<_>>()
         })
     }
@@ -4837,13 +4947,145 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
     #[test]
+    fn blank_drafts_never_hold_a_sidebar_row_or_accumulate() {
+        let mut state = State::new(".".into(), false);
+        let workspace = state.data_dir.join("blank-drafts");
+        state.projects.entries.push(Project::new(2, workspace));
+        assert!(state.sidebar_threads().is_empty());
+        for _ in 0..3 {
+            state.new_thread();
+        }
+        state.new_thread_in(Some(2));
+        state.new_thread_in(None);
+        assert_eq!(
+            state.threads.len(),
+            3,
+            "one blank draft per project, including no project"
+        );
+        assert!(state.sidebar_threads().is_empty(), "no empty Drafts rows");
+        state.current_mut().draft.replace_text("A first prompt");
+        let active = state.active;
+        assert_eq!(state.sidebar_threads(), vec![active]);
+        state.current_mut().draft.replace_text("");
+        state.discard_draft(state.current().id);
+        assert_eq!(state.threads.len(), 2, "the blank thread is gone");
+        assert!(state.undo.is_none(), "a blank draft offers no Undo");
+        assert!(state.sidebar_threads().is_empty());
+        state.show_archive = true;
+        assert!(state.sidebar_threads().is_empty(), "nothing was archived");
+        assert!(state.tabs.contains(&state.current().id));
+    }
+
+    #[test]
+    fn closing_a_blank_drafts_tab_removes_it_and_keeps_a_tab() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("A prompt");
+        state.select_thread(0);
+        state.new_thread_in(None);
+        state.current_mut().draft.replace_text("Keep this draft");
+        state.select_thread(0);
+        state.project_picker = Some(ProjectPicker::NewThread);
+        state.new_thread_in(Some(state.projects.entries.len()));
+        let blank = state.current().id;
+        assert!(state.current().blank_draft());
+        let written = 2;
+        assert_eq!(state.tabs, vec![1, written, blank]);
+        state.close_tab(blank);
+        assert!(!state.threads.iter().any(|t| t.id == blank));
+        assert_eq!(state.tabs, vec![1, written]);
+        assert_eq!(state.current().draft.text, "A prompt");
+        state.select_thread(1);
+        assert_eq!(state.current().draft.text, "Keep this draft");
+        state.close_tab(written);
+        assert!(state.threads.iter().any(|t| t.id == written));
+        assert_eq!(state.current().id, 1);
+        assert_eq!(state.current().draft.text, "A prompt");
+        state.close_tab(1);
+        assert_eq!(state.tabs, vec![1], "the tab strip keeps one tab");
+        assert!(state.undo.is_none());
+    }
+
+    #[test]
+    fn discarding_a_draft_with_content_archives_it_and_undo_restores_it() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("Keep me");
+        state
+            .current_mut()
+            .draft_images
+            .push(test_attachment("kept.png", 1));
+        assert_eq!(state.sidebar_threads(), vec![0]);
+        state.discard_draft(1);
+        assert!(
+            state.threads.iter().any(|t| t.id == 1 && t.archived()),
+            "a written draft stays as an archive record"
+        );
+        assert!(state.threads[0].archived());
+        assert!(state.undo.is_some(), "a draft with content offers Undo");
+        assert!(state.sidebar_threads().is_empty());
+        assert!(state.current().draft_images.is_empty());
+        state.undo_thread_action();
+        assert!(!state.threads[0].archived());
+        assert_eq!(state.threads[0].draft.text, "Keep me");
+        assert_eq!(state.threads[0].draft_images.len(), 1);
+        assert_eq!(state.sidebar_threads(), vec![0]);
+    }
+
+    #[test]
+    fn parked_new_threads_leave_nothing_blank_to_save_or_restore() {
+        let mut state = State::new(".".into(), false);
+        state.archive_thread(1);
+        assert!(state.current().blank_draft());
+        let slot = state.current().id;
+        for _ in 0..3 {
+            state.show_archive = false;
+            state.new_thread();
+        }
+        assert_eq!(state.threads.iter().filter(|t| !t.archived()).count(), 1);
+        assert_eq!(state.current().id, slot, "the same slot is reopened");
+        let saved = state.snapshot();
+        assert_eq!(
+            saved["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["title"] == "New thread")
+                .count(),
+            1,
+            "one blank draft is saved"
+        );
+        // Restoring never lists it or opens a second tab for it.
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&saved).unwrap();
+        assert!(restored.sidebar_threads().is_empty());
+        assert_eq!(restored.tabs, vec![restored.current().id]);
+        assert!(saved["nextId"].as_u64().unwrap() > 1, "ids are not reused");
+        // Restoring never lists the slot, and reloading the restored index never adds another.
+        let mut reloaded = State::new(PathBuf::new(), false);
+        reloaded.restore_global(&saved).unwrap();
+        assert_eq!(
+            reloaded.threads.len(),
+            1,
+            "a restart restores one blank draft"
+        );
+        reloaded.restore_global(&reloaded.snapshot()).unwrap();
+        assert_eq!(
+            reloaded.threads.len(),
+            1,
+            "blank drafts do not accumulate across restarts"
+        );
+        assert!(reloaded.sidebar_threads().is_empty());
+    }
+
+    #[test]
     fn multi_project_scope_persists_and_opening_a_hidden_thread_widens_it() {
         let mut state = State::new(".".into(), false);
         state
             .projects
             .entries
             .push(Project::new(2, state.data_dir.join("other-project")));
+        state.current_mut().draft.replace_text("Work in one");
         state.new_thread_in(Some(2));
+        state.current_mut().draft.replace_text("Work in two");
         state.new_thread_in(None);
         state.set_project_scope(Some(1), false);
         state.set_project_scope(Some(2), true);
@@ -6813,6 +7055,7 @@ mod tests {
         state.apply_catalog();
         assert_eq!(state.current().thinking, "high");
         assert_eq!(state.current().model, "Default CPA");
+        state.current_mut().draft.replace_text("Write the report");
         state.new_thread();
         assert_eq!(state.current().model, "Default CPA");
         assert_eq!(state.current().thinking, "low");
@@ -7074,11 +7317,13 @@ mod tests {
             state.thread_directory(0).unwrap(),
             state.thread_directory(b).unwrap()
         );
+        state.current_mut().draft.replace_text("Scratch work");
         state.new_thread_in(None);
         let scratch = state.working_directory();
         let id = state.current().id;
         assert_eq!(scratch, state.data_dir.join("chats").join(id.to_string()));
         assert!(state.current().captain.is_none());
+        state.current_mut().draft.replace_text("More scratch work");
         state.new_thread_in(None);
         assert_ne!(scratch, state.working_directory());
         state.current_mut().machine = "unavailable-host".into();
@@ -7107,6 +7352,7 @@ mod tests {
         let second = state.current().id;
         assert_ne!(first, second);
         assert_eq!(state.current().project, Some(b));
+        state.current_mut().draft.replace_text("Scratch work");
         state.new_thread_in(None);
         let scratch = state.current().id;
         state.open_captain(3);
@@ -7158,9 +7404,11 @@ mod tests {
         let mut state = State::new(".".into(), false);
         state.threads[0].updated = 10;
         state.threads[0].life.created_at = 10000;
+        state.current_mut().draft.replace_text("First");
         state.new_thread();
         state.current_mut().updated = 30;
         state.current_mut().life.created_at = 30000;
+        state.current_mut().draft.replace_text("Second");
         state.new_thread_in(None);
         state.current_mut().updated = 20;
         state.current_mut().life.created_at = 20000;
@@ -7953,6 +8201,7 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let origin = state.current().id;
         let image = test_attachment("picked.png", 1);
+        state.current_mut().draft.replace_text("Write the report");
         state.new_thread();
         assert_ne!(state.current().id, origin);
         state.attach_paths_to(origin, &[attachments::path_for(&image).unwrap()]);
