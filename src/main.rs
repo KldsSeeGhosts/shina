@@ -3,6 +3,7 @@
 mod backend;
 mod captains;
 mod install;
+mod mcp;
 mod model;
 mod store;
 mod ui;
