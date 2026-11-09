@@ -332,7 +332,7 @@ impl Thread {
     }
     pub fn remove_attachment(&mut self, id: &str) {
         self.draft_images.retain(|image| image.id != id);
-        self.attachment_error = None;
+        self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
     fn image_model_error(&self) -> String {
         let model = if self.model.is_empty() {
@@ -1452,12 +1452,10 @@ impl Thread {
                 images.push(image.clone());
             }
         }
-        self.draft_images.clear();
-        for image in images {
-            // Capacity was valid when the prompt was submitted. If a newer draft filled it,
-            // keep as many submitted images as still fit rather than dropping the draft.
-            let _ = self.add_attachment(image);
-        }
+        // Preserve both drafts even if their combined images exceed a message limit.
+        // The user can remove images before sending. Never discard a newer attachment.
+        self.draft_images = images;
+        self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
     fn finish_run(&mut self) {
@@ -2233,13 +2231,11 @@ impl State {
     }
     fn remember(&mut self, action: Action, index: usize) {
         let t = &self.threads[index];
-        UndoNotice::push(
-            &mut self.undo,
-            action,
-            t.id,
-            lifecycle::plan_undo(action, &t.life, &t.draft.text),
-            lifecycle::now(),
-        );
+        let mut steps = lifecycle::plan_undo(action, &t.life, &t.draft.text);
+        if action == Action::Discard && !t.draft_images.is_empty() {
+            steps.push(UndoStep::RestoreImages(t.draft_images.clone()));
+        }
+        UndoNotice::push(&mut self.undo, action, t.id, steps, lifecycle::now());
     }
     pub fn settle_thread(&mut self, id: usize) {
         if self
@@ -2383,6 +2379,11 @@ impl State {
                     UndoStep::RestoreDraft(draft) => {
                         t.draft.replace_text(&draft);
                         t.life.archived_at = None;
+                    }
+                    UndoStep::RestoreImages(images) => {
+                        t.draft_images = images;
+                        t.attachment_error =
+                            attachments::validate_prompt_images(&t.draft_images).err();
                     }
                 }
             }
@@ -3317,14 +3318,14 @@ impl State {
         }
         changed
     }
-    fn attachment_guard(&self) -> Option<String> {
+    fn attachment_guard(&self, index: usize) -> Option<String> {
         if self.demo {
             Some("Open a real workspace before attaching images.".into())
-        } else if self.current().archived() {
+        } else if self.threads[index].archived() {
             Some("Restore this thread before attaching images.".into())
-        } else if self.current().status.busy() {
+        } else if self.threads[index].status.busy() {
             Some("Wait for Pi to finish before attaching images.".into())
-        } else if self.current().configuring {
+        } else if self.threads[index].configuring {
             Some("Wait for the model change to finish before attaching images.".into())
         } else {
             None
@@ -3332,25 +3333,38 @@ impl State {
     }
     /// Attach one or more picked or dropped files. A failure leaves the text draft untouched.
     pub fn attach_paths(&mut self, paths: &[PathBuf]) {
+        self.attach_paths_to(self.current().id, paths);
+    }
+    pub fn attach_paths_to(&mut self, thread: usize, paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
         }
-        if let Some(error) = self.attachment_guard() {
-            self.current_mut().attachment_error = Some(error);
+        let Some(index) = self.threads.iter().position(|t| t.id == thread) else {
+            return;
+        };
+        if let Some(error) = self.attachment_guard(index) {
+            self.threads[index].attachment_error = Some(error);
             return;
         }
         let mut errors = Vec::new();
         let mut attached = 0;
         for path in paths {
+            if self.threads[index].draft_images.len() >= attachments::MAX_IMAGES {
+                errors.push(format!(
+                    "A message can carry up to {} images. The remaining files were not attached.",
+                    attachments::MAX_IMAGES
+                ));
+                break;
+            }
             match attachments::attach_file(path) {
-                Ok(image) => match self.current_mut().add_attachment(image) {
+                Ok(image) => match self.threads[index].add_attachment(image) {
                     Ok(()) => attached += 1,
                     Err(error) => errors.push(error),
                 },
                 Err(error) => errors.push(error),
             }
         }
-        self.current_mut().attachment_error = if errors.is_empty() {
+        self.threads[index].attachment_error = if errors.is_empty() {
             None
         } else {
             Some(errors.join(" "))
@@ -3361,8 +3375,15 @@ impl State {
     }
     /// Attach a pasted PNG image without touching the text draft.
     pub fn attach_image(&mut self, name: &str, bytes: &[u8]) {
-        if let Some(error) = self.attachment_guard() {
+        if let Some(error) = self.attachment_guard(self.active) {
             self.current_mut().attachment_error = Some(error);
+            return;
+        }
+        if bytes.len() as u64 > attachments::MAX_IMAGE_BYTES {
+            self.current_mut().attachment_error = Some(format!(
+                "Choose an image that is {} MB or smaller.",
+                attachments::MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
             return;
         }
         match attachments::attach_bytes(name, bytes.to_vec()) {
@@ -3841,15 +3862,19 @@ impl State {
             self.project_scope = ProjectScope::All;
         }
         for (id, draft) in ui["drafts"].as_object().ok_or("Invalid saved drafts.")? {
-            let (text, images) = if let Some(text) = draft.as_str() {
-                (text, Vec::new())
+            let (text, images, missing_images) = if let Some(text) = draft.as_str() {
+                (text, Vec::new(), false)
             } else {
                 let text = draft["text"].as_str().ok_or("Invalid draft text.")?;
-                let images = draft["images"]
+                let saved_images = draft["images"]
                     .as_array()
-                    .map(|images| images.iter().filter_map(Attachment::from_value).collect())
-                    .unwrap_or_default();
-                (text, images)
+                    .ok_or("Invalid saved draft images.")?;
+                let images: Vec<_> = saved_images
+                    .iter()
+                    .filter_map(Attachment::from_value)
+                    .collect();
+                let missing = images.len() != saved_images.len();
+                (text, images, missing)
             };
             if let Some(t) = id
                 .parse::<usize>()
@@ -3857,10 +3882,12 @@ impl State {
                 .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
             {
                 t.draft.replace_text(text);
-                t.draft_images.clear();
-                for image in images {
-                    let _ = t.add_attachment(image);
-                }
+                t.draft_images = images;
+                t.attachment_error = if missing_images {
+                    Some("Some saved draft images are missing or invalid. Attach those images again.".into())
+                } else {
+                    attachments::validate_prompt_images(&t.draft_images).err()
+                };
             }
         }
         Ok(())
@@ -7064,7 +7091,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Sends a real parent and child task through CPA to verify completion wake-ups"]
+    #[ignore = "Sends paid GPT 6.1 Sol and DeepSeek Flash max requests through CPA to verify explicit delegation and wake-ups"]
     fn installed_pi_parent_is_woken_by_child_completion() {
         let workspace = std::env::temp_dir().join(format!(
             "shina-crew-{}-{}",
@@ -7076,12 +7103,16 @@ mod tests {
         ));
         std::fs::create_dir(&workspace).unwrap();
         let mut state = State::new(workspace.clone(), false);
+        // Exercise the same MCP request pump as setup, without loading user state or
+        // starting the updater. Otherwise model tool calls wait forever in this test.
+        state.runtime_enabled = true;
+        state.threads[0].set_model("cpa".into(), "gpt-6.1-sol".into());
+        state.threads[0].set_thinking("off".into());
         state.threads[0].draft.replace_text(
-            "This is an orchestration integration test. Call mcp__shina__delegate_task exactly once with title Ping and prompt 'Reply with only the word PONG. Do not use tools or delegate.'. Do not set wait_seconds. Then immediately reply with only WAITING and end your turn. Do not call any other tools or poll. When a later Shina task completion message arrives containing PONG, reply with only WOKEN_PONG. Do not delegate again."
+            "This is an orchestration integration test. Call mcp__shina__orchestrator_capabilities first. Then call mcp__shina__delegate_task exactly once with title Ping, prompt 'Reply with only the word PONG. Do not use tools or delegate.', and target {\"provider\":\"cpa\",\"model\":\"opencode-go/deepseek-v4.1-flash\",\"options\":{\"reasoning\":\"max\"}}. Do not set wait_seconds. Then immediately reply with only WAITING and end your turn. Do not call any other tools or poll. When a later Shina task completion message arrives containing PONG, reply with only WOKEN_PONG. Do not delegate again."
         );
         state.send();
         let deadline = Instant::now() + Duration::from_secs(240);
-        let mut saw_idle_parent = false;
         let mut previous = vec![];
         loop {
             poll(&mut state, 0.0, &mut Tx::default());
@@ -7100,8 +7131,6 @@ mod tests {
                     thread.diagnostics
                 );
             }
-            saw_idle_parent |= state.threads[0].status == Status::Completed
-                && !state.threads[0].messages.iter().any(|m| m.role == "Shina");
             let finished = state.threads[0].status == Status::Completed
                 && state.threads[0]
                     .messages
@@ -7127,6 +7156,9 @@ mod tests {
             "the parent must delegate exactly one child"
         );
         assert_eq!(state.threads[1].parent, Some(1));
+        assert_eq!(state.threads[1].model_id, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(state.threads[1].thinking, "max");
+        assert!(state.threads[1].startup_selection_verified);
         assert!(
             state.threads[0]
                 .tools
@@ -7139,10 +7171,8 @@ mod tests {
                 .iter()
                 .any(|m| m.role == "Pi" && m.text.trim() == "WAITING")
         );
-        assert!(
-            saw_idle_parent,
-            "the parent must end its turn before the wake-up"
-        );
+        // A fast child can finish before WAITING settles. Both an idle wake-up and
+        // a queued follow-up are valid. The two replies and single notice prove delivery.
         let notices: Vec<_> = state.threads[0]
             .messages
             .iter()
@@ -7258,6 +7288,57 @@ mod tests {
 
     fn test_attachment(name: &str, width: u32) -> Attachment {
         crate::attachments::attach_bytes(name, test_png(width)).unwrap()
+    }
+
+    #[test]
+    #[ignore = "Sends a paid GPT 6.1 Sol vision request through CPA and resumes its saved image history"]
+    fn installed_pi_accepts_images_and_restores_them_from_history() {
+        let workspace = crate::store::directory().unwrap().join("image-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            64,
+            64,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let image = attachments::attach_bytes("color.png", png.into_inner()).unwrap();
+        let mut thread = Thread::new(1);
+        thread.set_model("cpa".into(), "gpt-6.1-sol".into());
+        thread.set_thinking("off".into());
+        thread.add_attachment(image.clone()).unwrap();
+        thread.draft.replace_text(
+            "What is the dominant color of the attached image? Reply only RED, GREEN or BLUE. Do not use tools."
+        );
+        thread.send();
+        thread.connect(workspace.clone(), Arc::new(|| {}));
+        receive_until(&mut thread, |t| {
+            t.status == Status::Completed && t.session.is_some()
+        });
+        let reply = thread
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "Pi")
+            .unwrap();
+        assert_eq!(reply.text.trim(), "RED");
+        let session = thread.session.clone();
+        thread.disconnect();
+        let mut resumed = Thread::new(2);
+        resumed.session = session;
+        resumed.connect(workspace, Arc::new(|| {}));
+        receive_until(&mut resumed, |t| {
+            !t.restoring_history() && !t.messages.is_empty()
+        });
+        let user = resumed.messages.iter().find(|m| m.role == "You").unwrap();
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(
+            attachments::read(&user.images[0]).unwrap(),
+            attachments::read(&image).unwrap()
+        );
+        resumed.disconnect();
+        crate::backend::shutdown_all();
     }
 
     #[test]
@@ -7466,6 +7547,78 @@ mod tests {
         oversized.bytes = crate::attachments::MAX_TOTAL_BYTES + 1;
         assert!(thread.add_attachment(oversized).is_err());
         assert_eq!(thread.draft.text, "Keep me");
+    }
+
+    #[test]
+    fn restoring_submitted_images_preserves_a_newer_full_draft() {
+        let mut thread = Thread::new(1);
+        let submitted = test_attachment("submitted.png", 30);
+        let prompt = Prompt::new("Submitted".into(), vec![submitted.clone()]);
+        let newer: Vec<_> = (1..=attachments::MAX_IMAGES as u32)
+            .map(|width| test_attachment("newer.png", width))
+            .collect();
+        thread.draft_images = newer.clone();
+        thread.draft.replace_text("Newer draft");
+        thread.restore_prompt(&prompt);
+        assert_eq!(thread.draft_images.len(), attachments::MAX_IMAGES + 1);
+        assert_eq!(thread.draft_images[0], submitted);
+        assert_eq!(&thread.draft_images[1..], newer.as_slice());
+        assert_eq!(thread.draft.text, "Submitted\n\nNewer draft");
+        assert!(
+            thread
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Remove images")
+        );
+        assert!(attachments::encode_images(&thread.draft_images).is_err());
+        thread.remove_attachment(&submitted.id);
+        assert!(thread.attachment_error.is_none());
+        assert_eq!(thread.draft_images, newer);
+    }
+
+    #[test]
+    fn an_image_picker_result_stays_with_its_original_thread() {
+        let mut state = State::new(".".into(), false);
+        let origin = state.current().id;
+        let image = test_attachment("picked.png", 1);
+        state.new_thread();
+        assert_ne!(state.current().id, origin);
+        state.attach_paths_to(origin, &[attachments::path_for(&image).unwrap()]);
+        assert!(state.current().draft_images.is_empty());
+        assert_eq!(state.threads[0].draft_images.len(), 1);
+        assert_eq!(state.threads[0].draft_images[0].id, image.id);
+    }
+
+    #[test]
+    fn discard_undo_restores_images_and_missing_saved_images_are_reported() {
+        let mut state = State::new(".".into(), false);
+        let image = test_attachment("undo.png", 1);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Draft with an image");
+        state.current_mut().add_attachment(image.clone()).unwrap();
+        state.discard_draft(state.current().id);
+        assert!(state.current().draft_images.is_empty());
+        state.undo_thread_action();
+        state.select_thread(0);
+        assert_eq!(state.current().draft.text, "Draft with an image");
+        assert_eq!(state.current().draft_images, vec![image.clone()]);
+        let snapshot = state.ui_snapshot();
+        std::fs::remove_file(attachments::path_for(&image).unwrap()).unwrap();
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&snapshot).unwrap();
+        assert_eq!(restored.current().draft.text, "Draft with an image");
+        assert!(restored.current().draft_images.is_empty());
+        assert!(
+            restored
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("missing")
+        );
     }
     #[test]
     fn retry_after_a_crash_resends_the_snapshotted_image_message() {

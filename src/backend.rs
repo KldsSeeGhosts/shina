@@ -405,7 +405,9 @@ fn write_record(writer: &mut impl Write, record: &Value) -> Result<(), String> {
 }
 
 fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
-    const LIMIT: u64 = 8 * 1024 * 1024;
+    // Pi echoes user images in message events and saved history. A single accepted
+    // 20 MiB image prompt expands to almost 28 MiB in base64, before JSON framing.
+    const LIMIT: u64 = 64 * 1024 * 1024;
     let mut bytes = Vec::new();
     let count = Read::by_ref(reader)
         .take(LIMIT + 1)
@@ -416,7 +418,7 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
     }
     if count as u64 > LIMIT {
         return Err(
-            "Pi sent a protocol record larger than 8 MiB. Retry to resume the saved conversation."
+            "Pi sent a protocol record larger than 64 MiB. Image-heavy history can exceed this limit. Inspect the saved session with Pi or start a new Shina thread."
                 .into(),
         );
     }
@@ -453,6 +455,24 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&output).unwrap()["message"],
             "quoted \"text\"\nand newline"
+        );
+    }
+
+    #[test]
+    fn image_history_records_can_exceed_the_old_eight_mib_limit() {
+        let data = "A".repeat(9 * 1024 * 1024);
+        let record = json!({"type":"response","command":"get_messages","data":{"messages":[
+            {"role":"user","content":[{"type":"image","data":data,"mimeType":"image/png"}]}
+        ]}});
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let mut input = std::io::Cursor::new(encoded);
+        let decoded = read_record(&mut input).unwrap().unwrap();
+        assert_eq!(
+            decoded["data"]["messages"][0]["content"][0]["data"]
+                .as_str()
+                .unwrap()
+                .len(),
+            9 * 1024 * 1024
         );
     }
 

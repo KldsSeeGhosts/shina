@@ -76,6 +76,7 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 - Independent Pi processes for active threads. Switching threads preserves their drafts and leaves other work running. Shina releases processes after 30 idle minutes and resumes their saved session on the next send.
 - Running, needs-input, and failed states. `agent_end` does not finish a run; the adapter waits for `agent_settled`. A finished thread goes quiet instead of showing a status, and a stopped run returns to idle. Background threads that finish get an unread badge.
 - Canceling a run clears the queue before requesting an abort.
+- Attach PNG, JPEG, GIF and WebP images with the composer button, clipboard paste or file drop. Remove images from their preview chips. Image-only messages work with vision models. Each message accepts up to eight images, 10 MiB per image and 20 MiB combined. Shina validates image contents and dimensions before sending Pi's typed image parts. Text-only models refuse image prompts without clearing the draft.
 - Native confirmation, selection, and text replies for Pi RPC dialog records. Nothing auto-approves a confirmation.
 - One atomic global index remembers projects, thread ownership, titles, pins, archive state, model/thinking choices, tabs and Pi session paths. Opening a saved thread restores its transcript, tool summaries and tool results automatically.
 - Process crashes show an inline error with Retry. Shina never automatically replays a prompt that might already have run tools. Retrying an accepted run can repeat tool actions, so check any partial result first.
@@ -134,7 +135,7 @@ On Windows, Shina stores its version 4 global index in `%LOCALAPPDATA%\Shina\ind
 
 Version 3 pin, archive and unread booleans migrate to timestamps. A synthetic completion at the saved activity time preserves a legacy unread flag. New unread state derives from `lastCompletedAt > lastVisitedAt`. Lifecycle timestamps use Unix milliseconds inside each record's `lifecycle` object. Runtime `Completed` means a Pi run finished, not that the thread is settled.
 
-Shelf expansion, multi-project scope, sidebar visibility and width, and draft text live in a separate `ui-state.json`. Unsent thread metadata still uses the global index so existing thread IDs and tabs remain stable. A malformed UI-state file also blocks saving.
+Shelf expansion, multi-project scope, sidebar visibility and width, and drafts live in a separate `ui-state.json`. Draft images use small references to deduplicated files in Shina's local `attachments` folder, not inline base64. Retry, startup cancellation and discard undo preserve the images. Shina reports missing saved draft images instead of silently treating the draft as complete. Image blobs currently remain on disk after removal. Unsent thread metadata still uses the global index so existing thread IDs and tabs remain stable. A malformed UI-state file also blocks saving.
 
 Migrated threads use their saved activity time, their Pi session file's modification time, or the legacy index's modification time, in that order. The sidebar hides unknown times. The Captains section shows assigned coordinators only. Its single assignment control lets you choose an unassigned project.
 
@@ -154,11 +155,12 @@ cargo test installed_pi_uses_captain_system_instructions -- --ignored
 cargo test installed_pi_calls_shina_mcp_tools -- --ignored
 cargo test installed_pi_edits_a_file_and_restores_the_session -- --ignored
 cargo test installed_pi_parent_is_woken_by_child_completion -- --ignored --nocapture
+cargo test installed_pi_accepts_images_and_restores_them_from_history -- --ignored --nocapture
 cargo test installed_pi_runs_projects_and_scratch_concurrently -- --ignored --nocapture
 cargo test real_clone_of_a_public_repository -- --ignored
 ```
 
-The first opt-in integration test verifies CPA model discovery, reasoning levels, state, and history without a model prompt. The captain and MCP tests send real CPA prompts through automatic startup. The file-edit test edits a disposable fixture and resumes its session to verify saved messages and tool results. The crew test runs a real parent that delegates a PONG reply, ends its turn, and receives a completion wake-up. The prompt-based tests consume upstream quota. Test Pi processes receive `--session-dir` pointing inside the owned temporary test profile, not Pi's normal session directory.
+The first opt-in integration test verifies CPA model discovery, reasoning levels, state, and history without a model prompt. The captain and MCP tests send real CPA prompts through automatic startup. The file-edit test edits a disposable fixture and resumes its session to verify saved messages and tool results. The crew test uses GPT 6.1 Sol to discover capabilities, delegate a PONG reply to DeepSeek V4.1 Flash at max reasoning, end its turn and receive a completion wake-up. The vision test sends a color fixture to GPT 6.1 Sol and resumes its saved image history. These two tests select their models in memory, without changing Pi's defaults. The prompt-based tests consume upstream quota. Test Pi processes receive `--session-dir` pointing inside the owned temporary test profile, not Pi's normal session directory.
 
 The multi-project live test runs two projects and a project-less chat concurrently. Each reads a different relative-path fixture to verify its working directory. The clone test clones two small public GitHub repositories, one with `gh` and one with `git`, into a temporary folder and deletes them afterwards.
 
@@ -188,7 +190,7 @@ The earlier layout's release build reported forced at-rest CPU times below 0.15 
 
 The full T3 thread-management port is on hold for a separate spec. Snooze and auto-wake, settle/unsettle rules, collapsible and paged settled shelves, drag between sections and undo notices are not implemented in this release. `Status::Settled` still means the Pi run finished, not that the user settled the thread. Future thread-list lifecycle fields must remain separate from process status.
 
-This is an initial desktop prototype. Login UI, attachments, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session.
+This is an initial desktop prototype. Login UI, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
 
 The supplied `assets/project-icon.png` is the T3 Code project favicon and the source for Shina's executable, taskbar, and window icons. The build generates Windows icon sizes without smoothing the pixel art. This user-supplied artwork is separate from the code's MIT license.
 

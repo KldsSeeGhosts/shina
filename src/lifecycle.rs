@@ -425,6 +425,7 @@ pub enum UndoStep {
     Snooze(u64),
     Unarchive,
     RestoreDraft(String),
+    RestoreImages(Vec<crate::attachments::Attachment>),
 }
 pub fn plan_undo(action: Action, old: &Lifecycle, draft: &str) -> Vec<UndoStep> {
     let mut steps = match action {

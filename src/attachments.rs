@@ -8,7 +8,7 @@ use image::{ImageFormat, ImageReader};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -137,12 +137,28 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Image".into());
-    let bytes = fs::read(path).map_err(|error| {
+    let file = fs::File::open(path).map_err(|error| {
         format!(
             "Could not read {}. Check that it still exists and is a file: {error}",
             clean_name(&name)
         )
     })?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Choose an image file, not a folder or device.".into());
+    }
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "{}: Choose an image that is {} MB or smaller.",
+            clean_name(&name),
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    // Bound the read as well as checking metadata, since the file can grow while we read it.
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not read {}: {error}", clean_name(&name)))?;
     attach_bytes(&name, bytes)
 }
 
@@ -168,6 +184,9 @@ pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
 /// images without Shina's JSON retaining Pi's base64 copy.
 pub fn from_history_part(part: &Value) -> Option<Attachment> {
     let data = part["data"].as_str()?;
+    if data.len() as u64 > MAX_IMAGE_BYTES.div_ceil(3) * 4 + 128 {
+        return None;
+    }
     let bytes = decode_base64(data)?;
     let name = part["name"]
         .as_str()
@@ -178,6 +197,7 @@ pub fn from_history_part(part: &Value) -> Option<Attachment> {
 
 /// Encode the typed Pi RPC `images` field. Call only when a prompt is submitted.
 pub fn encode_images(images: &[Attachment]) -> Result<Vec<Value>, String> {
+    validate_prompt_images(images)?;
     let mut encoded = Vec::with_capacity(images.len());
     for image in images {
         let bytes = read(image)?;
@@ -190,17 +210,42 @@ pub fn encode_images(images: &[Attachment]) -> Result<Vec<Value>, String> {
     Ok(encoded)
 }
 
+pub fn validate_prompt_images(images: &[Attachment]) -> Result<(), String> {
+    if images.len() > MAX_IMAGES {
+        return Err(format!(
+            "This draft has {} images. Remove images until at most {MAX_IMAGES} remain.",
+            images.len()
+        ));
+    }
+    if images.iter().map(|image| image.bytes).sum::<u64>() > MAX_TOTAL_BYTES {
+        return Err(format!(
+            "These images exceed the {} MB message limit. Remove images before sending.",
+            MAX_TOTAL_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 pub fn read(attachment: &Attachment) -> Result<Vec<u8>, String> {
     let path = path_for(attachment).ok_or_else(|| {
         "That image reference is not valid. Remove it and attach it again.".to_owned()
     })?;
-    let bytes = fs::read(&path).map_err(|error| {
+    let file = fs::File::open(&path).map_err(|error| {
         format!(
             "Could not read the saved image {}. Attach it again: {error}",
             attachment.name
         )
     })?;
-    if bytes.len() as u64 != attachment.bytes {
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "Could not read the saved image {}: {error}",
+                attachment.name
+            )
+        })?;
+    if bytes.len() as u64 != attachment.bytes || bytes.len() as u64 > MAX_IMAGE_BYTES {
         return Err(format!(
             "The saved image {} is incomplete. Attach it again.",
             attachment.name
@@ -513,6 +558,16 @@ mod tests {
                 .unwrap_err()
                 .contains("10 MB")
         );
+    }
+
+    #[test]
+    fn file_reads_reject_oversize_sources_and_directories() {
+        let directory = crate::store::directory().unwrap();
+        let path = directory.join("oversize.png");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        assert!(attach_file(&path).unwrap_err().contains("10 MB"));
+        assert!(attach_file(&directory).is_err());
     }
 
     #[test]

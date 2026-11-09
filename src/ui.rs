@@ -3792,20 +3792,23 @@ fn attach_control(locked: bool, p: Palette) -> El {
     control
 }
 
-fn pick_attachment(_: &mut State, tx: &mut Tx) {
+fn pick_attachment(s: &mut State, tx: &mut Tx) {
+    let thread = s.current().id;
     tx.open_file(
         rune::FileDialogOptions {
             title: "Attach an image".into(),
             ..Default::default()
         }
         .filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]),
-        |s: &mut State, result, _| {
+        move |s: &mut State, result, _| {
             match result {
-                Ok(Some(path)) => s.attach_paths(&[path]),
+                Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
                 Ok(None) => {}
                 Err(error) => {
-                    s.current_mut().attachment_error =
-                        Some(format!("Could not open the image picker: {error}"));
+                    if let Some(target) = s.threads.iter_mut().find(|t| t.id == thread) {
+                        target.attachment_error =
+                            Some(format!("Could not open the image picker: {error}"));
+                    }
                 }
             }
             s.checkpoint();
