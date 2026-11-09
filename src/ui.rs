@@ -2466,7 +2466,13 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             if let Some(last) = last_work {
                 for (index, part) in parts[..=last].iter().enumerate() {
                     if Some(index) != preamble {
-                        rows = rows.child(transcript_part(s, p, wide, part));
+                        let row = transcript_part(s, p, wide, part);
+                        // Prose between tool rows needs the same breathing room as paragraphs.
+                        rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
+                            row.py(8.0)
+                        } else {
+                            row
+                        });
                     }
                 }
             }
@@ -3311,7 +3317,13 @@ pub(crate) mod tests {
 
     #[test]
     fn settled_work_heads_activity_and_leaves_the_answer_visible_when_collapsed() {
-        let mut rt = runtime(1280.0);
+        // Tall enough that expanding a thought cannot scroll the work toggle under the header.
+        let mut rt = Runtime::new(
+            State::new(".".into(), false),
+            view,
+            (1280.0, 1000.0),
+            Env::new(false, 1.0),
+        );
         rt.state.populate_demo();
         rt.frame(0.0);
         let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
