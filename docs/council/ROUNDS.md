@@ -18,6 +18,7 @@ Scores from different judges are not on the same scale. Compare a judge with its
 | 6 | 8.1 | 8.6 | 8.3 (Capy 7.8) | 3 of 3 approve |
 | 7 | 8.0 | 8.6 | 7.7 (Capy 7.7) | 3 of 3 approve |
 | 8 | 8.1 | 8.8 | 8.0 (Capy 8.1) | 3 of 3 approve |
+| 9 | 8.3 | 9.0 | 8.2 (Capy 8.5) | 3 of 3 approve |
 
 ## Round 1
 
@@ -109,3 +110,16 @@ Shipped in round 8: a single top strip for sidebar header, tabs, actions, and ca
 | **Average** | 5.9 | 7.4 | **8.1** | 8.8 | 8.0 / **8.0** / 8.1 | 3 of 3 |
 
 First round under the whole-window brief. Window chrome & alignment, round 7 to round 8: Sonnet 4.5 to 7.2, GPT 6.4 to 8.8, Gemini 6.4 to 8.9. Whole window: Sonnet 6.0 to 7.4, GPT 7.4 to 8.2, Gemini 7.2 to 8.7. Judges now flag the narrow reading column at native size and small alignment drifts along the sidebar's right edge.
+
+Shipped in round 9: an 832px measure with 14px body text on wide windows, a tab aligned to the pane edge, one sidebar alignment grid, a divider before the caption buttons, a separated light-theme pane, visibly disabled demo controls, a single captain-home status, and a distinct activity glyph.
+
+## Round 9 (`r9/`)
+
+| Judge | Baseline | Round 8 | Round 9 | Capy | Crew art r8 / r9 / Capy | Approves |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5 | 5.4 | 7.3 | 7.7 | 8.6 | 7.6 / 7.6 / 8.0 | yes |
+| GPT 6.1 Sol | 6.2 | 8.1 | 8.4 | 8.9 | 8.3 / 8.3 / 8.2 | yes |
+| Gemini 4 Argon | 6.1 | 8.5 | 8.8 | 9.4 | 8.8 / 8.8 / 9.2 | yes |
+| **Average** | 5.9 | 8.0 | **8.3** | 9.0 | 8.2 / **8.2** / 8.5 | 3 of 3 |
+
+Window chrome & alignment, round 8 to round 9: Sonnet 7.0 to 7.8, GPT 8.0 to 8.7, Gemini 8.7 to 9.0. No judge found a pixel-level chrome break. Open items: sidebar text starts drift by a few pixels, user bubbles stay 13px on wide windows, hidden header buttons leave phantom gaps, Juniper's Needs you state is easy to miss, and the light theme's composer border is faint.
