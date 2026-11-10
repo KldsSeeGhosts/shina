@@ -5,11 +5,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  ASSETS, buildVersion, checksumManifest, parseVersion, prepareVersions, publicationDecision, uploadedChecksums,
+  ASSETS, buildVersion, checksumManifest, parseVersion, prepareVersions, publicationDecision, uploadedChecksums, releaseForTag,
 } from "./ci-release.mjs";
 
 const manifest = '[package]\nname = "shina"\nversion = "0.11.0"\n\n[dependencies]\nother = "1"\n';
 const lock = 'version = 4\n\n[[package]]\nname = "other"\nversion = "2.0.0"\n\n[[package]]\nname = "shina"\nversion = "0.11.0"\ndependencies = ["other"]\n';
+
+test("release lookup includes drafts before GitHub exposes a published tag", () => {
+  const draft = { tag_name: "v0.11.6", draft: true, assets: [{ name: ASSETS[1] }] };
+  const read = (path) => {
+    assert.equal(path, "repos/owner/shina/releases?per_page=100");
+    return [draft, { tag_name: "v0.10.0", draft: false }];
+  };
+  assert.equal(releaseForTag("owner/shina", "v0.11.6", read), draft);
+  assert.equal(releaseForTag("owner/shina", "v0.11.7", read), null);
+});
 
 test("versions increase numerically and fit Windows version resources", () => {
   assert.equal(buildVersion(manifest, "42"), "0.11.42");

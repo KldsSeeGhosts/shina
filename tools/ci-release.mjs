@@ -124,6 +124,13 @@ function api(path, optional = false) {
   }
 }
 
+export function releaseForTag(repo, tag, read = api) {
+  // GitHub's by-tag endpoint omits drafts, including a draft we just created.
+  // The authenticated release list includes them. Current builds are among the newest.
+  return read(`repos/${repo}/releases?per_page=100`)
+    .find((release) => release.tag_name === tag) ?? null;
+}
+
 function publish(directory, version, platform) {
   const { GITHUB_REPOSITORY: repo, GITHUB_SHA: sha, GITHUB_REF: ref, GITHUB_EVENT_NAME: event } = process.env;
   if (ref !== "refs/heads/main" || !["push", "workflow_dispatch"].includes(event)) {
@@ -141,11 +148,11 @@ function publish(directory, version, platform) {
     sha, version,
     head: api(`repos/${repo}/git/ref/heads/main`).object.sha,
     latest: api(`repos/${repo}/releases/latest`, true),
-    existing: api(`repos/${repo}/releases/tags/${tag}`, true),
+    existing: releaseForTag(repo, tag),
   });
   let state = decision();
   if (state === "publish" || state === "append") {
-    const existing = api(`repos/${repo}/releases/tags/${tag}`, true);
+    const existing = releaseForTag(repo, tag);
     if (!existing) {
       gh(["release", "create", tag, "--repo", repo, "--draft", "--target", sha,
         "--title", `Shina ${version}`, "--notes",
@@ -156,7 +163,8 @@ function publish(directory, version, platform) {
       gh(["release", "upload", tag, join(directory, assetName), "--repo", repo]);
     }
     // Publish jobs serialize their writes. The manifest grows as platforms finish.
-    const release = api(`repos/${repo}/releases/tags/${tag}`);
+    const release = releaseForTag(repo, tag);
+    if (!release) throw new Error("The uploaded release is missing from GitHub");
     writeFileSync(join(directory, "SHA256SUMS"), uploadedChecksums(release.assets));
     gh(["release", "upload", tag, join(directory, "SHA256SUMS"), "--repo", repo, "--clobber"]);
     state = decision();
