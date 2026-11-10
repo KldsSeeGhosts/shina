@@ -388,12 +388,12 @@ fn main() {
             }),
             ("projects", |state| {
                 state.populate_demo();
-                state.open_project_menu();
+                state.open_picker(model::ProjectPicker::AddProject);
             }),
             ("projects-dark", |state| {
                 state.populate_demo();
                 state.dark = true;
-                state.open_project_menu();
+                state.open_picker(model::ProjectPicker::AddProject);
             }),
             ("clone", |state| {
                 state.populate_demo();
@@ -414,6 +414,11 @@ fn main() {
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
+            }),
+            ("browse-folders", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.browse_for_project();
             }),
             ("workspace-picker", |state| {
                 state.populate_demo();

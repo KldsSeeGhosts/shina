@@ -201,6 +201,8 @@ pub enum ProjectPicker {
     NewThread,
     Scope,
     AssignCaptain,
+    /// Add a workspace, as T3 Code's Add project palette: pick a source, then browse.
+    AddProject,
 }
 
 pub struct Thread {
@@ -1665,6 +1667,8 @@ pub struct State {
     /// The workspace picker's search text and the row the arrow keys have reached.
     pub picker_query: TextEdit,
     pub picker_highlight: usize,
+    /// The Add workspace palette is browsing folders; the query holds the path.
+    pub picker_browsing: bool,
     pub hovered_captain: Option<usize>,
     pub activity_full: bool,
     pub show_archive: bool,
@@ -1775,6 +1779,7 @@ impl State {
             project_picker: None,
             picker_query: TextEdit::default(),
             picker_highlight: 0,
+            picker_browsing: false,
             hovered_captain: None,
             activity_full: false,
             show_archive: false,
@@ -2056,18 +2061,15 @@ impl State {
         self.opened_draft = Some((t.id, listed));
     }
     pub fn in_scope(&self, t: &Thread) -> bool {
+        self.scope_includes(t.project)
+    }
+    /// Whether the workspace filter shows this workspace (None is No workspace).
+    pub fn scope_includes(&self, project: Option<ProjectId>) -> bool {
+        let additional = project.is_some_and(|p| self.scope_additional.contains(&p));
         match self.project_scope {
             ProjectScope::All => true,
-            ProjectScope::Project(id) => {
-                t.project == Some(id)
-                    || t.project
-                        .is_some_and(|p| self.scope_additional.contains(&p))
-            }
-            ProjectScope::NoProject => {
-                t.project.is_none()
-                    || t.project
-                        .is_some_and(|p| self.scope_additional.contains(&p))
-            }
+            ProjectScope::Project(id) => project == Some(id) || additional,
+            ProjectScope::NoProject => project.is_none() || additional,
         }
     }
     pub fn set_project_scope(&mut self, project: Option<ProjectId>, multi: bool) {
@@ -2105,10 +2107,80 @@ impl State {
     }
     /// Open the workspace picker with an empty search.
     pub fn open_picker(&mut self, mode: ProjectPicker) {
+        self.picker_browsing = false;
         self.project_picker = Some(mode);
         self.picker_query = TextEdit::default();
         self.picker_query.focused = true;
         self.picker_highlight = 0;
+    }
+    /// Switch the Add workspace palette to browsing folders, starting beside the current
+    /// workspace or in the home folder.
+    pub fn browse_for_project(&mut self) {
+        let start = self
+            .project(self.current().project)
+            .and_then(|p| p.path.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| p.is_dir())
+            .or_else(crate::projects::home_dir)
+            .unwrap_or_else(|| self.working_directory());
+        self.project_picker = Some(ProjectPicker::AddProject);
+        self.picker_browsing = true;
+        self.picker_query = TextEdit::default();
+        self.picker_query
+            .replace_text(crate::projects::browse_text(&start));
+        self.picker_query.focused = true;
+        self.picker_highlight = 0;
+    }
+    /// Add the typed folder, creating it first when it does not exist yet.
+    pub fn add_browsed_project(&mut self) {
+        let path = crate::projects::expand_path(&self.picker_query.text);
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if !path.exists()
+            && let Err(error) = std::fs::create_dir_all(&path)
+        {
+            self.projects.menu_error = Some(format!("Could not create that folder: {error}"));
+            return;
+        }
+        match self.add_project(path) {
+            Ok(_) => {
+                self.project_picker = None;
+                self.picker_browsing = false;
+                self.projects.menu_error = None;
+                self.checkpoint();
+            }
+            Err(error) => self.projects.menu_error = Some(error),
+        }
+    }
+    /// The sidebar's New thread, by T3 Code's rule: with one workspace in view, or with Shift
+    /// in a workspace that is in view, start at once; otherwise ask which workspace.
+    pub fn new_thread_click(&mut self, shift: bool) {
+        let shown = |s: &Self, project: Option<ProjectId>| {
+            s.scope_includes(project)
+                && project.is_none_or(|id| s.project(Some(id)).is_some_and(|p| !p.hidden))
+        };
+        let in_view: Vec<_> = self
+            .projects
+            .entries
+            .iter()
+            .filter(|p| shown(self, Some(p.id)))
+            .map(|p| p.id)
+            .collect();
+        let current = self.current().project;
+        let target = if shift && current.is_some() && shown(self, current) {
+            Some(current)
+        } else if in_view.len() == 1 {
+            Some(Some(in_view[0]))
+        } else {
+            None
+        };
+        match target {
+            Some(project) => {
+                self.new_thread_in(project);
+                self.current_mut().draft.focused = true;
+            }
+            None => self.open_picker(ProjectPicker::NewThread),
+        }
     }
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
         let id = self.threads[index].id;

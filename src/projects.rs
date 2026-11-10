@@ -116,6 +116,7 @@ fn optional_id(value: &Value) -> Option<Option<usize>> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecentProject {
     pub path: PathBuf,
@@ -599,15 +600,13 @@ pub struct Projects {
     pub next_id: ProjectId,
     pub captain_target: Option<ProjectId>,
     pub recents: Recents,
-    /// The projects the open menu lists, checked for existence when it opened.
-    pub menu: Option<Vec<RecentProject>>,
     pub clone_open: bool,
     pub clone_source: TextEdit,
     pub clone_parent: PathBuf,
     pub clone_progress: String,
     pub clone_error: Option<String>,
     pub clone_job: Option<CloneJob>,
-    /// Shown in the menu when opening a project fails, such as when a thread is busy.
+    /// Shown in the Add workspace palette when adding a folder fails.
     pub menu_error: Option<String>,
 }
 
@@ -615,7 +614,6 @@ impl Projects {
     /// A fixed list for headless renders.
     pub fn demo() -> Self {
         Self {
-            menu: None,
             clone_parent: PathBuf::from(r"D:\AiStack"),
             ..Default::default()
         }
@@ -631,40 +629,7 @@ impl State {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "No project".into())
     }
-    pub fn open_project_menu(&mut self) {
-        self.projects.menu_error = None;
-        self.projects.menu = Some(
-            self.projects
-                .entries
-                .iter()
-                .filter(|p| p.hidden)
-                .map(|p| RecentProject {
-                    name: p.name.clone(),
-                    path: p.path.clone(),
-                    opened: p.updated,
-                })
-                .collect(),
-        );
-        self.projects
-            .menu
-            .as_mut()
-            .unwrap()
-            .sort_by_key(|p| std::cmp::Reverse(p.opened));
-    }
-    pub fn close_project_menu(&mut self) {
-        self.projects.menu = None;
-        self.projects.menu_error = None;
-    }
-    /// Opens a project from the menu, keeping the menu open with the reason if it cannot.
-    pub fn open_project(&mut self, path: PathBuf) {
-        if let Err(error) = self.add_project(path) {
-            self.projects.menu_error = Some(error);
-        } else {
-            self.close_project_menu();
-        }
-    }
     pub fn open_clone_dialog(&mut self) {
-        self.projects.menu = None;
         self.projects.clone_open = true;
         self.projects.clone_error = None;
         self.projects.clone_progress.clear();
@@ -776,9 +741,82 @@ impl State {
     }
 }
 
-/// The native folder picker, shared by the menu and Ctrl+O.
+/// The user's home folder, which `~` stands for in typed paths.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// A typed path with `~` expanded to the home folder.
+pub fn expand_path(input: &str) -> PathBuf {
+    let input = input.trim();
+    match home_dir() {
+        Some(home) if input == "~" => home,
+        Some(home) if input.starts_with("~/") || input.starts_with("~\\") => home.join(&input[2..]),
+        _ => PathBuf::from(input),
+    }
+}
+
+/// A folder written for the browse field: under home it starts with `~`, and it ends with a
+/// separator so the list shows what is inside it.
+pub fn browse_text(dir: &Path) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let text = match home_dir().and_then(|home| dir.strip_prefix(&home).ok().map(Path::to_path_buf))
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~{sep}{}", rest.display()),
+        None => dir.display().to_string(),
+    };
+    if text.ends_with(['/', '\\']) {
+        text
+    } else {
+        format!("{text}{sep}")
+    }
+}
+
+/// Splits a browse query into the folder to list and the name typed so far inside it, as
+/// T3 Code's path field does: `~/code/sh` lists `~/code` filtered by `sh`.
+pub fn browse_split(input: &str) -> (PathBuf, String) {
+    if input.trim().is_empty() {
+        return (
+            home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            String::new(),
+        );
+    }
+    if input.ends_with(['/', '\\']) || input.trim() == "~" {
+        return (expand_path(input), String::new());
+    }
+    let cut = input.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let (dir, name) = input.split_at(cut);
+    let dir = if dir.is_empty() { "." } else { dir };
+    (expand_path(dir), name.to_string())
+}
+
+/// The folders inside `dir` whose names contain `filter`, case-insensitively, sorted with
+/// prefix matches first. Hidden folders appear once the filter starts with a dot.
+pub fn list_folders(dir: &Path, filter: &str) -> Vec<String> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return vec![];
+    };
+    let needle = filter.to_lowercase();
+    let mut names: Vec<String> = read
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.') || needle.starts_with('.'))
+        .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .collect();
+    names.sort_by_key(|name| {
+        let lower = name.to_lowercase();
+        (!lower.starts_with(&needle), lower)
+    });
+    names.truncate(200);
+    names
+}
+
+/// The native folder picker, shared by the Add workspace palette and Ctrl+O.
 pub fn pick_folder(s: &mut State, tx: &mut Tx) {
-    s.projects.menu = None;
     tx.open_folder(
         rune::FileDialogOptions {
             title: "Open a project folder".into(),
@@ -823,6 +861,28 @@ pub fn pick_clone_parent(s: &mut State, tx: &mut Tx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browse_queries_split_into_a_folder_and_a_filter_and_list_matching_folders() {
+        let root = std::env::temp_dir().join(format!("shina-browse-{}", std::process::id()));
+        for name in ["shina", "Shared", "rune", ".hidden"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        fs::write(root.join("shina.txt"), "").unwrap();
+        let typed = format!("{}{}sh", root.display(), std::path::MAIN_SEPARATOR);
+        let (dir, filter) = browse_split(&typed);
+        assert_eq!((dir.as_path(), filter.as_str()), (root.as_path(), "sh"));
+        assert_eq!(list_folders(&root, "sh"), ["Shared", "shina"]);
+        assert_eq!(list_folders(&root, ""), ["rune", "Shared", "shina"]);
+        assert_eq!(list_folders(&root, ".h"), [".hidden"]);
+        let (dir, filter) = browse_split(&browse_text(&root));
+        assert_eq!((dir, filter.as_str()), (root.clone(), ""));
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_path("~"), home);
+            assert!(browse_text(&home.join("code")).starts_with('~'));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn filesystem_paths_drop_verbatim_prefixes_without_changing_devices() {
@@ -1050,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn switcher_opens_the_menu_and_the_clone_sheet() {
+    fn add_workspace_opens_the_palette_and_the_clone_sheet() {
         let mut rt = runtime();
         rt.frame(0.0);
         assert!(
@@ -1058,11 +1118,14 @@ mod tests {
             "the old footer button is gone"
         );
         press(&mut rt, "project-switcher");
-        assert!(rt.state.projects.menu.is_some());
+        assert_eq!(
+            rt.state.project_picker,
+            Some(crate::model::ProjectPicker::AddProject)
+        );
         rt.frame(1.0 / 60.0);
         assert!(rt.find("project-open-folder").is_some());
         press(&mut rt, "project-clone");
-        assert!(rt.state.projects.menu.is_none());
+        assert!(rt.state.project_picker.is_none());
         assert!(rt.state.projects.clone_open);
         rt.frame(1.0 / 60.0);
         press(&mut rt, "clone-start");

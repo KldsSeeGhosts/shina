@@ -240,6 +240,14 @@ fn icon(kind: &str, ink: Color) -> El {
         r#"<path d="M10.5 2.5 13.5 5.5 6 13H3v-3z" fill="none" stroke="currentColor" stroke-linejoin="round"/><path d="m9 4 3 3" stroke="currentColor"/>"#
     );
     glyph!(
+        FILTER,
+        r#"<path d="M2.5 4.5h11M4.5 8h7M6.5 11.5h3" stroke="currentColor" stroke-linecap="round"/>"#
+    );
+    glyph!(
+        FOLDER_PLUS,
+        r#"<path d="M2 4.5c0-.83.67-1.5 1.5-1.5h2.6l1.4 1.5h5c.83 0 1.5.67 1.5 1.5v5.5c0 .83-.67 1.5-1.5 1.5h-9c-.83 0-1.5-.67-1.5-1.5z" stroke="currentColor" stroke-linejoin="round" fill="none"/><path d="M8 7v3.5M6.25 8.75h3.5" stroke="currentColor" stroke-linecap="round"/>"#
+    );
+    glyph!(
         SETTINGS,
         r#"<circle cx="8" cy="8" r="2" stroke="currentColor" fill="none"/><path d="M6.9 1.75h2.2l.35 1.6 1.2.7 1.55-.5 1.1 1.9-1.2 1.1v1.4l1.2 1.1-1.1 1.9-1.55-.5-1.2.7-.35 1.6H6.9l-.35-1.6-1.2-.7-1.55.5-1.1-1.9 1.2-1.1v-1.4L2.7 5.45l1.1-1.9 1.55.5 1.2-.7z" stroke="currentColor" stroke-linejoin="round" fill="none"/>"#
     );
@@ -285,6 +293,8 @@ fn icon(kind: &str, ink: Color) -> El {
         "dot" => &DOT,
         "theme" => &THEME,
         "settings" => &SETTINGS,
+        "filter" => &FILTER,
+        "folder-plus" => &FOLDER_PLUS,
         "sun" => &SUN,
         "moon" => &MOON,
         "alert" => &ALERT,
@@ -607,6 +617,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(workspace.child(pane));
     if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
+    } else if s.project_picker == Some(ProjectPicker::AddProject) {
+        root = root.child(add_project_palette(s, p));
     } else if s.project_picker.is_some() {
         root = root.child(project_picker(s, p));
     } else if s.captain_editor.is_some() {
@@ -618,13 +630,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(captain_picker(s, p));
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
-    } else if s.projects.menu.is_some() {
-        let anchor = if cx.layout_with("project-switcher", |_| ()).is_some() {
-            "project-switcher"
-        } else {
-            "active-tab"
-        };
-        root = root.child(project_menu(s, p, anchor));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
     }
@@ -912,7 +917,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 toggle_button(
                     "project-scope",
                     &format!("Workspace: {scope}"),
-                    "folder",
+                    "filter",
                     scoped,
                     p,
                     |s| s.open_picker(ProjectPicker::Scope),
@@ -921,10 +926,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             )
             .child(project_switcher(s, p).help("Add workspace"))
             .child(
-                icon_button("new-thread", "New thread", "compose", p, |s| {
-                    s.open_picker(ProjectPicker::NewThread);
-                })
-                .help("New thread"),
+                icon_button("new-thread", "New thread", "compose", p, |_| {})
+                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+                    .help("New thread. Shift-click: in the current workspace"),
             ),
     );
     // A workspace filter names itself and clears in one click.
@@ -1263,21 +1267,10 @@ fn settings_menu(s: &State, p: Palette) -> El {
 }
 
 /// Add or restore a project. Project ownership stays on threads, not sidebar folders.
-fn project_switcher(s: &State, p: Palette) -> El {
-    toggle_button(
-        "project-switcher",
-        "Add workspace",
-        "plus",
-        s.projects.menu.is_some(),
-        p,
-        |s: &mut State| {
-            if s.projects.menu.is_some() {
-                s.close_project_menu();
-            } else {
-                s.open_project_menu();
-            }
-        },
-    )
+fn project_switcher(_: &State, p: Palette) -> El {
+    icon_button("project-switcher", "Add workspace", "folder-plus", p, |s| {
+        s.open_picker(ProjectPicker::AddProject)
+    })
 }
 
 fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
@@ -1300,89 +1293,6 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
                 .min_w(0.0)
                 .truncate(),
         )
-}
-
-/// Removed projects plus the two ways to add one.
-/// It opens under the sidebar's add button, or under the open tab when the sidebar is hidden.
-fn project_menu(s: &State, p: Palette, anchor: &str) -> El {
-    let projects = s.projects.menu.as_deref().unwrap_or_default();
-    let mut list = col().gap(1.0).shrink().min_h(0.0).scroll(ScrollSpec {
-        stick_bottom: false,
-    });
-    for (index, project) in projects.iter().enumerate() {
-        let path = project.path.clone();
-        let item = row()
-            .key(format!("project-{index}"))
-            .role("menuitem")
-            .cursor(rune::Cursor::Pointer)
-            .label(format!("Restore {}", project.name))
-            .focusable(true)
-            .px(8.0)
-            .py(5.0)
-            .gap(8.0)
-            .center_y()
-            .radius(5.0)
-            .hover(p.selected)
-            .on_press(move |s: &mut State| s.open_project(path.clone()))
-            .child(
-                col()
-                    .gap(1.0)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .child(
-                        label(&project.name, TextStyle::new(12.5, 520.0), p.ink)
-                            .truncate()
-                            .min_w(0.0),
-                    )
-                    .child(
-                        label(project.path.display().to_string(), SMALL, p.muted)
-                            .truncate()
-                            .min_w(0.0),
-                    ),
-            );
-        list = list.child(item);
-    }
-    if projects.is_empty() {
-        list = list.child(label("No removed projects", SMALL, p.muted).px(8.0).py(6.0));
-    }
-    let mut menu = col()
-        .key("project-menu")
-        .role("menu")
-        .label("Workspaces")
-        .w(280.0)
-        .max_h(440.0)
-        .padding(4.0)
-        .gap(1.0)
-        .radius(10.0)
-        .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
-        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, 6.0)
-        .modal(true, |s: &mut State| s.close_project_menu())
-        .child(row().h(24.0).px(8.0).center_y().child(label(
-            "Restore removed workspace",
-            TextStyle::new(11.5, 520.0),
-            p.muted,
-        )))
-        .child(list)
-        .child(el().h(1.0).w_full().my(4.0).fill(p.line))
-        .child(
-            menu_item("project-open-folder", "Open folder...", "folder", p)
-                .on_press_tx(crate::projects::pick_folder)
-                .child(label("Ctrl+O", SMALL, p.muted)),
-        )
-        .child(
-            menu_item("project-clone", "Clone repository...", "branch", p)
-                .on_press(|s: &mut State| s.open_clone_dialog()),
-        );
-    if let Some(error) = &s.projects.menu_error {
-        menu = menu.child(label(error, SMALL, p.danger).wrap().px(8.0).py(6.0));
-    }
-    menu
 }
 
 /// Clone a repository into a new folder and open it.
@@ -2594,9 +2504,10 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         .center_y()
         .gap(6.0)
         .child(tabs)
-        .child(icon_button("new-tab", "New thread", "plus", p, |s| {
-            s.open_picker(ProjectPicker::NewThread);
-        }))
+        .child(
+            icon_button("new-tab", "New thread", "plus", p, |_| {})
+                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift)),
+        )
 }
 
 fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
@@ -3341,6 +3252,7 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
     match mode {
         ProjectPicker::NewThread => s.new_thread_in(project),
         ProjectPicker::Scope => s.set_project_scope(project, shift),
+        ProjectPicker::AddProject => {}
         ProjectPicker::AssignCaptain => {
             s.project_picker = None;
             s.projects.captain_target = project;
@@ -3365,6 +3277,7 @@ fn project_picker(s: &State, p: Palette) -> El {
         ProjectPicker::Scope => "Filter by workspace...",
         ProjectPicker::NewThread => "New thread in...",
         ProjectPicker::AssignCaptain => "Assign a captain to...",
+        ProjectPicker::AddProject => "Add workspace",
     };
     let mut card = popover("project-picker", placeholder, s, p)
         .role("dialog")
@@ -3515,12 +3428,8 @@ fn project_picker(s: &State, p: Palette) -> El {
         .child(list)
         .child(el().h(0.5).w_full().my(4.0).fill(p.line))
         .child(
-            menu_item("picker-add-project", "Add workspace...", "plus", p).on_press(
-                |s: &mut State| {
-                    s.project_picker = None;
-                    s.open_project_menu();
-                },
-            ),
+            menu_item("picker-add-project", "Add workspace...", "folder-plus", p)
+                .on_press(|s: &mut State| s.open_picker(ProjectPicker::AddProject)),
         );
     let mut hints = row()
         .h(34.0)
@@ -3533,6 +3442,375 @@ fn project_picker(s: &State, p: Palette) -> El {
         hints = hints.child(keycap("Shift", "Add to filter", p));
     }
     card = card.child(hints.child(spacer()).child(keycap("Esc", "Close", p)));
+    modal_frame(
+        "project-picker-backdrop",
+        s,
+        |s| s.project_picker = None,
+        card,
+    )
+}
+
+/// What the Add workspace palette offers before browsing, as T3 Code's Add project sources.
+#[derive(Clone, PartialEq, Eq)]
+enum AddSource {
+    LocalFolder,
+    GitUrl,
+    SystemPicker,
+    Restore(std::path::PathBuf),
+}
+
+fn add_sources(s: &State) -> Vec<(AddSource, String, String)> {
+    let mut items = vec![
+        (
+            AddSource::LocalFolder,
+            "Local folder".to_string(),
+            "Browse a folder on disk".to_string(),
+        ),
+        (
+            AddSource::GitUrl,
+            "Git URL".into(),
+            "Clone from a remote URL".into(),
+        ),
+        (
+            AddSource::SystemPicker,
+            "System folder picker".into(),
+            "Choose a folder in the system dialog".into(),
+        ),
+    ];
+    let mut removed: Vec<_> = s.projects.entries.iter().filter(|p| p.hidden).collect();
+    removed.sort_by_key(|p| std::cmp::Reverse(p.updated));
+    for project in removed {
+        items.push((
+            AddSource::Restore(project.path.clone()),
+            format!("Restore {}", project.name),
+            project.path.display().to_string(),
+        ));
+    }
+    let query = s.picker_query.text.trim().to_lowercase();
+    items.retain(|(_, title, detail)| {
+        query.is_empty()
+            || title.to_lowercase().contains(&query)
+            || detail.to_lowercase().contains(&query)
+    });
+    items
+}
+
+fn run_add_source(s: &mut State, tx: &mut Tx, source: AddSource) {
+    match source {
+        AddSource::LocalFolder => s.browse_for_project(),
+        AddSource::GitUrl => {
+            s.project_picker = None;
+            s.open_clone_dialog();
+        }
+        AddSource::SystemPicker => {
+            s.project_picker = None;
+            crate::projects::pick_folder(s, tx);
+        }
+        AddSource::Restore(path) => match s.add_project(path) {
+            Ok(_) => {
+                s.project_picker = None;
+                s.projects.menu_error = None;
+                s.checkpoint();
+            }
+            Err(error) => s.projects.menu_error = Some(error),
+        },
+    }
+}
+
+/// The folders the browse field lists, and the typed text up to the folder they are in.
+fn browse_entries(query: &str) -> (String, Vec<String>) {
+    let cut = query.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let (dir, filter) = crate::projects::browse_split(query);
+    (
+        query[..cut].to_string(),
+        crate::projects::list_folders(&dir, &filter),
+    )
+}
+
+/// Move the browse field into a listed folder.
+fn browse_into(s: &mut State, name: &str) {
+    let (prefix, _) = browse_entries(&s.picker_query.text);
+    let prefix = if prefix.is_empty() && s.picker_query.text.trim() == "~" {
+        format!("~{}", std::path::MAIN_SEPARATOR)
+    } else {
+        prefix
+    };
+    s.picker_query
+        .replace_text(format!("{prefix}{name}{}", std::path::MAIN_SEPARATOR));
+    s.picker_highlight = 0;
+}
+
+/// A palette row with a title and a quieter description, as T3 Code lists its sources.
+fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p: Palette) -> El {
+    row()
+        .key(key)
+        .role("menuitem")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .focusable(true)
+        .min_h(44.0)
+        .px(8.0)
+        .py(6.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(if lit { p.selected } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .child(el().size(16.0, 16.0).center().child(icon(glyph, p.muted)))
+        .child({
+            let text = col()
+                .gap(1.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(label(title, TextStyle::new(14.0, 480.0), p.ink).truncate());
+            if detail.is_empty() {
+                text
+            } else {
+                text.child(label(detail, SMALL, p.muted).truncate())
+            }
+        })
+}
+
+/// The modifier the palette's add shortcut uses on this platform.
+const SUBMIT_CHORD: &str = if cfg!(target_os = "macos") {
+    "⌘ Enter"
+} else {
+    "Ctrl Enter"
+};
+
+/// Add workspace, as T3 Code's Add project palette: choose a source, then browse folders by
+/// typing a path. Enter opens the highlighted folder, Ctrl+Enter adds the typed one, and a
+/// path that does not exist yet is created first.
+fn add_project_palette(s: &State, p: Palette) -> El {
+    let browsing = s.picker_browsing;
+    let query = s.picker_query.text.clone();
+    let folders = if browsing {
+        browse_entries(&query).1
+    } else {
+        vec![]
+    };
+    let sources = if browsing { vec![] } else { add_sources(s) };
+    let count = if browsing {
+        folders.len()
+    } else {
+        sources.len()
+    };
+    let highlight = s.picker_highlight.min(count.saturating_sub(1));
+    let target = crate::projects::expand_path(&query);
+    let creates = browsing && !query.trim().is_empty() && !target.exists();
+    let submit = if creates { "Create & Add" } else { "Add" };
+    let placeholder = if browsing {
+        "Type a folder path"
+    } else {
+        "Add a workspace from..."
+    };
+    let mut field = row()
+        .h(46.0)
+        .px(8.0)
+        .gap(10.0)
+        .center_y()
+        .child(el().size(16.0, 16.0).center().child(icon(
+            if browsing { "folder" } else { "folder-plus" },
+            p.muted,
+        )))
+        .child(
+            rune::text_input(&s.picker_query, TextStyle::new(15.0, 420.0).tracking(-0.15))
+                .key("picker-search")
+                .label(placeholder)
+                .placeholder(placeholder, p.muted)
+                .color(p.ink)
+                .single_line()
+                .grow(1.0)
+                .min_w(0.0)
+                .on_edit(|s: &mut State| {
+                    s.picker_highlight = 0;
+                    s.projects.menu_error = None;
+                    &mut s.picker_query
+                })
+                .on_input_key(|s: &mut State, event, tx| {
+                    let browsing = s.picker_browsing;
+                    let (_, folders) = if browsing {
+                        browse_entries(&s.picker_query.text)
+                    } else {
+                        (String::new(), vec![])
+                    };
+                    let sources = if browsing { vec![] } else { add_sources(s) };
+                    let count = if browsing {
+                        folders.len()
+                    } else {
+                        sources.len()
+                    };
+                    let at = s.picker_highlight.min(count.saturating_sub(1));
+                    let command = event.mods.cmd || event.mods.ctrl;
+                    match event.key {
+                        rune::Key::Down if count > 0 => {
+                            s.picker_highlight = (at + 1).min(count - 1);
+                            true
+                        }
+                        rune::Key::Up => {
+                            s.picker_highlight = at.saturating_sub(1);
+                            true
+                        }
+                        rune::Key::Tab if browsing => {
+                            if let Some(name) = folders.get(at) {
+                                browse_into(s, &name.clone());
+                            }
+                            true
+                        }
+                        rune::Key::Enter if browsing => {
+                            match folders.get(at) {
+                                Some(name) if !command => browse_into(s, &name.clone()),
+                                _ => s.add_browsed_project(),
+                            }
+                            true
+                        }
+                        rune::Key::Enter => {
+                            if let Some((source, _, _)) = sources.get(at).cloned() {
+                                run_add_source(s, tx, source);
+                            }
+                            true
+                        }
+                        rune::Key::Escape => {
+                            if browsing {
+                                s.open_picker(ProjectPicker::AddProject);
+                            } else {
+                                s.project_picker = None;
+                            }
+                            true
+                        }
+                        _ => s.undo_key(event, true),
+                    }
+                }),
+        );
+    if browsing {
+        field = field.child(
+            row()
+                .key("browse-add")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("{submit} this folder"))
+                .focusable(true)
+                .h(28.0)
+                .px(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .border(0.5, p.line)
+                .hover(p.selected)
+                .on_press(|s: &mut State| s.add_browsed_project())
+                .child(label(submit, TextStyle::new(12.5, 560.0), p.ink))
+                .child(
+                    label(
+                        if folders.is_empty() {
+                            "Enter"
+                        } else {
+                            SUBMIT_CHORD
+                        },
+                        TextStyle::new(11.0, 520.0),
+                        p.muted,
+                    )
+                    .px(4.0)
+                    .radius(4.0)
+                    .fill(p.selected),
+                ),
+        );
+    }
+    let mut card = popover("project-picker", "Add workspace", s, p)
+        .role("dialog")
+        .w(560.0)
+        .max_h(480.0)
+        .padding(6.0)
+        .radius(14.0)
+        .on_press(|_: &mut State| {})
+        .child(field)
+        .child(el().h(0.5).w_full().mb(4.0).fill(p.line));
+    let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
+        stick_bottom: false,
+    });
+    if browsing {
+        for (index, name) in folders.iter().enumerate() {
+            let entry = name.clone();
+            list = list.child(
+                palette_row(
+                    format!("browse-{index}"),
+                    "folder",
+                    name,
+                    "",
+                    index == highlight,
+                    p,
+                )
+                .min_h(34.0)
+                .on_press(move |s: &mut State| browse_into(s, &entry)),
+            );
+        }
+        if folders.is_empty() {
+            list = list.child(
+                label(
+                    if creates {
+                        "No folder here yet. Add creates it."
+                    } else {
+                        "No folders inside this one."
+                    },
+                    SMALL,
+                    p.muted,
+                )
+                .px(8.0)
+                .py(10.0),
+            );
+        }
+    } else {
+        for (index, (source, title, detail)) in sources.iter().enumerate() {
+            let glyph = match source {
+                AddSource::LocalFolder => "folder-plus",
+                AddSource::GitUrl => "branch",
+                AddSource::SystemPicker => "folder",
+                AddSource::Restore(_) => "archive",
+            };
+            let key = match source {
+                AddSource::LocalFolder => "add-local-folder".to_string(),
+                AddSource::GitUrl => "project-clone".to_string(),
+                AddSource::SystemPicker => "project-open-folder".to_string(),
+                AddSource::Restore(_) => format!("project-{index}"),
+            };
+            let source = source.clone();
+            list = list.child(
+                palette_row(key, glyph, title, detail, index == highlight, p)
+                    .on_press_tx(move |s: &mut State, tx| run_add_source(s, tx, source.clone())),
+            );
+        }
+        if sources.is_empty() {
+            list = list.child(label("Nothing matches", SMALL, p.muted).px(8.0).py(10.0));
+        }
+    }
+    card = card.child(list);
+    if let Some(error) = &s.projects.menu_error {
+        card = card.child(label(error, SMALL, p.danger).wrap().px(8.0).py(6.0));
+    }
+    let hints = if browsing {
+        row()
+            .h(34.0)
+            .px(8.0)
+            .gap(16.0)
+            .center_y()
+            .child(keycap("Enter", "Open folder", p))
+            .child(keycap("Tab", "Complete", p))
+            .child(keycap(SUBMIT_CHORD, submit, p))
+            .child(spacer())
+            .child(keycap("Esc", "Back", p))
+    } else {
+        row()
+            .h(34.0)
+            .px(8.0)
+            .gap(16.0)
+            .center_y()
+            .child(keycap("↑↓", "Move", p))
+            .child(keycap("Enter", "Choose", p))
+            .child(spacer())
+            .child(keycap("Esc", "Close", p))
+    };
+    card = card
+        .child(el().h(0.5).w_full().mt(4.0).fill(p.line))
+        .child(hints);
     modal_frame(
         "project-picker-backdrop",
         s,
@@ -5575,10 +5853,11 @@ pub(crate) mod tests {
                 .starts_with("Read this project")
         );
         assert!(rt.state.current().pi.is_none());
+        // One workspace in view: New thread starts there at once, as in T3 Code.
         press(&mut rt, "new-thread");
-        rt.frame(1.0);
-        press(&mut rt, "choose-project-1");
+        assert!(rt.state.project_picker.is_none());
         assert_eq!(rt.state.threads.len(), 2);
+        assert_eq!(rt.state.current().project, Some(1));
         assert!(rt.state.current().draft.text.is_empty());
     }
     #[test]
@@ -6296,6 +6575,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn add_workspace_is_a_palette_that_browses_adds_and_creates_folders() {
+        let root = std::env::temp_dir().join(format!("shina-add-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("alpha").join("inner")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        // Add workspace inside the New thread picker opens the palette, not a menu.
+        rt.state.open_picker(ProjectPicker::NewThread);
+        rt.invalidate();
+        rt.frame(0.5);
+        press(&mut rt, "picker-add-project");
+        assert_eq!(rt.state.project_picker, Some(ProjectPicker::AddProject));
+        assert!(rt.find("project-open-folder").is_some());
+        press(&mut rt, "add-local-folder");
+        assert!(rt.state.picker_browsing);
+        let sep = std::path::MAIN_SEPARATOR;
+        rt.state
+            .picker_query
+            .replace_text(format!("{}{sep}al", root.display()));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("browse-0").is_some() && rt.find("browse-1").is_none());
+        let key = |key, cmd| rune::KeyEvent {
+            key,
+            mods: rune::Mods {
+                cmd,
+                ctrl: cmd,
+                ..Default::default()
+            },
+        };
+        rt.key(key(rune::Key::Enter, false));
+        rt.frame(1.5);
+        assert!(rt.state.picker_query.text.ends_with(&format!("alpha{sep}")));
+        rt.key(key(rune::Key::Enter, true));
+        rt.frame(2.0);
+        assert!(rt.state.project_picker.is_none());
+        let added = |s: &State, name: &str| {
+            s.projects
+                .entries
+                .iter()
+                .any(|p| p.path.file_name().is_some_and(|n| n == name))
+        };
+        assert!(added(&rt.state, "alpha"));
+        // A path that does not exist yet is created, then added.
+        press(&mut rt, "project-switcher");
+        press(&mut rt, "add-local-folder");
+        rt.state
+            .picker_query
+            .replace_text(format!("{}{sep}gamma", root.display()));
+        rt.invalidate();
+        rt.frame(3.0);
+        press(&mut rt, "browse-add");
+        assert!(root.join("gamma").is_dir());
+        assert!(added(&rt.state, "gamma"));
+        // Several workspaces in view: New thread asks which one.
+        press(&mut rt, "new-thread");
+        assert_eq!(rt.state.project_picker, Some(ProjectPicker::NewThread));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn workspace_filter_precedes_and_filters_both_captains_and_threads() {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
@@ -6349,7 +6689,7 @@ pub(crate) mod tests {
         assert!(rt.state.current().pi.is_none());
         press(&mut rt, "new-thread");
         rt.frame(2.0);
-        press(&mut rt, "choose-project-1");
+        assert_eq!(rt.state.current().project, Some(1));
         assert_eq!(rt.state.current().captain, None);
         assert!(!rt.state.current().captain_home);
     }
@@ -6593,7 +6933,8 @@ pub(crate) mod tests {
     fn project_picker_removes_only_the_project_entry_and_can_create_projectless_threads() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
-        press(&mut rt, "new-thread");
+        rt.state.open_picker(ProjectPicker::NewThread);
+        rt.invalidate();
         rt.frame(1.0);
         let (x, y) = rt.find("project-option-1").unwrap();
         rt.secondary_down(x, y);
@@ -6603,7 +6944,9 @@ pub(crate) mod tests {
         press(&mut rt, "menu-remove-project");
         assert!(rt.state.projects.entries[0].hidden);
         assert_eq!(rt.state.threads[0].project, Some(1));
+        // With no workspace in view, New thread asks where.
         press(&mut rt, "new-thread");
+        assert_eq!(rt.state.project_picker, Some(ProjectPicker::NewThread));
         press(&mut rt, "choose-no-project");
         assert!(rt.state.current().project.is_none());
         assert!(rt.state.current().captain.is_none());
