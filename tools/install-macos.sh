@@ -25,9 +25,8 @@ build_bundle() {
     iconset=$(dirname "$app")/Shina.iconset
     mkdir "$iconset"
     for size in 16 32 128 256 512; do
-        doubled=$((size * 2))
-        /usr/bin/sips -z "$size" "$size" "$root/assets/project-icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-        /usr/bin/sips -z "$doubled" "$doubled" "$root/assets/project-icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+        cp "$root/assets/macos/Shina.iconset/icon_${size}x${size}.png" "$iconset/"
+        cp "$root/assets/macos/Shina.iconset/icon_${size}x${size}@2x.png" "$iconset/"
     done
     /usr/bin/iconutil -c icns "$iconset" -o "$app/Contents/Resources/Shina.icns"
     for size in 16 32 128 256 512; do
@@ -88,9 +87,8 @@ build_bundle() {
     iconset=$(dirname "$app")/Shina.iconset
     mkdir "$iconset"
     for size in 16 32 128 256 512; do
-        doubled=$((size * 2))
-        /usr/bin/sips -z "$size" "$size" "$root/assets/project-icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-        /usr/bin/sips -z "$doubled" "$doubled" "$root/assets/project-icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+        cp "$root/assets/macos/Shina.iconset/icon_${size}x${size}.png" "$iconset/"
+        cp "$root/assets/macos/Shina.iconset/icon_${size}x${size}@2x.png" "$iconset/"
     done
     /usr/bin/iconutil -c icns "$iconset" -o "$app/Contents/Resources/Shina.icns"
     for size in 16 32 128 256 512; do

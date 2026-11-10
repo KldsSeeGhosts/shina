@@ -2,6 +2,7 @@
 
 mod attachments;
 mod backend;
+mod brand;
 mod captains;
 mod context;
 mod install;
