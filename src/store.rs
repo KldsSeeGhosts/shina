@@ -199,7 +199,7 @@ fn migrate_legacy(
     }
     let mut projects = Vec::new();
     let mut threads = Vec::new();
-    let mut captains: Vec<Value> = crate::captains::Captain::defaults()
+    let mut captains: Vec<Value> = crate::captains::Captain::presets()
         .iter()
         .map(crate::captains::Captain::to_value)
         .collect();
@@ -240,7 +240,7 @@ fn migrate_legacy(
                         .ok_or("Invalid legacy captain roster.")?
                         .clone()
                 } else {
-                    crate::captains::Captain::defaults()
+                    crate::captains::Captain::presets()
                         .iter()
                         .map(crate::captains::Captain::to_value)
                         .collect()

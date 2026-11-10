@@ -12,7 +12,9 @@ pub struct Captain {
 }
 
 impl Captain {
-    pub fn defaults() -> Vec<Self> {
+    /// The named roster earlier versions created on first run. New rosters start empty; this
+    /// remains for migrating old indexes, recognising untouched presets, and the demo.
+    pub fn presets() -> Vec<Self> {
         (0..visuals::CAPTAIN_NAMES.len())
             .map(|portrait| Self {
                 name: visuals::CAPTAIN_NAMES[portrait].into(),
@@ -30,11 +32,9 @@ impl Captain {
         {
             return Err("Use a captain name of 1 to 60 characters on one line.".into());
         }
-        if self.role.trim().is_empty()
-            || self.role.chars().count() > 100
-            || self.role.chars().any(char::is_control)
-        {
-            return Err("Use a role of 1 to 100 characters on one line.".into());
+        // The role is optional.
+        if self.role.chars().count() > 100 || self.role.chars().any(char::is_control) {
+            return Err("Keep the role under 100 characters, on one line.".into());
         }
         if self.instructions.chars().count() > 8000 || self.instructions.contains('\0') {
             return Err(
@@ -48,12 +48,17 @@ impl Captain {
     }
 
     pub fn prompt(&self) -> String {
+        let role = if self.role.trim().is_empty() {
+            String::new()
+        } else {
+            format!("Role: {}\n", self.role)
+        };
         format!(
-            "Shina captain profile\nName: {}\nRole: {}\nWorkspace-specific instructions:\n{}\n\n\
+            "Shina captain profile\nName: {}\n{role}Workspace-specific instructions:\n{}\n\n\
              Follow the workspace's instructions and the user's current request. \
              This profile does not grant tool permissions or access to other agents. \
              Do not claim to have delegated work unless a real delegation tool was used.",
-            self.name, self.role, self.instructions
+            self.name, self.instructions
         )
     }
 
@@ -93,7 +98,6 @@ impl CaptainEditor {
             error: None,
         };
         editor.name.focused = true;
-        editor.role.replace_text("General");
         editor
     }
 
@@ -113,7 +117,7 @@ mod tests {
 
     #[test]
     fn profiles_round_trip_and_reject_invalid_data() {
-        let captain = Captain::defaults().remove(2);
+        let captain = Captain::presets().remove(2);
         assert_eq!(Captain::from_value(&captain.to_value()), Some(captain));
         assert!(
             Captain::from_value(
@@ -121,7 +125,7 @@ mod tests {
             )
             .is_none()
         );
-        let mut blank = Captain::defaults().remove(0);
+        let mut blank = Captain::presets().remove(0);
         blank.name = " \n".into();
         assert!(blank.validate().is_err());
     }

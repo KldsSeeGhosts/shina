@@ -108,10 +108,14 @@ fn measure(wide: bool) -> f32 {
 }
 const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
+/// The project line of a sidebar card.
+const CARD_META: TextStyle = TextStyle::new(12.5, 430.0);
+/// Sidebar rows sit 8 px in from the sidebar's edge, and their content 12 px inside that, so
+/// icons and text share one left edge with the title strip and footer.
+const ROW_INSET: f32 = 12.0;
 /// Tool, thinking and status lines in the transcript.
 const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
 /// Height of one-line sidebar rows: navigation, workers and shelved threads.
-const SINGLE_ROW: f32 = 34.0;
 /// Workers sit a step below their captain: shorter rows on the captain's rail.
 const CREW_ROW: f32 = 30.0;
 
@@ -131,6 +135,7 @@ fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'sta
     row()
         .key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
         .center_y()
@@ -235,6 +240,10 @@ fn icon(kind: &str, ink: Color) -> El {
         r#"<path d="M10.5 2.5 13.5 5.5 6 13H3v-3z" fill="none" stroke="currentColor" stroke-linejoin="round"/><path d="m9 4 3 3" stroke="currentColor"/>"#
     );
     glyph!(
+        SETTINGS,
+        r#"<circle cx="8" cy="8" r="2" stroke="currentColor" fill="none"/><path d="M6.9 1.75h2.2l.35 1.6 1.2.7 1.55-.5 1.1 1.9-1.2 1.1v1.4l1.2 1.1-1.1 1.9-1.55-.5-1.2.7-.35 1.6H6.9l-.35-1.6-1.2-.7-1.55.5-1.1-1.9 1.2-1.1v-1.4L2.7 5.45l1.1-1.9 1.55.5 1.2-.7z" stroke="currentColor" stroke-linejoin="round" fill="none"/>"#
+    );
+    glyph!(
         SUN,
         r#"<circle cx="8" cy="8" r="2.75" stroke="currentColor" fill="none"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06" stroke="currentColor" stroke-linecap="round"/>"#
     );
@@ -275,6 +284,7 @@ fn icon(kind: &str, ink: Color) -> El {
         "bolt" => &BOLT,
         "dot" => &DOT,
         "theme" => &THEME,
+        "settings" => &SETTINGS,
         "sun" => &SUN,
         "moon" => &MOON,
         "alert" => &ALERT,
@@ -307,6 +317,7 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
     row()
         .key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
         .center_y()
@@ -322,6 +333,7 @@ fn dropdown(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 's
     row()
         .key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
         .center_y()
@@ -363,6 +375,7 @@ fn icon_button(
 ) -> El {
     el().key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
         .size(24.0, 24.0)
@@ -384,6 +397,7 @@ fn toggle_button(
 ) -> El {
     el().key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
         .size(24.0, 24.0)
@@ -605,7 +619,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
     } else if s.projects.menu.is_some() {
-        root = root.child(project_menu(s, p));
+        let anchor = if cx.layout_with("project-switcher", |_| ()).is_some() {
+            "project-switcher"
+        } else {
+            "active-tab"
+        };
+        root = root.child(project_menu(s, p, anchor));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
     }
@@ -622,6 +641,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.snooze_menu.is_some() {
         root = root.child(snooze_menu(s, p));
+    }
+    if s.settings_menu {
+        root = root.child(settings_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -793,39 +815,37 @@ fn sidebar_toggle(p: Palette, compact: bool) -> El {
     })
 }
 
-/// Sidebar controls share the title strip's centre line with tabs and window controls.
+/// The sidebar's half of the title strip, left-aligned as T3 Code lays it out: the sidebar
+/// toggle, then Shina's mark and name. Search and actions sit in the sidebar below.
 fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
-    let mut header = row().h(36.0).center_y().px(8.0);
+    let mut header = row()
+        .h(36.0)
+        .center_y()
+        .gap(8.0)
+        .child(sidebar_toggle(p, compact));
     if show_logo {
-        header = header.child(
-            el().key("shina-logo")
-                .size(24.0, 24.0)
-                .radius(6.0)
-                .clip_rounded(6.0)
-                .border(0.5, p.line)
-                .pixels(
-                    if s.dark {
-                        &s.artwork.mark_dark
-                    } else {
-                        &s.artwork.mark
-                    }
-                    .pixels(),
-                ),
-        );
+        header = header
+            .child(
+                el().key("shina-logo")
+                    .size(20.0, 20.0)
+                    .radius(5.0)
+                    .clip_rounded(5.0)
+                    .pixels(
+                        if s.dark {
+                            &s.artwork.mark_dark
+                        } else {
+                            &s.artwork.mark
+                        }
+                        .pixels(),
+                    ),
+            )
+            .child(label(
+                "Shina",
+                TextStyle::new(15.0, 650.0).tracking(-0.25),
+                p.ink,
+            ));
     }
-    header
-        .child(spacer())
-        .child(icon_button(
-            "search-toggle",
-            "Search threads",
-            "search",
-            p,
-            |s| {
-                s.search_open = !s.search_open;
-                s.search.focused = s.search_open;
-            },
-        ))
-        .child(sidebar_toggle(p, compact))
+    header.child(spacer())
 }
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
@@ -836,45 +856,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         .min_h(0.0)
         .pr(8.0)
         .gap(2.0);
-    // The Archive item doubles as the way back, so the list needs no separate Threads item.
-    side = side.child(nav("new-thread", "New thread", "compose", p, true, |s| {
-        s.project_picker = Some(ProjectPicker::NewThread);
-    }));
-    side = side.child(nav(
-        "show-archive",
-        if s.show_archive {
-            "Back to threads"
-        } else {
-            "Archive"
-        },
-        "archive",
-        p,
-        s.show_archive,
-        |s| s.show_archive = !s.show_archive,
-    ));
-    if s.search_open {
-        side = side.child(
-            row()
-                .h(30.0)
-                .center_y()
-                .px(8.0)
-                .gap(7.0)
-                .radius(6.0)
-                .fill(p.panel)
-                .child(icon("search", p.muted))
-                .child(
-                    text_input(&s.search, LABEL)
-                        .key("thread-search")
-                        .label("Search conversations")
-                        .placeholder("Search conversations", p.muted)
-                        .color(p.ink)
-                        .single_line()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .on_edit(|s: &mut State| &mut s.search),
-                ),
-        );
-    }
+    // One row holds search and the sidebar's actions, as in T3 Code: filter by workspace,
+    // add a workspace, and start a thread.
+    let scoped = !s.scope_additional.is_empty() || s.project_scope != ProjectScope::All;
     let scope = if !s.scope_additional.is_empty() {
         format!("{} workspaces", s.scope_additional.len() + 1)
     } else {
@@ -887,71 +871,131 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .unwrap_or_else(|| "All workspaces".into()),
         }
     };
-    // One context selector owns the entire navigation, including coordinators. Its folder
-    // glyph matches the composer's workspace control, which names the same thing.
     side = side.child(
-        col()
+        row()
             .key("workspace-context")
-            .pt(8.0)
-            .pb(6.0)
-            .gap(6.0)
+            .h(36.0)
+            .mb(6.0)
+            .pr(4.0)
+            .gap(2.0)
+            .center_y()
             .child(
                 row()
+                    .key("thread-search-field")
+                    .h(32.0)
+                    .px(ROW_INSET)
+                    .gap(8.0)
                     .center_y()
-                    .gap(4.0)
-                    .pr(10.0)
+                    .radius(8.0)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .fill(if s.search.focused || !s.search.text.is_empty() {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .child(icon("search", p.muted))
                     .child(
-                        row()
-                            .key("project-scope")
-                            .role("button")
-                            .label(format!("Workspace: {scope}"))
-                            .focusable(true)
-                            .h(SINGLE_ROW)
-                            .px(10.0)
-                            .gap(10.0)
-                            .center_y()
-                            .radius(8.0)
+                        text_input(&s.search, LABEL)
+                            .key("thread-search")
+                            .label("Search conversations")
+                            .placeholder("Search", p.muted)
+                            .color(p.ink)
+                            .single_line()
                             .grow(1.0)
                             .min_w(0.0)
-                            .hover(p.selected)
-                            .press(p.selected)
-                            .on_press(|s: &mut State| s.project_picker = Some(ProjectPicker::Scope))
-                            .child(
-                                el().size(20.0, 20.0)
-                                    .center()
-                                    .child(icon("folder", p.muted)),
-                            )
-                            .child(
-                                label(&scope, TextStyle::new(14.0, 520.0).tracking(-0.10), p.ink)
-                                    .truncate()
-                                    .shrink()
-                                    .min_w(0.0),
-                            )
-                            .child(icon("chevron", p.muted))
-                            .child(spacer()),
-                    )
-                    .child(project_switcher(s, p)),
+                            .on_edit(|s: &mut State| &mut s.search),
+                    ),
             )
-            .child(rule(p)),
+            .child(
+                toggle_button(
+                    "project-scope",
+                    &format!("Workspace: {scope}"),
+                    "folder",
+                    scoped,
+                    p,
+                    |s| s.open_picker(ProjectPicker::Scope),
+                )
+                .help(format!("Workspace: {scope}")),
+            )
+            .child(project_switcher(s, p).help("Add workspace"))
+            .child(
+                icon_button("new-thread", "New thread", "compose", p, |s| {
+                    s.open_picker(ProjectPicker::NewThread);
+                })
+                .help("New thread"),
+            ),
     );
-    let mut content = col().pb(12.0).gap(3.0).min_h(s.sidebar_viewport_height);
+    // A workspace filter names itself and clears in one click.
+    if scoped {
+        side = side.child(
+            row()
+                .key("scope-chip")
+                .h(28.0)
+                .pl(ROW_INSET)
+                .pr(4.0)
+                .gap(6.0)
+                .center_y()
+                .child(icon("folder", p.muted))
+                .child(label(&scope, SMALL, p.ink).truncate().shrink().min_w(0.0))
+                .child(spacer())
+                .child(icon_button(
+                    "clear-project-scope",
+                    "Show all workspaces",
+                    "close",
+                    p,
+                    |s| {
+                        s.project_scope = ProjectScope::All;
+                        s.scope_additional.clear();
+                        s.selected_threads.clear();
+                        s.checkpoint();
+                    },
+                )),
+        );
+    }
+    if s.show_archive {
+        side = side.child(
+            row()
+                .key("archive-heading")
+                .h(30.0)
+                .pl(ROW_INSET)
+                .pr(8.0)
+                .gap(8.0)
+                .center_y()
+                .child(icon("archive", p.muted))
+                .child(label("Archive", TextStyle::new(13.0, 560.0), p.ink))
+                .child(spacer())
+                .child(
+                    label("Back", SMALL, p.muted)
+                        .key("leave-archive")
+                        .role("button")
+                        .cursor(rune::Cursor::Pointer)
+                        .focusable(true)
+                        .on_press(|s: &mut State| s.show_archive = false),
+                ),
+        );
+    }
+    let mut content = col().pb(2.0).gap(2.0).min_h(s.sidebar_viewport_height);
     let captains = s.sidebar_captains();
     if !s.show_archive || !captains.is_empty() {
-        let mut heading = section_title(
-            if s.show_archive {
-                "Captain archive"
-            } else {
-                "Captains"
-            },
-            p,
-        );
+        let mut heading = section_title("Captains", p);
         if !s.show_archive {
             heading = heading.child(icon_button(
                 "assign-captain",
-                "Open a captain in a workspace",
+                "Add a captain",
                 "plus",
                 p,
-                |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
+                // With no captains yet, this goes straight to the create form, which also
+                // picks the workspace. Otherwise it picks a workspace, then a captain.
+                |s| {
+                    if s.captains.is_empty() {
+                        s.captain_project = None;
+                        s.begin_new_captain();
+                    } else {
+                        s.open_picker(ProjectPicker::AssignCaptain);
+                    }
+                },
             ));
         }
         content = content.child(heading);
@@ -993,15 +1037,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     } else {
         !visible.is_empty()
     };
-    if listed || dragging || captains.is_empty() {
-        content = content.child(section_title(
-            if s.show_archive {
-                "Archived threads"
-            } else {
-                "Threads"
-            },
-            p,
-        ));
+    // Threads follow the captains without a heading of their own. The captains' label and a
+    // gap mark where the crews end.
+    if (listed || dragging) && !captains.is_empty() {
+        content = content.child(el().h(12.0));
     }
     let drafts: Vec<_> = visible
         .iter()
@@ -1040,8 +1079,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             if rows.is_empty() && !(section == Section::Settled && dragging) {
                 continue;
             }
+            // The first shelf takes the remaining height above it, so the shelves sit at the
+            // bottom of the sidebar as in T3 Code.
             if first_shelf {
-                content = content.child(el().h(8.0));
+                content = content.child(spacer().min_h(12.0));
                 first_shelf = false;
             }
             let key = format!("shelf-{section:?}");
@@ -1052,10 +1093,12 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 row()
                     .key(&key)
                     .role("button")
+                    .cursor(rune::Cursor::Pointer)
                     .label(format!("{title}, {} threads", rows.len()))
                     .focusable(true)
-                    .h(28.0)
-                    .px(10.0)
+                    .h(32.0)
+                    .pl(ROW_INSET)
+                    .pr(8.0)
                     .gap(6.0)
                     .center_y()
                     .radius(6.0)
@@ -1067,9 +1110,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         s.shelves[shelf] = !s.shelves[shelf];
                         s.checkpoint();
                     })
-                    .child(label(title, SMALL, p.muted))
-                    .child(label(rows.len().to_string(), SMALL, p.muted.alpha(0.7)))
+                    .child(label(title, TextStyle::new(13.0, 460.0), p.muted))
                     .child(spacer())
+                    .child(label(rows.len().to_string(), SMALL, p.muted))
                     .child(icon(if open { "chevron" } else { "open" }, p.muted)),
             );
         } else if dragging {
@@ -1145,44 +1188,78 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         );
         side = side.child(button("thread-undo", &title, p, |s| s.undo_thread_action()).h(32.0));
     }
-    side = side.child(row().px(8.0).w_full().child(rule(p))).child(
+    // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark. Settings
+    // holds preferences such as the theme.
+    side = side.child(
         row()
-            .h(48.0)
-            .px(8.0)
-            .gap(8.0)
+            .key("sidebar-footer")
+            .h(40.0)
+            .pl(8.0)
+            .gap(6.0)
             .center_y()
             .child(
-                col()
-                    .gap(1.0)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .child(label("Shina", TextStyle::new(12.0, 560.0), p.ink))
-                    .child(label(
-                        if s.demo {
-                            "Demo workspace"
-                        } else {
-                            "Local workspaces"
-                        },
-                        SMALL,
-                        p.muted,
-                    )),
+                toggle_button(
+                    "sidebar-settings",
+                    "Settings",
+                    "settings",
+                    s.settings_menu,
+                    p,
+                    |s| s.settings_menu = !s.settings_menu,
+                )
+                .help("Settings"),
             )
-            .child(icon_button(
-                "theme-toggle",
-                if s.dark {
-                    "Switch to light theme"
-                } else {
-                    "Switch to dark theme"
-                },
-                if s.dark { "sun" } else { "moon" },
-                p,
-                |s| {
-                    s.dark = !s.dark;
-                    s.checkpoint();
-                },
-            )),
+            .child(
+                toggle_button(
+                    "show-archive",
+                    if s.show_archive {
+                        "Back to threads"
+                    } else {
+                        "Archive"
+                    },
+                    "archive",
+                    s.show_archive,
+                    p,
+                    |s| s.show_archive = !s.show_archive,
+                )
+                .help("Archive"),
+            )
+            .child(spacer()),
     );
     side
+}
+
+/// Preferences behind the footer's gear. The theme is the first; more join it here.
+fn settings_menu(s: &State, p: Palette) -> El {
+    col()
+        .key("settings-menu")
+        .role("menu")
+        .label("Settings")
+        .w(220.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
+        .anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
+        .modal(true, |s: &mut State| s.settings_menu = false)
+        .child(
+            menu_item(
+                "theme-toggle",
+                if s.dark { "Light theme" } else { "Dark theme" },
+                if s.dark { "sun" } else { "moon" },
+                p,
+            )
+            .on_press(|s: &mut State| {
+                s.dark = !s.dark;
+                s.settings_menu = false;
+                s.checkpoint();
+            }),
+        )
 }
 
 /// Add or restore a project. Project ownership stays on threads, not sidebar folders.
@@ -1207,17 +1284,18 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
     row()
         .key(key)
         .role("menuitem")
+        .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
-        .h(30.0)
+        .h(32.0)
         .px(8.0)
-        .gap(8.0)
+        .gap(10.0)
         .center_y()
-        .radius(5.0)
+        .radius(6.0)
         .hover(p.selected)
-        .child(icon(glyph, p.muted))
+        .child(el().size(16.0, 16.0).center().child(icon(glyph, p.muted)))
         .child(
-            label(title, TextStyle::new(12.5, 450.0), p.ink)
+            label(title, TextStyle::new(13.0, 450.0), p.ink)
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate(),
@@ -1225,7 +1303,8 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
 }
 
 /// Removed projects plus the two ways to add one.
-fn project_menu(s: &State, p: Palette) -> El {
+/// It opens under the sidebar's add button, or under the open tab when the sidebar is hidden.
+fn project_menu(s: &State, p: Palette, anchor: &str) -> El {
     let projects = s.projects.menu.as_deref().unwrap_or_default();
     let mut list = col().gap(1.0).shrink().min_h(0.0).scroll(ScrollSpec {
         stick_bottom: false,
@@ -1235,6 +1314,7 @@ fn project_menu(s: &State, p: Palette) -> El {
         let item = row()
             .key(format!("project-{index}"))
             .role("menuitem")
+            .cursor(rune::Cursor::Pointer)
             .label(format!("Restore {}", project.name))
             .focusable(true)
             .px(8.0)
@@ -1271,13 +1351,17 @@ fn project_menu(s: &State, p: Palette) -> El {
         .label("Workspaces")
         .w(280.0)
         .max_h(440.0)
-        .padding(5.0)
+        .padding(4.0)
         .gap(1.0)
-        .radius(8.0)
+        .radius(10.0)
         .fill(p.card)
         .border(0.5, p.line)
-        .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
-        .anchored_fit("active-tab", rune::Side::Bottom, rune::Align::Start, 4.0)
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
+        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, 6.0)
         .modal(true, |s: &mut State| s.close_project_menu())
         .child(row().h(24.0).px(8.0).center_y().child(label(
             "Restore removed workspace",
@@ -1494,6 +1578,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             let mut button = row()
                 .key("update-restart")
                 .role("button")
+                .cursor(rune::Cursor::Pointer)
                 .label(title.clone())
                 .description(description.clone().unwrap_or_default())
                 .h(30.0)
@@ -1519,50 +1604,13 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
     }
 }
 
-fn nav(
-    key: &str,
-    title: &str,
-    glyph: &str,
-    p: Palette,
-    active: bool,
-    action: impl Fn(&mut State) + 'static,
-) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .label(title)
-        .focusable(true)
-        .h(SINGLE_ROW)
-        .px(10.0)
-        .gap(10.0)
-        .center_y()
-        .radius(8.0)
-        .fill(if active {
-            p.selected
-        } else {
-            Color::TRANSPARENT
-        })
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(action)
-        .child(icon(glyph, if active { p.ink } else { p.muted }))
-        .child(label(
-            title,
-            if active {
-                TextStyle::new(14.0, 520.0).tracking(-0.10)
-            } else {
-                LABEL
-            },
-            if active { p.ink } else { p.muted },
-        ))
-}
 fn section_title(title: &str, p: Palette) -> El {
     row()
-        .h(40.0)
-        .pt(10.0)
-        .px(10.0)
+        .h(30.0)
+        .pl(ROW_INSET)
+        .pr(4.0)
         .center_y()
-        .child(label(title, SMALL, p.muted))
+        .child(label(title, TextStyle::new(12.5, 500.0), p.muted))
         .child(spacer())
 }
 fn face_for(status: Status) -> crate::visuals::Face {
@@ -1675,6 +1723,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let mut item = row()
         .key(format!("thread-{}", thread.id))
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(format!(
             "{}{}, {}",
             thread.title,
@@ -1807,6 +1856,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 row()
                     .key(key)
                     .role("button")
+                    .cursor(rune::Cursor::Pointer)
                     .label(title)
                     .focusable(true)
                     .h(22.0)
@@ -1857,6 +1907,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             label("Woke", SMALL, p.teal_text)
                 .key(format!("thread-woke-{id}"))
                 .role("button")
+                .cursor(rune::Cursor::Pointer)
                 .focusable(true)
                 .on_press(move |s: &mut State| {
                     s.threads[index].life.last_visited_at = Some(lifecycle::now());
@@ -1913,16 +1964,16 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         let mut text = col()
             .grow(1.0)
             .min_w(0.0)
-            .gap(2.0)
-            .child(row().gap(8.0).center_y().child(title).child(slot));
+            .gap(1.0)
+            .child(row().h(20.0).gap(8.0).center_y().child(title).child(slot));
         if !context.is_empty() {
-            text = text.child(label(context.join(" · "), SMALL, p.muted).truncate());
+            text = text.child(label(context.join(", "), CARD_META, p.muted).truncate());
         }
         return item.child(
             row()
                 .grow(1.0)
                 .min_w(0.0)
-                .px(10.0)
+                .px(ROW_INSET)
                 .py(8.0)
                 .gap(10.0)
                 .center_y()
@@ -1930,46 +1981,39 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     s,
                     p,
                     thread.captain.expect("captain home"),
-                    30.0,
+                    32.0,
                     row_status,
                 ))
                 .child(text),
         );
     }
 
+    let project = s.project(thread.project);
+    // Pins and drafts lead the line, as T3 Code puts its pin before the project icon.
+    let lead = |line: El| match &mark {
+        Some(_) if thread.pinned() || draft => line.child(mark.clone().unwrap()),
+        _ => line,
+    };
+
     // Snoozed and settled rows stay one line inside their shelves.
     if shelved {
-        let mut line = row().h(34.0).px(10.0).gap(8.0).center_y();
-        if let Some(mark) = mark {
-            line = line.child(mark);
-        }
-        if let Some(workspace) = workspace {
-            item = item.help(format!("{} · {workspace}", thread.title));
-        }
-        return item.child(line.child(title).child(slot));
+        let line = lead(row().h(34.0).px(ROW_INSET).gap(8.0).center_y())
+            .child(project_tile(s, p, project, 16.0))
+            .child(title)
+            .child(slot);
+        return item.child(line);
     }
 
-    // A thread card, as T3 Code lays it out: its workspace and status on top, then the title.
-    let mut top = row().h(18.0).gap(6.0).center_y();
-    if let Some(mark) = mark {
-        top = top.child(mark);
-    }
-    top = top
+    // A thread card, as T3 Code lays it out: the project's icon and name with the status on
+    // the right, then the title.
+    let top = lead(row().h(18.0).gap(8.0).center_y())
+        .child(project_tile(s, p, project, 16.0))
         .child(
             label(
-                workspace.unwrap_or_else(|| {
-                    if thread.is_draft() {
-                        "Draft".into()
-                    } else {
-                        thread
-                            .model
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or_default()
-                            .to_string()
-                    }
-                }),
-                SMALL,
+                project
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "No workspace".into()),
+                CARD_META,
                 p.muted,
             )
             .truncate()
@@ -1981,13 +2025,56 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         col()
             .grow(1.0)
             .min_w(0.0)
-            .px(10.0)
-            .pt(7.0)
-            .pb(8.0)
-            .gap(3.0)
+            .px(ROW_INSET)
+            .pt(9.0)
+            .pb(10.0)
+            .gap(5.0)
             .child(top)
             .child(row().child(title)),
     )
+}
+
+/// Tile colours for projects without an icon. Each project keeps one by its name.
+const PROJECT_HUES: [&str; 6] = [
+    "#6E8FE8", "#4FA58A", "#9A7BDD", "#C99A32", "#CF6A8C", "#3E9DBF",
+];
+
+/// A project's icon, as T3 Code shows each project's favicon: the repository's own PNG when
+/// it has one, otherwise its initial on a tile in the project's colour.
+fn project_tile(
+    s: &State,
+    p: Palette,
+    project: Option<&crate::projects::Project>,
+    size: f32,
+) -> El {
+    let tile = el()
+        .size(size, size)
+        .radius(4.0)
+        .clip_rounded(4.0)
+        .a11y_hidden();
+    let Some(project) = project else {
+        return tile.center().child(icon("thread", p.muted));
+    };
+    if let Some(path) = &project.icon {
+        let handle = s.attachment_cache.file(path.clone(), size, 2.0);
+        if rune::is_headless() {
+            let _ = handle.wait();
+        }
+        return tile.pixels(handle.pixels());
+    }
+    let hash = project.name.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as usize)
+    });
+    let hue = color(PROJECT_HUES[hash % PROJECT_HUES.len()]);
+    let initial = project
+        .name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default();
+    tile.center()
+        .fill(hue.alpha(if s.dark { 0.24 } else { 0.18 }))
+        .child(label(initial, TextStyle::new(size * 0.62, 650.0), hue))
 }
 
 /// A row's workspace name, unless the Workspace filter already names that one workspace.
@@ -2018,124 +2105,145 @@ fn relative_time(updated: u64) -> Option<String> {
     })
 }
 
+/// The Captain screen: a centred modal that introduces each captain by portrait, role, state,
+/// where they already work and how they are briefed, then offers a new one.
 fn captain_picker(s: &State, p: Palette) -> El {
-    let mut card = col()
-        .key("captain-picker")
+    let target = s.project(s.projects.captain_target);
+    let workspace = target
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| "No workspace".into());
+    let mut card = popover("captain-picker", "Choose a captain", s, p)
         .role("dialog")
-        .label("Open Captain")
-        .w(392.0)
-        .padding(16.0)
-        .gap(10.0)
-        .radius(10.0)
-        .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .w(560.0)
+        .max_h((s.viewport_height * 0.72).max(360.0))
+        .padding(6.0)
+        .radius(14.0)
         .on_press(|_: &mut State| {})
         .child(
-            row()
-                .center_y()
+            col()
+                .px(10.0)
+                .pt(12.0)
+                .pb(10.0)
+                .gap(4.0)
+                .child(label(
+                    "Choose a captain",
+                    TextStyle::new(16.0, 620.0).tracking(-0.2),
+                    p.ink,
+                ))
                 .child(
-                    col()
-                        .gap(2.0)
-                        .child(label("Open Captain", TextStyle::new(14.0, 560.0), p.ink))
-                        .child(label(
-                            "Choose a coordinator for ongoing work.",
-                            SMALL,
-                            p.muted,
-                        )),
-                )
-                .child(spacer())
-                .child(icon_button(
-                    "close-captain-picker",
-                    "Close Captain picker",
-                    "close",
-                    p,
-                    |s| s.captain_picker = false,
-                )),
+                    row()
+                        .gap(6.0)
+                        .center_y()
+                        .child(label("They will coordinate work in", SMALL, p.muted))
+                        .child(project_tile(s, p, target, 14.0))
+                        .child(label(workspace, TextStyle::new(12.0, 560.0), p.ink)),
+                ),
         );
+    let mut list = col().gap(2.0).min_h(0.0).shrink().scroll(ScrollSpec {
+        stick_bottom: false,
+    });
     for captain in 0..s.captains.len() {
         let state = s.captain_status(captain);
         let open = s.current().captain == Some(captain) && s.is_captain_home(s.current());
-        card = card.child(
+        let hovered = s.hovered_captain == Some(captain);
+        let profile = &s.captains[captain];
+        // The workspaces this captain already has a home in.
+        let mut homes: Vec<String> = s
+            .threads
+            .iter()
+            .filter(|t| t.captain == Some(captain) && s.is_captain_home(t) && !t.archived())
+            .map(|t| {
+                s.project(t.project)
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "No workspace".into())
+            })
+            .collect();
+        homes.sort();
+        homes.dedup();
+        let brief = profile.instructions.lines().find(|l| !l.trim().is_empty());
+        let mut text = col().gap(2.0).grow(1.0).min_w(0.0).child(
             row()
-                .key(format!("choose-captain-{captain}"))
-                .role("button")
-                .label(format!(
-                    "Open Captain {}, {}",
-                    s.captains[captain].name,
-                    state.label()
-                ))
-                .focusable(true)
-                .gap(11.0)
-                .padding(9.0)
-                .radius(6.0)
-                .fill(if open { p.selected } else { Color::TRANSPARENT })
-                .hover(p.selected)
-                .center_y()
-                .on_press(move |s: &mut State| s.open_captain(captain))
-                .child(avatar(s, p, captain, 40.0, state))
-                .child(
-                    col()
-                        .gap(3.0)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(label(
-                            &s.captains[captain].name,
-                            TextStyle::new(13.0, 560.0),
-                            p.ink,
-                        ))
-                        .child(label(&s.captains[captain].role, SMALL, p.muted)),
-                )
-                .child(captain_status_chip(state, p))
-                .child(icon_button(
-                    &format!("edit-captain-{captain}"),
-                    &format!("Rename or edit {}", s.captains[captain].name),
-                    "edit",
-                    p,
-                    move |s| {
-                        s.captain_picker = false;
-                        s.edit_captain(captain);
-                    },
-                )),
-        );
-    }
-    card = card
-        .child(
-            row()
-                .key("picker-new-captain")
-                .role("button")
-                .label("New Captain")
-                .focusable(true)
-                .h(36.0)
-                .px(10.0)
                 .gap(8.0)
                 .center_y()
-                .radius(6.0)
-                .border(0.5, p.line)
-                .hover(p.selected)
-                .on_press(|s: &mut State| s.begin_new_captain())
-                .child(icon("plus", p.muted))
-                .child(label("New Captain", LABEL, p.ink)),
-        )
-        .child(rule(p))
-        .child(
-            label(
-                "Each captain keeps a conversation and its workers. Several can share a workspace.",
-                SMALL,
-                p.muted,
-            )
-            .wrap(),
+                .child(label(&profile.name, TextStyle::new(14.0, 600.0), p.ink))
+                .child(label(&profile.role, SMALL, p.muted))
+                .child(spacer())
+                .child(captain_status_chip(state, p)),
         );
-    el().key("captain-picker-backdrop")
-        .instant_changes()
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
-        .center()
-        .modal(false, |s: &mut State| s.captain_picker = false)
-        .on_press(|s: &mut State| s.captain_picker = false)
-        .child(card)
+        if let Some(brief) = brief {
+            text = text.child(label(brief.trim(), SMALL, p.muted).truncate());
+        }
+        if !homes.is_empty() {
+            text = text.child(
+                label(
+                    format!("Works in {}", homes.join(", ")),
+                    SMALL,
+                    p.muted.alpha(0.8),
+                )
+                .truncate(),
+            );
+        }
+        let mut item = row()
+            .key(format!("choose-captain-{captain}"))
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("Open Captain {}, {}", profile.name, state.label()))
+            .focusable(true)
+            .px(10.0)
+            .py(10.0)
+            .gap(14.0)
+            .radius(10.0)
+            .fill(if open { p.selected } else { Color::TRANSPARENT })
+            .hover(p.selected)
+            .center_y()
+            .on_hover_change(move |s: &mut State, on, _| {
+                if on {
+                    s.hovered_captain = Some(captain);
+                } else if s.hovered_captain == Some(captain) {
+                    s.hovered_captain = None;
+                }
+            })
+            .on_press(move |s: &mut State| s.open_captain(captain))
+            .child(avatar(s, p, captain, 48.0, state))
+            .child(text);
+        item = item.child(
+            icon_button(
+                &format!("edit-captain-{captain}"),
+                &format!("Rename or edit {}", profile.name),
+                "edit",
+                p,
+                move |s| {
+                    s.captain_picker = false;
+                    s.edit_captain(captain);
+                },
+            )
+            .opacity(if hovered || open { 1.0 } else { 0.0 }),
+        );
+        list = list.child(item);
+    }
+    card = card
+        .child(list)
+        .child(el().h(0.5).w_full().my(4.0).fill(p.line))
+        .child(
+            row()
+                .h(40.0)
+                .pl(2.0)
+                .pr(8.0)
+                .gap(16.0)
+                .center_y()
+                .child(
+                    menu_item("picker-new-captain", "New captain", "plus", p)
+                        .on_press(|s: &mut State| s.begin_new_captain()),
+                )
+                .child(spacer())
+                .child(keycap("Esc", "Close", p)),
+        );
+    modal_frame(
+        "captain-picker-backdrop",
+        s,
+        |s| s.captain_picker = false,
+        card,
+    )
 }
 
 fn captain_editor(s: &State, p: Palette, height: f32) -> El {
@@ -2149,6 +2257,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             col()
                 .key(format!("captain-portrait-{portrait}"))
                 .role("button")
+                .cursor(rune::Cursor::Pointer)
                 .label(format!(
                     "Use {} portrait",
                     crate::visuals::PORTRAIT_NAMES[portrait]
@@ -2198,18 +2307,52 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             stick_bottom: false,
         })
         .child(
-            button(
-                "captain-project-choice",
-                &format!(
-                    "Workspace: {}",
-                    s.project(captain_project)
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("No workspace")
+            col()
+                .gap(5.0)
+                .child(label("Workspace", SMALL, p.muted))
+                .child(
+                    row()
+                        .key("captain-project-choice")
+                        .role("button")
+                        .cursor(rune::Cursor::Pointer)
+                        .label(format!(
+                            "Workspace: {}",
+                            s.project(captain_project)
+                                .map(|p| p.name.as_str())
+                                .unwrap_or("No workspace")
+                        ))
+                        .focusable(!editing)
+                        .h(38.0)
+                        .px(8.0)
+                        .gap(10.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(field)
+                        .border(1.0, p.field_line)
+                        .opacity(if editing { 0.6 } else { 1.0 })
+                        .on_press(move |s: &mut State| {
+                            if s.captain_editor
+                                .as_ref()
+                                .is_some_and(|e| e.editing.is_none())
+                            {
+                                s.open_picker(ProjectPicker::AssignCaptain);
+                            }
+                        })
+                        .child(project_tile(s, p, s.project(captain_project), 16.0))
+                        .child(
+                            label(
+                                s.project(captain_project)
+                                    .map(|p| p.name.as_str())
+                                    .unwrap_or("No workspace"),
+                                BODY,
+                                p.ink,
+                            )
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                        )
+                        .child(icon("chevron", p.muted)),
                 ),
-                p,
-                |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
-            )
-            .disabled(editing),
         )
         .child(
             col()
@@ -2235,21 +2378,24 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             ),
         )
         .child(
-            col().gap(5.0).child(label("Role", SMALL, p.muted)).child(
-                text_input(&editor.role, BODY)
-                    .key("captain-role")
-                    .label("Captain role")
-                    .placeholder("e.g. Code review", p.muted)
-                    .single_line()
-                    .color(p.ink)
-                    .caret(p.teal, p.teal_bg)
-                    .w_full()
-                    .padding(8.0)
-                    .radius(6.0)
-                    .fill(field)
-                    .border(1.0, p.field_line)
-                    .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
-            ),
+            col()
+                .gap(5.0)
+                .child(label("Role (optional)", SMALL, p.muted))
+                .child(
+                    text_input(&editor.role, BODY)
+                        .key("captain-role")
+                        .label("Captain role")
+                        .placeholder("e.g. Code review", p.muted)
+                        .single_line()
+                        .color(p.ink)
+                        .caret(p.teal, p.teal_bg)
+                        .w_full()
+                        .padding(8.0)
+                        .radius(6.0)
+                        .fill(field)
+                        .border(1.0, p.field_line)
+                        .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
+                ),
         )
         .child(
             col()
@@ -2286,22 +2432,26 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         body = body.child(label(error, SMALL, p.danger).wrap());
     }
     let title = if editing {
-        "Edit Captain"
+        "Edit captain"
     } else {
-        "New Captain"
+        "New captain"
     };
     let card = col()
         .key("captain-editor")
         .role("dialog")
         .label(title)
-        .w(432.0)
+        .w(480.0)
         .max_h((height - 32.0).max(240.0))
-        .padding(16.0)
+        .padding(18.0)
         .gap(14.0)
-        .radius(10.0)
+        .radius(14.0)
         .fill(p.card)
         .border(0.5, p.line)
-        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -2312,7 +2462,11 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     col()
                         .gap(3.0)
                         .child(label(title, TextStyle::new(16.0, 560.0), p.ink))
-                        .child(label("Give a captain a name and a job.", SMALL, p.muted)),
+                        .child(label(
+                            "Name it, pick a portrait, and say what it should focus on.",
+                            SMALL,
+                            p.muted,
+                        )),
                 )
                 .child(spacer())
                 .child(icon_button(
@@ -2329,9 +2483,12 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(button("cancel-captain", "Cancel", p, |s| {
-                    s.captain_editor = None
-                }))
+                .child(
+                    button("cancel-captain", "Cancel", p, |s| s.captain_editor = None)
+                        .h(32.0)
+                        .px(14.0)
+                        .border(0.5, p.line),
+                )
                 .child(spacer())
                 .child(if profile.validate().is_ok() {
                     primary_button(
@@ -2339,7 +2496,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         if editing {
                             "Save changes"
                         } else {
-                            "Create Captain"
+                            "Create captain"
                         },
                         p,
                         |s| s.save_captain(),
@@ -2350,7 +2507,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         if editing {
                             "Save changes"
                         } else {
-                            "Create Captain"
+                            "Create captain"
                         },
                         p,
                         |_| {},
@@ -2400,6 +2557,7 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
                 format!("tab-{id}")
             })
             .role("tab")
+            .cursor(rune::Cursor::Pointer)
             .label(format!("{project} / {}", thread.title))
             .focusable(true)
             .center_y()
@@ -2437,7 +2595,7 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         .gap(6.0)
         .child(tabs)
         .child(icon_button("new-tab", "New thread", "plus", p, |s| {
-            s.project_picker = Some(ProjectPicker::NewThread);
+            s.open_picker(ProjectPicker::NewThread);
         }))
 }
 
@@ -2510,12 +2668,16 @@ fn thread_menu(s: &State, p: Palette) -> El {
         .role("menu")
         .label("Thread actions")
         .w(200.0)
-        .padding(5.0)
+        .padding(4.0)
         .gap(1.0)
-        .radius(8.0)
+        .radius(10.0)
         .fill(p.card)
         .border(0.5, p.line)
-        .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
         .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.thread_menu = false)
         .child(thread_actions(s, s.current().id, p))
@@ -2953,12 +3115,16 @@ fn row_menu(s: &State, p: Palette) -> El {
         .role("menu")
         .label("Row actions")
         .w(222.0)
-        .padding(5.0)
+        .padding(4.0)
         .gap(1.0)
-        .radius(8.0)
+        .radius(10.0)
         .fill(p.card)
         .border(0.5, p.line)
-        .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
         .anchored_fit(
             if s.row_menu_at.is_some() {
                 "row-menu-point".into()
@@ -3081,148 +3247,298 @@ fn thread_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-fn project_picker(s: &State, p: Palette) -> El {
-    let mode = s.project_picker.expect("project picker");
-    let mut card = col()
-        .key("project-picker")
-        .role("dialog")
-        .label("Choose workspace")
-        .w(360.0)
-        .max_h(480.0)
-        .padding(10.0)
-        .gap(4.0)
-        .radius(8.0)
-        .fill(p.card)
-        .border(0.5, p.line)
-        .on_press(|_: &mut State| {})
-        .child(
-            row()
-                .center_y()
-                .child(
-                    label(
-                        match mode {
-                            ProjectPicker::Scope => "Show conversations in",
-                            ProjectPicker::NewThread => "New thread in",
-                            ProjectPicker::AssignCaptain => "Assign captain to",
-                        },
-                        LABEL,
-                        p.ink,
-                    )
-                    .grow(1.0),
-                )
-                .child(icon_button(
-                    "close-project-picker",
-                    "Close workspace picker",
-                    "close",
-                    p,
-                    |s| s.project_picker = None,
-                )),
-        );
-    if mode == ProjectPicker::Scope {
-        card = card.child(
-            menu_item("scope-all-projects", "All workspaces", "list", p).on_press(
-                |s: &mut State| {
-                    s.project_scope = ProjectScope::All;
-                    s.scope_additional.clear();
-                    s.selected_threads.clear();
-                    s.project_picker = None;
-                    s.checkpoint();
-                },
-            ),
-        );
-    }
-    {
-        card = card.child(
-            menu_item("choose-no-project", "No workspace", "thread", p).on_press_tx(
-                move |s: &mut State, tx| {
-                    if mode == ProjectPicker::NewThread {
-                        s.new_thread_in(None);
-                    } else if mode == ProjectPicker::Scope {
-                        s.set_project_scope(None, tx.mods().shift);
-                    } else {
-                        s.projects.captain_target = None;
-                        s.captain_project = Some(None);
-                        s.project_picker = None;
-                        s.captain_picker = s.captain_editor.is_none();
-                    }
-                },
-            ),
-        );
-    }
-    let mut choices = col().min_h(0.0).shrink().scroll(ScrollSpec {
-        stick_bottom: false,
-    });
-    for id in s.sorted_projects() {
-        let project = s.project(Some(id)).expect("sorted project");
-        if project.hidden {
-            continue;
-        }
-        let target = RowTarget::Project(id);
-        choices = choices.child(
-            row()
-                .key(format!("project-option-{id}"))
-                .center_y()
-                .on_secondary_press(move |s: &mut State, _, _| {
-                    s.row_menu = Some(target);
-                    s.row_menu_at = None;
-                })
-                .child(
-                    menu_item(&format!("choose-project-{id}"), &project.name, "folder", p)
-                        .grow(1.0)
-                        .child(
-                            if mode == ProjectPicker::Scope
-                                && (s.project_scope == ProjectScope::Project(id)
-                                    || s.scope_additional.contains(&id))
-                            {
-                                icon("check", p.teal)
-                            } else {
-                                el()
-                            },
-                        )
-                        .on_secondary_press(move |s: &mut State, _, _| {
-                            s.row_menu = Some(target);
-                            s.row_menu_at = None;
-                        })
-                        .on_press_tx(move |s: &mut State, tx| match mode {
-                            ProjectPicker::NewThread => s.new_thread_in(Some(id)),
-                            ProjectPicker::Scope => s.set_project_scope(Some(id), tx.mods().shift),
-                            ProjectPicker::AssignCaptain => {
-                                s.project_picker = None;
-                                s.projects.captain_target = Some(id);
-                                s.captain_project = Some(Some(id));
-                                s.captain_picker = s.captain_editor.is_none();
-                            }
-                        }),
-                )
-                .child(icon_button(
-                    &format!("project-more-{id}"),
-                    "Workspace actions",
-                    "more",
-                    p,
-                    move |s| {
-                        s.row_menu = Some(target);
-                        s.row_menu_at = None;
-                    },
-                )),
-        );
-    }
-    card = card.child(choices).child(rule(p)).child(
-        menu_item("picker-add-project", "Add workspace...", "folder", p).on_press(
-            |s: &mut State| {
-                s.project_picker = None;
-                s.open_project_menu();
-            },
-        ),
-    );
-    el().key("project-picker-backdrop")
+/// A centred modal over a dimmed window, as T3 Code opens its command palette: it sits a little
+/// above the middle, and a press outside or Escape closes it.
+fn modal_frame(key: &str, s: &State, close: fn(&mut State), card: El) -> El {
+    col()
+        .key(key)
         .instant_changes()
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .center()
-        .fill(Color::BLACK.alpha(0.2))
-        .modal(false, |s: &mut State| s.project_picker = None)
+        .items_center()
+        .pt((s.viewport_height * 0.16).clamp(40.0, 160.0))
+        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
+        .modal(false, close)
+        .on_press(close)
         .child(card)
+}
+
+/// A keyboard hint for a modal's footer: the key in a small cap, then what it does.
+fn keycap(keys: &str, action: &str, p: Palette) -> El {
+    row()
+        .gap(6.0)
+        .center_y()
+        .child(
+            row()
+                .h(18.0)
+                .px(5.0)
+                .center_y()
+                .radius(4.0)
+                .border(0.5, p.line)
+                .fill(p.selected)
+                .child(label(keys, TextStyle::new(11.0, 520.0), p.muted)),
+        )
+        .child(label(action, SMALL, p.muted))
+}
+
+/// A floating surface for menus and pickers, styled as T3 Code's popovers: one radius, a
+/// hairline edge and a soft shadow that reads in both themes.
+fn popover(key: &str, name: &str, s: &State, p: Palette) -> El {
+    col()
+        .key(key)
+        .label(name)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerChoice {
+    All,
+    NoProject,
+    Project(usize),
+}
+
+/// The picker's rows that match its search, in display order.
+fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String)> {
+    let query = s.picker_query.text.trim().to_lowercase();
+    let mut choices = vec![];
+    if mode == ProjectPicker::Scope {
+        choices.push((PickerChoice::All, "All workspaces".to_string()));
+    }
+    choices.push((PickerChoice::NoProject, "No workspace".to_string()));
+    for id in s.sorted_projects() {
+        let project = s.project(Some(id)).expect("sorted project");
+        if !project.hidden {
+            choices.push((PickerChoice::Project(id), project.name.clone()));
+        }
+    }
+    choices.retain(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query));
+    choices
+}
+
+fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift: bool) {
+    let project = match choice {
+        PickerChoice::All => {
+            s.project_scope = ProjectScope::All;
+            s.scope_additional.clear();
+            s.selected_threads.clear();
+            s.project_picker = None;
+            s.checkpoint();
+            return;
+        }
+        PickerChoice::NoProject => None,
+        PickerChoice::Project(id) => Some(id),
+    };
+    match mode {
+        ProjectPicker::NewThread => s.new_thread_in(project),
+        ProjectPicker::Scope => s.set_project_scope(project, shift),
+        ProjectPicker::AssignCaptain => {
+            s.project_picker = None;
+            s.projects.captain_target = project;
+            s.captain_project = Some(project);
+            if s.captains.is_empty() && s.captain_editor.is_none() {
+                s.begin_new_captain();
+            } else {
+                s.captain_picker = s.captain_editor.is_none();
+            }
+        }
+    }
+}
+
+/// The workspace picker, as T3 Code's command palette: a centred modal that starts with a
+/// search field and moves with the arrow keys. Enter picks the highlighted row; Shift adds a
+/// workspace to the filter.
+fn project_picker(s: &State, p: Palette) -> El {
+    let mode = s.project_picker.expect("project picker");
+    let choices = picker_choices(s, mode);
+    let highlight = s.picker_highlight.min(choices.len().saturating_sub(1));
+    let placeholder = match mode {
+        ProjectPicker::Scope => "Filter by workspace...",
+        ProjectPicker::NewThread => "New thread in...",
+        ProjectPicker::AssignCaptain => "Assign a captain to...",
+    };
+    let mut card = popover("project-picker", placeholder, s, p)
+        .role("dialog")
+        .w(520.0)
+        .max_h(460.0)
+        .padding(6.0)
+        .radius(14.0)
+        .on_press(|_: &mut State| {})
+        .child(
+            row()
+                .h(46.0)
+                .px(8.0)
+                .gap(10.0)
+                .center_y()
+                .child(
+                    el().size(16.0, 16.0)
+                        .center()
+                        .child(icon("search", p.muted)),
+                )
+                .child(
+                    rune::text_input(&s.picker_query, TextStyle::new(15.0, 420.0).tracking(-0.15))
+                        .key("picker-search")
+                        .label(placeholder)
+                        .placeholder(placeholder, p.muted)
+                        .color(p.ink)
+                        .single_line()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .on_edit(|s: &mut State| {
+                            s.picker_highlight = 0;
+                            &mut s.picker_query
+                        })
+                        .on_input_key(move |s: &mut State, event, _| {
+                            let count = s
+                                .project_picker
+                                .map_or(0, |mode| picker_choices(s, mode).len());
+                            match event.key {
+                                rune::Key::Down if count > 0 => {
+                                    s.picker_highlight = (s.picker_highlight + 1).min(count - 1);
+                                    true
+                                }
+                                rune::Key::Up => {
+                                    s.picker_highlight = s.picker_highlight.saturating_sub(1);
+                                    true
+                                }
+                                rune::Key::Enter => {
+                                    if let Some(mode) = s.project_picker
+                                        && let Some(choice) = picker_choices(s, mode)
+                                            .get(s.picker_highlight.min(count.saturating_sub(1)))
+                                            .map(|(choice, _)| *choice)
+                                    {
+                                        choose_picker(s, mode, choice, event.mods.shift);
+                                    }
+                                    true
+                                }
+                                rune::Key::Escape => {
+                                    s.project_picker = None;
+                                    true
+                                }
+                                _ => s.undo_key(event, true),
+                            }
+                        }),
+                ),
+        )
+        .child(el().h(0.5).w_full().mb(4.0).fill(p.line));
+    let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
+        stick_bottom: false,
+    });
+    for (index, (choice, name)) in choices.iter().enumerate() {
+        let (key, project) = match choice {
+            PickerChoice::All => ("scope-all-projects".to_string(), None),
+            PickerChoice::NoProject => ("choose-no-project".to_string(), None),
+            PickerChoice::Project(id) => (format!("choose-project-{id}"), s.project(Some(*id))),
+        };
+        let checked = mode == ProjectPicker::Scope
+            && match choice {
+                PickerChoice::All => s.project_scope == ProjectScope::All,
+                PickerChoice::NoProject => s.project_scope == ProjectScope::NoProject,
+                PickerChoice::Project(id) => {
+                    s.project_scope == ProjectScope::Project(*id) || s.scope_additional.contains(id)
+                }
+            };
+        let choice = *choice;
+        let mut item = row()
+            .key(key)
+            .role("menuitem")
+            .cursor(rune::Cursor::Pointer)
+            .label(name.as_str())
+            .focusable(true)
+            .h(38.0)
+            .px(8.0)
+            .gap(10.0)
+            .center_y()
+            .radius(8.0)
+            .fill(if index == highlight {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .on_press_tx(move |s: &mut State, tx| choose_picker(s, mode, choice, tx.mods().shift))
+            .child(match choice {
+                PickerChoice::All => el().size(16.0, 16.0).center().child(icon("list", p.muted)),
+                _ => project_tile(s, p, project, 16.0),
+            })
+            .child(
+                label(name.as_str(), TextStyle::new(14.0, 480.0), p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            )
+            // Where the workspace lives, so two folders with one name stay distinct.
+            .child(
+                label(
+                    project
+                        .map(|project| project.path.display().to_string())
+                        .unwrap_or_default(),
+                    SMALL,
+                    p.muted.alpha(0.8),
+                )
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+            );
+        if checked {
+            item = item.child(icon("check", p.teal));
+        }
+        if let PickerChoice::Project(id) = choice {
+            let target = RowTarget::Project(id);
+            item = item.on_secondary_press(move |s: &mut State, _, _| {
+                s.row_menu = Some(target);
+                s.row_menu_at = None;
+            });
+            item = row()
+                .key(format!("project-option-{id}"))
+                .child(item.grow(1.0));
+        }
+        list = list.child(item);
+    }
+    if choices.is_empty() {
+        list = list.child(
+            label("No matching workspace", SMALL, p.muted)
+                .px(8.0)
+                .py(8.0),
+        );
+    }
+    card = card
+        .child(list)
+        .child(el().h(0.5).w_full().my(4.0).fill(p.line))
+        .child(
+            menu_item("picker-add-project", "Add workspace...", "plus", p).on_press(
+                |s: &mut State| {
+                    s.project_picker = None;
+                    s.open_project_menu();
+                },
+            ),
+        );
+    let mut hints = row()
+        .h(34.0)
+        .px(8.0)
+        .gap(16.0)
+        .center_y()
+        .child(keycap("↑↓", "Move", p))
+        .child(keycap("Enter", "Choose", p));
+    if mode == ProjectPicker::Scope {
+        hints = hints.child(keycap("Shift", "Add to filter", p));
+    }
+    card = card.child(hints.child(spacer()).child(keycap("Esc", "Close", p)));
+    modal_frame(
+        "project-picker-backdrop",
+        s,
+        |s| s.project_picker = None,
+        card,
+    )
 }
 
 /// What a tool call does, for its one-line row: icon, past and present verb, and what it
@@ -3439,6 +3755,7 @@ fn activity_line(
     let mut line = row()
         .key(key)
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(a11y)
         .focusable(true)
         .center_y()
@@ -3771,19 +4088,28 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             row()
                 .key(format!("live-status-{}", t.id))
                 .min_h(26.0)
+                .ml(-14.0)
                 .center_y()
                 .gap(8.0)
                 .child(status_mark(Status::Running, p, 6.0))
                 .child(
-                    label(live_status(t), ACTIVITY, p.muted)
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0),
-                )
-                .child(match seconds {
-                    Some(seconds) => label(elapsed_label(seconds), ACTIVITY, quiet_inks(p).1),
-                    None => el(),
-                }),
+                    row()
+                        .gap(5.0)
+                        .center_y()
+                        .min_w(0.0)
+                        .child(
+                            label(live_status(t), ACTIVITY, p.muted)
+                                .truncate()
+                                .shrink()
+                                .min_w(0.0),
+                        )
+                        .child(match seconds {
+                            Some(seconds) => {
+                                label(elapsed_label(seconds), ACTIVITY, quiet_inks(p).1)
+                            }
+                            None => el(),
+                        }),
+                ),
         );
         response = response.child(rows);
     } else if last_work.is_some() {
@@ -4162,6 +4488,7 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
         .child(
             el().key(format!("remove-attachment-{id}"))
                 .role("button")
+                .cursor(rune::Cursor::Pointer)
                 .label(format!("Remove {}", image.name))
                 .focusable(true)
                 .size(22.0, 22.0)
@@ -4195,6 +4522,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
     let mut control = el()
         .key("attach-image")
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label("Attach image")
         .size(24.0, 24.0)
         .center()
@@ -4344,6 +4672,7 @@ fn context_ring(t: &Thread, p: Palette) -> El {
     let open = t.context.details_open;
     el().key("context-usage-ring")
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label(t.context.accessible_label(limit))
         .help(t.context.help_text(limit))
         .help_above()
@@ -4437,6 +4766,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let mut send = el()
         .key("send-message")
         .role("button")
+        .cursor(rune::Cursor::Pointer)
         .label("Send message")
         .size(32.0, 32.0)
         .radius(10.0)
@@ -4596,7 +4926,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                     "composer-project",
                     &format!("{} · {}", s.project_name(), t.machine),
                     p,
-                    |s| s.project_picker = Some(ProjectPicker::NewThread),
+                    |s| s.open_picker(ProjectPicker::NewThread),
                 )
                 .max_w(if narrow { 150.0 } else { 360.0 }),
             )
@@ -4615,6 +4945,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 row()
                     .key("leave-example")
                     .role("button")
+                    .cursor(rune::Cursor::Pointer)
                     .label("Open a real workspace")
                     .focusable(true)
                     .center_y()
@@ -5001,6 +5332,23 @@ pub(crate) mod tests {
         rt.frame(0.0);
         // A running thread stays in its own place in the list; there is no Working shelf.
         assert!(rt.find("shelf-Working").is_none());
+        // Shelves sit at the bottom of the sidebar, just above its footer.
+        let mut tall = Runtime::with_text(
+            State::new(".".into(), false),
+            view,
+            (1280.0, 1400.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        tall.state.populate_demo();
+        tall.frame(0.0);
+        tall.frame(0.5);
+        let (settled, _) = tall.presented("shelf-Settled").unwrap();
+        let (footer, _) = tall.presented("sidebar-footer").unwrap();
+        assert!(
+            footer[1] - (settled[1] + settled[3]) < 40.0,
+            "Settled {settled:?} is not above the footer {footer:?}"
+        );
         assert!(rt.find("thread-2").is_some());
         assert!(rt.find("shelf-Snoozed").is_some());
         assert!(rt.find("shelf-Settled").is_some());
@@ -5108,6 +5456,8 @@ pub(crate) mod tests {
     #[test]
     fn captain_home_menus_keep_lifecycle_controls_separate_from_threads() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let home = rt.state.current().id;
         rt.state
@@ -5505,12 +5855,25 @@ pub(crate) mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let (strip, _) = rt.presented("top-strip").unwrap();
-        for key in [
-            "sidebar-toggle",
-            "search-toggle",
-            "shina-logo",
-            "active-tab",
-        ] {
+        let (toggle, _) = rt.presented("sidebar-toggle").unwrap();
+        let (logo, _) = rt.presented("shina-logo").unwrap();
+        assert!(
+            toggle[0] < logo[0],
+            "the sidebar toggle leads the title strip"
+        );
+        // Without native window buttons on the left, the strip starts at the window's edge,
+        // on the same 20 px line as the search icon.
+        assert!(
+            toggle[0] <= 20.0,
+            "the title strip is left-aligned: {toggle:?}"
+        );
+        assert!(logo[0] - (toggle[0] + toggle[2]) <= 10.0);
+        let (search, _) = rt.presented("thread-search").unwrap();
+        assert!(
+            search[1] >= strip[1] + strip[3],
+            "search sits in the sidebar"
+        );
+        for key in ["sidebar-toggle", "shina-logo", "active-tab"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[1] >= strip[1] && rect[1] + rect[3] <= strip[1] + strip[3] + 0.5,
@@ -5572,12 +5935,7 @@ pub(crate) mod tests {
                     rt.set_chrome_insets(chrome);
                     rt.frame(0.0);
                     rt.frame(0.25);
-                    for key in [
-                        "shina-logo",
-                        "search-toggle",
-                        "sidebar-toggle",
-                        "active-tab",
-                    ] {
+                    for key in ["shina-logo", "sidebar-toggle", "active-tab"] {
                         if let Some((rect, _)) = rt.presented(key) {
                             assert!(
                                 rect[0] >= 87.5,
@@ -5810,6 +6168,8 @@ pub(crate) mod tests {
     #[test]
     fn captain_assignment_has_one_control_and_no_per_project_placeholders() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         for id in 2..=8 {
             rt.state
                 .projects
@@ -5839,6 +6199,100 @@ pub(crate) mod tests {
             "several captains can share a project"
         );
         assert!(rt.find("choose-project-1").is_some());
+    }
+
+    #[test]
+    fn settings_gear_holds_the_theme_and_projects_show_their_own_icon() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        assert!(
+            rt.find("theme-toggle").is_none(),
+            "the theme lives in settings"
+        );
+        let dark = rt.state.dark;
+        press(&mut rt, "sidebar-settings");
+        press(&mut rt, "theme-toggle");
+        assert_ne!(rt.state.dark, dark);
+        assert!(!rt.state.settings_menu);
+        // This repository ships assets/project-icon.png.
+        let project = crate::projects::Project::new(99, std::env::current_dir().unwrap());
+        assert!(
+            project
+                .icon
+                .as_ref()
+                .is_some_and(|icon| icon.ends_with("assets/project-icon.png"))
+        );
+    }
+
+    #[test]
+    fn controls_show_a_hand_and_the_workspace_picker_searches_by_keyboard() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        let (x, y) = rt.find("new-thread").unwrap();
+        rt.pointer_move(x, y);
+        rt.frame(0.1);
+        assert_eq!(rt.cursor(), rune::Cursor::Pointer);
+        let (x, y) = rt.find("thread-search").unwrap();
+        rt.pointer_move(x, y);
+        rt.frame(0.2);
+        assert_ne!(
+            rt.cursor(),
+            rune::Cursor::Pointer,
+            "fields keep their text cursor"
+        );
+
+        press(&mut rt, "new-thread");
+        let (picker, _) = rt.presented("project-picker").unwrap();
+        let middle = picker[0] + picker[2] / 2.0;
+        assert!(
+            (middle - 640.0).abs() < 2.0,
+            "the picker is a centred modal: {picker:?}"
+        );
+        assert!(
+            rt.find("close-project-picker").is_none(),
+            "no title bar or close button"
+        );
+        rt.state.picker_query.replace_text("run");
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.find("choose-no-project").is_none());
+        let threads = rt.state.threads.len();
+        let key = |key| rune::KeyEvent {
+            key,
+            mods: rune::Mods::default(),
+        };
+        rt.key(key(rune::Key::Down));
+        rt.key(key(rune::Key::Enter));
+        rt.frame(1.0);
+        assert!(rt.state.project_picker.is_none());
+        assert_eq!(rt.state.threads.len(), threads + 1);
+        let project = rt.state.current().project;
+        assert_eq!(rt.state.project(project).unwrap().name, "rune");
+    }
+
+    #[test]
+    fn a_new_roster_is_empty_and_adding_a_captain_opens_the_create_form() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        assert!(rt.state.captains.is_empty());
+        press(&mut rt, "assign-captain");
+        assert!(
+            rt.state.captain_editor.is_some(),
+            "no preset list to choose from"
+        );
+        assert!(rt.state.project_picker.is_none());
+        let editor = rt.state.captain_editor.as_mut().unwrap();
+        assert!(editor.role.text.is_empty(), "no default role");
+        editor.name.replace_text("Riku");
+        rt.invalidate();
+        rt.frame(0.5);
+        press(&mut rt, "save-captain");
+        assert_eq!(rt.state.captains.len(), 1);
+        assert_eq!(rt.state.captains[0].role, "");
+        assert!(!rt.state.captains[0].prompt().contains("Role:"));
+        assert_eq!(rt.state.current().captain, Some(0));
     }
 
     #[test]
@@ -5881,6 +6335,8 @@ pub(crate) mod tests {
     #[test]
     fn captain_picker_opens_a_separate_conversation_without_starting_pi() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
         press(&mut rt, "choose-project-1");
@@ -5900,6 +6356,8 @@ pub(crate) mod tests {
     #[test]
     fn fourth_captain_opens_from_the_picker() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
         press(&mut rt, "choose-project-1");
@@ -5912,6 +6370,8 @@ pub(crate) mod tests {
     #[test]
     fn new_captain_button_creates_a_profile_instead_of_reopening_a_preset() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.current_mut().draft.replace_text("Keep this draft");
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
@@ -5959,6 +6419,8 @@ pub(crate) mod tests {
     #[test]
     fn captain_crew_follows_its_home_and_never_enters_the_lone_thread_list() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.threads[0].title = "Parent".into();
         rt.state.threads[0].captain_home = true;
         rt.state.threads[0].captain = Some(2);
@@ -5991,6 +6453,8 @@ pub(crate) mod tests {
     #[test]
     fn archived_workers_remain_under_their_captain_and_can_be_restored() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
         let mut child = crate::model::Thread::new(3);
@@ -6025,6 +6489,8 @@ pub(crate) mod tests {
     #[test]
     fn nested_worker_alerts_cover_input_failure_and_unread_results_without_auto_expanding() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let mut child = crate::model::Thread::new(99);
         child.parent = Some(rt.state.current().id);
@@ -6157,6 +6623,8 @@ pub(crate) mod tests {
     #[test]
     fn a_named_captain_goal_wraps_without_pushing_the_composer_out_of_the_window() {
         let mut state = State::new(".".into(), false);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        state.captains = crate::captains::Captain::presets();
         state.open_captain(0);
         state.current_mut().title = "Polish the Shina workspace and keyboard navigation".into();
         state.current_mut().renamed = true;
@@ -6183,6 +6651,8 @@ pub(crate) mod tests {
     #[test]
     fn an_empty_captain_does_not_count_a_waiting_worker_as_running() {
         let mut rt = runtime(1280.0);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let mut worker = crate::model::Thread::new(99);
         worker.parent = Some(rt.state.current().id);

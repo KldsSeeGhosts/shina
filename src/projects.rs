@@ -37,6 +37,8 @@ pub struct Project {
     pub captain: Option<usize>,
     /// The designated coordinator. Older home flags remain historical metadata.
     pub captain_thread: Option<usize>,
+    /// A PNG icon found in the project, shown beside its threads as T3 Code shows favicons.
+    pub icon: Option<PathBuf>,
 }
 
 impl Project {
@@ -45,12 +47,13 @@ impl Project {
         Self {
             id,
             name: display_name(&path),
-            path,
             machine: "local".into(),
             hidden: false,
             updated: now(),
             captain: None,
             captain_thread: None,
+            icon: find_icon(&path),
+            path,
         }
     }
     pub fn to_value(&self) -> Value {
@@ -71,12 +74,38 @@ impl Project {
         if project.path.as_os_str().is_empty() || project.machine.is_empty() {
             return None;
         }
+        if project.machine != "local" {
+            project.icon = None;
+        }
         project.hidden = value["hidden"] == true;
         project.updated = value["updated"].as_u64().unwrap_or(0);
         project.captain = optional_id(&value["captain"])?;
         project.captain_thread = optional_id(&value["captainThread"])?;
         Some(project)
     }
+}
+
+/// The first PNG icon a project ships, in the places apps usually keep one. Shina's image
+/// decoder reads PNG, so ICO and SVG favicons are skipped.
+fn find_icon(root: &Path) -> Option<PathBuf> {
+    [
+        "assets/project-icon.png",
+        "favicon.png",
+        "public/favicon.png",
+        "static/favicon.png",
+        "assets/favicon.png",
+        "app/icon.png",
+        "src/app/icon.png",
+        "public/icon.png",
+        "public/logo.png",
+        "assets/icon.png",
+        "assets/logo.png",
+        "icon.png",
+        "logo.png",
+    ]
+    .iter()
+    .map(|candidate| root.join(candidate))
+    .find(|path| path.is_file())
 }
 
 fn optional_id(value: &Value) -> Option<Option<usize>> {

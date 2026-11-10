@@ -87,7 +87,6 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     } else if event.is_command('l') {
         state.current_mut().draft.focused = true;
     } else if event.is_command('k') {
-        state.search_open = true;
         state.search.focused = true;
     } else if event.is_command('=') || event.is_command('+') {
         state.step_zoom(1);
@@ -368,8 +367,7 @@ fn main() {
             }),
             ("captain-search", |state| {
                 captain_workspace_demo(state);
-                state.search_open = true;
-                state.search.replace_text("sidebar");
+                        state.search.replace_text("sidebar");
             }),
             ("thread-menu", |state| {
                 state.populate_demo();
@@ -416,6 +414,11 @@ fn main() {
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
+            }),
+            ("workspace-picker", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.open_picker(model::ProjectPicker::NewThread);
             }),
             ("new-captain", |state| {
                 state.populate_demo();

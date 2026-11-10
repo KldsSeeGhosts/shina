@@ -1628,6 +1628,8 @@ pub struct State {
     /// The open thread's "More actions" menu in the chat header.
     pub thread_menu: bool,
     pub row_menu: Option<RowTarget>,
+    /// The footer's settings menu is open.
+    pub settings_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
     pub hovered_row: Option<RowTarget>,
@@ -1660,6 +1662,10 @@ pub struct State {
     last_sweep: u64,
     last_lifecycle_clock: u64,
     pub project_picker: Option<ProjectPicker>,
+    /// The workspace picker's search text and the row the arrow keys have reached.
+    pub picker_query: TextEdit,
+    pub picker_highlight: usize,
+    pub hovered_captain: Option<usize>,
     pub activity_full: bool,
     pub show_archive: bool,
     pub sidebar: bool,
@@ -1679,7 +1685,6 @@ pub struct State {
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     pub captain_editor: Option<CaptainEditor>,
-    pub search_open: bool,
     pub settings_picker: Option<SettingsPicker>,
     pub model_search: TextEdit,
     pub updater: crate::update::Updater,
@@ -1736,6 +1741,7 @@ impl State {
             show_activity: false,
             thread_menu: false,
             row_menu: None,
+            settings_menu: false,
             row_menu_at: None,
             hovered_row: None,
             rename_thread: None,
@@ -1767,6 +1773,9 @@ impl State {
             last_sweep: 0,
             last_lifecycle_clock: 0,
             project_picker: None,
+            picker_query: TextEdit::default(),
+            picker_highlight: 0,
+            hovered_captain: None,
             activity_full: false,
             show_archive: false,
             sidebar: true,
@@ -1781,9 +1790,8 @@ impl State {
             attachment_drop_hover: false,
             captain_picker: false,
             captain_project: None,
-            captains: Captain::defaults(),
+            captains: Vec::new(),
             captain_editor: None,
-            search_open: false,
             settings_picker: None,
             model_search: TextEdit::default(),
             updater: Default::default(),
@@ -2094,6 +2102,13 @@ impl State {
             self.project_picker = None;
         }
         self.checkpoint();
+    }
+    /// Open the workspace picker with an empty search.
+    pub fn open_picker(&mut self, mode: ProjectPicker) {
+        self.project_picker = Some(mode);
+        self.picker_query = TextEdit::default();
+        self.picker_query.focused = true;
+        self.picker_highlight = 0;
     }
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
         let id = self.threads[index].id;
@@ -2738,6 +2753,10 @@ impl State {
         if let Some(captain) = self.project(Some(id)).and_then(|p| p.captain) {
             self.projects.captain_target = Some(id);
             self.open_captain(captain);
+        } else if self.captains.is_empty() {
+            self.projects.captain_target = Some(id);
+            self.captain_project = Some(Some(id));
+            self.begin_new_captain();
         } else {
             self.projects.captain_target = Some(id);
             self.captain_picker = true;
@@ -2845,6 +2864,35 @@ impl State {
             self.apply_catalog();
         }
         self.checkpoint();
+    }
+
+    /// Earlier versions seeded every roster with four named presets. Remove the ones nobody
+    /// has used or edited, and renumber the captains that remain.
+    fn drop_unused_presets(&mut self) {
+        let presets = Captain::presets();
+        let used = |id: usize| {
+            self.threads.iter().any(|t| t.captain == Some(id))
+                || self.projects.entries.iter().any(|p| p.captain == Some(id))
+        };
+        let mut remap = vec![None; self.captains.len()];
+        let mut kept = Vec::new();
+        for (id, captain) in self.captains.iter().enumerate() {
+            if presets.contains(captain) && !used(id) {
+                continue;
+            }
+            remap[id] = Some(kept.len());
+            kept.push(captain.clone());
+        }
+        if kept.len() == self.captains.len() {
+            return;
+        }
+        for thread in &mut self.threads {
+            thread.captain = thread.captain.and_then(|id| remap[id]);
+        }
+        for project in &mut self.projects.entries {
+            project.captain = project.captain.and_then(|id| remap[id]);
+        }
+        self.captains = kept;
     }
 
     pub fn begin_new_captain(&mut self) {
@@ -3866,7 +3914,7 @@ impl State {
     }
 
     fn restore_global(&mut self, index: &Value) -> Result<(), String> {
-        let Some(profiles) = index["captains"].as_array().filter(|p| !p.is_empty()) else {
+        let Some(profiles) = index["captains"].as_array() else {
             return Err("The saved captain profiles are invalid.".into());
         };
         let captains: Option<Vec<Captain>> = profiles.iter().map(Captain::from_value).collect();
@@ -4030,6 +4078,7 @@ impl State {
             }
             self.captains = captains;
             self.projects.entries = projects;
+            self.drop_unused_presets();
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             self.active = self
@@ -4313,6 +4362,7 @@ impl State {
     }
     pub fn populate_demo(&mut self) {
         self.demo = true;
+        self.captains = Captain::presets();
         self.threads.clear();
         let mut thread = Thread::new(1);
         thread.title = "Fix the reconnect listener".into();
@@ -4996,8 +5046,40 @@ mod tests {
     }
 
     #[test]
+    fn restoring_drops_unused_presets_and_renumbers_the_captains_that_remain() {
+        let mut old = State::new(".".into(), false);
+        old.captains = crate::captains::Captain::presets();
+        let mut custom = old.captains[0].clone();
+        custom.name = "Riku".into();
+        old.captains.push(custom);
+        // Sable (2) has a home; Riku (4) is custom; the other presets are untouched.
+        old.open_captain(2);
+        let sable_home = old.current().id;
+        let index = old.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&index).unwrap();
+        let names: Vec<_> = restored.captains.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Sable", "Riku"]);
+        let home = restored
+            .threads
+            .iter()
+            .find(|t| t.id == sable_home)
+            .unwrap();
+        assert_eq!(home.captain, Some(0));
+        assert!(
+            restored
+                .projects
+                .entries
+                .iter()
+                .all(|p| p.captain.is_none_or(|id| id < 2))
+        );
+    }
+
+    #[test]
     fn all_captain_homes_restore_without_demoting_or_settling_and_keep_their_crew() {
         let mut old = State::new(".".into(), false);
+        // Rosters start empty; this test restores homes for the earlier named presets.
+        old.captains = crate::captains::Captain::presets();
         for captain in 0..4 {
             old.open_captain(captain);
         }
@@ -5295,7 +5377,7 @@ mod tests {
         state.new_thread_in(Some(3));
         state.current_mut().draft.replace_text("Project B work");
         state.project_scope = ProjectScope::Project(3);
-        state.project_picker = Some(ProjectPicker::NewThread);
+        state.open_picker(ProjectPicker::NewThread);
         state.new_thread_in(Some(2));
         assert_eq!(state.current().id, draft, "the blank draft is reused");
         assert!(state.project_picker.is_none());
@@ -5356,7 +5438,7 @@ mod tests {
         state.new_thread_in(None);
         state.current_mut().draft.replace_text("Keep this draft");
         state.select_thread(0);
-        state.project_picker = Some(ProjectPicker::NewThread);
+        state.open_picker(ProjectPicker::NewThread);
         state.new_thread_in(Some(state.projects.entries.len()));
         let blank = state.current().id;
         assert!(state.current().blank_draft());
@@ -5867,6 +5949,8 @@ mod tests {
     #[test]
     fn saved_state_round_trips_drafts_images_tabs_projects_captains_and_sessions() {
         let mut state = State::new(PathBuf::new(), false);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        state.captains = crate::captains::Captain::presets();
         let base = crate::store::directory().unwrap().join("round-trip");
         std::fs::create_dir_all(&base).unwrap();
         // Two projects, three threads, two drafts, one image reference and two tabs.
@@ -7939,6 +8023,8 @@ mod tests {
     #[test]
     fn creating_and_editing_a_captain_preserves_conversations_and_drafts() {
         let mut state = State::new(".".into(), false);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        state.captains = crate::captains::Captain::presets();
         state
             .current_mut()
             .draft
@@ -7993,6 +8079,8 @@ mod tests {
     #[test]
     fn duplicate_names_and_busy_captain_edits_do_not_save() {
         let mut state = State::new(".".into(), false);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        state.captains = crate::captains::Captain::presets();
         state.begin_new_captain();
         state
             .captain_editor
@@ -8067,7 +8155,7 @@ mod tests {
         )
         .unwrap();
         let wake: Waker = Arc::new(|| {});
-        let mut profiles = Captain::defaults();
+        let mut profiles = Captain::presets();
         profiles[2].name = "Atlas".into();
         for (i, workspace) in [&a, &b, &missing].into_iter().enumerate() {
             let index_path = crate::store::legacy_path(&directory, workspace);
@@ -8213,6 +8301,8 @@ mod tests {
     #[test]
     fn captains_share_projects_and_mcp_lists_only_the_callers_crew() {
         let mut state = State::new(".".into(), false);
+        // Rosters start empty; these tests exercise the earlier named presets.
+        state.captains = crate::captains::Captain::presets();
         state.open_captain(0);
         let first = state.current().id;
         state.open_captain(2);
