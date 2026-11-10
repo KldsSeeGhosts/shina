@@ -1,0 +1,136 @@
+name: Build and publish updates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shina-updates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.98.1
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Test release tooling
+        run: node --test tools/ci-release.test.mjs
+      - name: Assign the build version
+        id: version
+        run: node tools/ci-release.mjs plan "$GITHUB_RUN_NUMBER"
+
+  build:
+    name: Check and build ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2025
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install the checked Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ matrix.platform }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Prepare the version without creating a source commit
+        env:
+          BUILD_VERSION: ${{ needs.plan.outputs.version }}
+        run: node tools/ci-release.mjs prepare "$BUILD_VERSION"
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Rust tests without paid integrations
+        run: cargo test --locked --quiet
+      - name: Run local JavaScript fixtures
+        run: node --test tools/*.test.mjs experiments/herdr/tests/*.test.mjs
+      - name: Check Rust warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build the app
+        run: cargo build --locked --release
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p target/release-package
+          cp target/release/shina.exe target/release-package/shina.exe
+      - name: Package and verify the Mac app
+        if: runner.os == 'macOS'
+        run: sh tools/package-macos.sh target/release/shina
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: update-${{ matrix.platform }}
+          path: |
+            target/release-package/shina.exe
+            target/release-package/Shina-macos-*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish the complete update
+    needs: [plan, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: update-*
+          merge-multiple: true
+          path: target/release-assets
+      - name: Publish only a complete, current main build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_VERSION: ${{ needs.plan.outputs.version }}
+        run: node tools/ci-release.mjs publish "$BUILD_VERSION"
