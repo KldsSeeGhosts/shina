@@ -285,7 +285,7 @@ fn cleanup_prepared(target: &InstalledTarget, keep: Option<&PreparedUpdate>) {
 #[cfg(windows)]
 pub fn start_windows_helper(update: &PreparedUpdate) -> Result<(), String> {
     if update.target.path()
-        != &install::install_dir()
+        != install::install_dir()
             .ok_or("No install folder.")?
             .join("shina.exe")
     {
