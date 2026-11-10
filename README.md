@@ -2,7 +2,17 @@
 
 A native desktop chat workspace built with [Rune](https://github.com/anomalyco/rune) and the [Pi coding agent](https://github.com/earendil-works/pi). Shina is a working-name prototype, not a T3 Code or Capy client.
 
-The interface is entirely Rune. Pi runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
+The standalone app's interface is entirely Rune. Pi runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
+
+## Native Herdr workspace on macOS
+
+The [Shina-on-Herdr workspace](experiments/herdr/workspace/README.md) combines
+native Herdr Chat, T3 thread management, and Shina's theme. It runs separately
+from the Rune app and preserves the existing provider configuration.
+
+```sh
+node experiments/herdr/workspace.mjs open
+```
 
 ## Run on Windows
 
@@ -96,7 +106,7 @@ If automatic Pi discovery fails, set `SHINA_PI_CLI` to the full path of Pi's CLI
 
 - Native chat with streamed text, selectable Markdown, syntax-highlighted code blocks, and a bottom composer. Sending immediately adds the submitted message without waiting for process startup.
 - CPA catalog model selection and model-specific reasoning levels through Pi RPC. Pi's existing CPA default is used for new sessions.
-- A native sidebar and chat reconstruction with variable Inter typography, light/dark palettes, compact tabs, search, and an optional overview pane.
+- A native sidebar with warm light/dark palettes, compact tabs, search, and an optional overview pane. Installed Anthropic Sans and Serif are preferred for controls and replies. Bundled Inter and Source Serif 4 cover machines without those fonts. Code keeps the platform's monospace font.
 - Four crew captains, each an original 40x40 pixel-art portrait that reacts to the crew's live state: Normal when ready, Determined while working, Surprised when a thread needs you, Dizzy after a failure, and Happy when settled. The set is Ember, Juniper, Sable, and Pip.
 - Captains are persistent coordinators with their own home conversations and crew, separate from lone threads. Several captains can share a project, and a captain can have no project. New-captain creation suggests a project without a captain. Captain homes never enter thread shelves or thread search. Opening a captain shows its crew beneath it. Opening crew highlights the captain. Crew approvals surface on the parent row; questions stay with the coordinator.
 - Independent Pi processes for active threads. Switching threads preserves their drafts and leaves other work running. Shina releases processes after 30 idle minutes and resumes their saved session on the next send.
@@ -200,12 +210,20 @@ cargo run -- --demo --snap artifacts\shina-light.png --size 1280x840 --scale 1
 cargo run -- --demo --scene dark --snap artifacts\shina-dark.png --size 1280x840 --scale 1
 cargo run -- --demo --snap artifacts\shina-narrow.png --size 620x720 --scale 1
 cargo run -- --demo --scene captain --snap artifacts\shina-captain.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-workspace --snap artifacts\shina-captain-workspace.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-workspace-dark --snap artifacts\shina-captain-workspace-dark.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-search --snap artifacts\shina-captain-search.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-crews-dark --snap artifacts\shina-captain-crews.png --size 1280x840 --scale 1
 cargo run -- --demo --scene picker --snap artifacts\shina-picker.png --size 1280x840 --scale 1
 cargo run -- --demo --scene projects --snap artifacts\shina-projects.png --size 1280x840 --scale 1
 cargo run -- --demo --scene clone --snap artifacts\shina-clone.png --size 1280x840 --scale 1
 cargo run -- --demo --scene sidebar-narrow --snap artifacts\shina-sidebar-narrow.png --size 620x720 --scale 1
 cargo run -- --demo --scene collapsed --snap artifacts\shina-collapsed.png --size 1280x840 --scale 1
+cargo run -- --demo --scene empty --snap artifacts\shina-empty.png --size 1280x840 --scale 1
+cargo run -- --demo --scene empty-dark --snap artifacts\shina-empty-dark.png --size 1280x840 --scale 1
 ```
+
+The [workspace design notes](docs/workspace-design.md) record the Claude Desktop reference, font sources, and this pass's design choices.
 
 ## Implementation and limits
 

@@ -1,0 +1,60 @@
+{
+  "id": "shina-root",
+  "name": "Shina",
+  "type": "column",
+  "titlebar": "none",
+  "traffic_lights": [14, 14],
+  "theme": { "light": "shina-light", "dark": "shina-dark" },
+  "ui_font": "Anthropic Sans Variable Text",
+  "font": "Menlo",
+  "font_size": 13,
+  "background": "chrome",
+  "preview": "layouts/shina-preview.svg",
+  "children": [
+    {
+      "id": "shina-titlebar",
+      "type": "block",
+      "size": { "px": 44 },
+      "window_drag": true,
+      "content": { "mod": "shina-native", "props": { "role": "header" } }
+    },
+    {
+      "id": "shina-body",
+      "type": "row",
+      "padding": [0, 8],
+      "gap": 6,
+      "children": [
+        {
+          "id": "sidebar",
+          "type": "block",
+          "size": { "px": 250 },
+          "min": 190,
+          "max": 380,
+          "content": { "mod": "shina-native", "props": { "role": "sidebar" } }
+        },
+        {
+          "id": "shina-conversation",
+          "type": "block",
+          "size": { "weight": 1 },
+          "background": "canvas",
+          "radius": 12,
+          "content": {
+            "tab": "active",
+            "pane": {
+              "gap": 6,
+              "radius": 10,
+              "background": "canvas",
+              "lone": false,
+              "header": {
+                "content": { "mod": "pane" },
+                "height": 28,
+                "position": "top",
+                "reveal": "hover"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

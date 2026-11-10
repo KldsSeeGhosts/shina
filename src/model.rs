@@ -18,6 +18,7 @@ use std::{
 
 /// The label shown when a thread uses whatever model Pi is configured with.
 pub const DEFAULT_MODEL: &str = "Default model";
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
 const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct Injection {
@@ -1756,7 +1757,7 @@ impl State {
             drop_rects: Default::default(),
             viewport_height: 720.0,
             viewport_width: 1280.0,
-            sidebar_width: 232.0,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_viewport_height: 0.0,
             ui_store: None,
             last_sweep: 0,
@@ -1951,6 +1952,88 @@ impl State {
         });
         threads.into_iter().map(|(i, _)| i).collect()
     }
+    /// Coordinators share the same workspace and search scope as standalone threads.
+    /// In the archive, keep a home visible when it owns archived worker chats.
+    pub fn sidebar_captains(&self) -> Vec<usize> {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|(_, home)| self.is_captain_home(home) && self.in_scope(home))
+            .filter(|(_, home)| {
+                let children = || {
+                    self.threads.iter().filter(|child| {
+                        child.parent == Some(home.id) && child.archived() == self.show_archive
+                    })
+                };
+                let own_match =
+                    home.archived() == self.show_archive && self.thread_search_matches(home);
+                if self.show_archive {
+                    own_match
+                        || children().any(|child| {
+                            self.thread_search_matches(home) || self.thread_search_matches(child)
+                        })
+                } else {
+                    !home.archived()
+                        && (own_match || children().any(|child| self.thread_search_matches(child)))
+                }
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+    pub fn thread_search_matches(&self, thread: &Thread) -> bool {
+        let search = self.search.text.to_lowercase();
+        thread.title.to_lowercase().contains(&search)
+            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
+            || thread
+                .messages
+                .iter()
+                .any(|message| message.text.to_lowercase().contains(&search))
+            || self.is_captain_home(thread)
+                && thread.captain.is_some_and(|captain| {
+                    self.captains[captain].name.to_lowercase().contains(&search)
+                })
+    }
+    /// Whether a captain shows its whole crew: while it or one of its workers is open, while
+    /// searching, and in the archive.
+    pub fn captain_expanded(&self, home: usize) -> bool {
+        home == self.selected_row() || !self.search.text.is_empty() || self.show_archive
+    }
+    /// Workers stay inside their captain. Alerts never expand a collapsed crew.
+    pub fn visible_captain_workers(&self, home: usize) -> Vec<usize> {
+        if !self.captain_expanded(home) {
+            return vec![];
+        }
+        let Some(parent) = self.threads.iter().find(|thread| thread.id == home) else {
+            return vec![];
+        };
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| {
+                child.parent == Some(home)
+                    && child.archived() == self.show_archive
+                    && (self.thread_search_matches(parent) || self.thread_search_matches(child))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+    /// Live or archived workers, matching the current view, whether shown or not.
+    pub fn captain_worker_count(&self, home: usize) -> usize {
+        self.threads
+            .iter()
+            .filter(|child| child.parent == Some(home) && child.archived() == self.show_archive)
+            .count()
+    }
+    /// Keyboard traversal follows the rows that the sidebar actually displays.
+    pub fn sidebar_navigation(&self) -> Vec<usize> {
+        let mut rows = vec![];
+        for index in self.sidebar_captains() {
+            rows.push(index);
+            rows.extend(self.visible_captain_workers(self.threads[index].id));
+        }
+        rows.extend(self.visible_sidebar_threads());
+        rows
+    }
     /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
     /// whatever it had when it was opened.
     pub fn draft_listed(&self, t: &Thread) -> bool {
@@ -2083,12 +2166,7 @@ impl State {
             .filter(|i| {
                 let t = &self.threads[*i];
                 if !self.search.text.is_empty() {
-                    let search = self.search.text.to_lowercase();
-                    return t.title.to_lowercase().contains(&search)
-                        || self.draft_listed(t) && t.draft.text.to_lowercase().contains(&search)
-                        || t.messages
-                            .iter()
-                            .any(|m| m.text.to_lowercase().contains(&search));
+                    return self.thread_search_matches(t);
                 }
                 let section = self.thread_section(t, lifecycle::now());
                 let shelf = match section {
@@ -4062,7 +4140,7 @@ impl State {
                     .ok_or("Invalid sidebar width.")
             })
             .transpose()?
-            .unwrap_or(232.0);
+            .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
@@ -4384,7 +4462,7 @@ impl State {
             .into_iter()
             .enumerate()
             .map(|(i, name)| {
-                let mut project = Project::new(i + 1, PathBuf::from(format!(r"D:\AiStack\{name}")));
+                let mut project = Project::new(i + 1, PathBuf::from("/workspaces").join(name));
                 project.captain = Some(i);
                 project.captain_thread = Some(i + 7);
                 project.updated = crate::projects::now().saturating_sub(i as u64 * 120);
@@ -4837,6 +4915,124 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captain_scope_search_and_keyboard_order_share_the_visible_hierarchy() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        state.project_scope = ProjectScope::Project(1);
+        assert_eq!(state.sidebar_captains(), vec![6]);
+        assert!(
+            state
+                .sidebar_threads()
+                .iter()
+                .all(|i| state.threads[*i].project == Some(1))
+        );
+        state.threads[0].parent = Some(7);
+        state.threads[0].delegated = true;
+        state.threads[0].messages.push(Message {
+            role: "Pi",
+            text: "A unique worker transcript phrase".into(),
+            images: vec![],
+        });
+        state.search.replace_text("unique worker");
+        assert_eq!(state.sidebar_captains(), vec![6]);
+        assert_eq!(state.visible_captain_workers(7), vec![0]);
+        assert_eq!(state.sidebar_navigation(), vec![6, 0]);
+        state.search.replace_text("Juniper");
+        assert!(
+            state.sidebar_navigation().is_empty(),
+            "search cannot escape workspace scope"
+        );
+        state.search.replace_text("");
+        state.project_scope = ProjectScope::NoProject;
+        assert!(state.sidebar_captains().is_empty());
+        assert!(
+            state
+                .sidebar_threads()
+                .iter()
+                .all(|i| state.threads[*i].project.is_none())
+        );
+    }
+
+    #[test]
+    fn collapsed_captains_keep_all_workers_nested_even_when_they_need_attention() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        state.project_scope = ProjectScope::Project(1);
+        for index in [0, 1] {
+            state.threads[index].parent = Some(7);
+            state.threads[index].delegated = true;
+        }
+        // Thread 2 has an unread result; thread 1 has been read.
+        state.threads[0].life.last_completed_at = Some(1);
+        state.threads[0].life.last_visited_at = Some(2);
+        let solo = state.threads.iter().position(|t| t.id == 6).unwrap();
+        state.threads[solo].project = Some(1);
+        state.select_thread(solo);
+        assert!(!state.captain_expanded(7));
+        assert!(state.visible_captain_workers(7).is_empty());
+        assert_eq!(state.captain_worker_count(7), 2);
+        state.threads[1].life.last_visited_at = state.threads[1].life.last_completed_at;
+        assert!(state.visible_captain_workers(7).is_empty());
+        state.threads[0].request = Some(serde_json::json!({"method": "confirm"}));
+        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.row_attention(&state.threads[6]));
+        assert_eq!(state.sidebar_navigation()[0], 6);
+        assert!(!state.sidebar_navigation().contains(&0));
+        state.threads[0].request = None;
+        state.threads[0].status = Status::Failed;
+        assert!(state.visible_captain_workers(7).is_empty());
+        state.threads[0].status = Status::Ready;
+        state.threads[0].request = Some(serde_json::json!({"method": "input"}));
+        assert!(state.visible_captain_workers(7).is_empty());
+        state.select_thread(6);
+        assert!(state.captain_expanded(7));
+        assert_eq!(state.visible_captain_workers(7), vec![0, 1]);
+    }
+
+    #[test]
+    fn settling_a_worker_preserves_its_captain_while_solo_threads_use_the_settled_shelf() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        state.threads[0].parent = Some(7);
+        state.threads[0].delegated = true;
+        state.select_thread(6);
+        state.settle_thread(1);
+        assert!(state.threads[0].life.settled());
+        assert_eq!(state.threads[0].parent, Some(7));
+        assert!(state.visible_captain_workers(7).contains(&0));
+        assert!(!state.sidebar_threads().contains(&0));
+        state.undo_thread_action();
+        assert!(!state.threads[0].life.settled());
+        state.settle_thread(6);
+        assert!(state.threads[5].life.settled());
+        assert_eq!(
+            state.thread_section(&state.threads[5], lifecycle::now()),
+            Section::Settled
+        );
+        state.shelves[2] = true;
+        assert!(state.visible_sidebar_threads().contains(&5));
+        state.settle_thread(6);
+        assert!(!state.threads[5].life.settled());
+    }
+
+    #[test]
+    fn archive_search_finds_worker_transcripts_without_archiving_the_captain() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        state.threads[0].parent = Some(7);
+        state.threads[0].delegated = true;
+        state.threads[0].life.archived_at = Some(1);
+        state.search.replace_text("duplicate listener");
+        state.show_archive = true;
+        assert_eq!(state.sidebar_captains(), vec![6]);
+        assert_eq!(state.visible_captain_workers(7), vec![0]);
+        assert!(!state.threads[6].archived());
+        assert!(state.visible_sidebar_threads().is_empty());
+        state.search.replace_text("not present");
+        assert!(state.sidebar_navigation().is_empty());
+    }
 
     #[test]
     fn all_captain_homes_restore_without_demoting_or_settling_and_keep_their_crew() {
