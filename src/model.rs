@@ -3,7 +3,7 @@ use crate::backend::{Event, HostLink, Pi};
 use crate::captains::{Captain, CaptainEditor};
 use crate::context::ContextMeter;
 use crate::lifecycle::{
-    self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep, Working,
+    self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep,
 };
 use crate::projects::{Project, ProjectId};
 use crate::session::{AgentModel, Catalog, IDLE_TIMEOUT, START_TIMEOUT};
@@ -117,6 +117,7 @@ impl Message {
     }
 }
 
+#[derive(Clone)]
 pub struct Tool {
     pub id: String,
     pub name: String,
@@ -239,7 +240,6 @@ pub struct Thread {
     pub reply: TextEdit,
     pub session: Option<String>,
     pub life: Lifecycle,
-    pub working: Working,
     pub started: Option<Instant>,
     pub elapsed: Option<u64>,
     pub captain: Option<usize>,
@@ -413,7 +413,6 @@ impl Thread {
             reply: TextEdit::default(),
             session: None,
             life: Lifecycle::new(lifecycle::now()),
-            working: Working::default(),
             started: None,
             elapsed: None,
             captain: None,
@@ -1019,9 +1018,10 @@ impl Thread {
             .rposition(|message| message.role != "Pi")
             .map_or(0, |index| index + 1);
         if self.work.last().is_none_or(|work| work.start != start) {
+            // A finished turn folds its steps into one "Worked for" line, as Cursor does.
             self.work.push(AssistantWork {
                 start,
-                expanded: true,
+                expanded: false,
                 elapsed: None,
             });
         }
@@ -1628,6 +1628,8 @@ pub struct State {
     /// The open thread's "More actions" menu in the chat header.
     pub thread_menu: bool,
     pub row_menu: Option<RowTarget>,
+    /// Where a right-click opened the row menu, in window points.
+    pub row_menu_at: Option<(f32, f32)>,
     pub hovered_row: Option<RowTarget>,
     pub rename_thread: Option<usize>,
     pub rename_edit: TextEdit,
@@ -1637,7 +1639,8 @@ pub struct State {
     pub scope_additional: Vec<ProjectId>,
     pub selected_threads: Vec<usize>,
     pub selection_anchor: Option<usize>,
-    pub shelves: [bool; 3],
+    /// Whether the Snoozed and Settled shelves are open.
+    pub shelves: [bool; 2],
     pub settled_visible: usize,
     pub undo: Option<UndoNotice>,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
@@ -1733,6 +1736,7 @@ impl State {
             show_activity: false,
             thread_menu: false,
             row_menu: None,
+            row_menu_at: None,
             hovered_row: None,
             rename_thread: None,
             rename_edit: TextEdit::default(),
@@ -1742,7 +1746,7 @@ impl State {
             scope_additional: vec![],
             selected_threads: vec![],
             selection_anchor: None,
-            shelves: [false; 3],
+            shelves: [false; 2],
             settled_visible: 10,
             undo: None,
             opened_draft: None,
@@ -1938,15 +1942,7 @@ impl State {
             self.draft_listed(b)
                 .cmp(&self.draft_listed(a))
                 .then_with(|| sa.cmp(&sb))
-                .then_with(|| {
-                    lifecycle::compare(
-                        sa,
-                        &a.life,
-                        &b.life,
-                        a.working.returned_at,
-                        b.working.returned_at,
-                    )
-                })
+                .then_with(|| lifecycle::compare(sa, &a.life, &b.life))
                 .then_with(|| a.id.cmp(&b.id))
                 .then_with(|| a.machine.cmp(&b.machine))
         });
@@ -2134,19 +2130,7 @@ impl State {
                 Section::Active
             };
         }
-        lifecycle::section(
-            &t.life,
-            at,
-            t.machine == "local"
-                && (t.working.was_working || t.status == Status::Running && !self.row_attention(t)),
-        )
-    }
-    pub fn row_attention(&self, t: &Thread) -> bool {
-        t.actionable()
-            || self.threads.iter().any(|c| {
-                c.parent == Some(t.id)
-                    && c.request.as_ref().is_some_and(|r| r["method"] == "confirm")
-            })
+        lifecycle::section(&t.life, at)
     }
     pub fn row_pending(&self, t: &Thread) -> bool {
         t.request.is_some()
@@ -2170,16 +2154,15 @@ impl State {
                 }
                 let section = self.thread_section(t, lifecycle::now());
                 let shelf = match section {
-                    Section::Working => Some(0),
-                    Section::Snoozed => Some(1),
-                    Section::Settled => Some(2),
+                    Section::Snoozed => Some(0),
+                    Section::Settled => Some(1),
                     _ => None,
                 };
                 if let Some(shelf) = shelf {
                     if !self.shelves[shelf] {
                         return t.id == self.selected_row();
                     }
-                    if shelf == 2 {
+                    if section == Section::Settled {
                         settled += 1;
                         return settled <= self.settled_visible || t.id == self.selected_row();
                     }
@@ -2403,7 +2386,6 @@ impl State {
             let key = self.first_pin_key(id);
             self.threads[index].life.pin(lifecycle::now(), Some(key));
         }
-        self.threads[index].working = Working::default();
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
@@ -2434,7 +2416,6 @@ impl State {
             self.tabs.retain(|t| *t != id);
             self.advance_parked(id);
         }
-        self.threads[index].working = Working::default();
         self.checkpoint();
     }
     fn first_pin_key(&mut self, except: usize) -> String {
@@ -2450,8 +2431,6 @@ impl State {
                 Section::Pinned,
                 &self.threads[*a].life,
                 &self.threads[*b].life,
-                0,
-                0,
             )
         });
         let after = pins
@@ -2517,7 +2496,6 @@ impl State {
             self.threads[i].disconnect();
             self.advance_parked(id);
         }
-        self.threads[i].working = Working::default();
         self.checkpoint();
     }
     fn advance_parked(&mut self, id: usize) {
@@ -2595,7 +2573,6 @@ impl State {
         let i = self.threads.iter().position(|t| t.id == id).unwrap();
         self.remember(Action::Snooze, i);
         self.threads[i].life.snooze(lifecycle::now(), until);
-        self.threads[i].working = Working::default();
         self.snooze_menu = None;
         self.advance_parked(id);
         self.checkpoint();
@@ -2608,7 +2585,6 @@ impl State {
             .find(|t| t.id == id && t.machine == "local")
         {
             t.life.unsnooze(lifecycle::now());
-            t.working = Working::default();
         }
         self.checkpoint();
     }
@@ -2701,8 +2677,6 @@ impl State {
                         Section::Pinned,
                         &self.threads[*a].life,
                         &self.threads[*b].life,
-                        0,
-                        0,
                     )
                 });
                 let place = before
@@ -2731,7 +2705,6 @@ impl State {
             DropPlan::Wake => self.unsnooze_thread(id),
             DropPlan::None => return,
         }
-        self.threads[i].working = Working::default();
         self.checkpoint();
     }
     /// Called each minute and after run-end events. PR integration can call this same hook.
@@ -2758,7 +2731,6 @@ impl State {
         for (i, stamp) in &eligible {
             self.threads[*i].life.settle(*stamp);
             self.threads[*i].disconnect();
-            self.threads[*i].working = Working::default();
         }
         !eligible.is_empty()
     }
@@ -4107,7 +4079,7 @@ impl State {
     }
     fn ui_snapshot(&self) -> Value {
         json!({
-            "version":1, "shelves":self.shelves, "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
@@ -4128,8 +4100,11 @@ impl State {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
         }
-        self.shelves =
+        // The first entry belonged to the removed Working shelf. It is still written so
+        // earlier versions can read the file.
+        let shelves: [bool; 3] =
             serde_json::from_value(ui["shelves"].clone()).map_err(|_| "Invalid shelf state.")?;
+        self.shelves = [shelves[1], shelves[2]];
         self.sidebar = ui["sidebar"].as_bool().ok_or("Invalid sidebar state.")?;
         self.sidebar_width = ui
             .get("sidebarWidth")
@@ -4496,7 +4471,7 @@ impl State {
             .life
             .snooze(lifecycle::now(), lifecycle::now() + 10_800_000);
         self.threads[4].life.settle(lifecycle::now() - 86_400_000);
-        self.shelves = [false; 3];
+        self.shelves = [false; 2];
         self.undo = None;
         self.tabs = vec![1, 3, 10];
     }
@@ -4649,11 +4624,6 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     let at = lifecycle::now();
-    let attention: Vec<_> = state
-        .threads
-        .iter()
-        .map(|t| state.row_attention(t))
-        .collect();
     let early_wake: Vec<_> = state
         .threads
         .iter()
@@ -4671,20 +4641,11 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         {
             changed = true;
         }
-        let previous = t.working.was_working;
         if t.life.snoozed(at) && early_wake[i] {
             // Store the early edge once. Answering the request must not re-snooze it
             // or make the scheduled wake display a second Woke notification.
             t.life.last_snooze_wake_at = Some(at);
             changed = true;
-        }
-        let skip =
-            attention[i] || t.pinned() || t.life.settled() || t.life.snoozed(at) || t.archived();
-        let working = t.status == Status::Running && t.machine == "local";
-        t.working.observe(at, working, skip);
-        changed |= previous != t.working.was_working;
-        if let Some(deadline) = t.working.deadline {
-            tx.wake_after(Duration::from_millis(deadline.saturating_sub(at)));
         }
         if let Some(wake) = t.life.snoozed_until.filter(|wake| *wake > at) {
             tx.wake_after(Duration::from_millis(wake - at));
@@ -4977,7 +4938,7 @@ mod tests {
         assert!(state.visible_captain_workers(7).is_empty());
         state.threads[0].request = Some(serde_json::json!({"method": "confirm"}));
         assert!(state.visible_captain_workers(7).is_empty());
-        assert!(state.row_attention(&state.threads[6]));
+        assert!(state.row_pending(&state.threads[6]));
         assert_eq!(state.sidebar_navigation()[0], 6);
         assert!(!state.sidebar_navigation().contains(&0));
         state.threads[0].request = None;
@@ -5011,7 +4972,7 @@ mod tests {
             state.thread_section(&state.threads[5], lifecycle::now()),
             Section::Settled
         );
-        state.shelves[2] = true;
+        state.shelves[1] = true;
         assert!(state.visible_sidebar_threads().contains(&5));
         state.settle_thread(6);
         assert!(!state.threads[5].life.settled());
@@ -5200,9 +5161,9 @@ mod tests {
         crew.parent = Some(1);
         crew.request = Some(json!({"method":"input"}));
         state.threads.push(crew);
-        assert!(!state.row_attention(&state.threads[0]));
+        assert!(!state.row_pending(&state.threads[0]));
         state.threads[1].request = Some(json!({"method":"confirm"}));
-        assert!(state.row_attention(&state.threads[0]));
+        assert!(state.row_pending(&state.threads[0]));
         state.threads[0].life.snooze(1, lifecycle::now() + 100000);
         poll(&mut state, 0.0, &mut Tx::default());
         assert!(!state.threads[0].life.snoozed(lifecycle::now()));
@@ -5255,7 +5216,7 @@ mod tests {
     #[test]
     fn ui_state_is_separate_and_corrupt_lifecycle_never_enables_saving() {
         let mut state = State::new(".".into(), false);
-        state.shelves = [true, false, true];
+        state.shelves = [false, true];
         state.sidebar = false;
         state
             .current_mut()
@@ -5266,7 +5227,7 @@ mod tests {
         restored.restore_global(&state.snapshot()).unwrap();
         restored.restore_ui(&state.ui_snapshot()).unwrap();
         assert_eq!(restored.current().draft.text, "Keep this unsent draft");
-        assert_eq!(restored.shelves, [true, false, true]);
+        assert_eq!(restored.shelves, [false, true]);
         assert!(!restored.sidebar);
         assert!(state.snapshot().get("projectScope").is_none());
         let mut damaged = state.snapshot();
@@ -7273,7 +7234,7 @@ mod tests {
                 .all(|thought| thought.done && thought.duration_ms.is_none())
         );
         assert_eq!(thread.work.len(), 1);
-        assert!(thread.work[0].expanded);
+        assert!(!thread.work[0].expanded, "restored turns start folded");
         assert!(thread.work[0].elapsed.is_none());
     }
 

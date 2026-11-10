@@ -378,7 +378,7 @@ fn main() {
             }),
             ("shelves-expanded", |state| {
                 state.populate_demo();
-                state.shelves = [true; 3];
+                state.shelves = [true; 2];
             }),
             ("snooze-menu", |state| {
                 state.populate_demo();

@@ -205,31 +205,22 @@ impl Lifecycle {
 pub enum Section {
     Pinned,
     Active,
-    Working,
     Snoozed,
     Settled,
 }
-pub fn section(life: &Lifecycle, now: u64, working: bool) -> Section {
+pub fn section(life: &Lifecycle, now: u64) -> Section {
     if life.snoozed(now) {
         Section::Snoozed
     } else if life.settled() {
         Section::Settled
     } else if life.pinned_at.is_some() {
         Section::Pinned
-    } else if working {
-        Section::Working
     } else {
         Section::Active
     }
 }
 
-pub fn compare(
-    section: Section,
-    a: &Lifecycle,
-    b: &Lifecycle,
-    a_return: u64,
-    b_return: u64,
-) -> Ordering {
+pub fn compare(section: Section, a: &Lifecycle, b: &Lifecycle) -> Ordering {
     let newest = |a: u64, b: u64| b.cmp(&a);
     match section {
         Section::Pinned => match (&a.pin_order_key, &b.pin_order_key) {
@@ -239,32 +230,19 @@ pub fn compare(
             _ => newest(a.created_at, b.created_at),
         },
         Section::Active => {
-            let stamp = |l: &Lifecycle, r| {
+            let stamp = |l: &Lifecycle| {
                 [
                     l.created_at,
                     l.unsettled_at.unwrap_or(0),
                     l.last_requested_at.unwrap_or(0),
                     l.last_completed_at.unwrap_or(0),
-                    r,
                 ]
                 .into_iter()
                 .max()
                 .unwrap()
             };
-            newest(stamp(a, a_return), stamp(b, b_return))
+            newest(stamp(a), stamp(b))
         }
-        Section::Working => newest(
-            a.created_at.max(
-                a.latest_user_message_at
-                    .or(a.last_requested_at)
-                    .unwrap_or(0),
-            ),
-            b.created_at.max(
-                b.latest_user_message_at
-                    .or(b.last_requested_at)
-                    .unwrap_or(0),
-            ),
-        ),
         Section::Snoozed => a.snoozed_until.cmp(&b.snoozed_until),
         Section::Settled => {
             let stamp = |l: &Lifecycle| {
@@ -286,7 +264,7 @@ pub fn compare(
     }
 }
 
-/// Rune supplies pointer drags on Windows. Working is not draggable; timed shelves reject drops.
+/// Rune supplies pointer drags on Windows. The timed Snoozed shelf rejects drops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropPlan {
     Pin,
@@ -300,7 +278,7 @@ pub enum DropPlan {
 pub fn plan_drop(from: Section, to: Section) -> DropPlan {
     use Section::*;
     match (from, to) {
-        (Working, _) | (_, Working | Snoozed) => DropPlan::None,
+        (_, Snoozed) => DropPlan::None,
         (Pinned, Pinned) => DropPlan::ReorderPin,
         (_, Pinned) => DropPlan::Pin,
         (Pinned, Active) => DropPlan::Unpin,
@@ -373,29 +351,6 @@ pub fn spread_pin_keys(count: usize) -> Vec<String> {
             String::from_utf8(key).unwrap()
         })
         .collect()
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Working {
-    pub was_working: bool,
-    pub deadline: Option<u64>,
-    pub returned_at: u64,
-}
-impl Working {
-    pub fn observe(&mut self, now: u64, working: bool, skip: bool) -> bool {
-        if working && !skip {
-            self.was_working = true;
-            self.deadline = None;
-        } else if self.was_working {
-            let deadline = *self.deadline.get_or_insert(now + 2000);
-            if skip || now >= deadline {
-                self.was_working = false;
-                self.deadline = None;
-                self.returned_at = now;
-            }
-        }
-        self.was_working
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,14 +625,13 @@ mod tests {
     #[test]
     fn exact_section_priority_and_manual_override() {
         let mut l = Lifecycle::new(1);
-        assert_eq!(section(&l, 10, false), Section::Active);
-        assert_eq!(section(&l, 10, true), Section::Working);
+        assert_eq!(section(&l, 10), Section::Active);
         l.pin(2, Some("n".into()));
-        assert_eq!(section(&l, 10, true), Section::Pinned);
+        assert_eq!(section(&l, 10), Section::Pinned);
         l.settled_override = Some(Settled::Settled);
-        assert_eq!(section(&l, 10, true), Section::Settled);
+        assert_eq!(section(&l, 10), Section::Settled);
         l.snooze(3, 100);
-        assert_eq!(section(&l, 10, true), Section::Snoozed);
+        assert_eq!(section(&l, 10), Section::Snoozed);
         l.settle(20);
         assert_eq!(l.pinned_at, None);
         assert_eq!(l.snoozed_until, None);
@@ -693,24 +647,23 @@ mod tests {
         let mut a = Lifecycle::new(10);
         let mut b = Lifecycle::new(20);
         a.pin_order_key = Some("n".into());
-        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Less);
+        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Less);
         b.pin_order_key = Some("b".into());
-        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Greater);
+        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Greater);
         a.pin_order_key = None;
         b.pin_order_key = None;
-        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Greater);
-        assert_eq!(compare(Section::Active, &a, &b, 30, 0), Ordering::Less);
-        a.latest_user_message_at = Some(40);
-        assert_eq!(compare(Section::Working, &a, &b, 0, 0), Ordering::Less);
+        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Greater);
+        a.last_completed_at = Some(30);
+        assert_eq!(compare(Section::Active, &a, &b), Ordering::Less);
         a.snoozed_until = Some(50);
         b.snoozed_until = Some(60);
-        assert_eq!(compare(Section::Snoozed, &a, &b, 0, 0), Ordering::Less);
+        assert_eq!(compare(Section::Snoozed, &a, &b), Ordering::Less);
         a.settled_at = Some(2);
         b.settled_at = Some(1);
-        assert_eq!(compare(Section::Settled, &a, &b, 0, 0), Ordering::Less);
+        assert_eq!(compare(Section::Settled, &a, &b), Ordering::Less);
         a.settled_at = None;
         b.settled_at = None;
-        assert_eq!(compare(Section::Settled, &a, &b, 0, 0), Ordering::Less);
+        assert_eq!(compare(Section::Settled, &a, &b), Ordering::Less);
     }
 
     #[test]
@@ -734,19 +687,6 @@ mod tests {
             assert!(keys.windows(2).all(|w| w[0] < w[1]));
             assert!(keys.iter().all(|k| !k.ends_with('a')));
         }
-    }
-
-    #[test]
-    fn working_linger_and_actionable_bypass() {
-        let mut w = Working::default();
-        assert!(w.observe(10, true, false));
-        assert!(w.observe(20, false, false));
-        assert!(w.observe(2019, false, false));
-        assert!(!w.observe(2020, false, false));
-        assert_eq!(w.returned_at, 2020);
-        assert!(w.observe(2030, true, false));
-        assert!(!w.observe(2031, false, true));
-        assert_eq!(w.returned_at, 2031);
     }
 
     #[test]
@@ -830,13 +770,11 @@ mod tests {
     }
 
     #[test]
-    fn drop_plan_table_rejects_timed_targets_and_working_sources() {
+    fn drop_plan_table_rejects_timed_targets() {
         use Section::*;
-        for from in [Pinned, Active, Working, Snoozed, Settled] {
+        for from in [Pinned, Active, Snoozed, Settled] {
             assert_eq!(plan_drop(from, Snoozed), DropPlan::None);
-            assert_eq!(plan_drop(from, Working), DropPlan::None);
         }
-        assert_eq!(plan_drop(Working, Pinned), DropPlan::None);
         assert_eq!(plan_drop(Pinned, Pinned), DropPlan::ReorderPin);
         assert_eq!(plan_drop(Active, Pinned), DropPlan::Pin);
         assert_eq!(plan_drop(Pinned, Active), DropPlan::Unpin);

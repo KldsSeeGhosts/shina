@@ -24,13 +24,13 @@ cargo run
 
 Shina 0.9 keeps all your projects and chats in one window. Use Add project for **Open folder...** or **Clone repository...**. New thread opens a project picker, including **No project**. Threads from different projects run concurrently and can share the tab strip.
 
-Lone threads use the [T3 Code lifecycle](docs/t3-thread-management.md). Pinned and Active read as one list, followed by collapsed Working, Snoozed and Settled shelves. A collapsed shelf keeps the open thread visible. Working has a two-second exit grace. Settled starts with 10 rows and adds 25 per page. Shift-click projects in the scope picker to select several.
+Lone threads use the [T3 Code lifecycle](docs/t3-thread-management.md). Pinned and Active read as one list, followed by collapsed Snoozed and Settled shelves. A running thread stays in its place and shows Working. A collapsed shelf keeps the open thread visible. Settled starts with 10 rows and adds 25 per page. Hovering a row shows Snooze and Settle; right-click opens the rest of its actions at the pointer. Shift-click projects in the scope picker to select several.
 
 Settle, snooze, unpin, archive and draft discard offer a grouped five-second Undo in the sidebar footer. Snooze offers one hour, three hours, this evening, tomorrow morning, next Monday and a custom local time or duration. A completion stays snoozed. An approval, question or new failure wakes it early. Unvisited wakes show "Woke". Completed runs show "Done" only after the last visit.
 
 Inactivity settling defaults to three days. The thread menu can disable it per thread and cycle the global interval through off, 1, 3, 7, 14 and 30 days. `autoSettleAfterDays` in the index also accepts other day counts. Manually un-settling opts the thread out until its next user message. Settling releases its Pi process. Captains never auto-settle.
 
-Drag lone-thread rows into Pinned, Active or Settled. Pinned rows reorder with fractional keys. Working and Snoozed reject drops, and Working rows cannot drag. Ctrl-click selects several rows, Shift-click selects a range, and right-click opens bulk actions. Drag the sidebar separator to resize it, or double-click to reset its width.
+Drag lone-thread rows into Pinned, Active or Settled. Pinned rows reorder with fractional keys. Snoozed rejects drops. Ctrl-click selects several rows, Shift-click selects a range, and right-click opens bulk actions. Drag the sidebar separator to resize it, or double-click to reset its width.
 
 Send a message to start work. Shina prepares Pi in the background when you start a draft, or on send if needed. There is no connection step. Sending a message can consume your CPA upstream quota.
 

@@ -80,9 +80,8 @@ pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
 ];
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
-const PROSE: TextStyle = TextStyle::new(16.0, 400.0)
-    .family(rune::Family::Named(SERIF_FAMILY))
-    .lh(25.0);
+/// Assistant answers use Cursor's agent-window text: 15/24 sans with slightly tight tracking.
+const PROSE: TextStyle = TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.20);
 const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
 const HEADING: TextStyle = TextStyle::new(30.0, 450.0)
     .family(rune::Family::Named(SERIF_FAMILY))
@@ -99,9 +98,7 @@ fn body_style(wide: bool) -> TextStyle {
 }
 fn prose_style(wide: bool) -> TextStyle {
     if wide {
-        TextStyle::new(17.0, 400.0)
-            .family(rune::Family::Named(SERIF_FAMILY))
-            .lh(27.0)
+        TextStyle::new(16.0, 400.0).lh(25.0).tracking(-0.20)
     } else {
         PROSE
     }
@@ -111,6 +108,8 @@ fn measure(wide: bool) -> f32 {
 }
 const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
+/// Tool, thinking and status lines in the transcript.
+const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
 /// Height of one-line sidebar rows: navigation, workers and shelved threads.
 const SINGLE_ROW: f32 = 34.0;
 /// Workers sit a step below their captain: shorter rows on the captain's rail.
@@ -611,6 +610,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(thread_menu(s, p));
     }
     if s.row_menu.is_some() {
+        // A right-click opens the menu where it landed; the keyboard opens it beside the row.
+        if let Some((x, y)) = s.row_menu_at {
+            root = root.child(
+                el().key("row-menu-point")
+                    .absolute(x / zoom, y / zoom)
+                    .size(0.0, 0.0),
+            );
+        }
         root = root.child(row_menu(s, p));
     }
     if s.snooze_menu.is_some() {
@@ -1012,7 +1019,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     for section in [
         Section::Pinned,
         Section::Active,
-        Section::Working,
         Section::Snoozed,
         Section::Settled,
     ] {
@@ -1025,9 +1031,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             })
             .collect();
         let shelf = match section {
-            Section::Working => Some(0),
-            Section::Snoozed => Some(1),
-            Section::Settled => Some(2),
+            Section::Snoozed => Some(0),
+            Section::Settled => Some(1),
             _ => None,
         };
         if let Some(shelf) = shelf {
@@ -1036,23 +1041,24 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 continue;
             }
             if first_shelf {
-                content = content.child(spacer());
+                content = content.child(el().h(8.0));
                 first_shelf = false;
             }
             let key = format!("shelf-{section:?}");
             let title = format!("{section:?}");
             let marker = format!("drop-{section:?}");
+            let open = s.shelves[shelf];
             content = content.child(
                 row()
                     .key(&key)
                     .role("button")
                     .label(format!("{title}, {} threads", rows.len()))
                     .focusable(true)
-                    .h(30.0)
+                    .h(28.0)
                     .px(10.0)
-                    .gap(8.0)
+                    .gap(6.0)
                     .center_y()
-                    .radius(8.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .on_drawn_layout(move |s: &mut State, rect| {
                         s.drop_rects.insert(marker.clone(), rect);
@@ -1061,12 +1067,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         s.shelves[shelf] = !s.shelves[shelf];
                         s.checkpoint();
                     })
-                    .child(el().size(20.0, 20.0).center().child(icon(
-                        if s.shelves[shelf] { "chevron" } else { "open" },
-                        p.muted,
-                    )))
-                    .child(label(title, SMALL, p.muted).grow(1.0))
-                    .child(label(rows.len().to_string(), SMALL, p.muted)),
+                    .child(label(title, SMALL, p.muted))
+                    .child(label(rows.len().to_string(), SMALL, p.muted.alpha(0.7)))
+                    .child(spacer())
+                    .child(icon(if open { "chevron" } else { "open" }, p.muted)),
             );
         } else if dragging {
             let marker = format!("drop-{section:?}");
@@ -1087,7 +1091,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         for index in rows.iter().copied().filter(|i| visible.contains(i)) {
             content = content.child(thread_row(s, index, p, false));
         }
-        if section == Section::Settled && s.shelves[2] && rows.len() > s.settled_visible {
+        if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
             content = content.child(button(
                 "settled-more",
                 &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
@@ -1636,9 +1640,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .as_ref()
                     .is_some_and(|r| r["method"] == "confirm")
         });
+    let captain_home = s.is_captain_home(thread);
     let row_status = if approval || thread.request.is_some() {
         Status::Waiting
-    } else if s.is_captain_home(thread) {
+    } else if captain_home {
         s.home_status(id)
     } else {
         thread.status
@@ -1646,36 +1651,54 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let target = RowTarget::Thread(id);
     let selected = id == s.current().id || s.selected_threads.contains(&id);
     let section = s.thread_section(thread, lifecycle::now());
-    let slim = matches!(section, Section::Snoozed | Section::Settled) && !s.is_captain_home(thread);
     let hovered = s.hovered_row == Some(target);
     let draft = thread.is_draft();
-    let mut item = col()
+    let at = lifecycle::now();
+    let state_label = if approval {
+        "Approval"
+    } else if thread.request.is_some() {
+        "Input"
+    } else if row_status == Status::Running {
+        "Working"
+    } else if thread.status == Status::Waiting {
+        "Waiting"
+    } else if thread.status == Status::Failed {
+        "Failed"
+    } else if thread.life.woke(at) {
+        "Woke"
+    } else if thread.unread() {
+        "Done"
+    } else {
+        ""
+    };
+    let workspace = row_workspace(s, thread);
+    let mut item = row()
         .key(format!("thread-{}", thread.id))
         .role("button")
         .label(format!(
-            "{}, {}",
+            "{}{}, {}",
             thread.title,
+            workspace
+                .as_ref()
+                .map(|w| format!(", {w}"))
+                .unwrap_or_default(),
             if approval {
                 "needs approval"
             } else if nested && (thread.request.is_some() || thread.status == Status::Waiting) {
                 "needs input"
             } else if nested && thread.unread() && !thread.actionable() {
                 "unread result"
-            } else {
+            } else if state_label.is_empty() {
                 row_status.label()
+            } else {
+                state_label
             },
         ))
         .focusable(true)
-        .px(10.0)
-        .py(if nested { 5.0 } else { 6.0 })
-        .gap(2.0)
+        .w_full()
         .radius(8.0)
-        .min_h(30.0)
-        .justify_center()
         .fill(if selected {
             p.selected
-        } else if draft {
-            p.gold.alpha(0.06)
         } else {
             Color::TRANSPARENT
         })
@@ -1695,7 +1718,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .on_drawn_layout(move |s: &mut State, rect| {
             s.drop_rects.insert(format!("thread-{id}"), rect);
         })
-        .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
+        .on_secondary_press(move |s: &mut State, at, _| {
+            s.row_menu = Some(target);
+            s.row_menu_at = Some((at.x, at.y));
+        })
         .on_hover_change(move |s: &mut State, hovered, _| {
             if hovered {
                 s.hovered_row = Some(target);
@@ -1703,170 +1729,72 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 s.hovered_row = None;
             }
         });
-    if !nested
-        && !s.is_captain_home(thread)
-        && thread.machine == "local"
-        && section != Section::Working
-    {
+    if !nested && !captain_home && thread.machine == "local" {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
     }
 
-    let captain_home = s.is_captain_home(thread);
-    // Workers use the same lead column inside their indented parent group.
-    let lead = if nested {
-        let alert = thread.actionable() || thread.unread();
-        let mark = match row_status {
-            Status::Waiting => el().size(6.0, 6.0).radius(3.0).fill(p.gold),
-            Status::Failed | Status::Running => status_mark(row_status, p, 6.0),
-            _ if thread.unread() => el().size(6.0, 6.0).radius(3.0).fill(p.teal_text),
-            _ => status_mark(row_status, p, 6.0),
-        };
-        if alert {
-            mark.key(format!("worker-alert-{id}")).a11y_hidden()
-        } else {
-            mark.a11y_hidden()
-        }
-    } else if captain_home {
-        avatar(
-            s,
-            p,
-            thread.captain.expect("captain home"),
-            20.0,
-            s.home_status(thread.id),
-        )
+    // The mark only shows what deserves a glance: work in progress, something that needs the
+    // user, a failure, an unread result, a draft or a pin. Quiet rows leave it out.
+    let dot = |ink: Color| el().size(7.0, 7.0).radius(3.5).fill(ink);
+    let mark = if approval || thread.request.is_some() || row_status == Status::Waiting {
+        Some(dot(p.gold))
+    } else if row_status == Status::Running || row_status == Status::Failed {
+        Some(status_mark(row_status, p, 7.0))
+    } else if thread.unread() || thread.life.woke(at) {
+        Some(dot(p.teal_text))
+    } else if draft {
+        Some(icon("edit", p.muted))
+    } else if thread.pinned() && !nested {
+        Some(icon("pin", p.muted))
     } else {
-        icon(
-            if draft {
-                "edit"
-            } else if thread.pinned() {
-                "pin"
-            } else {
-                "thread"
-            },
-            if selected { p.ink } else { p.muted },
-        )
-    };
-    let mut title = row()
-        .gap(8.0)
-        .center_y()
-        .child(el().size(20.0, 20.0).center().child(lead))
-        .child(
-            label(
-                if draft && !thread.draft.text.is_empty() {
-                    thread.draft.text.lines().next().unwrap_or(&thread.title)
-                } else {
-                    &thread.title
-                },
-                if selected || thread.unread() {
-                    TextStyle::new(14.0, 520.0).tracking(-0.10)
-                } else {
-                    LABEL
-                },
-                // Quiet workers recede so the captain and anything that needs the user lead.
-                if nested && !selected && !thread.unread() && !thread.actionable() {
-                    p.muted
-                } else {
-                    p.ink
-                },
-            )
-            .truncate()
-            .grow(1.0),
-        );
-    let more = icon_button(
-        &format!("thread-more-{id}"),
-        "Thread actions",
-        "more",
-        p,
-        move |s| s.row_menu = Some(target),
+        None
+    }
+    .map(|mark| {
+        let mark = el().size(14.0, 16.0).center().child(mark.a11y_hidden());
+        if nested && (thread.actionable() || thread.unread()) {
+            mark.key(format!("worker-alert-{id}"))
+        } else {
+            mark
+        }
+    });
+    let quiet = !selected && !thread.unread() && !thread.actionable();
+    let shelved = matches!(section, Section::Snoozed | Section::Settled) && !captain_home;
+    let title = label(
+        if draft && !thread.draft.text.is_empty() {
+            thread.draft.text.lines().next().unwrap_or(&thread.title)
+        } else {
+            &thread.title
+        },
+        if nested || shelved {
+            LABEL
+        } else {
+            TextStyle::new(14.0, 520.0).tracking(-0.10)
+        },
+        // Settled, snoozed and quiet worker rows recede.
+        if quiet && (nested || shelved) {
+            p.muted
+        } else {
+            p.ink
+        },
     )
-    .opacity(if hovered || selected { 1.0 } else { 0.0 });
-    // A one-line row gives the title the space of the hidden actions button until the
-    // row is hovered or selected. Two-line rows keep it, since their title line has room.
-    let line_more = more.clone();
-    let single_line = move |item: El, title: El| {
-        item.h(if nested { CREW_ROW } else { SINGLE_ROW })
-            .child(if hovered || selected {
-                title.child(line_more)
-            } else {
-                title
-            })
-    };
+    .truncate()
+    .grow(1.0)
+    .min_w(0.0);
+
     if nested {
-        return single_line(item, title);
-    }
-    let action = if section == Section::Snoozed {
-        "Wake"
-    } else if section == Section::Settled {
-        "Un-settle"
-    } else {
-        "Settle"
-    };
-    if slim {
-        if hovered {
-            title = title.child(
-                icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
-                    if section == Section::Snoozed {
-                        s.unsnooze_thread(id);
-                    } else {
-                        s.settle_thread(id);
-                    }
-                })
-                .disabled(section != Section::Snoozed && s.lifecycle_busy(id)),
-            );
-        } else {
-            let time = if section == Section::Snoozed {
-                lifecycle::wake_label(thread.life.snoozed_until.unwrap_or(0), lifecycle::now())
-            } else {
-                relative_time(thread.life.settled_at.unwrap_or(0) / 1000).unwrap_or_default()
-            };
-            title = title.child(label(time, SMALL, p.muted));
+        let mut line = row().h(CREW_ROW).px(10.0).gap(8.0).center_y();
+        if let Some(mark) = mark {
+            line = line.child(mark);
         }
-        return single_line(item, title);
+        return item.child(line.child(title));
     }
-    let mut context = vec![];
-    if captain_home && thread.renamed {
-        context.push(s.captains[thread.captain.unwrap()].name.clone());
-    }
-    context.extend(row_workspace(s, thread));
-    // A collapsed crew names its size without revealing individual workers.
-    if captain_home && !s.captain_expanded(id) {
-        let workers = s.captain_worker_count(id);
-        if workers > s.visible_captain_workers(id).len() {
-            let noun = if workers == 1 { "worker" } else { "workers" };
-            context.push(format!("{workers} {noun}"));
-        }
-    }
-    let at = lifecycle::now();
-    let state_label = if approval {
-        "Approval"
-    } else if thread.request.is_some() {
-        "Input"
-    } else if captain_home && s.home_status(id) == Status::Running
-        || thread.status == Status::Running
-    {
-        "Working"
-    } else if thread.status == Status::Waiting {
-        "Waiting"
-    } else if thread.status == Status::Failed {
-        "Failed"
-    } else if thread.life.woke(at) {
-        "Woke"
-    } else if thread.unread() {
-        "Done"
-    } else {
-        ""
-    };
-    // The age, state or hover actions trail the context line, or the title when the row
-    // has no context left to show.
-    let mut trailing = vec![];
-    if thread.life.woke(at) {
-        trailing.push(button(&format!("thread-woke-{id}"), "Woke", p, move |s| {
-            s.threads[index].life.last_visited_at = Some(lifecycle::now());
-            s.checkpoint();
-        }));
-    } else if hovered && !captain_home {
+
+    // The status slot: hover actions, then what needs attention, then how old the row is.
+    // Hover puts Snooze and Settle where the age sat; everything else is in the right-click menu.
+    let mut slot = row().gap(2.0).center_y().h(20.0);
+    if hovered && !captain_home && thread.machine == "local" {
         if draft || !thread.draft.text.is_empty() {
-            trailing.push(icon_button(
+            slot = slot.child(icon_button(
                 &format!("thread-discard-{id}"),
                 "Discard draft",
                 "close",
@@ -1875,56 +1803,191 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             ));
         }
         if !draft {
-            trailing.push(
-                icon_button(
-                    &format!("thread-snooze-{id}"),
-                    "Snooze",
-                    "clock",
-                    p,
-                    move |s| s.open_snooze(id),
-                )
-                .disabled(!s.can_snooze(id)),
-            );
-            trailing.push(
-                icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
-                    s.settle_thread(id)
-                })
-                .disabled(s.lifecycle_busy(id)),
-            );
+            let text_action = |key: String, title: &str, glyph: &str| {
+                row()
+                    .key(key)
+                    .role("button")
+                    .label(title)
+                    .focusable(true)
+                    .h(22.0)
+                    .px(6.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(p.line)
+                    .child(tool_icon(glyph, p.muted))
+                    .child(label(title, SMALL, p.muted))
+            };
+            match section {
+                Section::Snoozed => {
+                    slot = slot.child(
+                        text_action(format!("thread-park-{id}"), "Wake", "clock")
+                            .on_press(move |s: &mut State| s.unsnooze_thread(id)),
+                    )
+                }
+                Section::Settled => {
+                    slot = slot.child(
+                        text_action(format!("thread-park-{id}"), "Un-settle", "check")
+                            .on_press(move |s: &mut State| s.settle_thread(id))
+                            .disabled(s.lifecycle_busy(id)),
+                    )
+                }
+                _ => {
+                    slot = slot
+                        .child(
+                            icon_button(
+                                &format!("thread-snooze-{id}"),
+                                "Snooze",
+                                "clock",
+                                p,
+                                move |s| s.open_snooze(id),
+                            )
+                            .disabled(!s.can_snooze(id)),
+                        )
+                        .child(
+                            text_action(format!("thread-park-{id}"), "Settle", "check")
+                                .on_press(move |s: &mut State| s.settle_thread(id))
+                                .disabled(s.lifecycle_busy(id)),
+                        )
+                }
+            }
         }
+    } else if thread.life.woke(at) {
+        slot = slot.child(
+            label("Woke", SMALL, p.teal_text)
+                .key(format!("thread-woke-{id}"))
+                .role("button")
+                .focusable(true)
+                .on_press(move |s: &mut State| {
+                    s.threads[index].life.last_visited_at = Some(lifecycle::now());
+                    s.checkpoint();
+                }),
+        );
     } else if !state_label.is_empty() {
-        trailing.push(label(
-            state_label,
-            SMALL,
-            if approval {
-                p.gold
-            } else if thread.status == Status::Failed {
-                p.danger
-            } else {
-                p.teal_text
-            },
-        ));
-    } else if let Some(age) = relative_time(thread.updated) {
-        trailing.push(label(age, SMALL, p.muted).key(format!("thread-age-{id}")));
+        let ink = if approval || row_status == Status::Waiting {
+            p.gold
+        } else if thread.status == Status::Failed {
+            p.danger
+        } else {
+            p.teal_text
+        };
+        // A working row counts up, as T3 Code's status slot does.
+        let text = match (state_label, thread.started) {
+            ("Working", Some(start)) => {
+                format!("Working {}", elapsed_label(start.elapsed().as_secs()))
+            }
+            _ => state_label.to_string(),
+        };
+        slot = slot.child(label(text, TextStyle::new(12.0, 520.0), ink));
+    } else {
+        let time = match section {
+            Section::Snoozed => Some(lifecycle::wake_label(
+                thread.life.snoozed_until.unwrap_or(0),
+                at,
+            )),
+            Section::Settled => relative_time(thread.life.settled_at.unwrap_or(0) / 1000),
+            _ => relative_time(thread.updated),
+        };
+        if let Some(time) = time {
+            slot = slot.child(label(time, SMALL, p.muted).key(format!("thread-age-{id}")));
+        }
     }
     if thread.machine != "local" {
-        trailing.push(icon("cloud", p.muted));
+        slot = slot.child(icon("cloud", p.muted));
     }
-    if context.is_empty() {
-        for el in trailing {
-            title = title.child(el);
+
+    // Captains: a portrait beside their name, with what they work in and their crew below.
+    if captain_home {
+        let mut context = vec![];
+        if thread.renamed {
+            context.push(s.captains[thread.captain.unwrap()].name.clone());
         }
-        return single_line(item, title);
+        context.extend(workspace);
+        if !s.captain_expanded(id) {
+            let workers = s.captain_worker_count(id);
+            if workers > s.visible_captain_workers(id).len() {
+                let noun = if workers == 1 { "worker" } else { "workers" };
+                context.push(format!("{workers} {noun}"));
+            }
+        }
+        let mut text = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(2.0)
+            .child(row().gap(8.0).center_y().child(title).child(slot));
+        if !context.is_empty() {
+            text = text.child(label(context.join(" · "), SMALL, p.muted).truncate());
+        }
+        return item.child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .px(10.0)
+                .py(8.0)
+                .gap(10.0)
+                .center_y()
+                .child(avatar(
+                    s,
+                    p,
+                    thread.captain.expect("captain home"),
+                    30.0,
+                    row_status,
+                ))
+                .child(text),
+        );
     }
-    let mut meta = row().gap(8.0).center_y().pl(28.0).child(
-        label(context.join(" · "), SMALL, p.muted)
+
+    // Snoozed and settled rows stay one line inside their shelves.
+    if shelved {
+        let mut line = row().h(34.0).px(10.0).gap(8.0).center_y();
+        if let Some(mark) = mark {
+            line = line.child(mark);
+        }
+        if let Some(workspace) = workspace {
+            item = item.help(format!("{} · {workspace}", thread.title));
+        }
+        return item.child(line.child(title).child(slot));
+    }
+
+    // A thread card, as T3 Code lays it out: its workspace and status on top, then the title.
+    let mut top = row().h(18.0).gap(6.0).center_y();
+    if let Some(mark) = mark {
+        top = top.child(mark);
+    }
+    top = top
+        .child(
+            label(
+                workspace.unwrap_or_else(|| {
+                    if thread.is_draft() {
+                        "Draft".into()
+                    } else {
+                        thread
+                            .model
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    }
+                }),
+                SMALL,
+                p.muted,
+            )
             .truncate()
-            .grow(1.0),
-    );
-    for el in trailing {
-        meta = meta.child(el);
-    }
-    item.child(title.child(more)).child(meta)
+            .grow(1.0)
+            .min_w(0.0),
+        )
+        .child(slot);
+    item.child(
+        col()
+            .grow(1.0)
+            .min_w(0.0)
+            .px(10.0)
+            .pt(7.0)
+            .pb(8.0)
+            .gap(3.0)
+            .child(top)
+            .child(row().child(title)),
+    )
 }
 
 /// A row's workspace name, unless the Workspace filter already names that one workspace.
@@ -2897,14 +2960,20 @@ fn row_menu(s: &State, p: Palette) -> El {
         .border(0.5, p.line)
         .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
         .anchored_fit(
-            anchor,
-            if matches!(target, RowTarget::Thread(_)) {
+            if s.row_menu_at.is_some() {
+                "row-menu-point".into()
+            } else {
+                anchor
+            },
+            // Beside the point, as a native context menu opens, so the window clamps it
+            // vertically instead of cutting it short.
+            if s.row_menu_at.is_some() || matches!(target, RowTarget::Thread(_)) {
                 rune::Side::Right
             } else {
                 rune::Side::Bottom
             },
             rune::Align::Start,
-            4.0,
+            if s.row_menu_at.is_some() { 2.0 } else { 4.0 },
         )
         .modal(true, |s: &mut State| s.row_menu = None)
         .child(actions)
@@ -3093,7 +3162,10 @@ fn project_picker(s: &State, p: Palette) -> El {
             row()
                 .key(format!("project-option-{id}"))
                 .center_y()
-                .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
+                .on_secondary_press(move |s: &mut State, _, _| {
+                    s.row_menu = Some(target);
+                    s.row_menu_at = None;
+                })
                 .child(
                     menu_item(&format!("choose-project-{id}"), &project.name, "folder", p)
                         .grow(1.0)
@@ -3107,7 +3179,10 @@ fn project_picker(s: &State, p: Palette) -> El {
                                 el()
                             },
                         )
-                        .on_secondary_press(move |s: &mut State, _, _| s.row_menu = Some(target))
+                        .on_secondary_press(move |s: &mut State, _, _| {
+                            s.row_menu = Some(target);
+                            s.row_menu_at = None;
+                        })
                         .on_press_tx(move |s: &mut State, tx| match mode {
                             ProjectPicker::NewThread => s.new_thread_in(Some(id)),
                             ProjectPicker::Scope => s.set_project_scope(Some(id), tx.mods().shift),
@@ -3124,7 +3199,10 @@ fn project_picker(s: &State, p: Palette) -> El {
                     "Workspace actions",
                     "more",
                     p,
-                    move |s| s.row_menu = Some(target),
+                    move |s| {
+                        s.row_menu = Some(target);
+                        s.row_menu_at = None;
+                    },
                 )),
         );
     }
@@ -3147,68 +3225,127 @@ fn project_picker(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-fn tool_kind(name: &str) -> (&'static str, &'static str, &'static str) {
+/// What a tool call does, for its one-line row: icon, past and present verb, and what it
+/// acts on. Reads, listings and searches count as exploring when grouped, as Cursor does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolKind {
+    Read,
+    List,
+    Search,
+    Edit,
+    Run,
+    Other,
+}
+
+fn tool_kind(name: &str) -> ToolKind {
     match name.to_ascii_lowercase().as_str() {
-        "read" | "read_file" => ("file", "Read", "file"),
-        "edit" | "write" | "edit_file" | "write_file" | "apply_patch" => ("edit", "Edited", "file"),
-        "bash" | "powershell" | "shell" | "exec" | "exec_command" => ("terminal", "Ran", "command"),
-        "grep" | "rg" | "search" | "find" => ("search", "Searched", "query"),
-        "ls" | "list" | "list_directory" => ("folder", "Listed", "directory"),
-        _ => ("bolt", "Called", "tool"),
+        "read" | "read_file" => ToolKind::Read,
+        "edit" | "write" | "edit_file" | "write_file" | "apply_patch" => ToolKind::Edit,
+        "bash" | "powershell" | "shell" | "exec" | "exec_command" => ToolKind::Run,
+        "grep" | "rg" | "search" | "find" => ToolKind::Search,
+        "ls" | "list" | "list_directory" => ToolKind::List,
+        _ => ToolKind::Other,
+    }
+}
+
+/// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
+fn tool_verb(tool: &Tool) -> String {
+    let done = tool.done || tool.failed;
+    match (tool_kind(&tool.name), done) {
+        (ToolKind::Read, true) => "Read".into(),
+        (ToolKind::Read, false) => "Reading".into(),
+        (ToolKind::List, true) => "Listed".into(),
+        (ToolKind::List, false) => "Listing".into(),
+        (ToolKind::Search, true) => "Searched".into(),
+        (ToolKind::Search, false) => "Searching".into(),
+        (ToolKind::Edit, true) => "Edited".into(),
+        (ToolKind::Edit, false) => "Editing".into(),
+        (ToolKind::Run, true) => "Ran".into(),
+        (ToolKind::Run, false) => "Running".into(),
+        (ToolKind::Other, true) => format!("Called {}", tool.name),
+        (ToolKind::Other, false) => format!("Calling {}", tool.name),
     }
 }
 
 fn tool_title(tool: &Tool) -> String {
-    let (_, verb, noun) = tool_kind(&tool.name);
-    let name = if noun == "tool" {
-        format!("{verb} {}", tool.name)
-    } else {
-        verb.into()
-    };
+    let verb = tool_verb(tool);
     if tool.detail.is_empty() {
-        name
+        verb
     } else {
-        format!("{name} {}", tool.detail)
+        format!("{verb} {}", tool.detail)
     }
 }
 
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// One line for a batch: "Explored 3 files, 2 searches", "Edited 1 file", "Ran 2 commands".
 fn tool_summary(tools: &[&Tool]) -> String {
-    let mut counts: Vec<(&str, &str, usize)> = vec![];
-    for tool in tools {
-        let (_, verb, noun) = tool_kind(&tool.name);
-        if let Some(entry) = counts.iter_mut().find(|entry| entry.0 == verb) {
-            entry.2 += 1;
+    let count = |kind: ToolKind| tools.iter().filter(|t| tool_kind(&t.name) == kind).count();
+    let (read, list, search) = (
+        count(ToolKind::Read),
+        count(ToolKind::List),
+        count(ToolKind::Search),
+    );
+    let mut parts = vec![];
+    if read + list + search > 0 {
+        let mut explored = vec![];
+        if read > 0 {
+            explored.push(plural(read, "file", "files"));
+        }
+        if list > 0 {
+            explored.push(plural(list, "directory", "directories"));
+        }
+        if search > 0 {
+            explored.push(plural(search, "search", "searches"));
+        }
+        // A batch of reads alone reads as plain "Read 2 files".
+        let verb = if list + search == 0 {
+            "Read"
+        } else if read + search == 0 {
+            "Listed"
+        } else if read + list == 0 {
+            "Searched"
         } else {
-            counts.push((verb, noun, 1));
+            "Explored"
+        };
+        parts.push(if verb == "Searched" {
+            format!("Ran {}", explored.join(", "))
+        } else {
+            format!("{verb} {}", explored.join(", "))
+        });
+    }
+    for (kind, verb, one, many) in [
+        (ToolKind::Edit, "Edited", "file", "files"),
+        (ToolKind::Run, "Ran", "command", "commands"),
+        (ToolKind::Other, "Called", "tool", "tools"),
+    ] {
+        let n = count(kind);
+        if n > 0 {
+            parts.push(format!("{verb} {}", plural(n, one, many)));
         }
     }
-    counts
+    parts
         .iter()
         .enumerate()
-        .map(|(index, (verb, noun, count))| {
-            let verb = if index == 0 {
-                verb.to_string()
+        .map(|(i, part)| {
+            if i == 0 {
+                part.clone()
             } else {
-                verb.to_lowercase()
-            };
-            let noun = if *count == 1 {
-                noun.to_string()
-            } else if *noun == "directory" {
-                "directories".into()
-            } else {
-                format!("{noun}s")
-            };
-            format!("{verb} {count} {noun}")
+                part.to_lowercase()
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.1}s", ms as f64 / 1000.0)
+/// Turn and thinking durations, as Cursor writes them: 45s, 2m 5s, 1h 3m.
+fn elapsed_label(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 
@@ -3282,72 +3419,101 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
     parts
 }
 
+/// Secondary and tertiary transcript inks: a tool's verb, and what it acted on.
+fn quiet_inks(p: Palette) -> (Color, Color) {
+    (p.muted, p.muted.alpha(0.62))
+}
+
+/// A one-line activity row. The verb leads in the secondary ink, its target trails in the
+/// tertiary ink, and the whole line truncates. A failure says so in red at the end.
+fn activity_line(
+    key: String,
+    a11y: String,
+    verb: String,
+    detail: &str,
+    failed: bool,
+    open: bool,
+    p: Palette,
+) -> El {
+    let (secondary, tertiary) = quiet_inks(p);
+    let mut line = row()
+        .key(key)
+        .role("button")
+        .label(a11y)
+        .focusable(true)
+        .center_y()
+        .gap(5.0)
+        .min_h(26.0)
+        .px(6.0)
+        .ml(-6.0)
+        .radius(6.0)
+        .hover(p.selected)
+        .child(label(
+            verb,
+            ACTIVITY,
+            if failed { p.danger } else { secondary },
+        ));
+    if !detail.is_empty() {
+        line = line.child(
+            label(detail, ACTIVITY, tertiary)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+    }
+    if failed {
+        line = line.child(label("failed", ACTIVITY, p.danger));
+    }
+    line.child(icon(if open { "chevron" } else { "open" }, tertiary).opacity(0.8))
+        .child(spacer())
+}
+
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
-    let tool = &s.current().tools[index];
+    let t = s.current();
+    let tool = &t.tools[index];
     let title = tool_title(tool);
-    let ink = if tool.failed { p.danger } else { p.muted };
-    let mut content = col().gap(5.0).child(
-        row()
-            .key(format!("inline-tool-{}-{index}", s.current().id))
-            .role("button")
-            .label(format!(
+    let mut content = col().gap(4.0).child(
+        activity_line(
+            format!("inline-tool-{}-{index}", t.id),
+            format!(
                 "{} output for {title}",
                 if tool.expanded { "Hide" } else { "Show" }
-            ))
-            .focusable(true)
-            .center_y()
-            .gap(7.0)
-            .min_h(28.0)
-            .px(6.0)
-            .radius(5.0)
-            .hover(p.selected)
-            .on_press(move |s: &mut State| {
-                let tool = &mut s.current_mut().tools[index];
-                tool.expanded = !tool.expanded;
-            })
-            .child(tool_icon(tool_kind(&tool.name).0, ink))
-            .child(label(&title, SMALL, ink).grow(1.0).min_w(0.0).truncate())
-            .child(label(
-                if tool.failed {
-                    "Failed"
-                } else if tool.done {
-                    "Done"
-                } else {
-                    "Running"
-                },
-                TextStyle::new(11.0, 420.0),
-                ink,
-            ))
-            .child(if let Some(ms) = tool.duration_ms {
-                label(duration(ms), TextStyle::new(11.0, 420.0), p.muted)
-            } else {
-                el()
-            })
-            .child(icon(
-                if tool.expanded { "chevron" } else { "open" },
-                p.muted,
-            )),
+            ),
+            tool_verb(tool),
+            &tool.detail,
+            tool.failed,
+            tool.expanded,
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            let tool = &mut s.current_mut().tools[index];
+            tool.expanded = !tool.expanded;
+        }),
     );
     if tool.expanded {
         content = content.child(
             col()
-                .key(format!("tool-output-{}-{index}", s.current().id))
+                .key(format!("tool-output-{}-{index}", t.id))
                 .role("group")
                 .label(format!("Output for {title}"))
-                .ml(28.0)
-                .padding(10.0)
-                .gap(8.0)
-                .radius(6.0)
+                .mb(4.0)
+                .radius(10.0)
                 .fill(p.card)
                 .border(0.5, p.line)
                 .child(
                     label(&tool.detail, SMALL, p.muted)
                         .wrap_anywhere()
-                        .selectable(true),
+                        .selectable(true)
+                        .px(12.0)
+                        .pt(9.0)
+                        .pb(7.0),
                 )
+                .child(rule(p))
                 .child(
                     col()
-                        .max_h(220.0)
+                        .max_h(200.0)
+                        .px(12.0)
+                        .py(9.0)
                         .scroll(ScrollSpec {
                             stick_bottom: !tool.done,
                         })
@@ -3355,9 +3521,9 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                             label(
                                 if tool.output.is_empty() {
                                     if tool.done {
-                                        "No text output."
+                                        "No output"
                                     } else {
-                                        "Waiting for output..."
+                                        "Waiting for output"
                                     }
                                 } else {
                                     &tool.output
@@ -3365,7 +3531,11 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                                 TextStyle::new(11.5, 400.0)
                                     .family(rune::Family::SystemMono)
                                     .lh(17.0),
-                                p.ink,
+                                if tool.output.is_empty() {
+                                    p.muted
+                                } else {
+                                    p.ink
+                                },
                             )
                             .wrap_anywhere()
                             .selectable(true),
@@ -3385,73 +3555,31 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     let first = indices[0];
     let expanded = tools[0].group_expanded;
     let failed = tools.iter().filter(|tool| tool.failed).count();
-    let running = tools.iter().any(|tool| !tool.done);
-    let known_duration: Option<u64> = tools.iter().map(|tool| tool.duration_ms).sum();
-    let ink = if failed > 0 { p.danger } else { p.muted };
     let summary = tool_summary(&tools);
     let mut group = col()
         .key(format!("tool-group-{}-{first}", t.id))
-        .gap(3.0)
+        .gap(2.0)
         .child(
-            row()
-                .key(format!("toggle-tool-group-{}-{first}", t.id))
-                .role("button")
-                .label(format!(
-                    "{} {summary}",
-                    if expanded { "Collapse" } else { "Expand" }
-                ))
-                .focusable(true)
-                .center_y()
-                .gap(7.0)
-                .min_h(28.0)
-                .px(6.0)
-                .radius(5.0)
-                .hover(p.selected)
-                .on_press(move |s: &mut State| {
-                    let tool = &mut s.current_mut().tools[first];
-                    tool.group_expanded = !tool.group_expanded;
-                })
-                .child(icon(
-                    if failed > 0 {
-                        "alert"
-                    } else if running {
-                        "dot"
-                    } else {
-                        "check"
-                    },
-                    ink,
-                ))
-                .child(label(summary, SMALL, ink).grow(1.0).min_w(0.0).wrap())
-                .child(label(
-                    if failed > 0 {
-                        format!("{failed} failed")
-                    } else if running {
-                        "Running".into()
-                    } else {
-                        "Done".into()
-                    },
-                    TextStyle::new(11.0, 420.0),
-                    ink,
-                ))
-                .child(if let Some(ms) = known_duration {
-                    label(duration(ms), TextStyle::new(11.0, 420.0), p.muted)
-                } else {
-                    el()
-                })
-                .child(icon(if expanded { "chevron" } else { "open" }, p.muted)),
+            activity_line(
+                format!("toggle-tool-group-{}-{first}", t.id),
+                format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
+                summary.clone(),
+                "",
+                failed > 0,
+                expanded,
+                p,
+            )
+            .on_press(move |s: &mut State| {
+                let tool = &mut s.current_mut().tools[first];
+                tool.group_expanded = !tool.group_expanded;
+            }),
         );
     if expanded {
-        let mut rows = col().grow(1.0).min_w(0.0).gap(2.0);
+        let mut rows = col().pl(14.0).gap(0.0);
         for index in indices {
             rows = rows.child(inline_tool(s, p, *index));
         }
-        group = group.child(
-            row()
-                .gap(10.0)
-                .pl(12.0)
-                .child(el().w(1.0).h_full().fill(p.line))
-                .child(rows),
-        );
+        group = group.child(rows);
     }
     group
 }
@@ -3468,49 +3596,40 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
             })
             .flatten()
     });
-    let title = match (thought.done, timing) {
-        (true, Some(ms)) => format!("Thought for {}s", ms / 1000),
-        (false, Some(ms)) => format!("Thinking for {}s", ms / 1000),
-        (true, None) => "Thought".into(),
-        (false, None) => "Thinking".into(),
+    let (verb, detail) = match (thought.done, timing) {
+        (true, Some(ms)) if ms < 500 => ("Thought", "briefly".to_string()),
+        (true, Some(ms)) => ("Thought", elapsed_label(ms / 1000)),
+        (false, Some(ms)) => ("Thinking", elapsed_label(ms / 1000)),
+        (true, None) => ("Thought", String::new()),
+        (false, None) => ("Thinking", String::new()),
     };
-    let mut content = col().gap(5.0).child(
-        row()
-            .key(format!("inline-thought-{}-{index}", t.id))
-            .role("button")
-            .label(format!(
+    let mut content = col().gap(4.0).child(
+        activity_line(
+            format!("inline-thought-{}-{index}", t.id),
+            format!(
                 "{} thinking text",
                 if thought.expanded { "Hide" } else { "Show" }
-            ))
-            .focusable(true)
-            .center_y()
-            .gap(7.0)
-            .min_h(28.0)
-            .px(6.0)
-            .radius(5.0)
-            .hover(p.selected)
-            .on_press(move |s: &mut State| {
-                let thought = &mut s.current_mut().thoughts[index];
-                thought.expanded = !thought.expanded;
-            })
-            .child(icon("dot", p.muted))
-            .child(label(title, SMALL, p.muted).grow(1.0))
-            .child(icon(
-                if thought.expanded { "chevron" } else { "open" },
-                p.muted,
-            )),
+            ),
+            verb.into(),
+            &detail,
+            false,
+            thought.expanded,
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            let thought = &mut s.current_mut().thoughts[index];
+            thought.expanded = !thought.expanded;
+        }),
     );
     if thought.expanded {
+        // Thinking reads as a quiet aside, not a boxed output.
         content = content.child(
             col()
                 .key(format!("thought-output-{}-{index}", t.id))
                 .role("group")
                 .label("Thinking text")
-                .ml(28.0)
-                .padding(10.0)
-                .radius(6.0)
-                .fill(p.card)
-                .border(0.5, p.line)
+                .pl(12.0)
+                .mb(4.0)
                 .max_h(220.0)
                 .scroll(ScrollSpec {
                     stick_bottom: !thought.done,
@@ -3522,8 +3641,8 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
                         } else {
                             &thought.text
                         },
-                        SMALL.lh(18.0),
-                        p.muted,
+                        TextStyle::new(13.0, 400.0).lh(20.0),
+                        p.muted.alpha(0.8),
                     )
                     .wrap_anywhere()
                     .selectable(true),
@@ -3572,6 +3691,21 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
     }
 }
 
+/// What the agent is doing right now, for the live status line at the end of a turn. A
+/// running tool or thought already names itself in its own row, so the line says Working.
+fn live_status(t: &Thread) -> String {
+    if t.tools.iter().any(|tool| !tool.done && !tool.failed)
+        || t.thoughts.last().is_some_and(|thought| !thought.done)
+    {
+        return "Working".into();
+    }
+    match t.phase.as_str() {
+        "" | "Working" | "Waiting for the model" => "Planning next moves".into(),
+        phase if phase.starts_with("Running ") => "Working".into(),
+        phase => phase.into(),
+    }
+}
+
 fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
     let t = s.current();
     let parts = turn_parts(t, start, end);
@@ -3579,7 +3713,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         .iter()
         .rposition(|part| !matches!(part, TranscriptPart::Text { .. }));
     // Initial thinking may precede the preamble on the wire. Keep that thinking in
-    // the work section, and the first text before subsequent work above its heading.
+    // the work section, and the first text before subsequent work above its fold.
     let preamble = last_work.and_then(|last| {
         parts[..last]
             .iter()
@@ -3587,106 +3721,114 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     });
     let live = end == t.messages.len() && t.status.busy();
     let work = t.work.iter().find(|work| work.start == start);
-    let expanded = work.is_none_or(|work| work.expanded);
     let mut response = col()
         .key(format!("assistant-turn-{}-{start}", t.id))
-        .gap(16.0);
-    let mut heading = row().center_y().gap(7.0);
+        .gap(12.0);
+    // Captains sign their turns. A lone Pi thread needs no speaker label.
     if let Some(captain) = t.captain {
-        heading = heading.child(avatar(s, p, captain, 20.0, t.status));
+        response = response.child(
+            row()
+                .center_y()
+                .gap(7.0)
+                .child(avatar(s, p, captain, 18.0, t.status))
+                .child(label(
+                    format!("Captain {}", s.captains[captain].name),
+                    TextStyle::new(13.0, 600.0),
+                    p.ink,
+                )),
+        );
     }
-    response = response.child(
-        heading.child(label(
-            t.captain
-                .map(|id| format!("Captain {}", s.captains[id].name))
-                .unwrap_or("Pi".into()),
-            TextStyle::new(13.0, 600.0),
-            p.ink,
-        )),
-    );
     if let Some(index) = preamble {
         response = response.child(transcript_part(s, p, wide, &parts[index]));
     } else if live && last_work.is_none() {
-        // Until Pi emits work, streamed text is the preamble. Keep the live
-        // heading after it so the first tool does not move that text.
+        // Until Pi emits work, streamed text is the preamble.
         for part in &parts {
             response = response.child(transcript_part(s, p, wide, part));
         }
     }
-    if last_work.is_some() || live {
-        let seconds = if live {
-            t.started.map(|start| start.elapsed().as_secs())
-        } else {
-            work.and_then(|work| work.elapsed)
-        };
-        let title = match (live, seconds) {
-            (true, Some(seconds)) => format!("Working for {seconds}s"),
-            (true, None) => "Working".into(),
-            (false, Some(seconds)) => format!("Worked for {seconds}s"),
-            (false, None) => "Worked".into(),
+    let work_rows = |mut rows: El| {
+        if let Some(last) = last_work {
+            for (index, part) in parts[..=last].iter().enumerate() {
+                if Some(index) != preamble {
+                    let row = transcript_part(s, p, wide, part);
+                    // Prose between tool rows keeps its paragraph rhythm.
+                    rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
+                        row.py(6.0)
+                    } else {
+                        row
+                    });
+                }
+            }
+        }
+        rows
+    };
+    if live {
+        // While Pi works, its steps show as they happen, and one status line says what it
+        // is doing now. The turn folds into "Worked for" when it ends.
+        let mut rows = work_rows(col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0));
+        let seconds = t.started.map(|start| start.elapsed().as_secs());
+        rows = rows.child(
+            row()
+                .key(format!("live-status-{}", t.id))
+                .min_h(26.0)
+                .center_y()
+                .gap(8.0)
+                .child(status_mark(Status::Running, p, 6.0))
+                .child(
+                    label(live_status(t), ACTIVITY, p.muted)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                .child(match seconds {
+                    Some(seconds) => label(elapsed_label(seconds), ACTIVITY, quiet_inks(p).1),
+                    None => el(),
+                }),
+        );
+        response = response.child(rows);
+    } else if last_work.is_some() {
+        let expanded = work.is_some_and(|work| work.expanded);
+        let title = match work.and_then(|work| work.elapsed) {
+            Some(seconds) => format!("Worked for {}", elapsed_label(seconds)),
+            None => "Worked".into(),
         };
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
-            .gap(8.0)
+            .gap(4.0)
             .child(
-                row()
-                    .key(format!("toggle-work-{}-{start}", t.id))
-                    .role("button")
-                    .label(format!(
+                activity_line(
+                    format!("toggle-work-{}-{start}", t.id),
+                    format!(
                         "{} work section. {title}",
                         if expanded { "Collapse" } else { "Expand" }
-                    ))
-                    .focusable(true)
-                    .center_y()
-                    .gap(10.0)
-                    .min_h(28.0)
-                    .radius(5.0)
-                    .hover(p.selected)
-                    .on_press(move |s: &mut State| {
-                        if let Some(work) = s
-                            .current_mut()
-                            .work
-                            .iter_mut()
-                            .find(|work| work.start == start)
-                        {
-                            work.expanded = !work.expanded;
-                        }
-                    })
-                    .child(el().h(0.5).grow(1.0).fill(p.line))
-                    .child(label(title, TextStyle::new(11.0, 420.0), p.muted))
-                    .child(icon(if expanded { "chevron" } else { "open" }, p.muted))
-                    .child(el().h(0.5).grow(1.0).fill(p.line)),
+                    ),
+                    title.clone(),
+                    "",
+                    false,
+                    expanded,
+                    p,
+                )
+                .on_press(move |s: &mut State| {
+                    let t = s.current_mut();
+                    match t.work.iter_mut().find(|work| work.start == start) {
+                        Some(work) => work.expanded = !work.expanded,
+                        // Turns from before work records existed fold too; opening one
+                        // records it.
+                        None => t.work.push(crate::model::AssistantWork {
+                            start,
+                            expanded: true,
+                            elapsed: None,
+                        }),
+                    }
+                }),
             );
         if expanded {
-            let mut rows = col().key(format!("work-rows-{}-{start}", t.id)).gap(4.0);
-            if let Some(last) = last_work {
-                for (index, part) in parts[..=last].iter().enumerate() {
-                    if Some(index) != preamble {
-                        let row = transcript_part(s, p, wide, part);
-                        // Prose between tool rows needs the same breathing room as paragraphs.
-                        rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
-                            row.py(8.0)
-                        } else {
-                            row
-                        });
-                    }
-                }
-            }
-            if live {
-                rows = rows.child(
-                    label(
-                        if t.phase.is_empty() {
-                            "Waiting for the model"
-                        } else {
-                            &t.phase
-                        },
-                        SMALL,
-                        p.muted,
-                    )
-                    .px(6.0),
-                );
-            }
-            section = section.child(rows);
+            section = section.child(work_rows(
+                col()
+                    .key(format!("work-rows-{}-{start}", t.id))
+                    .pl(14.0)
+                    .gap(2.0),
+            ));
         }
         response = response.child(section);
     }
@@ -3891,9 +4033,9 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                             .wrap_anywhere()
                             .selectable(true)
                             .max_w(max_width)
-                            .px(14.0)
-                            .py(9.0)
-                            .radius(10.0)
+                            .px(16.0)
+                            .py(8.0)
+                            .radius(18.0)
                             .fill(if s.dark { p.card } else { p.selected }),
                     );
                 }
@@ -4857,24 +4999,25 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
         rt.frame(0.0);
-        assert!(rt.find("shelf-Working").is_some());
+        // A running thread stays in its own place in the list; there is no Working shelf.
+        assert!(rt.find("shelf-Working").is_none());
+        assert!(rt.find("thread-2").is_some());
         assert!(rt.find("shelf-Snoozed").is_some());
         assert!(rt.find("shelf-Settled").is_some());
-        assert!(rt.find("thread-2").is_none());
         assert!(rt.find("thread-4").is_none());
-        rt.wheel(100.0, 400.0, -400.0);
-        rt.frame(1.0);
-        press(&mut rt, "shelf-Working");
+        assert!(rt.find("thread-5").is_none());
+        rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
+        rt.frame(0.5);
+        press(&mut rt, "shelf-Snoozed");
         assert!(rt.state.shelves[0]);
-        // The expanded shelf can extend below a short window. Scroll it into view.
-        rt.wheel(100.0, 400.0, -220.0);
-        rt.frame(1.0);
-        assert!(rt.find("thread-2").is_some());
-        rt.state.select_thread(1);
+        assert!(rt.find("thread-4").is_some());
+        rt.state.select_thread(3);
         rt.frame(0.0);
-        press(&mut rt, "shelf-Working");
+        rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
+        rt.frame(0.5);
+        press(&mut rt, "shelf-Snoozed");
         assert!(
-            rt.find("thread-2").is_some(),
+            rt.find("thread-4").is_some(),
             "collapsed shelf retains the open thread"
         );
         for id in 11..51 {
@@ -4882,7 +5025,7 @@ pub(crate) mod tests {
             t.life.settle(lifecycle::now() - id as u64);
             rt.state.threads.push(t);
         }
-        rt.state.shelves[2] = true;
+        rt.state.shelves[1] = true;
         rt.invalidate();
         rt.frame(0.0);
         let count = |s: &State| {
@@ -5500,6 +5643,14 @@ pub(crate) mod tests {
             tool_summary(&t.tools[2..].iter().collect::<Vec<_>>()),
             "Edited 1 file, ran 1 command"
         );
+        let explored = [&t.tools[0], &t.tools[0]];
+        let mut search = t.tools[0].clone();
+        search.name = "grep".into();
+        assert_eq!(
+            tool_summary(&[explored[0], explored[1], &search]),
+            "Explored 2 files, 1 search"
+        );
+        assert_eq!(elapsed_label(125), "2m 5s");
         assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
     }
 
@@ -5543,6 +5694,9 @@ pub(crate) mod tests {
             images: Vec::new(),
         });
         rt.frame(0.0);
+        // The finished turn folds its tool into the work line, which still opens.
+        assert!(rt.presented("inline-tool-1-0").is_none());
+        press(&mut rt, "toggle-work-1-0");
         assert!(rt.presented("inline-tool-1-0").is_some());
     }
 
@@ -5593,7 +5747,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn streamed_preamble_stays_above_the_heading_when_the_first_tool_arrives() {
+    fn streamed_preamble_stays_put_when_the_first_tool_arrives() {
         let mut rt = runtime(1280.0);
         rt.state.current_mut().apply(json!({"type":"agent_start"}));
         rt.state
@@ -5602,8 +5756,12 @@ pub(crate) mod tests {
                 "type":"text_delta","contentIndex":0,"delta":"I'll check the file."
             }}));
         rt.frame(0.0);
-        let header_y = rt.presented("toggle-work-1-0").unwrap().0[1];
-        assert!(rt.presented("message-1-0-body-0").unwrap().0[1] < header_y);
+        let text_y = rt.presented("message-1-0-body-0").unwrap().0[1];
+        assert!(text_y < rt.presented("live-status-1").unwrap().0[1]);
+        assert!(
+            rt.presented("toggle-work-1-0").is_none(),
+            "no fold while live"
+        );
         rt.state
             .current_mut()
             .apply(json!({"type":"message_end","message":{
@@ -5615,12 +5773,13 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(2.0);
-        assert_eq!(rt.presented("toggle-work-1-0").unwrap().0[1], header_y);
-        assert!(rt.presented("inline-tool-1-0").is_some());
+        assert_eq!(rt.presented("message-1-0-body-0").unwrap().0[1], text_y);
+        let tool_y = rt.presented("inline-tool-1-0").unwrap().0[1];
+        assert!(tool_y < rt.presented("live-status-1").unwrap().0[1]);
     }
 
     #[test]
-    fn a_running_turn_keeps_the_same_work_header_after_settlement() {
+    fn a_running_turn_shows_its_steps_then_folds_into_worked_for() {
         let mut rt = runtime(620.0);
         rt.state.current_mut().apply(json!({"type":"agent_start"}));
         rt.state
@@ -5634,16 +5793,19 @@ pub(crate) mod tests {
                 "type":"thinking_delta","contentIndex":0,"delta":"Checking the file."
             }}));
         rt.frame(0.0);
-        let (header, _) = rt.presented("toggle-work-1-0").unwrap();
         let (thought, _) = rt.presented("inline-thought-1-0").unwrap();
-        assert!(header[1] < thought[1]);
+        let (status, _) = rt.presented("live-status-1").unwrap();
+        assert!(thought[1] < status[1]);
         rt.state
             .current_mut()
             .apply(json!({"type":"agent_settled"}));
         rt.invalidate();
         rt.frame(1.0);
-        assert_eq!(rt.presented("toggle-work-1-0").unwrap().0[1], header[1]);
-        assert!(rt.state.current().work[0].expanded);
+        rt.frame(2.0);
+        assert!(rt.presented("live-status-1").is_none());
+        assert!(rt.presented("toggle-work-1-0").is_some());
+        assert!(!rt.state.current().work[0].expanded);
+        assert!(rt.presented("inline-thought-1-0").is_none());
     }
     #[test]
     fn captain_assignment_has_one_control_and_no_per_project_placeholders() {
@@ -5934,7 +6096,13 @@ pub(crate) mod tests {
         press(&mut rt, "thread-actions");
         press(&mut rt, "menu-pin-thread");
         assert!(rt.state.current().pinned());
-        press(&mut rt, "thread-more-1");
+        // The row has no actions button; a right-click opens its menu at the pointer.
+        assert!(rt.find("thread-more-1").is_none());
+        let (x, y) = rt.find("thread-1").unwrap();
+        rt.secondary_down(x + 30.0, y);
+        rt.secondary_up(x + 30.0, y);
+        rt.frame(0.0);
+        assert!(rt.state.row_menu_at.is_some());
         press(&mut rt, "menu-delete-thread");
         assert_eq!(
             rt.state.delete_thread,
