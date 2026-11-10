@@ -6,7 +6,7 @@ if (scenario === "exit") process.exit(2);
 const input = createInterface({ input: process.stdin });
 input.on("line", (line) => {
   const command = JSON.parse(line);
-  appendFileSync("requests.jsonl", JSON.stringify({ ...command, argv: process.argv.slice(2) }) + "\n");
+  appendFileSync("requests.jsonl", JSON.stringify({ ...command, pid: process.pid, argv: process.argv.slice(2) }) + "\n");
   if (scenario === "hang") return;
   if (scenario === "auth") {
     console.log(JSON.stringify({ type: "response", command: command.type, success: false, error: "401 unauthorized secret-that-must-not-leak" }));

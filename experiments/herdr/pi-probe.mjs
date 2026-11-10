@@ -61,17 +61,12 @@ export async function probePi({
     let output = "";
     let bytes = 0;
     let settled = false;
+    let closed = false;
+    let failure;
+    let kill;
     const timer = setTimeout(() => finish(new Error("Pi metadata discovery timed out. No prompt was sent.")), timeout);
-    function finish(error) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdin.end();
-      child.kill("SIGTERM");
-      const kill = setTimeout(() => child.kill("SIGKILL"), 500);
-      kill.unref();
-      child.once("exit", () => clearTimeout(kill));
-      if (error) return reject(error);
+    function complete() {
+      if (failure) return reject(failure);
       resolve({
         provider: "cpa",
         model: state.model.name || state.model.id,
@@ -81,10 +76,26 @@ export async function probePi({
         promptSent: false,
       });
     }
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      failure = error;
+      clearTimeout(timer);
+      if (closed) return complete();
+      child.stdin.end();
+      child.kill("SIGTERM");
+      kill = setTimeout(() => child.kill("SIGKILL"), 500);
+      kill.unref();
+    }
     child.on("error", () => finish(new Error("Pi could not start. Check SHINA_PI_CLI and the project folder.")));
     child.stdin.on("error", () => finish(new Error("Pi closed its RPC input during discovery.")));
-    child.on("close", () => {
-      if (!settled) finish(new Error("Pi exited before returning its model metadata."));
+    child.once("close", () => {
+      // Windows retains the working-directory lock until the process closes. Do not
+      // return metadata or errors while the caller still owns a live probe process.
+      closed = true;
+      clearTimeout(kill);
+      if (settled) complete();
+      else finish(new Error("Pi exited before returning its model metadata."));
     });
     // Do not log stderr. Provider extensions may put private account details there.
     child.stderr.resume();
