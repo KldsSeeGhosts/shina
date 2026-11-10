@@ -20,9 +20,17 @@ async function setup(t, scenario = "success", enrolled = true) {
   return { cwd, agentDirectory, pi: fixture };
 }
 
+async function assertProbeStopped(options) {
+  const [request] = (await readFile(join(options.cwd, "requests.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+  assert.throws(() => process.kill(request.pid, 0), { code: "ESRCH" },
+    "the probe must close its process before settling its promise");
+}
+
 test("reads only model metadata without a prompt, session, or direct-provider fallback", async (t) => {
   const options = await setup(t);
   const result = await probePi(options);
+  await assertProbeStopped(options);
   assert.deepEqual(result, {
     provider: "cpa", model: "Test 模型", modelId: "test-model",
     thinking: "high", availableModels: 1, promptSent: false,
@@ -42,14 +50,18 @@ test("does not start Pi without CPA enrollment", async (t) => {
 });
 
 test("rejects a selected direct provider without changing it", async (t) => {
-  await assert.rejects(probePi(await setup(t, "direct")), /will not change it or fall back/);
+  const options = await setup(t, "direct");
+  await assert.rejects(probePi(options), /will not change it or fall back/);
+  await assertProbeStopped(options);
 });
 
 test("reports authentication denial without exposing provider error details", async (t) => {
-  await assert.rejects(probePi(await setup(t, "auth")), (error) =>
+  const options = await setup(t, "auth");
+  await assert.rejects(probePi(options), (error) =>
     error.message.includes("authentication failed")
     && error.message.includes("manually")
     && !error.message.includes("secret-that-must-not-leak"));
+  await assertProbeStopped(options);
 });
 
 test("bounds a stalled subprocess and handles an early exit", async (t) => {

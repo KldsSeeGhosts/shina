@@ -217,52 +217,11 @@ fn embedded(cache: &ImageCache, captain: usize) -> (Set, Set) {
 
 /// A small original pixel mark: a dark crew badge with a cream "S" and three service dots.
 fn mark(cache: &ImageCache, light: bool) -> Image {
-    const SIZE: usize = 24;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    let mut put = |x: usize, y: usize, color: [u8; 4]| {
-        let at = (y * SIZE + x) * 4;
-        rgba[at..at + 4].copy_from_slice(&color);
-    };
-    let (ink, cream) = if light {
-        ([236, 236, 238, 255], [30, 30, 32, 255])
-    } else {
-        ([35, 35, 31, 255], [244, 239, 227, 255])
-    };
-    let green = [143, 188, 106, 255];
-    let orange = [224, 122, 84, 255];
-    let blue = [106, 168, 200, 255];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let corner_x = x.clamp(5, SIZE - 6);
-            let corner_y = y.clamp(5, SIZE - 6);
-            let dx = x as i32 - corner_x as i32;
-            let dy = y as i32 - corner_y as i32;
-            if dx * dx + dy * dy <= 25 {
-                put(x, y, ink);
-            }
-        }
-    }
-    const S: [&str; 7] = [
-        "01110", "10000", "10000", "01110", "00001", "00001", "01110",
-    ];
-    for (row, bits) in S.iter().enumerate() {
-        for (column, bit) in bits.bytes().enumerate() {
-            if bit != b'0' {
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        put(7 + column * 2 + dx, 5 + row * 2 + dy, cream);
-                    }
-                }
-            }
-        }
-    }
-    for (offset, color) in [(7, green), (11, orange), (15, blue)] {
-        put(offset, 20, color);
-        put(offset + 1, 20, color);
-        put(offset, 21, color);
-        put(offset + 1, 21, color);
-    }
-    let image = cache.rgba(SIZE as u32, SIZE as u32, rgba);
+    let image = cache.rgba(
+        crate::brand::SIZE as u32,
+        crate::brand::SIZE as u32,
+        crate::brand::pixels(light),
+    );
     image.wait().expect("valid generated crew mark");
     image
 }

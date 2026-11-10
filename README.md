@@ -70,6 +70,12 @@ This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start
 
 ### Automatic updates
 
+During early development, every push to `main` runs the [update workflow](.github/workflows/updates.yml). Pull requests run the same checks and builds but cannot publish. Only after Windows, Apple-silicon Mac, and Intel Mac builds all pass does the workflow upload their assets and `SHA256SUMS` to a draft release, then publish it as Latest. A superseded main commit cannot replace a newer update.
+
+Cargo.toml holds the development baseline, currently `0.11.0`. CI replaces its zero patch with the workflow run number in the build checkout only, for example `0.11.42`. The executable and Mac bundle embed that exact version. Source commits and credentials do not change. Keep the workflow identity and its run counter; when starting a new major/minor line, keep the baseline patch at zero. Published assets are immutable. A failed upload can resume the same draft on a workflow rerun. Abandoned drafts never reach the updater.
+
+The workflow uses hosted GitHub runners and the job-scoped `GITHUB_TOKEN`; no CPA enrollment, signing secrets, or workstation access is needed. It skips opt-in paid integration tests. Mac bundles retain the existing ad-hoc signing rather than Developer ID notarization. Hosted runner usage is billed against the private repository's Actions allowance. Run the workflow manually on `main` to retry a failed build without another code change.
+
 An installed copy of Shina updates itself without a download step. It checks GitHub Releases 15 seconds after start and every 4 minutes after each check, through the GitHub CLI and your existing `gh` login, because the repository is private. When a newer version exists, Shina downloads it in the background, checks its size and SHA-256 against the release (the asset digest, or the release's `SHA256SUMS` file) and prepares the replacement next to the installed app. The sidebar shows a passive **Downloading update vX.Y.Z** row meanwhile, then one **Restart to update to vX.Y.Z** button and nothing else.
 
 The button is disabled while any thread is running, waiting for you, configuring Pi, or has queued messages or an open question, while a repository is cloning, and while a rename or captain editor is open. Composer drafts never block, because they are saved. A restart saves and flushes everything first, swaps the executable or app bundle, and reopens Shina on your last workspace.
@@ -86,7 +92,7 @@ sh tools/package-macos.sh
 
 It reuses the installer's bundle construction without installing anything and writes `target/release-package/Shina-macos-<arch>.zip`. An unwritable applications folder or a filesystem without atomic exchange defers installation without asking for elevation. Failed preparation removes that attempt and retries at the next interval.
 
-To publish a release, bump `version` in `Cargo.toml` in a PR, merge it, build each Mac zip on the matching Mac, then run this from a clean `main`:
+For a deliberate manual release instead of the push workflow, choose a version higher than the latest automatic build, update `Cargo.toml` and `Cargo.lock`, and merge it. Build each Mac zip on the matching Mac, then run this from a clean `main`. Restore a zero-patch baseline on a higher major/minor line before resuming automatic builds:
 
 ```powershell
 .\tools\release.ps1 -MacZips <path to>\Shina-macos-aarch64.zip -Install
@@ -237,7 +243,13 @@ The full T3 thread-management port is on hold for a separate spec. Snooze and au
 
 This is an initial desktop prototype. Login UI, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
 
-The supplied `assets/project-icon.png` is the T3 Code project favicon and the source for Shina's executable, taskbar, and window icons. The build generates Windows icon sizes without smoothing the pixel art. This user-supplied artwork is separate from the code's MIT license.
+The pixel S and three colored dots use the same drawing code in [`src/brand.rs`](src/brand.rs) for the in-app mark and native window/Windows executable icons. Checked-in PNG, ICO favicon, and Mac iconset exports retain sharp pixels at every size. The old Pikachu project icon is no longer used. Regenerate exports after changing the mark:
+
+```sh
+cargo run --example export-icons -- assets
+```
+
+`assets/project-icon.png` is the high-resolution app mark. `assets/favicon.png` and `assets/favicon.ico` are the project/browser favicons. The macOS installer packages `assets/macos/Shina.iconset` into the app bundle.
 
 ## Crew artwork
 

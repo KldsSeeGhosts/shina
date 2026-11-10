@@ -2,6 +2,7 @@
 
 mod attachments;
 mod backend;
+mod brand;
 mod captains;
 mod context;
 mod install;
@@ -453,7 +454,7 @@ fn quit_hook(state: &mut State) {
 
 /// After Rune and Pi shut down, apply only an explicitly approved update restart.
 fn install_recorded_update() {
-    let Some(exit) = update::take_exit() else {
+    let Some(exit) = update::take_exit().filter(|exit| exit.relaunch) else {
         return;
     };
     #[cfg(windows)]
@@ -462,7 +463,6 @@ fn install_recorded_update() {
             eprintln!("Could not start the update helper: {error}");
             let _ = update::relaunch(&exit.update.launcher(), &exit.update.target);
         }
-        return;
     }
     #[cfg(not(windows))]
     install_exit_update(exit);
