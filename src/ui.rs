@@ -11,7 +11,7 @@ use rune::{
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 
-// Capy's compact neutral hierarchy, redrawn with native Rune elements.
+// Warm neutral chrome, a paper-like reading area, and Shina's teal action color.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color,
@@ -36,57 +36,85 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#161616"),
-            panel: color("#242424"),
-            card: color("#2d2d2d"),
-            line: Color::WHITE.alpha(0.12),
-            ink: rune::color::oklch(0.9404, 0.0013, 286.4),
-            muted: color("#a1a1a4"),
-            selected: Color::WHITE.alpha(0.08),
-            teal: color("#329f98"),
-            teal_bg: color("#1d3b39"),
+            bg: color("#242422"),
+            panel: color("#1c1c1a"),
+            card: color("#30302d"),
+            line: color("#e3dfd5").alpha(0.12),
+            ink: color("#efede6"),
+            muted: color("#aaa79e"),
+            // Rune blends in linear light, so a small alpha still gives a visible highlight.
+            selected: color("#e3dfd5").alpha(0.02),
+            teal: color("#70b9ad"),
+            teal_bg: color("#263f39"),
             gold: color("#d3ba6b"),
             danger: color("#f0a39c"),
             on_teal: color("#0d1f1e"),
-            badge_ring: color("#161616"),
-            teal_text: color("#55bdb4"),
-            field_line: color("#56565c"),
+            badge_ring: color("#242422"),
+            teal_text: color("#89c8bc"),
+            field_line: color("#5e5c55"),
         }
     } else {
         Palette {
-            bg: color("#ededf0"),
-            panel: rune::color::oklch(0.985, 0.0015, 290.0),
-            card: Color::WHITE,
-            line: Color::BLACK.alpha(0.12),
-            ink: color("#202022"),
-            muted: color("#6a6a70"),
-            selected: Color::BLACK.alpha(0.055),
-            teal: color("#11827c"),
-            teal_bg: color("#e0efed"),
+            bg: color("#eeece5"),
+            panel: color("#faf9f5"),
+            card: color("#fffefa"),
+            line: color("#34332d").alpha(0.12),
+            ink: color("#292923"),
+            muted: color("#66645b"),
+            selected: color("#34332d").alpha(0.075),
+            teal: color("#23776b"),
+            teal_bg: color("#e0ede7"),
             gold: color("#8a701f"),
             danger: color("#a33e38"),
             on_teal: Color::WHITE,
-            badge_ring: color("#f4f4f6"),
-            teal_text: color("#11827c"),
-            field_line: color("#c4c4ca"),
+            badge_ring: color("#eeece5"),
+            teal_text: color("#23776b"),
+            field_line: color("#bcb9ae"),
         }
     }
 }
-const BODY: TextStyle = TextStyle::new(13.0, 400.0).lh(19.5).tracking(-0.13);
+pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
+pub const SERIF_FAMILY: &str = "Anthropic Serif Variable Text, Source Serif 4";
+pub const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/InterVariable.ttf"),
+    include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
+];
+const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
+const PROSE: TextStyle = TextStyle::new(16.0, 400.0)
+    .family(rune::Family::Named(SERIF_FAMILY))
+    .lh(25.0);
+const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
+const HEADING: TextStyle = TextStyle::new(30.0, 450.0)
+    .family(rune::Family::Named(SERIF_FAMILY))
+    .lh(38.0)
+    .tracking(-0.45);
 /// Wide windows (1600 px and up) get a longer measure and larger body text.
 const WIDE_WINDOW: f32 = 1600.0;
 fn body_style(wide: bool) -> TextStyle {
     if wide {
-        TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.14)
+        TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10)
     } else {
         BODY
+    }
+}
+fn prose_style(wide: bool) -> TextStyle {
+    if wide {
+        TextStyle::new(17.0, 400.0)
+            .family(rune::Family::Named(SERIF_FAMILY))
+            .lh(27.0)
+    } else {
+        PROSE
     }
 }
 fn measure(wide: bool) -> f32 {
     if wide { 896.0 } else { 768.0 }
 }
-const LABEL: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.13);
+const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
+/// Height of one-line sidebar rows: navigation, workers and shelved threads.
+const SINGLE_ROW: f32 = 34.0;
+/// Workers sit a step below their captain: shorter rows on the captain's rail.
+const CREW_ROW: f32 = 30.0;
 
 fn text_input(edit: &rune::TextEdit, style: TextStyle) -> El {
     rune::text_input(edit, style).on_input_key(|s: &mut State, event, _| s.undo_key(event, true))
@@ -112,6 +140,7 @@ fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'sta
         .h(24.0)
         .radius(5.0)
         .hover(p.selected)
+        .press(p.selected)
         .on_press(action)
         .child(label(title, TextStyle::new(12.0, 450.0), p.ink))
 }
@@ -305,6 +334,7 @@ fn dropdown(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 's
         .shrink()
         .min_w(0.0)
         .hover(p.selected)
+        .press(p.selected)
         .on_press(action)
         .child(
             label(title, TextStyle::new(12.0, 450.0), p.ink)
@@ -338,8 +368,9 @@ fn icon_button(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(5.0)
+        .radius(7.0)
         .hover(p.selected)
+        .press(p.selected)
         .on_press(action)
         .child(tool_icon(glyph, p.muted))
 }
@@ -486,7 +517,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .hover(p.line)
                     .focusable(true)
                     .on_double_press(|s: &mut State| {
-                        s.sidebar_width = 232.0;
+                        s.sidebar_width = crate::model::DEFAULT_SIDEBAR_WIDTH;
                         s.checkpoint();
                     })
                     .on_drag(move |s: &mut State, drag, _| {
@@ -521,10 +552,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
-        .radius(12.0)
         .fill(p.panel)
-        .border(0.5, p.line)
-        .clip_rounded(12.0);
+        .radius(10.0)
+        .clip_rounded(10.0);
     if s.show_activity && (narrow || s.activity_full) {
         pane = pane.child(activity(s, p, true));
     } else {
@@ -792,14 +822,17 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
 }
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
-    let mut side = col().key("sidebar").w(width).h_full().min_h(0.0).pr(8.0);
-    side = side
-        .child(nav("new-thread", "New thread", "compose", p, false, |s| {
-            s.project_picker = Some(ProjectPicker::NewThread);
-        }))
-        .child(nav("threads-nav", "Threads", "list", p, false, |s| {
-            s.show_archive = false;
-        }));
+    let mut side = col()
+        .key("sidebar")
+        .w(width)
+        .h_full()
+        .min_h(0.0)
+        .pr(8.0)
+        .gap(2.0);
+    // The Archive item doubles as the way back, so the list needs no separate Threads item.
+    side = side.child(nav("new-thread", "New thread", "compose", p, true, |s| {
+        s.project_picker = Some(ProjectPicker::NewThread);
+    }));
     side = side.child(nav(
         "show-archive",
         if s.show_archive {
@@ -825,8 +858,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .child(
                     text_input(&s.search, LABEL)
                         .key("thread-search")
-                        .label("Search threads")
-                        .placeholder("Search threads", p.muted)
+                        .label("Search conversations")
+                        .placeholder("Search conversations", p.muted)
                         .color(p.ink)
                         .single_line()
                         .grow(1.0)
@@ -835,66 +868,134 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 ),
         );
     }
-    let mut content = col().pb(12.0).gap(1.0).min_h(s.sidebar_viewport_height);
-    let search = s.search.text.to_lowercase();
-    if !s.show_archive {
-        content = content.child(section_title("Captains", p).child(icon_button(
-            "assign-captain",
-            "Assign captain to a project",
-            "plus",
-            p,
-            |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
-        )));
-        for (index, home) in s
-            .threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| s.is_captain_home(t) && !t.archived())
-        {
-            content = content.child(thread_row(s, index, p, false));
-            if home.id == s.selected_row() {
-                for (index, _) in s
-                    .threads
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.parent == Some(home.id) && !t.archived())
-                {
-                    content = content.child(el().ml(18.0).child(thread_row(s, index, p, true)));
-                }
-            }
-        }
-    }
     let scope = if !s.scope_additional.is_empty() {
-        format!("{} projects", s.scope_additional.len() + 1)
+        format!("{} workspaces", s.scope_additional.len() + 1)
     } else {
         match s.project_scope {
-            ProjectScope::All => "All projects".into(),
-            ProjectScope::NoProject => "No project".into(),
+            ProjectScope::All => "All workspaces".into(),
+            ProjectScope::NoProject => "No workspace".into(),
             ProjectScope::Project(id) => s
                 .project(Some(id))
                 .map(|p| p.name.clone())
-                .unwrap_or_else(|| "All projects".into()),
+                .unwrap_or_else(|| "All workspaces".into()),
         }
     };
-    content = content.child(
-        section_title(
+    // One context selector owns the entire navigation, including coordinators. Its folder
+    // glyph matches the composer's workspace control, which names the same thing.
+    side = side.child(
+        col()
+            .key("workspace-context")
+            .pt(8.0)
+            .pb(6.0)
+            .gap(6.0)
+            .child(
+                row()
+                    .center_y()
+                    .gap(4.0)
+                    .pr(10.0)
+                    .child(
+                        row()
+                            .key("project-scope")
+                            .role("button")
+                            .label(format!("Workspace: {scope}"))
+                            .focusable(true)
+                            .h(SINGLE_ROW)
+                            .px(10.0)
+                            .gap(10.0)
+                            .center_y()
+                            .radius(8.0)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .hover(p.selected)
+                            .press(p.selected)
+                            .on_press(|s: &mut State| s.project_picker = Some(ProjectPicker::Scope))
+                            .child(
+                                el().size(20.0, 20.0)
+                                    .center()
+                                    .child(icon("folder", p.muted)),
+                            )
+                            .child(
+                                label(&scope, TextStyle::new(14.0, 520.0).tracking(-0.10), p.ink)
+                                    .truncate()
+                                    .shrink()
+                                    .min_w(0.0),
+                            )
+                            .child(icon("chevron", p.muted))
+                            .child(spacer()),
+                    )
+                    .child(project_switcher(s, p)),
+            )
+            .child(rule(p)),
+    );
+    let mut content = col().pb(12.0).gap(3.0).min_h(s.sidebar_viewport_height);
+    let captains = s.sidebar_captains();
+    if !s.show_archive || !captains.is_empty() {
+        let mut heading = section_title(
+            if s.show_archive {
+                "Captain archive"
+            } else {
+                "Captains"
+            },
+            p,
+        );
+        if !s.show_archive {
+            heading = heading.child(icon_button(
+                "assign-captain",
+                "Open a captain in a workspace",
+                "plus",
+                p,
+                |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
+            ));
+        }
+        content = content.child(heading);
+        for index in captains.iter().copied() {
+            let home = s.threads[index].id;
+            let workers = s.visible_captain_workers(home);
+            let mut crew = col()
+                .key(format!("crew-{home}"))
+                .gap(1.0)
+                .child(thread_row(s, index, p, false));
+            if !workers.is_empty() {
+                // Both content and row highlights are inset beneath their owning captain.
+                let mut children = col()
+                    .key(format!("crew-threads-{home}"))
+                    .ml(20.0)
+                    .pl(8.0)
+                    .gap(1.0)
+                    .child(
+                        el().key(format!("crew-rail-{home}"))
+                            .pin(Some(0.0), Some(0.0), None, Some(CREW_ROW / 2.0))
+                            .w(1.0)
+                            .fill(p.line)
+                            .a11y_hidden(),
+                    );
+                for index in workers {
+                    children = children.child(thread_row(s, index, p, true));
+                }
+                crew = crew.child(children);
+            }
+            content = content.child(crew);
+        }
+    }
+    let all = s.sidebar_threads();
+    let visible = s.visible_sidebar_threads();
+    let dragging = s.drag_thread.is_some();
+    // Omit an empty thread list under captains; without captains it holds the empty state.
+    let listed = if s.search.text.is_empty() {
+        !all.is_empty()
+    } else {
+        !visible.is_empty()
+    };
+    if listed || dragging || captains.is_empty() {
+        content = content.child(section_title(
             if s.show_archive {
                 "Archived threads"
             } else {
                 "Threads"
             },
             p,
-        )
-        .child(project_switcher(s, p)),
-    );
-    content = content.child(
-        dropdown("project-scope", &scope, p, |s| {
-            s.project_picker = Some(ProjectPicker::Scope)
-        })
-        .w_full(),
-    );
-    let all = s.sidebar_threads();
-    let visible = s.visible_sidebar_threads();
+        ));
+    }
     let drafts: Vec<_> = visible
         .iter()
         .copied()
@@ -930,7 +1031,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             _ => None,
         };
         if let Some(shelf) = shelf {
-            if rows.is_empty() && section != Section::Settled {
+            // Settled stays visible as a drop target while dragging, even when empty.
+            if rows.is_empty() && !(section == Section::Settled && dragging) {
                 continue;
             }
             if first_shelf {
@@ -947,9 +1049,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .label(format!("{title}, {} threads", rows.len()))
                     .focusable(true)
                     .h(30.0)
-                    .px(8.0)
-                    .gap(6.0)
+                    .px(10.0)
+                    .gap(8.0)
                     .center_y()
+                    .radius(8.0)
                     .hover(p.selected)
                     .on_drawn_layout(move |s: &mut State, rect| {
                         s.drop_rects.insert(marker.clone(), rect);
@@ -958,14 +1061,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         s.shelves[shelf] = !s.shelves[shelf];
                         s.checkpoint();
                     })
-                    .child(icon(
+                    .child(el().size(20.0, 20.0).center().child(icon(
                         if s.shelves[shelf] { "chevron" } else { "open" },
                         p.muted,
-                    ))
+                    )))
                     .child(label(title, SMALL, p.muted).grow(1.0))
                     .child(label(rows.len().to_string(), SMALL, p.muted)),
             );
-        } else if s.drag_thread.is_some() {
+        } else if dragging {
             let marker = format!("drop-{section:?}");
             let selected = s.drag_target.is_some_and(|(to, _)| to == section);
             content = content.child(
@@ -982,9 +1085,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             );
         }
         for index in rows.iter().copied().filter(|i| visible.contains(i)) {
-            if thread_matches(s, index, &search) {
-                content = content.child(thread_row(s, index, p, false));
-            }
+            content = content.child(thread_row(s, index, p, false));
         }
         if section == Section::Settled && s.shelves[2] && rows.len() > s.settled_visible {
             content = content.child(button(
@@ -995,11 +1096,19 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             ));
         }
     }
-    if all.is_empty() {
+    if captains.is_empty() && (all.is_empty() || !s.search.text.is_empty() && visible.is_empty()) {
         content = content.child(
-            label("No threads in these projects yet", SMALL, p.muted)
-                .wrap()
-                .padding(8.0),
+            label(
+                if s.search.text.is_empty() {
+                    "No threads in this workspace yet"
+                } else {
+                    "No matching conversations"
+                },
+                SMALL,
+                p.muted,
+            )
+            .wrap()
+            .padding(8.0),
         );
     }
     side = side.child(
@@ -1048,7 +1157,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         if s.demo {
                             "Demo workspace"
                         } else {
-                            "Local projects"
+                            "Local workspaces"
                         },
                         SMALL,
                         p.muted,
@@ -1076,7 +1185,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
 fn project_switcher(s: &State, p: Palette) -> El {
     toggle_button(
         "project-switcher",
-        "Add project",
+        "Add workspace",
         "plus",
         s.projects.menu.is_some(),
         p,
@@ -1155,7 +1264,7 @@ fn project_menu(s: &State, p: Palette) -> El {
     let mut menu = col()
         .key("project-menu")
         .role("menu")
-        .label("Projects")
+        .label("Workspaces")
         .w(280.0)
         .max_h(440.0)
         .padding(5.0)
@@ -1167,7 +1276,7 @@ fn project_menu(s: &State, p: Palette) -> El {
         .anchored_fit("active-tab", rune::Side::Bottom, rune::Align::Start, 4.0)
         .modal(true, |s: &mut State| s.close_project_menu())
         .child(row().h(24.0).px(8.0).center_y().child(label(
-            "Restore removed project",
+            "Restore removed workspace",
             TextStyle::new(11.5, 520.0),
             p.muted,
         )))
@@ -1419,23 +1528,24 @@ fn nav(
         .role("button")
         .label(title)
         .focusable(true)
-        .h(28.0)
-        .px(8.0)
-        .gap(8.0)
+        .h(SINGLE_ROW)
+        .px(10.0)
+        .gap(10.0)
         .center_y()
-        .radius(6.0)
+        .radius(8.0)
         .fill(if active {
             p.selected
         } else {
             Color::TRANSPARENT
         })
         .hover(p.selected)
+        .press(p.selected)
         .on_press(action)
         .child(icon(glyph, if active { p.ink } else { p.muted }))
         .child(label(
             title,
             if active {
-                TextStyle::new(13.0, 520.0).tracking(-0.13)
+                TextStyle::new(14.0, 520.0).tracking(-0.10)
             } else {
                 LABEL
             },
@@ -1444,9 +1554,9 @@ fn nav(
 }
 fn section_title(title: &str, p: Palette) -> El {
     row()
-        .h(36.0)
-        .pt(8.0)
-        .px(8.0)
+        .h(40.0)
+        .pt(10.0)
+        .px(10.0)
         .center_y()
         .child(label(title, SMALL, p.muted))
         .child(spacer())
@@ -1512,26 +1622,29 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
-fn thread_matches(s: &State, index: usize, search: &str) -> bool {
-    let thread = &s.threads[index];
-    thread.title.to_lowercase().contains(search)
-        || s.draft_listed(thread) && thread.draft.text.to_lowercase().contains(search)
-        || thread
-            .messages
-            .iter()
-            .any(|m| m.text.to_lowercase().contains(search))
-        || s.threads.iter().any(|child| {
-            child.parent == Some(thread.id)
-                && child.archived() == s.show_archive
-                && child.title.to_lowercase().contains(search)
-        })
-}
-
 fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let thread = &s.threads[index];
     let id = thread.id;
+    let approval = thread
+        .request
+        .as_ref()
+        .is_some_and(|r| r["method"] == "confirm")
+        || s.threads.iter().any(|child| {
+            child.parent == Some(id)
+                && child
+                    .request
+                    .as_ref()
+                    .is_some_and(|r| r["method"] == "confirm")
+        });
+    let row_status = if approval || thread.request.is_some() {
+        Status::Waiting
+    } else if s.is_captain_home(thread) {
+        s.home_status(id)
+    } else {
+        thread.status
+    };
     let target = RowTarget::Thread(id);
-    let selected = id == s.selected_row() || s.selected_threads.contains(&id);
+    let selected = id == s.current().id || s.selected_threads.contains(&id);
     let section = s.thread_section(thread, lifecycle::now());
     let slim = matches!(section, Section::Snoozed | Section::Settled) && !s.is_captain_home(thread);
     let hovered = s.hovered_row == Some(target);
@@ -1539,12 +1652,24 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let mut item = col()
         .key(format!("thread-{}", thread.id))
         .role("button")
-        .label(format!("{}, {}", thread.title, thread.status.label()))
+        .label(format!(
+            "{}, {}",
+            thread.title,
+            if approval {
+                "needs approval"
+            } else if nested && (thread.request.is_some() || thread.status == Status::Waiting) {
+                "needs input"
+            } else if nested && thread.unread() && !thread.actionable() {
+                "unread result"
+            } else {
+                row_status.label()
+            },
+        ))
         .focusable(true)
-        .px(8.0)
+        .px(10.0)
         .py(if nested { 5.0 } else { 6.0 })
         .gap(2.0)
-        .radius(6.0)
+        .radius(8.0)
         .min_h(30.0)
         .justify_center()
         .fill(if selected {
@@ -1578,24 +1703,39 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 s.hovered_row = None;
             }
         });
-    if !s.is_captain_home(thread) && thread.machine == "local" && section != Section::Working {
+    if !nested
+        && !s.is_captain_home(thread)
+        && thread.machine == "local"
+        && section != Section::Working
+    {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
     }
 
     let captain_home = s.is_captain_home(thread);
-    // T3 cards lead with the project line; Captains lead with their avatar and name.
+    // Workers use the same lead column inside their indented parent group.
     let lead = if nested {
-        None
+        let alert = thread.actionable() || thread.unread();
+        let mark = match row_status {
+            Status::Waiting => el().size(6.0, 6.0).radius(3.0).fill(p.gold),
+            Status::Failed | Status::Running => status_mark(row_status, p, 6.0),
+            _ if thread.unread() => el().size(6.0, 6.0).radius(3.0).fill(p.teal_text),
+            _ => status_mark(row_status, p, 6.0),
+        };
+        if alert {
+            mark.key(format!("worker-alert-{id}")).a11y_hidden()
+        } else {
+            mark.a11y_hidden()
+        }
     } else if captain_home {
-        Some(avatar(
+        avatar(
             s,
             p,
             thread.captain.expect("captain home"),
             20.0,
             s.home_status(thread.id),
-        ))
+        )
     } else {
-        Some(icon(
+        icon(
             if draft {
                 "edit"
             } else if thread.pinned() {
@@ -1604,39 +1744,56 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 "thread"
             },
             if selected { p.ink } else { p.muted },
-        ))
+        )
     };
-    let mut title = row().gap(8.0).center_y();
-    if captain_home && let Some(lead) = lead.clone() {
-        title = title.child(lead);
+    let mut title = row()
+        .gap(8.0)
+        .center_y()
+        .child(el().size(20.0, 20.0).center().child(lead))
+        .child(
+            label(
+                if draft && !thread.draft.text.is_empty() {
+                    thread.draft.text.lines().next().unwrap_or(&thread.title)
+                } else {
+                    &thread.title
+                },
+                if selected || thread.unread() {
+                    TextStyle::new(14.0, 520.0).tracking(-0.10)
+                } else {
+                    LABEL
+                },
+                // Quiet workers recede so the captain and anything that needs the user lead.
+                if nested && !selected && !thread.unread() && !thread.actionable() {
+                    p.muted
+                } else {
+                    p.ink
+                },
+            )
+            .truncate()
+            .grow(1.0),
+        );
+    let more = icon_button(
+        &format!("thread-more-{id}"),
+        "Thread actions",
+        "more",
+        p,
+        move |s| s.row_menu = Some(target),
+    )
+    .opacity(if hovered || selected { 1.0 } else { 0.0 });
+    // A one-line row gives the title the space of the hidden actions button until the
+    // row is hovered or selected. Two-line rows keep it, since their title line has room.
+    let line_more = more.clone();
+    let single_line = move |item: El, title: El| {
+        item.h(if nested { CREW_ROW } else { SINGLE_ROW })
+            .child(if hovered || selected {
+                title.child(line_more)
+            } else {
+                title
+            })
+    };
+    if nested {
+        return single_line(item, title);
     }
-    title = title.child(
-        label(
-            if draft && !thread.draft.text.is_empty() {
-                thread.draft.text.lines().next().unwrap_or(&thread.title)
-            } else {
-                &thread.title
-            },
-            LABEL,
-            if selected || thread.unread() || thread.life.woke(lifecycle::now()) {
-                p.ink
-            } else {
-                p.muted
-            },
-        )
-        .truncate()
-        .grow(1.0),
-    );
-    title = title.child(
-        icon_button(
-            &format!("thread-more-{id}"),
-            "Thread actions",
-            "more",
-            p,
-            move |s| s.row_menu = Some(target),
-        )
-        .opacity(if hovered || selected { 1.0 } else { 0.0 }),
-    );
     let action = if section == Section::Snoozed {
         "Wake"
     } else if section == Section::Settled {
@@ -1664,43 +1821,29 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             };
             title = title.child(label(time, SMALL, p.muted));
         }
-        let mut line = row().gap(8.0).center_y();
-        if !captain_home && let Some(lead) = lead {
-            line = line.child(lead);
+        return single_line(item, title);
+    }
+    let mut context = vec![];
+    if captain_home && thread.renamed {
+        context.push(s.captains[thread.captain.unwrap()].name.clone());
+    }
+    context.extend(row_workspace(s, thread));
+    // A collapsed crew names its size without revealing individual workers.
+    if captain_home && !s.captain_expanded(id) {
+        let workers = s.captain_worker_count(id);
+        if workers > s.visible_captain_workers(id).len() {
+            let noun = if workers == 1 { "worker" } else { "workers" };
+            context.push(format!("{workers} {noun}"));
         }
-        return item.h(36.0).child(line.child(title.grow(1.0)));
     }
-    let mut meta = row()
-        .gap(if captain_home { 5.0 } else { 8.0 })
-        .center_y()
-        .pl(if captain_home { 28.0 } else { 0.0 });
-    if !captain_home && let Some(lead) = lead {
-        meta = meta.child(lead);
-    }
-    meta = meta.child(
-        label(
-            s.project(thread.project)
-                .map(|p| p.name.as_str())
-                .unwrap_or("No project"),
-            SMALL,
-            p.muted,
-        )
-        .truncate()
-        .grow(1.0),
-    );
-    let approval = thread
-        .request
-        .as_ref()
-        .is_some_and(|r| r["method"] == "confirm")
-        || s.threads.iter().any(|c| {
-            c.parent == Some(id) && c.request.as_ref().is_some_and(|r| r["method"] == "confirm")
-        });
     let at = lifecycle::now();
     let state_label = if approval {
         "Approval"
     } else if thread.request.is_some() {
         "Input"
-    } else if thread.status == Status::Running {
+    } else if captain_home && s.home_status(id) == Status::Running
+        || thread.status == Status::Running
+    {
         "Working"
     } else if thread.status == Status::Waiting {
         "Waiting"
@@ -1713,22 +1856,17 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     } else {
         ""
     };
+    // The age, state or hover actions trail the context line, or the title when the row
+    // has no context left to show.
+    let mut trailing = vec![];
     if thread.life.woke(at) {
-        meta = meta.child(button(&format!("thread-woke-{id}"), "Woke", p, move |s| {
+        trailing.push(button(&format!("thread-woke-{id}"), "Woke", p, move |s| {
             s.threads[index].life.last_visited_at = Some(lifecycle::now());
             s.checkpoint();
         }));
-    } else if hovered && draft {
-        meta = meta.child(icon_button(
-            &format!("thread-discard-{id}"),
-            "Discard draft",
-            "close",
-            p,
-            move |s| s.discard_draft(id),
-        ));
-    } else if hovered && !s.is_captain_home(thread) {
-        if !thread.draft.text.is_empty() {
-            meta = meta.child(icon_button(
+    } else if hovered && !captain_home {
+        if draft || !thread.draft.text.is_empty() {
+            trailing.push(icon_button(
                 &format!("thread-discard-{id}"),
                 "Discard draft",
                 "close",
@@ -1736,24 +1874,26 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 move |s| s.discard_draft(id),
             ));
         }
-        meta = meta.child(
-            icon_button(
-                &format!("thread-snooze-{id}"),
-                "Snooze",
-                "clock",
-                p,
-                move |s| s.open_snooze(id),
-            )
-            .disabled(!s.can_snooze(id)),
-        );
-        meta = meta.child(
-            icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
-                s.settle_thread(id)
-            })
-            .disabled(s.lifecycle_busy(id)),
-        );
+        if !draft {
+            trailing.push(
+                icon_button(
+                    &format!("thread-snooze-{id}"),
+                    "Snooze",
+                    "clock",
+                    p,
+                    move |s| s.open_snooze(id),
+                )
+                .disabled(!s.can_snooze(id)),
+            );
+            trailing.push(
+                icon_button(&format!("thread-park-{id}"), action, "check", p, move |s| {
+                    s.settle_thread(id)
+                })
+                .disabled(s.lifecycle_busy(id)),
+            );
+        }
     } else if !state_label.is_empty() {
-        meta = meta.child(label(
+        trailing.push(label(
             state_label,
             SMALL,
             if approval {
@@ -1765,16 +1905,41 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             },
         ));
     } else if let Some(age) = relative_time(thread.updated) {
-        meta = meta.child(label(age, SMALL, p.muted).key(format!("thread-age-{id}")));
+        trailing.push(label(age, SMALL, p.muted).key(format!("thread-age-{id}")));
     }
     if thread.machine != "local" {
-        meta = meta.child(icon("cloud", p.muted));
+        trailing.push(icon("cloud", p.muted));
     }
-    if captain_home {
-        item.child(title).child(meta)
-    } else {
-        item.child(meta).child(title)
+    if context.is_empty() {
+        for el in trailing {
+            title = title.child(el);
+        }
+        return single_line(item, title);
     }
+    let mut meta = row().gap(8.0).center_y().pl(28.0).child(
+        label(context.join(" · "), SMALL, p.muted)
+            .truncate()
+            .grow(1.0),
+    );
+    for el in trailing {
+        meta = meta.child(el);
+    }
+    item.child(title.child(more)).child(meta)
+}
+
+/// A row's workspace name, unless the Workspace filter already names that one workspace.
+fn row_workspace(s: &State, thread: &Thread) -> Option<String> {
+    let named_by_filter = s.scope_additional.is_empty()
+        && match s.project_scope {
+            ProjectScope::Project(id) => thread.project == Some(id),
+            ProjectScope::NoProject => thread.project.is_none(),
+            ProjectScope::All => false,
+        };
+    (!named_by_filter).then(|| {
+        s.project(thread.project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "No workspace".into())
+    })
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -1810,7 +1975,11 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     col()
                         .gap(2.0)
                         .child(label("Open Captain", TextStyle::new(14.0, 560.0), p.ink))
-                        .child(label("Choose this project's coordinator.", SMALL, p.muted)),
+                        .child(label(
+                            "Choose a coordinator for ongoing work.",
+                            SMALL,
+                            p.muted,
+                        )),
                 )
                 .child(spacer())
                 .child(icon_button(
@@ -1867,30 +2036,33 @@ fn captain_picker(s: &State, p: Palette) -> El {
                 )),
         );
     }
-    card = card.child(
-        row()
-            .key("picker-new-captain")
-            .role("button")
-            .label("New Captain")
-            .focusable(true)
-            .h(36.0)
-            .px(10.0)
-            .gap(8.0)
-            .center_y()
-            .radius(6.0)
-            .border(0.5, p.line)
-            .hover(p.selected)
-            .on_press(|s: &mut State| s.begin_new_captain())
-            .child(icon("plus", p.muted))
-            .child(label("New Captain", LABEL, p.ink)),
-    ).child(rule(p)).child(
-        label(
-            "Captains have separate conversations and crew. Several can share a project, or use no project.",
-            SMALL,
-            p.muted,
+    card = card
+        .child(
+            row()
+                .key("picker-new-captain")
+                .role("button")
+                .label("New Captain")
+                .focusable(true)
+                .h(36.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .border(0.5, p.line)
+                .hover(p.selected)
+                .on_press(|s: &mut State| s.begin_new_captain())
+                .child(icon("plus", p.muted))
+                .child(label("New Captain", LABEL, p.ink)),
         )
-        .wrap(),
-    );
+        .child(rule(p))
+        .child(
+            label(
+                "Each captain keeps a conversation and its workers. Several can share a workspace.",
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        );
     el().key("captain-picker-backdrop")
         .instant_changes()
         .absolute(0.0, 0.0)
@@ -1966,10 +2138,10 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             button(
                 "captain-project-choice",
                 &format!(
-                    "Project: {}",
+                    "Workspace: {}",
                     s.project(captain_project)
                         .map(|p| p.name.as_str())
-                        .unwrap_or("No project")
+                        .unwrap_or("No workspace")
                 ),
                 p,
                 |s| s.project_picker = Some(ProjectPicker::AssignCaptain),
@@ -2157,7 +2329,7 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         let project = s
             .project(thread.project)
             .map(|p| p.name.as_str())
-            .unwrap_or("No project");
+            .unwrap_or("No workspace");
         let mut tab = row()
             .key(if active {
                 "active-tab".into()
@@ -2293,6 +2465,8 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
     let captain = s.is_captain_home(thread);
     let mut actions = col()
         .gap(1.0)
+        .shrink()
+        .min_h(0.0)
         .max_h((s.viewport_height - 80.0).max(240.0))
         .scroll(ScrollSpec {
             stick_bottom: false,
@@ -2358,8 +2532,17 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
     actions = actions
         .child(rule(p))
         .child(
-            menu_item("menu-rename-thread", "Rename thread", "edit", p)
-                .on_press(move |s: &mut State| s.begin_rename(id)),
+            menu_item(
+                "menu-rename-thread",
+                if captain {
+                    "Name this body of work"
+                } else {
+                    "Rename thread"
+                },
+                "edit",
+                p,
+            )
+            .on_press(move |s: &mut State| s.begin_rename(id)),
         )
         .child(
             menu_item("menu-mark-unread", "Mark unread", "thread", p)
@@ -2380,9 +2563,9 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                 menu_item(
                     "menu-filter-project",
                     if s.project_scope == ProjectScope::All {
-                        "Filter by project"
+                        "Filter by workspace"
                     } else {
-                        "Show all projects"
+                        "Show all workspaces"
                     },
                     "folder",
                     p,
@@ -2689,7 +2872,7 @@ fn row_menu(s: &State, p: Palette) -> El {
                 .child(
                     menu_item(
                         "menu-remove-project",
-                        "Remove project from list",
+                        "Remove workspace from list",
                         "close",
                         p,
                     )
@@ -2713,7 +2896,16 @@ fn row_menu(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(0.5, p.line)
         .shadow(6.0, 18.0, Color::BLACK.alpha(0.14))
-        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 2.0)
+        .anchored_fit(
+            anchor,
+            if matches!(target, RowTarget::Thread(_)) {
+                rune::Side::Right
+            } else {
+                rune::Side::Bottom
+            },
+            rune::Align::Start,
+            4.0,
+        )
         .modal(true, |s: &mut State| s.row_menu = None)
         .child(actions)
 }
@@ -2721,14 +2913,21 @@ fn row_menu(s: &State, p: Palette) -> El {
 fn thread_dialog(s: &State, p: Palette) -> El {
     let renaming = s.rename_thread.is_some();
     let id = s.rename_thread.or(s.delete_thread).expect("thread dialog");
+    let captain = s
+        .threads
+        .iter()
+        .any(|thread| thread.id == id && s.is_captain_home(thread));
+    let title = if renaming && captain {
+        "Name this body of work"
+    } else if renaming {
+        "Rename thread"
+    } else {
+        "Delete thread"
+    };
     let mut card = col()
         .key("thread-management-dialog")
         .role("dialog")
-        .label(if renaming {
-            "Rename thread"
-        } else {
-            "Delete thread"
-        })
+        .label(title)
         .w(380.0)
         .max_w(540.0)
         .padding(16.0)
@@ -2737,16 +2936,18 @@ fn thread_dialog(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(0.5, p.line)
         .on_press(|_: &mut State| {})
-        .child(label(
-            if renaming {
-                "Rename thread"
-            } else {
-                "Delete thread?"
-            },
-            TextStyle::new(15.0, 560.0),
-            p.ink,
-        ));
+        .child(label(title, TextStyle::new(15.0, 560.0), p.ink));
     if renaming {
+        if captain {
+            card = card.child(
+                label(
+                    "Name the goal, feature, or ongoing work. The captain profile stays unchanged.",
+                    SMALL,
+                    p.muted,
+                )
+                .wrap(),
+            );
+        }
         card = card.child(
             text_input(&s.rename_edit, BODY)
                 .key("thread-name-input")
@@ -2816,7 +3017,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     let mut card = col()
         .key("project-picker")
         .role("dialog")
-        .label("Choose project")
+        .label("Choose workspace")
         .w(360.0)
         .max_h(480.0)
         .padding(10.0)
@@ -2831,7 +3032,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 .child(
                     label(
                         match mode {
-                            ProjectPicker::Scope => "Show threads in",
+                            ProjectPicker::Scope => "Show conversations in",
                             ProjectPicker::NewThread => "New thread in",
                             ProjectPicker::AssignCaptain => "Assign captain to",
                         },
@@ -2842,7 +3043,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 )
                 .child(icon_button(
                     "close-project-picker",
-                    "Close project picker",
+                    "Close workspace picker",
                     "close",
                     p,
                     |s| s.project_picker = None,
@@ -2850,18 +3051,20 @@ fn project_picker(s: &State, p: Palette) -> El {
         );
     if mode == ProjectPicker::Scope {
         card = card.child(
-            menu_item("scope-all-projects", "All projects", "list", p).on_press(|s: &mut State| {
-                s.project_scope = ProjectScope::All;
-                s.scope_additional.clear();
-                s.selected_threads.clear();
-                s.project_picker = None;
-                s.checkpoint();
-            }),
+            menu_item("scope-all-projects", "All workspaces", "list", p).on_press(
+                |s: &mut State| {
+                    s.project_scope = ProjectScope::All;
+                    s.scope_additional.clear();
+                    s.selected_threads.clear();
+                    s.project_picker = None;
+                    s.checkpoint();
+                },
+            ),
         );
     }
     {
         card = card.child(
-            menu_item("choose-no-project", "No project", "thread", p).on_press_tx(
+            menu_item("choose-no-project", "No workspace", "thread", p).on_press_tx(
                 move |s: &mut State, tx| {
                     if mode == ProjectPicker::NewThread {
                         s.new_thread_in(None);
@@ -2918,7 +3121,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 )
                 .child(icon_button(
                     &format!("project-more-{id}"),
-                    "Project actions",
+                    "Workspace actions",
                     "more",
                     p,
                     move |s| s.row_menu = Some(target),
@@ -2926,10 +3129,12 @@ fn project_picker(s: &State, p: Palette) -> El {
         );
     }
     card = card.child(choices).child(rule(p)).child(
-        menu_item("picker-add-project", "Add project...", "folder", p).on_press(|s: &mut State| {
-            s.project_picker = None;
-            s.open_project_menu();
-        }),
+        menu_item("picker-add-project", "Add workspace...", "folder", p).on_press(
+            |s: &mut State| {
+                s.project_picker = None;
+                s.open_project_menu();
+            },
+        ),
     );
     el().key("project-picker-backdrop")
         .instant_changes()
@@ -3339,7 +3544,7 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
             let style = MarkdownStyle::neutral(s.dark)
                 .text(p.ink)
                 .muted(p.muted)
-                .body_font(body_style(wide))
+                .body_font(prose_style(wide))
                 .inline_code_bg(if s.dark {
                     Color::WHITE.alpha(0.07)
                 } else {
@@ -3355,7 +3560,7 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
                 );
             memo(
                 format!("message-{}-{message}-body-{from}", t.id),
-                (chunk, s.dark, streaming),
+                (chunk, s.dark, streaming, wide),
                 || {
                     Markdown::new(chunk)
                         .streaming(streaming)
@@ -3519,24 +3724,37 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     .child(
                         col()
                             .gap(3.0)
+                            .grow(1.0)
+                            .min_w(0.0)
                             .child(
                                 row()
                                     .gap(8.0)
                                     .center_y()
-                                    .child(label(
-                                        format!("Captain {}", s.captains[captain].name),
-                                        TextStyle::new(16.0, 560.0),
-                                        p.ink,
-                                    ))
+                                    .child(
+                                        label(
+                                            if s.is_captain_home(t) && t.renamed {
+                                                t.title.clone()
+                                            } else {
+                                                format!("Captain {}", s.captains[captain].name)
+                                            },
+                                            TextStyle::new(24.0, 450.0)
+                                                .family(rune::Family::Named(SERIF_FAMILY))
+                                                .lh(32.0),
+                                            p.ink,
+                                        )
+                                        .key("captain-goal-heading")
+                                        .wrap()
+                                        .shrink()
+                                        .min_w(0.0),
+                                    )
                                     .child({
                                         let working = s
                                             .threads
                                             .iter()
                                             .filter(|thread| {
-                                                thread.captain == Some(captain)
-                                                    && !thread.captain_home
+                                                thread.parent == Some(t.id)
                                                     && !thread.archived()
-                                                    && thread.status.busy()
+                                                    && thread.status == Status::Running
                                             })
                                             .count();
                                         if working == 0 {
@@ -3546,37 +3764,52 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                                                 .center_y()
                                                 .gap(6.0)
                                                 .child(status_mark(Status::Running, p, 6.0))
-                                                .child(label(
-                                                    format!(
-                                                        "{working} {} working",
-                                                        if working == 1 {
-                                                            "thread"
-                                                        } else {
-                                                            "threads"
-                                                        }
-                                                    ),
-                                                    SMALL,
-                                                    status_ink(Status::Running, p),
-                                                ))
+                                                .child(
+                                                    label(
+                                                        format!(
+                                                            "{working} {} working",
+                                                            if working == 1 {
+                                                                "thread"
+                                                            } else {
+                                                                "threads"
+                                                            }
+                                                        ),
+                                                        SMALL,
+                                                        status_ink(Status::Running, p),
+                                                    )
+                                                    .key("captain-working-count"),
+                                                )
                                         }
                                     }),
                             )
-                            .child(label(
-                                format!(
-                                    "{} · {}",
-                                    s.captains[captain].role,
-                                    s.captains[captain]
-                                        .instructions
-                                        .lines()
-                                        .next()
-                                        .unwrap_or("")
-                                ),
-                                SMALL,
-                                p.muted,
-                            )),
+                            .child(
+                                label(
+                                    format!(
+                                        "{} · {}",
+                                        if t.renamed {
+                                            format!("Captain {}", s.captains[captain].name)
+                                        } else {
+                                            s.captains[captain].role.clone()
+                                        },
+                                        s.captains[captain]
+                                            .instructions
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                    ),
+                                    SMALL,
+                                    p.muted,
+                                )
+                                .wrap(),
+                            ),
                     ),
             );
         } else {
+            introduction = introduction.child(
+                label("What are we working on?", HEADING, p.ink)
+                    .key("empty-heading")
+                    .wrap(),
+            );
             introduction = introduction.child(
                 row()
                     .gap(6.0)
@@ -3661,7 +3894,7 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                             .px(14.0)
                             .py(9.0)
                             .radius(10.0)
-                            .fill(if s.dark { p.card } else { color("#ededf0") }),
+                            .fill(if s.dark { p.card } else { p.selected }),
                     );
                 }
                 row().justify_end().child(user)
@@ -4023,8 +4256,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .w_full()
         .max_w(measure(wide))
         .px(16.0)
-        .pb(12.0)
-        .gap(6.0);
+        .pb(16.0)
+        .gap(8.0);
     if let Some(error) = &s.storage_error {
         area = area.child(label(error, SMALL, p.danger).wrap_anywhere());
     }
@@ -4063,9 +4296,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .key("send-message")
         .role("button")
         .label("Send message")
-        .size(28.0, 28.0)
-        .radius(7.0)
+        .size(32.0, 32.0)
+        .radius(10.0)
         .center()
+        .hover(if can_send {
+            p.teal.alpha(0.85)
+        } else {
+            p.selected
+        })
         .fill(if can_send {
             p.teal
         } else if s.dark {
@@ -4073,7 +4311,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         } else {
             p.selected
         })
-        .child(icon("send", if can_send { p.card } else { p.muted }))
+        .child(icon("send", if can_send { p.on_teal } else { p.muted }))
         .disabled(!can_send);
     if can_send {
         send = send.focusable(true).on_press(|s: &mut State| s.send());
@@ -4082,18 +4320,12 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         icon_button("stop-agent", "Stop agent", "stop", p, |s| {
             s.current_mut().stop()
         })
+        .size(32.0, 32.0)
         .border(1.0, p.line)
     } else {
         send
     };
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
-    let identity = if let Some(captain) = t.captain {
-        avatar(s, p, captain, 16.0, shown_status(s))
-    } else {
-        el().size(16.0, 16.0)
-            .center()
-            .child(icon("thread", p.muted))
-    };
     let tray = if t.draft_images.is_empty() {
         None
     } else {
@@ -4105,29 +4337,27 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     };
     let mut card = col()
         .key("composer")
-        .radius(12.0)
+        .radius(16.0)
         .fill(p.card)
         .border(
-            if s.attachment_drop_hover || s.dark {
-                1.0
-            } else {
-                0.5
-            },
+            1.0,
             if s.attachment_drop_hover {
                 p.teal
+            } else if t.draft.focused {
+                p.field_line
             } else {
                 p.line
             },
         )
         .shadow(
-            2.0,
-            6.0,
-            Color::BLACK.alpha(if s.dark { 0.12 } else { 0.06 }),
+            3.0,
+            10.0,
+            Color::BLACK.alpha(if s.dark { 0.10 } else { 0.035 }),
         )
-        .px(14.0)
-        .pt(12.0)
-        .pb(10.0)
-        .gap(10.0)
+        .px(16.0)
+        .pt(14.0)
+        .pb(12.0)
+        .gap(12.0)
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
             s.attach_paths(files);
@@ -4138,21 +4368,21 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         card = card.child(tray);
     }
     card = card.child(
-        text_input(&t.draft, body_style(wide))
+        text_input(&t.draft, COMPOSER)
             .key("composer-input")
             .label("Message Pi")
             .placeholder(
                 if s.demo {
                     "Open a real workspace to send messages"
                 } else {
-                    "Ask anything..."
+                    "Describe a task or ask a question..."
                 },
                 p.muted,
             )
             .color(p.ink)
             .caret(p.teal, p.teal_bg)
             .w_full()
-            .min_h(24.0)
+            .min_h(52.0)
             .max_h(170.0)
             .on_edit(|s: &mut State| &mut s.current_mut().draft)
             .on_input_paste(|s: &mut State, content, _| {
@@ -4177,35 +4407,45 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     let mut actions = row()
         .key("composer-actions")
         .center_y()
-        .gap(5.0)
-        .child(identity)
+        .gap(4.0)
+        .child(attach_control(locked, p).size(28.0, 28.0))
+        .child(spacer())
         .child(
             dropdown("choose-pi-model", &t.model, p, |s| {
                 s.model_search.replace_text("");
                 s.settings_picker = Some(SettingsPicker::Model);
                 s.refresh_catalog();
             })
-            .max_w(if narrow { 112.0 } else { 230.0 })
+            .h(28.0)
+            .max_w(if narrow { 104.0 } else { 230.0 })
             .opacity(if locked { 0.65 } else { 1.0 })
             .disabled(locked),
         )
         .child(
-            dropdown("choose-pi-thinking", &thinking_label(&t.thinking), p, |s| {
-                s.settings_picker = Some(SettingsPicker::Thinking);
-                s.refresh_catalog();
-            })
+            dropdown(
+                "choose-pi-thinking",
+                thinking_label(&t.thinking).trim_end_matches(" thinking"),
+                p,
+                |s| {
+                    s.settings_picker = Some(SettingsPicker::Thinking);
+                    s.refresh_catalog();
+                },
+            )
+            .label(format!("Reasoning effort: {}", thinking_label(&t.thinking)))
+            .h(28.0)
+            .max_w(if narrow { 76.0 } else { 130.0 })
             .opacity(if locked { 0.65 } else { 1.0 })
             .disabled(locked),
-        )
-        .child(attach_control(locked, p))
-        .child(spacer());
+        );
     if context_available(t) {
         actions = actions.child(context_ring(t, p));
     }
     area = area.child(card.child(actions.child(action)));
     area = area.child(
         row()
-            .h(20.0)
+            .key("composer-footer")
+            .min_h(24.0)
+            .flex_wrap()
             .center_y()
             .gap(5.0)
             .child(icon("folder", p.muted))
@@ -4216,15 +4456,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                     p,
                     |s| s.project_picker = Some(ProjectPicker::NewThread),
                 )
-                .max_w(if narrow { 210.0 } else { 360.0 }),
+                .max_w(if narrow { 150.0 } else { 360.0 }),
             )
-            .child(label("·", SMALL, p.muted))
+            // The dropdown chevron already separates the picker from this note.
             .child(
                 label(
                     if s.demo { "Demo data" } else { "No sandbox" },
                     SMALL,
                     p.muted,
                 )
+                .ml(4.0)
                 .wrap()
                 .grow(1.0),
             )
@@ -4247,8 +4488,10 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                         TextStyle::new(11.5, 500.0),
                         p.teal,
                     ))
-            } else {
+            } else if !narrow {
                 label("Shift Enter for newline", SMALL, p.muted)
+            } else {
+                el()
             }),
     );
     col().w_full().items_center().child(area)
@@ -4423,11 +4666,12 @@ pub(crate) mod tests {
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
     fn runtime(width: f32) -> Runtime<State> {
-        Runtime::new(
+        Runtime::with_text(
             State::new(".".into(), false),
             view,
             (width, 720.0),
             Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
         )
     }
     fn press(rt: &mut Runtime<State>, key: &str) {
@@ -4447,6 +4691,88 @@ pub(crate) mod tests {
             .as_array()?
             .iter()
             .find_map(|c| find(c, key))
+    }
+
+    #[test]
+    fn reading_and_control_text_keep_accessible_contrast_in_both_themes() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            for (foreground, background) in [
+                (p.ink, p.panel),
+                (p.ink, p.bg),
+                (p.muted, p.panel),
+                (p.muted, p.bg),
+                (p.muted, p.card),
+                (p.muted, p.bg.mix(p.selected, p.selected.a)),
+                (p.muted, p.card.mix(p.selected, p.selected.a)),
+                (p.teal_text, p.panel),
+                (p.on_teal, p.teal),
+            ] {
+                let a = foreground.luminance();
+                let b = background.luminance();
+                let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(contrast >= 4.5, "text contrast {contrast:.2}, dark={dark}");
+            }
+        }
+    }
+
+    #[test]
+    fn composer_controls_fit_with_long_model_names_at_minimum_height() {
+        for (width, sidebar) in [(620.0, false), (620.0, true), (800.0, true), (1920.0, true)] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 480.0), 1.0);
+            rt.state.compact_sidebar = sidebar;
+            let t = rt.state.current_mut();
+            t.model = "A deliberately long model name for layout validation".into();
+            t.context.usage = ContextUsage {
+                tokens: Some(60_000),
+                context_window: Some(200_000),
+                percent: Some(30.0),
+            };
+            t.draft.replace_text("A short draft");
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (card, _) = rt.presented("composer").unwrap();
+            assert!(card[1] >= 0.0 && card[1] + card[3] <= 480.5);
+            let mut previous_right = card[0];
+            for key in [
+                "attach-image",
+                "choose-pi-model",
+                "choose-pi-thinking",
+                "context-usage-ring",
+                "send-message",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{key} is missing"));
+                assert!(
+                    rect[0] >= previous_right - 0.5
+                        && rect[0] + rect[2] <= card[0] + card[2] + 0.5
+                        && rect[1] >= card[1]
+                        && rect[1] + rect[3] <= card[1] + card[3] + 0.5,
+                    "{key} overlaps or overflows at {width}, sidebar={sidebar}: {rect:?} in {card:?}"
+                );
+                previous_right = rect[0] + rect[2];
+            }
+            let (footer, _) = rt.presented("composer-footer").unwrap();
+            assert!(footer[1] + footer[3] <= 480.5);
+        }
+    }
+
+    #[test]
+    fn sidebar_and_composer_remain_usable_with_system_reduce_motion() {
+        let mut rt = runtime(620.0);
+        rt.set_system_reduced_motion(true);
+        rt.frame(0.0);
+        press(&mut rt, "sidebar-toggle");
+        rt.frame(1.0);
+        assert!(rt.reduced_motion);
+        assert!(rt.presented("sidebar").is_some());
+        press(&mut rt, "sidebar-toggle");
+        rt.frame(1.0);
+        assert!(rt.presented("sidebar").is_none());
+        press(&mut rt, "composer-input");
+        assert!(rt.state.current().draft.focused);
     }
 
     #[test]
@@ -4536,7 +4862,13 @@ pub(crate) mod tests {
         assert!(rt.find("shelf-Settled").is_some());
         assert!(rt.find("thread-2").is_none());
         assert!(rt.find("thread-4").is_none());
+        rt.wheel(100.0, 400.0, -400.0);
+        rt.frame(1.0);
         press(&mut rt, "shelf-Working");
+        assert!(rt.state.shelves[0]);
+        // The expanded shelf can extend below a short window. Scroll it into view.
+        rt.wheel(100.0, 400.0, -220.0);
+        rt.frame(1.0);
         assert!(rt.find("thread-2").is_some());
         rt.state.select_thread(1);
         rt.frame(0.0);
@@ -4631,7 +4963,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn captain_home_menus_offer_no_lifecycle_controls_and_search_never_lists_homes() {
+    fn captain_home_menus_keep_lifecycle_controls_separate_from_threads() {
         let mut rt = runtime(1280.0);
         rt.state.open_captain(0);
         let home = rt.state.current().id;
@@ -5007,6 +5339,9 @@ pub(crate) mod tests {
         rt.frame(0.0);
         assert!(rt.find("toggle-tool-group-1-0").is_some());
         assert!(rt.find("inline-tool-1-0").is_none());
+        // Larger reply text can put the first tool group above the pinned-bottom viewport.
+        rt.wheel(800.0, 200.0, 1000.0);
+        rt.frame(1.0);
         press(&mut rt, "toggle-tool-group-1-0");
         rt.frame(2.0);
         assert!(rt.state.current().tools[0].group_expanded);
@@ -5345,6 +5680,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn workspace_filter_precedes_and_filters_both_captains_and_threads() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        let (filter, _) = rt.presented("project-scope").unwrap();
+        let (captain, _) = rt.presented("thread-7").unwrap();
+        assert!(filter[1] < captain[1]);
+        press(&mut rt, "project-scope");
+        press(&mut rt, "choose-project-1");
+        rt.frame(1.0);
+        assert!(rt.find("thread-7").is_some());
+        assert!(rt.find("thread-8").is_none());
+        assert!(rt.find("thread-9").is_none());
+        assert!(rt.find("thread-3").is_none());
+        rt.state.search.replace_text("no such conversation");
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("thread-7").is_none());
+        assert!(rt.find("assign-captain").is_some());
+    }
+
+    #[test]
     fn unknown_activity_does_not_render_an_epoch_age() {
         assert_eq!(relative_time(0), None);
         assert_eq!(relative_time(crate::projects::now()), Some("now".into()));
@@ -5455,12 +5812,13 @@ pub(crate) mod tests {
         rt.frame(0.0);
         let (parent, _) = rt.presented("thread-1").unwrap();
         let (child, _) = rt.presented("thread-2").unwrap();
-        assert!(child[0] > parent[0] && child[1] > parent[1]);
+        assert!(child[0] >= parent[0] + 24.0 && child[1] > parent[1]);
+        assert!(child[0] + child[2] <= parent[0] + parent[2] + 0.5);
         rt.state.search.replace_text("Delegated");
         rt.frame(0.0);
         assert!(
             rt.presented("thread-1").is_some(),
-            "captains stay in their own area during thread search"
+            "matching workers retain their captain as context during search"
         );
         press(&mut rt, "thread-2");
         assert_eq!(rt.state.current().id, 2);
@@ -5469,7 +5827,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn captain_crew_is_visible_in_the_captain_view_but_not_the_lone_archive() {
+    fn archived_workers_remain_under_their_captain_and_can_be_restored() {
         let mut rt = runtime(1280.0);
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
@@ -5486,10 +5844,50 @@ pub(crate) mod tests {
         rt.state.show_archive = true;
         rt.invalidate();
         rt.frame(0.0);
+        rt.frame(1.0);
+        let (home, _) = rt.presented(&format!("thread-{parent}")).unwrap();
+        let (worker, _) = rt.presented("thread-3").unwrap();
+        assert!(worker[0] >= home[0] + 24.0 && worker[1] > home[1]);
         assert!(
-            rt.find("thread-3").is_none(),
-            "exiting rows are not interactive archive rows"
+            !rt.state
+                .sidebar_threads()
+                .iter()
+                .any(|i| rt.state.threads[*i].id == 3)
         );
+        press(&mut rt, "thread-3");
+        press(&mut rt, "thread-actions");
+        press(&mut rt, "menu-archive-thread");
+        assert!(!rt.state.current().archived());
+    }
+
+    #[test]
+    fn nested_worker_alerts_cover_input_failure_and_unread_results_without_auto_expanding() {
+        let mut rt = runtime(1280.0);
+        rt.state.open_captain(0);
+        let mut child = crate::model::Thread::new(99);
+        child.parent = Some(rt.state.current().id);
+        child.delegated = true;
+        rt.state.threads.push(child);
+        rt.frame(0.0);
+        assert!(rt.presented("worker-alert-99").is_none());
+        for state in 0..3 {
+            let child = rt.state.threads.last_mut().unwrap();
+            child.request = (state == 0).then(|| json!({"method":"input"}));
+            child.status = if state == 1 {
+                Status::Failed
+            } else {
+                Status::Completed
+            };
+            child.life.last_completed_at = Some(2);
+            child.life.last_visited_at = Some(if state == 2 { 1 } else { 3 });
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(rt.presented("worker-alert-99").is_some());
+        }
+        rt.state.select_thread(0);
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("thread-99").is_none());
     }
 
     #[test]
@@ -5539,6 +5937,11 @@ pub(crate) mod tests {
         press(&mut rt, "thread-more-1");
         press(&mut rt, "menu-delete-thread");
         assert_eq!(
+            rt.state.delete_thread,
+            Some(1),
+            "delete menu opens confirmation"
+        );
+        assert_eq!(
             rt.state.threads.len(),
             1,
             "confirmation does not delete yet"
@@ -5582,6 +5985,47 @@ pub(crate) mod tests {
             "composer width was {}",
             rect[2]
         );
+    }
+    #[test]
+    fn a_named_captain_goal_wraps_without_pushing_the_composer_out_of_the_window() {
+        let mut state = State::new(".".into(), false);
+        state.open_captain(0);
+        state.current_mut().title = "Polish the Shina workspace and keyboard navigation".into();
+        state.current_mut().renamed = true;
+        let mut rt = Runtime::with_text(
+            state,
+            view,
+            (620.0, 480.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        rt.frame(0.0);
+        for key in ["captain-goal-heading", "composer", "send-message"] {
+            let (rect, _) = rt.presented(key).unwrap();
+            assert!(
+                rect[0] >= 0.0
+                    && rect[1] >= 0.0
+                    && rect[0] + rect[2] <= 620.5
+                    && rect[1] + rect[3] <= 480.5,
+                "{key} is outside the minimum window: {rect:?}",
+            );
+        }
+        assert!(rt.presented("captain-goal-heading").unwrap().0[3] > 32.0);
+    }
+    #[test]
+    fn an_empty_captain_does_not_count_a_waiting_worker_as_running() {
+        let mut rt = runtime(1280.0);
+        rt.state.open_captain(0);
+        let mut worker = crate::model::Thread::new(99);
+        worker.parent = Some(rt.state.current().id);
+        worker.status = Status::Waiting;
+        rt.state.threads.push(worker);
+        rt.frame(0.0);
+        assert!(rt.presented("captain-working-count").is_none());
+        rt.state.threads.last_mut().unwrap().status = Status::Running;
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.presented("captain-working-count").is_some());
     }
     #[test]
     fn composer_has_no_connection_controls_and_pickers_work_without_a_process() {

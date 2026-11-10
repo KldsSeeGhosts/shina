@@ -44,11 +44,11 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
             || event.is_command('{')
             || event.is_command('}'))
     {
-        let order = state.visible_sidebar_threads();
+        let order = state.sidebar_navigation();
         if !order.is_empty() {
             let i = order
                 .iter()
-                .position(|i| state.threads[*i].id == state.selected_row())
+                .position(|i| state.threads[*i].id == state.current().id)
                 .unwrap_or(0);
             let next = if event.is_command('[') || event.is_command('{') {
                 (i + order.len() - 1) % order.len()
@@ -61,10 +61,7 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         let Key::Command(n) = event.key else {
             unreachable!()
         };
-        if let Some(i) = state
-            .visible_sidebar_threads()
-            .get(n as usize - '1' as usize)
-        {
+        if let Some(i) = state.sidebar_navigation().get(n as usize - '1' as usize) {
             state.select_thread(*i);
         }
     } else if event.is_command('n') {
@@ -121,6 +118,96 @@ fn running_demo(state: &mut State) {
     tool.done = false;
     tool.duration_ms = None;
     tool.started = Some(std::time::Instant::now());
+}
+
+/// Example coordinator and worker chats. No agents run in snapshot scenes.
+fn captain_workspace_demo(state: &mut State) {
+    state.populate_demo();
+    state.project_scope = model::ProjectScope::Project(1);
+    let home = state
+        .threads
+        .iter()
+        .position(|thread| thread.id == 7)
+        .unwrap();
+    state.threads[home].title = "Polish the Shina workspace".into();
+    state.threads[home].renamed = true;
+    state.threads[home].messages = vec![
+        model::Message {
+            role: "You",
+            text: "Refine the sidebar and composer. Keep our captains and existing animations, but give each kind of work one clear place.".into(),
+            images: vec![],
+        },
+        model::Message {
+            role: "Pi",
+            text: "The workspace filter now applies to every conversation.\n\nI'll keep the sidebar review and reconnect fix under this captain. Independent conversations stay in the thread list, with the same pin, snooze, and settle controls.\n\nThe sidebar review needs your approval. You can open the worker directly without leaving this body of work.".into(),
+            images: vec![],
+        },
+    ];
+    for id in [1, 2] {
+        let worker = state
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .unwrap();
+        worker.parent = Some(7);
+        worker.delegated = true;
+    }
+    let review = &mut state.threads[1];
+    review.status = model::Status::Waiting;
+    review.request = Some(serde_json::json!({
+        "id": "demo-approval",
+        "method": "confirm",
+        "title": "Apply the sidebar changes?",
+        "message": "Example approval, not a real pending operation."
+    }));
+    let mut direct = model::Thread::new(11);
+    direct.title = "Explore keyboard navigation".into();
+    direct.project = Some(1);
+    direct.status = model::Status::Completed;
+    direct.life.latest_user_message_at = Some(lifecycle::now());
+    state.threads.push(direct);
+    // A second captain in the same workspace, with quiet, running and unread workers.
+    let mut release = model::Thread::new(12);
+    release.title = "Prepare the 0.11 release".into();
+    release.renamed = true;
+    release.captain = Some(2);
+    release.captain_home = true;
+    release.project = Some(1);
+    state.threads.push(release);
+    let now = lifecycle::now();
+    for (id, title, status, unread) in [
+        (13, "Draft the release notes", model::Status::Running, false),
+        (14, "Check the update feed", model::Status::Completed, false),
+        (
+            15,
+            "Verify the signed build",
+            model::Status::Completed,
+            true,
+        ),
+    ] {
+        let mut worker = model::Thread::new(id);
+        worker.title = title.into();
+        worker.status = status;
+        worker.parent = Some(12);
+        worker.delegated = true;
+        worker.captain = Some(2);
+        worker.project = Some(1);
+        if status == model::Status::Completed {
+            worker.life.last_completed_at = Some(now - 60_000);
+            worker.life.last_visited_at = Some(if unread { now - 120_000 } else { now });
+        }
+        state.threads.push(worker);
+    }
+    state.next_id = 16;
+    state.tabs = vec![7, 1, 11];
+    state.select_thread(home);
+}
+
+/// The same work with a standalone thread open, so both crews are collapsed.
+fn captain_crews_demo(state: &mut State) {
+    captain_workspace_demo(state);
+    let solo = state.threads.iter().position(|t| t.id == 11).unwrap();
+    state.select_thread(solo);
 }
 
 fn main() {
@@ -197,8 +284,8 @@ fn main() {
     let snapshot = std::env::args().any(|arg| arg == "--snap");
     OPTIONS.set((workspace, demo, snapshot)).ok();
     rune::App::new(AppSpec {
-        fonts: &[include_bytes!("../assets/fonts/InterVariable.ttf")],
-        families: ("Inter Variable", "Cascadia Mono, Consolas"),
+        fonts: ui::FONTS,
+        families: (ui::SANS_FAMILY, "Cascadia Mono, Consolas"),
         min_size: Some((620.0, 480.0)),
         setup: Some(|state: &mut State, wake| {
             if !OPTIONS.get().expect("startup options").2 { state.setup(wake); }
@@ -209,6 +296,15 @@ fn main() {
             ("example", |state| state.populate_demo()),
             ("dark", |state| {
                 state.populate_demo();
+                state.dark = true;
+            }),
+            ("empty", |state| {
+                state.populate_demo();
+                state.new_thread_in(None);
+            }),
+            ("empty-dark", |state| {
+                state.populate_demo();
+                state.new_thread_in(None);
                 state.dark = true;
             }),
             ("sidebar-narrow", |state| {
@@ -248,6 +344,31 @@ fn main() {
             ("captain", |state| {
                 state.populate_demo();
                 state.open_captain(0);
+            }),
+            ("captain-workspace", captain_workspace_demo),
+            ("captain-workspace-dark", |state| {
+                captain_workspace_demo(state);
+                state.dark = true;
+            }),
+            ("captain-goal-empty", |state| {
+                captain_workspace_demo(state);
+                let home = state.current_mut();
+                home.title = "Polish the Shina workspace and keyboard navigation".into();
+                home.messages.clear();
+            }),
+            ("captain-crews", captain_crews_demo),
+            ("captain-crews-dark", |state| {
+                captain_crews_demo(state);
+                state.dark = true;
+            }),
+            ("captain-crews-narrow", |state| {
+                captain_crews_demo(state);
+                state.compact_sidebar = true;
+            }),
+            ("captain-search", |state| {
+                captain_workspace_demo(state);
+                state.search_open = true;
+                state.search.replace_text("sidebar");
             }),
             ("thread-menu", |state| {
                 state.populate_demo();

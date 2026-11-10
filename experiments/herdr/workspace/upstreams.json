@@ -1,0 +1,12 @@
+{
+  "herdr-chat": {
+    "url": "https://github.com/ChmaraX/herdr-chat.git",
+    "commit": "f10e77b73338e474fb31ee8fb9535742a1683690",
+    "license": "MIT"
+  },
+  "herdr-t3": {
+    "url": "https://github.com/JinJieBeWater/herdr-t3.git",
+    "commit": "9e4c65de5702e448af07dc5fb505f9e43dc4c5fd",
+    "license": "Apache-2.0"
+  }
+}
