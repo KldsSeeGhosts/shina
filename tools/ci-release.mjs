@@ -7,8 +7,11 @@ import { fileURLToPath } from "node:url";
 export const ASSETS = [
   "shina.exe",
   "Shina-macos-aarch64.zip",
-  "Shina-macos-x86_64.zip",
+  "Shina-linux-x86_64.tar.gz",
 ];
+export const PLATFORM_ASSET = Object.fromEntries(
+  ["windows-x86_64", "macos-aarch64", "linux-x86_64"].map((platform, i) => [platform, ASSETS[i]]),
+);
 
 export function parseVersion(value) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(value);
@@ -62,17 +65,28 @@ export function prepareVersions(manifest, lock, version) {
   };
 }
 
-export function checksumManifest(directory) {
+export function checksumManifest(directory, assets = ASSETS) {
   const unexpected = readdirSync(directory).filter((name) =>
-    !ASSETS.includes(name) && name !== "SHA256SUMS");
+    !assets.includes(name) && name !== "SHA256SUMS");
   if (unexpected.length) throw new Error(`Unexpected release files: ${unexpected.join(", ")}`);
-  return ASSETS.map((name) => {
+  return assets.map((name) => {
     const path = join(directory, name);
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0) {
       throw new Error(`Expected a nonempty release file: ${name}`);
     }
     return `${createHash("sha256").update(readFileSync(path)).digest("hex")}  ${name}\n`;
+  }).join("");
+}
+
+export function uploadedChecksums(assets) {
+  const available = assets.filter((asset) => ASSETS.includes(asset.name));
+  if (!available.length) throw new Error("No platform assets have uploaded");
+  return available.sort((a, b) => a.name.localeCompare(b.name)).map((asset) => {
+    if (!/^sha256:[a-f0-9]{64}$/i.test(asset.digest ?? "")) {
+      throw new Error(`GitHub has no checksum for ${asset.name}`);
+    }
+    return `${asset.digest.slice(7).toLowerCase()}  ${asset.name}\n`;
   }).join("");
 }
 
@@ -87,9 +101,10 @@ function compareVersions(a, b) {
 export function publicationDecision({ sha, head, version, latest, existing }) {
   parseVersion(version);
   if (head !== sha) return "superseded";
+  if (latest && compareVersions(version, latest.tag_name) < 0) return "superseded";
   if (existing) {
     if (existing.target_commitish !== sha) throw new Error("Release tag belongs to another commit");
-    if (!existing.draft) return "published";
+    return existing.draft ? "publish" : "append";
   }
   if (latest && compareVersions(version, latest.tag_name) <= 0) return "superseded";
   return "publish";
@@ -109,7 +124,7 @@ function api(path, optional = false) {
   }
 }
 
-function publish(directory, version) {
+function publish(directory, version, platform) {
   const { GITHUB_REPOSITORY: repo, GITHUB_SHA: sha, GITHUB_REF: ref, GITHUB_EVENT_NAME: event } = process.env;
   if (ref !== "refs/heads/main" || !["push", "workflow_dispatch"].includes(event)) {
     throw new Error("Only main pushes or manual runs on main may publish updates");
@@ -118,8 +133,10 @@ function publish(directory, version) {
     throw new Error("Expected an exact Actions repository and commit");
   }
   const tag = `v${version}`;
-  const sums = checksumManifest(directory);
-  writeFileSync(join(directory, "SHA256SUMS"), sums);
+  const assetName = PLATFORM_ASSET[platform];
+  if (!assetName) throw new Error(`Unknown update platform: ${platform}`);
+  // Each platform publishes its own completed build, without waiting for the others.
+  checksumManifest(directory, [assetName]);
   const decision = () => publicationDecision({
     sha, version,
     head: api(`repos/${repo}/git/ref/heads/main`).object.sha,
@@ -127,19 +144,23 @@ function publish(directory, version) {
     existing: api(`repos/${repo}/releases/tags/${tag}`, true),
   });
   let state = decision();
-  if (state === "publish") {
+  if (state === "publish" || state === "append") {
     const existing = api(`repos/${repo}/releases/tags/${tag}`, true);
     if (!existing) {
       gh(["release", "create", tag, "--repo", repo, "--draft", "--target", sha,
         "--title", `Shina ${version}`, "--notes",
-        `Automatic development update from main.\n\nSource commit: ${sha}\n\nWindows and both Mac architectures passed tests before publication. Checksums cover every asset. Restart from Shina's update button to install.`]);
+        `Personal development update from main.\n\nSource commit: ${sha}\n\nWindows, Apple-silicon Mac and portable Linux builds arrive independently. This fast build does not run test or lint gates unless requested manually. Restart from Shina's update button to install on Windows or Mac.`]);
     }
-    // Only a draft owned by this exact commit can reach this point.
-    gh(["release", "upload", tag, ...[...ASSETS, "SHA256SUMS"].map((name) => join(directory, name)),
-      "--repo", repo, "--clobber"]);
-    // A newer push or published version may have arrived during the upload.
+    const uploaded = existing?.assets.find((asset) => asset.name === assetName);
+    if (!uploaded) {
+      gh(["release", "upload", tag, join(directory, assetName), "--repo", repo]);
+    }
+    // Publish jobs serialize their writes. The manifest grows as platforms finish.
+    const release = api(`repos/${repo}/releases/tags/${tag}`);
+    writeFileSync(join(directory, "SHA256SUMS"), uploadedChecksums(release.assets));
+    gh(["release", "upload", tag, join(directory, "SHA256SUMS"), "--repo", repo, "--clobber"]);
     state = decision();
-    if (state === "publish") {
+    if (state === "publish" || state === "append") {
       gh(["release", "edit", tag, "--repo", repo, "--draft=false", "--latest"]);
       state = "published";
     }
@@ -153,7 +174,7 @@ function publish(directory, version) {
 }
 
 function main() {
-  const [command, argument] = process.argv.slice(2);
+  const [command, argument, platform] = process.argv.slice(2);
   if (command === "plan") {
     const version = buildVersion(readFileSync("Cargo.toml", "utf8"), argument);
     console.log(version);
@@ -163,9 +184,9 @@ function main() {
     writeFileSync("Cargo.toml", result.manifest);
     writeFileSync("Cargo.lock", result.lock);
   } else if (command === "publish") {
-    publish(resolve("target/release-assets"), argument);
+    publish(resolve("target/release-assets"), argument, platform);
   } else {
-    throw new Error("Usage: node tools/ci-release.mjs plan <run-number> | prepare <version> | publish <version>");
+    throw new Error("Usage: node tools/ci-release.mjs plan <run-number> | prepare <version> | publish <version> <platform>");
   }
 }
 

@@ -27,8 +27,8 @@ use crate::install::{self, InstalledTarget};
 pub const REPOSITORY: &str = "KldsSeeGhosts/shina";
 const SHA256SUMS: &str = "SHA256SUMS";
 /// The first check runs after this delay. Then a finished check schedules the next one.
-pub const FIRST_CHECK: Duration = Duration::from_secs(15);
-pub const INTERVAL: Duration = Duration::from_secs(4 * 60);
+pub const FIRST_CHECK: Duration = Duration::from_secs(2);
+pub const INTERVAL: Duration = Duration::from_secs(30);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_DIAGNOSTICS: usize = 10;
@@ -1829,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_check_waits_fifteen_seconds_then_each_attempt_waits_four_minutes() {
+    fn the_first_check_waits_two_seconds_then_each_attempt_waits_thirty_seconds() {
         let (mut updater, checks, _) = installed(newer());
         let start = Instant::now();
         updater.start(true, start, wake());
