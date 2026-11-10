@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  ASSETS, buildVersion, checksumManifest, parseVersion, prepareVersions, publicationDecision,
+  ASSETS, buildVersion, checksumManifest, parseVersion, prepareVersions, publicationDecision, uploadedChecksums,
 } from "./ci-release.mjs";
 
 const manifest = '[package]\nname = "shina"\nversion = "0.11.0"\n\n[dependencies]\nother = "1"\n';
@@ -32,7 +32,7 @@ test("CI prepares only Shina's package versions and leaves dependencies locked",
   assert.throws(() => prepareVersions(manifest, lock, "invalid"));
 });
 
-test("only the current main commit and a newer complete version can publish", () => {
+test("only the current main commit can publish or append its completed platforms", () => {
   const input = { sha: "current", head: "current", version: "0.11.42", latest: { tag_name: "v0.10.0" } };
   assert.equal(publicationDecision(input), "publish");
   assert.equal(publicationDecision({ ...input, head: "newer" }), "superseded");
@@ -40,9 +40,28 @@ test("only the current main commit and a newer complete version can publish", ()
   assert.equal(publicationDecision({ ...input, latest: { tag_name: "v0.11.42" } }), "superseded");
   assert.equal(publicationDecision({ ...input, latest: null }), "publish");
   assert.equal(publicationDecision({ ...input, existing: { target_commitish: "current", draft: true } }), "publish");
-  assert.equal(publicationDecision({ ...input, existing: { target_commitish: "current", draft: false } }), "published");
+  assert.equal(publicationDecision({ ...input, existing: { target_commitish: "current", draft: false } }), "append");
+  assert.equal(publicationDecision({ ...input, latest: { tag_name: "v0.11.42" }, existing: { target_commitish: "current", draft: false } }), "append");
   assert.throws(() => publicationDecision({ ...input, existing: { target_commitish: "other", draft: true } }));
   assert.throws(() => publicationDecision({ ...input, latest: { tag_name: "not-a-version" } }));
+});
+
+test("a finished platform can publish alone and checksums grow as other assets arrive", () => {
+  const directory = mkdtempSync(join(tmpdir(), "shina-ci-platform-"));
+  try {
+    writeFileSync(join(directory, ASSETS[0]), "windows");
+    const hash = createHash("sha256").update("windows").digest("hex");
+    assert.equal(checksumManifest(directory, [ASSETS[0]]), `${hash}  ${ASSETS[0]}\n`);
+    const uploaded = [{ name: ASSETS[0], digest: `sha256:${hash}` }];
+    assert.equal(uploadedChecksums(uploaded), `${hash}  ${ASSETS[0]}\n`);
+    uploaded.push({ name: ASSETS[1], digest: `sha256:${"a".repeat(64)}` });
+    assert.match(uploadedChecksums(uploaded), /Shina-macos-aarch64.zip/);
+    assert.match(uploadedChecksums(uploaded), /shina.exe/);
+    assert.throws(() => uploadedChecksums([]));
+    assert.throws(() => uploadedChecksums([{ name: ASSETS[0], digest: null }]));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("checksums require all architectures and reject unexpected, empty or linked assets", () => {
