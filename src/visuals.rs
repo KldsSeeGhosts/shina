@@ -63,6 +63,8 @@ pub struct Artwork {
     pub mark: Image,
     /// The same mark with a light badge, for the dark theme.
     pub mark_dark: Image,
+    /// KSG Code's Antigravity provider mark, a bitmap rather than an SVG.
+    pub antigravity: Image,
 }
 
 impl Artwork {
@@ -76,12 +78,16 @@ impl Artwork {
         let (crew, small) = ([c0, c1, c2, c3], [s0, s1, s2, s3]);
         let mark_dark = mark(&cache, true);
         let mark = mark(&cache, false);
+        let antigravity = provider_mark(
+            &cache,
+            include_bytes!("../assets/providers/antigravity.png"),
+        );
         // Startup only. Decode off-thread before the first frame, including headless fixtures.
         for image in crew
             .iter()
             .chain(&small)
             .flatten()
-            .chain([&mark, &mark_dark])
+            .chain([&mark, &mark_dark, &antigravity])
         {
             image.wait().expect("valid crew artwork");
         }
@@ -90,6 +96,7 @@ impl Artwork {
             small,
             mark,
             mark_dark,
+            antigravity,
         })
     }
 
@@ -216,6 +223,13 @@ fn embedded(cache: &ImageCache, captain: usize) -> (Set, Set) {
 }
 
 /// A small original pixel mark: a dark crew badge with a cream "S" and three service dots.
+fn provider_mark(cache: &ImageCache, png: &[u8]) -> Image {
+    let image = image::load_from_memory(png)
+        .expect("valid provider mark")
+        .to_rgba8();
+    cache.rgba(image.width(), image.height(), image.into_raw())
+}
+
 fn mark(cache: &ImageCache, light: bool) -> Image {
     let image = cache.rgba(
         crate::brand::SIZE as u32,

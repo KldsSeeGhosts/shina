@@ -19,14 +19,12 @@ Already ported:
 | Shina (`src/ui.rs`) | KSG Code source |
 | --- | --- |
 | `empty_thread`, `draft_headline` | `components/ChatView.tsx` (draft hero overlay), `chat/DraftHeroHeadline.tsx`, `chat/DraftHeroProjectHeading.tsx` |
-| `composer` card, `composer_picker`, footer | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx` |
+| `composer` card and footer | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx` |
 | `attachment_chip` | `chat/ComposerAttachmentStrip.tsx` |
+| `model_effort_trigger`, `settings_picker`, `model_list` | `chat/ComposerModelEffort.tsx`, `chat/ModelPickerContent.tsx`, `chat/ModelListRow.tsx` |
+| `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
 
-Not yet ported:
-
-| Shina (`src/ui.rs`) | KSG Code source |
-| --- | --- |
-| `settings_picker` (model and effort popup) | `chat/ComposerModelEffort.tsx`, `chat/ModelPickerContent.tsx`, `chat/ModelListRow.tsx`, `chat/ModelPickerSidebar.tsx`, `chat/EffortGlyph.tsx` |
+The effort slider (`effort_slider`, `slider_curve`, `sparkles`) is ported from the Codex desktop app instead. Its source ships uncompressed in `C:\Program Files\WindowsApps\OpenAI.Codex_*\app\resources\app.asar`. Search it as text for `data-reasoning-slider`, `model-picker-power-slider` and the CSS classes it names. Read it there, never run it. Its values: a 24 px track in a 28 px row, a 28 px white thumb with a hairline edge, motion of 0.3 s on `cubic-bezier(.23, 1, .32, 1)` (0.15 s while dragging), a thumb that follows the pointer with no detents, and a closed-hand cursor only while the slider is pressed or dragged (hover keeps the arrow). winit shows `Cursor::Grabbing` as the four-way move arrow on Windows, so the hand is an image cursor, `assets/cursors/grabbing.png`, drawn by `tools/cursors.py`. Rune lands drag commits at once, so each drag phase sets `tx.motion_curve(...)`.
 
 Removed at the user's request. Do not add them back:
 

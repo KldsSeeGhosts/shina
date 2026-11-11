@@ -177,7 +177,7 @@ pub struct AssistantWork {
     pub elapsed: Option<u64>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPicker {
     Model,
     Thinking,
@@ -1786,6 +1786,9 @@ pub struct State {
     pub captains: Vec<Captain>,
     pub captain_editor: Option<CaptainEditor>,
     pub settings_picker: Option<SettingsPicker>,
+    /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
+    /// (highest). The level is chosen on release.
+    pub thinking_drag: Option<f32>,
     pub model_search: TextEdit,
     pub updater: crate::update::Updater,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
@@ -1894,6 +1897,7 @@ impl State {
             captains: Vec::new(),
             captain_editor: None,
             settings_picker: None,
+            thinking_drag: None,
             model_search: TextEdit::default(),
             updater: Default::default(),
             restart_for_update: false,

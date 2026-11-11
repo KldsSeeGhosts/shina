@@ -283,8 +283,18 @@ fn icon(kind: &str, ink: Color) -> El {
         MONITOR,
         r#"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1.25" fill="none" stroke="currentColor"/><path d="M5.5 13.5h5M8 11v2.5" stroke="currentColor" stroke-linecap="round"/>"#
     );
+    glyph!(
+        PAPERCLIP,
+        r#"<path d="M13.5 7.5 8 13a3.5 3.5 0 0 1-5-5l5.75-5.75a2.25 2.25 0 0 1 3.2 3.2L6.2 11.2a1 1 0 0 1-1.4-1.4L10 4.6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        CHEVRON_LEFT,
+        r#"<path d="m9.5 4.5-3.5 3.5 3.5 3.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
+        "paperclip" => &PAPERCLIP,
+        "back" => &CHEVRON_LEFT,
         "monitor" => &MONITOR,
         "sidebar" => &SIDEBAR,
         "compose" => &COMPOSE,
@@ -342,17 +352,6 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
         .fill(p.teal)
         .on_press(action)
         .child(label(title, TextStyle::new(13.0, 560.0), p.on_teal))
-}
-fn thinking_label(level: &str) -> String {
-    if level.is_empty() {
-        return "Default thinking".into();
-    }
-    let mut chars = level.chars();
-    let first = chars
-        .next()
-        .map(|c| c.to_uppercase().collect::<String>())
-        .unwrap_or_default();
-    format!("{first}{} thinking", chars.as_str())
 }
 fn icon_button(
     key: &str,
@@ -637,152 +636,637 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(root)
 }
 
+/// A model's display name and its CPA route: "Gemini 3.8 Flash (CPA → Antigravity)" is
+/// ("Gemini 3.8 Flash", Some("CPA → Antigravity")). Names without a route stay whole.
+fn split_model_label(label: &str) -> (&str, Option<&str>) {
+    let label = label.trim();
+    if let Some(open) = label.rfind(" (")
+        && label.ends_with(')')
+    {
+        return (&label[..open], Some(&label[open + 2..label.len() - 1]));
+    }
+    (label, None)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Vendor {
+    OpenAi,
+    Anthropic,
+    Antigravity,
+    Other,
+}
+
+/// The vendor behind a CPA model, from its route first and its id second, so the icon follows
+/// KSG Code's provider marks: Codex is OpenAI, Claude is Anthropic, Antigravity is Google's.
+fn model_vendor(id: &str, label: &str) -> Vendor {
+    let (_, route) = split_model_label(label);
+    let route = route.unwrap_or("").to_lowercase();
+    let id = id.to_lowercase();
+    let either = |words: &[&str]| words.iter().any(|w| route.contains(w) || id.contains(w));
+    if either(&["codex", "openai"]) || id.starts_with("gpt") || id.starts_with("o3") {
+        Vendor::OpenAi
+    } else if either(&["anthropic", "claude"]) {
+        Vendor::Anthropic
+    } else if either(&["antigravity", "gemini", "google"]) {
+        Vendor::Antigravity
+    } else {
+        Vendor::Other
+    }
+}
+
+/// Provider marks ported from KSG Code's `Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`).
+fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
+    static OPENAI: Icon = Icon {
+        name: "OPENAI",
+        view: 411.0,
+        body: r#"<g transform="translate(-100 -100)"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z"/></g>"#,
+    };
+    static CLAUDE: Icon = Icon {
+        name: "CLAUDE",
+        view: 257.0,
+        body: r##"<path fill="#d97757" d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"/>"##,
+    };
+    static CHIP: Icon = Icon {
+        name: "CHIP",
+        view: 16.0,
+        body: r#"<rect x="4" y="4" width="8" height="8" rx="1.5" fill="none" stroke="currentColor"/><path d="M6.5 2v2M9.5 2v2M6.5 12v2M9.5 12v2M2 6.5h2M2 9.5h2M12 6.5h2M12 9.5h2" stroke="currentColor" stroke-linecap="round"/>"#,
+    };
+    match vendor {
+        Vendor::Antigravity => el()
+            .size(size, size)
+            .pixels_fit(s.artwork.antigravity.pixels(), rune::SurfaceFit::Fit)
+            .a11y_hidden(),
+        Vendor::OpenAi => rune::icon(&OPENAI, size).color(p.ink).a11y_hidden(),
+        Vendor::Anthropic => rune::icon(&CLAUDE, size).a11y_hidden(),
+        Vendor::Other => rune::icon(&CHIP, size).color(p.muted).a11y_hidden(),
+    }
+}
+
+/// Pi's level ids in the slider's words: "xhigh" reads "XHigh", "medium" reads "Medium".
+fn effort_name(level: &str) -> String {
+    match level {
+        "" => "Default".into(),
+        "xhigh" => "XHigh".into(),
+        _ => {
+            let mut chars = level.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
+/// provider's mark, the model's name without its route, and the effort level.
+fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
+    let t = s.current();
+    let (name, _) = split_model_label(&t.model);
+    let effort = effort_name(&t.thinking);
+    let mut trigger = row()
+        .key("model-effort")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!(
+            "Model {name}, reasoning {effort}. Change model or reasoning"
+        ))
+        .help(t.model.clone())
+        .focusable(!locked)
+        .center_y()
+        .gap(7.0)
+        .h(28.0)
+        .px(8.0)
+        .radius(8.0)
+        .shrink()
+        .min_w(0.0)
+        .max_w(if narrow { 200.0 } else { 340.0 })
+        .opacity(if locked { 0.65 } else { 1.0 })
+        .disabled(locked)
+        .hover(p.selected)
+        .press(p.selected);
+    if !locked {
+        trigger = trigger.on_press(|s: &mut State| {
+            s.settings_picker = Some(SettingsPicker::Thinking);
+            s.thinking_drag = None;
+            s.refresh_catalog();
+        });
+    }
+    trigger
+        .child(provider_icon(
+            s,
+            p,
+            model_vendor(&t.model_id, &t.model),
+            14.0,
+        ))
+        .child(
+            label(name, TextStyle::new(13.0, 500.0), p.ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(label(effort, TextStyle::new(13.0, 500.0), p.muted))
+}
+
+const PICKER_WIDTH: f32 = 320.0;
+
+/// The model and reasoning popover. Its effort half is Codex's slider in Shina's colours; its
+/// model half drills into KSG Code's searchable, provider-grouped list in place.
 fn settings_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let is_model = s.settings_picker == Some(SettingsPicker::Model);
-    let title = if is_model {
-        "Choose CPA model"
-    } else {
-        "Choose reasoning level"
-    };
+    let can_choose = !t.status.busy() && !t.configuring;
     let mut card = col()
         .key("pi-settings-picker")
         .role("dialog")
-        .label(title)
-        .w(392.0)
-        .max_h(460.0)
-        .padding(16.0)
-        .gap(10.0)
-        .radius(10.0)
+        .label(if is_model {
+            "Choose a model"
+        } else {
+            "Model and reasoning"
+        })
+        .w(PICKER_WIDTH)
+        .radius(14.0)
+        .clip_rounded(14.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
-        .on_press(|_: &mut State| {})
-        .child(
-            row()
-                .center_y()
-                .child(label(title, LABEL, p.ink))
-                .child(spacer())
-                .child(icon_button(
-                    "close-pi-settings",
-                    "Close Pi settings",
-                    "close",
-                    p,
-                    |s| s.settings_picker = None,
-                )),
-        );
-    if is_model {
-        card = card.child(
-            text_input(&s.model_search, BODY)
-                .key("model-search")
-                .label("Filter Pi models")
-                .placeholder("Filter by model or provider", p.muted)
-                .color(p.ink)
-                .w_full()
-                .on_edit(|s: &mut State| &mut s.model_search),
-        );
-    }
-    let mut choices = col().w_full().max_h(300.0).gap(4.0).scroll(ScrollSpec {
-        stick_bottom: false,
-    });
-    let can_choose = !t.status.busy() && !t.configuring;
-    if is_model {
-        let query = s.model_search.text.to_lowercase();
-        let mut count = 0;
-        for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
-            format!("{} {} {}", m.provider, m.id, m.name)
-                .to_lowercase()
-                .contains(&query)
-        }) {
-            count += 1;
-            let provider = model.provider.clone();
-            let id = model.id.clone();
-            let selected = t.model_provider == model.provider && t.model_id == model.id;
-            choices = choices.child(
-                button(
-                    &format!("choose-model-{index}"),
-                    &format!("{} / {}", model.provider, model.name),
-                    p,
-                    move |s| {
-                        s.current_mut().set_model(provider.clone(), id.clone());
-                        s.settings_picker = None;
-                        s.checkpoint();
-                    },
-                )
-                .h(32.0)
-                .w_full()
-                .clip_rounded(5.0)
-                .fill(if selected { p.teal_bg } else { p.card })
-                .disabled(!can_choose),
-            );
-        }
-        if count == 0 {
-            choices = choices.child(
-                label(
-                    if t.models.is_empty() && s.catalog.remaining().is_some() {
-                        "Reading the CPA catalog..."
-                    } else if t.models.is_empty() {
-                        "No CPA models are available."
-                    } else {
-                        "No matching configured models."
-                    },
-                    BODY,
-                    p.muted,
-                )
-                .wrap(),
-            );
-        }
-    } else {
-        for (index, level) in t.thinking_levels.iter().enumerate() {
-            let value = level.clone();
-            choices = choices.child(
-                button(&format!("choose-thinking-{index}"), level, p, move |s| {
-                    s.current_mut().set_thinking(value.clone());
-                    s.settings_picker = None;
-                    s.checkpoint();
-                })
-                .fill(if *level == t.thinking {
-                    p.teal_bg
-                } else {
-                    p.card
-                })
-                .disabled(!can_choose),
-            );
-        }
-        if t.thinking_levels.is_empty() {
-            choices = choices.child(label(
-                "Reading the model's supported levels...",
-                BODY,
-                p.muted,
-            ));
-        }
-    }
-    card = card.child(choices).child(
-        label(
-            "Models come from your shared CPA catalog. Credentials stay in Pi.",
-            SMALL,
-            p.muted,
+        .border(1.0, p.line)
+        .shadow(
+            12.0,
+            32.0,
+            Color::BLACK.alpha(if s.dark { 0.45 } else { 0.18 }),
         )
-        .wrap(),
-    );
+        .on_press(|_: &mut State| {});
+    card = if is_model {
+        model_list(s, p, can_choose, 320.0, card)
+    } else {
+        card.child(effort_slider(t, s.thinking_drag, p, can_choose))
+            .child(rule(p))
+            .child(model_row(s, p))
+    };
     if let Some(error) = &t.error {
-        card = card.child(label(error, SMALL, p.danger).wrap_anywhere());
+        card = card.child(
+            label(error, SMALL, p.danger)
+                .wrap_anywhere()
+                .px(16.0)
+                .pb(10.0),
+        );
     }
     if let Some(error) = &s.catalog.error {
         card = card
-            .child(label(error, SMALL, p.danger).wrap_anywhere())
-            .child(button("retry-catalog", "Retry", p, |s| s.refresh_catalog()));
+            .child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0))
+            .child(
+                button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
+                    .ml(10.0)
+                    .mb(8.0),
+            );
     }
-    el().key("pi-settings-backdrop")
-        .instant_changes()
-        .absolute(0.0, 0.0)
+    // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
+    // layer draws over the page and shifts the card to stay inside the window.
+    card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
+        .modal(true, |s: &mut State| s.settings_picker = None)
+}
+
+const SLIDER_H: f32 = 28.0;
+
+/// The closed hand a held slider shows, as Codex's `cursor: grabbing`. winit draws
+/// `Cursor::Grabbing` as the four-way move arrow on Windows, so Shina ships its own, drawn by
+/// `tools/cursors.py` at 2x with the hot spot in the palm.
+const GRABBING_CURSOR: rune::CursorImage = rune::CursorImage::png(
+    include_bytes!("../assets/cursors/grabbing.png"),
+    [16.0, 16.0],
+);
+
+/// Codex's top-level flourish: specks of light drift through a full track and twinkle.
+/// Each speck rides a looping slide across the track and pulses on its own opacity loop.
+fn sparkles(p: Palette) -> El {
+    // (height, rise, period, delay, size), fixed so the pattern never jumps on a redraw.
+    const SPECKS: [(f32, f32, f64, f64, f32); 9] = [
+        (9.0, -0.10, 2.6, 0.0, 2.0),
+        (17.0, -0.18, 3.1, 0.4, 1.5),
+        (13.0, 0.08, 2.2, 0.9, 2.5),
+        (6.0, 0.12, 3.6, 1.3, 1.5),
+        (20.0, -0.22, 2.8, 1.7, 2.0),
+        (11.0, -0.06, 3.3, 2.1, 1.5),
+        (15.0, 0.16, 2.4, 0.2, 2.0),
+        (8.0, 0.20, 3.9, 2.6, 1.5),
+        (18.0, -0.12, 2.9, 1.1, 2.5),
+    ];
+    let mut layer = el()
+        .key("effort-sparkles")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .a11y_hidden();
+    for (index, (y, rise, period, delay, size)) in SPECKS.into_iter().enumerate() {
+        let mut drift =
+            rune::LoopSpec::slide(period, [-0.08, 0.0], [1.0, rise]).easing(rune::Easing::LINEAR);
+        drift.delay = delay;
+        layer = layer.child(
+            el().key(format!("speck-{index}"))
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .looping(drift)
+                .child(
+                    el().absolute(0.0, y - size / 2.0)
+                        .size(size, size)
+                        .radius(size / 2.0)
+                        .fill(p.on_teal)
+                        .looping(rune::LoopSpec::opacity(period / 2.0, delay, 0.15, 0.95)),
+                ),
+        );
+    }
+    layer
+}
+
+/// Codex's slider motion, from its `--model-picker-power-slider-motion-*` variables: 0.3 s on
+/// `cubic-bezier(.23, 1, .32, 1)`, a decisive ease-out with no overshoot, and 0.15 s while the
+/// thumb is dragged. Rune lands drag commits at once by default, so each drag phase asks for
+/// this curve explicitly; otherwise a release jumps to its level instead of gliding there.
+fn slider_curve(dragging: bool) -> rune::Curve {
+    rune::Curve::tween(
+        if dragging { 0.15 } else { 0.3 },
+        rune::Easing::cubic(0.23, 1.0, 0.32, 1.0),
+    )
+}
+
+fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool) -> El {
+    let levels = t.thinking_levels.clone();
+    let count = levels.len();
+    let current = levels.iter().position(|level| *level == t.thinking);
+    // While held, the thumb follows the pointer and the title names the nearest level.
+    let held = dragging.filter(|_| count > 1).map(|f| f.clamp(0.0, 1.0));
+    let shown = held
+        .map(|f| (f * (count - 1) as f32).round() as usize)
+        .or(current);
+    let title = shown
+        .and_then(|index| levels.get(index))
+        .map_or_else(|| effort_name(&t.thinking), |level| effort_name(level));
+    let mut section = col()
+        .key("effort-section")
+        .px(16.0)
+        .pt(14.0)
+        .pb(16.0)
+        .gap(12.0);
+    section = section.child(
+        row()
+            .center_y()
+            .child(icon("bolt", p.muted).w(16.0))
+            .child(
+                label(
+                    if count == 0 {
+                        "Fixed reasoning".to_string()
+                    } else {
+                        title
+                    },
+                    TextStyle::new(15.0, 600.0),
+                    if count == 0 { p.muted } else { p.teal_text },
+                )
+                .key("effort-title")
+                .align(rune::Align::Center)
+                .wrap()
+                .grow(1.0),
+            )
+            .child(el().w(16.0)),
+    );
+    // Codex's geometry: a 24 px track inside a 28 px row, and a 28 px thumb whose centre runs
+    // between the row's end caps. Fill, dots and thumb are fractions of the row.
+    let at = shown.unwrap_or(0);
+    let frac = held.unwrap_or(if count > 1 {
+        at as f32 / (count - 1) as f32
+    } else {
+        1.0
+    });
+    let max = shown.is_some() && at + 1 == count && count > 1;
+    let cap = SLIDER_H / 2.0;
+    let mut slider = el()
+        .key("effort-slider")
+        .role("slider")
+        .label("Reasoning effort")
+        .a11y_value(effort_name(&t.thinking))
+        .h(SLIDER_H)
         .w_full()
-        .h_full()
-        .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
-        .center()
-        .modal(false, |s: &mut State| s.settings_picker = None)
-        .on_press(|s: &mut State| s.settings_picker = None)
-        .child(card)
+        .motion(rune::Spring::new(0.3, 0.0))
+        // Only a press or drag shows the closed hand, as Codex does; hovering keeps the arrow.
+        .cursor(if can_choose && held.is_some() {
+            rune::Cursor::Image(GRABBING_CURSOR)
+        } else {
+            rune::Cursor::Default
+        });
+    let mut track = el()
+        .key("effort-track")
+        .pin(Some(0.0), Some(2.0), Some(0.0), Some(2.0))
+        .radius(12.0)
+        .clip_rounded(12.0)
+        .fill(p.selected)
+        .border(0.5, p.line);
+    if count == 0 {
+        return section.child(slider.child(track).opacity(0.5)).child(label(
+            "This model has no reasoning levels.",
+            SMALL,
+            p.muted,
+        ));
+    }
+    let fill = |on: bool| if on { p.teal } else { Color::TRANSPARENT };
+    // One fill, ending at cap + frac * (width - cap): under the thumb at the lowest level and
+    // at the track's far end at the top. The thumb covers the part past its centre.
+    track = track.child(
+        row()
+            .key("effort-fill")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .child(el().w(cap).h_full().fill(fill(shown.is_some())))
+            .child(
+                el().key("effort-fill-run")
+                    .w(0.0)
+                    .grow(frac)
+                    .h_full()
+                    .fill(fill(shown.is_some())),
+            )
+            .child(
+                el().key("effort-fill-rest")
+                    .w(0.0)
+                    .grow(1.0 - frac)
+                    .h_full(),
+            ),
+    );
+    if max {
+        track = track.child(sparkles(p));
+    }
+    slider = slider.child(track);
+    let mut dots = row()
+        .key("effort-dots")
+        .pin(Some(cap - 2.0), Some(0.0), Some(cap - 2.0), Some(0.0))
+        .center_y()
+        .justify_between();
+    for index in 0..count {
+        let lit = shown.is_some_and(|at| index <= at);
+        dots = dots.child(
+            el().key(format!("choose-thinking-{index}"))
+                .size(4.0, 4.0)
+                .radius(2.0)
+                .fill(if Some(index) == shown {
+                    Color::TRANSPARENT
+                } else if lit {
+                    p.on_teal.alpha(0.7)
+                } else {
+                    p.muted.alpha(0.55)
+                }),
+        );
+    }
+    slider = slider.child(dots);
+    if shown.is_some() {
+        slider = slider.child(
+            row()
+                .key("effort-thumb-row")
+                .pin(Some(cap), Some(0.0), Some(cap), Some(0.0))
+                .center_y()
+                .child(el().key("effort-thumb-before").w(0.0).grow(frac))
+                .child(
+                    el().key("effort-thumb").w(0.0).h(SLIDER_H).child(
+                        // Codex's thumb: white, a hairline edge, and a soft 2 px shadow.
+                        el().key("effort-thumb-knob")
+                            .absolute(-cap, 0.0)
+                            .size(SLIDER_H, SLIDER_H)
+                            .radius(cap)
+                            .fill(Color::WHITE)
+                            .border(0.5, p.field_line)
+                            .shadow(0.0, 2.0, Color::BLACK.alpha(0.12)),
+                    ),
+                )
+                .child(el().key("effort-thumb-after").w(0.0).grow(1.0 - frac)),
+        );
+    }
+    if can_choose {
+        let keyed = levels.clone();
+        let dragged = levels.clone();
+        let ends = levels.clone();
+        slider = slider
+            // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
+            .on_step(move |s: &mut State, delta, tx| {
+                let last = keyed.len() as i32 - 1;
+                let at = keyed
+                    .iter()
+                    .position(|l| *l == s.current().thinking)
+                    .unwrap_or(0) as i32;
+                let next = (at + delta).clamp(0, last) as usize;
+                if next as i32 != at {
+                    tx.motion_curve(slider_curve(false));
+                    s.current_mut().set_thinking(keyed[next].clone());
+                    s.checkpoint();
+                }
+            })
+            .on_step_limit(move |s: &mut State, max, tx| {
+                let level = if max { ends.last() } else { ends.first() };
+                if let Some(level) = level.cloned()
+                    && level != s.current().thinking
+                {
+                    tx.motion_curve(slider_curve(false));
+                    s.current_mut().set_thinking(level);
+                    s.checkpoint();
+                }
+            })
+            .on_drag(move |s: &mut State, drag, tx| {
+                // Where the pointer is between the end caps' centres, as Codex measures it.
+                let along = ((drag.x - cap) / (drag.w - 2.0 * cap).max(1.0)).clamp(0.0, 1.0);
+                let index = (along * (dragged.len() - 1) as f32).round() as usize;
+                tx.animated();
+                if drag.cancelled() {
+                    tx.motion_curve(slider_curve(false));
+                    s.thinking_drag = None;
+                } else if drag.phase == rune::Phase::Up {
+                    // Release glides onto the nearest level.
+                    tx.motion_curve(slider_curve(false));
+                    s.thinking_drag = None;
+                    if dragged[index] != s.current().thinking {
+                        s.current_mut().set_thinking(dragged[index].clone());
+                        s.checkpoint();
+                    }
+                } else {
+                    // A press glides to the pointer; a drag follows it closely.
+                    tx.motion_curve(slider_curve(drag.phase == rune::Phase::Move));
+                    s.thinking_drag = Some(along);
+                }
+            });
+    }
+    section.child(slider).child(
+        row()
+            .child(label(
+                effort_name(&levels[0]),
+                TextStyle::new(11.0, 450.0),
+                p.muted,
+            ))
+            .child(spacer())
+            .child(label(
+                effort_name(&levels[count - 1]),
+                TextStyle::new(11.0, 450.0),
+                p.muted,
+            )),
+    )
+}
+
+fn model_row(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let (name, route) = split_model_label(&t.model);
+    let mut text = col().gap(1.0).grow(1.0).min_w(0.0).child(
+        label(name, TextStyle::new(13.5, 500.0), p.ink)
+            .truncate()
+            .min_w(0.0),
+    );
+    if let Some(route) = route {
+        text = text.child(label(route, SMALL, p.muted).truncate().min_w(0.0));
+    }
+    row()
+        .key("open-model-list")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!("Model: {}. Choose another model", t.model))
+        .focusable(true)
+        .center_y()
+        .gap(10.0)
+        .pl(16.0)
+        .pr(12.0)
+        .py(10.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(|s: &mut State| {
+            s.model_search.replace_text("");
+            s.settings_picker = Some(SettingsPicker::Model);
+        })
+        .child(provider_icon(
+            s,
+            p,
+            model_vendor(&t.model_id, &t.model),
+            18.0,
+        ))
+        .child(text)
+        .child(icon("open", p.muted))
+}
+
+fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> El {
+    let t = s.current();
+    let header = row()
+        .center_y()
+        .gap(8.0)
+        .px(12.0)
+        .py(10.0)
+        .child(icon_button(
+            "back-to-effort",
+            "Back to reasoning",
+            "back",
+            p,
+            |s| s.settings_picker = Some(SettingsPicker::Thinking),
+        ))
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .h(30.0)
+                .px(10.0)
+                .radius(8.0)
+                .fill(p.selected)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(icon("search", p.muted))
+                .child(
+                    text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+                        .key("model-search")
+                        .label("Search models")
+                        .placeholder("Search models", p.muted)
+                        .color(p.ink)
+                        .caret(p.teal, p.teal_bg)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .on_edit(|s: &mut State| &mut s.model_search),
+                ),
+        );
+    let query = s.model_search.text.to_lowercase();
+    let mut list = col()
+        .key("model-list")
+        .w_full()
+        .max_h(max_h)
+        .pb(6.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    let mut group: Option<String> = None;
+    let mut count = 0;
+    for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
+        format!("{} {} {}", m.provider, m.id, m.name)
+            .to_lowercase()
+            .contains(&query)
+    }) {
+        count += 1;
+        let (name, route) = split_model_label(&model.name);
+        let heading = route.map_or_else(|| model.provider.to_uppercase(), str::to_string);
+        if group.as_deref() != Some(heading.as_str()) {
+            list = list.child(
+                label(&heading, TextStyle::new(11.5, 600.0), p.muted)
+                    .px(16.0)
+                    .pt(8.0)
+                    .pb(4.0),
+            );
+            group = Some(heading);
+        }
+        let provider = model.provider.clone();
+        let id = model.id.clone();
+        let selected = t.model_provider == model.provider && t.model_id == model.id;
+        let mut item = row()
+            .key(format!("choose-model-{index}"))
+            .role("option")
+            .label(&model.name)
+            .checked(selected)
+            .focusable(can_choose)
+            .center_y()
+            .gap(10.0)
+            .h(34.0)
+            .pl(16.0)
+            .pr(12.0)
+            .fill(if selected {
+                p.teal_bg
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(if selected { p.teal_bg } else { p.selected })
+            .disabled(!can_choose)
+            .child(provider_icon(
+                s,
+                p,
+                model_vendor(&model.id, &model.name),
+                16.0,
+            ))
+            .child(
+                label(name, TextStyle::new(13.5, 450.0), p.ink)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        if selected {
+            item = item.child(icon("check", p.teal_text));
+        }
+        if can_choose {
+            item = item
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.current_mut().set_model(provider.clone(), id.clone());
+                    s.settings_picker = Some(SettingsPicker::Thinking);
+                    s.checkpoint();
+                });
+        }
+        list = list.child(item);
+    }
+    if count == 0 {
+        list = list.child(
+            label(
+                if t.models.is_empty() && s.catalog.remaining().is_some() {
+                    "Reading the CPA catalog..."
+                } else if t.models.is_empty() {
+                    "No CPA models are available."
+                } else {
+                    "No matching models."
+                },
+                SMALL,
+                p.muted,
+            )
+            .wrap()
+            .px(16.0)
+            .py(10.0),
+        );
+    }
+    card.child(header).child(rule(p)).child(list)
 }
 
 fn sidebar_toggle(p: Palette, compact: bool) -> El {
@@ -4859,7 +5343,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
         .opacity(if locked { 0.65 } else { 1.0 })
         .hover(p.selected)
         .disabled(locked)
-        .child(icon("image", p.muted));
+        .child(icon("paperclip", p.muted));
     if !locked {
         control = control
             .focusable(true)
@@ -5223,32 +5707,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .pb(8.0)
         .child(attach_control(locked, p).size(28.0, 28.0).radius(8.0))
         .child(spacer())
-        .child(
-            composer_picker("choose-pi-model", &t.model, p.ink, p, |s| {
-                s.model_search.replace_text("");
-                s.settings_picker = Some(SettingsPicker::Model);
-                s.refresh_catalog();
-            })
-            .max_w(if narrow { 120.0 } else { 260.0 })
-            .opacity(if locked { 0.65 } else { 1.0 })
-            .disabled(locked),
-        )
-        .child(
-            composer_picker(
-                "choose-pi-thinking",
-                thinking_label(&t.thinking).trim_end_matches(" thinking"),
-                p.muted,
-                p,
-                |s| {
-                    s.settings_picker = Some(SettingsPicker::Thinking);
-                    s.refresh_catalog();
-                },
-            )
-            .label(format!("Reasoning effort: {}", thinking_label(&t.thinking)))
-            .max_w(if narrow { 80.0 } else { 130.0 })
-            .opacity(if locked { 0.65 } else { 1.0 })
-            .disabled(locked),
-        );
+        .child(model_effort_trigger(s, p, narrow, locked));
     if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
     }
@@ -5308,39 +5767,6 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     };
     area = area.child(footer);
     col().w_full().items_center().child(area)
-}
-
-/// A borderless composer control, as KSG Code's model and effort triggers: no chevron,
-/// a hover fill, and text that truncates before it can push the send button out.
-fn composer_picker(
-    key: &str,
-    title: &str,
-    ink: Color,
-    p: Palette,
-    action: impl Fn(&mut State) + 'static,
-) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(title)
-        .help(title)
-        .focusable(true)
-        .center_y()
-        .h(28.0)
-        .px(8.0)
-        .radius(8.0)
-        .shrink()
-        .min_w(0.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(action)
-        .child(
-            label(title, TextStyle::new(13.0, 500.0), ink)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
 }
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
@@ -5590,8 +6016,7 @@ pub(crate) mod tests {
             let mut previous_right = card[0];
             for key in [
                 "attach-image",
-                "choose-pi-model",
-                "choose-pi-thinking",
+                "model-effort",
                 "context-usage-ring",
                 "send-message",
             ] {
@@ -5989,7 +6414,10 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
         // A blank draft is reused, so give this one text before asking for another.
-        rt.state.current_mut().draft.replace_text("Read this project");
+        rt.state
+            .current_mut()
+            .draft
+            .replace_text("Read this project");
         assert!(rt.state.current().pi.is_none());
         // One workspace in view: New thread starts there at once, as in T3 Code.
         press(&mut rt, "new-thread");
@@ -7159,17 +7587,26 @@ pub(crate) mod tests {
         rt.frame(0.0);
         assert!(rt.find("connect-pi").is_none());
         assert!(rt.find("disconnect-pi").is_none());
-        press(&mut rt, "choose-pi-model");
+        press(&mut rt, "model-effort");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "open-model-list");
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         assert!(rt.state.current().pi.is_none());
+        assert_eq!(
+            rt.state.settings_picker,
+            Some(SettingsPicker::Thinking),
+            "picking a model returns to the slider"
+        );
         assert_eq!(rt.state.current().model_id, "model-a");
         rt.frame(0.0);
-        press(&mut rt, "choose-pi-thinking");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-thinking-1");
         assert_eq!(rt.state.current().thinking, "high");
         assert!(rt.state.current().pi.is_none());
+        assert!(
+            rt.state.settings_picker.is_some(),
+            "the popover stays open after a level change"
+        );
     }
 
     #[test]
@@ -7184,9 +7621,11 @@ pub(crate) mod tests {
         ]}}));
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","high"]}}));
         rt.frame(0.0);
-        press(&mut rt, "choose-pi-model");
+        press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("pi-settings-picker").is_some());
+        press(&mut rt, "open-model-list");
+        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         let model = commands.try_recv().unwrap();
         assert_eq!(model["type"], "set_model");
@@ -7201,8 +7640,8 @@ pub(crate) mod tests {
         );
         assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         rt.frame(0.0);
-        press(&mut rt, "choose-pi-thinking");
-        rt.frame(1.0 / 60.0);
+        // Pi's replies arrive outside a frame here, so redraw the open popover with them.
+        rt.invalidate();
         press(&mut rt, "choose-thinking-1");
         let thinking = commands.try_recv().unwrap();
         assert_eq!(thinking["type"], "set_thinking_level");
@@ -7212,6 +7651,159 @@ pub(crate) mod tests {
             .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
         assert_eq!(rt.state.current().thinking, "high");
     }
+    fn with_levels(rt: &mut Runtime<State>) {
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"provider":"cpa","id":"gpt-6.1-sol","name":"GPT 6.1 Sol (CPA → Codex)","reasoning":true,
+             "thinkingLevelMap":{"off":null,"low":null,"medium":null,"high":null}}
+        ]}}));
+        let t = rt.state.current_mut();
+        t.model = "GPT 6.1 Sol (CPA → Codex)".into();
+        t.model_provider = "cpa".into();
+        t.model_id = "gpt-6.1-sol".into();
+        t.thinking_levels = vec!["off".into(), "low".into(), "medium".into(), "high".into()];
+        t.thinking = "medium".into();
+        rt.invalidate();
+    }
+
+    #[test]
+    fn model_popover_opens_above_its_trigger_inside_the_window() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            with_levels(&mut rt);
+            rt.frame(0.0);
+            press(&mut rt, "model-effort");
+            rt.frame(1.0);
+            let (trigger, _) = rt.presented("model-effort").unwrap();
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            assert!(
+                card[1] + card[3] <= trigger[1] + 0.5,
+                "popover must open above the trigger at {width}: {card:?} {trigger:?}"
+            );
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "popover leaves the window at {width}: {card:?}"
+            );
+            press(&mut rt, "open-model-list");
+            rt.frame(2.0);
+            let (list, _) = rt.presented("pi-settings-picker").unwrap();
+            assert!(
+                list[1] >= 0.0,
+                "model list leaves the window at {width}: {list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_slider_moves_by_keyboard_click_and_drag() {
+        let mut rt = runtime(1280.0);
+        with_levels(&mut rt);
+        rt.frame(0.0);
+        press(&mut rt, "model-effort");
+        rt.frame(1.0);
+        let focused = |rt: &Runtime<State>| {
+            rt.elements()
+                .into_iter()
+                .any(|element| element.key.as_deref() == Some("effort-slider") && element.focused)
+        };
+        for _ in 0..40 {
+            if focused(&rt) {
+                break;
+            }
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+        }
+        assert!(focused(&rt), "Tab reaches the effort slider");
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Right,
+            mods: Default::default(),
+        });
+        rt.frame(1.5);
+        assert_eq!(rt.state.current().thinking, "high");
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Home,
+            mods: Default::default(),
+        });
+        rt.frame(1.5);
+        assert_eq!(rt.state.current().thinking, "off");
+        rt.frame(2.0);
+        press(&mut rt, "choose-thinking-2");
+        assert_eq!(rt.state.current().thinking, "medium");
+        rt.frame(3.0);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+        rt.pointer_down(track[0] + 4.0, y);
+        rt.pointer_move(track[0] + track[2] * 0.3, y);
+        rt.frame(3.5);
+        let held = rt.state.thinking_drag.expect("the drag holds the thumb");
+        assert!(
+            (0.2..0.4).contains(&held),
+            "the thumb follows the pointer, not the nearest stop: {held}"
+        );
+        rt.pointer_move(track[0] + track[2] - 4.0, y);
+        rt.pointer_up(track[0] + track[2] - 4.0, y);
+        rt.frame(4.0);
+        assert_eq!(rt.state.current().thinking, "high");
+        assert_eq!(rt.state.thinking_drag, None);
+        assert!(rt.state.settings_picker.is_some(), "the popover stays open");
+    }
+
+    #[test]
+    fn effort_track_fills_to_its_end_and_sparkles_only_at_the_top_level() {
+        let mut rt = runtime(1280.0);
+        with_levels(&mut rt);
+        rt.state.current_mut().thinking = "high".into();
+        rt.invalidate();
+        rt.frame(0.0);
+        press(&mut rt, "model-effort");
+        rt.frame(5.0);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let (thumb, _) = rt.presented("effort-thumb").unwrap();
+        assert!(
+            (thumb[0] - (track[0] + track[2] - SLIDER_H / 2.0)).abs() < 1.0,
+            "the top level puts the thumb at the end cap: {thumb:?} in {track:?}"
+        );
+        assert!(
+            rt.find("effort-sparkles").is_some(),
+            "the top level sparkles"
+        );
+        rt.state.current_mut().thinking = "off".into();
+        rt.invalidate();
+        rt.frame(10.0);
+        let (thumb, _) = rt.presented("effort-thumb").unwrap();
+        assert!(
+            (thumb[0] - (track[0] + SLIDER_H / 2.0)).abs() < 1.0,
+            "the lowest level puts the thumb at the start cap: {thumb:?} in {track:?}"
+        );
+        assert!(rt.find("effort-sparkles").is_none());
+    }
+
+    #[test]
+    fn model_labels_split_their_route_and_pick_ksg_provider_marks() {
+        assert_eq!(
+            split_model_label("Gemini 3.8 Flash (CPA → Antigravity)"),
+            ("Gemini 3.8 Flash", Some("CPA → Antigravity"))
+        );
+        assert_eq!(split_model_label("Model A"), ("Model A", None));
+        assert_eq!(
+            model_vendor("gpt-6.1-sol", "GPT 6.1 Sol (CPA → Codex)"),
+            Vendor::OpenAi
+        );
+        assert_eq!(
+            model_vendor("x", "Claude Opus 5.5 (CPA → Anthropic)"),
+            Vendor::Anthropic
+        );
+        assert_eq!(
+            model_vendor("gemini-3.8-flash", "Gemini 3.8 Flash"),
+            Vendor::Antigravity
+        );
+        assert_eq!(model_vendor("model-a", "Model A"), Vendor::Other);
+        assert_eq!(effort_name("xhigh"), "XHigh");
+    }
+
     fn ui_png(width: u32) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
