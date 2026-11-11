@@ -2144,7 +2144,7 @@ const TIMER_SLOT: f32 = 48.0;
 const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
 const CAPTAIN_STATUS: TextStyle = TextStyle::new(12.5, 460.0);
 /// Running clocks use tabular digits so a ticking timer keeps its width.
-const TIMER: TextStyle = TextStyle::new(12.0, 520.0).features("'tnum' 1");
+const SIDEBAR_TIMER: TextStyle = TextStyle::new(12.0, 520.0).features("'tnum' 1");
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -2291,10 +2291,14 @@ fn captain_row(
     }
     if let Some(start) = timer {
         status_line = status_line.child(
-            label(elapsed_label(start.elapsed().as_secs()), TIMER, p.muted)
-                .key(format!("captain-timer-{id}"))
-                .w(TIMER_SLOT)
-                .align(rune::Align::End),
+            label(
+                elapsed_label(start.elapsed().as_secs()),
+                SIDEBAR_TIMER,
+                p.muted,
+            )
+            .key(format!("captain-timer-{id}"))
+            .w(TIMER_SLOT)
+            .align(rune::Align::End),
         );
     }
     let badge = if requests > 0 || status == Status::Waiting {
@@ -2715,7 +2719,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             }
             _ => state_label.to_string(),
         };
-        slot = slot.child(label(text, TIMER, ink));
+        slot = slot.child(label(text, SIDEBAR_TIMER, ink));
     } else {
         let time = match section {
             Section::Snoozed => Some(lifecycle::wake_label(
