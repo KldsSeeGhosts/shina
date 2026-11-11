@@ -5,6 +5,8 @@
 mod tests;
 use super::*;
 use std::collections::{HashMap, HashSet};
+#[path = "questionnaire.rs"]
+pub mod questionnaire;
 
 /// Rebuild the active branch, never append order, and keep pre-compaction transcript history.
 /// Pi remains the only writer of its session files.
@@ -122,6 +124,11 @@ impl AccessMode {
 
 #[derive(Default)]
 pub struct PiSession {
+    pub questionnaire: Option<questionnaire::Questionnaire>,
+    questionnaires: HashMap<String, Value>,
+    questionnaire_replies: Vec<(String, String, String)>,
+    questionnaire_advance: Option<Instant>,
+    pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
     pub queue_expanded: bool,
     pub access: AccessMode,
@@ -298,7 +305,8 @@ impl Thread {
         {
             return;
         }
-        if !self.draft_images.is_empty() && self.supports_images != Some(true) {
+        if self.draft_images.iter().any(Attachment::is_image) && self.supports_images != Some(true)
+        {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
@@ -467,17 +475,15 @@ impl Thread {
         }
         // One in-flight submission preserves order and gives rejected prompts their own owner.
         if let Some(mut send) = self.native.sends.pop_front_if(|p| p.id.is_none()) {
-            let mut data = json!({"message":send.prompt.text,"streamingBehavior":send.mode});
-            if !send.prompt.images.is_empty() {
-                match attachments::encode_images(&send.prompt.images) {
-                    Ok(images) => data["images"] = json!(images),
-                    Err(error) => {
-                        self.restore_prompt(&send.prompt);
-                        self.attachment_error = Some(error);
-                        return false;
-                    }
+            let mut data = match attachments::prompt_record(&send.prompt, self.harness == "pi") {
+                Ok(data) => data,
+                Err(error) => {
+                    self.restore_prompt(&send.prompt);
+                    self.attachment_error = Some(error);
+                    return false;
                 }
-            }
+            };
+            data["streamingBehavior"] = json!(send.mode);
             if self.command("prompt", data) {
                 send.id = Some(self.command_id());
                 self.native.sends.push_front(send);
@@ -548,6 +554,8 @@ impl Thread {
     }
 
     pub(super) fn native_dialog_done(&mut self) {
+        self.native.questionnaire_advance = None;
+        self.native.questionnaire = None;
         self.native.dialog_deadline = None;
         self.status = self.native.dialog_status.take().unwrap_or(Status::Running);
         while let Some((request, deadline)) = self.native.dialogs.pop_front() {
@@ -557,6 +565,7 @@ impl Thread {
             self.native.dialog_status = Some(self.status);
             self.native.dialog_deadline = deadline;
             self.reply.replace_text(string(&request, "prefill"));
+            self.prepare_questionnaire(&request);
             self.request = Some(request);
             self.status = Status::Waiting;
             break;
@@ -570,6 +579,7 @@ impl Thread {
     }
 
     pub(super) fn cancel_native_dialogs(&mut self) {
+        self.cancel_questionnaire();
         for _ in 0..33 {
             if self.request.is_none() {
                 break;
@@ -587,6 +597,86 @@ impl Thread {
             self.native.session_approvals.insert(approval_key(request));
             self.respond(json!({"confirmed":true}));
         }
+    }
+
+    fn prepare_questionnaire(&mut self, request: &Value) {
+        if !matches!(
+            request["method"].as_str(),
+            Some("select" | "input" | "editor")
+        ) {
+            self.native.questionnaire = None;
+            return;
+        }
+        self.native.questionnaire = questionnaire::Questionnaire::parse(request).or_else(|| {
+            self.native
+                .questionnaires
+                .iter()
+                .find_map(|(id, params)| questionnaire::Questionnaire::rpiv(request, id, params))
+        });
+        // A previously focused, hidden composer must not receive questionnaire shortcuts.
+        if self.native.questionnaire.is_some() {
+            self.draft.focused = false;
+            self.reply.focused = false;
+        }
+    }
+
+    pub fn questionnaire_toggle(&mut self, index: usize) {
+        if let Some(form) = &mut self.native.questionnaire {
+            form.answers[form.index].other = self.reply.text.clone();
+            if form.toggle(index) {
+                self.reply.replace_text("");
+                if !form.questions[form.index].multi {
+                    self.native.questionnaire_advance =
+                        Some(Instant::now() + Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
+    pub fn questionnaire_edit(&mut self) -> &mut rune::TextEdit {
+        self.native.questionnaire_advance = None;
+        &mut self.reply
+    }
+
+    pub fn questionnaire_step(&mut self, previous: bool) {
+        self.native.questionnaire_advance = None;
+        let Some(form) = &mut self.native.questionnaire else {
+            return;
+        };
+        form.answers[form.index].other = self.reply.text.clone();
+        if previous {
+            form.index = form.index.saturating_sub(1);
+        } else if form.answer(form.index).is_some() {
+            if form.index + 1 == form.questions.len() {
+                if let Some(response) = form.response() {
+                    let replies = form.remaining_rpc();
+                    let request = self.request.as_ref().map(|r| r["id"].clone());
+                    self.respond(response);
+                    if self.request.as_ref().map(|r| r["id"].clone()) != request {
+                        self.native.questionnaire_replies.extend(replies);
+                    }
+                }
+                return;
+            }
+            form.index += 1;
+        }
+        self.reply.replace_text(&form.answers[form.index].other);
+        self.reply.focused = false;
+    }
+
+    pub(super) fn cancel_questionnaire(&mut self) {
+        self.native.questionnaire_replies.clear();
+        self.native.questionnaire_advance = None;
+    }
+
+    pub(super) fn native_deadline(&self) -> Option<Instant> {
+        self.native
+            .notifications
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .chain(self.native.dialog_deadline)
+            .chain(self.native.questionnaire_advance)
+            .min()
     }
 
     pub fn refresh_commands(&mut self) {
@@ -642,12 +732,11 @@ impl Thread {
         let missing_images = self.attachment_error.clone();
         let recovery = std::mem::take(&mut self.native.recovery);
         for send in recovery.into_iter().rev() {
-            if !self
-                .messages
-                .iter()
-                .skip(send.after)
-                .any(|m| m.role == "You" && m.text == send.prompt.text)
-            {
+            if !self.messages.iter().skip(send.after).any(|m| {
+                m.role == "You"
+                    && (m.text == send.prompt.text
+                        || attachments::pi_message(&send.prompt).is_ok_and(|text| m.text == text))
+            }) {
                 self.restore_prompt(&send.prompt);
                 self.diagnostic(
                     "Recovered a queued message into the draft. It was not automatically resent.",
@@ -660,6 +749,11 @@ impl Thread {
     }
 
     pub(super) fn native_disconnect(&mut self) {
+        self.native.questionnaire = None;
+        self.native.questionnaire_advance = None;
+        self.native.questionnaires.clear();
+        self.native.questionnaire_replies.clear();
+        self.native.notifications.clear();
         self.return_local_queue();
         let queued = std::mem::take(&mut self.native.queued_inputs);
         for send in queued.into_iter().rev() {
@@ -695,19 +789,61 @@ impl Thread {
     }
 
     pub(super) fn native_tick(&mut self, now: Instant) -> bool {
+        let before = self.native.notifications.len();
+        self.native
+            .notifications
+            .retain(|(_, deadline)| *deadline > now);
+        let changed = before != self.native.notifications.len();
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
+            self.cancel_questionnaire();
             self.native.dialog_deadline = None;
             self.request = None;
             self.native_dialog_done();
             self.diagnostic("Pi's input request expired.");
             return true;
         }
-        false
+        if self
+            .native
+            .questionnaire_advance
+            .is_some_and(|at| now >= at)
+        {
+            self.questionnaire_step(false);
+            return true;
+        }
+        changed
     }
 
     /// Returns true when this record is fully handled here rather than by the chat reducer.
     pub(super) fn apply_native(&mut self, record: &Value) -> bool {
         match string(record, "type") {
+            "tool_execution_start" if record["toolName"] == "ask_user_question" => {
+                if let Some(id) = record["toolCallId"].as_str()
+                    && self.native.questionnaires.len() < 32
+                {
+                    self.native
+                        .questionnaires
+                        .insert(id.into(), record["args"].clone());
+                }
+            }
+            "tool_execution_end" => {
+                if let Some(id) = record["toolCallId"].as_str() {
+                    self.native.questionnaires.remove(id);
+                    self.native
+                        .questionnaire_replies
+                        .retain(|(tool, _, _)| tool != id);
+                }
+            }
+            "extension_ui_request" if record["method"] == "notify" => {
+                let message = truncate(string(record, "message"), 2000);
+                self.diagnostic(&message);
+                if self.native.notifications.len() >= 4 {
+                    self.native.notifications.pop_front();
+                }
+                self.native
+                    .notifications
+                    .push_back((message, Instant::now() + Duration::from_secs(6)));
+                return true;
+            }
             "response" => {
                 let command = string(record, "command");
                 if command == "get_state" && self.native.state_floor > 0 {
@@ -1088,6 +1224,29 @@ impl Thread {
                     "confirm" | "select" | "input" | "editor"
                 ) =>
             {
+                let signature = questionnaire::signature(record);
+                if let Some(at) =
+                    self.native
+                        .questionnaire_replies
+                        .iter()
+                        .position(|(tool, key, _)| {
+                            self.native.questionnaires.len() == 1
+                                && *key == signature
+                                && self.native.questionnaires.contains_key(tool)
+                                && record["timeout"].as_i64().is_none_or(|n| n >= 0)
+                        })
+                {
+                    let (_, _, value) = self.native.questionnaire_replies.remove(at);
+                    if let Some(pi) = &self.pi {
+                        if let Err(error) = pi.send(
+                            json!({"type":"extension_ui_response","id":record["id"],"value":value}),
+                        ) {
+                            self.error = Some(error);
+                        } else {
+                            return true;
+                        }
+                    }
+                }
                 if record["method"] == "confirm"
                     && self
                         .native
@@ -1129,6 +1288,7 @@ impl Thread {
                 }
                 self.native.dialog_status.get_or_insert(self.status);
                 self.native.dialog_deadline = deadline;
+                self.prepare_questionnaire(record);
             }
             "agent_settled"
                 if self.native.compact_id.is_some() || self.native.lifecycle_id.is_some() =>

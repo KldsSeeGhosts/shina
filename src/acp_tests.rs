@@ -2,6 +2,44 @@ use super::*;
 use crate::model::{Status, Thread};
 use std::sync::Arc;
 
+#[test]
+fn file_prompts_use_negotiated_resources_or_path_text() {
+    let directory = crate::store::directory().unwrap();
+    let path = directory.join("resource.txt");
+    std::fs::write(&path, "Resource body").unwrap();
+    let attachment = crate::attachments::attach_file(&path).unwrap();
+    for embedded in [false, true] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.ready = true;
+        client.session = Some("fixture-session".into());
+        client.capabilities = json!({"promptCapabilities":{"embeddedContext":embedded}});
+        let prompt = crate::attachments::Prompt::new(String::new(), vec![attachment.clone()]);
+        let record = crate::attachments::prompt_record(&prompt, false).unwrap();
+        client.prompt(record).unwrap();
+        let wire = client
+            .wire
+            .iter()
+            .find(|r| r["method"] == "session/prompt")
+            .unwrap();
+        let content = wire["params"]["prompt"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        if embedded {
+            assert_eq!(content[1]["type"], "resource");
+            assert_eq!(content[1]["resource"]["text"], "Resource body");
+        } else {
+            assert_eq!(content[1]["type"], "text");
+            assert!(
+                content[1]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("resource.txt")
+            );
+        }
+        assert!(client.running);
+        assert_eq!(client.history[0]["content"][1], content[1]);
+    }
+}
+
 fn spec(source: SessionSource) -> Start {
     Start {
         id: "fixture".into(),

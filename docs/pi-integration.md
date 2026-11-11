@@ -7,6 +7,7 @@ Shina controls one harness subprocess per active conversation. Pi is the default
 | Area | Behavior |
 | --- | --- |
 | Resources | Real sessions use Pi's normal extension, MCP, skill, template and project-trust discovery. Shina adds its CPA provider and thread-scoped bridge. Catalog probes remain isolated and offline. No provider configuration, credentials or trust records are edited by Shina. |
+| Attachments | The attach button, paste and drop accept files and folders. Shift-click Attach opens the folder picker. Up to 20 attachments share a message, with the existing eight-image, 10 MiB per-image and 20 MiB combined image limits. Pi receives KSG's `[Attached file "name" is saved at: path]` context and typed image parts. KSG's Pi adapter does not inline ordinary file text. Other files remain absolute references, including files larger than 256 KiB and binary files. Drafts and queued messages save references, not file contents; missing references remain removable and block sending with an error. |
 | Commands | Each process requests `get_commands` in its own workspace. The composer lists extension commands, templates and `/skill:name` commands with descriptions and source labels. Arrow keys select, Tab or Enter inserts, Escape dismisses. The thread menu can refresh discovery without discarding a previously usable inventory after an error. |
 | Built-ins | `/model` opens Shina's model picker. `/compact [instructions]` maps to `compact`, not `prompt`. Unknown commands stay in the draft and produce an error rather than accidentally becoming a model request. Pi's terminal-only built-ins are not advertised as RPC commands. |
 | Compaction | The context details expose Compact context. Pi receives optional `customInstructions`. Both manual and automatic compaction report progress, failure, cancellation, summary and token counts. Post-compaction token estimates are labelled approximate; the context ring stays unknown until Pi supplies fresh usage. Stop retires a process whose compaction cannot be interrupted by ordinary agent abort. |
@@ -18,7 +19,7 @@ Shina controls one harness subprocess per active conversation. Pi is the default
 | History | `get_entries` supplies the active branch by leaf ancestry, not append order. Shina retains pre-compaction transcript history while Pi independently builds compacted model context. Abandoned branches are not mixed into the visible conversation. Compaction summaries survive reconnect. |
 | Names | Shina synchronizes thread titles through `set_session_name`. |
 | Approvals | Supervised and Auto-accept edits use a blocking `tool_call` hook in Shina's bridge. The default remains Full access for existing profiles. Permission changes restart the idle runtime; forks and crew inherit the mode. A failed permission-bridge setup blocks supervised startup. |
-| Extension UI | Confirm, select, input and editor requests support concurrent dialogs and expiration. Allow for session remembers an exact confirmation only for that process. Extension failures are visible in the conversation and diagnostics. Notifications and `set_editor_text` remain supported. |
+| Extension UI | Confirm, select, input and editor requests support concurrent dialogs and expiration. RPIV `ask_user_question` inputs recover structured questions only when the title and option strings match KSG's serialization. A composer-replacing drawer has Previous/Next, digit shortcuts, multi-select and free-text answers. It collects answers before replying to the sequential RPC dialogs, with later replies limited to exact matches from the same live tool call. Structured `questions` on a native input/editor request also use the drawer and return a JSON answer map in the RPC value string. Allow for session remembers an exact confirmation only for that process. Extension failures are visible in the conversation and diagnostics. Notifications appear as bounded six-second notices and stay in diagnostics. `set_editor_text` remains supported. |
 | Results | Tool output retains up to 50,000 display characters, image references, parent call IDs, exit codes, and bounded structured result/details/nested-call metadata. Pi subagent extension results have individual status, model, task and output cards, with no invented Shina thread links. Pi retains the authoritative result. |
 | Usage | The context meter accepts provider streaming usage and refreshes native session statistics after turns and compaction. Details show total processed tokens and Pi's reported session cost, separate from live context usage. |
 
@@ -28,10 +29,10 @@ The selected-message picker is Pi-specific. KSG normally attaches its conversati
 
 ## Remaining differences from KSG Code
 
-This closes the command, compaction, steering and native conversation-operation gaps. It is not complete application parity:
+Attachments and structured questionnaires now have native support. These differences remain:
 
-- Shina's attachment picker still accepts images only. KSG also resolves ordinary file attachments and extracted-text paths.
-- RPIV's structured multi-select questionnaire presentation still uses Pi's native select/input fallback in Shina. Replies work, but there is no equivalent rich questionnaire form.
+- Shina references ordinary files at their original absolute paths rather than uploading a saved copy. It does not run KSG's extracted-text conversion pipeline for documents. The agent reads these files with its tools. Only negotiated ACP embedded text resources inline UTF-8 files without NULs, up to 256 KiB.
+- The questionnaire drawer is a functional Rune port. It does not yet have KSG's collapsible header or Markdown question rendering. Unmatched or malformed RPC requests retain the native dialog fallback.
 - KSG has a cross-session usage dashboard, provider maintenance/version checks, configurable launch arguments and multiple Pi provider instances. Shina has per-session statistics and its existing CLI path override, not those settings pages.
 - KSG supports provider handoffs. Shina does not switch an existing conversation between harnesses. Pi remains CPA-only.
 - Rollback here changes conversation history only. It does not implement KSG's filesystem checkpoint restoration.
@@ -49,7 +50,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Headless UI tests exercise the controls at 620, 960, 1280 and 1920 px. Reducer tests cover native compaction, stop, failures, steering rejection, compaction races, queue editing/promotion/recovery, session changes, stale responses, history ancestry, extension dialogs and structured results.
+Headless UI tests exercise the controls, questionnaire drawer and file/folder chips at 620, 960, 1280 and 1920 px. Tests cover attachment classification and limits, Pi and negotiated ACP prompt blocks, missing-file draft round trips, questionnaire parsing and wire replies, digit selection, navigation, expiration and notification expiry. Reducer tests also cover native compaction, stop, failures, steering rejection, compaction races, queue editing/promotion/recovery, session changes, stale responses, history ancestry, extension dialogs and structured results.
 
 The installed-Pi smoke test uses a temporary profile and fixture provider:
 

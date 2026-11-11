@@ -377,9 +377,6 @@ impl Thread {
     pub fn has_draft_content(&self) -> bool {
         !self.draft.text.trim().is_empty() || !self.draft_images.is_empty()
     }
-    fn attachment_bytes(&self) -> u64 {
-        self.draft_images.iter().map(|image| image.bytes).sum()
-    }
     /// Add a validated attachment while preserving the text draft and its undo history.
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
         if self
@@ -389,19 +386,10 @@ impl Thread {
         {
             return Err(format!("{} is already attached.", image.name));
         }
-        if self.draft_images.len() >= attachments::MAX_IMAGES {
-            return Err(format!(
-                "A message can carry up to {} images. Remove one before attaching another.",
-                attachments::MAX_IMAGES
-            ));
-        }
-        if self.attachment_bytes() + image.bytes > attachments::MAX_TOTAL_BYTES {
-            return Err(format!(
-                "The images total more than {} MB. Remove one before attaching another.",
-                attachments::MAX_TOTAL_BYTES / (1024 * 1024)
-            ));
-        }
-        self.draft_images.push(image);
+        let mut proposed = self.draft_images.clone();
+        proposed.push(image);
+        attachments::validate_prompt_images(&proposed)?;
+        self.draft_images = proposed;
         self.attachment_error = None;
         Ok(())
     }
@@ -744,7 +732,8 @@ impl Thread {
             self.error = Some("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
-        if !self.draft_images.is_empty() && self.supports_images == Some(false) {
+        if self.draft_images.iter().any(Attachment::is_image) && self.supports_images == Some(false)
+        {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
@@ -764,7 +753,13 @@ impl Thread {
                 prompt
                     .images
                     .first()
-                    .map(|image| format!("Image: {}", image.name))
+                    .map(|image| {
+                        format!(
+                            "{}: {}",
+                            if image.is_image() { "Image" } else { "File" },
+                            image.name
+                        )
+                    })
                     .unwrap_or_else(|| "New thread".into())
                     .chars()
                     .take(45)
@@ -833,6 +828,9 @@ impl Thread {
     }
 
     pub fn respond(&mut self, mut response: Value) {
+        if response["cancelled"] == true {
+            self.cancel_questionnaire();
+        }
         let Some(request) = &self.request else {
             return;
         };
@@ -1116,21 +1114,18 @@ impl Thread {
             self.fail_session("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
-        if !prompt.images.is_empty() && self.supports_images != Some(true) {
+        if prompt.images.iter().any(Attachment::is_image) && self.supports_images != Some(true) {
             let error = self.image_model_error();
             self.reject_images(&prompt, index, error);
             return;
         }
-        let mut record = json!({"message": prompt.text.clone()});
-        if !prompt.images.is_empty() {
-            match attachments::encode_images(&prompt.images) {
-                Ok(images) => record["images"] = Value::Array(images),
-                Err(error) => {
-                    self.reject_images(&prompt, index, error);
-                    return;
-                }
+        let record = match attachments::prompt_record(&prompt, self.harness == "pi") {
+            Ok(record) => record,
+            Err(error) => {
+                self.reject_images(&prompt, index, error);
+                return;
             }
-        }
+        };
         if self.command("prompt", record) {
             self.pending_prompt = Some((format!("{}-{}", self.id, self.serial), prompt, index));
         } else {
@@ -1738,8 +1733,6 @@ impl Thread {
                     self.reply.replace_text(string(&record, "prefill"));
                     self.request = Some(record);
                     self.status = Status::Waiting;
-                } else if record["method"] == "notify" {
-                    self.diagnostic(string(&record, "message"));
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
                 }
@@ -4023,17 +4016,19 @@ impl State {
     }
     fn attachment_guard(&self, index: usize) -> Option<String> {
         if self.demo {
-            Some("Open a real workspace before attaching images.".into())
+            Some("Open a real workspace before attaching files.".into())
         } else if self.threads[index].archived() {
-            Some("Restore this thread before attaching images.".into())
+            Some("Restore this thread before attaching files.".into())
+        } else if self.threads[index].request.is_some() {
+            Some("Answer the current question before attaching files.".into())
         } else if self.threads[index].status.busy() {
-            if self.threads[index].request.is_some() || self.threads[index].native.operating() {
-                Some("Wait for Pi's current operation before attaching images.".into())
+            if self.threads[index].native.operating() {
+                Some("Wait for the current operation before attaching files.".into())
             } else {
                 None
             }
         } else if self.threads[index].configuring {
-            Some("Wait for the model change to finish before attaching images.".into())
+            Some("Wait for the model change to finish before attaching files.".into())
         } else {
             None
         }
@@ -4056,10 +4051,10 @@ impl State {
         let mut errors = Vec::new();
         let mut attached = 0;
         for path in paths {
-            if self.threads[index].draft_images.len() >= attachments::MAX_IMAGES {
+            if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
                 errors.push(format!(
-                    "A message can carry up to {} images. The remaining files were not attached.",
-                    attachments::MAX_IMAGES
+                    "A message can carry up to {} attachments. The remaining files were not attached.",
+                    attachments::MAX_ATTACHMENTS
                 ));
                 break;
             }
@@ -5222,6 +5217,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         thread.drive_session();
         changed |= thread.check_deadlines(Instant::now());
         changed |= thread.native_tick(Instant::now());
+        if let Some(deadline) = thread.native_deadline() {
+            tx.wake_after(deadline.saturating_duration_since(Instant::now()));
+        }
         if thread.request.is_none()
             && thread
                 .session_started
@@ -6848,6 +6846,7 @@ mod tests {
             width: 4,
             height: 4,
             bytes: 3,
+            path: None,
         });
         let mut second = Thread::new(2);
         second.title = "Second".into();
@@ -9802,7 +9801,7 @@ mod tests {
     }
 
     #[test]
-    fn image_only_prompts_send_typed_pi_images_without_file_paths() {
+    fn image_only_prompts_send_typed_pi_images_with_ksg_path_context() {
         let mut thread = Thread::new(1);
         thread.model_provider = "cpa".into();
         thread.supports_images = Some(true);
@@ -9813,7 +9812,10 @@ mod tests {
         thread.send();
         let prompt = commands.try_recv().unwrap();
         assert_eq!(prompt["type"], "prompt");
-        assert_eq!(prompt["message"], "");
+        assert_eq!(
+            prompt["message"],
+            attachments::pi_message(&Prompt::new(String::new(), vec![image.clone()])).unwrap()
+        );
         assert_eq!(prompt["images"][0]["type"], "image");
         assert_eq!(prompt["images"][0]["mimeType"], "image/png");
         assert_eq!(
@@ -9989,6 +9991,45 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_file_drafts_round_trip_and_keep_missing_file_errors() {
+        let path = crate::store::directory()
+            .unwrap()
+            .join("draft-reference.txt");
+        std::fs::write(&path, "Draft text stays outside ui-state.").unwrap();
+        let file = attachments::attach_file(&path).unwrap();
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("Review this");
+        state.current_mut().add_attachment(file.clone()).unwrap();
+        let snapshot = state.ui_snapshot();
+        assert!(!snapshot.to_string().contains("Draft text stays outside"));
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&snapshot).unwrap();
+        assert_eq!(restored.current().draft.text, "Review this");
+        assert_eq!(restored.current().draft_images, vec![file.clone()]);
+        std::fs::remove_file(path).unwrap();
+        restored.restore_ui(&snapshot).unwrap();
+        assert_eq!(restored.current().draft_images, vec![file]);
+        assert!(
+            restored
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Missing file")
+        );
+        let again = restored.ui_snapshot();
+        restored.restore_ui(&again).unwrap();
+        assert!(
+            restored
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Missing file")
+        );
+    }
+
+    #[test]
     fn attachment_count_and_size_limits_keep_the_text_draft_untouched() {
         let mut thread = Thread::new(1);
         thread.draft.replace_text("Keep me");
@@ -10111,7 +10152,10 @@ mod tests {
         }
         poll(&mut state, 0.0, &mut Tx::default());
         let prompt = commands.try_iter().find(|c| c["type"] == "prompt").unwrap();
-        assert_eq!(prompt["message"], "");
+        assert_eq!(
+            prompt["message"],
+            attachments::pi_message(&Prompt::new(String::new(), vec![image.clone()])).unwrap()
+        );
         assert_eq!(prompt["images"][0]["type"], "image");
         assert_eq!(
             crate::attachments::decode_base64(prompt["images"][0]["data"].as_str().unwrap())
