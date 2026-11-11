@@ -36,6 +36,9 @@ fn init() -> State {
 }
 
 fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if ui::questionnaire_key(state, event) {
+        return true;
+    }
     if state.undo_key(event, false) {
         return true;
     }

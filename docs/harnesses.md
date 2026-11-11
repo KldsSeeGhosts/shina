@@ -32,6 +32,8 @@ Shina also detects `claude-code-acp`, `codex-acp`, `gemini --experimental-acp`, 
 
 The client implements ACP protocol version 1 as JSON-RPC 2.0 JSONL over stdio. It negotiates capabilities, starts sessions in the thread's project or scratch directory, and supports text and negotiated image prompts. Agent text, thoughts, tool calls and tool results use Shina's existing transcript reducer. Plans and mode updates remain in per-thread runtime metadata. Advertised commands enter the composer command menu.
 
+When the agent advertises `promptCapabilities.embeddedContext`, file attachments use `resource` blocks for valid UTF-8 text without NULs up to 256 KiB, and `resource_link` blocks for binary files, larger files and folders. Without embedded context, Shina sends absolute path text. Images keep their negotiated typed image blocks. Files remain at their original paths; missing files block sending without clearing the draft.
+
 `session/request_permission` uses Shina's existing confirmation queue. Supervised mode asks before mutations and execution. Read and search requests can proceed. Auto-accept edits also approves tools classified as edits. Full access approves permission requests. Declines and cancellation use the agent's advertised option ids. These are approval policies, not an OS sandbox. The ACP agent still controls whether it requests permission.
 
 Stop sends `session/cancel`. An unresponsive stop triggers Shina's existing ten-second disconnect deadline. ACP v1 has no standard steering API, so messages sent during a run become follow-ups and wait for settlement. Stop recovers queued user input. Shina never retries an accepted prompt after an agent error because tools may already have run.

@@ -1,5 +1,155 @@
 use super::*;
 
+#[test]
+fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
+    let (mut t, commands) = thread(Status::Running);
+    let params = json!({"questions":[
+        {"header":"Storage","question":"Where?","options":[{"label":"Disk","description":"Local"}]},
+        {"question":"Which?","multiSelect":true,"options":[{"label":"A","description":"First"},{"label":"B","description":"Second"}]}
+    ]});
+    t.apply(json!({"type":"tool_execution_start","toolCallId":"ask-1","toolName":"ask_user_question","args":params}));
+    t.apply(json!({"type":"extension_ui_request","id":"first","method":"select","title":"[Storage] Where?",
+        "options":["1. Disk \u{2014} Local","2. Type something."]}));
+    assert!(t.native.questionnaire.is_some());
+    t.questionnaire_toggle(0);
+    assert!(t.native_tick(Instant::now() + Duration::from_millis(250)));
+    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 1);
+    assert!(
+        commands
+            .try_iter()
+            .all(|r| r["type"] != "extension_ui_response")
+    );
+    t.questionnaire_toggle(1);
+    t.questionnaire_toggle(0);
+    t.questionnaire_step(true);
+    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 0);
+    t.questionnaire_step(false);
+    t.questionnaire_step(false);
+    assert_eq!(
+        command(&commands, "extension_ui_response")["value"],
+        "1. Disk \u{2014} Local"
+    );
+    assert!(t.request.is_none());
+    let second = json!({"type":"extension_ui_request","id":"second","method":"input",
+        "title":"Which?\n\n1. A \u{2014} First\n2. B \u{2014} Second\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"). Add \"; custom answer\" to include your own text, or type only custom text."});
+    let mut unrelated = second.clone();
+    unrelated["title"] = json!("Unrelated");
+    unrelated["id"] = json!("unrelated");
+    t.apply(unrelated);
+    assert!(t.request.is_some());
+    assert!(
+        commands
+            .try_iter()
+            .all(|r| r["type"] != "extension_ui_response")
+    );
+    t.respond(json!({"value":"Manual answer"}));
+    command(&commands, "extension_ui_response");
+    t.apply(second.clone());
+    let response = command(&commands, "extension_ui_response");
+    assert_eq!(response["id"], "second");
+    assert_eq!(response["value"], "1,2");
+    assert!(t.request.is_none());
+    t.apply(json!({"type":"tool_execution_end","toolCallId":"ask-1","result":{"content":[]}}));
+    t.apply(second);
+    assert!(t.native.questionnaire.is_none());
+    assert!(t.request.is_some());
+}
+
+#[test]
+fn structured_questionnaire_expiry_cancels_auto_advance_and_notifications_expire() {
+    let (mut t, commands) = thread(Status::Running);
+    t.apply(
+        json!({"type":"extension_ui_request","id":"form","method":"input","timeout":1,
+        "questions":[{"id":"one","question":"Choose","options":[{"label":"A"}]}]}),
+    );
+    t.questionnaire_toggle(0);
+    assert!(t.native.questionnaire_advance.is_some());
+    t.native_tick(Instant::now() + Duration::from_secs(1));
+    assert!(t.native.questionnaire.is_none());
+    assert!(t.native.questionnaire_advance.is_none());
+    assert!(
+        commands
+            .try_iter()
+            .all(|r| r["type"] != "extension_ui_response")
+    );
+    t.apply(json!({"type":"extension_ui_request","method":"notify","message":"Done"}));
+    assert_eq!(t.native.notifications.len(), 1);
+    assert!(t.native_deadline().is_some());
+    assert!(t.native_tick(Instant::now() + Duration::from_secs(7)));
+    assert!(t.native.notifications.is_empty());
+    t.native
+        .questionnaire_replies
+        .push(("tool".into(), "signature".into(), "answer".into()));
+    t.cancel_native_dialogs();
+    assert!(t.native.questionnaire_replies.is_empty());
+}
+
+#[test]
+fn single_selection_auto_submits_and_other_edit_cancels_auto_advance() {
+    let (mut t, commands) = thread(Status::Running);
+    let mut request = json!({"type":"extension_ui_request","id":"form","method":"input",
+        "questions":[{"id":"one","question":"Choose","options":[{"label":"A"}]}]});
+    t.apply(request.clone());
+    t.questionnaire_toggle(0);
+    assert!(t.native_tick(Instant::now() + Duration::from_millis(250)));
+    let response = command(&commands, "extension_ui_response");
+    assert_eq!(response["id"], "form");
+    assert_eq!(response["value"], json!({"one":"A"}).to_string());
+    request["id"] = json!("other");
+    t.apply(request);
+    t.questionnaire_toggle(0);
+    t.questionnaire_edit().replace_text("Custom");
+    assert!(!t.native_tick(Instant::now() + Duration::from_millis(250)));
+    assert!(t.request.is_some());
+    t.questionnaire_step(false);
+    let response = command(&commands, "extension_ui_response");
+    assert_eq!(response["value"], json!({"one":"Custom"}).to_string());
+    assert!(t.native.questionnaire.is_none());
+}
+
+#[test]
+fn files_send_and_steer_without_vision_and_recover_from_persisted_queue_references() {
+    let path = crate::store::directory().unwrap().join("ordinary.txt");
+    std::fs::write(&path, "A file, not an image.").unwrap();
+    let file = attachments::attach_file(&path).unwrap();
+    let (mut t, commands) = thread(Status::Ready);
+    t.supports_images = Some(false);
+    t.add_attachment(file.clone()).unwrap();
+    t.send();
+    let prompt = command(&commands, "prompt");
+    assert!(
+        prompt["message"]
+            .as_str()
+            .unwrap()
+            .contains("[Attached file \"ordinary.txt\"")
+    );
+    assert!(prompt.get("images").is_none());
+    assert_eq!(t.title, "File: ordinary.txt");
+    t.add_attachment(file.clone()).unwrap();
+    t.send_during_run();
+    let steer = command(&commands, "prompt");
+    assert_eq!(steer["streamingBehavior"], "steer");
+    assert!(steer["message"].as_str().unwrap().contains("ordinary.txt"));
+    t.native.follow_up = true;
+    t.add_attachment(file.clone()).unwrap();
+    t.send_during_run();
+    let saved = t.pending_inputs_value();
+    assert!(!saved.to_string().contains("A file, not an image."));
+    std::fs::remove_file(path).unwrap();
+    let (mut restored, _) = thread(Status::Ready);
+    restored.restore_pending_inputs(&saved).unwrap();
+    restored.recover_native_inputs();
+    assert_eq!(restored.draft_images, vec![file]);
+    assert!(
+        restored
+            .attachment_error
+            .as_deref()
+            .unwrap()
+            .contains("Missing file")
+    );
+    assert!(restored.native.queue.is_empty());
+}
+
 fn thread(status: Status) -> (Thread, mpsc::Receiver<Value>) {
     let mut thread = Thread::new(1);
     let (pi, commands, _) = Pi::test_connection();

@@ -14,6 +14,7 @@ use serde_json::json;
 mod crew_ui;
 #[path = "pi_ui.rs"]
 mod pi_ui;
+pub(crate) use pi_ui::questionnaire_key;
 
 // Warm neutral chrome, a paper-like reading area, and Shina's teal action color.
 #[derive(Clone, Copy)]
@@ -5905,7 +5906,14 @@ fn image_preview(
         preview = preview
             .center()
             .fill(p.selected)
-            .child(icon("image", p.muted));
+            .child(if image.is_image() {
+                icon("image", p.muted)
+            } else {
+                label(&image.name, TextStyle::new(10.0, 400.0), p.muted)
+                    .wrap_anywhere()
+                    .align(rune::Align::Center)
+                    .padding(4.0)
+            });
     }
     preview
 }
@@ -5926,7 +5934,11 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
     let id = image.id.clone();
     el().key(format!("attachment-{}", image.id))
         .role("group")
-        .label(format!("Attached image: {}", image.name))
+        .label(format!(
+            "Attached {}: {}",
+            if image.is_image() { "image" } else { "file" },
+            image.name
+        ))
         .help(image.name.clone())
         .size(ATTACHMENT_THUMB, ATTACHMENT_THUMB)
         .child(
@@ -5971,7 +5983,11 @@ fn message_images(s: &State, p: Palette, images: &[Attachment], key: &str) -> El
         strip = strip.child(
             image_preview(s, p, image, width, height, format!("{key}-image-{index}"))
                 .role("group")
-                .label(format!("Attached image: {}", image.name)),
+                .label(format!(
+                    "Attached {}: {}",
+                    if image.is_image() { "image" } else { "file" },
+                    image.name
+                )),
         );
     }
     strip
@@ -5982,7 +5998,8 @@ fn attach_control(locked: bool, p: Palette) -> El {
         .key("attach-image")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label("Attach image")
+        .label("Attach files or folders. Shift-click to choose a folder.")
+        .help("Attach files. Shift-click for a folder.")
         .size(24.0, 24.0)
         .center()
         .radius(5.0)
@@ -5993,33 +6010,40 @@ fn attach_control(locked: bool, p: Palette) -> El {
     if !locked {
         control = control
             .focusable(true)
-            .on_press_tx(|s: &mut State, tx: &mut Tx| pick_attachment(s, tx));
+            .on_press_tx(|s: &mut State, tx: &mut Tx| pick_attachment(s, tx, tx.mods().shift));
     }
     control
 }
 
-fn pick_attachment(s: &mut State, tx: &mut Tx) {
+fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
-    tx.open_file(
-        rune::FileDialogOptions {
-            title: "Attach an image".into(),
-            ..Default::default()
+    let options = rune::FileDialogOptions {
+        title: if folder {
+            "Attach a folder"
+        } else {
+            "Attach a file"
         }
-        .filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]),
-        move |s: &mut State, result, _| {
-            match result {
-                Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
-                Ok(None) => {}
-                Err(error) => {
-                    if let Some(target) = s.threads.iter_mut().find(|t| t.id == thread) {
-                        target.attachment_error =
-                            Some(format!("Could not open the image picker: {error}"));
-                    }
+        .into(),
+        ..Default::default()
+    };
+    let callback = move |s: &mut State, result, _: &mut Tx| {
+        match result {
+            Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(target) = s.threads.iter_mut().find(|t| t.id == thread) {
+                    target.attachment_error =
+                        Some(format!("Could not open the attachment picker: {error}"));
                 }
             }
-            s.checkpoint();
-        },
-    );
+        }
+        s.checkpoint();
+    };
+    if folder {
+        tx.open_folder(options, callback);
+    } else {
+        tx.open_file(options, callback);
+    }
 }
 
 const CONTEXT_RING_SIZE: f32 = 28.0;
@@ -6387,6 +6411,9 @@ fn context_popover(s: &State, p: Palette) -> El {
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
+    if !t.native.notifications.is_empty() {
+        area = area.child(pi_ui::notifications(s, p));
+    }
     if let Some(error) = &s.storage_error {
         area = area.child(label(error, SMALL, p.danger).wrap_anywhere());
     }
@@ -6415,6 +6442,9 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 .wrap_anywhere()
                 .selectable(true),
         );
+    }
+    if t.native.questionnaire.is_some() && t.request.is_some() {
+        return area.child(pi_ui::questionnaire_drawer(s, p));
     }
     if t.request.is_some() {
         area = area.child(dialog(s, p));
@@ -6874,6 +6904,127 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn questionnaire_replaces_composer_and_supports_keyboard_and_previous_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.state.current_mut().draft.replace_text("Preserved draft");
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"form","method":"input",
+                "questions":[
+                    {"id":"one","header":"Choose storage","question":"Where should the working data go?",
+                     "multiSelect":true,"options":[{"label":"Disk","description":"Keep it on this computer"},{"label":"Server","description":"Use a remote server"}]},
+                    {"id":"two","header":"Details","question":"Anything else?","options":[]}
+                ]}));
+            rt.frame(0.0);
+            for key in [
+                "questionnaire-drawer",
+                "dialog-option-0",
+                "dialog-option-1",
+                "dialog-reply",
+                "questionnaire-next",
+                "dialog-cancel",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{key}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 721.0,
+                    "{key}: {rect:?}"
+                );
+            }
+            assert!(rt.find("composer-input").is_none());
+            assert!(rt.find("send-message").is_none());
+            // Digit shortcuts work before any drawer control has focus.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("1".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("2".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .answers[0]
+                    .selected,
+                vec!["Disk", "Server"]
+            );
+            press(&mut rt, "questionnaire-next");
+            assert_eq!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                1
+            );
+            assert!(rt.find("dialog-submit").is_some());
+            rt.state.current_mut().reply.replace_text("Free text");
+            press(&mut rt, "questionnaire-previous");
+            assert_eq!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                0
+            );
+            press(&mut rt, "questionnaire-next");
+            assert_eq!(rt.state.current().reply.text, "Free text");
+            assert_eq!(rt.state.current().draft.text, "Preserved draft");
+            rt.state.current_mut().reply.focused = true;
+            assert!(!pi_ui::questionnaire_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Text("1".into()),
+                    mods: Default::default()
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_file_and_folder_chips_fit_at_all_widths() {
+        let path = crate::store::directory()
+            .unwrap()
+            .join("a long file name.txt");
+        std::fs::write(&path, "Fixture file").unwrap();
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .attach_paths(&[path.clone(), crate::store::directory().unwrap()]);
+            rt.frame(0.0);
+            let (composer, _) = rt.presented("composer").unwrap();
+            for attachment in &rt.state.current().draft_images {
+                let (rect, _) = rt
+                    .presented(&format!("attachment-{}", attachment.id))
+                    .unwrap();
+                assert_eq!((rect[2], rect[3]), (64.0, 64.0));
+                assert!(
+                    rect[0] >= composer[0] && rect[0] + rect[2] <= composer[0] + composer[2] + 1.0
+                );
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width);
+            }
+            assert_eq!(rt.state.current().draft_images.len(), 2);
+        }
+    }
+
+    #[test]
     fn harness_picker_is_available_before_first_send_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -7236,6 +7387,7 @@ pub(crate) mod tests {
                         width: 512,
                         height: 512,
                         bytes: 1,
+                        path: None,
                     })
                     .collect(),
             });

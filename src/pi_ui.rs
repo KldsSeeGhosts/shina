@@ -2,6 +2,201 @@
 use super::*;
 use crate::model::ConversationMode;
 
+/// Ported from KSG Code's ComposerPendingUserInputPanel: header, 14 px option labels,
+/// descriptions, digit shortcuts, radio/checkbox rows and a scrollable composer replacement.
+pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let form = t.native.questionnaire.as_ref().expect("questionnaire");
+    let question = &form.questions[form.index];
+    let answer = &form.answers[form.index];
+    let custom = !t.reply.text.trim().is_empty();
+    let mut options = col().gap(2.0).w_full();
+    for (i, option) in question.options.iter().enumerate() {
+        let selected = !custom && answer.selected.contains(&option.value);
+        let indicator = if question.multi {
+            if selected { "[x]" } else { "[ ]" }
+        } else if selected {
+            "(*)"
+        } else {
+            "( )"
+        };
+        options = options.child(
+            row()
+                .key(format!("dialog-option-{i}"))
+                .role(if question.multi { "checkbox" } else { "radio" })
+                .label(format!(
+                    "{}{}{}",
+                    option.label,
+                    if selected { ", selected. " } else { ". " },
+                    option.description
+                ))
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .w_full()
+                .min_h(34.0)
+                .py(6.0)
+                .px(8.0)
+                .gap(10.0)
+                .radius(6.0)
+                .fill(if selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .child(label(indicator, SMALL, p.teal).w(20.0))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(2.0)
+                        .child(
+                            label(&option.label, TextStyle::new(14.0, 500.0), p.ink)
+                                .wrap_anywhere(),
+                        )
+                        .child(
+                            label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
+                                .wrap_anywhere(),
+                        ),
+                )
+                .child(
+                    label(
+                        if i < 9 {
+                            (i + 1).to_string()
+                        } else {
+                            String::new()
+                        },
+                        SMALL,
+                        p.muted,
+                    )
+                    .w(24.0),
+                )
+                .on_press(move |s: &mut State| s.current_mut().questionnaire_toggle(i)),
+        );
+    }
+    let can_advance = custom || !answer.selected.is_empty();
+    let last = form.index + 1 == form.questions.len();
+    col()
+        .key("pi-dialog")
+        .role("group")
+        .label("Pi needs your input")
+        .w_full()
+        .child(
+            col()
+                .key("questionnaire-drawer")
+                .w_full()
+                .padding(16.0)
+                .gap(8.0)
+                .radius(12.0)
+                .fill(p.card)
+                .border(1.0, p.line)
+                .child(
+                    row()
+                        .gap(8.0)
+                        .child(
+                            label(&question.header, SMALL, p.muted)
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .truncate(),
+                        )
+                        .child(label(
+                            format!("{}/{}", form.index + 1, form.questions.len()),
+                            SMALL,
+                            p.muted,
+                        )),
+                )
+                .child(
+                    col()
+                        .key("questionnaire-scroll")
+                        .w_full()
+                        .max_h((s.viewport_height * 0.32).clamp(96.0, 260.0))
+                        .scroll(ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .child(label(&question.text, BODY, p.ink).wrap_anywhere())
+                        .child(options),
+                )
+                .child(
+                    text_input(&t.reply, BODY)
+                        .key("dialog-reply")
+                        .label("Other answer")
+                        .placeholder("Other answer...", p.muted)
+                        .color(p.ink)
+                        .w_full()
+                        .min_h(32.0)
+                        .max_h(72.0)
+                        .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
+                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false)),
+                )
+                .child(
+                    row()
+                        .gap(6.0)
+                        .flex_wrap()
+                        .child(
+                            button("questionnaire-previous", "Previous", p, |s| {
+                                s.current_mut().questionnaire_step(true)
+                            })
+                            .disabled(form.index == 0),
+                        )
+                        .child(
+                            button(
+                                if last {
+                                    "dialog-submit"
+                                } else {
+                                    "questionnaire-next"
+                                },
+                                if last { "Submit reply" } else { "Next" },
+                                p,
+                                |s| s.current_mut().questionnaire_step(false),
+                            )
+                            .disabled(!can_advance),
+                        )
+                        .child(button("dialog-cancel", "Cancel", p, |s| {
+                            s.current_mut().respond(json!({"cancelled":true}))
+                        })),
+                ),
+        )
+}
+
+pub(crate) fn questionnaire_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+    if event.mods.ctrl
+        || event.mods.cmd
+        || event.mods.alt
+        || s.current().reply.focused
+        || s.search.focused
+    {
+        return false;
+    }
+    let rune::Key::Text(digit) = &event.key else {
+        return false;
+    };
+    let Some(form) = &mut s.current_mut().native.questionnaire else {
+        return false;
+    };
+    // Validate with the same helper used by non-UI questionnaire tests.
+    let Some(index) = form.digit_index(digit) else {
+        return false;
+    };
+    s.current_mut().questionnaire_toggle(index);
+    true
+}
+
+pub(super) fn notifications(s: &State, p: Palette) -> El {
+    let mut list = col().key("pi-notifications").w_full().gap(4.0);
+    for (i, (message, _)) in s.current().native.notifications.iter().enumerate() {
+        list = list.child(
+            label(message, SMALL, p.ink)
+                .key(format!("pi-notification-{i}"))
+                .wrap_anywhere()
+                .padding(8.0)
+                .radius(8.0)
+                .fill(p.teal_bg)
+                .border(0.5, p.line),
+        );
+    }
+    list
+}
+
 /// Ported from KSG Code's chat/ComposerCommandMenu.tsx: rounded rows, 12 px label and description,
 /// a source badge, and a scrollable drawer above the composer. Pi supplies the workspace inventory.
 pub(super) fn slash_menu(s: &State, p: Palette) -> El {

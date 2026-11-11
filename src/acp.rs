@@ -486,6 +486,18 @@ impl Client {
         if !text.is_empty() {
             content.push(json!({"type":"text","text":text}));
         }
+        let files: Vec<_> = record["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                crate::attachments::Attachment::from_value(value)
+                    .ok_or_else(|| "Invalid ACP attachment reference.".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        let parts =
+            crate::attachments::acp_parts(&files, &self.capabilities["promptCapabilities"])?;
+        content.extend(parts.clone());
         content.extend(images.clone());
         self.awareness_sent = true;
         self.events
@@ -493,6 +505,7 @@ impl Client {
         self.running = true;
         self.cancelling = false;
         let mut history_content = vec![json!({"type":"text","text":text})];
+        history_content.extend(parts);
         history_content.extend(images);
         self.history
             .push(json!({"role":"user","content":history_content}));
