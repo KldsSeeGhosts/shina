@@ -1901,13 +1901,18 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     side
 }
 
-/// Preferences behind the footer's gear. The theme is the first; more join it here.
+/// Preferences behind the footer's gear. BackgroundActivitySettings in KSG Code has no
+/// close-to-tray/routine equivalent; these requested plain items reuse the existing menu.
 fn settings_menu(s: &State, p: Palette) -> El {
-    col()
+    let mut menu = col()
         .key("settings-menu")
         .role("menu")
         .label("Settings")
-        .w(220.0)
+        .w(300.0)
+        .max_h(420.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
         .padding(4.0)
         .gap(1.0)
         .radius(10.0)
@@ -1918,7 +1923,82 @@ fn settings_menu(s: &State, p: Palette) -> El {
             30.0,
             Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
         )
-        .anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
+        .child(
+            menu_item(
+                "background-toggle",
+                if s.background_settings().keep_working {
+                    "Keep working in background: On"
+                } else {
+                    "Keep working in background: Off"
+                },
+                "moon",
+                p,
+            )
+            .on_press(|s: &mut State| {
+                s.set_keep_working(!s.background_settings().keep_working);
+            }),
+        )
+        .child(
+            menu_item(
+                "keep-awake-toggle",
+                s.background_settings().keep_awake.label(),
+                "sun",
+                p,
+            )
+            .on_press(|s: &mut State| {
+                s.set_keep_awake(s.background_settings().keep_awake.next());
+            }),
+        );
+    if let Some(error) = s.background_status().error {
+        menu = menu.child(label(&error, SMALL, p.danger).wrap().px(8.0));
+    }
+    for captain in 0..s.captains.len() {
+        for routine in s.routines(captain) {
+            let id = routine.id;
+            let paused = routine.paused;
+            menu = menu
+                .child(
+                    label(
+                        format!("Routine: {} ({})", routine.name, routine.last_status),
+                        SMALL,
+                        p.muted,
+                    )
+                    .wrap()
+                    .px(8.0),
+                )
+                .child(
+                    menu_item(
+                        &format!("routine-pause-{id}"),
+                        if paused {
+                            "Resume routine"
+                        } else {
+                            "Pause routine"
+                        },
+                        "moon",
+                        p,
+                    )
+                    .on_press(move |s: &mut State| {
+                        if let Err(error) = s.set_routine_paused(id, !paused) {
+                            s.storage_error = Some(error);
+                        }
+                    }),
+                )
+                .child(
+                    menu_item(
+                        &format!("routine-delete-{id}"),
+                        "Delete routine",
+                        "close",
+                        p,
+                    )
+                    .on_press(move |s: &mut State| {
+                        if let Err(error) = s.delete_routine(id) {
+                            s.storage_error = Some(error);
+                        }
+                    }),
+                );
+        }
+    }
+    menu.anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
         .modal(true, |s: &mut State| s.settings_menu = false)
         .child(
             menu_item(
@@ -2212,7 +2292,7 @@ fn face_for(status: Status) -> crate::visuals::Face {
         Status::Running => Face::Determined,
         Status::Waiting => Face::Surprised,
         Status::Completed => Face::Happy,
-        Status::Failed => Face::Dizzy,
+        Status::Failed | Status::Paused => Face::Dizzy,
     }
 }
 fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
@@ -6892,6 +6972,53 @@ pub(crate) mod tests {
             Env::new(false, 1.0),
             rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
         )
+    }
+    #[test]
+    fn background_settings_fit_the_existing_menu_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.settings_menu = true;
+            rt.frame(0.0);
+            let (menu, _) = rt.presented("settings-menu").unwrap();
+            for key in ["background-toggle", "keep-awake-toggle", "theme-toggle"] {
+                let (item, _) = rt.presented(key).unwrap();
+                assert!(item[0] >= menu[0] && item[0] + item[2] <= menu[0] + menu[2] + 0.5);
+                assert!(item[1] >= 0.0 && item[1] + item[3] <= 720.5);
+            }
+        }
+    }
+    #[test]
+    fn settings_lists_and_removes_routines_without_starting_a_prompt() {
+        let mut rt = runtime(1280.0);
+        rt.state.captains = crate::captains::Captain::presets();
+        rt.state.open_captain(0);
+        let home = rt.state.current().id;
+        rt.state.background.routines = crate::routines::Routines::load(
+            crate::store::directory().unwrap().join("routines.json"),
+        );
+        let id = rt
+            .state
+            .background
+            .routines
+            .create(
+                0,
+                home,
+                "Review".into(),
+                "Read status".into(),
+                crate::routines::Schedule::Every { minutes: 15 },
+                crate::routines::MissedPolicy::Skip,
+                chrono::Local::now(),
+            )
+            .unwrap();
+        rt.state.settings_menu = true;
+        rt.frame(0.0);
+        assert!(rt.presented(&format!("routine-delete-{id}")).is_some());
+        press(&mut rt, &format!("routine-pause-{id}"));
+        assert!(rt.state.routines(0)[0].paused);
+        press(&mut rt, &format!("routine-delete-{id}"));
+        assert!(rt.state.routines(0).is_empty());
+        assert!(rt.state.current().pi.is_none());
     }
     fn press(rt: &mut Runtime<State>, key: &str) {
         rt.frame(0.25);

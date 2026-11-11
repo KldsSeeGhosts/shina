@@ -32,6 +32,10 @@ mod tasks;
 use tasks::Task;
 #[allow(unused_imports)]
 pub use tasks::{AttentionItem, AttentionKind, TaskState, TaskView};
+#[path = "background.rs"]
+mod background;
+#[allow(unused_imports)]
+pub use background::{BackgroundSettings, BackgroundStatus};
 
 struct Injection {
     text: String,
@@ -77,6 +81,7 @@ pub enum Status {
     Waiting,
     Completed,
     Failed,
+    Paused,
 }
 
 impl Status {
@@ -87,6 +92,7 @@ impl Status {
             Self::Waiting => "Needs you",
             Self::Completed => "Done",
             Self::Failed => "Error",
+            Self::Paused => "Paused (offline)",
         }
     }
     pub fn busy(self) -> bool {
@@ -97,6 +103,7 @@ impl Status {
     pub fn urgency(self) -> u8 {
         match self {
             Self::Failed => 6,
+            Self::Paused => 6,
             Self::Waiting => 5,
             Self::Running => 4,
             Self::Ready => 2,
@@ -239,6 +246,8 @@ pub struct Thread {
     pub title: String,
     pub renamed: bool,
     pub status: Status,
+    /// Resume connectivity gate. Never retries an accepted prompt.
+    offline_blocked: bool,
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
     pub thoughts: Vec<Thought>,
@@ -367,12 +376,15 @@ impl Thread {
             && self.parent.is_none()
     }
     pub fn actionable(&self) -> bool {
-        self.request.is_some() || self.status == Status::Waiting || self.status == Status::Failed
+        self.request.is_some()
+            || self.status == Status::Waiting
+            || matches!(self.status, Status::Failed | Status::Paused)
     }
     pub fn queued(&self) -> bool {
         self.queued_prompt.is_some()
             || self.pending_prompt.is_some()
             || !self.pending_injections.is_empty()
+            || self.native_pending_turns()
     }
     pub fn has_draft_content(&self) -> bool {
         !self.draft.text.trim().is_empty() || !self.draft_images.is_empty()
@@ -425,6 +437,7 @@ impl Thread {
             title: "New thread".into(),
             renamed: false,
             status: Status::Ready,
+            offline_blocked: false,
             messages: vec![],
             tools: vec![],
             thoughts: vec![],
@@ -725,6 +738,9 @@ impl Thread {
     }
 
     pub fn send(&mut self) {
+        if self.offline_blocked || self.status == Status::Paused {
+            return;
+        }
         if self.status.busy() || self.configuring || !self.has_draft_content() {
             return;
         }
@@ -908,6 +924,9 @@ impl Thread {
     }
 
     fn flush_injection(&mut self) -> bool {
+        if self.offline_blocked || self.status == Status::Paused {
+            return false;
+        }
         if self
             .injection_retry_at
             .is_some_and(|at| Instant::now() >= at)
@@ -1042,7 +1061,11 @@ impl Thread {
 
     /// Settings and history are transport details, never conversation states.
     fn drive_session(&mut self) {
-        if self.pi.is_none() || self.configuring || self.status == Status::Failed {
+        if self.pi.is_none()
+            || self.configuring
+            || matches!(self.status, Status::Failed | Status::Paused)
+            || self.offline_blocked
+        {
             return;
         }
         if self.initializing {
@@ -1836,6 +1859,7 @@ impl Thread {
 }
 
 pub struct State {
+    pub background: background::Background,
     pub data_dir: PathBuf,
     /// The open thread's id and whether it was a draft with content when it was opened. Like
     /// T3 Code's frozen draft row, the open draft's sidebar row neither pops in while typing nor
@@ -1967,6 +1991,7 @@ impl State {
         let artwork = crate::visuals::Artwork::load(&workspace);
         let attachment_cache = rune::ImageCache::new(Arc::new(|| {}));
         let mut state = Self {
+            background: Default::default(),
             data_dir: crate::store::directory()
                 .unwrap_or_else(|| std::env::temp_dir().join("Shina")),
             launch_project: (!workspace.as_os_str().is_empty()).then_some(workspace.clone()),
@@ -3599,6 +3624,12 @@ impl State {
     }
     /// Answers a Shina MCP tool call on the UI thread. `caller` is the calling thread's id.
     fn mcp_call(&mut self, caller: usize, tool: &str, args: &Value) -> Result<Value, String> {
+        if matches!(
+            tool,
+            "create_routine" | "list_routines" | "pause_routine" | "delete_routine"
+        ) {
+            return self.routine_mcp(caller, tool, args);
+        }
         if matches!(tool, "delegate_task" | "task_status") {
             wait_seconds(args)?;
         }
@@ -4105,6 +4136,15 @@ impl State {
         self.checkpoint();
     }
     pub fn send(&mut self) {
+        if self.network_blocked() {
+            self.current_mut().error =
+                Some("Waiting for the network after resume. Your draft has not been sent.".into());
+            return;
+        }
+        if self.current().status == Status::Paused {
+            self.current_mut().status = Status::Ready;
+            self.current_mut().error = None;
+        }
         if self.demo
             || self.current().archived()
             || self.current().configuring
@@ -4174,7 +4214,11 @@ impl State {
     }
 
     pub fn retry(&mut self) {
-        if self.demo || self.current().archived() || self.current().status.busy() {
+        if self.demo
+            || self.network_blocked()
+            || self.current().archived()
+            || self.current().status.busy()
+        {
             return;
         }
         if !self.current().has_draft_content()
@@ -4346,6 +4390,7 @@ impl State {
             return;
         }
         self.load_global(wake.clone());
+        self.setup_background();
         self.runtime_enabled = true;
         self.start_task_recovery();
         self.refresh_catalog();
@@ -4693,6 +4738,7 @@ impl State {
     }
     fn ui_snapshot(&self) -> Value {
         json!({
+            "background": self.background.settings,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -4715,6 +4761,10 @@ impl State {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
         }
+        self.background.settings = serde_json::from_value(
+            ui.get("background").cloned().unwrap_or(json!({})),
+        )
+        .map_err(|_| "Invalid background settings. Existing UI state has not been overwritten.")?;
         // The first entry belonged to the removed Working shelf. It is still written so
         // earlier versions can read the file.
         let shelves: [bool; 3] =
@@ -4853,6 +4903,9 @@ impl State {
     /// Why a restart to update must wait, or `None` when nothing is active. It checks every
     /// thread, including delegated, settled and archived ones.
     pub fn update_restart_blocker(&self) -> Option<&'static str> {
+        if self.routines_running() {
+            return Some("A routine is still running. Restart when it finishes.");
+        }
         if self.threads.iter().any(|t| {
             t.status.busy()
                 || t.configuring
@@ -5117,6 +5170,10 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    let background_changed = state.poll_background_start(tx);
+    if state.background.quitting {
+        return true;
+    }
     if let Some(marker) = &mut state.run_marker {
         if let Err(error) = marker.tick() {
             state.storage_error = Some(error);
@@ -5127,7 +5184,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if state.restart_approved && !rune::quitting() {
         state.cancel_update_exit();
     }
-    let mut changed = state.updater.poll(Instant::now(), state.wake.clone());
+    let mut changed = background_changed | state.updater.poll(Instant::now(), state.wake.clone());
     if let Some(remaining) = state.updater.remaining(Instant::now()) {
         tx.wake_after(remaining);
     }
@@ -5171,6 +5228,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             thread.life.updated_at = lifecycle::now();
             match event {
                 Event::Record(record) => {
+                    state.background.observe_record(&record);
                     let settled = record["type"] == "agent_settled";
                     if record["type"] == "extension_ui_request"
                         && !thread.recovering_task
@@ -5208,7 +5266,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                 Event::Diagnostic(diagnostic) => thread.diagnostic(&diagnostic),
                 Event::Exited => {
                     run_ended = true;
-                    if thread.status != Status::Failed {
+                    if !matches!(thread.status, Status::Failed | Status::Paused) {
                         thread.fail_session(
                             "Pi stopped unexpectedly. Retry to resume the saved conversation."
                                 .into(),
@@ -5223,7 +5281,8 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         if let Some(deadline) = thread.native_deadline() {
             tx.wake_after(deadline.saturating_duration_since(Instant::now()));
         }
-        if thread.request.is_none()
+        if !thread.offline_blocked
+            && thread.request.is_none()
             && thread
                 .session_started
                 .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
@@ -5243,10 +5302,14 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             if let Some((_, deadline)) = thread.operation_deadline {
                 tx.wake_after(deadline.saturating_duration_since(Instant::now()));
             }
-            if let Some(deadline) = thread.injection_retry_at {
+            if !thread.offline_blocked
+                && let Some(deadline) = thread.injection_retry_at
+            {
                 tx.wake_after(deadline.saturating_duration_since(Instant::now()));
             }
-            let remaining = if let Some(started) = thread.session_started {
+            let remaining = if thread.offline_blocked {
+                Duration::from_secs(2)
+            } else if let Some(started) = thread.session_started {
                 START_TIMEOUT.saturating_sub(started.elapsed())
             } else if !thread.status.busy() && !thread.configuring {
                 IDLE_TIMEOUT.saturating_sub(thread.last_activity.elapsed())
@@ -5264,7 +5327,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    changed |= state.pause_offline_errors();
     changed |= state.poll_tasks(Instant::now());
+    changed |= state.poll_background_end(tx);
     if let Some(wait) = crate::ui::tick_portraits(state, Instant::now()) {
         tx.wake_after(wait);
     }
@@ -5496,6 +5561,7 @@ fn status_word(status: Status) -> &'static str {
         Status::Running => "working",
         Status::Waiting => "needs input",
         Status::Failed => "failed",
+        Status::Paused => "paused",
         Status::Completed => "done",
     }
 }

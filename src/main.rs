@@ -12,10 +12,13 @@ mod lifecycle;
 mod mcp;
 mod model;
 mod portraits;
+mod power;
 mod process;
 mod projects;
+mod routines;
 mod session;
 mod store;
+mod tray;
 mod ui;
 mod update;
 mod visuals;
@@ -437,7 +440,7 @@ fn main() {
     }
     let snapshot = std::env::args().any(|arg| arg == "--snap");
     OPTIONS.set((workspace, demo, snapshot)).ok();
-    rune::App::new(AppSpec {
+    let app = rune::App::new(AppSpec {
         fonts: ui::FONTS,
         families: (ui::SANS_FAMILY, "Cascadia Mono, Consolas"),
         min_size: Some((620.0, 480.0)),
@@ -643,16 +646,24 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
     })
     // Portraits rest while the window is in the background or minimized.
     .on_focus(|state, focused, _| state.portraits.set_focused(focused))
-    .on_close(|state, _| close_hook(state))
+    .keep_running()
+    .on_close(|state, tx| {
+        if !state.close_in_background() {
+            close_hook(state);
+            tx.quit();
+        }
+    })
     .on_quit(|state, _| quit_hook(state))
-    .titlebar(rune::Titlebar::new(44.0))
-    .run();
+    .titlebar(rune::Titlebar::new(44.0));
+    let handle = app.handle();
+    let shared = handle.clone();
+    handle.update(move |state, _| state.background.handle = Some(shared));
+    app.run();
     backend::shutdown_all();
     install_recorded_update();
 }
 
-/// This app does not enable Rune's keep_running. Closing its window terminates the host,
-/// which Rune removes before running quit hooks. Save here too, including session end.
+/// Save on actual close-to-quit too, including session end.
 fn close_hook(state: &mut State) {
     quit_hook(state);
 }

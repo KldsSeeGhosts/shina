@@ -76,6 +76,24 @@ pub struct Store {
     healthy: Arc<AtomicBool>,
 }
 
+/// Synchronous durable replacement for small ledgers that must commit before dispatch.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("Missing parent"))?,
+    )?;
+    let temporary = path.with_extension("json.tmp");
+    let mut staged = fs::File::create(&temporary)?;
+    staged.write_all(bytes)?;
+    staged.sync_all()?;
+    drop(staged);
+    fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    fs::File::open(path.parent().expect("checked parent"))?.sync_all()?;
+    Ok(())
+}
+
 /// A queued write, or a barrier that is acknowledged after every earlier write finished.
 enum Message {
     Save(String),
