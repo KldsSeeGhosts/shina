@@ -313,7 +313,7 @@ impl Thread {
         let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.native.follow_up || self.harness != "pi" {
+        if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex") {
             self.serial += 1;
             self.native.queue.push_back(QueuedMessage {
                 id: self.serial,

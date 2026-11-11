@@ -38,8 +38,13 @@ impl AgentModel {
                 .as_str()
                 .or_else(|| model["id"].as_str())?
                 .into(),
-            thinking_levels: vec![],
-            context_window: None,
+            thinking_levels: model["thinkingLevels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|level| level.as_str().map(str::to_owned))
+                .collect(),
+            context_window: model["contextWindow"].as_u64().filter(|window| *window > 0),
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),

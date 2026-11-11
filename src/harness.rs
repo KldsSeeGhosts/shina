@@ -59,7 +59,7 @@ impl Registry {
                     let mut ids = HashSet::new();
                     for agent in agents {
                         if !valid_id(&agent.id)
-                            || agent.id == "pi"
+                            || matches!(agent.id.as_str(), "pi" | "codex")
                             || !ids.insert(agent.id.clone())
                             || agent.command.trim().is_empty()
                             || agent.name.trim().is_empty()
@@ -126,7 +126,7 @@ impl Registry {
 }
 
 /// No shell is used. Resolve npm Windows shims to their JavaScript entry points.
-fn executable(command: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
+pub(crate) fn executable(command: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
     let path = Path::new(command);
     let candidates = if path.is_absolute() || path.components().count() > 1 {
         vec![path.to_path_buf()]
@@ -246,6 +246,9 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
             start.owner,
         ))
     } else {
+        if start.id == "codex" {
+            return crate::codex::start(start, wake);
+        }
         let agent = Registry::read().find(&start.id)?;
         crate::acp::start(agent, start, wake)
     }

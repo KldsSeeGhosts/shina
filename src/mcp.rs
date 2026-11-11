@@ -53,23 +53,26 @@ Conversation content does not become memory automatically and is not carried int
 `delete_routine` to schedule recurring work when the user asks. Routines can consume \
 provider quota. Creation needs no approval, and every routine is visible and removable in Settings.
 
-- `mcp__shina__orchestrator_capabilities` reports Shina's delegation capabilities: exact CPA model \
+- `mcp__shina__orchestrator_capabilities` reports Shina's delegation capabilities: harnesses, exact model \
 ids, each model's supported reasoning levels, the default and caller selections, and the \
 runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
 exact entry from that model's `reasoning_levels`. `ready: false` means model discovery \
 has not produced a usable catalog; do not invent model ids or reasoning levels. Delegated work \
-currently runs in CPA-backed Pi threads on local machines, regardless of your own thread's harness.
+runs in Pi, Codex, or an installed ACP harness on local machines. Pi uses CPA; Codex and ACP \
+use their own configured providers and login. Shina never changes their configuration or authentication.
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, in the selected scoped \
 workspace and under the calling captain, if any. Each captain owns its crew even when several \
 captains share a folder. Use it for parallel, self-contained work, and give the new \
 thread a complete brief: it has no access to this conversation. A delegated thread cannot \
 delegate further. \
-Pass an optional `target` shaped like `{\"provider\":\"cpa\",\"model\":\"<id from \
+Pass an optional `target` shaped like `{\"harness\":\"codex\",\"model\":\"<id from \
 orchestrator_capabilities>\",\"options\":{\"reasoning\":\"<level for that model>\"}}`. \
-`target.model` is required when `target` is present. `provider` defaults to `cpa`, and \
+`target.harness` accepts pi, codex, or an installed ACP id. `target.model` is required unless \
+target.harness is present. Omit model to use that harness's configured default. \
+`provider` defaults to cpa for Pi, otherwise the harness id, and \
 `thinking` is accepted as an alias for `reasoning`. Omit \
-`target` to inherit your current or pinned CPA selection, or Shina's CPA catalog default when \
-your harness has no CPA selection. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
+`target` to inherit your harness and current or pinned selection. Pi uses Shina's CPA catalog \
+default when no choice is pinned. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
 level before starting the child, and rejects an unknown or unsupported choice. It never silently \
 substitutes a model or clamps a level.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
@@ -224,7 +227,8 @@ pub fn tools() -> Value {
         "type":"object",
         "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
         "properties":{
-            "provider":{"type":"string","enum":["cpa"],"description":"Only the CPA provider is supported. Default cpa."},
+            "harness":{"type":"string","description":"pi, codex, or an installed ACP id. Defaults to the parent's harness."},
+            "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{
                 "type":"object",
@@ -236,13 +240,13 @@ pub fn tools() -> Value {
                 "additionalProperties":false
             }
         },
-        "required":["model"],
+        "anyOf":[{"required":["model"]},{"required":["harness"]}],
         "additionalProperties":false
     });
     let mut tools = json!([
         {
             "name": "orchestrator_capabilities",
-            "description": "Read Shina's delegation capabilities: exact CPA model ids, supported reasoning levels, the default and caller selections, and runtime and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
+            "description": "Read Shina's delegation capabilities: harnesses, discovered model ids and reasoning levels, default and caller selections, and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
             "inputSchema": {"type":"object","properties":{}},
             "annotations": {"readOnlyHint": true}
         },
@@ -868,8 +872,11 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
         let target = &delegate["inputSchema"]["properties"]["target"];
         assert_eq!(target["type"], "object");
         assert_eq!(target["additionalProperties"], false);
-        assert_eq!(target["required"], json!(["model"]));
-        assert_eq!(target["properties"]["provider"]["enum"], json!(["cpa"]));
+        assert_eq!(
+            target["anyOf"],
+            json!([{"required":["model"]},{"required":["harness"]}])
+        );
+        assert!(target["properties"]["harness"].is_object());
         let options = &target["properties"]["options"];
         assert_eq!(options["additionalProperties"], false);
         assert!(
