@@ -222,9 +222,17 @@ fn main() {
         }
         return;
     }
-    if let Err(error) =
-        rune::set_app_icon(include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon.png")).to_vec())
-    {
+    // The window icon follows the saved theme: the night sail for dark, the day sail for light.
+    let saved_dark = store::directory()
+        .and_then(|dir| std::fs::read_to_string(dir.join("index.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|index| index["dark"] == true);
+    let icon: &[u8] = if saved_dark {
+        include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon.png"))
+    } else {
+        include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon-day.png"))
+    };
+    if let Err(error) = rune::set_app_icon(icon.to_vec()) {
         eprintln!("Could not set the Shina window icon: {error}");
     }
     let args = rune::extra_args();

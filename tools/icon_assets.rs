@@ -4,7 +4,7 @@ use image::{ImageFormat, RgbaImage, imageops::FilterType};
 use std::io::Cursor;
 
 pub fn source() -> RgbaImage {
-    RgbaImage::from_raw(brand::SIZE as u32, brand::SIZE as u32, brand::pixels(false))
+    RgbaImage::from_raw(brand::SIZE as u32, brand::SIZE as u32, brand::pixels(true))
         .expect("valid Shina mark")
 }
 

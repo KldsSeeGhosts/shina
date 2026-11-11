@@ -1444,8 +1444,9 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
     if show_logo {
         header = header
             .child(
+                // The 32-cell sail stays crisp at 24 px, an exact three-quarter scale on 2x displays.
                 el().key("shina-logo")
-                    .size(20.0, 20.0)
+                    .size(24.0, 24.0)
                     .radius(5.0)
                     .clip_rounded(5.0)
                     .pixels(

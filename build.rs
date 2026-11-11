@@ -14,6 +14,12 @@ fn main() {
     image::imageops::resize(&source, 256, 256, FilterType::Nearest)
         .save(output.join("shina-icon.png"))
         .expect("write window icon");
+    let day =
+        image::RgbaImage::from_raw(brand::SIZE as u32, brand::SIZE as u32, brand::pixels(false))
+            .expect("valid day mark");
+    image::imageops::resize(&day, 256, 256, FilterType::Nearest)
+        .save(output.join("shina-icon-day.png"))
+        .expect("write day window icon");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
