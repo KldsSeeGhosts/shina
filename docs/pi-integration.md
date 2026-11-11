@@ -1,6 +1,6 @@
 # Pi integration
 
-Shina controls one Pi RPC subprocess per active conversation. Pi owns model execution, compaction and session files. Shina owns its threads, drafts, tabs, captain relationships and queued user turns. Inference selection remains CPA-only.
+Shina controls one harness subprocess per active conversation. Pi is the default and owns model execution, compaction and its session files. Shina owns its threads, drafts, tabs, captain relationships and queued user turns. Pi inference remains CPA-only. Optional ACP harnesses use their own providers. See [thread harnesses](harnesses.md) for the registry, ACP protocol and limits.
 
 ## Implemented behavior
 
@@ -33,7 +33,7 @@ This closes the command, compaction, steering and native conversation-operation 
 - Shina's attachment picker still accepts images only. KSG also resolves ordinary file attachments and extracted-text paths.
 - RPIV's structured multi-select questionnaire presentation still uses Pi's native select/input fallback in Shina. Replies work, but there is no equivalent rich questionnaire form.
 - KSG has a cross-session usage dashboard, provider maintenance/version checks, configurable launch arguments and multiple Pi provider instances. Shina has per-session statistics and its existing CLI path override, not those settings pages.
-- KSG supports provider handoffs. Shina intentionally keeps inference CPA-only.
+- KSG supports provider handoffs. Shina does not switch an existing conversation between harnesses. Pi remains CPA-only.
 - Rollback here changes conversation history only. It does not implement KSG's filesystem checkpoint restoration.
 
 Neither application can reproduce arbitrary terminal extension components through RPC. Pi's `custom()` terminal UI, terminal shortcuts, footer components and editor components do not become native controls automatically. Shina does not change Pi authentication or install packages on the user's behalf.

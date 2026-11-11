@@ -1,4 +1,4 @@
-//! Pi is an RPC subprocess, never a terminal. All pipes and process waits live off the UI thread.
+//! Harnesses are RPC subprocesses, never terminals. Pipes and process waits stay off the UI thread.
 use rune::Waker;
 use serde_json::{Value, json};
 use std::{
@@ -33,8 +33,7 @@ pub fn shutdown_all() {
     }
 }
 
-/// How a Pi process reaches the Shina MCP: the endpoint, this thread's bearer token, and the
-/// bridge extension that registers Shina's tools inside Pi.
+/// A thread's Shina MCP endpoint and bearer token. Pi additionally uses a bridge extension.
 #[derive(Clone, Debug)]
 pub struct HostLink {
     pub url: String,
@@ -52,7 +51,7 @@ pub struct Pi {
 #[derive(Default)]
 pub struct SessionOwner {
     lock: Mutex<()>,
-    quarantined: AtomicBool,
+    pub(crate) quarantined: AtomicBool,
 }
 
 impl Drop for Pi {
@@ -135,6 +134,74 @@ struct Launch {
 }
 
 impl Pi {
+    /// ACP shares Pi's bounded connection, per-thread owner and shutdown registry.
+    pub(crate) fn worker(
+        wake: Waker,
+        owner: Arc<SessionOwner>,
+        session_key: Option<PathBuf>,
+        run: impl FnOnce(
+            Receiver<Value>,
+            &SyncSender<Event>,
+            &Waker,
+            &AtomicBool,
+            &SessionOwner,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
+    ) -> Self {
+        let (commands, input) = mpsc::sync_channel(32);
+        let (events, output) = mpsc::sync_channel(256);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let session_lock = session_key.map(|key| {
+            let mut sessions = SESSIONS.lock().expect("session owners");
+            sessions.retain(|_, owner| owner.strong_count() > 0);
+            let lock = sessions
+                .get(&key)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            sessions.insert(key, Arc::downgrade(&lock));
+            lock
+        });
+        let worker = thread::spawn(move || {
+            let result = (|| {
+                let Some(_guard) = acquire_session(&owner.lock, &stop)? else {
+                    return Ok(());
+                };
+                if owner.quarantined.load(Ordering::Acquire) {
+                    return Err(
+                        "The previous agent could not be reaped. Restart Shina before resuming."
+                            .into(),
+                    );
+                }
+                let _session = if let Some(lock) = &session_lock {
+                    let Some(guard) = acquire_session(lock, &stop)? else {
+                        return Ok(());
+                    };
+                    Some(guard)
+                } else {
+                    None
+                };
+                run(input, &events, &wake, &stop, &owner)
+            })();
+            publish(
+                &events,
+                &wake,
+                match result {
+                    Ok(()) => Event::Exited,
+                    Err(error) => Event::Error(error),
+                },
+            );
+        });
+        let mut workers = WORKERS.lock().expect("worker registry");
+        workers.retain(|worker| !worker.is_finished());
+        workers.push(worker);
+        Self {
+            commands,
+            events: output,
+            stopped,
+        }
+    }
     #[cfg(test)]
     pub fn test_connection() -> (Self, Receiver<Value>, SyncSender<Event>) {
         Self::test_connection_with_capacity(256)
@@ -285,11 +352,11 @@ impl Pi {
     pub fn send(&self, record: Value) -> Result<(), String> {
         self.commands
             .try_send(record)
-            .map_err(|e| format!("Pi did not accept the command: {e}"))
+            .map_err(|e| format!("The agent did not accept the command: {e}"))
     }
 }
 
-fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) -> bool {
+pub(crate) fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) -> bool {
     // A full queue applies backpressure instead of growing memory without a limit.
     let sent = output.send(event).is_ok();
     wake();
@@ -610,7 +677,7 @@ fn run(
     result
 }
 
-fn write_record(writer: &mut impl Write, record: &Value) -> Result<(), String> {
+pub(crate) fn write_record(writer: &mut impl Write, record: &Value) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, record).map_err(|e| e.to_string())?;
     writer
         .write_all(b"\n")
@@ -618,7 +685,7 @@ fn write_record(writer: &mut impl Write, record: &Value) -> Result<(), String> {
         .map_err(|e| format!("Could not write to Pi: {e}"))
 }
 
-fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
+pub(crate) fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
     // Pi echoes user images in message events and saved history. A single accepted
     // 20 MiB image prompt expands to almost 28 MiB in base64, before JSON framing.
     const LIMIT: u64 = 64 * 1024 * 1024;

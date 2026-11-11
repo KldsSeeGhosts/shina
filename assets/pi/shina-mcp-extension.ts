@@ -193,6 +193,7 @@ export default async function shinaExtension(pi: ExtensionAPI) {
   // Keep the guidance in the system prompt so leading slash commands still expand.
   pi.on("before_agent_start", (event) => {
     if (!instructions) return undefined;
+    if (event.systemPrompt.includes(instructions)) return undefined;
     const options = event.systemPromptOptions;
     if (options?.sections && typeof options.sections === "object" && options.forceSystemPrompt === undefined) {
       options.sections.shina = instructions;

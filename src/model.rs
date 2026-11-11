@@ -1,7 +1,8 @@
 use crate::attachments::{self, Attachment, Prompt};
-use crate::backend::{Event, HostLink, Pi};
+use crate::backend::{Event, HostLink};
 use crate::captains::{Captain, CaptainEditor};
 use crate::context::ContextMeter;
+use crate::harness::Session as Pi;
 use crate::lifecycle::{
     self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep,
 };
@@ -228,6 +229,10 @@ pub enum ProjectPicker {
 
 pub struct Thread {
     pub id: usize,
+    /// `pi` or an ACP registry id. Pi remains the default for legacy indexes.
+    pub harness: String,
+    pub harness_context_sent: bool,
+    pub harness_state: Value,
     pub project: Option<ProjectId>,
     pub machine: String,
     pub updated: u64,
@@ -306,6 +311,17 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn can_choose_harness(&self) -> bool {
+        !self.delegated
+            && !self.archived()
+            && !self.status.busy()
+            && !self.configuring
+            && self.messages.is_empty()
+            && self.life.latest_user_message_at.is_none()
+            && self.native.fork_source.is_none()
+            && self.native.previous_session.is_none()
+            && (self.session.is_none() || self.state_loaded && self.history_loaded)
+    }
     pub fn pinned(&self) -> bool {
         self.life.pinned_at.is_some()
     }
@@ -412,6 +428,9 @@ impl Thread {
     pub fn new(id: usize) -> Self {
         Self {
             id,
+            harness: "pi".into(),
+            harness_context_sent: false,
+            harness_state: json!({}),
             project: None,
             machine: "local".into(),
             updated: crate::projects::now(),
@@ -526,32 +545,44 @@ impl Thread {
         self.startup_selection_verified = false;
         self.context_startup_requested = false;
         self.context.begin_model_change();
-        self.pi = Some(
-            backend.start(
-                path,
-                self.native
-                    .fork_source
+        let source = self
+            .native
+            .fork_source
+            .clone()
+            .map(crate::backend::SessionSource::Fork)
+            .or_else(|| {
+                self.session
                     .clone()
-                    .map(crate::backend::SessionSource::Fork)
-                    .or_else(|| {
-                        self.session
-                            .clone()
-                            .map(crate::backend::SessionSource::Resume)
-                    })
-                    .unwrap_or(crate::backend::SessionSource::New),
-                wake,
+                    .map(crate::backend::SessionSource::Resume)
+            })
+            .unwrap_or(crate::backend::SessionSource::New);
+        match crate::harness::start(
+            backend,
+            crate::harness::Start {
+                id: self.harness.clone(),
+                workspace: path,
+                source,
                 instructions,
-                self.host.clone(),
-                self.connection_owner.clone(),
-            ),
-        );
+                link: self.host.clone(),
+                owner: self.connection_owner.clone(),
+                context_sent: self.harness_context_sent,
+            },
+            wake,
+        ) {
+            Ok(session) => self.pi = Some(session),
+            Err(error) => self.fail_session(error),
+        }
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
-        if provider != "cpa" {
-            self.error = Some(
-                "Shina uses CPA proxy models only. Choose a model from the CPA catalog.".into(),
-            );
+        if self.harness == "pi" && provider != "cpa"
+            || self.harness != "pi" && provider != self.harness
+        {
+            self.error = Some(if self.harness == "pi" {
+                "Shina uses CPA proxy models only. Choose a model from the CPA catalog.".into()
+            } else {
+                "Choose a model advertised by this thread's ACP harness.".into()
+            });
             return;
         }
         if self.status.busy() || self.configuring {
@@ -589,6 +620,10 @@ impl Thread {
     }
 
     pub fn set_thinking(&mut self, level: String) {
+        if self.harness != "pi" {
+            self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
+            return;
+        }
         if self.status.busy() || self.configuring {
             return;
         }
@@ -632,7 +667,12 @@ impl Thread {
 
     /// What the thread is actually running now, for status and read output.
     fn effective_selection(&self) -> Option<Selection> {
-        if self.model_provider != "cpa" || self.model_id.trim().is_empty() {
+        let provider = if self.harness == "pi" {
+            "cpa"
+        } else {
+            &self.harness
+        };
+        if self.model_provider != provider || self.model_id.trim().is_empty() {
             return None;
         }
         Some(Selection {
@@ -650,7 +690,7 @@ impl Thread {
             .pi
             .as_ref()
             .ok_or_else(|| "The session is unavailable. Retry to resume it.".to_owned())
-            .and_then(|pi| pi.send(data));
+            .and_then(|pi| crate::harness::send(pi, data));
         if let Err(error) = result {
             self.error = Some(error);
             return false;
@@ -700,7 +740,7 @@ impl Thread {
         if self.status.busy() || self.configuring || !self.has_draft_content() {
             return;
         }
-        if !self.model_provider.is_empty() && self.model_provider != "cpa" {
+        if self.harness == "pi" && !self.model_provider.is_empty() && self.model_provider != "cpa" {
             self.error = Some("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
         }
@@ -802,7 +842,7 @@ impl Thread {
             .pi
             .as_ref()
             .ok_or_else(|| "The session is unavailable. Retry to resume it.".to_owned())
-            .and_then(|pi| pi.send(response));
+            .and_then(|pi| crate::harness::send(pi, response));
         match result {
             Ok(()) => {
                 self.request = None;
@@ -894,7 +934,7 @@ impl Thread {
         {
             return false;
         }
-        if self.model_provider != "cpa" {
+        if self.harness == "pi" && self.model_provider != "cpa" {
             self.error =
                 Some("Choose a CPA model before Shina can deliver queued messages.".into());
             return false;
@@ -928,7 +968,12 @@ impl Thread {
             self.elapsed = None;
             self.assistant = None;
             self.error = None;
-            self.phase = "Waiting for Pi".into();
+            self.phase = if self.harness == "pi" {
+                "Waiting for Pi"
+            } else {
+                "Waiting for ACP"
+            }
+            .into();
             self.ensure_work();
         }
         true
@@ -1066,7 +1111,7 @@ impl Thread {
         let Some((prompt, index)) = self.queued_prompt.take() else {
             return;
         };
-        if self.model_provider != "cpa" {
+        if self.harness == "pi" && self.model_provider != "cpa" {
             self.queued_prompt = Some((prompt, index));
             self.fail_session("Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into());
             return;
@@ -1261,6 +1306,13 @@ impl Thread {
             return;
         }
         match string(&record, "type") {
+            "harness_update" => {
+                if record["field"] == "awareness" {
+                    self.harness_context_sent = record["value"] == true;
+                } else if let Some(field) = record["field"].as_str() {
+                    self.harness_state[field] = record["value"].clone();
+                }
+            }
             "response" => {
                 let command = string(&record, "command");
                 if self
@@ -1377,7 +1429,12 @@ impl Thread {
                         self.models = record["data"]["models"]
                             .as_array()
                             .map(|models| {
-                                models.iter().filter_map(AgentModel::from_value).collect()
+                                models
+                                    .iter()
+                                    .filter_map(|model| {
+                                        AgentModel::from_harness_value(model, &self.harness)
+                                    })
+                                    .collect()
                             })
                             .unwrap_or_default();
                         self.refresh_thinking_levels();
@@ -1883,6 +1940,7 @@ pub struct State {
     /// Recent projects, the switcher menu, and the clone sheet.
     pub projects: crate::projects::Projects,
     pub catalog: Catalog,
+    pub harnesses: crate::harness::Registry,
     runtime_enabled: bool,
 }
 
@@ -1989,6 +2047,7 @@ impl State {
             task_waiters: vec![],
             projects: Default::default(),
             catalog: Catalog::default(),
+            harnesses: crate::harness::Registry::read(),
             runtime_enabled: false,
             tasks: Vec::new(),
             recovery_notice: None,
@@ -3518,7 +3577,11 @@ impl State {
             Ok(HostLink {
                 url: server.url.clone(),
                 token: server.token_for(thread_id),
-                extension: crate::mcp::extension_path()?,
+                extension: if self.threads[index].harness == "pi" {
+                    crate::mcp::extension_path()?
+                } else {
+                    PathBuf::new()
+                },
                 access_mode: self.threads[index].native.access.id().into(),
             })
         });
@@ -4058,7 +4121,7 @@ impl State {
                 self.choose_slash("model".into());
                 return;
             }
-            Some("/compact") => {
+            Some("/compact") if self.current().harness == "pi" => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
                         Some("Compaction does not accept attachments. Your draft was kept.".into());
@@ -4085,7 +4148,12 @@ impl State {
                     .any(|c| c.name == name)
                 {
                     self.current_mut().error = Some(format!(
-                        "Unknown Pi command {command}. Use / to browse the workspace's commands."
+                        "Unknown {} command {command}. Use / to browse the workspace's commands.",
+                        if self.current().harness == "pi" {
+                            "Pi"
+                        } else {
+                            "ACP"
+                        }
                     ));
                     return;
                 }
@@ -4127,6 +4195,7 @@ impl State {
     }
 
     pub fn refresh_catalog(&mut self) {
+        self.harnesses = crate::harness::Registry::read();
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh(self.data_dir.clone(), self.wake.clone());
@@ -4136,8 +4205,49 @@ impl State {
         }
     }
 
+    /// Changing a new thread's harness retires only its unused prewarmed process.
+    pub fn choose_harness(&mut self, id: &str) {
+        if !self.current().can_choose_harness() || self.current().harness == id {
+            return;
+        }
+        if id != "pi"
+            && let Err(error) = self.harnesses.find(id)
+        {
+            self.current_mut().error = Some(error);
+            return;
+        }
+        let thread = self.current_mut();
+        thread.disconnect();
+        thread.harness = id.into();
+        thread.harness_context_sent = false;
+        thread.harness_state = json!({});
+        thread.session = None;
+        thread.selected_model = None;
+        thread.selected_thinking = None;
+        thread.model_provider.clear();
+        thread.model_id.clear();
+        thread.model = DEFAULT_MODEL.into();
+        thread.thinking.clear();
+        thread.models.clear();
+        thread.thinking_levels.clear();
+        thread.context_window = None;
+        thread.supports_images = None;
+        thread.context.begin_model_change();
+        thread.native.commands.clear();
+        thread.native.commands_loaded = false;
+        thread.error = None;
+        thread.prewarm_attempted = false;
+        if id == "pi" {
+            self.apply_catalog();
+        }
+        self.checkpoint();
+    }
+
     fn apply_catalog(&mut self) {
         for thread in &mut self.threads {
+            if thread.harness != "pi" {
+                continue;
+            }
             thread.models = self.catalog.models.clone();
             if thread.model_id.is_empty()
                 && thread.session.is_none()
@@ -4372,6 +4482,16 @@ impl State {
                         return None;
                     }
                     let mut thread = Thread::new(id);
+                    if let Some(harness) = record.get("harness") {
+                        let harness = harness.as_str()?;
+                        if !crate::harness::valid_id(harness) {
+                            return None;
+                        }
+                        thread.harness = harness.into();
+                    }
+                    if let Some(sent) = record.get("harnessContextSent") {
+                        thread.harness_context_sent = sent.as_bool()?;
+                    }
                     thread.native.fork_source = record["forkSource"].as_str().map(str::to_owned);
                     thread.native.fork_entry = record["forkEntry"].as_str().map(str::to_owned);
                     thread.native.previous_session =
@@ -4421,9 +4541,14 @@ impl State {
                     thread.renamed = record["renamed"] == true;
                     thread.session = record["session"].as_str().map(str::to_owned);
                     if let Some(model) = record["model"].as_str() {
-                        // Only CPA choices survive restart, even in hand-edited indexes.
-                        thread.selected_model = Some(("cpa".into(), model.into()));
-                        thread.model_provider = "cpa".into();
+                        // Pi restores only CPA choices. ACP selections belong to its agent id.
+                        let provider = if thread.harness == "pi" {
+                            "cpa"
+                        } else {
+                            &thread.harness
+                        };
+                        thread.selected_model = Some((provider.into(), model.into()));
+                        thread.model_provider = provider.into();
                         thread.model_id = model.into();
                         thread.model = model.into();
                     }
@@ -4808,6 +4933,7 @@ impl State {
                 !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
+                "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
                 "forkSource":thread.native.fork_source, "forkEntry":thread.native.fork_entry,
                 "previousSession":thread.native.previous_session,"accessMode":thread.native.access.id(),
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
@@ -5431,6 +5557,42 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_selection_and_awareness_round_trip_and_legacy_indexes_default_to_pi() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.current_mut().harness = "fixture".into();
+        state.current_mut().harness_context_sent = true;
+        state.current_mut().selected_model = Some(("fixture".into(), "agent-model".into()));
+        state.current_mut().session = Some("agent-session".into());
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&snapshot).unwrap();
+        assert_eq!(restored.current().harness, "fixture");
+        assert!(restored.current().harness_context_sent);
+        assert_eq!(
+            restored.current().selected_model.as_ref().unwrap().0,
+            "fixture"
+        );
+        assert_eq!(restored.current().session.as_deref(), Some("agent-session"));
+        let mut legacy = snapshot.clone();
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("harness");
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("harnessContextSent");
+        restored.restore_global(&legacy).unwrap();
+        assert_eq!(restored.current().harness, "pi");
+        assert!(!restored.current().harness_context_sent);
+        for value in [json!(1), json!("bad id"), json!("")] {
+            let mut invalid = snapshot.clone();
+            invalid["threads"][0]["harness"] = value;
+            assert!(restored.restore_global(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn restore_rejects_invalid_relationships_and_wrong_typed_session_fields() {

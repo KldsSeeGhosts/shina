@@ -1,0 +1,470 @@
+use super::*;
+use crate::model::{Status, Thread};
+use std::sync::Arc;
+
+fn spec(source: SessionSource) -> Start {
+    Start {
+        id: "fixture".into(),
+        workspace: crate::store::directory().unwrap(),
+        source,
+        instructions: Some("Captain fixture instructions".into()),
+        link: Some(HostLink {
+            url: "http://127.0.0.1:12345/mcp".into(),
+            token: "fixture-thread-token".into(),
+            extension: PathBuf::new(),
+            access_mode: "approval-required".into(),
+        }),
+        owner: Arc::default(),
+        context_sent: false,
+    }
+}
+
+fn fixture(flags: &[&str]) -> (Agent, PathBuf) {
+    let dir = crate::store::directory().unwrap();
+    let script = dir.join("fake_acp.py");
+    std::fs::write(&script, include_str!("../assets/tests/fake_acp.py")).unwrap();
+    let log = dir.join(format!("acp-{}.jsonl", flags.join("-").replace("--", "")));
+    let mut args = vec![
+        "-u".into(),
+        script.to_string_lossy().into_owned(),
+        "--log".into(),
+        log.to_string_lossy().into_owned(),
+    ];
+    args.extend(flags.iter().map(|s| (*s).into()));
+    (
+        Agent {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            command: if cfg!(windows) { "python" } else { "python3" }.into(),
+            args,
+            env: vec![],
+        },
+        log,
+    )
+}
+
+fn pump(thread: &mut Thread, predicate: impl Fn(&Thread) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut diagnostics = vec![];
+    while !predicate(thread) {
+        assert!(
+            Instant::now() < deadline,
+            "ACP timed out: {:?}, {}",
+            thread.status,
+            thread.error.as_deref().unwrap_or("")
+        );
+        let event = thread
+            .pi
+            .as_ref()
+            .unwrap()
+            .events
+            .recv_timeout(Duration::from_millis(100));
+        match event {
+            Ok(Event::Record(record)) => thread.apply(record),
+            Ok(Event::Error(error)) => {
+                panic!("ACP fixture failed: {error}\n{}", diagnostics.join("\n"))
+            }
+            Ok(Event::Diagnostic(message)) => diagnostics.push(message),
+            Ok(Event::Exited) => panic!("ACP fixture exited unexpectedly"),
+            _ => {}
+        }
+    }
+}
+
+fn records(log: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn live_thread(agent: Agent, source: SessionSource) -> Thread {
+    let dir = crate::store::directory().unwrap();
+    std::fs::write(dir.join("harnesses.json"), json!([{
+        "id":agent.id,"name":agent.name,"command":agent.command,"args":agent.args,"env":agent.env,
+    }]).to_string()).unwrap();
+    let mut thread = Thread::new(31);
+    thread.harness = "fixture".into();
+    if let SessionSource::Resume(session) = source {
+        thread.session = Some(session);
+    }
+    thread.host = spec(SessionSource::New).link;
+    thread.native.access = crate::model::AccessMode::Supervised;
+    thread.connect_with_instructions(
+        dir,
+        Arc::new(|| {}),
+        Some("Captain fixture instructions".into()),
+    );
+    pump(&mut thread, |t| {
+        t.native.commands_loaded && !t.harness_state["modes"].is_null()
+    });
+    thread
+}
+
+#[test]
+fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
+    let (agent, log) = fixture(&[]);
+    let mut thread = live_thread(agent.clone(), SessionSource::New);
+    assert_eq!(thread.session.as_deref(), Some("fixture-session"));
+    assert_eq!(thread.models[0].provider, "fixture");
+    assert_eq!(thread.native.commands[0].name, "fixture");
+    assert!(thread.harness_state["plan"]["entries"].is_array());
+    assert_eq!(thread.harness_state["modes"]["currentModeId"], "code");
+    thread.draft.replace_text("permission");
+    thread.send();
+    pump(&mut thread, |t| t.request.is_some());
+    assert_eq!(thread.status, Status::Waiting);
+    assert_eq!(thread.request.as_ref().unwrap()["method"], "confirm");
+    thread.respond(json!({"confirmed":true}));
+    pump(&mut thread, |t| t.status == Status::Completed);
+    assert!(thread.messages.iter().any(|m| m.text == "Hello ACP"));
+    assert_eq!(thread.thoughts[0].text, "Checking");
+    assert!(thread.tools[0].done);
+    assert_eq!(thread.tools[0].output, "Written");
+    assert!(thread.harness_context_sent);
+    let wire = records(&log);
+    let prompt = wire
+        .iter()
+        .find(|r| r["method"] == "session/prompt")
+        .unwrap();
+    let context = prompt["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert!(context.contains(crate::mcp::INSTRUCTIONS));
+    assert!(context.contains("Captain fixture instructions"));
+    assert_eq!(
+        wire.iter()
+            .find(|r| r["id"] == 71 && r.get("result").is_some())
+            .unwrap()["result"]["outcome"]["optionId"],
+        "yes"
+    );
+
+    thread.draft.replace_text("again");
+    thread.send();
+    pump(&mut thread, |t| t.status == Status::Completed);
+    let wire = records(&log);
+    assert_eq!(
+        wire.iter()
+            .rfind(|r| r["method"] == "session/prompt")
+            .unwrap()["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    thread.draft.replace_text("hold");
+    thread.send();
+    pump(&mut thread, |t| {
+        t.messages.iter().any(|m| m.text == "Waiting")
+    });
+    thread.stop();
+    pump(&mut thread, |t| t.status == Status::Ready);
+    assert!(
+        records(&log)
+            .iter()
+            .any(|r| r["method"] == "session/cancel" && r.get("id").is_none())
+    );
+    thread.disconnect();
+    thread.connect_with_instructions(crate::store::directory().unwrap(), Arc::new(|| {}), None);
+    pump(&mut thread, |t| {
+        t.messages.iter().any(|m| m.text == "Earlier reply")
+    });
+    assert_eq!(thread.messages[0].text, "Earlier user");
+    assert_eq!(
+        records(&log)
+            .iter()
+            .filter(|r| r["method"] == "session/load")
+            .count(),
+        1
+    );
+    thread.draft.replace_text("resumed");
+    thread.send();
+    pump(&mut thread, |t| t.status == Status::Completed);
+    assert_eq!(
+        records(&log)
+            .iter()
+            .rfind(|r| r["method"] == "session/prompt")
+            .unwrap()["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn fake_agent_stdio_fallback_and_resume_without_load() {
+    let (agent, log) = fixture(&["--stdio", "--resume"]);
+    let mut thread = live_thread(agent, SessionSource::Resume("fixture-session".into()));
+    assert!(thread.messages.iter().any(|m| m.text == "Earlier reply"));
+    assert!(
+        records(&log)
+            .iter()
+            .any(|r| r["method"] == "session/resume")
+    );
+    thread.disconnect();
+}
+
+#[test]
+fn fake_agent_authentication_denial_does_not_authenticate_or_retry() {
+    let (agent, log) = fixture(&["--auth-denied"]);
+    let pi = start(agent, spec(SessionSource::New), Arc::new(|| {})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline);
+        if let Ok(Event::Error(error)) = pi.events.recv_timeout(Duration::from_millis(100)) {
+            assert!(error.contains("Authentication required"));
+            break;
+        }
+    }
+    let wire = records(&log);
+    assert_eq!(
+        wire.iter().filter(|r| r["method"] == "session/new").count(),
+        1
+    );
+    assert!(!wire.iter().any(|r| r["method"] == "authenticate"));
+}
+
+fn negotiate(client: &mut Client, caps: Value) {
+    client.initialize();
+    let init = client.wire.pop().unwrap();
+    client.incoming(json!({"jsonrpc":"2.0","id":init["id"],"result":{"protocolVersion":1,"agentCapabilities":caps}})).unwrap();
+}
+
+fn ready(client: &mut Client) {
+    negotiate(
+        client,
+        json!({"mcpCapabilities":{"http":true},"promptCapabilities":{"image":true},"loadSession":true}),
+    );
+    let new = client.wire.pop().unwrap();
+    assert_eq!(
+        new["params"]["mcpServers"][0]["headers"][0]["value"],
+        "Bearer fixture-thread-token"
+    );
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":new["id"],"result":{"sessionId":"fixture-session"}}))
+        .unwrap();
+    client.events.clear();
+}
+
+#[test]
+fn capabilities_images_model_selection_queue_and_unknown_requests() {
+    let mut client = Client::new(spec(SessionSource::New));
+    ready(&mut client);
+    client.command(json!({"type":"prompt","id":"image","message":"look","images":[{"type":"image","mimeType":"image/png","data":"fixture-base64"}]})).unwrap();
+    let prompt = client.wire.pop().unwrap();
+    assert_eq!(prompt["params"]["prompt"][2]["mimeType"], "image/png");
+    client
+        .command(
+            json!({"type":"prompt","id":"queued","message":"next","streamingBehavior":"steer"}),
+        )
+        .unwrap();
+    assert_eq!(client.queued.len(), 1);
+    assert!(client.wire.is_empty());
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    assert!(
+        client
+            .wire
+            .iter()
+            .any(|r| r["method"] == "session/prompt" && r["params"]["prompt"][0]["text"] == "next")
+    );
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":91,"method":"fs/read_text_file","params":{}}))
+        .unwrap();
+    assert_eq!(client.wire.last().unwrap()["error"]["code"], -32601);
+    client
+        .command(json!({"type":"compact","id":"unsupported"}))
+        .unwrap();
+    assert!(
+        client.events.last().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("Pi-only")
+    );
+
+    client.configure_models(&json!({"configOptions":[{"category":"model","id":"model","type":"select","currentValue":"a","options":[{"value":"a","name":"A"}]}]}));
+    client.running = false;
+    client
+        .command(json!({"type":"set_model","id":"select","modelId":"a"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["method"],
+        "session/set_config_option"
+    );
+    client.capabilities["promptCapabilities"]["image"] = json!(false);
+    client
+        .command(json!({"type":"prompt","id":"bad-image","images":[{"type":"image"}]}))
+        .unwrap();
+    assert_eq!(client.events.last().unwrap()["success"], false);
+}
+
+#[test]
+fn permissions_honor_access_mode_and_cancellation() {
+    for (mode, kind, automatic) in [
+        ("approval-required", "execute", false),
+        ("approval-required", "read", true),
+        ("auto-accept-edits", "edit", true),
+        ("auto-accept-edits", "execute", false),
+        ("full-access", "execute", true),
+    ] {
+        let mut start = spec(SessionSource::New);
+        start.link.as_mut().unwrap().access_mode = mode.into();
+        let mut client = Client::new(start);
+        ready(&mut client);
+        client.incoming(json!({"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{
+            "sessionId":"fixture-session","toolCall":{"kind":kind,"title":"Fixture"},
+            "options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]
+        }})).unwrap();
+        if automatic {
+            assert_eq!(
+                client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+                "yes"
+            );
+        } else {
+            let request = client.events.last().unwrap().clone();
+            client
+                .command(
+                    json!({"type":"extension_ui_response","id":request["id"],"confirmed":false}),
+                )
+                .unwrap();
+            assert_eq!(
+                client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+                "no"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_resume_and_mcp_and_protocol_versions_fail_clearly() {
+    let mut client = Client::new(spec(SessionSource::Resume("fixture-session".into())));
+    client.initialize();
+    let request = client.wire.pop().unwrap();
+    let error = client.incoming(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":true}}}})).unwrap_err();
+    assert!(error.contains("session/load"));
+    let mut client = Client::new(spec(SessionSource::New));
+    client.capabilities = json!({"mcpCapabilities":{"stdio":false,"sse":true}});
+    assert!(
+        client
+            .mcp_servers()
+            .unwrap_err()
+            .contains("neither HTTP nor stdio")
+    );
+    client.initialize();
+    let request = client.wire.pop().unwrap();
+    assert!(
+        client
+            .incoming(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":2}}))
+            .unwrap_err()
+            .contains("version 1")
+    );
+}
+
+#[test]
+fn rejected_http_mcp_retries_stdio_once_but_authentication_denials_do_not() {
+    let mut client = Client::new(spec(SessionSource::New));
+    negotiate(
+        &mut client,
+        json!({"mcpCapabilities":{"http":true,"stdio":true}}),
+    );
+    let new = client.wire.pop().unwrap();
+    client.incoming(json!({"jsonrpc":"2.0","id":new["id"],"error":{"code":-32602,"message":"HTTP MCP unsupported"}})).unwrap();
+    let retry = client.wire.pop().unwrap();
+    assert_eq!(
+        retry["params"]["mcpServers"][0]["args"],
+        json!(["--mcp-bridge"])
+    );
+    assert!(client.incoming(json!({"jsonrpc":"2.0","id":retry["id"],"error":{"code":-32602,"message":"Unsupported MCP"}})).is_err());
+    assert!(client.wire.is_empty());
+}
+
+#[test]
+fn cancellation_releases_pending_permissions_and_clears_internal_followups() {
+    let mut client = Client::new(spec(SessionSource::New));
+    ready(&mut client);
+    client
+        .command(json!({"type":"prompt","id":"run","message":"work"}))
+        .unwrap();
+    client
+        .command(json!({"type":"prompt","id":"follow","message":"next"}))
+        .unwrap();
+    client.incoming(json!({"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{
+        "sessionId":"fixture-session","toolCall":{"kind":"execute"},"options":[{"kind":"allow_once","optionId":"yes"}]
+    }})).unwrap();
+    assert_eq!(client.permissions.len(), 1);
+    client
+        .command(json!({"type":"clear_queue","id":"clear"}))
+        .unwrap();
+    assert!(client.queued.is_empty());
+    client
+        .command(json!({"type":"abort","id":"cancel"}))
+        .unwrap();
+    assert!(client.permissions.is_empty());
+    assert!(
+        client
+            .wire
+            .iter()
+            .any(|r| r["id"] == 77 && r["result"]["outcome"]["outcome"] == "cancelled")
+    );
+    assert_eq!(client.wire.last().unwrap()["method"], "session/cancel");
+}
+
+#[test]
+fn http_response_reads_exact_content_length_without_waiting_for_eof() {
+    let mut input = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}extra");
+    assert_eq!(http_response(&mut input).unwrap(), (200, b"{}".to_vec()));
+    let mut remaining = String::new();
+    input.read_to_string(&mut remaining).unwrap();
+    assert_eq!(remaining, "extra");
+    for invalid in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 9000000\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{",
+    ] {
+        assert!(http_response(&mut std::io::Cursor::new(invalid)).is_err());
+    }
+}
+
+#[test]
+fn mcp_stdio_relay_returns_server_instructions_with_thread_authorization() {
+    let server = crate::mcp::server(Arc::new(|| {})).unwrap();
+    let host = HostLink {
+        url: server.url.clone(),
+        token: server.token_for(8181),
+        extension: PathBuf::new(),
+        access_mode: "full-access".into(),
+    };
+    let result = relay(
+        &host,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(result["result"]["instructions"], crate::mcp::INSTRUCTIONS);
+    let bad = HostLink {
+        token: "wrong".into(),
+        ..host
+    };
+    assert!(relay(&bad, &json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).is_err());
+}
+
+#[test]
+fn replayed_awareness_is_hidden_and_not_repeated_after_resume() {
+    let mut client = Client::new(spec(SessionSource::Resume("fixture-session".into())));
+    client.update(&json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":format!("<shina_context>\n{}\n</shina_context>", crate::mcp::INSTRUCTIONS)}}));
+    assert!(client.history.is_empty());
+    assert!(client.awareness_sent);
+    ready(&mut client);
+    client
+        .command(json!({"type":"prompt","id":"next","message":"Continue"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

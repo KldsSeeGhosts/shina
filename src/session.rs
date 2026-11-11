@@ -24,6 +24,27 @@ pub struct AgentModel {
 }
 
 impl AgentModel {
+    pub fn from_harness_value(model: &Value, harness: &str) -> Option<Self> {
+        if harness == "pi" {
+            return Self::from_value(model);
+        }
+        if model["provider"] != harness {
+            return None;
+        }
+        Some(Self {
+            provider: harness.into(),
+            id: model["id"].as_str()?.into(),
+            name: model["name"]
+                .as_str()
+                .or_else(|| model["id"].as_str())?
+                .into(),
+            thinking_levels: vec![],
+            context_window: None,
+            supports_images: model["input"]
+                .as_array()
+                .map(|input| input.iter().any(|kind| kind == "image")),
+        })
+    }
     pub fn from_value(model: &Value) -> Option<Self> {
         if model["provider"] != "cpa" {
             return None;

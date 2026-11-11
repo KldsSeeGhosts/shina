@@ -229,23 +229,23 @@ impl Thread {
             return vec![];
         }
         let query = text[1..].to_lowercase();
-        let mut commands = vec![
-            SlashCommand {
-                name: "model".into(),
-                description: "Switch response model for this thread".into(),
-                source: "Shina".into(),
-            },
-            SlashCommand {
+        let mut commands = vec![SlashCommand {
+            name: "model".into(),
+            description: "Switch response model for this thread".into(),
+            source: "Shina".into(),
+        }];
+        if self.harness == "pi" {
+            commands.push(SlashCommand {
                 name: "compact".into(),
                 description: "Summarize context, with optional instructions".into(),
                 source: "Pi".into(),
-            },
-        ];
+            });
+        }
         commands.extend(
             self.native
                 .commands
                 .iter()
-                .filter(|c| !matches!(c.name.as_str(), "model" | "compact"))
+                .filter(|c| c.name != "model" && (self.harness != "pi" || c.name != "compact"))
                 .cloned(),
         );
         commands.retain(|c| {
@@ -266,6 +266,10 @@ impl Thread {
     }
 
     pub fn compact(&mut self, instructions: Option<String>) {
+        if self.harness != "pi" {
+            self.error = Some("Native compaction is Pi-only in Shina. Use the ACP agent's own commands if it advertises them.".into());
+            return;
+        }
         if self.archived()
             || self.configuring
             || self.native.operating()
@@ -290,7 +294,7 @@ impl Thread {
             || self.phase == "Stopping"
             || self.request.is_some()
             || !self.has_draft_content()
-            || self.model_provider != "cpa"
+            || self.harness == "pi" && self.model_provider != "cpa"
         {
             return;
         }
@@ -301,7 +305,7 @@ impl Thread {
         let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.native.follow_up {
+        if self.native.follow_up || self.harness != "pi" {
             self.serial += 1;
             self.native.queue.push_back(QueuedMessage {
                 id: self.serial,
@@ -489,6 +493,10 @@ impl Thread {
     }
 
     pub fn request_fork_points(&mut self, mode: ConversationMode) {
+        if self.harness != "pi" {
+            self.error = Some("Conversation forks and rewinds are Pi-only in Shina.".into());
+            return;
+        }
         if self.status.busy() || self.configuring || self.session.is_none() {
             return;
         }
@@ -1210,6 +1218,10 @@ impl State {
 
     /// Fork in a separate process, as KSG does, so the source session and its owner never move.
     pub fn fork_conversation(&mut self, entry: Option<String>) {
+        if self.current().harness != "pi" {
+            self.current_mut().error = Some("Conversation forks are Pi-only in Shina.".into());
+            return;
+        }
         if self.demo
             || self.current().archived()
             || self.current().status.busy()

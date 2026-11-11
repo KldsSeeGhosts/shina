@@ -1231,6 +1231,7 @@ fn model_row(s: &State, p: Palette) -> El {
         .child(icon("open", p.muted))
 }
 
+/// Harness rows reuse KSG Code's ModelPickerContent groups and ModelListRow proportions.
 fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> El {
     let t = s.current();
     let header = row()
@@ -1279,6 +1280,62 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         });
     let mut group: Option<String> = None;
     let mut count = 0;
+    list = list.child(
+        label("Harness", TextStyle::new(11.5, 600.0), p.muted)
+            .key("harness-group")
+            .px(16.0)
+            .pt(8.0)
+            .pb(4.0),
+    );
+    let harnesses = std::iter::once(("pi", "Pi")).chain(
+        s.harnesses
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.name.as_str())),
+    );
+    for (id, name) in harnesses {
+        let selected = t.harness == id;
+        let enabled = t.can_choose_harness();
+        let chosen = id.to_owned();
+        let mut item = row()
+            .key(format!("choose-harness-{id}"))
+            .role("option")
+            .label(name)
+            .checked(selected)
+            .focusable(enabled)
+            .center_y()
+            .gap(10.0)
+            .h(34.0)
+            .pl(16.0)
+            .pr(12.0)
+            .fill(if selected {
+                p.teal_bg
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(if selected { p.teal_bg } else { p.selected })
+            .disabled(!enabled)
+            .child(
+                label(name, TextStyle::new(13.5, 450.0), p.ink)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        if selected {
+            item = item.child(icon("check", p.teal_text));
+        }
+        if enabled {
+            item = item
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.choose_harness(&chosen);
+                });
+        }
+        list = list.child(item);
+    }
+    if let Some(error) = &s.harnesses.error {
+        list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
+    }
     for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
         format!("{} {} {}", m.provider, m.id, m.name)
             .to_lowercase()
@@ -1346,7 +1403,9 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
     if count == 0 {
         list = list.child(
             label(
-                if t.models.is_empty() && s.catalog.remaining().is_some() {
+                if t.harness != "pi" && t.models.is_empty() {
+                    "This harness uses its configured model until it reports available models."
+                } else if t.models.is_empty() && s.catalog.remaining().is_some() {
                     "Reading the CPA catalog..."
                 } else if t.models.is_empty() {
                     "No CPA models are available."
@@ -6683,6 +6742,49 @@ pub(crate) mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
+    }
+
+    #[test]
+    fn harness_picker_is_available_before_first_send_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.harnesses.agents = vec![crate::harness::Agent {
+                id: "fixture".into(),
+                name: "Fixture ACP".into(),
+                command: "fixture-agent".into(),
+                args: vec![],
+                env: vec![],
+            }];
+            rt.state.settings_picker = Some(SettingsPicker::Model);
+            rt.frame(0.0);
+            for key in [
+                "harness-group",
+                "choose-harness-pi",
+                "choose-harness-fixture",
+                "model-list",
+                "model-search",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{key}: {rect:?}"
+                );
+            }
+            press(&mut rt, "choose-harness-fixture");
+            assert_eq!(rt.state.current().harness, "fixture");
+            assert!(rt.state.current().selected_model.is_none());
+            rt.state.current_mut().life.latest_user_message_at = Some(1);
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "choose-harness-pi");
+            assert_eq!(
+                rt.state.current().harness,
+                "fixture",
+                "harness is fixed after first send"
+            );
+        }
     }
     fn find<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
         if tree["key"] == key {
