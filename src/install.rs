@@ -600,7 +600,6 @@ pub fn uninstall() -> Result<(), String> {
     wait_for_marker(&mut child, &marker, std::time::Duration::from_secs(10))
 }
 
-#[cfg(windows)]
 pub fn wait_for_marker(
     child: &mut std::process::Child,
     marker: &Path,
