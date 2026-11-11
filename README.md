@@ -378,8 +378,6 @@ cargo run -- --demo --scene empty --snap artifacts\shina-empty.png --size 1280x8
 cargo run -- --demo --scene empty-dark --snap artifacts\shina-empty-dark.png --size 1280x840 --scale 1
 ```
 
-The [workspace design notes](docs/workspace-design.md) record the Claude Desktop reference, font sources, and this pass's design choices.
-
 ## Implementation and limits
 
 `src/ui.rs` draws the interface. `src/model.rs` reduces Pi events and owns global project/thread state and automatic session lifetimes. `src/session.rs` caches provider metadata independently of thread runtimes. `src/backend.rs` dispatches machine hosts and handles local subprocesses and JSONL framing on worker threads. `src/store.rs` migrates legacy data and saves the global index off the render thread. `src/projects.rs` holds project records, project actions and background clones.
