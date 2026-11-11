@@ -106,12 +106,15 @@ pub fn tailscale_addresses() -> Result<Vec<IpAddr>, String> {
     let output = tailscale_candidates()
         .into_iter()
         .find_map(|executable| {
-            crate::process::output(
-                std::process::Command::new(executable).args(["status", "--json"]),
-                Duration::from_millis(3500),
-                1024 * 1024,
-            )
-            .ok()
+            let mut command = std::process::Command::new(executable);
+            // The macOS app binary opens its GUI instead of acting as the CLI unless told
+            // otherwise, which fails under launchd. Other platforms ignore the variable.
+            command
+                .args(["status", "--json"])
+                .env("TAILSCALE_BE_CLI", "1");
+            crate::process::output(&mut command, Duration::from_millis(3500), 1024 * 1024)
+                .ok()
+                .filter(|output| output.status.success())
         })
         .ok_or("Could not read Tailscale status. Check that Tailscale is installed and running.")?;
     if !output.status.success() {
