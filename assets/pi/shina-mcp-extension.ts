@@ -10,6 +10,15 @@ import { Type } from "typebox";
 const PROTOCOL = "2025-06-18";
 const PREFIX = "mcp__shina__";
 
+// Pure policy, also exercised by the Rust bridge tests without starting Pi.
+export function shinaToolDecision(mode: string, builtinRead: boolean, ownBridge: boolean, ownReadOnly: boolean, builtinEdit: boolean): "allow" | "deny" | "confirm" {
+  if (mode === "full-access") return "allow";
+  if (builtinRead || (mode === "read-only" ? ownBridge : ownReadOnly)) return "allow";
+  if (mode === "read-only") return "deny";
+  if (mode === "auto-accept-edits" && builtinEdit) return "allow";
+  return "confirm";
+}
+
 type McpTool = {
   name: string;
   description?: string;
@@ -111,11 +120,17 @@ export default async function shinaExtension(pi: ExtensionAPI) {
       tool?.sourceInfo?.path === `builtin:${event.toolName}`) ||
       (event.toolName === "tool_search" && tool?.sourceInfo?.path === "builtin:tool-search");
     const bridgePath = process.env.SHINA_PI_BRIDGE_PATH;
-    const ownReadOnly = readOnlyMcp.has(event.toolName) && bridgePath !== undefined &&
+    const ownBridge = event.toolName.startsWith(PREFIX) && bridgePath !== undefined &&
       typeof tool?.sourceInfo?.path === "string" && resolve(tool.sourceInfo.path) === resolve(bridgePath);
-    if (builtinRead || ownReadOnly) return;
-    if (mode === "auto-accept-edits" && ["edit", "write"].includes(event.toolName) &&
-      tool?.sourceInfo?.path === `builtin:${event.toolName}`) return;
+    const ownReadOnly = ownBridge && readOnlyMcp.has(event.toolName);
+    const builtinEdit = ["edit", "write"].includes(event.toolName) &&
+      tool?.sourceInfo?.path === `builtin:${event.toolName}`;
+    const decision = shinaToolDecision(mode, builtinRead, ownBridge, ownReadOnly, builtinEdit);
+    if (decision === "allow") return;
+    if (decision === "deny") return {
+      block: true,
+      reason: `Shina is in Read only mode. ${event.toolName} is blocked. Delegate code changes to a thread with mcp__shina__delegate_task.`,
+    };
     const approved = await ctx.ui.confirm(`Allow ${event.toolName}?`,
       JSON.stringify(event.input, null, 2).slice(0, 4_000), { signal: ctx.signal });
     if (!approved) return { block: true, reason: `${event.toolName} was declined in Shina.` };

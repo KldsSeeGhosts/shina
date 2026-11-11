@@ -478,6 +478,10 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .border(1.0, p.line);
     for (mode, description) in [
         (
+            AccessMode::ReadOnly,
+            "Read files and coordinate. Delegate code changes to a thread.",
+        ),
+        (
             AccessMode::Supervised,
             "Ask before commands and file changes.",
         ),
@@ -513,4 +517,28 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         |s| s.current_mut().native.access_picker = false,
         card,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_option_fits_the_existing_permissions_menu_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut state = State::new(".".into(), false);
+            state.current_mut().native.access_picker = true;
+            let mut rt = rune::Runtime::with_text(
+                state,
+                view,
+                (width, 720.0),
+                rune::Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            let (option, _) = rt.presented("access-read-only").expect("Read only option");
+            assert!(option[2] > 0.0 && option[3] > 0.0);
+            assert!(option[0] >= 0.0 && option[0] + option[2] <= width);
+        }
+    }
 }

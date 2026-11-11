@@ -13,6 +13,61 @@ use std::{
     time::Duration,
 };
 
+/// Exists for the lifetime of a run, including the interval between a cancelled quit
+/// request and the next frame. Only an actual drop following a clean save removes it.
+pub struct RunMarker {
+    path: PathBuf,
+    pub previous_unclean: bool,
+    refreshed: std::time::Instant,
+    pub clean: bool,
+}
+
+impl RunMarker {
+    pub fn start(directory: &std::path::Path) -> Result<Self, String> {
+        let path = directory.join("run-marker.json");
+        let previous_unclean = match fs::metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("Could not inspect Shina's run marker: {error}")),
+        };
+        let mut marker = Self {
+            path,
+            previous_unclean,
+            refreshed: std::time::Instant::now(),
+            clean: false,
+        };
+        marker.write()?;
+        Ok(marker)
+    }
+
+    fn write(&mut self) -> Result<(), String> {
+        fs::write(
+            &self.path,
+            serde_json::json!({"pid":std::process::id(),"refreshed_at":crate::lifecycle::now()})
+                .to_string(),
+        )
+        .map_err(|error| format!("Could not write Shina's run marker: {error}"))?;
+        self.refreshed = std::time::Instant::now();
+        Ok(())
+    }
+
+    pub fn tick(&mut self) -> Result<(), String> {
+        self.clean = false;
+        if self.refreshed.elapsed() >= Duration::from_secs(60) {
+            self.write()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RunMarker {
+    fn drop(&mut self) {
+        if self.clean {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub struct Store {
     sender: Option<mpsc::Sender<Message>>,
     pub errors: mpsc::Receiver<String>,
@@ -526,6 +581,41 @@ mod tests {
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
+    #[test]
+    fn run_markers_distinguish_unclean_exits_and_clear_only_on_clean_drop() {
+        let root = directory().unwrap().join("markers");
+        fs::create_dir_all(&root).unwrap();
+        let marker_path = root.join("run-marker.json");
+        {
+            let mut marker = RunMarker::start(&root).unwrap();
+            assert!(!marker.previous_unclean);
+            marker.refreshed -= Duration::from_secs(61);
+            marker.tick().unwrap();
+            assert!(marker.refreshed.elapsed() < Duration::from_secs(1));
+            assert!(load(&marker_path).unwrap().unwrap()["refreshed_at"].is_u64());
+        }
+        assert!(marker_path.exists(), "unclean drop keeps evidence");
+        {
+            let mut marker = RunMarker::start(&root).unwrap();
+            assert!(marker.previous_unclean);
+            marker.clean = true;
+            assert!(
+                marker_path.exists(),
+                "quit intent alone cannot clear the marker"
+            );
+            marker.tick().unwrap();
+            assert!(
+                !marker.clean,
+                "a cancelled quit returns to an unclean running state"
+            );
+            marker.clean = true;
+        }
+        assert!(!marker_path.exists());
+        let mut marker = RunMarker::start(&root).unwrap();
+        assert!(!marker.previous_unclean);
+        marker.clean = true;
+    }
+
     #[test]
     fn default_test_storage_and_mcp_bridge_never_use_the_user_profile() {
         let base = directory().unwrap();

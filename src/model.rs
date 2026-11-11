@@ -24,6 +24,13 @@ const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 #[path = "pi_session.rs"]
 mod pi_session;
 pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+#[path = "tasks.rs"]
+// Public UI entry points are consumed by the concurrent captain UI implementation.
+#[allow(dead_code)]
+mod tasks;
+use tasks::Task;
+#[allow(unused_imports)]
+pub use tasks::{AttentionItem, AttentionKind, TaskState, TaskView};
 
 struct Injection {
     text: String,
@@ -293,6 +300,9 @@ pub struct Thread {
     task_result: Option<&'static str>,
     completion_notified: bool,
     forwarded_question: Option<String>,
+    accepted_deliveries: Vec<String>,
+    recovering_task: bool,
+    task_history: Option<Value>,
 }
 
 impl Thread {
@@ -468,6 +478,9 @@ impl Thread {
             task_result: None,
             completion_notified: true,
             forwarded_question: None,
+            accepted_deliveries: Vec::new(),
+            recovering_task: false,
+            task_history: None,
         }
     }
 
@@ -1241,6 +1254,7 @@ impl Thread {
     }
 
     pub fn apply(&mut self, record: Value) {
+        self.observe_task_history(&record);
         self.last_activity = Instant::now();
         if self.apply_native(&record) {
             self.drive_session();
@@ -1861,6 +1875,9 @@ pub struct State {
     /// Why the last restart click waited. Cleared while the update row shows ready.
     pub restart_notice: Option<String>,
     task_waiters: Vec<TaskWaiter>,
+    tasks: Vec<Task>,
+    pub recovery_notice: Option<String>,
+    run_marker: Option<crate::store::RunMarker>,
     /// Recent projects, the switcher menu, and the clone sheet.
     pub projects: crate::projects::Projects,
     pub catalog: Catalog,
@@ -1970,6 +1987,9 @@ impl State {
             projects: Default::default(),
             catalog: Catalog::default(),
             runtime_enabled: false,
+            tasks: Vec::new(),
+            recovery_notice: None,
+            run_marker: None,
         };
         if !workspace.as_os_str().is_empty() {
             state.projects.entries.push(Project::new(1, workspace));
@@ -2594,6 +2614,9 @@ impl State {
             }
         }
         self.threads.retain(|t| !ids.contains(&t.id));
+        self.tasks.retain(|task| {
+            !ids.contains(&task.parent_thread_id) && !ids.contains(&task.child_thread_id)
+        });
         self.tabs.retain(|id| !ids.contains(id));
         for project in &mut self.projects.entries {
             if project.captain_thread.is_some_and(|id| ids.contains(&id)) {
@@ -3092,6 +3115,7 @@ impl State {
             thread.title = self.captains[captain].name.clone();
             thread.captain = Some(captain);
             thread.captain_home = true;
+            thread.native.access = AccessMode::ReadOnly;
             thread.project = project_id;
             thread.machine = machine;
             self.threads.push(thread);
@@ -3439,6 +3463,8 @@ impl State {
                 "host_supported": caller.machine == "local",
             },
             "constraints": {
+                "running_children_per_coordinator": tasks::RUNNING_LIMIT,
+                "unfinished_tasks_per_coordinator": tasks::UNFINISHED_LIMIT,
                 "direct_providers": false,
                 "remote_hosts": false,
                 "model_ids": "exact ids only",
@@ -3621,6 +3647,7 @@ impl State {
                 Ok(json!({ "captains": captains }))
             }
             "delegate_task" => {
+                self.check_task_capacity(caller)?;
                 if self.threads[caller_index].delegated {
                     return Err(
                         "Delegated threads cannot delegate further. Do the work in this thread."
@@ -3689,7 +3716,10 @@ impl State {
                     .collect();
                 thread.captain = captain;
                 thread.delegated = true;
-                thread.native.access = self.threads[caller_index].native.access;
+                thread.native.access = match self.threads[caller_index].native.access {
+                    AccessMode::ReadOnly => AccessMode::default(),
+                    access => access,
+                };
                 thread.parent = Some(caller);
                 thread.models = models;
                 if let Some(selection) = &selection {
@@ -3700,16 +3730,20 @@ impl State {
                 }
                 thread.arm_task();
                 thread.life.mark_unread();
-                thread.enqueue_injection(format!("Shina: task from parent #{caller}\n\n{prompt}"));
+                let task = Task::new(&thread, prompt, selection.as_ref().map(Selection::to_value));
                 let id = thread.id;
                 self.threads.push(thread);
-                let index = self.threads.len() - 1;
-                self.connect_thread(index);
+                self.tasks.push(task);
+                self.start_queued_tasks();
                 self.checkpoint();
                 self.mcp_call(caller, "task_status", &json!({"thread_id":id}))
             }
             "task_status" => {
                 let thread = &self.threads[find(self)?];
+                let task = self
+                    .tasks
+                    .iter()
+                    .find(|task| task.child_thread_id == thread.id);
                 let reply = thread
                     .messages
                     .iter()
@@ -3730,16 +3764,25 @@ impl State {
                     "machine": thread.machine,
                     "parent": thread.parent,
                     "captain": captain_name(self, thread.captain),
-                    "status": status,
+                    "status": task.map(|task| task.state.id()).unwrap_or(status),
+                    "task_id": task.map(|task| &task.id),
+                    "queue_position": task.and_then(|task| self.task_queue_position(task)),
                     "selection": selection_value(thread),
-                    "finished": thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed)),
+                    "finished": task.map(|task| task.state.finished()).unwrap_or(thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed))),
                     "phase": thread.phase,
-                    "error": thread.error,
-                    "latest_reply": reply,
+                    "error": task.map(|task| task.error_excerpt.as_str()).filter(|s| !s.is_empty()).or(thread.error.as_deref()),
+                    "latest_reply": task.map(|task| task.result_excerpt.as_str()).filter(|s| !s.is_empty()).map(str::to_owned).or(reply),
                 }))
             }
             "task_cancel" | "task_send" => {
                 let index = find(self)?;
+                if self.prepare_task_control(index, caller, tool, args)? {
+                    return self.mcp_call(
+                        caller,
+                        "task_status",
+                        &json!({"thread_id":self.threads[index].id}),
+                    );
+                }
                 let thread = &mut self.threads[index];
                 if !thread.delegated || thread.parent != Some(caller) {
                     return Err(format!(
@@ -3815,7 +3858,11 @@ impl State {
                 .map(|value| (seconds, value))
         });
         match result {
-            Ok((seconds, value)) if seconds > 0 && value["finished"] == false => {
+            Ok((seconds, value))
+                if seconds > 0
+                    && value["finished"] == false
+                    && value["status"] != "interrupted" =>
+            {
                 let deadline = Instant::now() + Duration::from_secs(seconds);
                 let (timer, cancel) = mpsc::channel();
                 let wake = self.wake.clone();
@@ -3844,10 +3891,17 @@ impl State {
 
     /// Called after all threads' events are drained, so simultaneous results cannot overwrite
     /// each other. Each finished run contributes one message to its parent's separate queue.
-    fn poll_tasks(&mut self, now: Instant) -> bool {
+    fn poll_legacy_tasks(&mut self, now: Instant) -> bool {
         let mut changed = false;
         let mut completions = vec![];
         for thread in &mut self.threads {
+            if self
+                .tasks
+                .iter()
+                .any(|task| task.child_thread_id == thread.id)
+            {
+                continue;
+            }
             if !thread.completion_notified
                 && let Some(result) = thread.task_result
             {
@@ -3886,6 +3940,9 @@ impl State {
             );
             if result.as_ref().is_err()
                 || result.as_ref().is_ok_and(|value| value["finished"] == true)
+                || result
+                    .as_ref()
+                    .is_ok_and(|value| value["status"] == "interrupted")
                 || now >= waiter.deadline
             {
                 let _ = waiter.reply.send(result);
@@ -4032,6 +4089,7 @@ impl State {
             }
             _ => {}
         }
+        self.release_task_results(self.current().id);
         if self.current().status.busy() {
             self.current_mut().send_during_run();
             self.checkpoint();
@@ -4178,6 +4236,7 @@ impl State {
         }
         self.load_global(wake.clone());
         self.runtime_enabled = true;
+        self.start_task_recovery();
         self.refresh_catalog();
         self.updater.start(true, Instant::now(), wake.clone());
         self.prewarm_current();
@@ -4192,6 +4251,12 @@ impl State {
     }
 
     fn load_global(&mut self, wake: Waker) {
+        if self.run_marker.is_none() {
+            match crate::store::RunMarker::start(&self.data_dir) {
+                Ok(marker) => self.run_marker = Some(marker),
+                Err(error) => self.storage_error = Some(error),
+            }
+        }
         let path = self.data_dir.join("index.json");
         match crate::store::load_global(&self.data_dir, self.launch_project.as_deref()) {
             Ok(Some(index)) if index["version"] == 3 || index["version"] == 4 => {
@@ -4227,6 +4292,23 @@ impl State {
         }
         self.ui_store = Some(crate::store::Store::new(ui_path, wake.clone()));
         self.store = Some(crate::store::Store::new(path, wake));
+        let running_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Starting | TaskState::Running))
+            .count();
+        self.prepare_task_recovery();
+        if let Some(marker) = &self.run_marker
+            && (running_tasks > 0 || marker.previous_unclean)
+        {
+            self.recovery_notice = Some(if marker.previous_unclean {
+                "Shina closed unexpectedly. Recovered tasks need review. No task was automatically replayed.".into()
+            } else {
+                format!(
+                    "Shina was closed while {running_tasks} tasks were running. Review or resume them explicitly."
+                )
+            });
+        }
         if let Some(path) = self.launch_project.take()
             && let Err(error) = self.add_project(path)
         {
@@ -4480,6 +4562,7 @@ impl State {
                 .unwrap_or(ProjectScope::All),
         };
         self.capture_opened_draft();
+        self.restore_tasks(index, &project_remap)?;
         Ok(())
     }
     fn ui_snapshot(&self) -> Value {
@@ -4713,6 +4796,7 @@ impl State {
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
+            "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
@@ -4906,6 +4990,12 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    if let Some(marker) = &mut state.run_marker {
+        if let Err(error) = marker.tick() {
+            state.storage_error = Some(error);
+        }
+        tx.wake_after(Duration::from_secs(60));
+    }
     // A resumed event loop is no longer committed to the earlier quit attempt.
     if state.restart_approved && !rune::quitting() {
         state.cancel_update_exit();
@@ -4956,6 +5046,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                 Event::Record(record) => {
                     let settled = record["type"] == "agent_settled";
                     if record["type"] == "extension_ui_request"
+                        && !thread.recovering_task
                         && matches!(
                             record["method"].as_str(),
                             Some("input" | "editor" | "select")
