@@ -7063,7 +7063,7 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             })))
         .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(label("Host",SMALL,p.ink))
-        .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("kidsseemac",p.muted)
+        .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
             .single_line().w_full().padding(8.0).radius(6.0).border(1.0,p.field_line).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.host))
         .child(label("Pairing code",SMALL,p.ink))
@@ -7343,7 +7343,7 @@ pub(crate) mod tests {
             let mut remote = crate::client::Client::new(rt.state.data_dir.clone());
             remote.remote = Some(crate::peer::Link {
                 server_id: "fixture-server".into(),
-                host: "kidsseemac".into(),
+                host: "studio-mac".into(),
                 device_id: "fixture-device".into(),
                 token: "fixture".into(),
             });

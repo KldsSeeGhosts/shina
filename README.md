@@ -70,7 +70,7 @@ Tailscale must already be installed, signed in, and resolve MagicDNS names. Shin
 
 After installing this build on each host, run these commands in its own terminal. These commands opt into an always-on server; do not run a legacy desktop against the same profile.
 
-Windows, `kidsseeghosts`, PowerShell:
+Windows, `windows-pc`, PowerShell:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\Shina\shina.exe" service install --tailnet
@@ -78,7 +78,7 @@ Windows, `kidsseeghosts`, PowerShell:
 & "$env:LOCALAPPDATA\Programs\Shina\shina.exe" pair
 ```
 
-macOS, separately on `kidsseemac` and `kidsseembp`:
+macOS, separately on `studio-mac` and `laptop-mac`:
 
 ```sh
 /Applications/Shina.app/Contents/MacOS/shina service install --tailnet
@@ -86,7 +86,7 @@ macOS, separately on `kidsseemac` and `kidsseembp`:
 /Applications/Shina.app/Contents/MacOS/shina pair
 ```
 
-Ubuntu, `serverseesghosts`, with the installed `shina` on PATH:
+Ubuntu, `linux-server`, with the installed `shina` on PATH:
 
 ```sh
 shina service install --tailnet --enable-linger
@@ -96,15 +96,15 @@ shina pair
 
 Omit `--enable-linger` to leave Linux logout behavior unchanged. To run without a service, use `shina serve --tailnet` in a separate terminal instead. Reinstalling a service without `--tailnet` restores loopback-only service startup. Stop a standalone tailnet server and restart with plain `shina serve` to remove its remote listeners. Coordinated updates retain the running server's listener options.
 
-Create a code on the host you want to access. On the client machine, redeem that code once, within five minutes. For example, after `pair` on `kidsseemac`, run on Windows:
+Create a code on the host you want to access. On the client machine, redeem that code once, within five minutes. For example, after `pair` on `studio-mac`, run on Windows:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" link kidsseemac <code-from-kidsseemac>
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" link studio-mac <code-from-studio-mac>
 & "$env:LOCALAPPDATA\Programs\Shina\shina.exe" links
 & "$env:LOCALAPPDATA\Programs\Shina\shina.exe" --server-client
 ```
 
-On either Mac use `/Applications/Shina.app/Contents/MacOS/shina link <host> <code>`. On Ubuntu use `shina link <host> <code>`. Replace `<host>` with `kidsseeghosts`, `kidsseemac`, `kidsseembp` or `serverseesghosts`. Generate a fresh code for each client/server link. Linking A to B does not grant B access to A. Repeat for each direction needed; no full mesh is required. CLI links load when the desktop starts. An open desktop can link immediately through Run on > Add to another machine or Settings > Linked machines.
+On either Mac use `/Applications/Shina.app/Contents/MacOS/shina link <host> <code>`. On Ubuntu use `shina link <host> <code>`. Replace `<host>` with `windows-pc`, `studio-mac`, `laptop-mac` or `linux-server`. Generate a fresh code for each client/server link. Linking A to B does not grant B access to A. Repeat for each direction needed; no full mesh is required. CLI links load when the desktop starts. An open desktop can link immediately through Run on > Add to another machine or Settings > Linked machines.
 
 The dialog also creates a host code, lists authorized devices and revokes them. The CLI equivalents are:
 
@@ -281,7 +281,7 @@ Pi must already be enrolled in CPA through its provider extension or a configure
 
 Shina's localhost MCP endpoint controls threads. It is separate from Pi's CPA inference connection. An assistant message such as "Connection error." comes from Pi's provider request, not proof that the Shina MCP failed.
 
-Check the CPA provider extension and the local proxy or tunnel on the machine running Shina. A provider URL such as `http://127.0.0.1:8317` refers to that machine. After moving CPA from `serverseesghosts` to the Mac Studio, a client that uses an SSH tunnel must forward to `kidsseemac` instead of the old server. The Mac Studio can use its local CPA listener directly. Catalog discovery URLs and inference URLs are separate; a working model picker does not prove inference works.
+Check the CPA provider extension and the local proxy or tunnel on the machine running Shina. A provider URL such as `http://127.0.0.1:8317` refers to that machine. After moving CPA from `linux-server` to the Mac Studio, a client that uses an SSH tunnel must forward to `studio-mac` instead of the old server. The Mac Studio can use its local CPA listener directly. Catalog discovery URLs and inference URLs are separate; a working model picker does not prove inference works.
 
 Keep endpoint and tunnel configuration in the existing CPA/Pi configuration, outside this repository. Shina does not rewrite authentication or replace the provider extension. After updating the host-owned configuration, restart Shina so new Pi processes load it. A missing Pi extension, a Pi process exit, and a provider connection error have different causes; preserve the full error when reporting a failure.
 
