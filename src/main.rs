@@ -11,6 +11,7 @@ mod context;
 mod harness;
 mod install;
 mod lifecycle;
+mod maintenance;
 mod mcp;
 mod model;
 mod portraits;
@@ -23,6 +24,7 @@ mod runtime;
 mod server;
 mod server_auth;
 mod server_lock;
+mod service;
 mod session;
 mod store;
 mod tray;
@@ -452,6 +454,25 @@ fn captain_crews_demo(state: &mut State) {
 }
 
 fn main() {
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    let result = match cli.first().map(String::as_str) {
+        Some("service") => Some(service::cli(&cli[1..])),
+        Some("update") => Some(update::cli_update(&cli[1..])),
+        Some("--service-run") => Some(
+            cli.get(1)
+                .ok_or("Service descriptor required.".to_string())
+                .and_then(|path| service::launch(std::path::Path::new(path))),
+        ),
+        Some("--coordinated-update") => Some(update::coordinated_helper()),
+        _ => None,
+    };
+    if let Some(result) = result {
+        if let Err(error) = result {
+            eprintln!("Shina: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("serve") {
         if let Err(error) = server::serve() {
             eprintln!("Shina server: {error}");

@@ -49,8 +49,13 @@ pub struct Commands {
     ready: Arc<AtomicBool>,
 }
 impl Commands {
+    pub fn connected(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
     pub fn send(&self, method: &str, params: Value) -> Result<uuid::Uuid, String> {
-        if !self.ready.load(Ordering::Acquire) {
+        if !self.ready.load(Ordering::Acquire)
+            && !matches!(method, "server.clientReady" | "server.cancelRestart")
+        {
             return Err("The local server is disconnected. Reconnect before sending commands. Your draft was kept.".into());
         }
         let command = Command::new(method, params);
@@ -65,6 +70,7 @@ impl Commands {
 pub enum Event {
     Receipt(Command, Value),
     Error(String),
+    Maintenance(String, Value),
 }
 
 pub struct Client {
@@ -207,6 +213,7 @@ fn spawn() -> Result<Child, String> {
         std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command
         .arg("serve")
+        .env("SHINA_DESKTOP_OWNER_PID", std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -222,7 +229,7 @@ fn spawn() -> Result<Child, String> {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(discovery: &Discovery, device: &str) -> Result<Socket, String> {
+async fn connect(discovery: &Discovery, device: &str, desktop: bool) -> Result<Socket, String> {
     if discovery.protocol_major != crate::protocol::MAJOR {
         return Err("Protocol major mismatch. Update the server and client together.".into());
     }
@@ -248,7 +255,7 @@ async fn connect(discovery: &Discovery, device: &str) -> Result<Socket, String> 
     .await
     .map_err(|_| "Server connection timed out.")?
     .map_err(|_| "Server listener is unavailable.")?;
-    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}}).to_string().into())).await.map_err(|e| e.to_string())?;
+    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":crate::protocol::MAJOR,"protocolMinor":crate::protocol::MINOR,"projectionSchema":1,"clientPid":desktop.then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
     let reply: Value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match socket.next().await {
@@ -319,6 +326,8 @@ async fn supervise(
     let mut next_spawn = Instant::now();
     let mut owned_instance = None;
     let mut socket: Option<Socket> = None;
+    let mut updating = false;
+    let mut server_stopped = false;
     while !stop.load(Ordering::Acquire) {
         if socket.is_none() {
             ready.store(false, Ordering::Release);
@@ -333,7 +342,7 @@ async fn supervise(
             }
             if let Ok(discovery) = Discovery::read(&directory) {
                 match tokio::select! {
-                    result = connect(&discovery, &device) => result,
+                    result = connect(&discovery, &device, true) => result,
                     _ = stopped(&stop) => break,
                 } {
                     Ok(mut connected) => {
@@ -364,7 +373,7 @@ async fn supervise(
                     Err(_) => {}
                 }
             }
-            if child.is_none() && Instant::now() >= next_spawn {
+            if !server_stopped && !updating && child.is_none() && Instant::now() >= next_spawn {
                 match crate::server_lock::Owner::acquire(&directory) {
                     Ok(probe) => {
                         drop(probe);
@@ -398,9 +407,21 @@ async fn supervise(
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            if value["method"] == "subscription.snapshot" {
+                            if let Some(method) = value["method"].as_str().filter(|m| matches!(*m, "server.draining" | "server.restarting" | "server.drainCancelled" | "server.stopping")) {
+                                let draining = method != "server.drainCancelled";
+                                server_stopped |= method == "server.stopping";
+                                ready.store(!draining, Ordering::Release);
+                                if output.try_send(Event::Maintenance(method.into(), value["params"].clone())).is_err() {
+                                    socket = None;
+                                }
+                                if method == "server.restarting" { updating = true; }
+                            } else if value["method"] == "subscription.snapshot" {
                                 *snapshot.lock().expect("client snapshot") = Some(value["params"]["state"].clone());
-                                ready.store(true,Ordering::Release);
+                                let phase = value["params"]["maintenance"]["phase"].as_str().unwrap_or("ready");
+                                let draining = phase != "ready";
+                                server_stopped |= phase == "stopping";
+                                updating |= phase == "restarting";
+                                ready.store(!draining,Ordering::Release);
                             } else if let Some(id) = value["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
                                 && let Some(command) = pending.iter().find(|command| command.command_id == id) {
                                     let transient = value["error"]["message"].as_str().is_some_and(|text| text.contains("queue is full") || text.contains("Runtime unavailable"));
@@ -422,7 +443,7 @@ async fn supervise(
         }
     }
     ready.store(false, Ordering::Release);
-    if let Some(mut process) = child {
+    if !updating && let Some(mut process) = child {
         // Only a process handle we spawned, with an authenticated matching instance, may be stopped.
         if owned_instance.is_some()
             && let Some(connected) = &mut socket
@@ -442,6 +463,50 @@ async fn supervise(
         }
         let _ = process.wait();
     }
+}
+
+/// Used by the service CLI and detached updater. Does not register a desktop PID.
+pub async fn local_rpc(
+    directory: &std::path::Path,
+    method: &str,
+    args: Value,
+) -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let discovery = Discovery::read(directory)?;
+        static DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let mut socket = connect(
+            &discovery,
+            DEVICE.get_or_init(|| uuid::Uuid::new_v4().to_string()),
+            false,
+        )
+        .await?;
+        let command = Command::new(method, args);
+        socket
+            .send(wire_command(&command))
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(message) = socket.next().await {
+            match message.map_err(|e| e.to_string())? {
+                Message::Ping(payload) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Message::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    if value["id"] == command.command_id.to_string() {
+                        if let Some(error) = value["error"]["message"].as_str() {
+                            return Err(error.into());
+                        }
+                        return Ok(value["result"].clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("Server disconnected before maintenance response.".into())
+    })
+    .await
+    .map_err(|_| "Maintenance request timed out.".to_string())?
 }
 
 fn wire_command(command: &Command) -> Message {
@@ -482,6 +547,7 @@ mod tests {
     #[test]
     fn offline_commands_including_approvals_are_not_queued() {
         let client = Client::new(crate::store::directory().unwrap());
+        assert!(client.commands.send("server.stop", json!({})).is_err());
         assert!(
             client
                 .commands

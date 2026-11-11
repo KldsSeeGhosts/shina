@@ -57,6 +57,8 @@ pub struct RuntimeState {
     pub state: State,
     pub seq: u64,
     last_projection: Value,
+    pub maintenance: crate::maintenance::Maintenance,
+    validation_hold: bool,
 }
 
 impl RuntimeState {
@@ -67,13 +69,23 @@ impl RuntimeState {
     }
     pub fn from_state(state: State) -> Self {
         Self {
+            validation_hold: state.data_dir.join("update-validation").exists(),
             seq: state.server_sequence(),
             last_projection: state.projection(),
             state,
+            maintenance: crate::maintenance::Maintenance::default(),
         }
     }
 
     pub fn command(&mut self, device: &str, command: Command) -> Result<Value, String> {
+        if let Some(result) = self.maintenance_command(&command) {
+            return result;
+        }
+        if self.maintenance.fenced() || self.validation_hold {
+            return Err(
+                "Server is draining for an update. Retry after restart or cancellation.".into(),
+            );
+        }
         if let Some(receipt) = self
             .state
             .command_receipt(device, command.command_id)
@@ -115,14 +127,21 @@ impl RuntimeState {
     }
 
     pub fn tick(&mut self) -> bool {
+        let before = self.maintenance.status();
+        if self.maintenance.advance(std::time::Instant::now()) {
+            self.state.runtime_stop_requested = true;
+        }
+        if self.maintenance.fenced() || self.validation_hold {
+            return false;
+        }
         let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
             | self.state.collect_recovered_inputs();
         if !changed {
-            return false;
+            return before != self.maintenance.status();
         }
         let projection = self.state.projection();
         if projection == self.last_projection {
-            return false;
+            return before != self.maintenance.status();
         }
         self.last_projection = projection;
         self.seq += 1;
@@ -132,7 +151,68 @@ impl RuntimeState {
     }
 
     pub fn snapshot(&self) -> Value {
-        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":self.last_projection,"historyCursor":null})
+        let mut maintenance = self.maintenance.status();
+        if self.state.runtime_stop_requested && !self.maintenance.fenced() {
+            maintenance["phase"] = json!("stopping");
+        }
+        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":self.last_projection,"historyCursor":null,"maintenance":maintenance})
+    }
+
+    fn maintenance_command(&mut self, command: &Command) -> Option<Result<Value, String>> {
+        let now = std::time::Instant::now();
+        let result = match command.method.as_str() {
+            "server.status" => {
+                let mut value = self.maintenance.status();
+                value["ready"] = json!(true);
+                value["validationHold"] = json!(self.validation_hold);
+                Ok(value)
+            }
+            "server.validateRestart" => {
+                std::fs::remove_file(self.state.data_dir.join("update-validation"))
+                    .map_err(|e| e.to_string())
+                    .map(|()| {
+                        self.validation_hold = false;
+                        json!({"ready":true})
+                    })
+            }
+            "server.prepareRestart" => {
+                let clients = command.params["clientPids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+                    .collect();
+                if let Some(reason) = self.state.update_restart_blocker() {
+                    Err(reason.into())
+                } else {
+                    match self.state.checkpoint_and_flush() {
+                        Ok(()) => self.maintenance.prepare(None, clients, now),
+                        Err(error) => Err(format!("Save failed. Drain cancelled: {error}")),
+                    }
+                }
+            }
+            "server.cancelRestart" => self.maintenance.cancel(&command.params),
+            "server.clientReady" => self.maintenance.client_ready(&command.params),
+            "server.commitRestart" => match self.state.checkpoint_and_flush() {
+                Ok(()) => self.maintenance.commit(&command.params, now),
+                Err(error) => {
+                    let _ = self.maintenance.cancel(&command.params);
+                    Err(format!("Save failed. Drain cancelled: {error}"))
+                }
+            },
+            "server.stop" => {
+                if self.maintenance.fenced() {
+                    Err("An update is draining. Cancel it before stopping the server.".into())
+                } else {
+                    self.state.checkpoint_and_flush().map(|()| {
+                        self.state.runtime_stop_requested = true;
+                        json!({"stopping":true})
+                    })
+                }
+            }
+            _ => return None,
+        };
+        Some(result)
     }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
@@ -151,3 +231,67 @@ impl RuntimeState {
 }
 
 pub const TICK: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn runtime() -> RuntimeState {
+        let mut state = State::headless(crate::store::directory().unwrap());
+        state.load_global_for_test();
+        RuntimeState::from_state(state)
+    }
+    #[test]
+    fn drain_fences_mutations_and_save_failure_resumes_without_stopping() {
+        let mut rt = runtime();
+        let prepared = rt
+            .command(
+                "maintainer",
+                Command::new("server.prepareRestart", json!({})),
+            )
+            .unwrap();
+        assert!(
+            rt.command("device", Command::new("thread.create", json!({})))
+                .unwrap_err()
+                .contains("draining")
+        );
+        assert!(!rt.state.runtime_stop_requested);
+        rt.state.ui_store.take();
+        assert!(
+            rt.command("maintainer", Command::new("server.commitRestart", prepared))
+                .unwrap_err()
+                .contains("Save failed")
+        );
+        assert!(!rt.maintenance.fenced());
+        assert!(!rt.state.runtime_stop_requested);
+    }
+    #[test]
+    fn prepare_refuses_active_configuring_approval_and_queue_without_aborting() {
+        let mut rt = runtime();
+        for kind in ["active", "configuring", "approval", "queue"] {
+            {
+                let t = rt.state.current_mut();
+                t.status = crate::model::Status::Ready;
+                t.configuring = false;
+                t.request = None;
+                t.native.projected_queued = false;
+                match kind {
+                    "active" => t.status = crate::model::Status::Running,
+                    "configuring" => t.configuring = true,
+                    "approval" => t.request = Some(json!({"id":"pending"})),
+                    "queue" => t.native.projected_queued = true,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                rt.command(
+                    "maintainer",
+                    Command::new("server.prepareRestart", json!({}))
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert!(!rt.maintenance.fenced());
+            assert!(!rt.state.runtime_stop_requested);
+        }
+    }
+}

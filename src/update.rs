@@ -73,6 +73,7 @@ impl PreparedUpdate {
             "target": match &self.target {
                 InstalledTarget::Windows { exe } => serde_json::json!({"windows": exe}),
                 InstalledTarget::MacBundle { app } => serde_json::json!({"macos": app}),
+                InstalledTarget::Linux { exe } => serde_json::json!({"linux": exe}),
             },
         })
     }
@@ -83,6 +84,10 @@ impl PreparedUpdate {
         }
         let target = if let Some(exe) = value["target"]["windows"].as_str() {
             InstalledTarget::Windows {
+                exe: PathBuf::from(exe),
+            }
+        } else if let Some(exe) = value["target"]["linux"].as_str() {
+            InstalledTarget::Linux {
                 exe: PathBuf::from(exe),
             }
         } else {
@@ -104,7 +109,7 @@ impl PreparedUpdate {
     /// The executable, or the bundle an explicit restart opens.
     pub fn launcher(&self) -> PathBuf {
         match &self.target {
-            InstalledTarget::Windows { exe } => exe.clone(),
+            InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.clone(),
             InstalledTarget::MacBundle { app } => app.clone(),
         }
     }
@@ -277,6 +282,9 @@ fn cleanup_prepared(target: &InstalledTarget, keep: Option<&PreparedUpdate>) {
                 install::discard_prepared(app);
             }
         }
+        InstalledTarget::Linux { exe } => {
+            let _ = fs::remove_file(exe.with_file_name("shina.new"));
+        }
     }
 }
 
@@ -425,6 +433,17 @@ pub fn apply_prepared_update(update: &PreparedUpdate) -> Result<PathBuf, String>
             register_mac_bundle(app);
             Ok(app.clone())
         }
+        InstalledTarget::Linux { exe } => {
+            let dir = exe.parent().ok_or("No executable directory.")?;
+            let _lock = install::InstallLock::acquire(dir)?;
+            fs::copy(exe, exe.with_file_name("shina.previous")).map_err(|e| e.to_string())?;
+            fs::File::open(exe.with_file_name("shina.previous"))
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?;
+            fs::rename(&update.prepared, exe).map_err(|e| e.to_string())?;
+            install::sync_directory(dir);
+            Ok(exe.clone())
+        }
     }
 }
 
@@ -448,7 +467,9 @@ fn register_mac_bundle(app: &Path) {
 /// Opens the replaced app after an explicit restart.
 pub fn relaunch(installed: &Path, target: &InstalledTarget) -> Result<(), String> {
     match target {
-        InstalledTarget::Windows { .. } => install::launch_with(installed, &[]),
+        InstalledTarget::Windows { .. } | InstalledTarget::Linux { .. } => {
+            install::launch_with(installed, &[])
+        }
         InstalledTarget::MacBundle { .. } => install::open_mac_bundle(installed),
     }
 }
@@ -500,6 +521,9 @@ pub fn restore_previous(update: &PreparedUpdate, running: &Path) -> Result<(), S
             install::restore_exe(dir, running)
         }
         InstalledTarget::MacBundle { app } => install::restore_mac_bundle(app),
+        InstalledTarget::Linux { exe } => {
+            fs::rename(exe.with_file_name("shina.previous"), exe).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -623,6 +647,7 @@ impl UpdateHost for Gh {
                 }
                 prepared
             }
+            InstalledTarget::Linux { exe } => prepare_linux(download, exe).map_err(Failure::quiet),
         }
     }
 
@@ -632,6 +657,7 @@ impl UpdateHost for Gh {
             InstalledTarget::MacBundle { app } => {
                 install::bundle_staging(app).join(install::MACOS_APP_NAME)
             }
+            InstalledTarget::Linux { exe } => exe.with_file_name("shina.new"),
         };
         if update.prepared != owned || update.prepared.is_symlink() {
             return Err("The prepared update is outside its staging location.".into());
@@ -656,6 +682,21 @@ impl UpdateHost for Gh {
                 }
                 if let Some(problem) = mac_bundle_problem(&update.prepared, &update.tag) {
                     return Err(problem);
+                }
+            }
+            InstalledTarget::Linux { .. } => {
+                let mut command = Command::new("tar");
+                command
+                    .arg("-xOzf")
+                    .arg(&update.download)
+                    .arg("Shina/shina");
+                let (status, binary, _) =
+                    run_bounded_with_limit(command, METADATA_TIMEOUT, 256 * 1024 * 1024)
+                        .map_err(|e| failure_text(&e))?;
+                if !status.success()
+                    || format!("{:x}", Sha256::digest(binary)) != file_sha256(&update.prepared)?
+                {
+                    return Err("Prepared Linux binary differs from verified archive.".into());
                 }
             }
         }
@@ -1288,12 +1329,563 @@ fn running_architecture() -> &'static str {
     }
 }
 
-impl Updater {
-    pub fn disable_for_server(&mut self) {
-        self.status = Status::Disabled;
-        self.next_check = None;
-        self.notice = Some("In-app installation is disabled in server mode. Coordinated server updates are planned for slice 3.".into());
+fn prepare_linux(download: &Path, exe: &Path) -> Result<PathBuf, String> {
+    let mut list = Command::new("tar");
+    list.args(["-tzvf"]).arg(download);
+    let (status, bytes, _) = run_bounded_with_limit(list, METADATA_TIMEOUT, MAX_ARCHIVE_LISTING)
+        .map_err(|e| failure_text(&e))?;
+    let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+    if !status.success() || !linux_archive_safe(&text) {
+        return Err("Unsafe or incomplete Linux update archive.".into());
     }
+    let extracted = download
+        .parent()
+        .ok_or("No archive directory.")?
+        .join("linux");
+    fs::create_dir(&extracted).map_err(|e| e.to_string())?;
+    let mut extract = Command::new("tar");
+    extract
+        .args(["--no-same-owner", "--no-same-permissions", "-xzf"])
+        .arg(download)
+        .arg("-C")
+        .arg(&extracted);
+    if !run_bounded(extract, METADATA_TIMEOUT)
+        .map_err(|e| failure_text(&e))?
+        .0
+        .success()
+    {
+        return Err("Could not extract Linux update.".into());
+    }
+    let source = extracted.join("Shina/shina");
+    let staged = exe.with_file_name("shina.new");
+    fs::copy(&source, &staged).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    if file_sha256(&source)? != file_sha256(&staged)? {
+        return Err("Linux preparation checksum mismatch.".into());
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&staged)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(staged)
+}
+
+fn linux_archive_safe(text: &str) -> bool {
+    let mut binary = false;
+    let mut names = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 6 {
+            return false;
+        }
+        let kind = line.chars().next().unwrap_or(' ');
+        let name = fields[5];
+        if !names.insert(name) {
+            return false;
+        }
+        match (kind, name) {
+            ('d', "Shina/") | ('-', "Shina/shina.png" | "Shina/README.txt" | "Shina/LICENSE") => {}
+            ('-', "Shina/shina") => binary = true,
+            _ => return false,
+        }
+    }
+    binary
+}
+
+fn coordinated_path() -> PathBuf {
+    Storage::default_storage().root.join(if cfg!(windows) {
+        "coordinated-helper.exe"
+    } else {
+        "coordinated-helper"
+    })
+}
+
+pub fn start_coordinated_helper(update: &PreparedUpdate) -> Result<(), String> {
+    Gh.reverify(update)?;
+    let storage = Storage::default_storage();
+    fs::create_dir_all(&storage.root).map_err(|e| e.to_string())?;
+    let _lock = install::InstallLock::acquire(&storage.root)?;
+    let helper = coordinated_path();
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    fs::copy(&current, &helper).map_err(|e| e.to_string())?;
+    if file_sha256(&helper)? != file_sha256(&current)? {
+        return Err("Helper copy mismatch.".into());
+    }
+    crate::store::write_atomic(
+        &storage.manifest(),
+        update.to_value().to_string().as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    let handshake = storage.root.join("coordinated-started");
+    if handshake.exists() {
+        fs::remove_file(&handshake).map_err(|e| e.to_string())?;
+    }
+    drop(_lock);
+    let mut child = install::launch_child(&helper, &["--coordinated-update"])?;
+    install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT)
+}
+
+pub fn cli_update(args: &[String]) -> Result<(), String> {
+    if args != ["--yes"] {
+        return Err("Usage: shina update --yes. This explicitly approves an idle-only server restart. Uses your existing gh login.".into());
+    }
+    let target = if cfg!(target_os = "linux") {
+        if !cfg!(target_arch = "x86_64") {
+            return Err("Linux releases currently support x86_64 only.".into());
+        }
+        InstalledTarget::Linux {
+            exe: std::env::current_exe().map_err(|e| e.to_string())?,
+        }
+    } else {
+        install::installed_target().ok_or("Run shina update from the installed app.")?
+    };
+    println!("Checking GitHub Releases with the existing gh login.");
+    let Some(release) = Gh.fetch_release(&target).map_err(|e| failure_text(&e))? else {
+        println!("No newer release is available.");
+        return Ok(());
+    };
+    let storage = Storage::default_storage();
+    let attempt = storage.attempt();
+    let (download, sha256) = Gh
+        .download_release(&release, &target, &attempt)
+        .map_err(|e| failure_text(&e))?;
+    let prepared = Gh
+        .prepare(&release, &target, &download)
+        .map_err(|e| failure_text(&e))?;
+    let update = PreparedUpdate {
+        tag: release.tag,
+        target,
+        asset: release.asset.name,
+        size: release.asset.size,
+        sha256,
+        download,
+        prepared,
+    };
+    start_coordinated_helper(&update)?;
+    println!(
+        "Verified {}. The helper will refuse busy work, save clients, back up state, replace and validate the server. See updates/coordinated-result.txt.",
+        update.tag
+    );
+    Ok(())
+}
+
+/// Hold a real process handle on Windows before committing the drain. Never kill a PID.
+struct WaitProcess {
+    #[cfg(windows)]
+    handle: *mut std::ffi::c_void,
+    #[cfg(not(windows))]
+    pid: u32,
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut std::ffi::c_void;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+impl WaitProcess {
+    fn open(pid: u32) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            let handle = unsafe { OpenProcess(0x00100000, 0, pid) };
+            if handle.is_null() {
+                return Err(format!(
+                    "Cannot wait for local client {pid}. Drain cancelled."
+                ));
+            }
+            Ok(Self { handle })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self { pid })
+        }
+    }
+    fn wait(&self, timeout: Duration) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if unsafe {
+                WaitForSingleObject(
+                    self.handle,
+                    timeout.as_millis().min(u32::MAX as u128) as u32,
+                )
+            } == 0
+            {
+                return Ok(());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if unsafe { libc::kill(self.pid as i32, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Err("A local Shina process did not exit. The executable was not replaced.".into())
+    }
+}
+#[cfg(windows)]
+impl Drop for WaitProcess {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+fn start_server(
+    update: &PreparedUpdate,
+    service: Option<&crate::service::Service>,
+) -> Result<(), String> {
+    if let Some(service) = service {
+        return service.start();
+    }
+    let exe = match &update.target {
+        InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.clone(),
+        InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
+    };
+    install::launch_with(&exe, &["serve"])
+}
+
+fn readiness(directory: &Path, expected: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(discovery) = crate::server_auth::Discovery::read(directory)
+            && discovery.binary_version == expected.trim_start_matches('v')
+            && crate::maintenance::rpc(directory, "server.status", serde_json::json!({})).is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("Updated server did not become ready with the expected version.".into())
+}
+
+trait HelperSteps {
+    fn wait_clients(&mut self) -> Result<(), String>;
+    fn wait_server(&mut self) -> Result<(), String>;
+    fn replace(&mut self) -> Result<(), String>;
+    fn start(&mut self) -> Result<(), String>;
+    fn validate(&mut self) -> Result<(), String>;
+    fn reopen(&mut self) -> Result<(), String>;
+    fn rollback(&mut self) -> Result<(), String>;
+}
+fn helper_sequence(host: &mut impl HelperSteps) -> Result<(), String> {
+    // No replacement at all if any mapped client or server remains alive.
+    host.wait_clients()?;
+    host.wait_server()?;
+    host.replace()?;
+    if let Err(error) = host.start().and_then(|()| host.validate()) {
+        host.rollback()
+            .map_err(|rollback| format!("{error}. Rollback failed: {rollback}"))?;
+        return Err(format!("{error}. Previous binary and state restored."));
+    }
+    host.reopen()
+}
+
+struct CoordinatedUpdate {
+    update: PreparedUpdate,
+    directory: PathBuf,
+    service: Option<crate::service::Service>,
+    clients: Vec<WaitProcess>,
+    server: Option<WaitProcess>,
+    launcher: Option<WaitProcess>,
+    update_id: Option<String>,
+    desktop_owned: bool,
+    reopen: usize,
+    closed_clients: usize,
+    backup: Option<PathBuf>,
+    replaced: bool,
+}
+impl HelperSteps for CoordinatedUpdate {
+    fn wait_clients(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + METADATA_TIMEOUT;
+        for client in &self.clients {
+            client.wait(deadline.saturating_duration_since(Instant::now()))?;
+            self.closed_clients += 1;
+        }
+        Ok(())
+    }
+    fn wait_server(&mut self) -> Result<(), String> {
+        if let Some(server) = &self.server {
+            server.wait(METADATA_TIMEOUT)?;
+        }
+        crate::maintenance::wait_unowned(&self.directory, METADATA_TIMEOUT)?;
+        if let Some(launcher) = &self.launcher {
+            launcher.wait(METADATA_TIMEOUT)?;
+        }
+        if let Some(service) = &self.service {
+            service.stop()?;
+        }
+        if let Some(id) = &self.update_id
+            && fs::read_to_string(self.directory.join("restart-flushed"))
+                .ok()
+                .as_ref()
+                != Some(id)
+        {
+            return Err(
+                "The server did not confirm its final save. No executable was replaced.".into(),
+            );
+        }
+        Ok(())
+    }
+    fn replace(&mut self) -> Result<(), String> {
+        let _owner = crate::server_lock::Owner::acquire(&self.directory)?;
+        self.backup = Some(crate::maintenance::backup_state(&self.directory)?);
+        crate::store::write_atomic(
+            &self.directory.join("update-validation"),
+            b"hold routine dispatch until readiness",
+        )
+        .map_err(|e| e.to_string())?;
+        apply_prepared_update(&self.update)?;
+        self.replaced = true;
+        Ok(())
+    }
+    fn start(&mut self) -> Result<(), String> {
+        if self.desktop_owned && self.service.is_none() {
+            crate::store::write_atomic(
+                &self.directory.join("update-validation"),
+                b"hold until desktop supervision resumes",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        start_server(&self.update, self.service.as_ref())
+    }
+    fn validate(&mut self) -> Result<(), String> {
+        readiness(&self.directory, &self.update.tag)?;
+        if !self.desktop_owned || self.service.is_some() {
+            crate::maintenance::rpc(
+                &self.directory,
+                "server.validateRestart",
+                serde_json::json!({}),
+            )?;
+        }
+        Ok(())
+    }
+    fn reopen(&mut self) -> Result<(), String> {
+        if self.desktop_owned && self.service.is_none() && self.reopen > 0 {
+            // Validate with a temporary paused server, then let the reopened desktop
+            // spawn its own child. An update must not turn a desktop host into a service.
+            let discovery = crate::server_auth::Discovery::read(&self.directory)?;
+            let server = WaitProcess::open(discovery.pid)?;
+            crate::maintenance::rpc(&self.directory, "server.stop", serde_json::json!({}))?;
+            server.wait(METADATA_TIMEOUT)?;
+            crate::maintenance::wait_unowned(&self.directory, METADATA_TIMEOUT)?;
+            fs::remove_file(self.directory.join("update-validation")).map_err(|e| e.to_string())?;
+        } else if self.directory.join("update-validation").exists() {
+            crate::maintenance::rpc(
+                &self.directory,
+                "server.validateRestart",
+                serde_json::json!({}),
+            )?;
+        }
+        let exe = match &self.update.target {
+            InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.clone(),
+            InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
+        };
+        for _ in 0..self.reopen {
+            install::launch_with(&exe, &["--server-client"])?;
+        }
+        Ok(())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        // Validation mode never dispatched routines or mutations. Refuse restoration if
+        // a newer process still owns state. Never run the old binary on the new schema.
+        if crate::server_lock::Owner::acquire(&self.directory).is_err() {
+            let discovery = crate::server_auth::Discovery::read(&self.directory)?;
+            let server = WaitProcess::open(discovery.pid)?;
+            let launcher = if self.service.is_some() {
+                fs::read_to_string(self.directory.join("service-launcher.pid"))
+                    .ok()
+                    .map(|pid| {
+                        pid.trim()
+                            .parse::<u32>()
+                            .map_err(|e| e.to_string())
+                            .and_then(WaitProcess::open)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            crate::maintenance::rpc(&self.directory, "server.stop", serde_json::json!({}))?;
+            server.wait(METADATA_TIMEOUT)?;
+            crate::maintenance::wait_unowned(&self.directory, METADATA_TIMEOUT)?;
+            if let Some(launcher) = launcher {
+                launcher.wait(METADATA_TIMEOUT)?;
+            }
+        }
+        if let Some(service) = &self.service {
+            service.stop()?;
+        }
+        {
+            let _owner = crate::server_lock::Owner::acquire(&self.directory)?;
+            restore_previous(&self.update, &coordinated_path())?;
+            if let Some(backup) = &self.backup {
+                crate::maintenance::restore_backup(&self.directory, backup)?;
+            }
+        }
+        let _ = fs::remove_file(self.directory.join("update-validation"));
+        self.start()?;
+        readiness(&self.directory, env!("CARGO_PKG_VERSION"))?;
+        self.reopen()
+    }
+}
+
+pub fn coordinated_helper() -> Result<(), String> {
+    let storage = Storage::default_storage();
+    let directory = crate::store::directory().ok_or("No profile.")?;
+    if std::env::current_exe().map_err(|e| e.to_string())? != coordinated_path() {
+        return Err("Only the staged helper may coordinate replacement.".into());
+    }
+    let _lock = install::InstallLock::acquire(&storage.root)?;
+    let result = (|| {
+        let update = PreparedUpdate::from_value(
+            &serde_json::from_slice::<Value>(
+                &fs::read(storage.manifest()).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+        .ok_or("Invalid update manifest.")?;
+        Gh.reverify(&update)?;
+        // The manifest's target must be this helper's original installation, not a
+        // path supplied by a remote command. service.json is protected with the profile.
+        let service = crate::service::Service::load()?;
+        let installed_exe = match &update.target {
+            InstalledTarget::Windows { exe } => {
+                if Some(exe.parent().ok_or("No install folder.")?.to_path_buf())
+                    != install::install_dir()
+                {
+                    return Err("Wrong Windows installation.".into());
+                }
+                exe.clone()
+            }
+            InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
+            InstalledTarget::Linux { exe } => exe.clone(),
+        };
+        if let Some(service) = &service
+            && service.executable != installed_exe
+        {
+            return Err("Service points to another executable. Reconcile it with shina service install first.".into());
+        }
+        fs::write(storage.root.join("coordinated-started"), b"ready").map_err(|e| e.to_string())?;
+        let live = crate::server_lock::Owner::acquire(&directory).is_err();
+        let prepared = if live {
+            crate::maintenance::rpc(&directory, "server.prepareRestart", serde_json::json!({}))?
+        } else {
+            serde_json::json!({"clientPids":[]})
+        };
+        let mut host = CoordinatedUpdate {
+            update,
+            directory: directory.clone(),
+            service,
+            clients: Vec::new(),
+            server: None,
+            launcher: None,
+            update_id: prepared["updateId"].as_str().map(str::to_owned),
+            desktop_owned: prepared["desktopOwned"] == true,
+            reopen: 0,
+            closed_clients: 0,
+            backup: None,
+            replaced: false,
+        };
+        let prepare = (|| {
+            if let Some(pid) = prepared["serverPid"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+            {
+                host.server = Some(WaitProcess::open(pid)?);
+            }
+            if host.service.is_some()
+                && let Ok(pid) = fs::read_to_string(directory.join("service-launcher.pid"))
+            {
+                host.launcher = Some(WaitProcess::open(
+                    pid.trim().parse::<u32>().map_err(|e| e.to_string())?,
+                )?);
+            }
+            for pid in prepared["clientPids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_u64())
+            {
+                host.clients.push(WaitProcess::open(
+                    u32::try_from(pid).map_err(|e| e.to_string())?,
+                )?);
+            }
+            host.reopen = host.clients.len();
+            if live {
+                let deadline =
+                    Instant::now() + crate::maintenance::DRAIN_TIMEOUT - Duration::from_secs(2);
+                loop {
+                    let status = crate::maintenance::rpc(
+                        &directory,
+                        "server.status",
+                        serde_json::json!({}),
+                    )?;
+                    if status["updateId"] != prepared["updateId"] {
+                        return Err("Drain was cancelled. Normal operation resumed.".into());
+                    }
+                    if status["clientsReady"] == true {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("Client save timed out. Drain cancelled.".into());
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                crate::maintenance::rpc(&directory, "server.commitRestart", prepared.clone())?;
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = prepare {
+            if live {
+                let _ = crate::maintenance::rpc(&directory, "server.cancelRestart", prepared);
+            }
+            return Err(error);
+        }
+        let result = helper_sequence(&mut host);
+        if result.is_err() && !host.replaced {
+            // A post-commit wait or pre-swap save failed. Start the unchanged server.
+            let _ = fs::remove_file(directory.join("update-validation"));
+            if host.start().is_ok() && readiness(&directory, env!("CARGO_PKG_VERSION")).is_ok() {
+                host.reopen = host.closed_clients;
+                let _ = host.reopen();
+            }
+        }
+        if result.is_ok() {
+            let _ = fs::remove_file(storage.manifest());
+        }
+        result
+    })();
+    let message = match &result {
+        Ok(()) => "Update completed.".into(),
+        Err(error) => format!("Update did not complete: {error}"),
+    };
+    let _ = crate::store::write_atomic(
+        &storage.root.join("coordinated-result.txt"),
+        message.as_bytes(),
+    );
+    if result.is_err() {
+        let _ =
+            crate::store::write_atomic(&directory.join("startup-warning.txt"), message.as_bytes());
+    }
+    result
+}
+
+impl Updater {
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -1668,6 +2260,95 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeHelper {
+        steps: Vec<&'static str>,
+        fail: Option<&'static str>,
+    }
+    impl FakeHelper {
+        fn step(&mut self, step: &'static str) -> Result<(), String> {
+            self.steps.push(step);
+            if self.fail == Some(step) {
+                Err(format!("{step} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl HelperSteps for FakeHelper {
+        fn wait_clients(&mut self) -> Result<(), String> {
+            self.step("clients")
+        }
+        fn wait_server(&mut self) -> Result<(), String> {
+            self.step("server")
+        }
+        fn replace(&mut self) -> Result<(), String> {
+            self.step("backup-and-replace")
+        }
+        fn start(&mut self) -> Result<(), String> {
+            self.step("start")
+        }
+        fn validate(&mut self) -> Result<(), String> {
+            self.step("readiness")
+        }
+        fn reopen(&mut self) -> Result<(), String> {
+            self.step("reopen")
+        }
+        fn rollback(&mut self) -> Result<(), String> {
+            self.step("rollback")
+        }
+    }
+    #[test]
+    fn coordinated_helper_waits_replaces_validates_then_opens_clients() {
+        let mut helper = FakeHelper::default();
+        helper_sequence(&mut helper).unwrap();
+        assert_eq!(
+            helper.steps,
+            [
+                "clients",
+                "server",
+                "backup-and-replace",
+                "start",
+                "readiness",
+                "reopen"
+            ]
+        );
+        for failure in ["clients", "server"] {
+            let mut helper = FakeHelper {
+                fail: Some(failure),
+                ..FakeHelper::default()
+            };
+            assert!(helper_sequence(&mut helper).is_err());
+            assert!(!helper.steps.contains(&"backup-and-replace"));
+        }
+        for failure in ["start", "readiness"] {
+            let mut helper = FakeHelper {
+                fail: Some(failure),
+                ..FakeHelper::default()
+            };
+            assert!(
+                helper_sequence(&mut helper)
+                    .unwrap_err()
+                    .contains("restored")
+            );
+            assert_eq!(helper.steps.last(), Some(&"rollback"));
+            assert!(!helper.steps.contains(&"reopen"));
+        }
+    }
+    #[test]
+    fn linux_archive_rejects_links_traversal_and_duplicate_entries() {
+        let valid = "-rwxr-xr-x tester/tester 123 2026-11-11 12:00 Shina/shina\n";
+        assert!(linux_archive_safe(valid));
+        for bad in [
+            "lrwxrwxrwx tester/tester 0 2026-11-11 12:00 Shina/shina -> /tmp/other\n",
+            "-rwxr-xr-x tester/tester 123 2026-11-11 12:00 ../shina\n",
+            "-rwxr-xr-x tester/tester 123 2026-11-11 12:00 /Shina/shina\n",
+        ] {
+            assert!(!linux_archive_safe(bad));
+        }
+        assert!(!linux_archive_safe(&valid.repeat(2)));
+    }
 
     #[test]
     fn forbidden_is_not_automatically_an_authentication_denial() {

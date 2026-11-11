@@ -1,0 +1,18 @@
+[Unit]
+Description=Shina always-on server
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart="/opt/Shina/shina" --service-run "/data/Shina/service.json"
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=90
+StandardOutput=append:/data/Shina/service.log
+StandardError=append:/data/Shina/service.log
+
+[Install]
+WantedBy=default.target

@@ -27,7 +27,7 @@ Legacy single-process mode remains the default. Slice 1 of the [server architect
 
 `serve` is headless and owns harnesses, tasks, memory, routines and MCP. The desktop attaches to an authenticated loopback WebSocket endpoint described by the user-only `server.json`. If no server owns the profile, the desktop starts one and supervises it with 0.5 to 10 second restart backoff. Quitting stops only a server that desktop spawned, with a five-second grace. An independently started server keeps running after its clients close. Windows' background tray setting keeps the desktop and its owned server alive even after idle windows close.
 
-Both execution modes take the same `server-owner.sqlite` exclusive transaction before opening writable state. Do not delete that file. A legacy app cannot execute against a profile owned by `serve`. No login, provider environment or authentication settings are copied or changed.
+Both execution modes take the same `server-owner.sqlite` exclusive transaction before opening writable state. Do not delete that file. A legacy app cannot execute against a profile owned by `serve`. No provider credentials or authentication settings are copied or changed.
 
 Clients render projected records through the existing `State` and `Thread` APIs. Editors, attachments not yet submitted, selection, menus and expansion state stay local. Concurrent desktop launches reserve separate persistent draft slots under `clients/<slot>/ui-state.json`. Existing legacy drafts are read without rewriting their source. The server atomically keeps accepted inputs, transcripts and command receipts in `index.json`. `server-inputs.json` is a compatibility checkpoint for existing pending-input recovery. Memory and routines keep their existing files. Stop leaves recovered input for an `input.claim`. Only the initiating client automatically claims its stop/rewind results, never another client's editor.
 
@@ -35,7 +35,26 @@ The slice uses Tokio/Axum and the same Tungstenite implementation on both ends. 
 
 Every mutation has a client UUID. The index atomically journals its payload hash, receipt and uncertain dispatch intent before harness dispatch, then commits its result. Retrying the same ID returns its receipt; changed payloads fail. An uncertain intent is not automatically replayed after a crash. This does not promise exactly-once provider tools or a transaction across the separate memory and routine files.
 
-In-app update installation is disabled in server mode until slice 3 coordinates server and client replacement. Browser connections, remote listeners, pairing and services are not part of this slice.
+Installed server clients use the same in-app restart action as legacy mode. The server refuses updates while work, configuration, queues, approvals, clones or routines are active. A leased drain fences mutations and routine dispatch while clients save their drafts. A failed save or preparation timeout cancels the drain. Only after every connected local client acknowledges does the helper close clients and the server, wait for their processes, back up state, replace the app, validate server readiness and reopen clients. Backups remain under `Shina/backups`; rollback restores the matching binary and state. Browser connections, remote listeners and pairing remain out of scope.
+
+### Opt-in always-on server
+
+Desktop login startup remains off. Hosts that should keep running without a desktop window can opt in:
+
+```text
+shina service install
+shina service status
+shina service start
+shina service stop
+shina service uninstall
+shina update --yes
+```
+
+Linux uses a systemd user unit. `service install --enable-linger` explicitly asks `loginctl` to enable lingering without sudo or a password prompt. Without that flag, install leaves lingering unchanged and explains the logout limit. macOS uses a per-user LaunchAgent. Windows uses a per-user logon scheduled task with `InteractiveToken`, least privilege and hidden process startup. No administrator rights or desktop login item are requested. A normal explicit stop stays stopped until the next service start or login. Unexpected failures restart through the platform manager.
+
+Service installation reconciles executable and provider discovery paths, not credentials. It inherits the host's environment and reads an existing `Shina/service.env` on every launch. This file accepts one `NAME=value` assignment per line, optional `export`, comments and quoted values, without shell execution or expansion. Use the host's existing Pi/CPA and Codex configuration and login. Shina never exports authentication into unit files. Logs go to `Shina/service.log`. `service stop`, `service uninstall` and the tray's explicit Stop server can interrupt work. Updating cannot.
+
+`shina update --yes` uses the existing GitHub CLI login and release checksums, including `Shina-linux-x86_64.tar.gz` on headless Linux. The flag explicitly approves an idle-only restart. Authentication denial stops that attempt and asks you to run `gh auth login` yourself. A protocol-major mismatch refuses commands with upgrade guidance; protocol minor versions negotiate down. In server-client mode the Windows tray shows connection status and sends Stop server through the authenticated client connection. Quitting an attached client does not stop an independent service.
 
 For any development GUI check, set `LOCALAPPDATA` to a new temporary directory before launching either process. Never use the real profile for fixtures. `cargo test --test server_runtime` starts real servers and fake Pi/ACP subprocesses in isolated profiles without consuming quota.
 
@@ -95,7 +114,7 @@ The `dev-release` profile disables LTO, enables incremental compilation, and cac
 
 The workflow uses hosted GitHub runners and the job-scoped `GITHUB_TOKEN`; no CPA enrollment, signing secrets, or workstation access is needed. Mac bundles retain the existing ad-hoc signing rather than Developer ID notarization. Hosted runner usage is billed against the private repository's Actions allowance. New main pushes cancel superseded builds. Checksums, saved drafts, explicit restart and rollback remain in the app; they do not delay building or publication.
 
-Linux initially ships as `Shina-linux-x86_64.tar.gz`, built on Ubuntu 24.04. Extract and run `./Shina/shina` with a Vulkan-capable desktop and existing Pi/CPA enrollment. It requires glibc 2.39 or newer. Linux installation and in-app updates are not implemented yet; replace the portable download manually. Windows and Mac retain their existing in-app updater.
+Linux ships as `Shina-linux-x86_64.tar.gz`, built on Ubuntu 24.04. Extract and run `./Shina/shina` with a Vulkan-capable desktop and existing Pi/CPA enrollment. It requires glibc 2.39 or newer. Linux hosts can update that executable with `shina update --yes`, including a coordinated service restart. Linux has no desktop installer or automatic in-app download yet. Windows and Mac retain their existing in-app updater.
 
 An installed copy of Shina updates itself without a download step. It checks GitHub Releases 2 seconds after start and every 30 seconds after each check, through the GitHub CLI and your existing `gh` login, because the repository is private. When a newer version exists, Shina downloads it in the background, checks its size and SHA-256 against the release (the asset digest, or the release's `SHA256SUMS` file) and prepares the replacement next to the installed app. The sidebar shows a passive **Downloading update vX.Y.Z** row meanwhile, then one **Restart to update to vX.Y.Z** button and nothing else.
 

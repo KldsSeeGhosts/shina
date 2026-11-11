@@ -256,6 +256,17 @@ impl State {
         let Some(tray) = &self.background.tray else {
             return false;
         };
+        tray.server_status(
+            if self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.commands.connected())
+            {
+                "connected"
+            } else {
+                "disconnected or draining"
+            },
+        );
         let changed = match tray.action() {
             1 => {
                 if let Some(handle) = &self.background.handle {
@@ -266,6 +277,14 @@ impl State {
             2 => {
                 self.background.quitting = true;
                 tx.quit();
+                true
+            }
+            3 => {
+                if let Some(client) = &self.client
+                    && let Err(error) = client.commands.send("server.stop", json!({}))
+                {
+                    self.background.status.error = Some(error);
+                }
                 true
             }
             _ => false,

@@ -514,8 +514,7 @@ impl State {
             }
         };
         self.setup_client_background();
-        self.updater.disable_for_server();
-        self.restart_notice = Some("In-app installation is disabled in server mode until coordinated server updates ship in slice 3.".into());
+        self.updater.start(true, Instant::now(), wake.clone());
         self.client.as_mut().expect("client").start(wake);
     }
 
@@ -532,7 +531,8 @@ impl State {
     }
 
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
-        let changed = self.poll_client_background(tx);
+        let changed =
+            self.poll_client_background(tx) | self.updater.poll(Instant::now(), self.wake.clone());
         if self.background.quitting {
             return true;
         }
@@ -546,6 +546,32 @@ impl State {
         while let Some(event) = self.client.as_ref().and_then(|client| client.event()) {
             changed = true;
             match event {
+                crate::client::Event::Maintenance(method, mut params) => {
+                    if method == "server.draining" {
+                        params["pid"] = json!(std::process::id());
+                        let saved = self.checkpoint_and_flush();
+                        let (method, params) = match saved {
+                            Ok(()) => ("server.clientReady", params),
+                            Err(error) => {
+                                self.restart_notice = Some(format!(
+                                    "Update cancelled because drafts could not save: {error}"
+                                ));
+                                ("server.cancelRestart", params)
+                            }
+                        };
+                        if let Some(client) = &self.client {
+                            let _ = client.commands.send(method, params);
+                        }
+                    } else if method == "server.restarting" {
+                        self.background.quitting = true;
+                        tx.quit();
+                    } else if method == "server.stopping" {
+                        self.restart_notice = Some("The local server stopped. Start it with shina service start or shina serve.".into());
+                    } else {
+                        self.restart_notice =
+                            Some("Update drain cancelled. Normal operation resumed.".into());
+                    }
+                }
                 crate::client::Event::Error(error) => self.storage_error = Some(error),
                 crate::client::Event::Receipt(command, value) => {
                     if let Some(thread) = self
@@ -566,7 +592,11 @@ impl State {
                             thread.remote_send = Some((id, edit, attachments));
                         }
                     }
-                    if value["result"]["status"] == "accepted" {
+                    if command.method.starts_with("server.") {
+                        if let Some(error) = value["error"]["message"].as_str() {
+                            self.restart_notice = Some(error.into());
+                        }
+                    } else if value["result"]["status"] == "accepted" {
                         if matches!(
                             command.method.as_str(),
                             "thread.create"
@@ -666,6 +696,15 @@ impl State {
         }
         if changed {
             self.checkpoint_client();
+        }
+        if self.restart_for_update {
+            self.restart_for_update = false;
+            if let Err(error) = self.prepared_exit(true, None) {
+                self.restart_notice = Some(error);
+            }
+        }
+        if let Some(wait) = self.updater.remaining(Instant::now()) {
+            tx.wake_after(wait);
         }
         changed
     }

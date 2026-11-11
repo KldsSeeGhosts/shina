@@ -506,3 +506,113 @@ fn a_lost_send_acknowledgement_retries_the_same_id_without_a_second_prompt() {
     );
     profile.stop();
 }
+
+#[test]
+fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let old_client = client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4());
+    assert!(
+        old_client["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("older client")
+    );
+    let mismatch = client.rpc(
+        "hello",
+        json!({"protocolMajor":99,"protocolMinor":0,"projectionSchema":1}),
+        json!("bad-version"),
+    );
+    assert!(
+        mismatch["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shina update")
+    );
+    let refused = client.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"refused"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hello")
+    );
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
+        json!("good-version"),
+    );
+    assert_eq!(hello["result"]["protocolMinor"], 1);
+    let prepared =
+        client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
+    assert_eq!(prepared["phase"], "draining");
+    assert_eq!(prepared["clientsReady"], false);
+    let blocked = client.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"fenced"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("draining")
+    );
+    let commit = client.command(
+        "server.commitRestart",
+        prepared.clone(),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        commit["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("clients")
+    );
+    let cancelled = client.command("server.cancelRestart", prepared, uuid::Uuid::new_v4());
+    assert_eq!(cancelled["result"]["phase"], "ready");
+    let renamed = client.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"resumed"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(renamed["result"]["status"], "accepted");
+    profile.stop();
+}
+
+#[test]
+fn committed_restart_waits_for_client_acknowledgement_then_exits_cleanly() {
+    let mut profile = Profile::new();
+    let process = profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":1,"projectionSchema":1,"clientPid":4242}),
+        json!("register"),
+    );
+    let mut prepared =
+        client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
+    prepared["pid"] = json!(4242);
+    let ack = client.command("server.clientReady", prepared.clone(), uuid::Uuid::new_v4());
+    assert_eq!(ack["result"]["clientsReady"], true);
+    let commit = client.command("server.commitRestart", prepared, uuid::Uuid::new_v4());
+    assert_eq!(commit["result"]["phase"], "restarting");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = profile.children[process].try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "committed server did not exit");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!profile.root.join("Shina/server.json").exists());
+    assert_eq!(
+        fs::read_to_string(profile.root.join("Shina/restart-flushed")).unwrap(),
+        commit["result"]["updateId"].as_str().unwrap()
+    );
+}

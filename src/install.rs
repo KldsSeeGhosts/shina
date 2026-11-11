@@ -52,18 +52,22 @@ pub fn install_dir() -> Option<PathBuf> {
 pub enum InstalledTarget {
     Windows { exe: PathBuf },
     MacBundle { app: PathBuf },
+    Linux { exe: PathBuf },
 }
 
 impl InstalledTarget {
     /// The Windows executable or the macOS bundle directory.
     pub fn path(&self) -> &Path {
         match self {
-            Self::Windows { exe } => exe,
+            Self::Windows { exe } | Self::Linux { exe } => exe,
             Self::MacBundle { app } => app,
         }
     }
     /// The release asset this build installs from, for the running architecture.
     pub fn asset(&self) -> &'static str {
+        if matches!(self, Self::Linux { .. }) {
+            return "Shina-linux-x86_64.tar.gz";
+        }
         #[cfg(all(not(windows), target_arch = "x86_64"))]
         if matches!(self, Self::MacBundle { .. }) {
             return "Shina-macos-x86_64.zip";
@@ -143,7 +147,7 @@ fn target_for_executable(current: &Path, installed: &Path) -> Option<InstalledTa
 /// The executable a target runs, which is the bundle's inner binary on macOS.
 fn executable_in(target: &InstalledTarget) -> PathBuf {
     match target {
-        InstalledTarget::Windows { exe } => exe.clone(),
+        InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.clone(),
         InstalledTarget::MacBundle { app } => app.join(executable_path()),
     }
 }

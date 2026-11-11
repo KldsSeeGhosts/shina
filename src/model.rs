@@ -5565,6 +5565,23 @@ impl State {
             }
             return Err(error);
         }
+        if self.client.is_some() {
+            if !self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.commands.connected())
+            {
+                return Err("Reconnect to the local server before requesting an update.".into());
+            }
+            crate::update::start_coordinated_helper(&update)?;
+            self.restart_for_update = false;
+            self.restart_notice =
+                Some("Waiting for the server and local clients to save before restarting.".into());
+            return Err(
+                "Coordinated restart requested. This window will close after every client saves."
+                    .into(),
+            );
+        }
         crate::update::record_exit(crate::update::ExitUpdate {
             update,
             relaunch: explicit,

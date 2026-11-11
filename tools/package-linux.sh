@@ -1,5 +1,5 @@
 #!/bin/sh
-# A portable x86_64 Linux download. Linux has no in-app installer/updater yet.
+# A portable x86_64 Linux download. Headless hosts update through `shina update --yes`.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${1:?Supply the built Linux executable}

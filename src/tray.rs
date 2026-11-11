@@ -3,7 +3,7 @@
 mod windows {
     use rune::Waker;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     };
@@ -17,6 +17,7 @@ mod windows {
     const REFRESH: u32 = WM_APP + 2;
     const OPEN: usize = 1;
     const QUIT: usize = 2;
+    const STOP_SERVER: usize = 3;
 
     struct Context {
         count: Arc<AtomicUsize>,
@@ -26,6 +27,7 @@ mod windows {
         icon: HICON,
         added: bool,
         taskbar_created: u32,
+        server_status: Arc<Mutex<Option<String>>>,
     }
 
     fn wide(text: &str) -> Vec<u16> {
@@ -53,7 +55,11 @@ mod windows {
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = CALLBACK;
         data.hIcon = context.icon;
-        let tip = wide(&format!("Shina: {count} working"));
+        let status = context.server_status.lock().expect("tray status").clone();
+        let tip = wide(&status.map_or_else(
+            || format!("Shina: {count} working"),
+            |status| format!("Shina server {status}: {count} working"),
+        ));
         for (to, from) in data.szTip.iter_mut().zip(tip) {
             *to = from;
         }
@@ -103,14 +109,28 @@ mod windows {
                             // mutable context borrow across that reentrant call.
                             let action = context.action.clone();
                             let wake = context.wake.clone();
+                            let server_status =
+                                context.server_status.lock().expect("tray status").clone();
                             unsafe {
                                 AppendMenuW(menu, MF_STRING, OPEN, wide("Open Shina").as_ptr());
                                 AppendMenuW(
                                     menu,
                                     MF_STRING | MF_DISABLED | MF_GRAYED,
                                     0,
-                                    wide(&format!("{count} working")).as_ptr(),
+                                    wide(&server_status.as_ref().map_or_else(
+                                        || format!("{count} working"),
+                                        |status| format!("Server {status}, {count} working"),
+                                    ))
+                                    .as_ptr(),
                                 );
+                                if server_status.is_some() {
+                                    AppendMenuW(
+                                        menu,
+                                        MF_STRING,
+                                        STOP_SERVER,
+                                        wide("Stop server").as_ptr(),
+                                    );
+                                }
                                 AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
                                 AppendMenuW(menu, MF_STRING, QUIT, wide("Quit").as_ptr());
                                 let mut point = POINT { x: 0, y: 0 };
@@ -127,7 +147,7 @@ mod windows {
                                 ) as usize;
                                 DestroyMenu(menu);
                                 PostMessageW(hwnd, WM_NULL, 0, 0);
-                                if matches!(selection, OPEN | QUIT) {
+                                if matches!(selection, OPEN | QUIT | STOP_SERVER) {
                                     action.store(selection, Ordering::Release);
                                     wake();
                                 }
@@ -160,6 +180,7 @@ mod windows {
         resumed: Arc<AtomicBool>,
         action: Arc<AtomicUsize>,
         worker: Option<std::thread::JoinHandle<()>>,
+        server_status: Arc<Mutex<Option<String>>>,
     }
 
     impl Tray {
@@ -167,6 +188,8 @@ mod windows {
             let count = Arc::new(AtomicUsize::new(0));
             let resumed = Arc::new(AtomicBool::new(false));
             let action = Arc::new(AtomicUsize::new(0));
+            let server_status = Arc::new(Mutex::new(None));
+            let worker_status = server_status.clone();
             let (ready, receive) = mpsc::sync_channel(1);
             let worker_count = count.clone();
             let worker_resumed = resumed.clone();
@@ -180,6 +203,7 @@ mod windows {
                     icon: std::ptr::null_mut(),
                     added: false,
                     taskbar_created: 0,
+                    server_status: worker_status,
                 });
                 let instance = GetModuleHandleW(std::ptr::null());
                 let class = wide("ShinaBackgroundOwner");
@@ -259,12 +283,22 @@ mod windows {
                 resumed,
                 action,
                 worker: Some(worker),
+                server_status,
             })
         }
 
         pub fn update(&self, count: usize, visible: bool) {
             let encoded = if visible { count.saturating_add(1) } else { 0 };
             if self.count.swap(encoded, Ordering::AcqRel) != encoded {
+                unsafe {
+                    PostMessageW(self.hwnd as HWND, REFRESH, 0, 0);
+                }
+            }
+        }
+        pub fn server_status(&self, status: &str) {
+            let mut current = self.server_status.lock().expect("tray status");
+            if current.as_deref() != Some(status) {
+                *current = Some(status.into());
                 unsafe {
                     PostMessageW(self.hwnd as HWND, REFRESH, 0, 0);
                 }
@@ -317,6 +351,7 @@ impl Tray {
         Err("Notification-area background mode is supported on Windows only.".into())
     }
     pub fn update(&self, _: usize, _: bool) {}
+    pub fn server_status(&self, _: &str) {}
     pub fn resumed(&self) -> bool {
         false
     }
