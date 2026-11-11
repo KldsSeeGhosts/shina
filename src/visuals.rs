@@ -401,7 +401,7 @@ fn embedded(cache: &ImageCache, captain: usize) -> (Set, Set) {
     }
 }
 
-/// A small original pixel mark: a dark crew badge with a cream "S" and three service dots.
+/// A provider mark from PNG bytes.
 fn provider_mark(cache: &ImageCache, png: &[u8]) -> Image {
     let image = image::load_from_memory(png)
         .expect("valid provider mark")

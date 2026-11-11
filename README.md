@@ -253,7 +253,7 @@ The full T3 thread-management port is on hold for a separate spec. Snooze and au
 
 This is an initial desktop prototype. Login UI, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
 
-The pixel S and three colored dots use the same drawing code in [`src/brand.rs`](src/brand.rs) for the in-app mark and native window/Windows executable icons. Checked-in PNG, ICO favicon, and Mac iconset exports retain sharp pixels at every size. The old Pikachu project icon is no longer used. Regenerate exports after changing the mark:
+The mark is a 32-cell pixel sailboat drawn by [`src/brand.rs`](src/brand.rs). The light theme shows a day sail with a sun, clouds and the three status dots as foam; the dark theme shows a night sail under a moon and stars. The window icon follows the saved theme at launch. The executable icon, favicons and Mac iconset use the night sail because they cannot follow the theme. Exports keep sharp pixels at every size. Regenerate them after changing the mark:
 
 ```sh
 cargo run --example export-icons -- assets
