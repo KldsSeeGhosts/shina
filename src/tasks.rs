@@ -933,6 +933,32 @@ impl State {
         changed |= self.start_queued_tasks();
         changed | self.poll_legacy_tasks(now)
     }
+
+    /// A task record for demo scenes and layout tests. It never starts a process: the child
+    /// must already exist as a delegated thread, and `started_ago` is in milliseconds.
+    pub fn demo_task(
+        &mut self,
+        child_id: usize,
+        state: TaskState,
+        started_ago: Option<u64>,
+        reply: &str,
+        error: &str,
+    ) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == child_id) else {
+            return;
+        };
+        let mut task = Task::new(thread, &thread.title.clone(), None);
+        let now = lifecycle::now();
+        task.started_at = started_ago.map(|ago| now.saturating_sub(ago));
+        if state.finished() {
+            task.finish(state, reply, error);
+            task.delivered = true;
+        } else {
+            task.state = state;
+            task.error_excerpt = error.into();
+        }
+        self.tasks.push(task);
+    }
 }
 
 #[cfg(test)]

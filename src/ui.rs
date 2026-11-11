@@ -10,6 +10,8 @@ use rune::{
 };
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
+#[path = "crew_ui.rs"]
+mod crew_ui;
 #[path = "pi_ui.rs"]
 mod pi_ui;
 
@@ -76,7 +78,6 @@ fn palette(dark: bool) -> Palette {
     }
 }
 pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
-pub const SERIF_FAMILY: &str = "Anthropic Serif Variable Text, Source Serif 4";
 pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/InterVariable.ttf"),
     include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
@@ -473,10 +474,9 @@ fn status(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
-/// Room for "Working for 59m 59s" in the chat header and "12 threads working" beside a
-/// captain's heading, so live status never reflows the row around it.
+/// Room for "Working for 59m 59s" in the chat header, so live status never reflows the row
+/// around it.
 const HEADER_STATUS_SLOT: f32 = 132.0;
-const CAPTAIN_STATUS_SLOT: f32 = 124.0;
 /// A live status in a slot of fixed width. The text sits at the slot's end in tabular
 /// figures, never shrinks or truncates, and fades between values on Shina's motion curve, so
 /// "Ready" becoming "Working for 12m 05s" moves nothing beside it. Ready and Done show only
@@ -718,6 +718,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.settings_menu {
         root = root.child(settings_menu(s, p));
+    }
+    if docked && let Some(pill) = crew_ui::attention_row(s, p, sidebar_width < 240.0) {
+        root = root.child(pill);
+    }
+    if s.attention_menu && docked && !s.attention().is_empty() {
+        root = root.child(crew_ui::attention_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -1315,12 +1321,25 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             })
             .hover(if selected { p.teal_bg } else { p.selected })
             .disabled(!enabled)
+            .child(harness_icon(s, p, id, name))
             .child(
                 label(name, TextStyle::new(13.5, 450.0), p.ink)
                     .truncate()
-                    .grow(1.0)
+                    .shrink()
                     .min_w(0.0),
             );
+        if id != "pi" {
+            // KSG Code's `ModelListRow` "New" tag, here naming the protocol the agent speaks.
+            item = item.child(
+                label("ACP", TextStyle::new(9.5, 650.0).tracking(0.4), p.muted)
+                    .key(format!("harness-tag-{id}"))
+                    .px(4.0)
+                    .py(1.0)
+                    .radius(4.0)
+                    .border(1.0, p.ink.alpha(0.12)),
+            );
+        }
+        item = item.child(spacer());
         if selected {
             item = item.child(icon("check", p.teal_text));
         }
@@ -1423,6 +1442,28 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
     card.child(header).child(rule(p)).child(list)
 }
 
+/// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
+/// mark when the agent names one, Pi's own glyph, or a generic agent glyph.
+fn harness_icon(s: &State, p: Palette, id: &str, name: &str) -> El {
+    static PI: Icon = Icon {
+        name: "PI",
+        view: 16.0,
+        body: r#"<path d="M3 4.5h10M6 4.5V12M10.25 4.5v5.75a1.75 1.75 0 0 0 1.75 1.75h.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    static AGENT: Icon = Icon {
+        name: "AGENT",
+        view: 16.0,
+        body: r#"<rect x="2" y="3" width="12" height="10" rx="2.5" fill="none" stroke="currentColor"/><path d="m5 6.5 2 1.5-2 1.5M8.5 10H11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    if id == "pi" {
+        return rune::icon(&PI, 16.0).color(p.ink).a11y_hidden();
+    }
+    match model_vendor(id, name) {
+        Vendor::Other => rune::icon(&AGENT, 16.0).color(p.muted).a11y_hidden(),
+        vendor => provider_icon(s, p, vendor, 16.0),
+    }
+}
+
 fn sidebar_toggle(p: Palette, compact: bool) -> El {
     icon_button("sidebar-toggle", "Toggle sidebar", "sidebar", p, move |s| {
         if compact {
@@ -1463,7 +1504,9 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
                 p.ink,
             ));
     }
-    header.child(spacer())
+    header
+        .child(spacer())
+        .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
 }
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
@@ -1489,6 +1532,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .unwrap_or_else(|| "All workspaces".into()),
         }
     };
+    if let Some(notice) = crew_ui::recovery_banner(s, p) {
+        side = side.child(notice);
+    }
     side = side.child(
         row()
             .key("workspace-context")
@@ -2517,6 +2563,18 @@ pub(crate) fn tick_portraits(
     } else {
         vec![]
     };
+    let mut rows = rows;
+    let t = s.current();
+    if let Some(captain) = t
+        .captain
+        .filter(|_| t.messages.is_empty() && t.tools.is_empty())
+    {
+        rows.push((
+            HERO_PORTRAIT_ROW,
+            captain_portrait(s, Some(captain)),
+            face_for(shown_status(s)),
+        ));
+    }
     s.portraits.tick(now, rows)
 }
 
@@ -5244,7 +5302,7 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
 fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
     let t = s.current();
     match part {
-        TranscriptPart::Tools(indices) => inline_tools(s, p, indices),
+        TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
         TranscriptPart::Thought(index) => inline_thought(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
@@ -5298,9 +5356,12 @@ fn live_status(t: &Thread) -> String {
 fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
     let t = s.current();
     let parts = turn_parts(t, start, end);
+    // A captain's delegations are its answer, not its working: their task cards stay in view
+    // when the rest of the turn folds into "Worked for".
+    let card = |part: &TranscriptPart| crew_ui::is_card_part(s, t, part);
     let last_work = parts
         .iter()
-        .rposition(|part| !matches!(part, TranscriptPart::Text { .. }));
+        .rposition(|part| !matches!(part, TranscriptPart::Text { .. }) && !card(part));
     // Initial thinking may precede the preamble on the wire. Keep that thinking in
     // the work section, and the first text before subsequent work above its fold.
     let preamble = last_work.and_then(|last| {
@@ -5335,10 +5396,10 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             response = response.child(transcript_part(s, p, wide, part));
         }
     }
-    let work_rows = |mut rows: El| {
+    let work_rows = |mut rows: El, lift_cards: bool| {
         if let Some(last) = last_work {
             for (index, part) in parts[..=last].iter().enumerate() {
-                if Some(index) != preamble {
+                if Some(index) != preamble && !(lift_cards && card(part)) {
                     let row = transcript_part(s, p, wide, part);
                     // Prose between tool rows keeps its paragraph rhythm.
                     rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
@@ -5354,7 +5415,10 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     if live {
         // While Pi works, its steps show as they happen, and one status line says what it
         // is doing now. The turn folds into "Worked for" when it ends.
-        let mut rows = work_rows(col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0));
+        let mut rows = work_rows(
+            col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+            false,
+        );
         let seconds = t.started.map(|start| start.elapsed().as_secs());
         rows = rows.child(
             row()
@@ -5431,9 +5495,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     .key(format!("work-rows-{}-{start}", t.id))
                     .pl(14.0)
                     .gap(2.0),
+                true,
             ));
         }
         response = response.child(section);
+        if let Some(last) = last_work {
+            for part in parts[..=last].iter().filter(|part| card(part)) {
+                response = response.child(transcript_part(s, p, wide, part));
+            }
+        }
     }
     if !live || last_work.is_some() {
         for part in &parts[last_work.map_or(0, |index| index + 1)..] {
@@ -5465,93 +5535,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             .pb(12.0)
             .gap(16.0);
         if let Some(captain) = t.captain {
-            introduction = introduction.child(
-                row()
-                    .gap(12.0)
-                    .center_y()
-                    .child(avatar(s, p, captain, 40.0, shown_status(s)))
-                    .child(
-                        col()
-                            .gap(3.0)
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .child(
-                                row()
-                                    .gap(8.0)
-                                    .center_y()
-                                    .child(
-                                        label(
-                                            if s.is_captain_home(t) && t.renamed {
-                                                t.title.clone()
-                                            } else {
-                                                format!("Captain {}", s.captains[captain].name)
-                                            },
-                                            TextStyle::new(24.0, 450.0)
-                                                .family(rune::Family::Named(SERIF_FAMILY))
-                                                .lh(32.0),
-                                            p.ink,
-                                        )
-                                        .key("captain-goal-heading")
-                                        .wrap()
-                                        .shrink()
-                                        .min_w(0.0),
-                                    )
-                                    .child({
-                                        let working = s
-                                            .threads
-                                            .iter()
-                                            .filter(|thread| {
-                                                thread.parent == Some(t.id)
-                                                    && !thread.archived()
-                                                    && thread.status == Status::Running
-                                            })
-                                            .count();
-                                        // The heading wraps and gives way first; the status
-                                        // keeps a fixed slot so a count change never reflows it.
-                                        if working == 0 {
-                                            status_slot(
-                                                "captain-status",
-                                                shown_status(s),
-                                                None,
-                                                CAPTAIN_STATUS_SLOT,
-                                                p,
-                                            )
-                                        } else {
-                                            status_slot(
-                                                "captain-working-count",
-                                                Status::Running,
-                                                Some(format!(
-                                                    "{working} {} working",
-                                                    if working == 1 { "thread" } else { "threads" }
-                                                )),
-                                                CAPTAIN_STATUS_SLOT,
-                                                p,
-                                            )
-                                        }
-                                    }),
-                            )
-                            .child(
-                                label(
-                                    format!(
-                                        "{} · {}",
-                                        if t.renamed {
-                                            format!("Captain {}", s.captains[captain].name)
-                                        } else {
-                                            s.captains[captain].role.clone()
-                                        },
-                                        s.captains[captain]
-                                            .instructions
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("")
-                                    ),
-                                    SMALL,
-                                    p.muted,
-                                )
-                                .wrap(),
-                            ),
-                    ),
-            );
+            introduction = introduction
+                .items_center()
+                .pb(16.0)
+                .child(captain_hero(s, p, captain, pane_width));
         } else {
             introduction = introduction
                 .items_center()
@@ -5626,6 +5613,17 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     );
                 }
                 row().justify_end().child(user)
+            } else if let Some(completion) = s
+                .is_captain_home(t)
+                .then(|| crew_ui::parse_completion(message.display_text()))
+                .flatten()
+            {
+                crew_ui::result_block(s, p, wide, &completion)
+            } else if let Some(brief) = (message.role == "Shina" && t.delegated)
+                .then(|| crew_ui::parse_brief(message.display_text()))
+                .flatten()
+            {
+                crew_ui::brief_block(s, p, wide, brief)
             } else {
                 col()
                     .gap(4.0)
@@ -5664,6 +5662,118 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .px(gutter)
         .items_center()
         .child(messages)
+}
+
+/// The sidebar portraits' animation stage also plays the captain hero, under this row id.
+pub(crate) const HERO_PORTRAIT_ROW: usize = usize::MAX;
+const HERO_PORTRAIT: f32 = 72.0;
+
+/// An empty captain home greets like KSG Code's draft hero (`DraftHeroHeadline`: centred
+/// `text-3xl font-normal tracking-tight`, `text-2xl` on a narrow pane), with the captain's
+/// animated portrait above it. A home with a goal shows the goal; otherwise the captain asks
+/// what to look after. The live status keeps one 20 px line, so it never moves the composer.
+fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
+    let t = s.current();
+    let profile = &s.captains[captain];
+    let status = shown_status(s);
+    let face = face_for(status);
+    let portrait_index = captain_portrait(s, Some(captain));
+    let pixels = s
+        .portraits
+        .pixels(portrait_index, face)
+        .unwrap_or_else(|| s.artwork.face(portrait_index, face).pixels());
+    let portrait = el()
+        .key("captain-hero-portrait")
+        .size(HERO_PORTRAIT, HERO_PORTRAIT)
+        .radius(20.0)
+        .clip_rounded(20.0)
+        .border(0.5, p.line)
+        .pixels(pixels)
+        .a11y_hidden()
+        .on_visible(|s: &mut State, on, tx| {
+            s.portraits.set_visible(HERO_PORTRAIT_ROW, on);
+            tx.live_only();
+            tx.wake_after(std::time::Duration::ZERO);
+        });
+    let heading = if s.is_captain_home(t) && t.renamed {
+        t.title.clone()
+    } else {
+        format!("What should {} look after?", profile.name)
+    };
+    let narrow = lane_width(pane_width, true) < 560.0;
+    let working = s
+        .threads
+        .iter()
+        .filter(|thread| {
+            thread.parent == Some(t.id) && !thread.archived() && thread.status == Status::Running
+        })
+        .count();
+    let (key, line_status, text) = if working > 0 {
+        (
+            "captain-working-count",
+            Status::Running,
+            Some(format!(
+                "{working} {} working",
+                if working == 1 { "thread" } else { "threads" }
+            )),
+        )
+    } else if matches!(status, Status::Ready | Status::Completed) {
+        ("captain-status", status, None)
+    } else {
+        ("captain-status", status, Some(status.label().to_string()))
+    };
+    let mut status_line = row().key("captain-status-line").h(20.0).center_y();
+    if let Some(text) = text {
+        status_line = status_line.child(
+            row()
+                .key(key)
+                .label(text.clone())
+                .center_y()
+                .gap(6.0)
+                .opacity_motion(slider_curve(false))
+                .child(status_mark(line_status, p, 6.0))
+                .child(label(
+                    text,
+                    SMALL.features(TABULAR),
+                    status_ink(line_status, p),
+                )),
+        );
+    }
+    let role = profile
+        .instructions
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .map_or_else(
+            || format!("Captain {} · {}", profile.name, profile.role),
+            |line| format!("Captain {} · {line}", profile.name),
+        );
+    col()
+        .key("captain-hero")
+        .w_full()
+        .items_center()
+        .gap(10.0)
+        .child(status_badge(p, portrait, HERO_PORTRAIT, status).mb(6.0))
+        .child(
+            label(
+                heading,
+                if narrow { HEADING_NARROW } else { HEADING },
+                p.ink,
+            )
+            .key("captain-goal-heading")
+            .align(rune::Align::Center)
+            .wrap()
+            .w_full()
+            .max_w(measure(true)),
+        )
+        .child(
+            label(role, SMALL.lh(18.0), p.muted)
+                .align(rune::Align::Center)
+                .wrap()
+                .w_full()
+                .max_w(520.0),
+        )
+        .child(status_line)
 }
 
 /// The new-thread screen, laid out like KSG Code's draft hero: the composer sits at the
@@ -6363,6 +6473,19 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
     let attach_locked =
         s.demo || t.archived() || t.configuring || t.native.operating() || t.request.is_some();
+    // Delegation context sits above the composer, nearest first: who sent this worker, then
+    // what the crew needs from the user, then what it is doing.
+    let lane = lane_width(pane_width, wide);
+    for part in [
+        crew_ui::parent_bar(s, p, lane),
+        crew_ui::needs_you(s, p),
+        crew_ui::crew_tray(s, p, lane),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        area = area.child(part);
+    }
     area = area.child(pi_ui::slash_menu(s, p));
     area = area.child(pi_ui::queued_messages(s, p));
     // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
@@ -6761,6 +6884,7 @@ pub(crate) mod tests {
                 "harness-group",
                 "choose-harness-pi",
                 "choose-harness-fixture",
+                "harness-tag-fixture",
                 "model-list",
                 "model-search",
             ] {
@@ -6772,6 +6896,10 @@ pub(crate) mod tests {
                     "{key}: {rect:?}"
                 );
             }
+            assert!(
+                rt.presented("harness-tag-pi").is_none(),
+                "Pi is built in, not an ACP agent"
+            );
             press(&mut rt, "choose-harness-fixture");
             assert_eq!(rt.state.current().harness, "fixture");
             assert!(rt.state.current().selected_model.is_none());
@@ -8766,6 +8894,161 @@ pub(crate) mod tests {
         assert!(rt.state.current().project.is_none());
         assert!(rt.state.current().captain.is_none());
     }
+    fn assert_inside(rt: &mut Runtime<State>, width: f32, keys: &[&str]) {
+        for key in keys {
+            let (r, _) = rt
+                .presented(key)
+                .unwrap_or_else(|| panic!("{width}: {key} is missing"));
+            assert!(
+                r[0] >= 0.0 && r[0] + r[2] <= width + 1.0 && r[2] > 0.0,
+                "{width}: {key} {r:?}"
+            );
+        }
+    }
+    fn crew_runtime(width: f32) -> Runtime<State> {
+        let mut rt = runtime(width);
+        crate::captain_workspace_demo(&mut rt.state);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt
+    }
+
+    #[test]
+    fn captain_crew_surfaces_fit_and_open_workers_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            assert_eq!(rt.state.current().id, 7);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "task-card-16",
+                    "task-clock-16",
+                    "resume-task-18",
+                    "dismiss-task-18",
+                    "result-open-1",
+                    "needs-you",
+                    "needs-you-2",
+                    "approve-2",
+                    "decline-2",
+                    "crew-tray",
+                    "crew-chip-19",
+                    "composer",
+                ],
+            );
+            // Delegations are task cards, not generic tool rows, and finished tasks stay off
+            // the tray.
+            assert!(rt.presented("inline-tool-7-0").is_none());
+            assert!(rt.presented("crew-chip-1").is_none());
+            assert!(rt.presented("crew-chip-18").is_none());
+            // The approval stack scrolls inside KSG's max-h-80.
+            assert!(rt.presented("needs-you").unwrap().0[3] <= 320.5);
+            press(&mut rt, "crew-chip-16");
+            rt.frame(1.0);
+            assert_eq!(rt.state.current().id, 16, "{width}");
+            assert_inside(&mut rt, width, &["parent-bar", "open-captain", "composer"]);
+            assert!(rt.presented("crew-tray").is_none());
+            press(&mut rt, "open-captain");
+            assert_eq!(rt.state.current().id, 7, "{width}");
+            press(&mut rt, "open-request-2");
+            assert_eq!(rt.state.current().id, 2, "{width}");
+        }
+    }
+
+    #[test]
+    fn the_crew_tray_stacks_on_a_narrow_lane() {
+        let rt = crew_runtime(1280.0);
+        let first = rt.presented("crew-chip-16").unwrap().0;
+        let second = rt.presented("crew-chip-17").unwrap().0;
+        assert!(
+            (first[1] - second[1]).abs() < 1.0,
+            "wide lanes keep one row"
+        );
+        let rt = crew_runtime(560.0);
+        let first = rt.presented("crew-chip-16").unwrap().0;
+        let second = rt.presented("crew-chip-17").unwrap().0;
+        assert!(second[1] > first[1] + 20.0, "narrow lanes stack");
+        assert!(
+            (first[2] - second[2]).abs() < 1.0,
+            "stacked chips share a width"
+        );
+    }
+
+    #[test]
+    fn attention_row_keeps_one_height_and_opens_threads_from_its_popover() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            let (row, _) = rt.presented("attention-row").unwrap();
+            assert_eq!(row[3], 28.0);
+            assert_inside(&mut rt, width, &["attention-row", "attention-count"]);
+            press(&mut rt, "attention-row");
+            assert!(rt.state.attention_menu);
+            assert_inside(&mut rt, width, &["attention-menu", "attention-item-18"]);
+            press(&mut rt, "attention-item-18");
+            assert_eq!(rt.state.current().id, 18);
+            assert!(!rt.state.attention_menu);
+        }
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        for t in &mut rt.state.threads {
+            t.request = None;
+            if t.status == Status::Failed {
+                t.status = Status::Ready;
+            }
+        }
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.state.attention().is_empty());
+        assert!(rt.presented("attention-row").is_none());
+        let keys = ["workspace-context", "thread-search-field", "sidebar"];
+        let before: Vec<_> = keys.iter().map(|k| rt.presented(k).unwrap().0).collect();
+        rt.state.threads[0].request = Some(json!({"method":"confirm"}));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.presented("attention-row").is_some());
+        let after: Vec<_> = keys.iter().map(|k| rt.presented(k).unwrap().0).collect();
+        assert_eq!(before, after, "the attention pill never moves the sidebar");
+    }
+
+    #[test]
+    fn recovery_notice_reviews_the_first_interrupted_task_or_dismisses() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state.recovery_notice = Some("Shina was closed while 2 tasks were running.".into());
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(&mut rt, width, &["recovery-notice", "review-recovery"]);
+            press(&mut rt, "review-recovery");
+            assert_eq!(rt.state.current().id, 18);
+            assert!(rt.state.recovery_notice.is_none());
+            rt.state.recovery_notice = Some("Notice".into());
+            rt.invalidate();
+            press(&mut rt, "dismiss-recovery");
+            assert!(rt.state.recovery_notice.is_none());
+        }
+    }
+
+    #[test]
+    fn an_empty_captain_greets_with_a_large_portrait_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            rt.frame(0.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &["captain-hero-portrait", "captain-goal-heading", "composer"],
+            );
+            let (portrait, _) = rt.presented("captain-hero-portrait").unwrap();
+            let (heading, _) = rt.presented("captain-goal-heading").unwrap();
+            let (composer, _) = rt.presented("composer").unwrap();
+            assert_eq!(portrait[2], HERO_PORTRAIT);
+            assert!(portrait[1] + portrait[3] < heading[1]);
+            assert!(heading[1] + heading[3] < composer[1]);
+        }
+    }
+
     #[test]
     fn an_empty_captain_keeps_the_reference_composer_width() {
         let mut rt = runtime(1280.0);
