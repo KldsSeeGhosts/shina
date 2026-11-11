@@ -739,6 +739,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.settings_menu {
         root = root.child(settings_menu(s, p));
     }
+    if s.machines.picker {
+        root = root.child(machine_picker(s, p));
+    }
+    if s.machines.dialog {
+        root = root.child(machine_dialog(s, p));
+    }
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
     }
@@ -1664,6 +1670,27 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         );
     }
     let mut content = col().pb(2.0).gap(2.0).min_h(s.sidebar_viewport_height);
+    if s.client.is_some() {
+        content = content.child(
+            label(
+                format!(
+                    "{}{}",
+                    s.machine_label(&s.machines.selected),
+                    if s.machine_connected(&s.machines.selected) {
+                        ""
+                    } else {
+                        " · Offline, reconnecting"
+                    }
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key("sidebar-machine-label")
+            .px(ROW_INSET)
+            .py(4.0)
+            .truncate(),
+        );
+    }
     let captains = s.sidebar_captains();
     if !s.show_archive || !captains.is_empty() {
         let mut heading = section_title("Captains", p);
@@ -1853,6 +1880,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .padding(8.0),
         );
     }
+    content = content.child(other_machine_threads(s, p));
     side = side.child(
         col()
             .key("sidebar-scroll")
@@ -1959,6 +1987,16 @@ fn settings_menu(s: &State, p: Palette) -> El {
         .child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
     for item in captain_ui::background_settings(s, p) {
         menu = menu.child(item);
+    }
+    if s.client.is_some() {
+        menu = menu.child(
+            menu_item("machine-settings", "Linked machines", "monitor", p).on_press(
+                |s: &mut State| {
+                    s.settings_menu = false;
+                    s.machines.dialog = true;
+                },
+            ),
+        );
     }
     menu = menu.child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
     menu.anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
@@ -2105,6 +2143,21 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                         ),
                 ),
         );
+    if s.machines.selected != "local" {
+        card = card
+            .child(label("Destination path on this server", SMALL, p.muted))
+            .child(
+                text_input(&s.machines.project_path, BODY)
+                    .key("remote-clone-path")
+                    .label("Host destination path")
+                    .single_line()
+                    .w_full()
+                    .padding(8.0)
+                    .border(1.0, p.field_line)
+                    .color(p.ink)
+                    .on_edit(|s: &mut State| &mut s.machines.project_path),
+            );
+    }
     let hint = match s.clone_target() {
         Ok((_, target)) => format!("Creates {}", target.display()),
         Err(_) if projects.clone_source.text.trim().is_empty() => {
@@ -4641,6 +4694,9 @@ const SUBMIT_CHORD: &str = if cfg!(target_os = "macos") {
 /// typing a path. Enter opens the highlighted folder, Ctrl+Enter adds the typed one, and a
 /// path that does not exist yet is created first.
 fn add_project_palette(s: &State, p: Palette) -> El {
+    if s.machines.selected != "local" {
+        return remote_project_dialog(s, p);
+    }
     let browsing = s.picker_browsing;
     let query = s.picker_query.text.clone();
     let folders = if browsing {
@@ -4876,6 +4932,74 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         |s| s.project_picker = None,
         card,
     )
+}
+
+/// Ported from KSG Code's AddEnvironmentDialog host input; paths belong to the selected server.
+fn remote_project_dialog(s: &State, p: Palette) -> El {
+    let card = col()
+        .key("remote-project-dialog")
+        .role("dialog")
+        .label("Add workspace on server")
+        .w((s.viewport_width - 32.0).clamp(280.0, 480.0))
+        .padding(16.0)
+        .gap(12.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .child(
+            label(
+                format!("Workspace on {}", s.machine_label(&s.machines.selected)),
+                BODY,
+                p.ink,
+            )
+            .wrap(),
+        )
+        .child(
+            label(
+                "Enter an absolute path on that server. Shina does not copy or translate files.",
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        )
+        .child(
+            text_input(&s.machines.project_path, BODY)
+                .key("remote-project-path")
+                .label("Host workspace path")
+                .single_line()
+                .w_full()
+                .padding(8.0)
+                .border(1.0, p.field_line)
+                .color(p.ink)
+                .on_edit(|s: &mut State| &mut s.machines.project_path),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .child(spacer())
+                .child(button("remote-project-cancel", "Cancel", p, |s| {
+                    s.project_picker = None
+                }))
+                .child(
+                    primary_button("remote-project-add", "Add workspace", p, |s| {
+                        let path = std::path::PathBuf::from(&s.machines.project_path.text);
+                        match s.add_project(path) {
+                            Ok(_) => s.project_picker = None,
+                            Err(error) => s.machines.notice = Some(error),
+                        }
+                    })
+                    .disabled(!s.machine_connected(&s.machines.selected)),
+                ),
+        );
+    el().key("remote-project-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .center()
+        .fill(Color::BLACK.alpha(0.28))
+        .modal(false, |s: &mut State| s.project_picker = None)
+        .child(card)
 }
 
 /// What a tool call does, for its one-line row: icon, past and present verb, and what it
@@ -6502,6 +6626,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         area = area.child(dialog(s, p));
     }
     let can_send = !s.demo
+        && (s.client.is_none() || s.machine_connected(&s.machines.selected))
+        && !t.initializing
         && !t.archived()
         && !t.configuring
         && t.request.is_none()
@@ -6692,7 +6818,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     // access mode on the right, inset to line up with the card's controls.
     let mut footer = row()
         .key("composer-footer")
-        .min_h(24.0)
+        .min_h(if s.client.is_some() { 28.0 } else { 24.0 })
         .px(10.0)
         .flex_wrap()
         .center_y()
@@ -6723,30 +6849,12 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                     )),
             )
     } else {
-        let local = t.machine == "local";
-        footer
-            .child(icon(if local { "monitor" } else { "cloud" }, p.muted))
-            .child(
-                label(
-                    if local {
-                        "Local".to_string()
-                    } else {
-                        t.machine.clone()
-                    },
-                    SMALL,
-                    p.muted,
-                )
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-            )
-            .child(spacer())
-            .child(
-                button("access-mode", t.native.access.label(), p, |s| {
-                    s.current_mut().native.access_picker = true
-                })
-                .disabled(t.status.busy() || t.configuring || t.archived()),
-            )
+        footer.child(machine_selector(s, p)).child(spacer()).child(
+            button("access-mode", t.native.access.label(), p, |s| {
+                s.current_mut().native.access_picker = true
+            })
+            .disabled(t.status.busy() || t.configuring || t.archived()),
+        )
     };
     area = area.child(footer);
     col()
@@ -6755,6 +6863,287 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .px(lane_gutter(pane_width))
         .items_center()
         .child(area)
+}
+
+/// Ported from KSG Code's BranchToolbarEnvironmentSelector and ComposerControl size="xs".
+fn machine_selector(s: &State, p: Palette) -> El {
+    let title = s.machine_label(&s.machines.selected);
+    row()
+        .key("machine-selector")
+        .role("button")
+        .label("Run on")
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .radius(8.0)
+        .hover(p.selected)
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .disabled(s.client.is_none())
+        .on_press(|s: &mut State| s.machines.picker = !s.machines.picker)
+        .child(
+            icon(
+                if s.machines.selected == "local" {
+                    "monitor"
+                } else {
+                    "cloud"
+                },
+                p.muted,
+            )
+            .size(12.0, 12.0),
+        )
+        .child(
+            label(title, SMALL, p.muted)
+                .key("machine-selector-label")
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Ported from KSG Code's BranchToolbarEnvironmentSelector SelectPopup/SelectGroup.
+fn machine_picker(s: &State, p: Palette) -> El {
+    let mut menu = col()
+        .key("machine-picker")
+        .role("menu")
+        .label("Run on")
+        .w(270.0)
+        .max_h(360.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .padding(4.0)
+        .gap(1.0)
+        .radius(8.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .child(label("Run on", SMALL, p.muted).px(8.0).py(6.0));
+    let servers = std::iter::once("local".to_owned()).chain(
+        s.client
+            .iter()
+            .flat_map(|client| client.linked.keys().cloned()),
+    );
+    for server in servers {
+        let title = format!(
+            "{}{}",
+            s.machine_label(&server),
+            if s.machine_connected(&server) {
+                ""
+            } else {
+                " · Offline"
+            }
+        );
+        let key = format!("machine-option-{server}");
+        menu = menu.child(
+            menu_item(
+                &key,
+                &title,
+                if server == "local" {
+                    "monitor"
+                } else {
+                    "cloud"
+                },
+                p,
+            )
+            .on_press(move |s: &mut State| {
+                s.select_machine(&server);
+                if s.machines.selected == server && s.machine_connected(&server) {
+                    s.new_thread_in(None);
+                }
+            }),
+        );
+    }
+    menu = menu.child(
+        menu_item("link-machine", "Add to another machine", "plus", p).on_press(|s: &mut State| {
+            s.machines.picker = false;
+            s.machines.dialog = true;
+        }),
+    );
+    menu.anchored_fit("machine-selector", rune::Side::Top, rune::Align::Start, 6.0)
+        .modal(true, |s: &mut State| s.machines.picker = false)
+}
+
+/// Ported from KSG Code's SidebarThreadRow environment label, grouped by server.
+fn other_machine_threads(s: &State, p: Palette) -> El {
+    let mut rows = col().gap(2.0);
+    for (server, projection) in &s.machines.views {
+        if server == &s.machines.selected {
+            continue;
+        }
+        let machine = s.machine_label(server);
+        rows = rows.child(
+            label(
+                format!(
+                    "{machine}{}",
+                    if s.machine_connected(server) {
+                        ""
+                    } else {
+                        " · Offline"
+                    }
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key(format!("machine-heading-{server}"))
+            .px(ROW_INSET)
+            .pt(12.0)
+            .pb(4.0)
+            .truncate(),
+        );
+        for thread in projection["index"]["threads"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if thread["delegated"] == true || !thread["lifecycle"]["archivedAt"].is_null() {
+                continue;
+            }
+            let title = thread["title"].as_str().unwrap_or("Thread");
+            if !s.search.text.is_empty()
+                && !title.to_lowercase().contains(&s.search.text.to_lowercase())
+            {
+                continue;
+            }
+            let server = server.clone();
+            let id = thread["id"].as_u64().unwrap_or(0) as usize;
+            let captain = thread["captainHome"] == true;
+            rows = rows.child(
+                row()
+                    .key(format!("machine-thread-{server}-{id}"))
+                    .role("button")
+                    .label(format!("{title}, {machine}"))
+                    .h(44.0)
+                    .px(ROW_INSET)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .on_press(move |s: &mut State| {
+                        s.select_machine(&server);
+                        if s.machines.selected == server
+                            && let Some(index) = s.threads.iter().position(|thread| thread.id == id)
+                        {
+                            s.select_thread(index);
+                        }
+                    })
+                    .child(icon(if captain { "crew" } else { "thread" }, p.muted))
+                    .child(
+                        col()
+                            .min_w(0.0)
+                            .grow(1.0)
+                            .child(label(title, LABEL, p.ink).truncate().min_w(0.0))
+                            .child(label(&machine, SMALL, p.muted).truncate().min_w(0.0)),
+                    ),
+            );
+        }
+    }
+    rows
+}
+
+/// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
+fn machine_dialog(s: &State, p: Palette) -> El {
+    let busy = s.machines.pending.is_some();
+    let mut card = col().key("machine-dialog").role("dialog").label("Linked machines")
+        .w((s.viewport_width-32.0).clamp(280.0,520.0)).max_h((s.viewport_height-64.0).max(240.0))
+        .scroll(ScrollSpec {stick_bottom:false}).padding(16.0).gap(12.0).radius(10.0)
+        .fill(p.card).border(0.5,p.line)
+        .child(row().center_y().child(label("Linked machines",TextStyle::new(16.0,550.0),p.ink)).child(spacer())
+            .child(icon_button("close-machines","Close","close",p,|s| {
+                s.machines.dialog=false;s.machines.code.replace_text("");s.machines.notice=None;
+            })))
+        .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
+        .child(label("Host",SMALL,p.ink))
+        .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("kidsseemac",p.muted)
+            .single_line().w_full().padding(8.0).radius(6.0).border(1.0,p.field_line).color(p.ink)
+            .disabled(busy).on_edit(|s: &mut State| &mut s.machines.host))
+        .child(label("Pairing code",SMALL,p.ink))
+        .child(text_input(&s.machines.code,BODY).key("machine-code").label("Pairing code").placeholder("PAIRCODE",p.muted)
+            .single_line().w_full().padding(8.0).radius(6.0).border(1.0,p.field_line).color(p.ink)
+            .disabled(busy).on_edit(|s: &mut State| &mut s.machines.code))
+        .child(primary_button("machine-link-submit","Link machine",p,|s| s.machine_action("link","")).disabled(busy))
+        .child(row().flex_wrap().gap(8.0)
+            .child(button("machine-pair","Create a code for this host",p,|s| s.machine_action("pair","")).disabled(busy))
+            .child(button("machine-devices","Authorized devices",p,|s| s.machine_action("devices","")).disabled(busy)));
+    if let Some(notice) = &s.machines.notice {
+        card = card.child(
+            label(notice, SMALL, p.muted)
+                .key("machine-notice")
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    if let Some(client) = &s.client {
+        for (id, remote) in &client.linked {
+            let server = id.clone();
+            card = card.child(
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .child(
+                        label(
+                            remote
+                                .remote
+                                .as_ref()
+                                .map(|link| link.host.as_str())
+                                .unwrap_or(id),
+                            SMALL,
+                            p.ink,
+                        )
+                        .grow(1.0)
+                        .truncate()
+                        .min_w(0.0),
+                    )
+                    .child(
+                        button(&format!("unlink-{id}"), "Unlink and revoke", p, move |s| {
+                            s.machine_action("unlink", &server)
+                        })
+                        .disabled(busy),
+                    ),
+            );
+        }
+    }
+    for device in s.machines.devices.as_array().into_iter().flatten() {
+        if !device["revokedAt"].is_null() {
+            continue;
+        }
+        let id = device["deviceId"].as_str().unwrap_or("").to_owned();
+        let title = format!("Device {}", &id[..id.len().min(8)]);
+        card = card.child(
+            row()
+                .center_y()
+                .gap(8.0)
+                .child(label(title, SMALL, p.muted).grow(1.0))
+                .child(
+                    button(&format!("revoke-{id}"), "Revoke", p, move |s| {
+                        s.machine_action("revoke", &id)
+                    })
+                    .disabled(busy),
+                ),
+        );
+    }
+    el().key("machines-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(Color::BLACK.alpha(0.28))
+        .center()
+        .modal(false, |s: &mut State| {
+            s.machines.dialog = false;
+            s.machines.code.replace_text("");
+            s.machines.notice = None;
+        })
+        .child(card)
 }
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
@@ -6944,6 +7333,107 @@ pub(crate) mod tests {
             Env::new(false, 1.0),
             rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
         )
+    }
+    #[test]
+    fn machine_selector_labels_and_link_dialog_fit_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            let mut client = crate::client::Client::new(rt.state.data_dir.clone());
+            let mut remote = crate::client::Client::new(rt.state.data_dir.clone());
+            remote.remote = Some(crate::peer::Link {
+                server_id: "fixture-server".into(),
+                host: "kidsseemac".into(),
+                device_id: "fixture-device".into(),
+                token: "fixture".into(),
+            });
+            client.linked.insert("fixture-server".into(), remote);
+            rt.state.client = Some(client);
+            rt.state.machines.views.insert(
+                "fixture-server".into(),
+                json!({"index":{"threads":[
+                    {"id":1,"title":"Remote thread","captainHome":false,"lifecycle":{}},
+                    {"id":2,"title":"Remote captain","captainHome":true,"lifecycle":{}}
+                ]}}),
+            );
+            rt.frame(0.0);
+            for key in ["machine-selector", "machine-selector-label"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            for key in [
+                "sidebar-machine-label",
+                "machine-heading-fixture-server",
+                "machine-thread-fixture-server-1",
+                "machine-thread-fixture-server-2",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            press(&mut rt, "machine-selector");
+            for key in [
+                "machine-picker",
+                "machine-option-local",
+                "machine-option-fixture-server",
+                "link-machine",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            press(&mut rt, "link-machine");
+            for key in [
+                "machine-dialog",
+                "machine-host",
+                "machine-code",
+                "machine-link-submit",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            press(&mut rt, "close-machines");
+            rt.state.machines.selected = "fixture-server".into();
+            rt.state.project_picker = Some(ProjectPicker::AddProject);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.25);
+            assert!(rt.presented("remote-project-path").is_some());
+            assert!(
+                rt.find("send-message")
+                    .is_none_or(|_| !rt.state.machine_connected("fixture-server"))
+            );
+        }
     }
     #[test]
     fn background_settings_fit_the_existing_menu_at_supported_widths() {

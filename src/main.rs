@@ -16,6 +16,7 @@ mod maintenance;
 mod mcp;
 mod model;
 mod outbox;
+mod peer;
 mod portraits;
 mod power;
 mod process;
@@ -460,6 +461,7 @@ fn main() {
     let result = match cli.first().map(String::as_str) {
         Some("service") => Some(service::cli(&cli[1..])),
         Some("update") => Some(update::cli_update(&cli[1..])),
+        Some("pair" | "link" | "links" | "unlink" | "devices") => Some(peer::cli(&cli)),
         Some("--service-run") => Some(
             cli.get(1)
                 .ok_or("Service descriptor required.".to_string())

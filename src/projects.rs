@@ -62,12 +62,24 @@ impl Project {
             "captain": self.captain, "captainThread": self.captain_thread,
         })
     }
-    pub fn from_value(value: &Value) -> Option<Self> {
+    /// Client paths are opaque host strings. Do not canonicalize or inspect another host.
+    pub fn from_record(value: &Value, inspect_host: bool) -> Option<Self> {
         let id = usize::try_from(value["id"].as_u64()?).ok()?;
         if id == 0 || id == usize::MAX {
             return None;
         }
-        let mut project = Self::new(id, PathBuf::from(value["path"].as_str()?));
+        let path = PathBuf::from(value["path"].as_str()?);
+        let mut project = Self {
+            id,
+            name: String::new(),
+            path: path.clone(),
+            machine: String::new(),
+            hidden: false,
+            updated: 0,
+            captain: None,
+            captain_thread: None,
+            icon: if inspect_host { find_icon(&path) } else { None },
+        };
         project.name = value["name"].as_str()?.into();
         project.machine = value["machine"].as_str()?.into();
         if project.path.as_os_str().is_empty() || project.machine.is_empty() {
@@ -729,6 +741,18 @@ impl State {
         if self.demo {
             return;
         }
+        if self.machines.selected != "local" {
+            self.projects.clone_parent = self
+                .projects
+                .recents
+                .clone_parent
+                .clone()
+                .unwrap_or_default();
+            self.machines
+                .project_path
+                .replace_text(self.projects.clone_parent.to_string_lossy());
+            return;
+        }
         self.projects.clone_parent = self
             .projects
             .recents
@@ -757,6 +781,9 @@ impl State {
         Ok((source, self.projects.clone_parent.join(name)))
     }
     pub fn start_clone(&mut self) {
+        if self.machines.selected != "local" {
+            self.projects.clone_parent = PathBuf::from(&self.machines.project_path.text);
+        }
         if self.forward("project.clone", serde_json::json!({"source":self.projects.clone_source.text,"parent":self.projects.clone_parent})) { return; }
         if self.projects.cloning() {
             return;
@@ -917,6 +944,10 @@ pub fn list_folders(dir: &Path, filter: &str) -> Vec<String> {
 
 /// The native folder picker, shared by the Add workspace palette and Ctrl+O.
 pub fn pick_folder(s: &mut State, tx: &mut Tx) {
+    if s.machines.selected != "local" {
+        s.open_picker(crate::model::ProjectPicker::AddProject);
+        return;
+    }
     tx.open_folder(
         rune::FileDialogOptions {
             title: "Open a project folder".into(),
@@ -939,6 +970,10 @@ pub fn pick_folder(s: &mut State, tx: &mut Tx) {
 
 /// The folder picker for the clone destination.
 pub fn pick_clone_parent(s: &mut State, tx: &mut Tx) {
+    if s.machines.selected != "local" {
+        s.projects.clone_error = Some("Type a destination path on the selected server.".into());
+        return;
+    }
     tx.open_folder(
         rune::FileDialogOptions {
             title: "Choose where to clone".into(),

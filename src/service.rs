@@ -271,18 +271,25 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     let action = args.first().map(String::as_str).unwrap_or("status");
     let mut name = None;
     let mut linger = false;
+    let mut tailnet = false;
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--enable-linger" if action == "install" => linger = true,
+            "--tailnet" if action == "install" => tailnet = true,
             "--name" if action == "install" => name = Some(iter.next().ok_or("--name requires a value.")?.clone()),
-            _ => return Err("Usage: shina service install [--enable-linger] [--name Shina-name] | uninstall | status | start | stop".into()),
+            _ => return Err("Usage: shina service install [--tailnet] [--enable-linger] [--name Shina-name] | uninstall | status | start | stop".into()),
         }
     }
     let existing = Service::load()?;
     if action == "install" {
-        let service =
+        let mut service =
             Service::current(name.or_else(|| existing.as_ref().map(|old| old.name.clone())))?;
+        if tailnet {
+            service
+                .environment
+                .insert("SHINA_SERVICE_TAILNET".into(), "1".into());
+        }
         if let Some(old) = &existing {
             if old.name != service.name {
                 return Err("Uninstall the existing service before changing its name.".into());
@@ -430,6 +437,13 @@ pub fn launch(path: &Path) -> Result<(), String> {
         .env("SHINA_BOOT_SERVICE", "1")
         .env_remove("SHINA_DESKTOP_OWNER_PID")
         .stdin(Stdio::null());
+    if service
+        .environment
+        .get("SHINA_SERVICE_TAILNET")
+        .is_some_and(|value| value == "1")
+    {
+        command.arg("--tailnet");
+    }
     match fs::read_to_string(service.directory.join("service.env")) {
         Ok(text) => {
             for line in text

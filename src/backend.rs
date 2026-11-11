@@ -85,8 +85,8 @@ fn acquire_session<'a>(
     }
 }
 
-/// Machine dispatch lives here, not in the UI or orchestration reducer. A remote host
-/// can implement the same session transport without changing project/thread ownership.
+/// A server dispatches only its own subprocesses. Multi-server clients send commands to
+/// the owning server, whose records use `local`. Never fall back to this host for a peer.
 pub enum BackendHost {
     Local,
 }

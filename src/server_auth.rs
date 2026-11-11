@@ -2,6 +2,65 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// One live code per host, with a bounded global attempt window. Restart invalidates it.
+#[derive(Default)]
+pub struct Pairing {
+    code_hash: String,
+    expires: u64,
+    deadline: Option<std::time::Instant>,
+    attempts: u32,
+    window: u64,
+}
+impl Pairing {
+    pub fn create(&mut self, now: u64) -> Result<serde_json::Value, String> {
+        if self.expires > now
+            && self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return Err(
+                "A pairing code is already active. Wait for its five-minute expiry.".into(),
+            );
+        }
+        let code = secret()[..12].to_ascii_uppercase();
+        self.code_hash = crate::protocol::revision(&serde_json::json!(code));
+        self.expires = now + 300_000;
+        self.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
+        Ok(serde_json::json!({"code":code,"expiresAt":self.expires}))
+    }
+    pub fn exchange(
+        &mut self,
+        database: &crate::database::Database,
+        code: &str,
+        device: &str,
+        now: u64,
+    ) -> Result<String, String> {
+        if now.saturating_sub(self.window) >= 60_000 {
+            self.window = now;
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        if self.attempts > 5
+            || now >= self.expires
+            || self
+                .deadline
+                .is_none_or(|deadline| std::time::Instant::now() >= deadline)
+            || self.code_hash.is_empty()
+            || code.len() != 12
+            || self.code_hash != crate::protocol::revision(&serde_json::json!(code))
+            || uuid::Uuid::parse_str(device).is_err()
+        {
+            return Err("Pairing refused.".into());
+        }
+        // Consume before issuing. Storage failure never makes a code reusable.
+        self.code_hash.clear();
+        self.expires = 0;
+        let token = secret();
+        database.issue_scoped_device(device, &token, &["paired", "read", "operate", "approve"])?;
+        Ok(token)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Discovery {
@@ -49,12 +108,32 @@ pub fn protect(directory: &Path) -> Result<(), String> {
             .find(|part| part.starts_with("S-1-"))
             .ok_or("Missing user SID.")?;
         restrict_windows(directory, sid, true)?;
-        for name in ["server.json", "server.json.tmp"] {
+        for name in [
+            "server.json",
+            "server.json.tmp",
+            "credential.json",
+            "credential.json.tmp",
+            "client-credential.json",
+            "client-credential.json.tmp",
+        ] {
             let path = directory.join(name);
             if path.exists() {
                 restrict_windows(&path, sid, false)?;
             }
         }
+    }
+    Ok(())
+}
+
+pub fn save_secret(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let directory = path.parent().ok_or("Missing credential directory.")?;
+    protect(directory)?;
+    crate::store::write_atomic(path, bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

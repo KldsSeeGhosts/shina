@@ -31,6 +31,8 @@ struct ThreadView {
     context_usage: crate::context::ContextUsage,
     context_phase: crate::context::ContextPhase,
     configuring: bool,
+    #[serde(default)]
+    initializing: bool,
     phase: String,
     error: Option<String>,
     diagnostics: Vec<String>,
@@ -111,6 +113,7 @@ impl ThreadView {
             context_usage: thread.context.usage.clone(),
             context_phase: thread.context.phase,
             configuring: thread.configuring,
+            initializing: thread.initializing,
             phase: thread.phase.clone(),
             error: thread.error.clone(),
             diagnostics: thread.diagnostics.clone(),
@@ -212,6 +215,9 @@ impl ThreadView {
         thread.context.usage = self.context_usage;
         thread.context.phase = self.context_phase;
         thread.configuring = self.configuring;
+        if thread.remote.is_some() {
+            thread.initializing = self.initializing;
+        }
         thread.phase = self.phase;
         thread.error = self.error;
         thread.diagnostics = self.diagnostics;
@@ -632,6 +638,7 @@ impl State {
         }
         json!({
             "index":index,"threads":self.thread_views(),"recoveryNotice":self.recovery_notice,
+            "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
             "routines":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.routines(id)))).collect::<serde_json::Map<_,_>>(),
@@ -674,6 +681,11 @@ impl State {
                 return;
             }
         };
+        let ui = &self.client_views["localUi"];
+        self.machines.ui = ui
+            .get("machineUi")
+            .cloned()
+            .unwrap_or_else(|| json!({"local":ui}));
         self.setup_client_background();
         self.updater.start(true, Instant::now(), wake.clone());
         self.client.as_mut().expect("client").start(wake);
@@ -686,8 +698,15 @@ impl State {
         ui["tabs"] = json!(self.tabs);
         ui["dark"] = json!(self.dark);
         ui["zoom"] = json!(self.zoom);
+        self.machines.ui[&self.machines.selected] = ui.clone();
+        // The top-level legacy format remains the local server's namespace.
+        let mut saved = self.machines.ui["local"].clone();
+        if saved.is_null() {
+            saved = ui;
+        }
+        saved["machineUi"] = self.machines.ui.clone();
         if let Some(store) = &mut self.ui_store {
-            store.save(ui);
+            store.save(saved);
         }
     }
 
@@ -697,18 +716,85 @@ impl State {
         if self.background.quitting {
             return true;
         }
-        let projection = self.client.as_ref().and_then(|client| client.snapshot());
-        let mut changed = changed || projection.is_some();
-        if let Some(projection) = projection
-            && let Err(error) = self.apply_projection(projection)
-        {
-            self.storage_error = Some(error);
+        let projections = self
+            .client
+            .as_ref()
+            .map(|client| client.snapshots())
+            .unwrap_or_default();
+        let mut changed = changed || !projections.is_empty();
+        for (server, projection) in projections {
+            self.machines
+                .views
+                .insert(server.clone(), projection.clone());
+            if server == self.machines.selected
+                && let Err(error) = self.apply_projection(projection)
+            {
+                self.storage_error = Some(error);
+            }
         }
         if let Some(client) = &self.client {
-            client.show_history(self.current().id);
+            if self.machines.selected == "local" {
+                client.show_history(self.current().id);
+            } else if let Some(client) = client.linked.get(&self.machines.selected) {
+                client.show_history(self.current().id);
+            }
         }
-        while let Some(event) = self.client.as_ref().and_then(|client| client.event()) {
+        let mut events = self
+            .machines
+            .receipts
+            .remove(&self.machines.selected)
+            .unwrap_or_default()
+            .into_iter();
+        loop {
+            let event = events
+                .next()
+                .map(|event| (self.machines.selected.clone(), event))
+                .or_else(|| {
+                    self.client
+                        .as_ref()
+                        .and_then(|client| client.machine_event())
+                });
+            let Some((server, event)) = event else {
+                break;
+            };
             changed = true;
+            if server != self.machines.selected
+                && matches!(event, crate::client::Event::Receipt(..))
+            {
+                if let crate::client::Event::Receipt(command, value) = &event
+                    && let Some(thread) =
+                        self.machines.threads.get_mut(&server).and_then(|threads| {
+                            threads
+                                .iter_mut()
+                                .find(|thread| json!(thread.id) == command.params["threadId"])
+                        })
+                    && thread
+                        .remote_send
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id == command.command_id)
+                    && let Some((_, edit, attachments)) = thread.remote_send.take()
+                    && value["result"]["status"] == "accepted"
+                    && thread.draft == edit
+                    && thread.draft_images == attachments
+                {
+                    thread.draft.replace_text("");
+                    thread.draft_images.clear();
+                    self.machines.ui[&server]["drafts"][thread.id.to_string()] = json!("");
+                }
+                self.machines
+                    .receipts
+                    .entry(server)
+                    .or_default()
+                    .push(event);
+                continue;
+            }
+            if server != "local" && matches!(event, crate::client::Event::Maintenance(..)) {
+                self.machines.notice = Some(format!(
+                    "{} is restarting or unavailable. Reconnecting.",
+                    self.machine_label(&server)
+                ));
+                continue;
+            }
             match event {
                 crate::client::Event::Maintenance(method, mut params) => {
                     if method == "server.draining" {
@@ -736,7 +822,14 @@ impl State {
                             Some("Update drain cancelled. Normal operation resumed.".into());
                     }
                 }
-                crate::client::Event::Error(error) => self.storage_error = Some(error),
+                crate::client::Event::Error(error) => {
+                    if server == "local" {
+                        self.storage_error = Some(error);
+                    } else {
+                        self.machines.notice =
+                            Some(format!("{}: {error}", self.machine_label(&server)));
+                    }
+                }
                 crate::client::Event::Receipt(command, value) => {
                     if let Some(thread) = self
                         .threads
@@ -801,6 +894,64 @@ impl State {
                         self.storage_error = Some(value["error"]["message"].as_str().or(value["result"]["result"]["error"].as_str()).unwrap_or("Command outcome is uncertain. Inspect the receipt before retrying.").into());
                     }
                 }
+            }
+        }
+        if let Some(result) = self
+            .machines
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.try_recv().ok())
+        {
+            self.machines.pending = None;
+            changed = true;
+            match result {
+                Ok(crate::peer::MachineResult::Linked(link)) => {
+                    if self
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.linked.contains_key(&link.server_id))
+                    {
+                        let threads = if self.machines.selected == link.server_id {
+                            Some(&mut self.threads)
+                        } else {
+                            self.machines.threads.get_mut(&link.server_id)
+                        };
+                        if let Some(threads) = threads {
+                            for thread in threads {
+                                if thread.remote_send.take().is_some() {
+                                    thread.error=Some("This device was paired again. Review the previous send before retrying. Your draft was kept.".into());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(client) = &mut self.client {
+                        client.add_link(link, self.wake.clone());
+                    }
+                    self.machines.code.replace_text("");
+                    self.machines.notice =
+                        Some("Machine linked. Its workspace will appear when connected.".into());
+                }
+                Ok(crate::peer::MachineResult::Paired(value)) => {
+                    self.machines.notice = Some(format!(
+                        "Pairing code: {}. Expires in five minutes and works once.",
+                        value["code"].as_str().unwrap_or("")
+                    ))
+                }
+                Ok(crate::peer::MachineResult::Unlinked(id)) => {
+                    if self.machines.selected == id {
+                        self.select_machine("local");
+                    }
+                    if let Some(client) = &mut self.client {
+                        client.linked.remove(&id);
+                    }
+                    self.machines.views.remove(&id);
+                    self.machines.threads.remove(&id);
+                    self.machines.notice = Some(
+                        "The server acknowledged revocation. Local drafts were retained.".into(),
+                    );
+                }
+                Ok(crate::peer::MachineResult::Devices(value)) => self.machines.devices = value,
+                Err(error) => self.machines.notice = Some(error),
             }
         }
         if let Some(id) = self.client_select
@@ -920,7 +1071,11 @@ impl State {
                 local.selected_thinking = thread.selected_thinking;
                 thread = local;
             }
-            thread.remote = self.client.as_ref().map(|client| client.commands.clone());
+            thread.remote = self
+                .client
+                .as_ref()
+                .and_then(|client| client.commands_for(&self.machines.selected))
+                .cloned();
             self.threads.push(thread);
         }
         let views: Vec<ThreadView> =
@@ -997,9 +1152,136 @@ impl State {
     }
 
     pub(super) fn remote(&self, method: &str, params: Value) -> Option<Result<uuid::Uuid, String>> {
+        self.client.as_ref().map(|client| {
+            client
+                .commands_for(if method.starts_with("server.") {
+                    "local"
+                } else {
+                    &self.machines.selected
+                })
+                .ok_or_else(|| "This machine is not linked.".to_string())?
+                .send(method, params)
+        })
+    }
+    pub fn machine_label(&self, server: &str) -> String {
+        if server == "local" {
+            "Local".into()
+        } else {
+            self.client
+                .as_ref()
+                .and_then(|client| client.linked.get(server))
+                .and_then(|client| client.remote.as_ref())
+                .map(|link| link.host.clone())
+                .unwrap_or_else(|| server.into())
+        }
+    }
+    pub fn machine_connected(&self, server: &str) -> bool {
         self.client
             .as_ref()
-            .map(|client| client.commands.send(method, params))
+            .and_then(|client| client.commands_for(server))
+            .is_some_and(|commands| commands.connected())
+    }
+    /// Server/thread ids remain a pair. Only one server's records enter the State facade.
+    pub fn select_machine(&mut self, server: &str) {
+        self.machines.picker = false;
+        if server == self.machines.selected {
+            return;
+        }
+        let Some(projection) = self.machines.views.get(server).cloned() else {
+            self.machines.notice =
+                Some("This machine is offline and has no cached workspace yet.".into());
+            return;
+        };
+        self.checkpoint_client();
+        self.machines.threads.insert(
+            self.machines.selected.clone(),
+            std::mem::take(&mut self.threads),
+        );
+        self.machines.recover.insert(
+            self.machines.selected.clone(),
+            std::mem::take(&mut self.client_recover),
+        );
+        self.machines
+            .selection
+            .insert(self.machines.selected.clone(), self.client_select.take());
+        self.machines.selected = server.into();
+        self.threads = self
+            .machines
+            .threads
+            .remove(server)
+            .unwrap_or_else(|| vec![Thread::new(1)]);
+        self.active = 0;
+        self.tabs.clear();
+        self.client_select = self.machines.selection.remove(server).flatten();
+        self.client_recover = self.machines.recover.remove(server).unwrap_or_default();
+        self.selected_threads.clear();
+        self.project_scope = ProjectScope::All;
+        self.scope_additional.clear();
+        self.project_picker = None;
+        self.captain_editor = None;
+        self.row_menu = None;
+        self.undo = None;
+        self.client_views = json!({"localUi":self.machines.ui[server]});
+        if let Err(error) = self.apply_projection(projection) {
+            self.storage_error = Some(error);
+        }
+    }
+    pub fn machine_action(&mut self, action: &str, target: &str) {
+        if self.machines.pending.is_some() {
+            return;
+        }
+        let profile = self.data_dir.clone();
+        let host = self.machines.host.text.clone();
+        let code = self.machines.code.text.clone();
+        self.machines.code.replace_text("");
+        let action = action.to_owned();
+        let target = target.to_owned();
+        let wake = self.wake.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        self.machines.pending = Some(receive);
+        self.machines.notice = None;
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        use crate::peer::MachineResult;
+                        match action.as_str() {
+                            "link" => crate::peer::link(&profile, &host, &code)
+                                .await
+                                .map(MachineResult::Linked),
+                            "pair" => crate::client::local_rpc(&profile, "devices.pair", json!({}))
+                                .await
+                                .map(MachineResult::Paired),
+                            "unlink" => crate::peer::unlink(&profile, &target)
+                                .await
+                                .map(|()| MachineResult::Unlinked(target)),
+                            "devices" => {
+                                crate::client::local_rpc(&profile, "devices.list", json!({}))
+                                    .await
+                                    .map(MachineResult::Devices)
+                            }
+                            "revoke" => {
+                                let receipt = crate::client::local_rpc(
+                                    &profile,
+                                    "devices.revoke",
+                                    json!({"deviceId":target}),
+                                )
+                                .await?;
+                                if receipt["status"] != "accepted" {
+                                    return Err("Device revocation refused.".into());
+                                }
+                                crate::client::local_rpc(&profile, "devices.list", json!({}))
+                                    .await
+                                    .map(MachineResult::Devices)
+                            }
+                            _ => Err("Unknown machine action.".into()),
+                        }
+                    })
+                });
+            let _ = send.send(result);
+            wake();
+        });
     }
     pub(crate) fn forward(&mut self, method: &str, params: Value) -> bool {
         if let Some(result) = self.remote(method, params) {
@@ -1393,6 +1675,60 @@ impl Thread {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeState;
+
+    #[test]
+    fn machine_views_isolate_equal_thread_ids_drafts_projects_and_commands() {
+        let (runtime, _) = wired();
+        let mut state = State::new(PathBuf::new(), false);
+        let mut client = crate::client::Client::new(state.data_dir.clone());
+        client.linked.insert(
+            "server-b".into(),
+            crate::client::Client::new(state.data_dir.clone()),
+        );
+        state.client = Some(client);
+        let projection = runtime.state.projection();
+        state
+            .machines
+            .views
+            .insert("local".into(), projection.clone());
+        state
+            .machines
+            .views
+            .insert("server-b".into(), projection.clone());
+        state.apply_projection(projection).unwrap();
+        state.current_mut().draft.replace_text("Local thread 1");
+        state.select_machine("server-b");
+        assert_eq!(state.current().id, 1);
+        assert_eq!(state.current().draft.text, "");
+        state.current_mut().draft.replace_text("Server B thread 1");
+        state.select_machine("local");
+        assert_eq!(state.current().draft.text, "Local thread 1");
+        state.select_machine("server-b");
+        assert_eq!(state.current().draft.text, "Server B thread 1");
+        state.checkpoint_client();
+        assert_eq!(state.machines.ui["local"]["drafts"]["1"], "Local thread 1");
+        assert_eq!(
+            state.machines.ui["server-b"]["drafts"]["1"],
+            "Server B thread 1"
+        );
+        assert!(
+            state
+                .remote("thread.stop", json!({"threadId":1}))
+                .unwrap()
+                .is_err()
+        );
+        assert!(!state.machine_connected("server-b"));
+    }
+
+    #[test]
+    fn remote_project_paths_are_never_normalized_or_inspected_on_the_client() {
+        let value =
+            json!({"id":1,"name":"Host project","path":"/srv/projects/shina","machine":"local"});
+        let project = Project::from_record(&value, false).unwrap();
+        assert_eq!(project.path, PathBuf::from("/srv/projects/shina"));
+        assert!(project.icon.is_none());
+        assert_eq!(project.to_value()["path"], value["path"]);
+    }
 
     fn wired() -> (RuntimeState, mpsc::Receiver<Value>) {
         let mut state = State::headless(crate::store::directory().unwrap());

@@ -18,7 +18,7 @@ cargo run
 
 ### Experimental local server
 
-Legacy single-process mode remains the default for unmigrated profiles. Slices 1 through 3 of the [server architecture](docs/server-architecture.md) are integrated. Server mode is opt-in for a new profile:
+Legacy single-process mode remains the default for unmigrated profiles. Slices 1 through 4 of the [server architecture](docs/server-architecture.md) are implemented. Server mode is opt-in for a new profile:
 
 ```powershell
 .\target\debug\shina.exe serve
@@ -35,11 +35,11 @@ Server state now lives in `state.sqlite`, using bundled SQLite, WAL and full syn
 
 Every mutation has a client UUID. State changes, receipts and outbound effects commit together before harness sends. Retrying the same device/command ID returns its receipt; changed payloads fail. Process-bound effects left pending or dispatching by a crash become interrupted and are never automatically repeated. Existing history and task delivery markers still decide what the provider accepted. Honcho retains its stable-ID remote reconciliation. This does not promise exactly-once provider tools.
 
-Protocol 1.2 negotiates additive minors and combines coordinated restart with 1.1 cursor replay, bounded typed patches and compact snapshots. Protocol 1.0 clients receive full snapshots and upgrade guidance if they cannot coordinate a restart. Transcripts travel through revision-pinned `thread.history` pages, including single oversized messages. Image-file reads use authenticated `/v1/blobs/{id}` offset/limit paging. Pages default to 64 KiB of data, with a 256 KiB maximum. Workspace metadata also pages when needed. The native client's reassembly budget is 64 MiB, replacing the old 2 MiB snapshot cap. Control requests remain limited to 1 MiB, and the runtime queue to 32 commands. Slow clients cannot block harness drains. New commands, including approvals, are refused while disconnected.
+Protocol 1.3 adds scoped pairing and image uploads to 1.2 restart coordination and 1.1 cursor replay, bounded typed patches and compact snapshots. Protocol 1.0 clients receive full snapshots and upgrade guidance if they cannot coordinate a restart. Transcripts travel through revision-pinned `thread.history` pages, including single oversized messages. Image-file reads use authenticated `/v1/blobs/{id}` offset/limit paging. Pages default to 64 KiB of data, with a 256 KiB maximum. Workspace metadata also pages when needed. The native client's reassembly budget is 64 MiB, replacing the old 2 MiB snapshot cap. Control requests remain limited to 1 MiB, and the runtime queue to 32 commands. Slow clients cannot block harness drains. New commands, including approvals, are refused while disconnected.
 
-Local bootstrap exchange issues durable per-device credentials. The server stores token hashes only; native clients keep their token in their protected draft-slot directory. The `devices.list` protocol method lists IDs and revocation state. A `devices.revoke` mutation takes `args.deviceId` and a command UUID. It blocks existing sockets and reconnects, including bootstrap reuse of that device ID. A denied client does not silently enroll again. Pairing and scoped remote access remain slice 4.
+Local bootstrap exchange issues durable per-device credentials. The server stores token hashes only; native clients keep their token in their protected draft-slot directory. The `devices.list` protocol method lists IDs, scopes and revocation state. A `devices.revoke` mutation takes `args.deviceId` and a command UUID. It blocks existing sockets and reconnects, including bootstrap reuse of that device ID. A denied client does not silently enroll again. Paired user-device credentials grant read, operate and approve access, without maintenance or peer delegation.
 
-Installed server clients use the same in-app restart action as legacy mode. The server refuses updates while work, configuration, queues, approvals, clones or routines are active. A leased drain fences mutations and routine dispatch while clients save their drafts. A failed save or preparation timeout cancels the drain. Only after every connected local client acknowledges does the helper close clients and the server, wait for their processes, back up state, replace the app, validate server readiness and reopen clients. Backups remain under `Shina/backups`; rollback restores the matching binary and state. Browser connections, remote listeners and pairing remain out of scope.
+Installed server clients use the same in-app restart action as legacy mode. The server refuses updates while work, configuration, queues, approvals, clones or routines are active. A leased drain fences mutations and routine dispatch while clients save their drafts. A failed save or preparation timeout cancels the drain. Only after every connected local client acknowledges does the helper close clients and the server, wait for their processes, back up state, replace the app, validate server readiness and reopen clients. Backups remain under `Shina/backups`; rollback restores the matching binary and state. Remote clients reconnect without closing their desktop. They cannot authorize host maintenance. Browser connections remain out of scope.
 
 ### Opt-in always-on server
 
@@ -61,6 +61,67 @@ Service installation reconciles executable and provider discovery paths, not cre
 `shina update --yes` uses the existing GitHub CLI login and release checksums, including `Shina-linux-x86_64.tar.gz` on headless Linux. The flag explicitly approves an idle-only restart. Authentication denial stops that attempt and asks you to run `gh auth login` yourself. A protocol-major mismatch refuses commands with upgrade guidance; protocol minor versions negotiate down. In server-client mode the Windows tray shows connection status and sends Stop server through the authenticated client connection. Quitting an attached client does not stop an independent service.
 
 For any development GUI check, set `LOCALAPPDATA` to a new temporary directory before launching either process. Never use the real profile for fixtures. `cargo test --test server_runtime` starts real servers and fake Pi/ACP subprocesses in isolated profiles without consuming quota.
+
+## Linking machines
+
+Each installation owns its threads, captains, projects, provider login and host paths. Linking is direct client access, not filesystem or session replication. The desktop keeps its local connection and one independent connection per linked server. The sidebar groups all servers' threads and captain homes under quiet machine labels. The composer's "Run on" menu starts new work on a selected server. Clicking another server's existing row opens it without moving it. New work defaults to Local after desktop launch.
+
+Tailscale must already be installed, signed in, and resolve MagicDNS names. Shina does not change Tailscale or firewall settings. `serve` binds only loopback unless `--tailnet` is explicit. Tailnet mode adds each validated `Self.TailscaleIPs` address, IPv4 `100.64.0.0/10` or IPv6 `fd7a:115c:a1e0::/48`, on TCP port 47329. It never binds a wildcard or LAN/public address. `--port <number>` changes the port for isolated testing or an alternate installation. The loopback bootstrap endpoint refuses requests on the remote listener, even with the correct bootstrap token.
+
+After installing this build on each host, run these commands in its own terminal. These commands opt into an always-on server; do not run a legacy desktop against the same profile.
+
+Windows, `kidsseeghosts`, PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" service install --tailnet
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" service status
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" pair
+```
+
+macOS, separately on `kidsseemac` and `kidsseembp`:
+
+```sh
+/Applications/Shina.app/Contents/MacOS/shina service install --tailnet
+/Applications/Shina.app/Contents/MacOS/shina service status
+/Applications/Shina.app/Contents/MacOS/shina pair
+```
+
+Ubuntu, `serverseesghosts`, with the installed `shina` on PATH:
+
+```sh
+shina service install --tailnet --enable-linger
+shina service status
+shina pair
+```
+
+Omit `--enable-linger` to leave Linux logout behavior unchanged. To run without a service, use `shina serve --tailnet` in a separate terminal instead. Reinstalling a service without `--tailnet` restores loopback-only service startup. Stop a standalone tailnet server and restart with plain `shina serve` to remove its remote listeners. Coordinated updates retain the running server's listener options.
+
+Create a code on the host you want to access. On the client machine, redeem that code once, within five minutes. For example, after `pair` on `kidsseemac`, run on Windows:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" link kidsseemac <code-from-kidsseemac>
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" links
+& "$env:LOCALAPPDATA\Programs\Shina\shina.exe" --server-client
+```
+
+On either Mac use `/Applications/Shina.app/Contents/MacOS/shina link <host> <code>`. On Ubuntu use `shina link <host> <code>`. Replace `<host>` with `kidsseeghosts`, `kidsseemac`, `kidsseembp` or `serverseesghosts`. Generate a fresh code for each client/server link. Linking A to B does not grant B access to A. Repeat for each direction needed; no full mesh is required. CLI links load when the desktop starts. An open desktop can link immediately through Run on > Add to another machine or Settings > Linked machines.
+
+The dialog also creates a host code, lists authorized devices and revokes them. The CLI equivalents are:
+
+```text
+shina devices
+shina devices revoke <device-id>
+shina links
+shina unlink <server-id-or-host>
+```
+
+`devices` lists inbound grants on that host; `links` lists this client's outbound server links without tokens. `unlink` first asks the remote server to revoke this client's credential, then removes the local credential file. If the server is offline, it keeps the link and reports that revocation was not acknowledged. Revoke on the host instead when necessary. After a host revocation, automatic reconnect stops. Run `pair` on the host and explicitly `link` again to replace the denied credential.
+
+Codes have 48 bits of OS randomness, expire after five minutes, allow five exchange attempts per minute per host, and work once. Durable tokens have 256 bits of OS randomness. Servers store hashes and scopes in SQLite; clients store secrets outside repositories in `Shina/linked/<server-id>/credential.json`. Windows uses a protected current-user-only DACL. Unix uses a private directory and mode 0600 credential file. Tokens never enter argv or logs. Only the one-time code enters `link` argv. HTTP/WebSocket traffic uses Tailscale's encrypted transport; proxies, redirects and non-tailnet destinations are refused. MCP agents receive only their existing thread-bound MCP token, never a paired user credential, so they cannot answer approvals or mint credentials.
+
+Each desktop draft slot stores per-server UI state and last-known projections separately. Sleeping servers appear offline and reconnect with their own cursor and backoff. Cached threads remain readable. New commands and approvals are not queued offline, and work never falls back to Local. Projects use the selected server's absolute paths; remote workspace dialogs do not browse this client's filesystem. Image attachments upload in bounded, offset-checked chunks and validate their hash and image content before submission. Ordinary local file/folder references cannot be sent to another server.
+
+Cross-server captain delegation remains slice 5. Each captain currently owns and delegates work only on its home server.
 
 Shina 0.9 keeps all your projects and chats in one window. Use Add project for **Open folder...** or **Clone repository...**. New thread opens a project picker, including **No project**. Threads from different projects run concurrently and can share the tab strip.
 
@@ -236,7 +297,7 @@ Shelf expansion, multi-project scope, sidebar visibility and width, and drafts l
 
 Migrated threads use their saved activity time, their Pi session file's modification time, or the legacy index's modification time, in that order. The sidebar hides unknown times. The Captains section shows assigned coordinators only. Its single assignment control lets you choose an unassigned project.
 
-Each thread starts its harness in its project's folder. A project-less lone or worker thread uses `%LOCALAPPDATA%\Shina\chats\<thread-id>`, isolated from other chats and reused on resume. A general captain uses `%LOCALAPPDATA%\Shina\captains\<captain-id>\scratch`. A scoped captain runs in its first workspace and receives the other scoped paths in its context. Projects and threads record a machine id. The backend dispatch currently supports only `local`; unknown machines fail instead of running locally. A remote `shina serve` host remains follow-up work.
+Each thread starts its harness in its project's folder on its owning server. A project-less lone or worker thread uses that server's `Shina/chats/<thread-id>`, isolated from other chats and reused on resume. A general captain uses `Shina/captains/<captain-id>/scratch`. A scoped captain runs in its first workspace and receives the other scoped paths in its context. Projects and threads record a machine id. Backend subprocess dispatch supports only `local` within the owning server. Linked clients send commands to that server; unknown or offline machines never fall back to local execution.
 
 Pi keeps its session files and credentials in its normal locations outside this repository. Drafts survive thread and project switches and app restarts. Run one legacy instance per profile. Multiple `--server-client` desktops share the server-owned profile and keep separate drafts.
 
@@ -329,7 +390,7 @@ The earlier layout's release build reported forced at-rest CPU times below 0.15 
 
 The full T3 thread-management port is on hold for a separate spec. Snooze and auto-wake, settle/unsettle rules, collapsible and paged settled shelves, drag between sections and undo notices are not implemented in this release. `Status::Settled` still means the Pi run finished, not that the user settled the thread. Future thread-list lifecycle fields must remain separate from process status.
 
-This is an initial desktop prototype. Login UI, git diffs, worktrees and remote hosts remain unfinished. Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
+This is an initial desktop prototype. Login UI, git diffs, worktrees and cross-server captain delegation remain unfinished. Paired remote user clients are available as described in "Linking machines". Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
 
 The mark is a 32-cell pixel sailboat drawn by [`src/brand.rs`](src/brand.rs). The light theme shows a day sail with a sun, clouds and the three status dots as foam; the dark theme shows a night sail under a moon and stars. The window icon follows the saved theme at launch. The executable icon, favicons and Mac iconset use the night sail because they cannot follow the theme. Exports keep sharp pixels at every size. Regenerate them after changing the mark:
 

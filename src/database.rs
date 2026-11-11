@@ -96,7 +96,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 1 {
+        if version > 2 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         connection
@@ -118,6 +118,13 @@ impl Database {
             crate::maintenance::backup_state(directory)?;
             let tx = connection.transaction().map_err(error)?;
             tx.execute_batch(include_str!("migrations/001.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
+        if version < 2 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/002.sql"))
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -471,7 +478,16 @@ impl Database {
     }
 
     pub fn issue_device(&self, id: &str, token: &str) -> Result<(), String> {
-        let inner = self.0.lock().expect("database");
+        self.issue_scoped_device(id, token, &["read", "operate", "approve", "maintain"])
+    }
+
+    pub fn issue_scoped_device(
+        &self,
+        id: &str,
+        token: &str,
+        scopes: &[&str],
+    ) -> Result<(), String> {
+        let mut inner = self.0.lock().expect("database");
         if let Some(failure) = &inner.failure {
             return Err(failure.clone());
         }
@@ -483,19 +499,96 @@ impl Database {
                 |r| r.get(0),
             )
             .map_err(error)?;
+        if scopes.contains(&"paired")
+            && inner
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(error)?
+        {
+            return Err(
+                "Pairing requires a fresh device ID. Existing grants cannot be replaced.".into(),
+            );
+        }
         if count >= 256 {
             return Err("Device limit reached.".into());
         }
-        inner.connection.execute(
+        let tx = inner.connection.transaction().map_err(error)?;
+        let updated = tx.execute(
             "INSERT INTO devices(id,token_hash,created_at) VALUES(?1,?2,?3)
              ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash WHERE devices.revoked_at IS NULL",
             params![id, hash_token(token), crate::lifecycle::now() as i64],
         ).map_err(error)?;
-        drop(inner);
-        if self.device(token)?.is_none() {
+        if updated == 0 {
             return Err("Device revoked. Enroll a new device with user approval.".into());
         }
-        Ok(())
+        tx.execute(
+            "INSERT INTO device_grants(device_id,scopes) VALUES(?1,?2)
+             ON CONFLICT(device_id) DO NOTHING",
+            params![id, json!(scopes).to_string()],
+        )
+        .map_err(error)?;
+        tx.commit().map_err(error)
+    }
+
+    pub fn authorize(&self, id: &str, method: &str, args: &Value) -> Result<(), String> {
+        let text: Option<String> = self
+            .0
+            .lock()
+            .expect("database")
+            .connection
+            .query_row(
+                "SELECT g.scopes FROM device_grants g JOIN devices d ON d.id=g.device_id
+             WHERE d.id=?1 AND d.revoked_at IS NULL",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        let scopes: Vec<String> =
+            serde_json::from_str(&text.ok_or("Authentication denied. Device unknown or revoked.")?)
+                .map_err(error)?;
+        let scope = match method {
+            "hello"
+            | "workspace.subscribe"
+            | "thread.subscribe"
+            | "subscription.cancel"
+            | "thread.history"
+            | "command.get"
+            | "server.status"
+            | "blobs.read" => "read",
+            "request.respond" => "approve",
+            "devices.revoke" if args["deviceId"] == id => "read",
+            "devices.list" | "devices.pair" | "devices.revoke" => "maintain",
+            method if method.starts_with("server.") => "maintain",
+            method if method.starts_with("peer.") => "peer-delegate",
+            _ => "operate",
+        };
+        if scopes.iter().any(|granted| granted == scope) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Permission denied. This device has no {scope} grant."
+            ))
+        }
+    }
+
+    pub fn paired(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("database")
+            .connection
+            .query_row(
+                "SELECT scopes FROM device_grants WHERE device_id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "paired"))
     }
 
     pub fn device(&self, token: &str) -> Result<Option<String>, String> {
@@ -516,13 +609,14 @@ impl Database {
         let inner = self.0.lock().expect("database");
         let mut stmt = inner
             .connection
-            .prepare("SELECT id,created_at,revoked_at FROM devices ORDER BY created_at,id")
+            .prepare("SELECT id,created_at,revoked_at,(SELECT scopes FROM device_grants WHERE device_id=id) FROM devices ORDER BY created_at,id")
             .map_err(error)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(json!({
                     "deviceId":r.get::<_,String>(0)?,"createdAt":r.get::<_,i64>(1)?,
-                    "revokedAt":r.get::<_,Option<i64>>(2)?
+                    "revokedAt":r.get::<_,Option<i64>>(2)?,
+                    "scopes":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null)
                 }))
             })
             .map_err(error)?;

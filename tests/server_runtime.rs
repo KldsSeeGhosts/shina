@@ -100,6 +100,23 @@ impl Profile {
     fn client(&self, device: uuid::Uuid) -> Client {
         Client::connect(&self.discovery(), device)
     }
+    fn cli(&self, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shina"));
+        command
+            .args(args)
+            .env("LOCALAPPDATA", &self.root)
+            .env("XDG_DATA_HOME", &self.root)
+            .env("PI_CODING_AGENT_DIR", self.root.join("enrollment"))
+            .env("SHINA_PI_CLI", self.root.join("fake_pi.js"))
+            .current_dir(&self.root)
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        command.output().unwrap()
+    }
     fn stop(&mut self) {
         if self
             .children
@@ -172,15 +189,16 @@ impl Client {
             "bootstrap exchange failed"
         );
         let auth: Value = serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        Self::with_token(discovery, auth["token"].as_str().unwrap().to_owned())
+    }
+    fn with_token(discovery: &Value, token: String) -> Self {
+        let port = discovery["port"].as_u64().unwrap() as u16;
         let mut request = format!("ws://127.0.0.1:{port}/v1/ws")
             .into_client_request()
             .unwrap();
-        request.headers_mut().insert(
-            "authorization",
-            format!("Bearer {}", auth["token"].as_str().unwrap())
-                .parse()
-                .unwrap(),
-        );
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
         let (mut socket, _) = tungstenite::connect(request).unwrap();
         if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
             stream
@@ -193,7 +211,7 @@ impl Client {
             seq: 0,
             epoch: Value::Null,
             notifications: Vec::new(),
-            token: auth["token"].as_str().unwrap().to_owned(),
+            token,
         };
         let hello = client.rpc(
             "hello",
@@ -303,6 +321,129 @@ impl Client {
             self.read();
         }
     }
+}
+
+#[test]
+fn paired_cli_client_starts_views_steers_and_stops_only_the_remote_server() {
+    let mut a = Profile::new();
+    let mut b = Profile::new();
+    a.launch(&["serve"]);
+    b.launch(&["serve"]);
+    let discovery_a = a.discovery();
+    let discovery_b = b.discovery();
+    let paired = b.cli(&["pair"]);
+    assert!(
+        paired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paired.stderr)
+    );
+    let text = String::from_utf8(paired.stdout).unwrap();
+    let code = text
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let host = format!("127.0.0.1:{}", discovery_b["port"].as_u64().unwrap());
+    assert!(a.cli(&["link", &host, code]).status.success());
+    assert!(
+        !a.cli(&["link", &host, code]).status.success(),
+        "a used code must refuse"
+    );
+    let listing = a.cli(&["links"]);
+    assert!(listing.status.success());
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            a.root
+                .join("Shina/linked")
+                .join(discovery_b["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&listing.stdout).contains(credential["token"].as_str().unwrap())
+    );
+    let mut remote = Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let workspace = b.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    assert_eq!(
+        remote.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let created = remote.command(
+        "thread.create",
+        json!({"project":1,"occupiedDrafts":[1,2]}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(created["result"]["status"], "accepted", "{created}");
+    let thread = created["result"]["result"]["threadId"].as_u64().unwrap();
+    assert_eq!(
+        remote.command(
+            "thread.send",
+            json!({"threadId":thread,"text":"disconnect-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    remote.until(|state| {
+        state["threads"].as_array().unwrap().iter().any(|row| {
+            row["id"] == thread
+                && row["status"] == "Running"
+                && row["configuring"] == false
+                && row["operating"] == false
+                && row["initializing"] == false
+                && row["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["text"] == "disconnect-fixture")
+        })
+    });
+    let steer = remote.command(
+        "thread.send",
+        json!({"threadId":thread,"text":"remote-steer","attachments":[],"mode":"steer"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(steer["result"]["status"], "accepted", "{steer}");
+    assert_eq!(
+        remote.command(
+            "thread.stop",
+            json!({"threadId":thread}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let local = Client::connect(&discovery_a, uuid::Uuid::new_v4());
+    assert!(
+        local.snapshot["index"]["projects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        local.snapshot["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        remote.command("server.stop", json!({}), uuid::Uuid::new_v4())["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maintain")
+    );
+    drop(local);
+    drop(remote);
+    assert!(a.cli(&["unlink", &host]).status.success());
+    assert!(a.cli(&["links"]).stdout.is_empty());
+    a.stop();
+    b.stop();
 }
 
 #[test]
@@ -633,7 +774,7 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
         json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
         json!("good-version"),
     );
-    assert_eq!(hello["result"]["protocolMinor"], 2);
+    assert_eq!(hello["result"]["protocolMinor"], 3);
     let prepared =
         client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
     assert_eq!(prepared["phase"], "draining");
