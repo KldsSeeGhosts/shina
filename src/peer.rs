@@ -12,6 +12,10 @@ pub const PORT: u16 = 47329;
 
 pub struct Machines {
     pub selected: String,
+    /// Owner of the sidebar's numeric workspace IDs. The filter belongs to this
+    /// window, not to whichever server currently supplies the conversation.
+    pub scope_server: Option<String>,
+    pub scope_remote: Vec<(String, usize)>,
     pub views: std::collections::BTreeMap<String, Value>,
     pub threads: std::collections::HashMap<String, Vec<crate::model::Thread>>,
     pub ui: Value,
@@ -37,6 +41,8 @@ impl Default for Machines {
     fn default() -> Self {
         Self {
             selected: "local".into(),
+            scope_server: None,
+            scope_remote: Vec::new(),
             views: Default::default(),
             threads: Default::default(),
             ui: json!({}),

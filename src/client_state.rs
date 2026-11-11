@@ -702,7 +702,23 @@ impl State {
         // The top-level legacy format remains the local server's namespace.
         let mut saved = self.machines.ui["local"].clone();
         if saved.is_null() {
-            saved = ui;
+            saved = ui.clone();
+        }
+        // Device preferences must survive a restart even when the last selected
+        // thread belonged to a remote server. Drafts and IDs stay server-scoped.
+        for field in [
+            "dark",
+            "zoom",
+            "sidebar",
+            "sidebarWidth",
+            "shelves",
+            "background",
+            "scope",
+            "scopeAdditional",
+            "scopeServer",
+            "scopeRemote",
+        ] {
+            saved[field] = ui[field].clone();
         }
         saved["machineUi"] = self.machines.ui.clone();
         if let Some(store) = &mut self.ui_store {
@@ -1145,7 +1161,9 @@ impl State {
             .retain(|id, _| self.threads.iter().any(|thread| thread.id == *id));
         self.capture_opened_draft();
         self.storage_error = None;
-        if let Some(path) = self.launch_project.take() {
+        if let Some(path) = self.launch_project.take()
+            && !self.demo
+        {
             self.forward("project.put", json!({"path":path}));
         }
         Ok(())
@@ -1192,6 +1210,15 @@ impl State {
                 Some("This machine is offline and has no cached workspace yet.".into());
             return;
         };
+        self.machines
+            .scope_server
+            .get_or_insert_with(|| self.machines.selected.clone());
+        let filter = (
+            self.project_scope,
+            self.scope_additional.clone(),
+            self.machines.scope_server.clone(),
+            self.machines.scope_remote.clone(),
+        );
         self.checkpoint_client();
         self.machines.threads.insert(
             self.machines.selected.clone(),
@@ -1221,9 +1248,60 @@ impl State {
         self.captain_editor = None;
         self.row_menu = None;
         self.undo = None;
+        // Theme, zoom and the sidebar's layout belong to this device, not to the machine. A
+        // machine's saved UI only brings back its drafts, tabs, open thread and workspace filter.
+        let device = (
+            self.dark,
+            self.zoom,
+            self.sidebar,
+            self.sidebar_width,
+            self.shelves,
+            self.background.settings.clone(),
+        );
         self.client_views = json!({"localUi":self.machines.ui[server]});
         if let Err(error) = self.apply_projection(projection) {
             self.storage_error = Some(error);
+        }
+        (
+            self.dark,
+            self.zoom,
+            self.sidebar,
+            self.sidebar_width,
+            self.shelves,
+            self.background.settings,
+        ) = device;
+        (
+            self.project_scope,
+            self.scope_additional,
+            self.machines.scope_server,
+            self.machines.scope_remote,
+        ) = filter;
+    }
+    /// Opens a thread on any linked machine, as one click in the unified sidebar.
+    pub fn open_machine_thread(&mut self, server: &str, id: usize) {
+        let exists = if server == self.machines.selected {
+            self.threads.iter().any(|thread| thread.id == id)
+        } else {
+            self.machines.views.get(server).is_some_and(|projection| {
+                projection["index"]["threads"]
+                    .as_array()
+                    .is_some_and(|threads| {
+                        threads
+                            .iter()
+                            .any(|thread| thread["id"].as_u64() == Some(id as u64))
+                    })
+            })
+        };
+        if !exists {
+            self.machines.notice =
+                Some("This thread is no longer available on that machine.".into());
+            return;
+        }
+        self.select_machine(server);
+        if self.machines.selected == server
+            && let Some(index) = self.threads.iter().position(|thread| thread.id == id)
+        {
+            self.select_thread(index);
         }
     }
     pub fn machine_action(&mut self, action: &str, target: &str) {
@@ -1718,6 +1796,79 @@ mod tests {
                 .is_err()
         );
         assert!(!state.machine_connected("server-b"));
+    }
+
+    #[test]
+    fn opening_remote_threads_preserves_device_preferences_and_namespaces() {
+        let (runtime, _) = wired();
+        let mut state = State::new(PathBuf::new(), false);
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        let mut projection = runtime.state.projection();
+        projection["index"]["dark"] = json!(true);
+        projection["index"]["zoom"] = json!(1.6);
+        state
+            .machines
+            .views
+            .insert("local".into(), projection.clone());
+        state
+            .machines
+            .views
+            .insert("remote".into(), projection.clone());
+        state.apply_projection(projection).unwrap();
+        state.dark = false;
+        state.zoom = 1.1;
+        state.sidebar_width = 312.0;
+        state.sidebar = false;
+        state.shelves = [true, false];
+        state.current_mut().draft.replace_text("local unsent text");
+        state.checkpoint_client();
+        let mut remote_ui = state.machines.ui["local"].clone();
+        remote_ui["dark"] = json!(true);
+        remote_ui["zoom"] = json!(1.8);
+        remote_ui["sidebar"] = json!(true);
+        remote_ui["sidebarWidth"] = json!(200.0);
+        remote_ui["shelves"] = json!([false, false, true]);
+        remote_ui["drafts"]["1"] = json!("remote unsent text");
+        state.machines.ui["remote"] = remote_ui;
+        for server in ["remote", "local", "remote", "local"] {
+            state.open_machine_thread(server, 1);
+            assert_eq!(state.machines.selected, server);
+            assert!(!state.dark);
+            assert_eq!(state.zoom, 1.1);
+            assert_eq!(state.sidebar_width, 312.0);
+            assert!(!state.sidebar);
+            assert_eq!(state.shelves, [true, false]);
+            assert_eq!(
+                state.current().draft.text,
+                if server == "local" {
+                    "local unsent text"
+                } else {
+                    "remote unsent text"
+                }
+            );
+        }
+        state.open_machine_thread("remote", usize::MAX);
+        assert_eq!(state.machines.selected, "local");
+    }
+
+    #[test]
+    fn multi_machine_workspace_filter_toggles_without_aliasing_equal_ids() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        state.set_machine_scope("remote".into(), Some(1), false);
+        state.set_machine_scope("local".into(), Some(1), true);
+        state.set_machine_scope("local".into(), None, true);
+        assert!(state.scope_includes_on("remote", Some(1)));
+        assert!(state.scope_includes_on("local", Some(1)));
+        assert!(state.scope_includes_on("another", None));
+        assert!(!state.scope_includes_on("another", Some(1)));
+        state.set_machine_scope("local".into(), None, true);
+        state.set_machine_scope("local".into(), Some(1), true);
+        assert!(!state.scope_includes_on("local", Some(1)));
+        assert!(state.scope_includes_on("remote", Some(1)));
+        state.set_machine_scope("remote".into(), Some(1), true);
+        assert_eq!(state.project_scope, ProjectScope::All);
+        assert!(state.machines.scope_remote.is_empty());
     }
 
     #[test]

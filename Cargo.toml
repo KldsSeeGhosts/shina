@@ -9,6 +9,7 @@ license = "MIT"
 rune = { git = "https://github.com/anomalyco/rune", rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b", default-features = false, features = ["accessibility", "embedded-fonts", "native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b", features = ["markdown"] }
 serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 sha2 = "0.10"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }

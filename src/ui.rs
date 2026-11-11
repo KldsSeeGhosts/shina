@@ -14,11 +14,51 @@ use serde_json::json;
 mod captain_ui;
 #[path = "crew_ui.rs"]
 mod crew_ui;
+#[path = "markdown_ui.rs"]
+mod markdown_ui;
 #[path = "pi_ui.rs"]
 mod pi_ui;
+#[path = "sidebar_ui.rs"]
+mod sidebar_ui;
 pub(crate) use pi_ui::questionnaire_key;
 
-// Warm neutral chrome, a paper-like reading area, and Shina's teal action color.
+/// Keyboard navigation uses the same server-scoped order as the unified sidebar.
+pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
+    if s.client.is_none() {
+        return s
+            .sidebar_navigation()
+            .into_iter()
+            .map(|index| (s.machines.selected.clone(), s.threads[index].id))
+            .collect();
+    }
+    let mut rows = Vec::new();
+    let mut settled = 0;
+    for entry in sidebar_ui::entries(s) {
+        if !entry.captain && !entry.visible {
+            continue;
+        }
+        if !entry.captain
+            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
+            && s.search.text.is_empty()
+        {
+            settled += 1;
+            if settled > s.settled_visible {
+                continue;
+            }
+        }
+        rows.push((entry.server.to_owned(), entry.id));
+        if entry.captain && entry.local.is_some() {
+            rows.extend(
+                s.visible_captain_workers(entry.id)
+                    .into_iter()
+                    .map(|index| (entry.server.to_owned(), s.threads[index].id)),
+            );
+        }
+    }
+    rows
+}
+
+// Sailcloth, chart paper and the night sky from brand.rs, with teal actions.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color,
@@ -36,6 +76,8 @@ struct Palette {
     badge_ring: Color,
     teal_text: Color,
     field_line: Color,
+    message_bg: Color,
+    code_bg: Color,
 }
 fn color(hex: &str) -> Color {
     rune::color::hex(hex).expect("palette color")
@@ -43,40 +85,44 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#242422"),
-            panel: color("#1c1c1a"),
-            card: color("#30302d"),
+            bg: color("#12161f"),
+            panel: color("#171c26"),
+            card: color("#202733"),
             line: color("#e3dfd5").alpha(0.12),
             ink: color("#efede6"),
-            muted: color("#aaa79e"),
+            muted: color("#b2b9c4"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
-            selected: color("#e3dfd5").alpha(0.02),
+            selected: color("#a0bdcf").alpha(0.065),
             teal: color("#70b9ad"),
             teal_bg: color("#263f39"),
             gold: color("#d3ba6b"),
             danger: color("#f0a39c"),
             on_teal: color("#0d1f1e"),
-            badge_ring: color("#242422"),
+            badge_ring: color("#12161f"),
             teal_text: color("#89c8bc"),
-            field_line: color("#5e5c55"),
+            field_line: color("#526173"),
+            message_bg: color("#263940"),
+            code_bg: color("#111720"),
         }
     } else {
         Palette {
-            bg: color("#eeece5"),
-            panel: color("#faf9f5"),
-            card: color("#fffefa"),
+            bg: color("#ebe6da"),
+            panel: color("#f8f4ea"),
+            card: color("#fffdf7"),
             line: color("#34332d").alpha(0.12),
             ink: color("#292923"),
-            muted: color("#66645b"),
+            muted: color("#605e55"),
             selected: color("#34332d").alpha(0.075),
             teal: color("#23776b"),
             teal_bg: color("#e0ede7"),
-            gold: color("#8a701f"),
+            gold: color("#8a6a2f"),
             danger: color("#a33e38"),
             on_teal: Color::WHITE,
-            badge_ring: color("#eeece5"),
+            badge_ring: color("#ebe6da"),
             teal_text: color("#23776b"),
             field_line: color("#bcb9ae"),
+            message_bg: color("#eae3d3"),
+            code_bg: color("#eeeadd"),
         }
     }
 }
@@ -91,8 +137,15 @@ const PROSE: TextStyle = TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.20);
 const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
 /// The new-thread greeting, ported from KSG Code's `DraftHeroHeadline`: centred sans,
 /// `text-3xl font-normal tracking-tight`, or `text-2xl` when the pane is narrow.
-const HEADING: TextStyle = TextStyle::new(30.0, 400.0).lh(36.0).tracking(-0.75);
-const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0).lh(32.0).tracking(-0.6);
+/// Shina uses its bundled serif for greetings, the only typographic departure.
+const HEADING: TextStyle = TextStyle::new(30.0, 400.0)
+    .lh(36.0)
+    .tracking(-0.45)
+    .family(rune::Family::Named("Source Serif 4"));
+const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0)
+    .lh(32.0)
+    .tracking(-0.3)
+    .family(rune::Family::Named("Source Serif 4"));
 /// A chat pane this wide (a 1600 px window with the sidebar open) gets a longer measure and
 /// larger body text. It follows the pane, not the window, so an open session panel or a wide
 /// sidebar keeps the reading size that fits the lane.
@@ -182,7 +235,7 @@ fn icon(kind: &str, ink: Color) -> El {
             static $name: Icon = Icon {
                 name: stringify!($name),
                 view: 16.0,
-                body: $body,
+                body: concat!(r#"<g stroke-width="1.5">"#, $body, "</g>"),
             };
         };
     }
@@ -324,6 +377,26 @@ fn icon(kind: &str, ink: Color) -> El {
         MINIMIZE,
         r#"<path d="M9.33 2.67v4h4M2.67 9.33h4v4M9.33 6.67 14 2M2 14l4.67-4.67" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
+    glyph!(
+        EYE,
+        r#"<path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8Z" fill="none" stroke="currentColor"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor"/>"#
+    );
+    glyph!(
+        BRAIN,
+        r#"<path d="M8 3a2 2 0 0 0-3.8-.8A2.5 2.5 0 0 0 2.5 6 3 3 0 0 0 3 11a2.5 2.5 0 0 0 5 1V3Zm0 0a2 2 0 0 1 3.8-.8A2.5 2.5 0 0 1 13.5 6 3 3 0 0 1 13 11a2.5 2.5 0 0 1-5 1M5 6l-2-1M11 6l2-1M5 10l-2 1M11 10l2 1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        WRENCH,
+        r#"<path d="M10 2a4 4 0 0 0-4.8 4.8l-3.5 3.5a2.1 2.1 0 0 0 3 3l3.5-3.5A4 4 0 0 0 13 5l-2.5 2.5L8.5 5.5 11 3Z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
+    );
+    glyph!(
+        CREW,
+        r#"<circle cx="8" cy="5" r="2.5" fill="none" stroke="currentColor"/><path d="M3 14v-1a5 5 0 0 1 10 0v1" fill="none" stroke="currentColor" stroke-linecap="round"/>"#
+    );
+    glyph!(
+        COPY,
+        r#"<rect x="5" y="5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor"/><path d="M10 5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" fill="none" stroke="currentColor"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
         "minimize" => &MINIMIZE,
@@ -365,8 +438,14 @@ fn icon(kind: &str, ink: Color) -> El {
         "terminal" => &TERMINAL,
         "expand" => &EXPAND,
         "image" => &IMAGE,
+        "eye" => &EYE,
+        "brain" => &BRAIN,
+        "wrench" => &WRENCH,
+        "crew" => &CREW,
+        "copy" => &COPY,
         _ => &rune_kit::glyphs::CHECK_SMALL,
     };
+    // A 1.5 px stroke on our 16 px grid matches Lucide's 2 px at 24 px.
     rune::icon(glyph, 14.0).color(ink).a11y_hidden()
 }
 fn tool_icon(kind: &str, ink: Color) -> El {
@@ -1550,16 +1629,44 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     // One row holds search and the sidebar's actions, as in T3 Code: filter by workspace,
     // add a workspace, and start a thread.
     let scoped = !s.scope_additional.is_empty() || s.project_scope != ProjectScope::All;
-    let scope = if !s.scope_additional.is_empty() {
-        format!("{} workspaces", s.scope_additional.len() + 1)
+    let scope = if !s.scope_additional.is_empty()
+        || !s.machines.scope_remote.is_empty() && s.project_scope != ProjectScope::All
+    {
+        format!(
+            "{} workspaces",
+            s.scope_additional.len() + s.machines.scope_remote.len() + 1
+        )
     } else {
         match s.project_scope {
             ProjectScope::All => "All workspaces".into(),
             ProjectScope::NoProject => "No workspace".into(),
-            ProjectScope::Project(id) => s
-                .project(Some(id))
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "All workspaces".into()),
+            ProjectScope::Project(id) => {
+                let owner = s
+                    .machines
+                    .scope_server
+                    .as_deref()
+                    .unwrap_or(&s.machines.selected);
+                let name = if owner == s.machines.selected {
+                    s.project(Some(id)).map(|p| p.name.as_str())
+                } else {
+                    s.machines
+                        .views
+                        .get(owner)
+                        .and_then(|view| view["index"]["projects"].as_array())
+                        .and_then(|projects| {
+                            projects
+                                .iter()
+                                .find(|project| project["id"].as_u64() == Some(id as u64))
+                        })
+                        .and_then(|project| project["name"].as_str())
+                }
+                .unwrap_or("Workspace");
+                if s.client.is_some() {
+                    format!("{name} · {}", s.machine_label(owner))
+                } else {
+                    name.into()
+                }
+            }
         }
     };
     if let Some(notice) = crew_ui::recovery_banner(s, p) {
@@ -1641,6 +1748,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     |s| {
                         s.project_scope = ProjectScope::All;
                         s.scope_additional.clear();
+                        s.machines.scope_remote.clear();
                         s.selected_threads.clear();
                         s.checkpoint();
                     },
@@ -1670,28 +1778,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         );
     }
     let mut content = col().pb(2.0).gap(2.0).min_h(s.sidebar_viewport_height);
-    if s.client.is_some() {
-        content = content.child(
-            label(
-                format!(
-                    "{}{}",
-                    s.machine_label(&s.machines.selected),
-                    if s.machine_connected(&s.machines.selected) {
-                        ""
-                    } else {
-                        " · Offline, reconnecting"
-                    }
-                ),
-                SMALL,
-                p.muted,
-            )
-            .key("sidebar-machine-label")
-            .px(ROW_INSET)
-            .py(4.0)
-            .truncate(),
-        );
-    }
-    let captains = s.sidebar_captains();
+    let entries = sidebar_ui::entries(s);
+    let captains: Vec<_> = entries.iter().filter(|entry| entry.captain).collect();
     if !s.show_archive || !captains.is_empty() {
         let mut heading = section_title("Captains", p);
         if !captains.is_empty() {
@@ -1720,13 +1808,20 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             ));
         }
         content = content.child(heading);
-        for index in captains.iter().copied() {
-            let home = s.threads[index].id;
-            let workers = s.visible_captain_workers(home);
+        for entry in &captains {
+            let home = entry.id;
+            let workers = entry
+                .local
+                .map(|_| s.visible_captain_workers(home))
+                .unwrap_or_default();
             let mut crew = col()
-                .key(format!("crew-{home}"))
+                .key(if s.client.is_some() {
+                    format!("crew-{}-{home}", entry.server)
+                } else {
+                    format!("crew-{home}")
+                })
                 .gap(1.0)
-                .child(thread_row(s, index, p, false));
+                .child(sidebar_ui::row(s, p, entry));
             if !workers.is_empty() {
                 // Both content and row highlights are inset beneath their owning captain, and
                 // the rail runs down from the centre of the captain's portrait.
@@ -1750,8 +1845,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             content = content.child(crew);
         }
     }
-    let all = s.sidebar_threads();
-    let visible = s.visible_sidebar_threads();
+    let all: Vec<_> = entries.iter().filter(|entry| !entry.captain).collect();
+    let visible: Vec<_> = all.iter().copied().filter(|entry| entry.visible).collect();
     let dragging = s.drag_thread.is_some();
     // Omit an empty thread list under captains; without captains it holds the empty state.
     let listed = if s.search.text.is_empty() {
@@ -1767,12 +1862,12 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let drafts: Vec<_> = visible
         .iter()
         .copied()
-        .filter(|i| s.draft_listed(&s.threads[*i]))
+        .filter(|entry| entry.draft)
         .collect();
     if !drafts.is_empty() {
         content = content.child(section_title("Drafts", p));
-        for i in drafts {
-            content = content.child(thread_row(s, i, p, false));
+        for entry in drafts {
+            content = content.child(sidebar_ui::row(s, p, entry));
         }
         content = content.child(rule(p));
     }
@@ -1786,9 +1881,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         let rows: Vec<_> = all
             .iter()
             .copied()
-            .filter(|i| {
-                !s.threads[*i].is_draft()
-                    && s.thread_section(&s.threads[*i], lifecycle::now()) == section
+            .filter(|entry| {
+                !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
             })
             .collect();
         let shelf = match section {
@@ -1853,8 +1947,18 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .child(label(format!("{section:?}"), SMALL, p.muted)),
             );
         }
-        for index in rows.iter().copied().filter(|i| visible.contains(i)) {
-            content = content.child(thread_row(s, index, p, false));
+        let limit = if section == Section::Settled && s.search.text.is_empty() {
+            s.settled_visible
+        } else {
+            usize::MAX
+        };
+        for entry in rows
+            .iter()
+            .copied()
+            .filter(|entry| entry.visible)
+            .take(limit)
+        {
+            content = content.child(sidebar_ui::row(s, p, entry));
         }
         if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
             content = content.child(button(
@@ -1880,7 +1984,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .padding(8.0),
         );
     }
-    content = content.child(other_machine_threads(s, p));
     side = side.child(
         col()
             .key("sidebar-scroll")
@@ -2337,9 +2440,8 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
     status_badge(p, portrait, size, status)
 }
 
-/// Captain rows: a portrait slot that holds the focal size, so rows never change height.
+/// Every machine uses the same portrait size, including before a captain is selected.
 const CAPTAIN_SLOT: f32 = 44.0;
-const CAPTAIN_PORTRAIT: f32 = 36.0;
 /// Room for one badge at the end of the name line, kept even when there is none, so a
 /// badge arriving never moves the name.
 const BADGE_SLOT: f32 = 28.0;
@@ -2372,7 +2474,7 @@ fn sidebar_portrait(
         .size(size, size)
         .radius(radius)
         .clip_rounded(radius)
-        .border(0.5, p.line)
+        .border(0.5, p.gold.alpha(0.4))
         .pixels(pixels)
         .a11y_hidden()
         .on_visible(move |s: &mut State, on, tx| {
@@ -2444,7 +2546,7 @@ fn captain_row(
             format!("{n} {one}s")
         }
     };
-    let detail = match status {
+    let mut detail = match status {
         Status::Running => plural(running.len().max(1), "thread"),
         Status::Waiting if approval => "approval".into(),
         Status::Waiting if requests > 0 => "a question".into(),
@@ -2457,10 +2559,24 @@ fn captain_row(
             if count > 0 {
                 parts.push(format!("{count} crew"));
             }
-            parts.extend(row_workspace(s, thread));
             parts.join(" · ")
         }
     };
+    if let Some(workspace) = row_workspace(s, thread) {
+        detail = if detail.is_empty() {
+            workspace
+        } else {
+            format!("{detail} · {workspace}")
+        };
+    }
+    if s.client.is_some() {
+        let machine = machine_caption(s, &s.machines.selected);
+        detail = if detail.is_empty() {
+            machine
+        } else {
+            format!("{detail} · {machine}")
+        };
+    }
     let timer = (status == Status::Running)
         .then(|| running.iter().filter_map(|t| t.started).min())
         .flatten();
@@ -2533,11 +2649,7 @@ fn captain_row(
                 .min_w(0.0),
         )
         .child(badges);
-    let size = if focal_captain(s) == Some(id) {
-        CAPTAIN_SLOT
-    } else {
-        CAPTAIN_PORTRAIT
-    };
+    let size = CAPTAIN_SLOT;
     let portrait = captain_portrait(s, thread.captain);
     let (hover, active) = row_washes(s, p);
     let curve = |seconds| rune::Curve::tween(seconds, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
@@ -2677,23 +2789,6 @@ pub(crate) fn tick_portraits(
     s.portraits.tick(now, rows)
 }
 
-/// The captain that gets the larger portrait: the one whose crew is open, otherwise the most
-/// urgent one that is working or needs the user. The portrait's slot has the same size either
-/// way, so moving the focus never moves a row.
-fn focal_captain(s: &State) -> Option<usize> {
-    let captains = s.sidebar_captains();
-    let open = s.selected_row();
-    if let Some(i) = captains.iter().find(|i| s.threads[**i].id == open) {
-        return Some(s.threads[*i].id);
-    }
-    captains
-        .iter()
-        .map(|i| (s.threads[*i].id, row_status(s, &s.threads[*i]).0))
-        .filter(|(_, status)| status.urgency() >= Status::Running.urgency())
-        .max_by_key(|(id, status)| (status.urgency(), std::cmp::Reverse(*id)))
-        .map(|(id, _)| id)
-}
-
 fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let thread = &s.threads[index];
     let id = thread.id;
@@ -2724,16 +2819,25 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     };
     let workspace = row_workspace(s, thread);
     let mut item = row()
-        .key(format!("thread-{}", thread.id))
+        .key(if s.client.is_some() {
+            format!("machine-thread-{}-{id}", s.machines.selected)
+        } else {
+            format!("thread-{id}")
+        })
         .role("button")
         .cursor(rune::Cursor::Pointer)
         .label(format!(
-            "{}{}, {}",
+            "{}{}{}, {}",
             thread.title,
             workspace
                 .as_ref()
                 .map(|w| format!(", {w}"))
                 .unwrap_or_default(),
+            if s.client.is_some() {
+                format!(", {}", machine_caption(s, &s.machines.selected))
+            } else {
+                String::new()
+            },
             if approval {
                 "needs approval"
             } else if nested && (thread.request.is_some() || thread.status == Status::Waiting) {
@@ -2975,9 +3079,17 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .child(project_tile(s, p, project, 16.0))
         .child(
             label(
-                project
-                    .map(|project| project.name.clone())
-                    .unwrap_or_else(|| "No workspace".into()),
+                format!(
+                    "{}{}",
+                    project
+                        .map(|project| project.name.clone())
+                        .unwrap_or_else(|| "No workspace".into()),
+                    if s.client.is_some() {
+                        format!(" · {}", machine_caption(s, &s.machines.selected))
+                    } else {
+                        String::new()
+                    }
+                ),
                 CARD_META,
                 p.muted,
             )
@@ -3044,17 +3156,39 @@ fn project_tile(
 
 /// A row's workspace name, unless the Workspace filter already names that one workspace.
 fn row_workspace(s: &State, thread: &Thread) -> Option<String> {
-    let named_by_filter = s.scope_additional.is_empty()
-        && match s.project_scope {
-            ProjectScope::Project(id) => thread.project == Some(id),
-            ProjectScope::NoProject => thread.project.is_none(),
-            ProjectScope::All => false,
-        };
+    let named_by_filter = workspace_named_by_filter(s, &s.machines.selected, thread.project);
     (!named_by_filter).then(|| {
         s.project(thread.project)
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "No workspace".into())
     })
+}
+fn workspace_named_by_filter(s: &State, server: &str, project: Option<usize>) -> bool {
+    s.scope_additional.is_empty()
+        && s.machines.scope_remote.is_empty()
+        && match s.project_scope {
+            ProjectScope::Project(id) => {
+                project == Some(id)
+                    && s.machines
+                        .scope_server
+                        .as_deref()
+                        .unwrap_or(&s.machines.selected)
+                        == server
+            }
+            ProjectScope::NoProject => project.is_none(),
+            ProjectScope::All => false,
+        }
+}
+fn machine_caption(s: &State, server: &str) -> String {
+    format!(
+        "{}{}",
+        s.machine_label(server),
+        if s.machine_connected(server) {
+            ""
+        } else {
+            " · Offline"
+        }
+    )
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -3502,6 +3636,55 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
 }
 
 fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
+    // Ported from KSG Code's ChatHeader workspace/thread breadcrumb. Linked
+    // environments share one navigation header, not a new set of tabs per server.
+    if s.client.is_some() {
+        let thread = s.current();
+        let project = s.project(thread.project);
+        return row()
+            .h(36.0)
+            .window_drag()
+            .center_y()
+            .gap(8.0)
+            .child(
+                row()
+                    .key("thread-tabs")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .h(36.0)
+                    .center_y()
+                    .child(
+                        row()
+                            .key("active-tab")
+                            .h(28.0)
+                            .gap(6.0)
+                            .px(8.0)
+                            .min_w(0.0)
+                            .child(project_tile(s, p, project, 14.0))
+                            .child(
+                                label(
+                                    project.map(|p| p.name.as_str()).unwrap_or("No workspace"),
+                                    SMALL,
+                                    p.muted,
+                                )
+                                .max_w(if narrow { 90.0 } else { 160.0 })
+                                .truncate()
+                                .shrink(),
+                            )
+                            .child(label("/", SMALL, p.muted))
+                            .child(
+                                label(&thread.title, TextStyle::new(13.0, 520.0), p.ink)
+                                    .truncate()
+                                    .min_w(0.0)
+                                    .shrink(),
+                            ),
+                    ),
+            )
+            .child(
+                icon_button("new-tab", "New thread", "plus", p, |_| {})
+                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift)),
+            );
+    }
     let mut tabs = row()
         .key("thread-tabs")
         .min_w(0.0)
@@ -3580,6 +3763,35 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         .px(10.0)
         .center_y()
         .gap(4.0);
+    if s.client.is_some() {
+        let server = &s.machines.selected;
+        header = header.child(
+            row()
+                .key("chat-machine")
+                .gap(5.0)
+                .center_y()
+                .min_w(0.0)
+                .child(icon("monitor", p.muted))
+                .child(
+                    label(
+                        format!(
+                            "{}{}",
+                            s.machine_label(server),
+                            if s.machine_connected(server) {
+                                ""
+                            } else {
+                                " · Offline"
+                            }
+                        ),
+                        SMALL,
+                        p.muted,
+                    )
+                    .truncate()
+                    .min_w(0.0)
+                    .shrink(),
+                ),
+        );
+    }
     // Crew threads link back to the thread that started them; nothing else repeats the tab.
     if let Some(parent) = s
         .current()
@@ -4310,11 +4522,12 @@ fn popover(key: &str, name: &str, s: &State, p: Palette) -> El {
         )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PickerChoice {
     All,
     NoProject,
     Project(usize),
+    MachineProject(String, usize),
 }
 
 /// The picker's rows that match its search, in display order.
@@ -4330,7 +4543,36 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String)>
     for id in s.sorted_projects() {
         let project = s.project(Some(id)).expect("sorted project");
         if !project.hidden {
-            choices.push((PickerChoice::Project(id), project.name.clone()));
+            choices.push((
+                PickerChoice::Project(id),
+                if mode == ProjectPicker::Scope && s.client.is_some() {
+                    format!(
+                        "{} · {}",
+                        project.name,
+                        s.machine_label(&s.machines.selected)
+                    )
+                } else {
+                    project.name.clone()
+                },
+            ));
+        }
+    }
+    if mode == ProjectPicker::Scope && s.client.is_some() {
+        for (server, view) in &s.machines.views {
+            if server == &s.machines.selected {
+                continue;
+            }
+            for project in view["index"]["projects"].as_array().into_iter().flatten() {
+                if project["hidden"] == true {
+                    continue;
+                }
+                if let (Some(id), Some(name)) = (project["id"].as_u64(), project["name"].as_str()) {
+                    choices.push((
+                        PickerChoice::MachineProject(server.clone(), id as usize),
+                        format!("{name} · {}", s.machine_label(server)),
+                    ));
+                }
+            }
         }
     }
     choices.retain(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query));
@@ -4342,6 +4584,7 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         PickerChoice::All => {
             s.project_scope = ProjectScope::All;
             s.scope_additional.clear();
+            s.machines.scope_remote.clear();
             s.selected_threads.clear();
             s.project_picker = None;
             s.checkpoint();
@@ -4349,6 +4592,12 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         }
         PickerChoice::NoProject => None,
         PickerChoice::Project(id) => Some(id),
+        PickerChoice::MachineProject(server, id) => {
+            if mode == ProjectPicker::Scope {
+                s.set_machine_scope(server, Some(id), shift);
+            }
+            return;
+        }
     };
     match mode {
         ProjectPicker::NewThread => s.new_thread_in(project),
@@ -4434,7 +4683,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                                     if let Some(mode) = s.project_picker
                                         && let Some(choice) = picker_choices(s, mode)
                                             .get(s.picker_highlight.min(count.saturating_sub(1)))
-                                            .map(|(choice, _)| *choice)
+                                            .map(|(choice, _)| choice.clone())
                                     {
                                         choose_picker(s, mode, choice, event.mods.shift);
                                     }
@@ -4454,10 +4703,28 @@ fn project_picker(s: &State, p: Palette) -> El {
         stick_bottom: false,
     });
     for (index, (choice, name)) in choices.iter().enumerate() {
+        let remote_project = if let PickerChoice::MachineProject(server, id) = choice {
+            s.machines
+                .views
+                .get(server)
+                .and_then(|view| view["index"]["projects"].as_array())
+                .and_then(|projects| {
+                    projects
+                        .iter()
+                        .find(|project| project["id"].as_u64() == Some(*id as u64))
+                })
+                .and_then(|project| crate::projects::Project::from_record(project, false))
+        } else {
+            None
+        };
         let (key, project) = match choice {
             PickerChoice::All => ("scope-all-projects".to_string(), None),
             PickerChoice::NoProject => ("choose-no-project".to_string(), None),
             PickerChoice::Project(id) => (format!("choose-project-{id}"), s.project(Some(*id))),
+            PickerChoice::MachineProject(server, id) => (
+                format!("choose-project-{server}-{id}"),
+                remote_project.as_ref(),
+            ),
         };
         let checked = match (mode, choice) {
             (ProjectPicker::CaptainScope, PickerChoice::Project(id)) => {
@@ -4468,11 +4735,16 @@ fn project_picker(s: &State, p: Palette) -> El {
                 s.project_scope == ProjectScope::NoProject
             }
             (ProjectPicker::Scope, PickerChoice::Project(id)) => {
-                s.project_scope == ProjectScope::Project(*id) || s.scope_additional.contains(id)
+                s.project_scope != ProjectScope::All
+                    && s.scope_includes_on(&s.machines.selected, Some(*id))
+            }
+            (ProjectPicker::Scope, PickerChoice::MachineProject(server, id)) => {
+                s.project_scope != ProjectScope::All && s.scope_includes_on(server, Some(*id))
             }
             _ => false,
         };
-        let choice = *choice;
+        let choice = choice.clone();
+        let action_choice = choice.clone();
         let mut item = row()
             .key(key)
             .role("menuitem")
@@ -4490,7 +4762,9 @@ fn project_picker(s: &State, p: Palette) -> El {
                 Color::TRANSPARENT
             })
             .hover(p.selected)
-            .on_press_tx(move |s: &mut State, tx| choose_picker(s, mode, choice, tx.mods().shift))
+            .on_press_tx(move |s: &mut State, tx| {
+                choose_picker(s, mode, action_choice.clone(), tx.mods().shift)
+            })
             .child(match choice {
                 PickerChoice::All => el().size(16.0, 16.0).center().child(icon("list", p.muted)),
                 _ => project_tile(s, p, project, 16.0),
@@ -5201,8 +5475,7 @@ fn quiet_inks(p: Palette) -> (Color, Color) {
     (p.muted, p.muted.alpha(0.62))
 }
 
-/// A one-line activity row. The verb leads in the secondary ink, its target trails in the
-/// tertiary ink, and the whole line truncates. A failure says so in red at the end.
+/// Ported from KSG Code's WorkLogLine: a 24 px icon slot, a label and adjacent disclosure.
 fn activity_line(
     key: String,
     a11y: String,
@@ -5210,6 +5483,7 @@ fn activity_line(
     detail: &str,
     failed: bool,
     open: bool,
+    glyph: &str,
     p: Palette,
 ) -> El {
     let (secondary, tertiary) = quiet_inks(p);
@@ -5226,6 +5500,11 @@ fn activity_line(
         .ml(-6.0)
         .radius(6.0)
         .hover(p.selected)
+        .child(
+            el().size(24.0, 24.0)
+                .center()
+                .child(tool_icon(glyph, secondary)),
+        )
         .child(label(
             verb,
             ACTIVITY,
@@ -5261,6 +5540,14 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             &tool.detail,
             tool.failed,
             tool.expanded,
+            match tool_kind(&tool.name) {
+                ToolKind::Read => "eye",
+                ToolKind::List => "folder",
+                ToolKind::Search => "search",
+                ToolKind::Edit => "edit",
+                ToolKind::Run => "terminal",
+                ToolKind::Other => "wrench",
+            },
             p,
         )
         .on_press(move |s: &mut State| {
@@ -5278,8 +5565,9 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                 .role("group")
                 .label(format!("Output for {title}"))
                 .mb(4.0)
-                .radius(10.0)
-                .fill(p.card)
+                .ml(28.0)
+                .radius(8.0)
+                .fill(p.code_bg)
                 .border(0.5, p.line)
                 .child(
                     label(&tool.detail, SMALL, p.muted)
@@ -5391,6 +5679,7 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
                 "",
                 failed > 0,
                 expanded,
+                "list",
                 p,
             )
             .on_press(move |s: &mut State| {
@@ -5438,6 +5727,7 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
             &detail,
             false,
             thought.expanded,
+            "brain",
             p,
         )
         .on_press(move |s: &mut State| {
@@ -5452,7 +5742,7 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
                 .key(format!("thought-output-{}-{index}", t.id))
                 .role("group")
                 .label("Thinking text")
-                .pl(12.0)
+                .pl(28.0)
                 .mb(4.0)
                 .max_h(220.0)
                 .scroll(ScrollSpec {
@@ -5483,32 +5773,23 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
         TranscriptPart::Thought(index) => inline_thought(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
+            let message_index = *message;
+            let offset = *from;
+            let thread_id = t.id;
             let streaming = t.status == Status::Running && message + 1 == t.messages.len();
-            let style = MarkdownStyle::neutral(s.dark)
-                .text(p.ink)
-                .muted(p.muted)
-                .body_font(prose_style(wide))
-                .inline_code_bg(if s.dark {
-                    Color::WHITE.alpha(0.07)
-                } else {
-                    Color::BLACK.alpha(0.055)
-                })
-                .selection(p.teal_bg)
-                .code_block(p.card, p.line)
-                .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))
-                .code_block_font(
-                    TextStyle::new(12.0, 400.0)
-                        .family(rune::Family::SystemMono)
-                        .lh(18.0),
-                );
             memo(
                 format!("message-{}-{message}-body-{from}", t.id),
                 (chunk, s.dark, streaming, wide),
                 || {
-                    Markdown::new(chunk)
-                        .streaming(streaming)
-                        .scroll_wide(true)
-                        .render(&style)
+                    markdown_ui::render(
+                        chunk,
+                        p,
+                        s.dark,
+                        wide,
+                        false,
+                        streaming,
+                        &format!("{thread_id}-{message_index}-{offset}"),
+                    )
                 },
             )
         }
@@ -5650,6 +5931,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     "",
                     false,
                     expanded,
+                    "clock",
                     p,
                 )
                 .on_press(move |s: &mut State| {
@@ -5779,14 +6061,27 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 }
                 if !message.text.trim().is_empty() {
                     user = user.child(
-                        label(&message.text, body_style(wide), p.ink)
-                            .key(format!("{key}-text"))
-                            .wrap_anywhere()
-                            .selectable(true)
-                            .max_w(max_width)
-                            .padding(12.0)
-                            .radius(16.0)
-                            .fill(if s.dark { p.card } else { p.selected }),
+                        memo(
+                            format!("{key}-markdown"),
+                            (&message.text, s.dark, wide),
+                            || {
+                                markdown_ui::render(
+                                    &message.text,
+                                    p,
+                                    s.dark,
+                                    wide,
+                                    true,
+                                    false,
+                                    &format!("user-{}-{index}", t.id),
+                                )
+                            },
+                        )
+                        .key(format!("{key}-text"))
+                        .max_w(max_width)
+                        .min_w(0.0)
+                        .padding(12.0)
+                        .radius(16.0)
+                        .fill(p.message_bg),
                     );
                 }
                 row().justify_end().child(user)
@@ -6971,85 +7266,6 @@ fn machine_picker(s: &State, p: Palette) -> El {
         .modal(true, |s: &mut State| s.machines.picker = false)
 }
 
-/// Ported from KSG Code's SidebarThreadRow environment label, grouped by server.
-fn other_machine_threads(s: &State, p: Palette) -> El {
-    let mut rows = col().gap(2.0);
-    for (server, projection) in &s.machines.views {
-        if server == &s.machines.selected {
-            continue;
-        }
-        let machine = s.machine_label(server);
-        rows = rows.child(
-            label(
-                format!(
-                    "{machine}{}",
-                    if s.machine_connected(server) {
-                        ""
-                    } else {
-                        " · Offline"
-                    }
-                ),
-                SMALL,
-                p.muted,
-            )
-            .key(format!("machine-heading-{server}"))
-            .px(ROW_INSET)
-            .pt(12.0)
-            .pb(4.0)
-            .truncate(),
-        );
-        for thread in projection["index"]["threads"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if thread["delegated"] == true || !thread["lifecycle"]["archivedAt"].is_null() {
-                continue;
-            }
-            let title = thread["title"].as_str().unwrap_or("Thread");
-            if !s.search.text.is_empty()
-                && !title.to_lowercase().contains(&s.search.text.to_lowercase())
-            {
-                continue;
-            }
-            let server = server.clone();
-            let id = thread["id"].as_u64().unwrap_or(0) as usize;
-            let captain = thread["captainHome"] == true;
-            rows = rows.child(
-                row()
-                    .key(format!("machine-thread-{server}-{id}"))
-                    .role("button")
-                    .label(format!("{title}, {machine}"))
-                    .h(44.0)
-                    .px(ROW_INSET)
-                    .gap(8.0)
-                    .center_y()
-                    .radius(6.0)
-                    .hover(p.selected)
-                    .cursor(rune::Cursor::Pointer)
-                    .focusable(true)
-                    .on_press(move |s: &mut State| {
-                        s.select_machine(&server);
-                        if s.machines.selected == server
-                            && let Some(index) = s.threads.iter().position(|thread| thread.id == id)
-                        {
-                            s.select_thread(index);
-                        }
-                    })
-                    .child(icon(if captain { "crew" } else { "thread" }, p.muted))
-                    .child(
-                        col()
-                            .min_w(0.0)
-                            .grow(1.0)
-                            .child(label(title, LABEL, p.ink).truncate().min_w(0.0))
-                            .child(label(&machine, SMALL, p.muted).truncate().min_w(0.0)),
-                    ),
-            );
-        }
-    }
-    rows
-}
-
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
 fn machine_dialog(s: &State, p: Palette) -> El {
     let busy = s.machines.pending.is_some();
@@ -7335,6 +7551,243 @@ pub(crate) mod tests {
         )
     }
     #[test]
+    fn fleet_navigation_keeps_one_header_and_stable_captain_positions_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.dark = false;
+            rt.state.zoom = 1.0;
+            rt.frame(0.0);
+            let positions = |rt: &Runtime<State>| {
+                sidebar_ui::entries(&rt.state)
+                    .iter()
+                    .filter(|entry| entry.captain)
+                    .map(|entry| {
+                        let key = format!("machine-thread-{}-{}", entry.server, entry.id);
+                        let rect = rt.presented(&key).unwrap().0;
+                        ((entry.server.to_string(), entry.id), rect)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = positions(&rt);
+            let header = rt.presented("thread-tabs").unwrap().0;
+            for server in ["example-studio", "example-laptop", "local"] {
+                let id = match server {
+                    "example-studio" => 3,
+                    "example-laptop" => 2,
+                    _ => 1,
+                };
+                rt.state.open_machine_thread(server, id);
+                rt.update(|state, tx| {
+                    crate::model::poll(state, 0.0, tx);
+                });
+                rt.invalidate();
+                rt.frame(1.0);
+                assert_eq!(rt.state.machines.selected, server);
+                assert!(
+                    rt.state.storage_error.is_none(),
+                    "{width}: {:?}",
+                    rt.state.storage_error
+                );
+                assert!(!rt.state.dark);
+                assert_eq!(rt.state.zoom, 1.0);
+                assert_eq!(rt.presented("thread-tabs").unwrap().0, header);
+                assert_eq!(
+                    positions(&rt),
+                    before,
+                    "{width}: selecting {server} moved captains"
+                );
+                assert!(rt.find("tab-1").is_none());
+                assert!(rt.find("tab-3").is_none());
+                assert!(rt.find("sidebar-machine-label").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn fleet_workspace_filter_is_server_scoped_and_does_not_follow_the_open_machine() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.open_picker(ProjectPicker::Scope);
+            rt.frame(0.0);
+            assert!(rt.presented("choose-project-example-laptop-1").is_some());
+            choose_picker(
+                &mut rt.state,
+                ProjectPicker::Scope,
+                PickerChoice::MachineProject("example-laptop".into(), 1),
+                false,
+            );
+            assert_eq!(rt.state.machines.selected, "local");
+            let entries = sidebar_ui::entries(&rt.state);
+            assert!(!entries.is_empty());
+            assert!(entries.iter().all(|entry| entry.server == "example-laptop"));
+            rt.state.open_machine_thread("example-laptop", 2);
+            assert_eq!(rt.state.project_scope, ProjectScope::Project(1));
+            assert_eq!(
+                rt.state.machines.scope_server.as_deref(),
+                Some("example-laptop")
+            );
+            choose_picker(
+                &mut rt.state,
+                ProjectPicker::Scope,
+                PickerChoice::All,
+                false,
+            );
+            rt.state.open_machine_thread("local", 1);
+            // The laptop now has a saved filter. Opening it must not restore that filter.
+            rt.state.open_machine_thread("example-laptop", 2);
+            assert_eq!(rt.state.project_scope, ProjectScope::All);
+            assert!(
+                sidebar_ui::entries(&rt.state)
+                    .iter()
+                    .any(|entry| entry.server == "local")
+            );
+            rt.state
+                .set_machine_scope("example-laptop".into(), Some(1), false);
+            rt.state.set_machine_scope("local".into(), Some(1), true);
+            assert!(rt.state.scope_includes_on("example-laptop", Some(1)));
+            assert!(rt.state.scope_includes_on("local", Some(1)));
+            assert!(!rt.state.scope_includes_on("example-studio", Some(1)));
+            rt.invalidate();
+            rt.frame(1.0);
+            let key = "machine-thread-local-7";
+            let before = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some(key))
+                .unwrap()
+                .path;
+            rt.state.open_machine_thread("local", 1);
+            rt.invalidate();
+            rt.frame(2.0);
+            let after = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some(key))
+                .unwrap()
+                .path;
+            assert_eq!(before, after, "{width}: captain button identity changed");
+        }
+    }
+
+    #[test]
+    fn user_markdown_keeps_line_breaks_and_long_paths_inside_the_bubble() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let source = format!(
+                "step one\nstep two\nstep three\n\n/{}",
+                "segment".repeat(40)
+            );
+            rt.state.current_mut().messages = vec![crate::model::Message {
+                role: "You",
+                text: source.clone(),
+                images: vec![],
+            }];
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().messages[0].text, source);
+            let bubble = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("message-1-0-text"))
+                .unwrap();
+            let text: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|element| element.path.starts_with(&bubble.path))
+                .filter_map(|element| element.text.map(|text| (text, element.rect)))
+                .collect();
+            assert!(
+                text.iter()
+                    .any(|(text, _)| text == "step one\nstep two\nstep three"),
+                "{text:?}"
+            );
+            for (_, rect) in text {
+                assert!(
+                    rect[0] >= bubble.rect[0] - 0.5
+                        && rect[0] + rect[2] <= bubble.rect[0] + bubble.rect[2] + 0.5,
+                    "{width}: text {rect:?} escapes bubble {:?}",
+                    bubble.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_code_headers_fit_and_copy_only_the_code_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            let thread = rt.state.current_mut();
+            thread.tools.clear();
+            thread.thoughts.clear();
+            thread.work.clear();
+            thread.captain = None;
+            thread.messages = vec![
+                crate::model::Message {
+                    role: "You",
+                    text: "Explain **this change**.".into(),
+                    images: vec![],
+                },
+                crate::model::Message {
+                    role: "Pi",
+                    text: "```rust\nlet ready = true;\n```".into(),
+                    images: vec![],
+                },
+            ];
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            rt.frame(0.0);
+            let key = "copy-code-1-1-0-0";
+            let (rect, _) = rt.presented(key).unwrap();
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                "{width}: {rect:?}"
+            );
+            press(&mut rt, key);
+            assert_eq!(
+                clipboard.text().as_deref().map(|text| text.as_str()),
+                Some("let ready = true;")
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_diff_and_user_code_have_code_only_copy_headers_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::markdown_demo(&mut rt.state);
+            let diff_start = rt.state.current().messages[1].text.find("```diff").unwrap();
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            rt.frame(0.0);
+            // Reveal the top of the conversation to exercise the user code header.
+            rt.wheel(width - 80.0, 200.0, 2000.0);
+            rt.frame(1.0);
+            press(&mut rt, "copy-code-user-1-0-0");
+            assert_eq!(
+                clipboard.text().as_deref().map(|text| text.as_str()),
+                Some("let ready = true;")
+            );
+            let key = format!("copy-code-1-1-0-diff-{diff_start}");
+            rt.wheel(width - 80.0, 400.0, -2000.0);
+            rt.frame(2.0);
+            let (rect, _) = rt.presented(&key).unwrap();
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                "{width}: {rect:?}"
+            );
+            press(&mut rt, &key);
+            assert_eq!(
+                clipboard.text().as_deref().map(|text| text.as_str()),
+                Some("- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();")
+            );
+        }
+    }
+
+    #[test]
     fn machine_selector_labels_and_link_dialog_fit_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -7352,7 +7805,7 @@ pub(crate) mod tests {
             rt.state.machines.views.insert(
                 "fixture-server".into(),
                 json!({"index":{"threads":[
-                    {"id":1,"title":"Remote thread","captainHome":false,"lifecycle":{}},
+                    {"id":1,"title":"Remote thread","session":"fixture","captainHome":false,"lifecycle":{}},
                     {"id":2,"title":"Remote captain","captainHome":true,"lifecycle":{}}
                 ]}}),
             );
@@ -7371,10 +7824,9 @@ pub(crate) mod tests {
                 );
             }
             for key in [
-                "sidebar-machine-label",
-                "machine-heading-fixture-server",
                 "machine-thread-fixture-server-1",
                 "machine-thread-fixture-server-2",
+                "machine-portrait-fixture-server-2",
             ] {
                 let (rect, _) = rt
                     .presented(key)
@@ -7388,6 +7840,8 @@ pub(crate) mod tests {
                     "{width}: {rect:?}"
                 );
             }
+            assert!(rt.find("sidebar-machine-label").is_none());
+            assert!(rt.find("machine-heading-fixture-server").is_none());
             press(&mut rt, "machine-selector");
             for key in [
                 "machine-picker",
@@ -7871,6 +8325,8 @@ pub(crate) mod tests {
                 (p.muted, p.panel),
                 (p.muted, p.bg),
                 (p.muted, p.card),
+                (p.ink, p.message_bg),
+                (p.muted, p.code_bg),
                 (p.muted, p.bg.mix(p.selected, p.selected.a)),
                 (p.muted, p.card.mix(p.selected, p.selected.a)),
                 (p.teal_text, p.panel),

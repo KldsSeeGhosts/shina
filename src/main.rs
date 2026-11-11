@@ -70,25 +70,36 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
             || event.is_command('{')
             || event.is_command('}'))
     {
-        let order = state.sidebar_navigation();
+        let order = ui::sidebar_navigation(state);
         if !order.is_empty() {
             let i = order
                 .iter()
-                .position(|i| state.threads[*i].id == state.current().id)
+                .position(|(server, id)| {
+                    server == &state.machines.selected && *id == state.current().id
+                })
                 .unwrap_or(0);
             let next = if event.is_command('[') || event.is_command('{') {
                 (i + order.len() - 1) % order.len()
             } else {
                 (i + 1) % order.len()
             };
-            state.select_thread(order[next]);
+            let (server, id) = &order[next];
+            if state.client.is_some() {
+                state.open_machine_thread(server, *id);
+            } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id) {
+                state.select_thread(index);
+            }
         }
     } else if matches!(event.key, Key::Command('1'..='9')) && !event.mods.shift && !event.mods.alt {
         let Key::Command(n) = event.key else {
             unreachable!()
         };
-        if let Some(i) = state.sidebar_navigation().get(n as usize - '1' as usize) {
-            state.select_thread(*i);
+        if let Some((server, id)) = ui::sidebar_navigation(state).get(n as usize - '1' as usize) {
+            if state.client.is_some() {
+                state.open_machine_thread(server, *id);
+            } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id) {
+                state.select_thread(index);
+            }
         }
     } else if event.is_command('n') {
         if event.mods.alt {
@@ -143,6 +154,67 @@ fn running_demo(state: &mut State) {
     tool.done = false;
     tool.duration_ms = None;
     tool.started = Some(std::time::Instant::now());
+}
+
+/// An offline, read-only fleet fixture for native navigation and sidebar checks.
+fn fleet_demo(state: &mut State) {
+    state.populate_demo();
+    let mut projections = Vec::new();
+    for (server, host, home, chat) in [
+        ("local", "Local", 7, 1),
+        ("example-studio", "Studio", 8, 3),
+        ("example-laptop", "Laptop", 9, 2),
+    ] {
+        let mut fixture = State::new(PathBuf::new(), false);
+        fixture.populate_demo();
+        fixture
+            .threads
+            .retain(|thread| thread.id == home || thread.id == chat);
+        fixture.active = fixture
+            .threads
+            .iter()
+            .position(|thread| thread.id == chat)
+            .unwrap();
+        fixture.tabs = vec![chat];
+        for project in &mut fixture.projects.entries {
+            project.captain = None;
+            project.captain_thread = None;
+        }
+        let projection = fixture.projection();
+        projections.push((server, host, projection));
+    }
+    state
+        .threads
+        .retain(|thread| thread.id == 7 || thread.id == 1);
+    state.tabs = vec![1];
+    let mut client = client::Client::new(state.data_dir.clone());
+    for (server, host, projection) in projections {
+        if server != "local" {
+            let mut remote = client::Client::new(state.data_dir.clone());
+            remote.remote = Some(peer::Link {
+                server_id: server.into(),
+                host: host.into(),
+                device_id: "example".into(),
+                token: "unused-offline-fixture".into(),
+            });
+            client.linked.insert(server.into(), remote);
+        }
+        state.machines.views.insert(server.into(), projection);
+    }
+    state.client = Some(client);
+}
+
+fn markdown_demo(state: &mut State) {
+    fleet_demo(state);
+    let thread = state.current_mut();
+    thread.tools.clear();
+    thread.thoughts.clear();
+    thread.work.clear();
+    thread.captain = None;
+    thread.messages = vec![
+        model::Message { role: "You", text: "Keep the setup order:\nattach the listener\nopen the socket\n\n```rust\nlet ready = true;\n```".into(), images: vec![] },
+        model::Message { role: "Pi", text: "Register the listener before opening the socket.\n\n```rust\nlet ready = true;\nif ready {\n    socket.open();\n}\n```\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nBoth blocks have a code-only copy action.".into(), images: vec![] },
+    ];
 }
 
 /// Example coordinator and worker chats. No agents run in snapshot scenes.
@@ -603,6 +675,11 @@ fn main() {
         on_key: Some(key),
         scenes: &[
             ("example", |state| state.populate_demo()),
+            ("fleet", fleet_demo),
+            ("fleet-sidebar", |state| { fleet_demo(state); state.compact_sidebar = true; }),
+            ("markdown", markdown_demo),
+            ("markdown-dark", |state| { markdown_demo(state); state.dark = true; }),
+            ("fleet-dark", |state| { fleet_demo(state); state.dark = true; }),
             ("dark", |state| {
                 state.populate_demo();
                 state.dark = true;

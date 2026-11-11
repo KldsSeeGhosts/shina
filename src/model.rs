@@ -2321,7 +2321,9 @@ impl State {
             return;
         }
         self.active = index;
-        self.forward("thread.visit", json!({"threadId":self.current().id}));
+        if !self.demo {
+            self.forward("thread.visit", json!({"threadId":self.current().id}));
+        }
         self.selected_threads.clear();
         let id = self.current().id;
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
@@ -2495,13 +2497,7 @@ impl State {
                         || home.captain.is_some_and(|captain| {
                             self.captain_scope(captain)
                                 .iter()
-                                .any(|id| match self.project_scope {
-                                    ProjectScope::All => true,
-                                    ProjectScope::Project(primary) => {
-                                        *id == primary || self.scope_additional.contains(id)
-                                    }
-                                    ProjectScope::NoProject => false,
-                                })
+                                .any(|id| self.scope_includes(Some(*id)))
                         }))
             })
             .filter(|(_, home)| {
@@ -2611,40 +2607,91 @@ impl State {
     }
     /// Whether the workspace filter shows this workspace (None is No workspace).
     pub fn scope_includes(&self, project: Option<ProjectId>) -> bool {
-        let additional = project.is_some_and(|p| self.scope_additional.contains(&p));
+        self.scope_includes_on(&self.machines.selected, project)
+    }
+    pub fn scope_includes_on(&self, server: &str, project: Option<ProjectId>) -> bool {
+        let owner = self
+            .machines
+            .scope_server
+            .as_deref()
+            .unwrap_or(&self.machines.selected);
+        let same_server = self.client.is_none() || server == owner;
+        let additional = project.is_some_and(|p| {
+            same_server && self.scope_additional.contains(&p)
+                || self
+                    .machines
+                    .scope_remote
+                    .iter()
+                    .any(|(owner, id)| owner == server && *id == p)
+        });
         match self.project_scope {
             ProjectScope::All => true,
-            ProjectScope::Project(id) => project == Some(id) || additional,
+            ProjectScope::Project(id) => same_server && project == Some(id) || additional,
             ProjectScope::NoProject => project.is_none() || additional,
         }
     }
     pub fn set_project_scope(&mut self, project: Option<ProjectId>, multi: bool) {
-        let mut choices: Vec<_> = if multi {
+        self.set_machine_scope(self.machines.selected.clone(), project, multi);
+    }
+    pub fn set_machine_scope(&mut self, server: String, project: Option<ProjectId>, multi: bool) {
+        let owner = self
+            .machines
+            .scope_server
+            .clone()
+            .unwrap_or_else(|| self.machines.selected.clone());
+        // None means the global "No workspace" choice; every project has an
+        // explicit server. Keep the legacy primary/additional fields readable.
+        let mut choices: Vec<Option<(String, usize)>> = if multi {
             match self.project_scope {
                 ProjectScope::All => vec![],
                 ProjectScope::NoProject => std::iter::once(None)
-                    .chain(self.scope_additional.iter().copied().map(Some))
+                    .chain(
+                        self.scope_additional
+                            .iter()
+                            .map(|id| Some((owner.clone(), *id))),
+                    )
+                    .chain(self.machines.scope_remote.iter().cloned().map(Some))
                     .collect(),
-                ProjectScope::Project(id) => std::iter::once(Some(id))
-                    .chain(self.scope_additional.iter().copied().map(Some))
+                ProjectScope::Project(id) => std::iter::once(Some((owner.clone(), id)))
+                    .chain(
+                        self.scope_additional
+                            .iter()
+                            .map(|id| Some((owner.clone(), *id))),
+                    )
+                    .chain(self.machines.scope_remote.iter().cloned().map(Some))
                     .collect(),
             }
         } else {
             vec![]
         };
-        if let Some(i) = choices.iter().position(|id| *id == project) {
+        let target = project.map(|id| (server, id));
+        if let Some(i) = choices.iter().position(|choice| choice == &target) {
             choices.remove(i);
         } else {
-            choices.push(project);
+            choices.push(target);
         }
         choices.sort();
         choices.dedup();
         self.project_scope = match choices.first() {
             None => ProjectScope::All,
             Some(None) => ProjectScope::NoProject,
-            Some(Some(id)) => ProjectScope::Project(*id),
+            Some(Some((_, id))) => ProjectScope::Project(*id),
         };
-        self.scope_additional = choices.into_iter().skip(1).flatten().collect();
+        let owner = choices
+            .iter()
+            .flatten()
+            .next()
+            .map(|(server, _)| server.clone());
+        self.machines.scope_server = owner.clone();
+        self.scope_additional.clear();
+        self.machines.scope_remote.clear();
+        for (server, id) in choices.into_iter().skip(1).flatten() {
+            if Some(&server) == owner.as_ref() {
+                self.scope_additional.push(id);
+            } else {
+                self.machines.scope_remote.push((server, id));
+            }
+        }
         self.selected_threads.clear();
         if !multi {
             self.project_picker = None;
@@ -5382,6 +5429,8 @@ impl State {
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
+            "scopeServer":self.machines.scope_server,
+            "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
                 let value = if t.draft_images.is_empty() {
@@ -5432,7 +5481,16 @@ impl State {
         };
         self.scope_additional = serde_json::from_value(ui["scopeAdditional"].clone())
             .map_err(|_| "Invalid project scopes.")?;
+        self.machines.scope_server = ui["scopeServer"].as_str().map(str::to_owned);
+        self.machines.scope_remote =
+            serde_json::from_value(ui.get("scopeRemote").cloned().unwrap_or(json!([])))
+                .map_err(|_| "Invalid remote project scopes.")?;
         if let ProjectScope::Project(id) = self.project_scope
+            && self
+                .machines
+                .scope_server
+                .as_ref()
+                .is_none_or(|owner| owner == &self.machines.selected)
             && self.project(Some(id)).is_none()
             && self
                 .scope_additional
@@ -5862,6 +5920,15 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    // Linked-machine examples are offline fixtures. Animate their artwork, but
+    // never run native provider maintenance or client commands for those records.
+    if state.demo && state.client.is_some() {
+        if let Some(wait) = crate::ui::tick_portraits(state, Instant::now()) {
+            tx.wake_after(wait);
+            return true;
+        }
+        return false;
+    }
     if state.client.is_some() {
         return state.poll_client(tx);
     }
