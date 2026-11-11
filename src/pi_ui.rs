@@ -298,13 +298,6 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
 }
 
 /// KSG Code's context meter exposes its native compact action next to context details.
-pub(super) fn compact_control(s: &State, p: Palette) -> El {
-    button("compact-context", "Compact context", p, |s| {
-        s.compact_context(None)
-    })
-    .disabled(s.demo || !s.current().can_compact())
-}
-
 /// Ported from KSG Code's compaction activity items: collapsed summary, status and token figures.
 pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
     let t = s.current();

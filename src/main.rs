@@ -427,6 +427,16 @@ fn main() {
                     state.projects.clone_parent.join("rune").display()
                 ));
             }),
+            ("context-popover", |state| {
+                state.populate_demo();
+                let t = state.current_mut();
+                t.context_window = Some(200_000);
+                t.context.absorb(&serde_json::json!({
+                    "contextUsage": {"tokens": 61_400, "contextWindow": 200_000, "percent": 30.7}
+                }));
+                t.native.stats = serde_json::json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
+                t.context.details_open = true;
+            }),
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
