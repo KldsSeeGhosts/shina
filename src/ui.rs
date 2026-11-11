@@ -10,6 +10,8 @@ use rune::{
 };
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
+#[path = "captain_ui.rs"]
+mod captain_ui;
 #[path = "crew_ui.rs"]
 mod crew_ui;
 #[path = "pi_ui.rs"]
@@ -638,7 +640,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.panel)
         .radius(10.0)
         .clip_rounded(10.0);
-    if s.show_activity && (narrow || s.activity_full) {
+    // A captain home shows its Brief instead of session details: beside the chat, or as a
+    // sheet over it on a narrow window.
+    let brief = s.show_activity && captain_ui::brief_captain(s).is_some();
+    if s.show_activity && !brief && (narrow || s.activity_full) {
         pane = pane.child(activity(s, p, true));
     } else {
         let mut body = row().grow(1.0).min_h(0.0);
@@ -648,7 +653,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .min_w(0.0)
             .min_h(0.0)
             .child(chat_header(s, p, narrow, compact));
-        let main = if s.current().messages.is_empty() && s.current().tools.is_empty() {
+        let main = if captain_ui::is_earlier(s) {
+            main.child(conversation(s, p, wide, main_width))
+                .child(captain_ui::earlier_bar(s, p, wide, main_width))
+        } else if s.current().messages.is_empty() && s.current().tools.is_empty() {
             main.child(empty_thread(s, p, narrow, wide, main_width))
         } else {
             main.child(conversation(s, p, wide, main_width))
@@ -656,7 +664,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         };
         body = body.child(main);
         context_popover_shown = true;
-        if s.show_activity {
+        if brief && !narrow {
+            body = body
+                .child(el().w(1.0).h_full().fill(p.line))
+                .child(captain_ui::brief_side(s, p));
+        } else if s.show_activity && !brief {
             body = body
                 .child(el().w(1.0).h_full().fill(p.line))
                 .child(activity(s, p, false));
@@ -680,6 +692,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         && s.current().context.popover_open()
     {
         root = root.child(context_popover(s, p));
+    }
+    if brief && narrow {
+        let top = chrome.height.max(40.0 * zoom) / zoom;
+        root = root.child(captain_ui::brief_sheet(s, p, top));
     }
     if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
@@ -719,6 +735,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.settings_menu {
         root = root.child(settings_menu(s, p));
+    }
+    for dialog in captain_ui::dialogs(s, p) {
+        root = root.child(dialog);
     }
     if docked && let Some(pill) = crew_ui::attention_row(s, p, sidebar_width < 240.0) {
         root = root.child(pill);
@@ -1901,17 +1920,16 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     side
 }
 
-/// Preferences behind the footer's gear. BackgroundActivitySettings in KSG Code has no
-/// close-to-tray/routine equivalent; these requested plain items reuse the existing menu.
-// Default selection follows KSG Code's settings/ProjectDefaultsSettings.tsx.
-// This interim menu item reuses Shina's existing menu spacing.
+/// Preferences behind the footer's gear: the "You" profile, background work, and the theme.
+/// The background rows are KSG Code's `SettingsRow` with a `Switch` (see `captain_ui`); a
+/// captain's routines live in its Brief.
 fn settings_menu(s: &State, p: Palette) -> El {
     let mut menu = col()
         .key("settings-menu")
         .role("menu")
         .label("Settings")
-        .w(300.0)
-        .max_h(420.0)
+        .w(320.0)
+        .max_h(460.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
@@ -1934,81 +1952,12 @@ fn settings_menu(s: &State, p: Palette) -> El {
             )
             .on_press(|s: &mut State| s.cycle_default_harness()),
         )
-        .child(
-            menu_item(
-                "background-toggle",
-                if s.background_settings().keep_working {
-                    "Keep working in background: On"
-                } else {
-                    "Keep working in background: Off"
-                },
-                "moon",
-                p,
-            )
-            .on_press(|s: &mut State| {
-                s.set_keep_working(!s.background_settings().keep_working);
-            }),
-        )
-        .child(
-            menu_item(
-                "keep-awake-toggle",
-                s.background_settings().keep_awake.label(),
-                "sun",
-                p,
-            )
-            .on_press(|s: &mut State| {
-                s.set_keep_awake(s.background_settings().keep_awake.next());
-            }),
-        );
-    if let Some(error) = s.background_status().error {
-        menu = menu.child(label(&error, SMALL, p.danger).wrap().px(8.0));
+        .child(captain_ui::profile_item(s, p))
+        .child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
+    for item in captain_ui::background_settings(s, p) {
+        menu = menu.child(item);
     }
-    for captain in 0..s.captains.len() {
-        for routine in s.routines(captain) {
-            let id = routine.id;
-            let paused = routine.paused;
-            menu = menu
-                .child(
-                    label(
-                        format!("Routine: {} ({})", routine.name, routine.last_status),
-                        SMALL,
-                        p.muted,
-                    )
-                    .wrap()
-                    .px(8.0),
-                )
-                .child(
-                    menu_item(
-                        &format!("routine-pause-{id}"),
-                        if paused {
-                            "Resume routine"
-                        } else {
-                            "Pause routine"
-                        },
-                        "moon",
-                        p,
-                    )
-                    .on_press(move |s: &mut State| {
-                        if let Err(error) = s.set_routine_paused(id, !paused) {
-                            s.storage_error = Some(error);
-                        }
-                    }),
-                )
-                .child(
-                    menu_item(
-                        &format!("routine-delete-{id}"),
-                        "Delete routine",
-                        "close",
-                        p,
-                    )
-                    .on_press(move |s: &mut State| {
-                        if let Err(error) = s.delete_routine(id) {
-                            s.storage_error = Some(error);
-                        }
-                    }),
-                );
-        }
-    }
+    menu = menu.child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
     menu.anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
         .modal(true, |s: &mut State| s.settings_menu = false)
         .child(
@@ -3589,6 +3538,9 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
             .min_w(0.0),
         );
     }
+    if let Some(line) = captain_ui::away_status(s, p) {
+        header = header.child(line);
+    }
     header = header.child(spacer()).child(if s.demo {
         row()
             .key("demo-badge")
@@ -3619,7 +3571,9 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         p,
         |s| s.thread_menu = !s.thread_menu,
     ));
-    if !s.show_activity {
+    if captain_ui::brief_captain(s).is_some() {
+        header = header.child(captain_ui::brief_button(s, p));
+    } else if !s.show_activity {
         header = header.child(icon_button(
             "open-session-panel",
             "Show session details",
@@ -4329,7 +4283,9 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String)>
     if mode == ProjectPicker::Scope {
         choices.push((PickerChoice::All, "All workspaces".to_string()));
     }
-    choices.push((PickerChoice::NoProject, "No workspace".to_string()));
+    if mode != ProjectPicker::CaptainScope {
+        choices.push((PickerChoice::NoProject, "No workspace".to_string()));
+    }
     for id in s.sorted_projects() {
         let project = s.project(Some(id)).expect("sorted project");
         if !project.hidden {
@@ -4357,6 +4313,11 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         ProjectPicker::NewThread => s.new_thread_in(project),
         ProjectPicker::Scope => s.set_project_scope(project, shift),
         ProjectPicker::AddProject => {}
+        ProjectPicker::CaptainScope => {
+            if let Some(project) = project {
+                captain_ui::toggle_scope(s, project);
+            }
+        }
         ProjectPicker::AssignCaptain => {
             s.project_picker = None;
             s.projects.captain_target = project;
@@ -4382,6 +4343,7 @@ fn project_picker(s: &State, p: Palette) -> El {
         ProjectPicker::NewThread => "New thread in...",
         ProjectPicker::AssignCaptain => "Assign a captain to...",
         ProjectPicker::AddProject => "Add workspace",
+        ProjectPicker::CaptainScope => "Add to this captain's scope...",
     };
     let mut card = popover("project-picker", placeholder, s, p)
         .role("dialog")
@@ -4456,14 +4418,19 @@ fn project_picker(s: &State, p: Palette) -> El {
             PickerChoice::NoProject => ("choose-no-project".to_string(), None),
             PickerChoice::Project(id) => (format!("choose-project-{id}"), s.project(Some(*id))),
         };
-        let checked = mode == ProjectPicker::Scope
-            && match choice {
-                PickerChoice::All => s.project_scope == ProjectScope::All,
-                PickerChoice::NoProject => s.project_scope == ProjectScope::NoProject,
-                PickerChoice::Project(id) => {
-                    s.project_scope == ProjectScope::Project(*id) || s.scope_additional.contains(id)
-                }
-            };
+        let checked = match (mode, choice) {
+            (ProjectPicker::CaptainScope, PickerChoice::Project(id)) => {
+                captain_ui::in_scope(s, *id)
+            }
+            (ProjectPicker::Scope, PickerChoice::All) => s.project_scope == ProjectScope::All,
+            (ProjectPicker::Scope, PickerChoice::NoProject) => {
+                s.project_scope == ProjectScope::NoProject
+            }
+            (ProjectPicker::Scope, PickerChoice::Project(id)) => {
+                s.project_scope == ProjectScope::Project(*id) || s.scope_additional.contains(id)
+            }
+            _ => false,
+        };
         let choice = *choice;
         let mut item = row()
             .key(key)
@@ -7005,7 +6972,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn settings_lists_and_removes_routines_without_starting_a_prompt() {
+    fn the_brief_lists_and_removes_routines_without_starting_a_prompt() {
         let mut rt = runtime(1280.0);
         rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
@@ -7027,7 +6994,7 @@ pub(crate) mod tests {
                 chrono::Local::now(),
             )
             .unwrap();
-        rt.state.settings_menu = true;
+        rt.state.show_activity = true;
         rt.frame(0.0);
         assert!(rt.presented(&format!("routine-delete-{id}")).is_some());
         press(&mut rt, &format!("routine-pause-{id}"));

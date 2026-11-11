@@ -332,6 +332,110 @@ Error: none".into(),
 }
 
 /// The same work with a standalone thread open, so both crews are collapsed.
+/// A captain's Brief with labelled example scope, memory, routines and an earlier
+/// conversation. Routines save to a throwaway temporary folder, never Shina's data folder.
+fn captain_brief_demo(state: &mut State) {
+    captain_workspace_demo(state);
+    let Some(captain) = state.current().captain else {
+        return;
+    };
+    let home = state.current().id;
+    let _ = state.set_captain_scope(captain, vec![1, 2]);
+    for (text, essential) in [
+        (
+            "Example memory: prefers small pull requests, each with a regression test.",
+            true,
+        ),
+        (
+            "Example memory: Shina ships on Windows first. Check macOS before a release.",
+            true,
+        ),
+        (
+            "Example memory: port UI from KSG Code instead of inventing new components.",
+            true,
+        ),
+        (
+            "Example memory: the release branch is cut on Thursday afternoons.",
+            false,
+        ),
+        (
+            "Example memory: Rune lands drag commits at once, so set a motion curve per phase.",
+            false,
+        ),
+    ] {
+        let _ = state.add_memory(captain, text.into(), essential);
+    }
+    let folder = std::env::temp_dir().join(format!("shina-demo-{}", std::process::id()));
+    if std::fs::create_dir_all(&folder).is_ok() {
+        let mut routines = routines::Routines::load(folder.join("routines.json"));
+        let now = chrono::Local::now();
+        let made = [
+            (
+                "Example: Morning review",
+                routines::Schedule::Weekdays { at: "09:00".into() },
+            ),
+            (
+                "Example: End-of-day summary",
+                routines::Schedule::Daily { at: "18:30".into() },
+            ),
+            (
+                "Example: Dependency check",
+                routines::Schedule::Every { minutes: 240 },
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, schedule)| {
+            routines
+                .create(
+                    captain,
+                    home,
+                    name.into(),
+                    "Example routine prompt.".into(),
+                    schedule,
+                    routines::MissedPolicy::Skip,
+                    now,
+                )
+                .ok()
+        })
+        .collect::<Vec<_>>();
+        if let Some(&last) = made.last() {
+            let _ = routines.set_paused(last, true);
+        }
+        state.background.routines = routines;
+    }
+    let mut earlier = model::Thread::new(40);
+    earlier.title = "Example: earlier conversation".into();
+    earlier.captain = Some(captain);
+    earlier.captain_home = true;
+    earlier.project = Some(1);
+    earlier.updated = projects::now().saturating_sub(3 * 86_400);
+    earlier.life.created_at = earlier.updated * 1000;
+    earlier.life.updated_at = earlier.life.created_at;
+    earlier.messages = vec![model::Message {
+        role: "You",
+        text: "Example message in an earlier conversation.".into(),
+        images: vec![],
+    }];
+    state.threads.push(earlier);
+    state.brief.demo_status = Some(model::BackgroundStatus {
+        routines_paused_while_away: true,
+        ..Default::default()
+    });
+    state.show_activity = true;
+}
+
+/// The "You" profile editor with a labelled example profile.
+fn settings_profile_demo(state: &mut State) {
+    state.populate_demo();
+    state.brief.profile_open = true;
+    state.brief.profile_name.replace_text("Example: Sam");
+    state.brief.profile_zone.replace_text("Europe/Berlin");
+    state.brief.profile_preferences.replace_text(
+        "Example preferences: short answers first, then detail. Ask before large refactors. Prefer British spelling in docs.",
+    );
+    state.brief.profile_name.focused = true;
+}
+
 fn captain_crews_demo(state: &mut State) {
     captain_workspace_demo(state);
     let solo = state.threads.iter().position(|t| t.id == 11).unwrap();
@@ -535,6 +639,16 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 let home = state.current_mut();
                 home.title = "Polish the Shina workspace and keyboard navigation".into();
                 home.messages.clear();
+            }),
+            ("captain-brief", captain_brief_demo),
+            ("captain-brief-dark", |state| {
+                captain_brief_demo(state);
+                state.dark = true;
+            }),
+            ("settings-profile", settings_profile_demo),
+            ("settings-menu", |state| {
+                state.populate_demo();
+                state.settings_menu = true;
             }),
             ("captain-crews", captain_crews_demo),
             ("captain-crews-dark", |state| {
