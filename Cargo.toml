@@ -1,6 +1,6 @@
 [package]
 name = "shina"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "A native Rune workspace for the Pi coding agent"
 license = "MIT"
