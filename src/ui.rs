@@ -89,8 +89,10 @@ const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10)
 /// `text-3xl font-normal tracking-tight`, or `text-2xl` when the pane is narrow.
 const HEADING: TextStyle = TextStyle::new(30.0, 400.0).lh(36.0).tracking(-0.75);
 const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0).lh(32.0).tracking(-0.6);
-/// Wide windows (1600 px and up) get a longer measure and larger body text.
-const WIDE_WINDOW: f32 = 1600.0;
+/// A chat pane this wide (a 1600 px window with the sidebar open) gets a longer measure and
+/// larger body text. It follows the pane, not the window, so an open session panel or a wide
+/// sidebar keeps the reading size that fits the lane.
+const WIDE_PANE: f32 = 1200.0;
 fn body_style(wide: bool) -> TextStyle {
     if wide {
         TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10)
@@ -105,9 +107,25 @@ fn prose_style(wide: bool) -> TextStyle {
         PROSE
     }
 }
+/// The chat lane's content width, ported from KSG Code's `.chat-content-lane`
+/// (`max-width: var(--chat-content-max-width)`, 46 rem). Wide panes get 54 rem for the larger
+/// text. Messages, tool rows, the queue and the composer all share it.
 fn measure(wide: bool) -> f32 {
-    if wide { 896.0 } else { 768.0 }
+    if wide { 864.0 } else { 736.0 }
 }
+/// The lane's side padding, from KSG Code's `.chat-composer-lane` and
+/// `.messages-timeline-scroll`: 0.75 rem below `sm` (640 px) and 3 rem from `sm` up. KSG reads
+/// the viewport; Shina reads the chat pane, which is what the lane actually has to share.
+fn lane_gutter(pane_width: f32) -> f32 {
+    if pane_width >= 640.0 { 48.0 } else { 12.0 }
+}
+/// How wide the lane is in a pane of `pane_width`.
+fn lane_width(pane_width: f32, wide: bool) -> f32 {
+    (pane_width - 2.0 * lane_gutter(pane_width)).clamp(0.0, measure(wide))
+}
+/// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
+const TABULAR: &str = "'tnum' 1";
+const TIMER: TextStyle = ACTIVITY.features(TABULAR);
 const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
 /// The project line of a sidebar card.
@@ -148,7 +166,11 @@ fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'sta
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
-        .child(label(title, TextStyle::new(12.0, 450.0), p.ink))
+        .child(
+            label(title, TextStyle::new(12.0, 450.0), p.ink)
+                .truncate()
+                .shrink(),
+        )
 }
 fn icon(kind: &str, ink: Color) -> El {
     macro_rules! glyph {
@@ -293,8 +315,14 @@ fn icon(kind: &str, ink: Color) -> El {
         CHEVRON_LEFT,
         r#"<path d="m9.5 4.5-3.5 3.5 3.5 3.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
+    // Lucide's `Minimize2`, the icon on KSG Code's Compact button.
+    glyph!(
+        MINIMIZE,
+        r#"<path d="M9.33 2.67v4h4M2.67 9.33h4v4M9.33 6.67 14 2M2 14l4.67-4.67" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
+        "minimize" => &MINIMIZE,
         "paperclip" => &PAPERCLIP,
         "back" => &CHEVRON_LEFT,
         "monitor" => &MONITOR,
@@ -445,6 +473,50 @@ fn status(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
+/// Room for "Working for 59m 59s" in the chat header and "12 threads working" beside a
+/// captain's heading, so live status never reflows the row around it.
+const HEADER_STATUS_SLOT: f32 = 132.0;
+const CAPTAIN_STATUS_SLOT: f32 = 124.0;
+/// A live status in a slot of fixed width. The text sits at the slot's end in tabular
+/// figures, never shrinks or truncates, and fades between values on Shina's motion curve, so
+/// "Ready" becoming "Working for 12m 05s" moves nothing beside it. Ready and Done show only
+/// the empty slot, as `status` shows nothing for them.
+fn status_slot(key: &str, status: Status, text: Option<String>, width: f32, p: Palette) -> El {
+    let mut slot = row()
+        .key(key)
+        .w(width)
+        .min_w(width)
+        .h(20.0)
+        .justify_end()
+        .center_y();
+    let text = match text {
+        Some(text) => text,
+        None if matches!(status, Status::Ready | Status::Completed) => return slot,
+        None => status.label().into(),
+    };
+    slot = slot.label(text.clone()).child(
+        row()
+            .key(format!("{key}-{}", status.label()))
+            .center_y()
+            .gap(6.0)
+            .opacity_motion(slider_curve(false))
+            .child(status_mark(status, p, 6.0))
+            .child(
+                label(text, SMALL.features(TABULAR), status_ink(status, p))
+                    .key(format!("{key}-text")),
+            ),
+    );
+    slot
+}
+/// A running timer for live status: "45s", "12m 05s", "1h 05m". Padding the trailing field
+/// keeps its width steady from one tick to the next.
+fn timer_label(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
@@ -458,15 +530,21 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let compact = cx
         .layout_with("workspace-root", |r| r[2] < 760.0)
         .unwrap_or(false);
-    let wide = cx
-        .layout_with("workspace-root", |r| r[2] >= WIDE_WINDOW)
-        .unwrap_or(false);
     let sidebar_width = if narrow {
         s.sidebar_width.min(216.0)
     } else {
         s.sidebar_width
     };
     let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
+    // The chat column's width from the last layout. The first frame guesses from the window,
+    // less the gutters and a docked sidebar, so it already lays out close to its final lane.
+    let main_width = cx.layout_with("chat-main", |r| r[2]).unwrap_or_else(|| {
+        let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+        cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
+            .unwrap_or(900.0)
+    });
+    let wide = main_width >= WIDE_PANE;
+    let mut context_popover_shown = false;
     let chrome = cx.chrome_insets();
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
@@ -562,18 +640,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else {
         let mut body = row().grow(1.0).min_h(0.0);
         let main = col()
+            .key("chat-main")
             .grow(1.0)
             .min_w(0.0)
             .min_h(0.0)
             .child(chat_header(s, p, narrow, compact));
         let main = if s.current().messages.is_empty() && s.current().tools.is_empty() {
-            let pane_width = cx.layout_with("chat-pane", |r| r[2]).unwrap_or(900.0);
-            main.child(empty_thread(s, p, narrow, wide, pane_width))
+            main.child(empty_thread(s, p, narrow, wide, main_width))
         } else {
-            main.child(conversation(s, p, wide, 0.0))
-                .child(composer(s, p, narrow, wide))
+            main.child(conversation(s, p, wide, main_width))
+                .child(composer(s, p, narrow, wide, main_width))
         };
         body = body.child(main);
+        context_popover_shown = true;
         if s.show_activity {
             body = body
                 .child(el().w(1.0).h_full().fill(p.line))
@@ -591,6 +670,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
+    // The context popover floats at the root, after the ring it anchors to, so the composer
+    // never makes room for it and no clipping ancestor cuts it off.
+    if context_popover_shown
+        && context_ring_shown(s.current())
+        && s.current().context.popover_open()
+    {
+        root = root.child(context_popover(s, p));
+    }
     if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
     } else if s.project_picker == Some(ProjectPicker::AddProject) {
@@ -3027,7 +3114,15 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
             .label("Demo data, read-only")
             .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
     } else {
-        status(s.current().status, p)
+        let t = s.current();
+        let text = match (t.status, t.started) {
+            (Status::Running, Some(start)) => Some(format!(
+                "Working for {}",
+                timer_label(start.elapsed().as_secs())
+            )),
+            _ => None,
+        };
+        status_slot("chat-status", t.status, text, HEADER_STATUS_SLOT, p)
     });
     header = header.child(toggle_button(
         "thread-actions",
@@ -4934,25 +5029,30 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             row()
                 .key(format!("live-status-{}", t.id))
                 .min_h(26.0)
-                .ml(-14.0)
+                // The mark hangs in the lane's gutter so the words line up with the tool
+                // rows above; 12 px fits even the narrow 0.75 rem gutter.
+                .ml(-12.0)
                 .center_y()
-                .gap(8.0)
+                .gap(6.0)
                 .child(status_mark(Status::Running, p, 6.0))
                 .child(
                     row()
                         .gap(5.0)
                         .center_y()
                         .min_w(0.0)
+                        .shrink()
                         .child(
                             label(live_status(t), ACTIVITY, p.muted)
+                                .key(format!("live-status-text-{}", t.id))
                                 .truncate()
                                 .shrink()
                                 .min_w(0.0),
                         )
+                        // The phase gives way before the timer, whose tabular figures and
+                        // padded seconds keep each tick the same width.
                         .child(match seconds {
-                            Some(seconds) => {
-                                label(elapsed_label(seconds), ACTIVITY, quiet_inks(p).1)
-                            }
+                            Some(seconds) => label(timer_label(seconds), TIMER, quiet_inks(p).1)
+                                .key(format!("live-timer-{}", t.id)),
                             None => el(),
                         }),
                 ),
@@ -5012,21 +5112,25 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     response
 }
 
+/// The transcript, laid out in KSG Code's chat lane (`MessagesTimeline`'s
+/// `.chat-content-lane` inside `.messages-timeline-scroll`): 46 rem of content, centred, with
+/// 0.75 rem gutters below 640 px and 3 rem from there up. `pane_width` is the chat column's.
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
+    let gutter = lane_gutter(pane_width);
     let mut messages = col()
+        .key("chat-lane")
         .w_full()
         .max_w(measure(wide))
-        .px(16.0)
         .pt(20.0)
         .pb(24.0)
-        .gap(18.0);
+        .gap(20.0);
     if t.messages.is_empty() && t.tools.is_empty() && !t.status.busy() {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
-            .max_w(measure(wide))
-            .px(16.0)
+            .max_w(measure(wide) + 2.0 * gutter)
+            .px(gutter)
             .pb(12.0)
             .gap(16.0);
         if let Some(captain) = t.captain {
@@ -5071,28 +5175,27 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                                                     && thread.status == Status::Running
                                             })
                                             .count();
+                                        // The heading wraps and gives way first; the status
+                                        // keeps a fixed slot so a count change never reflows it.
                                         if working == 0 {
-                                            status(shown_status(s), p)
+                                            status_slot(
+                                                "captain-status",
+                                                shown_status(s),
+                                                None,
+                                                CAPTAIN_STATUS_SLOT,
+                                                p,
+                                            )
                                         } else {
-                                            row()
-                                                .center_y()
-                                                .gap(6.0)
-                                                .child(status_mark(Status::Running, p, 6.0))
-                                                .child(
-                                                    label(
-                                                        format!(
-                                                            "{working} {} working",
-                                                            if working == 1 {
-                                                                "thread"
-                                                            } else {
-                                                                "threads"
-                                                            }
-                                                        ),
-                                                        SMALL,
-                                                        status_ink(Status::Running, p),
-                                                    )
-                                                    .key("captain-working-count"),
-                                                )
+                                            status_slot(
+                                                "captain-working-count",
+                                                Status::Running,
+                                                Some(format!(
+                                                    "{working} {} working",
+                                                    if working == 1 { "thread" } else { "threads" }
+                                                )),
+                                                CAPTAIN_STATUS_SLOT,
+                                                p,
+                                            )
                                         }
                                     }),
                             )
@@ -5159,7 +5262,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             }
             let key = format!("message-{}-{index}", t.id);
             let body = if message.role == "You" {
-                let max_width = if wide { 660.0 } else { 620.0 };
+                // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
+                let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
                 let mut user = col()
                     .items_end()
                     .gap(6.0)
@@ -5185,9 +5289,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                             .wrap_anywhere()
                             .selectable(true)
                             .max_w(max_width)
-                            .px(16.0)
-                            .py(8.0)
-                            .radius(18.0)
+                            .padding(12.0)
+                            .radius(16.0)
                             .fill(if s.dark { p.card } else { p.selected }),
                     );
                 }
@@ -5227,6 +5330,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .scroll(ScrollSpec {
             stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
         })
+        .px(gutter)
         .items_center()
         .child(messages)
 }
@@ -5252,7 +5356,7 @@ fn empty_thread(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, narrow, wide))
+        .child(composer(s, p, narrow, wide, pane_width))
         .child(below)
 }
 
@@ -5264,8 +5368,8 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
     } else {
         s.project_name()
     };
-    // Sans at 30 px averages about 15 px a character; keep the 16 px gutters free.
-    let available = pane_width.min(measure(true)) - 32.0;
+    // Sans at 30 px averages about 15 px a character, and the line stays inside the lane.
+    let available = lane_width(pane_width, true);
     let inline = pane_width > 0.0
         && ("What should we build in ?".len() + name.chars().count()) as f32 * 15.0 <= available;
     let picker = |style: TextStyle| {
@@ -5583,15 +5687,40 @@ fn context_ring_shape(context: &ContextMeter, p: Palette) -> Shape {
     shape
 }
 
+/// KSG Code opens the meter's popover after the pointer rests 150 ms on the ring and, when it
+/// offers Compact, closes it 150 ms after the pointer leaves both the ring and the popover.
+const CONTEXT_HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Escape closes the usage popover from the ring or from inside it.
+fn context_escape(s: &mut State, event: &rune::KeyEvent) -> bool {
+    if event.key == rune::Key::Escape && s.current().context.popover_open() {
+        s.current_mut().context.close_popover();
+        true
+    } else {
+        false
+    }
+}
+
+/// A press, Enter or Space on the ring opens the popover, or closes one it opened.
+fn context_toggle(s: &mut State) {
+    let context = &mut s.current_mut().context;
+    if context.details_open {
+        context.close_popover();
+    } else {
+        context.details_open = true;
+    }
+}
+
+/// The composer's context meter, ported from KSG Code's `ContextWindowMeter` trigger: a
+/// `size-7` ghost button that opens the usage popover on hover (150 ms in, 150 ms out), and on
+/// a press, Enter or Space. The popover itself is drawn at the root by `context_popover`.
 fn context_ring(t: &Thread, p: Palette) -> El {
     let limit = context_limit(t);
-    let open = t.context.details_open;
+    let open = t.context.popover_open();
     el().key("context-usage-ring")
         .role("button")
         .cursor(rune::Cursor::Pointer)
         .label(t.context.accessible_label(limit))
-        .help(t.context.help_text(limit))
-        .help_above()
         .focusable(true)
         .expanded(open)
         .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
@@ -5599,7 +5728,16 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         .radius(CONTEXT_RING_SIZE / 2.0)
         .fill(if open { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
-        .on_press(|s: &mut State| s.current_mut().context.toggle_details())
+        .on_press(context_toggle)
+        .on_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Enter {
+                context_toggle(s);
+                return true;
+            }
+            context_escape(s, event)
+        })
+        .on_hover_change(|s: &mut State, inside, _| s.current_mut().context.hover(true, inside))
+        .hover_delays(CONTEXT_HOVER_DELAY, CONTEXT_HOVER_DELAY)
         .child(
             canvas(context_ring_shape(&t.context, p))
                 .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
@@ -5607,53 +5745,201 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         )
 }
 
-fn context_details(t: &Thread, p: Palette) -> El {
+/// KSG Code's `formatPercentage`: one decimal under 10 %, whole numbers above.
+fn context_percent_text(percent: f64) -> String {
+    if !percent.is_finite() {
+        return String::new();
+    }
+    if percent < 10.0 {
+        let text = format!("{percent:.1}");
+        format!("{}%", text.strip_suffix(".0").unwrap_or(&text))
+    } else {
+        format!("{}%", percent.round() as i64)
+    }
+}
+
+/// KSG Code's `formatContextWindowTokens`: 950, 9.5k, 120k, 1.2m.
+fn context_tokens_text(value: u64) -> String {
+    let trim = |text: String| text.strip_suffix(".0").map(str::to_owned).unwrap_or(text);
+    match value {
+        0..1_000 => value.to_string(),
+        1_000..10_000 => format!("{}k", trim(format!("{:.1}", value as f64 / 1_000.0))),
+        10_000..999_500 => format!("{}k", (value as f64 / 1_000.0).round() as u64),
+        _ => format!("{}m", trim(format!("{:.1}", value as f64 / 1_000_000.0))),
+    }
+}
+
+/// KSG Code's `formatContextWindowCost`: four decimals under a cent, two otherwise.
+fn context_cost_text(cost: f64) -> String {
+    if cost > 0.0 && cost < 0.01 {
+        format!("USD {cost:.4}")
+    } else {
+        format!("USD {cost:.2}")
+    }
+}
+
+/// The usage popover, ported from KSG Code's `ContextWindowMeter` popup (the branch without a
+/// breakdown, which is what Pi reports): a `w-64` tooltip-style card above the ring, aligned to
+/// its end, with "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, a
+/// `h-1.5` usage bar, total processed and cost rows, the compaction state, and a full-width
+/// "Compact context" button.
+fn context_popover(s: &State, p: Palette) -> El {
+    let t = s.current();
     let limit = context_limit(t);
-    let mut details = row()
-        .key("context-details")
-        .role("group")
-        .label("Context usage details")
-        .w_full()
-        .center_y()
-        .gap(7.0)
-        .flex_wrap()
-        .pt(1.0)
-        .child(label("Context", TextStyle::new(11.5, 500.0), p.muted))
-        .child(label(t.context.usage.usage_text(limit), SMALL, p.ink).key("context-details-usage"));
-    if let Some(percent) = t.context.usage.percent_text() {
-        details = details.child(
-            label(
-                percent,
-                TextStyle::new(12.0, 620.0),
-                context_ink(t.context.usage.percent.unwrap_or(0.0), p),
+    let usage = &t.context.usage;
+    let secondary = TextStyle::new(11.0, 400.0).lh(16.0).features(TABULAR);
+    let strong = TextStyle::new(11.0, 500.0).lh(16.0).features(TABULAR);
+    let mut figures = row().center_y().gap(4.0);
+    if let Some(percent) = usage.percent {
+        figures = figures
+            .child(
+                label(context_percent_text(percent), secondary, p.muted)
+                    .key("context-details-percent"),
             )
-            .key("context-details-percent"),
+            .child(label("·", secondary, p.muted));
+    }
+    let used = match (usage.tokens, limit) {
+        (Some(tokens), Some(limit)) => {
+            format!(
+                "{}/{}",
+                context_tokens_text(tokens),
+                context_tokens_text(limit)
+            )
+        }
+        (Some(tokens), None) => context_tokens_text(tokens),
+        (None, Some(limit)) => format!("Limit {}", context_tokens_text(limit)),
+        (None, None) => "Not reported".into(),
+    };
+    figures = figures.child(label(used, secondary, p.muted).key("context-details-usage"));
+    let mut card = col()
+        .key("context-details")
+        .role("dialog")
+        .label("Context window")
+        .w(256.0)
+        .padding(12.0)
+        .gap(8.0)
+        .radius(8.0)
+        .fill(p.card)
+        .border(0.5, p.line)
+        .shadow(
+            8.0,
+            24.0,
+            Color::BLACK.alpha(if s.dark { 0.36 } else { 0.10 }),
+        )
+        .anchored("context-usage-ring", rune::Side::Top, rune::Align::End, 4.0)
+        .on_key(|s: &mut State, event, _| context_escape(s, event))
+        .on_hover_change(|s: &mut State, inside, _| s.current_mut().context.hover(false, inside))
+        .hover_delays(std::time::Duration::ZERO, CONTEXT_HOVER_DELAY)
+        .child(
+            row()
+                .center_y()
+                .gap(12.0)
+                .child(label(
+                    "Context Window",
+                    TextStyle::new(12.0, 500.0).lh(16.0),
+                    p.muted,
+                ))
+                .child(spacer())
+                .child(figures),
         );
+    if let Some(limit) = limit
+        && limit > 0
+    {
+        let fraction = usage.percent.unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0;
+        let ink = if fraction > 0.9 {
+            p.danger
+        } else {
+            p.muted.alpha(0.72)
+        };
+        let mut bar = row()
+            .key("context-details-bar")
+            .role("progressbar")
+            .label("Context window usage")
+            .w_full()
+            .h(6.0)
+            .radius(3.0)
+            .clip_rounded(3.0)
+            .fill(p.line);
+        if usage.percent.is_some() {
+            bar = bar.child(el().w_frac(fraction).h_full().radius(3.0).fill(ink));
+        }
+        card = card.child(bar);
     }
-    if let Some(state) = t.context.state_text() {
-        details = details
-            .child(label(state, TextStyle::new(11.5, 420.0), p.muted).key("context-details-state"));
-    }
-    if let Some(tokens) = t.native.stats["tokens"]["total"].as_u64() {
-        details = details.child(label(format!("{tokens} total processed"), SMALL, p.muted));
+    let figure_row = |name: &str, value: String| {
+        row()
+            .center_y()
+            .gap(12.0)
+            .child(label(name, secondary, p.muted))
+            .child(spacer())
+            .child(label(value, strong, p.muted))
+    };
+    if let Some(tokens) = t.native.stats["tokens"]["total"]
+        .as_u64()
+        .filter(|tokens| *tokens > 0)
+    {
+        card = card.child(figure_row("Total processed", context_tokens_text(tokens)));
     }
     if let Some(cost) = t.native.stats["cost"]
         .as_f64()
         .filter(|n| n.is_finite() && *n >= 0.0)
     {
-        details = details.child(label(format!("${cost:.4}"), SMALL, p.muted));
+        card = card.child(figure_row("Cost", context_cost_text(cost)));
     }
-    details
+    if let Some(state) = t.context.state_text() {
+        card = card.child(
+            label(state, TextStyle::new(11.0, 500.0).lh(16.0), p.muted)
+                .key("context-details-state")
+                .wrap()
+                .mt(4.0),
+        );
+    }
+    let can_compact = !s.demo && t.can_compact();
+    let mut compact = row()
+        .key("compact-context")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label("Compact context")
+        .w_full()
+        .h(24.0)
+        .mt(4.0)
+        .gap(6.0)
+        .justify_center()
+        .center_y()
+        .radius(6.0)
+        .border(1.0, p.line)
+        .hover(p.selected)
+        .press(p.selected)
+        .opacity(if can_compact { 1.0 } else { 0.55 })
+        .disabled(!can_compact)
+        .child(icon("minimize", p.ink).size(14.0, 14.0))
+        .child(label("Compact context", TextStyle::new(12.0, 500.0), p.ink));
+    if can_compact {
+        compact = compact.focusable(true).on_press(|s: &mut State| {
+            s.current_mut().context.close_popover();
+            s.compact_context(None);
+        });
+    }
+    card = card.child(compact);
+    if !can_compact {
+        let reason = if s.demo {
+            "Demo threads cannot compact."
+        } else if t.session.is_none() {
+            "Available once the conversation has a saved session."
+        } else if t.model_provider != "cpa" {
+            "Compaction needs a CPA model."
+        } else {
+            "Available when Pi is idle."
+        };
+        card = card.child(label(reason, secondary, p.muted).wrap());
+    }
+    card
 }
 
-fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
+/// The composer sits in KSG Code's `.chat-composer-lane`: the same gutters and 46 rem lane as
+/// the messages above it, with `pb-4` under the footer.
+fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
     let t = s.current();
-    let mut area = col()
-        .w_full()
-        .max_w(measure(wide))
-        .px(16.0)
-        .pb(16.0)
-        .gap(8.0);
+    let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if let Some(error) = &s.storage_error {
         area = area.child(label(error, SMALL, p.danger).wrap_anywhere());
     }
@@ -5828,16 +6114,6 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 }
             }),
     );
-    if t.context.details_open && context_available(t) {
-        card = card.child(
-            col()
-                .gap(8.0)
-                .px(16.0)
-                .pb(8.0)
-                .child(context_details(t, p))
-                .child(pi_ui::compact_control(s, p)),
-        );
-    }
     let mut actions = row()
         .key("composer-actions")
         .center_y()
@@ -5931,7 +6207,12 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             )
     };
     area = area.child(footer);
-    col().w_full().items_center().child(area)
+    col()
+        .key("composer-lane")
+        .w_full()
+        .px(lane_gutter(pane_width))
+        .items_center()
+        .child(area)
 }
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
@@ -6775,12 +7056,9 @@ pub(crate) mod tests {
             label.contains("60,000 of 200,000 tokens") && label.contains("30%"),
             "{label}"
         );
-        let help = ring.help.as_deref().unwrap();
         assert!(
-            help.contains("60,000 of 200,000 tokens")
-                && help.contains("30%")
-                && help.contains("Updates after each turn and after compaction."),
-            "{help}"
+            ring.help.is_none(),
+            "the popover replaces the native tooltip"
         );
 
         let (ring_rect, _) = rt.presented("context-usage-ring").unwrap();
@@ -6837,7 +7115,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .text
                 .as_deref(),
-            Some("60,000 of 200,000 tokens")
+            Some("60k/200k")
         );
         assert_eq!(
             rt.elements()
@@ -6902,24 +7180,30 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("unknown after compaction")
         );
-        assert!(
-            ring.help
-                .as_deref()
-                .unwrap()
-                .contains("unknown after compaction")
-        );
         let (ring_rect, _) = rt.presented("context-usage-ring").unwrap();
         let (send_rect, _) = rt.presented("send-message").unwrap();
         assert!(ring_rect[0] >= 0.0 && ring_rect[0] + ring_rect[2] <= 620.0);
         assert!(ring_rect[0] + ring_rect[2] <= send_rect[0]);
+        assert!(
+            rt.elements()
+                .into_iter()
+                .any(
+                    |element| element.key.as_deref() == Some("context-usage-ring")
+                        && element.role == "button"
+                ),
+            "the unknown state keeps its dashed ring"
+        );
 
         press(&mut rt, "context-usage-ring");
         rt.frame(0.5);
-        let (composer, _) = rt.presented("composer").unwrap();
         let (details, _) = rt.presented("context-details").unwrap();
         assert!(
-            details[0] >= composer[0] && details[0] + details[2] <= composer[0] + composer[2] + 0.5,
-            "details row must stay inside the composer: {details:?} in {composer:?}"
+            details[0] >= 0.0 && details[0] + details[2] <= 620.5,
+            "the popover stays in the window: {details:?}"
+        );
+        assert!(
+            details[1] + details[3] <= ring_rect[1] + 0.5,
+            "the popover sits above the ring: {details:?} {ring_rect:?}"
         );
         assert_eq!(
             rt.elements()
@@ -6928,7 +7212,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .text
                 .as_deref(),
-            Some("Limit 200,000 tokens")
+            Some("Limit 200k")
+        );
+        assert!(rt.find("context-details-percent").is_none());
+        assert!(
+            rt.find("context-details-bar").is_some(),
+            "the bar keeps its empty track while usage is unknown"
         );
         assert_eq!(
             rt.elements()
@@ -6939,6 +7228,304 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("Waiting for Pi to report usage")
         );
+    }
+
+    fn context_fixture(width: f32) -> Runtime<State> {
+        let mut rt = runtime(width);
+        let thread = rt.state.current_mut();
+        thread.context_window = Some(200_000);
+        thread.context.usage = ContextUsage {
+            tokens: Some(61_400),
+            context_window: Some(200_000),
+            percent: Some(30.7),
+        };
+        thread.native.stats = json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
+        thread.draft.replace_text("Ready");
+        rt.invalidate();
+        rt.frame(0.0);
+        rt
+    }
+
+    fn focused_key(rt: &Runtime<State>) -> Option<String> {
+        rt.elements()
+            .into_iter()
+            .find(|element| element.focused)
+            .and_then(|element| element.key)
+    }
+
+    #[test]
+    fn context_popover_opens_on_hover_and_stays_while_the_pointer_is_inside() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = context_fixture(width);
+            let (composer, _) = rt.presented("composer").unwrap();
+            let (ring, _) = rt.presented("context-usage-ring").unwrap();
+            let (rx, ry) = (ring[0] + ring[2] / 2.0, ring[1] + ring[3] / 2.0);
+
+            // A brief pass opens nothing; resting past KSG's 150 ms delay does.
+            rt.pointer_move(rx, ry);
+            rt.frame(0.05);
+            assert!(
+                rt.find("context-details").is_none(),
+                "{width}: opened early"
+            );
+            rt.frame(0.2);
+            rt.frame(0.3);
+            let (popover, _) = rt
+                .presented("context-details")
+                .unwrap_or_else(|| panic!("{width}: hover did not open the popover"));
+            assert!(
+                popover[0] >= 0.0 && popover[0] + popover[2] <= width + 0.5,
+                "{width}: popover leaves the window {popover:?}"
+            );
+            assert!(
+                popover[1] + popover[3] <= ring[1] + 0.5,
+                "{width}: popover must sit above the ring {popover:?} {ring:?}"
+            );
+            assert!(
+                (popover[0] + popover[2] - (ring[0] + ring[2])).abs() < 1.0
+                    || popover[0] + popover[2] >= width - 9.0,
+                "{width}: popover aligns to the ring's end"
+            );
+            let (after, _) = rt.presented("composer").unwrap();
+            assert_eq!(
+                composer, after,
+                "{width}: the composer moved when it opened"
+            );
+            for (key, text) in [
+                ("context-details-percent", "31%"),
+                ("context-details-usage", "61k/200k"),
+            ] {
+                let element = rt
+                    .elements()
+                    .into_iter()
+                    .find(|element| element.key.as_deref() == Some(key))
+                    .unwrap();
+                assert_eq!(element.text.as_deref(), Some(text), "{width}: {key}");
+            }
+
+            // Crossing the gap into the popover keeps it open past the close delay.
+            rt.pointer_move(rx, ring[1] - 2.0);
+            rt.frame(0.02);
+            rt.pointer_move(popover[0] + 20.0, popover[1] + 20.0);
+            rt.frame(0.02);
+            rt.frame(0.4);
+            rt.frame(0.4);
+            assert!(
+                rt.find("context-details").is_some(),
+                "{width}: moving into the popover closed it"
+            );
+
+            // Leaving both closes it after the delay.
+            rt.pointer_move(4.0, 200.0);
+            rt.frame(0.05);
+            assert!(
+                rt.state.current().context.popover_open(),
+                "{width}: closed before the delay"
+            );
+            rt.frame(0.3);
+            rt.frame(0.5);
+            assert!(!rt.state.current().context.popover_open(), "{width}");
+            assert!(rt.find("context-details").is_none(), "{width}: still shown");
+        }
+    }
+
+    #[test]
+    fn context_popover_opens_from_the_keyboard_and_escape_closes_it() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = context_fixture(width);
+            let (composer, _) = rt.presented("composer").unwrap();
+            for _ in 0..120 {
+                if focused_key(&rt).as_deref() == Some("context-usage-ring") {
+                    break;
+                }
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Tab,
+                    mods: Default::default(),
+                });
+                rt.frame(0.0);
+            }
+            assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.3);
+            assert!(rt.find("context-details").is_some(), "{width}: Enter");
+            assert_eq!(rt.presented("composer").unwrap().0, composer, "{width}");
+            assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert!(rt.find("context-details").is_none(), "{width}: Escape");
+            assert!(!rt.state.current().context.popover_open());
+        }
+    }
+
+    #[test]
+    fn context_popover_shows_ksg_figures_and_compaction_state() {
+        assert_eq!(context_percent_text(0.0), "0%");
+        assert_eq!(context_percent_text(4.26), "4.3%");
+        assert_eq!(context_percent_text(9.0), "9%");
+        assert_eq!(context_percent_text(30.7), "31%");
+        assert_eq!(context_tokens_text(950), "950");
+        assert_eq!(context_tokens_text(9_500), "9.5k");
+        assert_eq!(context_tokens_text(120_400), "120k");
+        assert_eq!(context_tokens_text(1_200_000), "1.2m");
+        assert_eq!(context_cost_text(0.004), "USD 0.0040");
+        assert_eq!(context_cost_text(0.4183), "USD 0.42");
+
+        let mut rt = context_fixture(960.0);
+        let t = rt.state.current_mut();
+        t.context.begin_compaction();
+        t.context.details_open = true;
+        rt.invalidate();
+        rt.frame(0.3);
+        let text = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some(key))
+                .and_then(|element| element.text)
+        };
+        assert_eq!(
+            text(&rt, "context-details-state").as_deref(),
+            Some("Compacting context")
+        );
+        assert_eq!(
+            text(&rt, "context-details-usage").as_deref(),
+            Some("Limit 200k")
+        );
+        let compact = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("compact-context"))
+            .unwrap();
+        assert!(!compact.focusable, "no second compaction while one runs");
+        press(&mut rt, "compact-context");
+        assert_eq!(rt.state.current().context.phase, ContextPhase::Compacting);
+    }
+
+    #[test]
+    fn chat_lane_follows_ksg_gutters_and_width_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.demo = false;
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let (main, _) = rt.presented("chat-main").unwrap();
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            let (card, _) = rt.presented("composer").unwrap();
+            let gutter = lane_gutter(main[2]);
+            assert!(
+                lane[0] - main[0] >= gutter - 0.5
+                    && main[0] + main[2] - (lane[0] + lane[2]) >= gutter - 0.5,
+                "{width}: lane {lane:?} crowds its pane {main:?}"
+            );
+            assert!(lane[2] <= measure(main[2] >= WIDE_PANE) + 0.5, "{width}");
+            assert!(
+                (card[0] - lane[0]).abs() < 0.5 && (card[2] - lane[2]).abs() < 0.5,
+                "{width}: the composer {card:?} and transcript {lane:?} share one lane"
+            );
+            let bubble =
+                rt.elements()
+                    .into_iter()
+                    .filter(|element| {
+                        element.key.as_deref().is_some_and(|key| {
+                            key.starts_with("message-") && key.ends_with("-text")
+                        })
+                    })
+                    .filter_map(|element| rt.presented(element.key.as_deref()?))
+                    .map(|(rect, _)| rect)
+                    .next();
+            if let Some(bubble) = bubble {
+                assert!(
+                    bubble[2] <= lane[2] * 0.8 + 0.5,
+                    "{width}: bubble {bubble:?}"
+                );
+                assert!(bubble[0] + bubble[2] <= lane[0] + lane[2] + 0.5, "{width}");
+            }
+        }
+    }
+
+    #[test]
+    fn header_status_keeps_its_slot_and_siblings_when_it_starts_working() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let (header, _) = rt.presented("chat-header").unwrap();
+            let (slot, _) = rt.presented("chat-status").unwrap();
+            let (actions, _) = rt.presented("thread-actions").unwrap();
+            let t = rt.state.current_mut();
+            t.status = Status::Running;
+            t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(725));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let label = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("chat-status-text"))
+                .unwrap();
+            assert_eq!(label.text.as_deref(), Some("Working for 12m 05s"));
+            let (text, _) = rt.presented("chat-status-text").unwrap();
+            let (after_slot, _) = rt.presented("chat-status").unwrap();
+            assert_eq!(
+                slot, after_slot,
+                "{width}: the status slot moved or resized"
+            );
+            assert!(
+                text[0] >= after_slot[0] - 0.5
+                    && text[0] + text[2] <= after_slot[0] + after_slot[2] + 0.5
+                    && text[0] >= header[0]
+                    && text[0] + text[2] <= header[0] + header[2],
+                "{width}: status text {text:?} escapes {after_slot:?} in {header:?}"
+            );
+            assert_eq!(
+                rt.presented("thread-actions").unwrap().0[0],
+                actions[0],
+                "{width}: More actions moved"
+            );
+        }
+    }
+
+    #[test]
+    fn live_timer_ticks_without_moving_the_status_line() {
+        assert_eq!(timer_label(45), "45s");
+        assert_eq!(timer_label(725), "12m 05s");
+        assert_eq!(timer_label(3_900), "1h 05m");
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.messages.push(crate::model::Message {
+                role: "You",
+                text: "Go".into(),
+                images: vec![],
+            });
+            t.status = Status::Running;
+            t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(721));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let id = rt.state.current().id;
+            let (line, _) = rt.presented(&format!("live-status-{id}")).unwrap();
+            let (timer, _) = rt.presented(&format!("live-timer-{id}")).unwrap();
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            assert!(line[0] >= 0.0 && timer[0] + timer[2] <= lane[0] + lane[2] + 0.5);
+            rt.state.current_mut().started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(728));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (later, _) = rt.presented(&format!("live-timer-{id}")).unwrap();
+            assert_eq!(later[0], timer[0], "{width}: the timer moved");
+            assert!(
+                (later[2] - timer[2]).abs() < 0.5,
+                "{width}: tabular figures keep the width, {timer:?} then {later:?}"
+            );
+        }
     }
 
     #[test]

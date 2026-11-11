@@ -88,7 +88,11 @@ impl ContextUsage {
 pub struct ContextMeter {
     pub usage: ContextUsage,
     pub phase: ContextPhase,
+    /// The usage popover was opened with a press, Enter or Space.
     pub details_open: bool,
+    /// The pointer rests on the ring, or on the popover the ring opened.
+    pub ring_hovered: bool,
+    pub popover_hovered: bool,
     /// The id of the in-flight `get_session_stats` request. Responses to an older request
     /// are ignored, which is how a stats request that crossed a compaction cannot restore
     /// the percentage compaction invalidated.
@@ -188,36 +192,28 @@ impl ContextMeter {
         }
     }
 
-    /// Hover text: used, limit, percent and any compaction state, on one line so native
-    /// tooltips stay compact.
-    pub fn help_text(&self, model_window: Option<u64>) -> String {
-        let usage = self.usage.usage_text(model_window);
-        let percent = self
-            .usage
-            .percent_text()
-            .map(|percent| format!(", {percent}"))
-            .unwrap_or_default();
-        match self.phase {
-            ContextPhase::Compacting => format!(
-                "Context: {usage}{percent}. Compacting now; usage refreshes when compaction finishes."
-            ),
-            ContextPhase::AwaitingUsage => format!(
-                "Context: {usage}{percent}. Usage is unknown after compaction until Pi answers again."
-            ),
-            ContextPhase::Idle if self.is_pending() => {
-                format!("Context: {usage}{percent}. Refreshing current usage.")
-            }
-            ContextPhase::Idle if usage == "Not reported" => {
-                "Context usage has not been reported yet.".into()
-            }
-            ContextPhase::Idle => {
-                format!("Context: {usage}{percent}. Updates after each turn and after compaction.")
-            }
+    /// Whether the usage popover shows: opened from the keyboard or a press, or hovered.
+    pub fn popover_open(&self) -> bool {
+        self.details_open || self.ring_hovered || self.popover_hovered
+    }
+
+    /// Records the pointer entering or leaving the ring (`ring`) or its popover. Once the
+    /// pointer has left both, the popover closes, including one a press opened.
+    pub fn hover(&mut self, ring: bool, inside: bool) {
+        if ring {
+            self.ring_hovered = inside;
+        } else {
+            self.popover_hovered = inside;
+        }
+        if !self.ring_hovered && !self.popover_hovered && !inside {
+            self.details_open = false;
         }
     }
 
-    pub fn toggle_details(&mut self) {
-        self.details_open = !self.details_open;
+    pub fn close_popover(&mut self) {
+        self.details_open = false;
+        self.ring_hovered = false;
+        self.popover_hovered = false;
     }
 }
 
@@ -390,9 +386,10 @@ mod tests {
         meter.begin_model_change();
         assert_eq!(meter.usage, ContextUsage::default());
         assert_eq!(meter.phase, ContextPhase::Idle);
+        assert_eq!(meter.usage.usage_text(Some(100000)), "Limit 100,000 tokens");
         assert_eq!(
-            meter.help_text(Some(100000)),
-            "Context: Limit 100,000 tokens. Updates after each turn and after compaction."
+            meter.accessible_label(Some(100000)),
+            "Context usage unavailable. View context details"
         );
     }
 
