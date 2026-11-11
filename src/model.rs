@@ -1857,12 +1857,22 @@ impl State {
         if !self.tabs.contains(&id) {
             self.tabs.push(id);
         }
+        self.drop_blank_tabs();
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
         if !self.in_scope(self.current()) {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
         }
         self.checkpoint();
+    }
+    /// As in KSG Code, a blank draft is only a landing page: it keeps a tab while it is open and
+    /// loses it once another thread opens. new_thread_in reopens the same draft later.
+    fn drop_blank_tabs(&mut self) {
+        let current = self.current().id;
+        let threads = &self.threads;
+        self.tabs.retain(|&tab| {
+            tab == current || !threads.iter().any(|t| t.id == tab && t.blank_draft())
+        });
     }
     /// Closing a blank draft's tab closes the draft. Otherwise the selection returns to the last
     /// remaining tab.
@@ -4153,16 +4163,6 @@ impl State {
             self.drop_unused_presets();
             self.projects.next_id = next_project;
             self.next_id = next_thread;
-            self.active = self
-                .threads
-                .iter()
-                .position(|t| Some(t.id as u64) == index["active"].as_u64())
-                .or_else(|| self.threads.iter().position(|t| !t.archived()))
-                .unwrap_or(0);
-            if self.threads.is_empty() {
-                self.threads.push(Thread::new(self.next_id));
-                self.next_id += 1;
-            }
             self.tabs = index["tabs"]
                 .as_array()
                 .into_iter()
@@ -4173,8 +4173,29 @@ impl State {
                 .collect();
             let mut seen_tabs = std::collections::HashSet::new();
             self.tabs.retain(|id| seen_tabs.insert(*id));
-            if !self.tabs.contains(&self.current().id) {
-                self.tabs.push(self.current().id);
+            // An archived thread is never reopened at launch. Without any live thread, land on
+            // the most recent workspace's draft, as KSG Code's index route does.
+            let active = self
+                .threads
+                .iter()
+                .position(|t| Some(t.id as u64) == index["active"].as_u64() && !t.archived())
+                .or_else(|| self.threads.iter().position(|t| !t.archived()));
+            if let Some(active) = active {
+                self.active = active;
+                if !self.tabs.contains(&self.current().id) {
+                    self.tabs.push(self.current().id);
+                }
+                self.drop_blank_tabs();
+            } else {
+                let project = self
+                    .projects
+                    .entries
+                    .iter()
+                    .filter(|p| !p.hidden)
+                    .max_by_key(|p| (p.updated, p.id))
+                    .map(|p| p.id);
+                self.active = self.active.min(self.threads.len().saturating_sub(1));
+                self.new_thread_in(project);
             }
         } else {
             return Err("The saved index has no valid thread list.".into());
@@ -5152,6 +5173,8 @@ mod tests {
         let mut old = State::new(".".into(), false);
         // Rosters start empty; this test restores homes for the earlier named presets.
         old.captains = crate::captains::Captain::presets();
+        // Text keeps the first thread's tab, so it is saved and restored with the homes.
+        old.current_mut().draft.replace_text("Saved draft");
         for captain in 0..4 {
             old.open_captain(captain);
         }
@@ -5529,6 +5552,82 @@ mod tests {
         state.close_tab(1);
         assert_eq!(state.tabs, vec![1], "the tab strip keeps one tab");
         assert!(state.undo.is_none());
+    }
+
+    #[test]
+    fn leaving_a_blank_draft_drops_its_tab_and_reopening_reuses_it() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("A prompt");
+        let written = state.current().id;
+        let workspace = state.data_dir.join("blank-tab");
+        state.projects.entries.push(Project::new(2, workspace));
+        state.new_thread_in(Some(2));
+        let blank = state.current().id;
+        assert_eq!(state.tabs, vec![written, blank]);
+        state.select_thread(0);
+        assert_eq!(state.tabs, vec![written], "the blank draft's tab closes");
+        assert!(
+            !state.snapshot()["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == blank),
+            "an unopened blank draft is not saved"
+        );
+        for _ in 0..3 {
+            state.new_thread_in(Some(2));
+            state.select_thread(0);
+        }
+        assert_eq!(
+            state.tabs,
+            vec![written],
+            "repeated new threads never pile up tabs"
+        );
+        state.new_thread_in(Some(2));
+        assert_eq!(state.current().id, blank, "the workspace's draft is reused");
+        state.current_mut().draft.replace_text("Typed");
+        state.select_thread(0);
+        assert_eq!(
+            state.tabs,
+            vec![written, blank],
+            "a draft with text keeps its tab"
+        );
+    }
+
+    #[test]
+    fn restoring_without_a_live_active_thread_lands_on_the_recent_workspace_draft() {
+        let mut state = State::new(".".into(), false);
+        let old = state.data_dir.join("old-workspace");
+        let recent = state.data_dir.join("recent-workspace");
+        let mut old = Project::new(1, old);
+        old.updated = 1;
+        let mut recent = Project::new(2, recent);
+        recent.updated = 2;
+        state.projects.entries = vec![old, recent];
+        state.projects.next_id = 3;
+        state.threads[0].project = Some(1);
+        state.threads[0].life.pinned_at = Some(1);
+        state.archive_thread(1);
+        let mut saved = state.snapshot();
+        // Every saved thread is archived, as in a profile whose live drafts were never saved.
+        saved["threads"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| !t["lifecycle"]["archivedAt"].is_null());
+        saved["active"] = json!(1);
+        saved["tabs"] = json!([1]);
+        for _ in 0..3 {
+            let mut restored = State::new(PathBuf::new(), false);
+            restored.restore_global(&saved).unwrap();
+            assert!(
+                !restored.current().archived(),
+                "an archived thread is not reopened"
+            );
+            assert_eq!(restored.current().project, Some(2));
+            assert!(restored.current().blank_draft());
+            assert_eq!(restored.tabs, vec![restored.current().id]);
+            saved = restored.snapshot();
+        }
     }
 
     #[test]
