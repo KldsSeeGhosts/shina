@@ -302,6 +302,18 @@ impl Thread {
 }
 
 impl State {
+    pub(super) fn task_has_background_work(&self, thread: usize) -> bool {
+        self.tasks.iter().any(|task| {
+            task.child_thread_id == thread
+                && matches!(
+                    task.state,
+                    TaskState::Queued | TaskState::Starting | TaskState::Running
+                )
+                || task.parent_thread_id == thread
+                    && (task.state.finished() && !task.delivered
+                        || !task.prior_deliveries.is_empty())
+        })
+    }
     pub fn mark_clean_quit(&mut self) {
         if let Some(marker) = &mut self.run_marker {
             marker.clean = true;
@@ -634,6 +646,9 @@ impl State {
     }
 
     pub(super) fn start_queued_tasks(&mut self) -> bool {
+        if self.network_blocked() {
+            return false;
+        }
         let mut changed = false;
         for index in 0..self.tasks.len() {
             let task = &self.tasks[index];

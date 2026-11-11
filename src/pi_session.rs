@@ -375,7 +375,17 @@ impl Thread {
         }
     }
 
+    pub(super) fn native_pending_turns(&self) -> bool {
+        !self.native.queue.is_empty()
+            || !self.native.sends.is_empty()
+            || !self.native.steering.is_empty()
+            || !self.native.follow_ups.is_empty()
+    }
+
     pub(super) fn drive_native(&mut self) -> bool {
+        if self.offline_blocked || self.status == Status::Paused {
+            return true;
+        }
         if self.initializing || self.pi.is_none() {
             return false;
         }

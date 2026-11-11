@@ -32,6 +32,10 @@ own role and instructions. Shina shows the user every thread, its status, and it
 
 Ordinary coding tasks need no Shina tools.
 
+- Captain homes can use `create_routine`, `list_routines`, `pause_routine` and \
+`delete_routine` to schedule recurring work when the user asks. Routines can consume \
+provider quota. Creation needs no approval, and every routine is visible and removable in Settings.
+
 - `mcp__shina__orchestrator_capabilities` reports Shina's delegation capabilities: exact CPA model \
 ids, each model's supported reasoning levels, the default and caller selections, and the \
 runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
@@ -218,7 +222,7 @@ pub fn tools() -> Value {
         "required":["model"],
         "additionalProperties":false
     });
-    json!([
+    let mut tools = json!([
         {
             "name": "orchestrator_capabilities",
             "description": "Read Shina's delegation capabilities: exact CPA model ids, supported reasoning levels, the default and caller selections, and runtime and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
@@ -279,7 +283,12 @@ pub fn tools() -> Value {
                 "message":{"type":"string","description":"The correction or follow-up brief."}
             },"required":["thread_id","message"]}
         }
-    ])
+    ]);
+    tools
+        .as_array_mut()
+        .expect("tool array")
+        .extend(crate::routines::tools());
+    tools
 }
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
