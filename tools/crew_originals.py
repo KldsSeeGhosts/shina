@@ -6,7 +6,7 @@ Four original captains drawn as 40x40 busts in the style of Pokemon Mystery Dung
 portraits: a close crop, outlines tinted by the region they border, and three-tone
 shading. Each sits on the square colored tile Capy uses for its crew. Six expressions
 are exported per captain at 6x nearest-neighbor scale so Rune's linear filtering stays
-crisp at sidebar sizes.
+crisp at sidebar sizes, plus four animation strips (`<Clip>.strip.png`, see CLIPS).
 
   ember    Platform  long layered copper hair, goggles on the forehead, olive work jacket
   juniper  Release   long mint hime-cut hair, star clip, cream cardigan with navy collar
@@ -117,14 +117,32 @@ def lidded(cv):
         cv.mask(20, x0, ".lll.", None)
 
 
+def eyes_half(cv):
+    # Blink in-between: the upper lid has dropped two rows.
+    for x0 in EYES:
+        cv.mask(17, x0, "lllll", None)
+        cv.mask(18, x0, "liIIl", None)
+        cv.mask(19, x0, "ljjjl", None)
+        cv.mask(20, x0, ".lll.", None)
+
+
+def eyes_closed(cv):
+    for x0 in EYES:
+        cv.mask(18, x0, "lllll", None)
+
+
+def open_or(cv, eyes):
+    {"half": eyes_half, "closed": eyes_closed}.get(eyes, eyes_open)(cv)
+
+
 def brows(cv, left, right):
     for x, y in left + right:
         cv.put(x, y, "l")
 
 
-def expression(cv, face):
+def expression(cv, face, eyes=None):
     if face == "Normal":
-        eyes_open(cv)
+        open_or(cv, eyes)
         cv.span(24, 19, 20, "m")
     elif face == "Happy":
         for x0 in EYES:
@@ -137,11 +155,9 @@ def expression(cv, face):
         cv.span(24, 19, 20, "m")
     elif face == "Determined":
         # Working: focused, not angry. Level brows, open eyes, a "..." in the tile corner.
-        eyes_open(cv)
+        open_or(cv, eyes)
         brows(cv, [(12, 13), (13, 13), (14, 13), (15, 13)], [(24, 13), (25, 13), (26, 13), (27, 13)])
         cv.span(24, 19, 20, "M")
-        for x in (32, 34, 36) if cv.marks else ():
-            cv.put(x, 4, "w")
     elif face == "Surprised":
         for x0 in EYES:
             cv.mask(14, x0, ".lll.", None)
@@ -171,9 +187,53 @@ def expression(cv, face):
             cv.mask(18, x0, "lllll", None)
             cv.mask(19, x0, ".l.l.", None)
         cv.span(24, 19, 20, "m")
-        z = ((32, 2), (33, 2), (34, 2), (35, 2), (34, 3), (33, 4), (32, 5), (33, 5), (34, 5), (35, 5))
-        for x, y in z if cv.marks else ():
+
+
+# Tile-corner marks. They are drawn after any body motion, so they stay put on the tile.
+Z_MARK = ((32, 2), (33, 2), (34, 2), (35, 2), (34, 3), (33, 4), (32, 5), (33, 5), (34, 5), (35, 5))
+BANG = ((34, 1), (34, 2), (34, 3), (34, 4), (34, 6))
+SPARKLE = ((34, 2), (34, 3), (32, 4), (33, 4), (34, 4), (35, 4), (36, 4), (34, 5), (34, 6))
+
+
+def corner(cv, face, mark=None):
+    """The face's own mark, or an animation's: ("dots", n) lights n of the three dots."""
+    if not cv.marks:
+        return
+    if mark is None:
+        mark = {"Determined": ("dots", 3), "Sad": "z"}.get(face)
+    if isinstance(mark, tuple) and mark[0] == "dots":
+        for i, x in enumerate((32, 34, 36)):
+            cv.put(x, 4, "w" if i < mark[1] else "v")
+    elif mark == "z":
+        for x, y in Z_MARK:
             cv.put(x, y, "w")
+    elif mark == "bang":
+        for x, y in BANG:
+            cv.put(x, y, "w")
+    elif mark == "sparkle":
+        for x, y in SPARKLE:
+            cv.put(x, y, "w")
+
+
+# Rows above the shoulders. Breathing moves only these; a hop moves the whole bust.
+SHOULDERS = 31
+
+
+def shift(cv, dy, whole):
+    """Move the character dy rows (positive is down), leaving the tile in place."""
+    if dy == 0:
+        return
+    g = cv.g
+    rows = N if whole else SHOULDERS
+    old = [row[:] for row in g]
+    for y in range(rows):
+        src = y - dy
+        if src < 0:
+            g[y] = ["."] * N
+        elif src >= N:
+            g[y] = old[N - 1][:]
+        else:
+            g[y] = old[src][:]
 
 
 # Captains -------------------------------------------------------------------------
@@ -358,14 +418,18 @@ def finish(cv):
         g[y][x] = "o" + source
 
 
-def render(draw, extra, tile, colors, face, marks=True):
+def render(draw, extra, tile, colors, face, marks=True, eyes=None, dy=0, whole=False, mark=None):
     cv = Canvas(marks)
     draw(cv)
-    expression(cv, face)
+    expression(cv, face, eyes)
     if extra:
         extra(cv)
+    shift(cv, dy, whole)
+    corner(cv, face, mark)
     finish(cv)
     pal = {k: hexc(v) for k, v in {**COMMON, **colors}.items()}
+    # An unlit working dot: white sunk most of the way into the tile.
+    pal["v"] = tuple(int(w * 0.35 + t * 0.65) for w, t in zip(pal["w"], hexc(tile)))
     img = Image.new("RGBA", (N, N), hexc(tile) + (255,))
     for y in range(N):
         for x in range(N):
@@ -385,6 +449,49 @@ def render(draw, extra, tile, colors, face, marks=True):
 SMALL_CROP = (6, 4, 34, 32)
 
 
+# Animation strips: frames left to right, each a full 40x40 bust. Frame 0 is always the
+# matching static face, so a paused or reduced-motion portrait shows exactly that face.
+# `src/visuals.rs` (`Clip`) holds the timing; keep the frame order in step with it.
+CLIPS = {
+    # Ready: breathing (the head settles a pixel) and a blink.
+    "Idle": [
+        dict(face="Normal"),
+        dict(face="Normal", dy=1),
+        dict(face="Normal", eyes="half"),
+        dict(face="Normal", eyes="closed"),
+    ],
+    # Working: the corner dots type out one by one, the head dips on the second, and an
+    # occasional blink.
+    "Working": [
+        dict(face="Determined"),
+        dict(face="Determined", mark=("dots", 1)),
+        dict(face="Determined", mark=("dots", 2), dy=1),
+        dict(face="Determined", eyes="closed"),
+    ],
+    # Needs you: a startled hop with a "!" in the corner, then the plain Surprised face.
+    "Attention": [
+        dict(face="Surprised"),
+        dict(face="Surprised", dy=-2, whole=True, mark="bang"),
+        dict(face="Surprised", dy=-1, whole=True, mark="bang"),
+        dict(face="Surprised", mark="bang"),
+    ],
+    # Done: a small hop with a sparkle, once, then the Happy face.
+    "Happy": [
+        dict(face="Happy"),
+        dict(face="Happy", dy=-2, whole=True, mark="sparkle"),
+        dict(face="Happy", dy=-1, whole=True, mark="sparkle"),
+    ],
+}
+
+
+def strip(draw, extra, tile, colors, frames):
+    size = N * SCALE
+    sheet = Image.new("RGBA", (size * len(frames), size))
+    for i, frame in enumerate(frames):
+        sheet.paste(render(draw, extra, tile, colors, **frame), (i * size, 0))
+    return sheet
+
+
 def main():
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "assets/crew")
     for name, draw, extra, tile, colors in CREW:
@@ -395,6 +502,9 @@ def main():
             box = tuple(v * SCALE for v in SMALL_CROP)
             plain = render(draw, extra, tile, colors, face, marks=False)
             plain.crop(box).save(out / name / f"{face}.small.png", optimize=True)
+        for clip, frames in CLIPS.items():
+            sheet = strip(draw, extra, tile, colors, frames)
+            sheet.save(out / name / f"{clip}.strip.png", optimize=True)
 
 
 if __name__ == "__main__":

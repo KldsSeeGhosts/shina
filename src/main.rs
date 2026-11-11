@@ -9,6 +9,7 @@ mod install;
 mod lifecycle;
 mod mcp;
 mod model;
+mod portraits;
 mod process;
 mod projects;
 mod session;
@@ -453,6 +454,8 @@ fn main() {
         ],
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
+    // Portraits rest while the window is in the background or minimized.
+    .on_focus(|state, focused, _| state.portraits.set_focused(focused))
     .on_close(|state, _| close_hook(state))
     .on_quit(|state, _| quit_hook(state))
     .titlebar(rune::Titlebar::new(44.0))

@@ -451,6 +451,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     cx.foreground(p.ink);
     cx.focus_ring(2.0, 2.0, p.teal);
     cx.caption_color(p.muted);
+    // The sidebar portraits' animation clock lives outside the view and needs this setting.
+    s.portraits.set_reduced_motion(cx.is_reduced_motion());
     let narrow = cx
         .layout_with("workspace-root", |r| r[2] < 1050.0)
         .unwrap_or(false);
@@ -1449,6 +1451,13 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let captains = s.sidebar_captains();
     if !s.show_archive || !captains.is_empty() {
         let mut heading = section_title("Captains", p);
+        if !captains.is_empty() {
+            heading = heading.child(
+                label(captains.len().to_string(), SMALL, p.muted)
+                    .key("captain-count")
+                    .mr(6.0),
+            );
+        }
         if !s.show_archive {
             heading = heading.child(icon_button(
                 "assign-captain",
@@ -1476,11 +1485,12 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .gap(1.0)
                 .child(thread_row(s, index, p, false));
             if !workers.is_empty() {
-                // Both content and row highlights are inset beneath their owning captain.
+                // Both content and row highlights are inset beneath their owning captain, and
+                // the rail runs down from the centre of the captain's portrait.
                 let mut children = col()
                     .key(format!("crew-threads-{home}"))
-                    .ml(20.0)
-                    .pl(8.0)
+                    .ml(6.0 + CAPTAIN_SLOT / 2.0)
+                    .pl(6.0)
                     .gap(1.0)
                     .child(
                         el().key(format!("crew-rail-{home}"))
@@ -2033,6 +2043,250 @@ fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Sta
             .pixels(),
         )
         .a11y_hidden();
+    status_badge(p, portrait, size, status)
+}
+
+/// Captain rows: a portrait slot that holds the focal size, so rows never change height.
+const CAPTAIN_SLOT: f32 = 44.0;
+const CAPTAIN_PORTRAIT: f32 = 36.0;
+/// Room for one badge at the end of the name line, kept even when there is none, so a
+/// badge arriving never moves the name.
+const BADGE_SLOT: f32 = 28.0;
+/// Room for "59m 59s" at the end of the status line.
+const TIMER_SLOT: f32 = 48.0;
+const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
+const CAPTAIN_STATUS: TextStyle = TextStyle::new(12.5, 460.0);
+/// Running clocks use tabular digits so a ticking timer keeps its width.
+const TIMER: TextStyle = TextStyle::new(12.0, 520.0).features("'tnum' 1");
+
+/// A sidebar portrait. It plays its status's animation strip through the shared stage in
+/// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
+/// motion, or for a set without strips, it is the static face.
+fn sidebar_portrait(
+    s: &State,
+    p: Palette,
+    row: usize,
+    portrait: usize,
+    size: f32,
+    status: Status,
+) -> El {
+    let portrait = portrait.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
+    let face = face_for(status);
+    let pixels = s
+        .portraits
+        .pixels(portrait, face)
+        .unwrap_or_else(|| s.artwork.face(portrait, face).pixels());
+    let radius = (size * 0.27).round();
+    el().key(format!("portrait-{row}"))
+        .size(size, size)
+        .radius(radius)
+        .clip_rounded(radius)
+        .border(0.5, p.line)
+        .pixels(pixels)
+        .a11y_hidden()
+        .on_visible(move |s: &mut State, on, tx| {
+            s.portraits.set_visible(row, on);
+            // The view doesn't read this; the next poll does.
+            tx.live_only();
+            tx.wake_after(std::time::Duration::ZERO);
+        })
+}
+
+fn count_pill(count: usize, fill: Color, ink: Color) -> El {
+    let text = if count > 9 {
+        "9+".into()
+    } else {
+        count.to_string()
+    };
+    row()
+        .h(16.0)
+        .min_w(16.0)
+        .px(5.0)
+        .radius(8.0)
+        .fill(fill)
+        .center()
+        .child(label(text, TextStyle::new(10.5, 650.0), ink))
+}
+
+/// A row's hover and selection washes, after Grok Bot's bot list: ink at about 6% on hover
+/// and 8% when selected. Rune blends in linear light, so dark mode needs far less alpha.
+fn row_washes(s: &State, p: Palette) -> (Color, Color) {
+    if s.dark {
+        (p.ink.alpha(0.014), p.selected)
+    } else {
+        (p.ink.alpha(0.055), p.selected)
+    }
+}
+
+/// A captain in the sidebar, laid out like Grok Bot's bot rows: a larger portrait, the name,
+/// and one status line under it. Every part has a fixed place: the name truncates before
+/// anything else, the badge and timer keep reserved slots, and the status word never
+/// shrinks, so a status change never moves the name, the portrait or the rows around it.
+fn captain_row(
+    s: &State,
+    p: Palette,
+    thread: &Thread,
+    item: El,
+    status: Status,
+    approval: bool,
+    selected: bool,
+) -> El {
+    let id = thread.id;
+    let name = thread
+        .captain
+        .and_then(|c| s.captains.get(c))
+        .map(|c| c.name.as_str())
+        .unwrap_or(&thread.title);
+    let crew: Vec<&Thread> = s
+        .threads
+        .iter()
+        .filter(|t| t.parent == Some(id) && t.archived() == s.show_archive)
+        .collect();
+    let family = || std::iter::once(thread).chain(crew.iter().copied());
+    let running: Vec<&Thread> = family().filter(|t| t.status == Status::Running).collect();
+    let requests = family().filter(|t| t.request.is_some()).count();
+    let unread = family().filter(|t| t.unread()).count();
+    let plural = |n: usize, one: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {one}s")
+        }
+    };
+    let detail = match status {
+        Status::Running => plural(running.len().max(1), "thread"),
+        Status::Waiting if approval => "approval".into(),
+        Status::Waiting if requests > 0 => "a question".into(),
+        _ => {
+            let mut parts = vec![];
+            if thread.renamed {
+                parts.push(thread.title.clone());
+            }
+            let count = s.captain_worker_count(id);
+            if count > 0 {
+                parts.push(format!("{count} crew"));
+            }
+            parts.extend(row_workspace(s, thread));
+            parts.join(" · ")
+        }
+    };
+    let timer = (status == Status::Running)
+        .then(|| running.iter().filter_map(|t| t.started).min())
+        .flatten();
+    let status_ink = match status {
+        Status::Ready => p.muted,
+        Status::Completed => p.teal_text,
+        other => status_ink(other, p),
+    };
+    let mut status_line = row()
+        .key(format!("captain-status-{id}"))
+        .h(18.0)
+        .gap(4.0)
+        .center_y()
+        .child(
+            el().size(10.0, 10.0)
+                .center()
+                .child(status_mark(status, p, 6.0)),
+        )
+        .child(
+            label(status.label(), CAPTAIN_STATUS, status_ink).key(format!("captain-state-{id}")),
+        );
+    if !detail.is_empty() {
+        status_line = status_line.child(
+            label(format!("· {detail}"), CAPTAIN_STATUS, p.muted)
+                .truncate()
+                .shrink()
+                .grow(1.0)
+                .min_w(0.0),
+        );
+    } else {
+        status_line = status_line.child(spacer());
+    }
+    if let Some(start) = timer {
+        status_line = status_line.child(
+            label(elapsed_label(start.elapsed().as_secs()), TIMER, p.muted)
+                .key(format!("captain-timer-{id}"))
+                .w(TIMER_SLOT)
+                .align(rune::Align::End),
+        );
+    }
+    let badge = if requests > 0 || status == Status::Waiting {
+        Some(count_pill(requests.max(1), p.gold, p.on_teal).key(format!("captain-attention-{id}")))
+    } else if unread > 0 {
+        Some(count_pill(unread, p.teal, p.on_teal).key(format!("captain-unread-{id}")))
+    } else {
+        None
+    };
+    let mut badges = row()
+        .key(format!("captain-badges-{id}"))
+        .w(BADGE_SLOT)
+        .h(18.0)
+        .center_y()
+        .child(spacer());
+    if let Some(badge) = badge {
+        badges = badges.child(badge);
+    }
+    let name_line = row()
+        .h(20.0)
+        .gap(6.0)
+        .center_y()
+        .child(
+            label(name, CAPTAIN_NAME, p.ink)
+                .key(format!("captain-name-{id}"))
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(badges);
+    let size = if focal_captain(s) == Some(id) {
+        CAPTAIN_SLOT
+    } else {
+        CAPTAIN_PORTRAIT
+    };
+    let portrait = captain_portrait(s, thread.captain);
+    let (hover, active) = row_washes(s, p);
+    let curve = |seconds| rune::Curve::tween(seconds, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
+    let mut description = format!("{name}, {}", status.label());
+    if !detail.is_empty() {
+        description.push_str(&format!(", {detail}"));
+    }
+    if unread > 0 {
+        description.push_str(&format!(", {unread} unread"));
+    }
+    item.label(description)
+        .radius(10.0)
+        .fill(if selected { active } else { Color::TRANSPARENT })
+        .hover(hover)
+        .press(active)
+        .hover_motion(curve(0.15), curve(0.2))
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .h(CAPTAIN_SLOT + 12.0)
+                .pl(6.0)
+                .pr(8.0)
+                .gap(10.0)
+                .center_y()
+                .child(
+                    el().key(format!("portrait-slot-{id}"))
+                        .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
+                        .center()
+                        .child(sidebar_portrait(s, p, id, portrait, size, status)),
+                )
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(1.0)
+                        .child(name_line)
+                        .child(status_line),
+                ),
+        )
+}
+
+/// The corner mark that shows a portrait's status in pickers and headers.
+fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
     if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
         // A backing disc in the surface color keeps the mark readable over the artwork.
         let (backing, mark) = if size <= 16.0 {
@@ -2062,28 +2316,82 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(label(status.label(), SMALL, status_ink(status, p)))
 }
-fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
-    let thread = &s.threads[index];
+/// A sidebar row's status, and whether it waits on an approval: a pending request, or a
+/// worker's approval, outranks the run. A captain's home stands for its whole crew.
+fn row_status(s: &State, thread: &Thread) -> (Status, bool) {
     let id = thread.id;
-    let approval = thread
-        .request
-        .as_ref()
-        .is_some_and(|r| r["method"] == "confirm")
-        || s.threads.iter().any(|child| {
-            child.parent == Some(id)
-                && child
-                    .request
-                    .as_ref()
-                    .is_some_and(|r| r["method"] == "confirm")
-        });
-    let captain_home = s.is_captain_home(thread);
-    let row_status = if approval || thread.request.is_some() {
+    let confirm = |t: &Thread| t.request.as_ref().is_some_and(|r| r["method"] == "confirm");
+    let approval = confirm(thread)
+        || s.threads
+            .iter()
+            .any(|child| child.parent == Some(id) && confirm(child));
+    let status = if approval || thread.request.is_some() {
         Status::Waiting
-    } else if captain_home {
+    } else if s.is_captain_home(thread) {
         s.home_status(id)
     } else {
         thread.status
     };
+    (status, approval)
+}
+
+/// The portrait a captain wears; threads without a profile wear the first.
+fn captain_portrait(s: &State, captain: Option<usize>) -> usize {
+    captain
+        .and_then(|c| s.captains.get(c))
+        .map(|c| c.portrait)
+        .unwrap_or(0)
+}
+
+/// Whether the sidebar is on screen, as `view` decides it.
+fn sidebar_docked(s: &State) -> bool {
+    let compact = s.viewport_width < 760.0;
+    (s.sidebar && !compact) || (compact && s.compact_sidebar)
+}
+
+/// Advances the sidebar's portrait animations. Called from the app's poll; the answer is
+/// when to wake for the next frame, or None when no portrait plays.
+pub(crate) fn tick_portraits(
+    s: &mut State,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let rows: Vec<_> = if sidebar_docked(s) {
+        s.sidebar_captains()
+            .into_iter()
+            .map(|i| {
+                let t = &s.threads[i];
+                let face = face_for(row_status(s, t).0);
+                (t.id, captain_portrait(s, t.captain), face)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    s.portraits.tick(now, rows)
+}
+
+/// The captain that gets the larger portrait: the one whose crew is open, otherwise the most
+/// urgent one that is working or needs the user. The portrait's slot has the same size either
+/// way, so moving the focus never moves a row.
+fn focal_captain(s: &State) -> Option<usize> {
+    let captains = s.sidebar_captains();
+    let open = s.selected_row();
+    if let Some(i) = captains.iter().find(|i| s.threads[**i].id == open) {
+        return Some(s.threads[*i].id);
+    }
+    captains
+        .iter()
+        .map(|i| (s.threads[*i].id, row_status(s, &s.threads[*i]).0))
+        .filter(|(_, status)| status.urgency() >= Status::Running.urgency())
+        .max_by_key(|(id, status)| (status.urgency(), std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
+}
+
+fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
+    let thread = &s.threads[index];
+    let id = thread.id;
+    let (row_status, approval) = row_status(s, thread);
+    let captain_home = s.is_captain_home(thread);
     let target = RowTarget::Thread(id);
     let selected = id == s.current().id || s.selected_threads.contains(&id);
     let section = s.thread_section(thread, lifecycle::now());
@@ -2168,6 +2476,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         });
     if !nested && !captain_home && thread.machine == "local" {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
+    }
+    if captain_home && !nested {
+        return captain_row(s, p, thread, item, row_status, approval, selected);
     }
 
     // The mark only shows what deserves a glance: work in progress, something that needs the
@@ -2317,7 +2628,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             }
             _ => state_label.to_string(),
         };
-        slot = slot.child(label(text, TextStyle::new(12.0, 520.0), ink));
+        slot = slot.child(label(text, TIMER, ink));
     } else {
         let time = match section {
             Section::Snoozed => Some(lifecycle::wake_label(
@@ -2333,49 +2644,6 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     }
     if thread.machine != "local" {
         slot = slot.child(icon("cloud", p.muted));
-    }
-
-    // Captains: a portrait beside their name, with what they work in and their crew below.
-    if captain_home {
-        let mut context = vec![];
-        if thread.renamed
-            && let Some(profile) = thread.captain.and_then(|id| s.captains.get(id))
-        {
-            context.push(profile.name.clone());
-        }
-        context.extend(workspace);
-        if !s.captain_expanded(id) {
-            let workers = s.captain_worker_count(id);
-            if workers > s.visible_captain_workers(id).len() {
-                let noun = if workers == 1 { "worker" } else { "workers" };
-                context.push(format!("{workers} {noun}"));
-            }
-        }
-        let mut text = col()
-            .grow(1.0)
-            .min_w(0.0)
-            .gap(1.0)
-            .child(row().h(20.0).gap(8.0).center_y().child(title).child(slot));
-        if !context.is_empty() {
-            text = text.child(label(context.join(", "), CARD_META, p.muted).truncate());
-        }
-        return item.child(
-            row()
-                .grow(1.0)
-                .min_w(0.0)
-                .px(ROW_INSET)
-                .py(8.0)
-                .gap(10.0)
-                .center_y()
-                .child(avatar(
-                    s,
-                    p,
-                    thread.captain.unwrap_or(usize::MAX),
-                    32.0,
-                    row_status,
-                ))
-                .child(text),
-        );
     }
 
     let project = s.project(thread.project);
@@ -8232,6 +8500,175 @@ pub(crate) mod tests {
         assert!(
             chip[0] >= rect[0] && chip[0] + chip[2] <= rect[0] + rect[2] + 0.5,
             "attachment chip overflows the composer: {chip:?} in {rect:?}"
+        );
+    }
+
+    fn rect(rt: &Runtime<State>, key: &str) -> [f32; 4] {
+        rt.presented(key)
+            .unwrap_or_else(|| panic!("{key} is not presented"))
+            .0
+    }
+
+    #[test]
+    fn captain_status_stays_inside_its_row_and_never_moves_siblings() {
+        let mut status_widths = vec![];
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 200.0] {
+                let mut rt = runtime(width);
+                rt.state.populate_demo();
+                rt.state.sidebar_width = sidebar_width;
+                rt.state.compact_sidebar = width < 760.0;
+                for captain in &mut rt.state.captains {
+                    captain.name = format!("{} of the Extraordinarily Long Name", captain.name);
+                }
+                let homes: Vec<usize> = rt
+                    .state
+                    .sidebar_captains()
+                    .iter()
+                    .map(|i| rt.state.threads[*i].id)
+                    .collect();
+                assert!(homes.len() >= 2);
+                let (first, next) = (homes[0], homes[1]);
+                let i = rt.state.threads.iter().position(|t| t.id == first).unwrap();
+                rt.state.threads[i].title =
+                    "Coordinate a long migration across every workspace and release train".into();
+                rt.state.threads[i].renamed = true;
+                rt.invalidate();
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let siblings = [
+                    format!("captain-name-{first}"),
+                    format!("portrait-slot-{first}"),
+                    format!("captain-badges-{first}"),
+                    format!("thread-{next}"),
+                ];
+                let before: Vec<_> = siblings.iter().map(|k| rect(&rt, k)).collect();
+                for step in 0..4 {
+                    let t = &mut rt.state.threads[i];
+                    t.request = None;
+                    t.started = None;
+                    match step {
+                        0 => {
+                            t.status = Status::Running;
+                            t.started = Some(
+                                std::time::Instant::now() - std::time::Duration::from_secs(3599),
+                            );
+                        }
+                        1 => {
+                            t.status = Status::Waiting;
+                            t.request = Some(json!({"method":"confirm"}));
+                        }
+                        2 => t.status = Status::Failed,
+                        _ => t.status = Status::Completed,
+                    }
+                    rt.invalidate();
+                    rt.frame(1.0);
+                    rt.frame(1.0);
+                    let row = rect(&rt, &format!("thread-{first}"));
+                    let mut parts = vec![
+                        format!("captain-state-{first}"),
+                        format!("captain-status-{first}"),
+                        format!("captain-name-{first}"),
+                    ];
+                    if step == 0 {
+                        parts.push(format!("captain-timer-{first}"));
+                    }
+                    for key in parts {
+                        let r = rect(&rt, &key);
+                        assert!(
+                            r[2] > 0.0
+                                && r[0] >= row[0] - 0.5
+                                && r[0] + r[2] <= row[0] + row[2] + 0.5
+                                && r[1] >= row[1] - 0.5
+                                && r[1] + r[3] <= row[1] + row[3] + 0.5,
+                            "{width}/{sidebar_width} step {step}: {key} {r:?} leaves {row:?}"
+                        );
+                    }
+                    if step == 1 {
+                        status_widths.push(rect(&rt, &format!("captain-state-{first}"))[2]);
+                    }
+                    let after: Vec<_> = siblings.iter().map(|k| rect(&rt, k)).collect();
+                    for (key, (a, b)) in siblings.iter().zip(before.iter().zip(&after)) {
+                        assert!(
+                            a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.5),
+                            "{width}/{sidebar_width} step {step}: {key} moved from {a:?} to {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // "Needs you" is never squeezed: it has its full width at the narrowest sidebar too.
+        let widest = status_widths.iter().cloned().fold(0.0, f32::max);
+        assert!(
+            status_widths.iter().all(|w| (widest - w).abs() < 0.5),
+            "{status_widths:?}"
+        );
+    }
+
+    #[test]
+    fn thread_card_timers_stay_inside_narrow_rows() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.sidebar_width = 200.0;
+            rt.state.compact_sidebar = width < 760.0;
+            let i = rt
+                .state
+                .threads
+                .iter()
+                .position(|t| t.status == Status::Running && !rt.state.is_captain_home(t))
+                .unwrap();
+            let id = rt.state.threads[i].id;
+            rt.state.threads[i].title = "An extremely long thread title that cannot fit".into();
+            rt.state.threads[i].started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(3000));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let row = rect(&rt, &format!("thread-{id}"));
+            let side = rect(&rt, "sidebar");
+            assert!(
+                row[0] + row[2] <= side[0] + side[2] + 0.5,
+                "{width}: {row:?}"
+            );
+            let label = rt
+                .accessibility_json()
+                .to_string()
+                .contains("Working 50m 0s");
+            assert!(label, "{width}: the running timer is shown");
+        }
+    }
+
+    #[test]
+    fn sidebar_portraits_play_only_while_shown_focused_and_allowed_to_move() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.frame(0.0);
+        rt.frame(0.1);
+        rt.frame(0.1);
+        let now = std::time::Instant::now();
+        assert!(
+            tick_portraits(&mut rt.state, now).is_some(),
+            "on-screen captains animate"
+        );
+        rt.state.sidebar = false;
+        assert!(
+            tick_portraits(&mut rt.state, now).is_none(),
+            "hidden sidebar"
+        );
+        rt.state.sidebar = true;
+        rt.state.portraits.set_focused(false);
+        assert!(
+            tick_portraits(&mut rt.state, now).is_none(),
+            "unfocused window"
+        );
+        rt.state.portraits.set_focused(true);
+        rt.set_system_reduced_motion(true);
+        rt.invalidate();
+        rt.frame(0.1);
+        assert!(
+            tick_portraits(&mut rt.state, now).is_none(),
+            "reduced motion"
         );
     }
 }
