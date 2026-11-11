@@ -202,9 +202,126 @@ fn captain_workspace_demo(state: &mut State) {
         }
         state.threads.push(worker);
     }
-    state.next_id = 16;
+    crew_tasks_demo(state);
     state.tabs = vec![7, 1, 11];
     state.select_thread(home);
+}
+
+/// Ember's delegations in the captain workspace: task records in each state, the calls that
+/// started them, and one delivered result. Nothing here starts a process.
+fn crew_tasks_demo(state: &mut State) {
+    let now = lifecycle::now();
+    for (id, title, status, phase) in [
+        (
+            16,
+            "Tighten the composer spacing",
+            model::Status::Running,
+            "Editing src/ui.rs",
+        ),
+        (
+            17,
+            "Audit keyboard focus order",
+            model::Status::Running,
+            "Reading src/main.rs",
+        ),
+        (18, "Port the attention popover", model::Status::Ready, ""),
+        (19, "Document the crew tray", model::Status::Ready, ""),
+    ] {
+        let mut worker = model::Thread::new(id);
+        worker.title = title.into();
+        worker.status = status;
+        worker.phase = phase.into();
+        worker.parent = Some(7);
+        worker.delegated = true;
+        worker.captain = Some(0);
+        worker.project = Some(1);
+        worker.life.latest_user_message_at = Some(now - 60_000);
+        state.threads.push(worker);
+    }
+    for id in [1, 2, 16, 17, 18, 19] {
+        let worker = state.threads.iter_mut().find(|t| t.id == id).unwrap();
+        worker.set_model("cpa".into(), "gpt-5.5".into());
+        worker.model = "GPT-5.5 (CPA → Codex)".into();
+    }
+    if let Some(review) = state.threads.iter_mut().find(|t| t.id == 2) {
+        review.phase = "Waiting for approval".into();
+    }
+    state.next_id = 20;
+    use model::TaskState::*;
+    state.demo_task(
+        1,
+        Completed,
+        Some(552_000),
+        "Reconnect now retries with backoff and keeps the draft. Tests pass.",
+        "",
+    );
+    state.demo_task(2, Running, Some(252_000), "", "");
+    state.demo_task(16, Running, Some(65_000), "", "");
+    state.demo_task(17, Running, Some(31_000), "", "");
+    state.demo_task(19, Queued, None, "", "");
+    state.demo_task(
+        18,
+        Interrupted,
+        Some(1_250_000),
+        "",
+        "Shina restarted before this worker finished. Check its partial changes before resuming.",
+    );
+    let home = state.threads.iter_mut().find(|t| t.id == 7).unwrap();
+    let plan = "I'll split this into six pieces of work. Each worker gets a full brief, and I'll keep the sidebar review with you.";
+    let request = std::mem::take(&mut home.messages)
+        .into_iter()
+        .next()
+        .unwrap();
+    home.messages = vec![
+        request,
+        model::Message {
+            role: "Pi",
+            text: plan.into(),
+            images: vec![],
+        },
+        model::Message {
+            role: "Shina",
+            text: "Shina: task #1 finished
+Task id: demo
+Title: Fix the reconnect listener
+Status: completed
+Last reply:
+Reconnect now retries with backoff and keeps the draft. I added a regression test for a dropped socket, and `cargo test` passes.
+Error: none".into(),
+            images: vec![],
+        },
+        model::Message {
+            role: "Pi",
+            text: "The reconnect fix is in and tested. The sidebar review is waiting on your approval below, and the crew tray notes start when a slot frees up.".into(),
+            images: vec![],
+        },
+    ];
+    home.tools = [1, 2, 16, 17, 18, 19]
+        .into_iter()
+        .enumerate()
+        .map(|(block, child)| model::Tool {
+            id: format!("delegate-{child}"),
+            name: "mcp__shina__delegate_task".into(),
+            detail: String::new(),
+            done: true,
+            failed: false,
+            output: format!("{{\"thread_id\":{child}}}"),
+            images: vec![],
+            structured: serde_json::Value::Null,
+            parent_call: None,
+            exit_code: None,
+            subagents: vec![],
+            anchor: model::ToolAnchor {
+                message: 1,
+                offset: plan.len(),
+            },
+            block,
+            expanded: false,
+            group_expanded: false,
+            started: None,
+            duration_ms: Some(400),
+        })
+        .collect();
 }
 
 /// The same work with a standalone thread open, so both crews are collapsed.
@@ -384,6 +501,28 @@ fn main() {
                 captain_workspace_demo(state);
                 state.dark = true;
             }),
+            ("captain-worker", |state| {
+                captain_workspace_demo(state);
+                let worker = state.threads.iter().position(|t| t.id == 16).unwrap();
+                state.select_thread(worker);
+                let t = state.current_mut();
+                t.status = model::Status::Running;
+                t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(65));
+                t.messages = vec![
+                    model::Message {
+                        role: "Shina",
+                        text: "Shina: task from parent #7
+
+Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
+                        images: vec![],
+                    },
+                ];
+            }),
+            ("captain-attention", |state| {
+                captain_workspace_demo(state);
+                state.recovery_notice = Some("Shina was closed while 2 tasks were running. Check their partial work, then resume or dismiss them.".into());
+                state.attention_menu = true;
+            }),
             ("captain-goal-empty", |state| {
                 captain_workspace_demo(state);
                 let home = state.current_mut();
@@ -458,6 +597,24 @@ fn main() {
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
+            }),
+            ("harness-picker", |state| {
+                state.populate_demo();
+                let fixture = |id: &str, name: &str| harness::Agent {
+                    id: id.into(),
+                    name: name.into(),
+                    command: String::new(),
+                    args: vec![],
+                    env: vec![],
+                };
+                state.harnesses.agents = vec![
+                    fixture("claude-code", "Claude Code"),
+                    fixture("codex", "Codex"),
+                    fixture("goose", "Goose"),
+                ];
+                state.current_mut().model = "GPT-5.5 (CPA → Codex)".into();
+                state.current_mut().models = vec![];
+                state.settings_picker = Some(model::SettingsPicker::Model);
             }),
             ("browse-folders", |state| {
                 state.populate_demo();

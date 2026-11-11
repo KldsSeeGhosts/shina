@@ -26,6 +26,11 @@ Already ported:
 | `measure`, `lane_gutter`, `conversation`, `composer` lane | `index.css` (`.chat-content-lane`, `.chat-composer-lane`), `chat/MessagesTimeline.tsx`, `chat/TimelineUserMessageRow.tsx` |
 | `captain_editor` portrait grid | `settings/ProjectIconPickerDialog.tsx` (emoji grid) |
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
+| `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` |
+| `crew_ui::parent_bar`, `crew_ui::task_card` meta line | `chat/ProviderSubagentBar.tsx` |
+| `crew_ui::crew_tray` placement | `chat/QueuedRunsControl.tsx` |
+| `captain_hero` | `chat/DraftHeroHeadline.tsx` |
+| `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
 
 The effort slider (`effort_slider`, `slider_curve`, `sparkles`) is ported from the Codex desktop app instead. Its source ships uncompressed in `C:\Program Files\WindowsApps\OpenAI.Codex_*\app\resources\app.asar`. Search it as text for `data-reasoning-slider`, `model-picker-power-slider` and the CSS classes it names. Read it there, never run it. Its values: a 24 px track in a 28 px row, a 28 px white thumb with a hairline edge, motion of 0.3 s on `cubic-bezier(.23, 1, .32, 1)` (0.15 s while dragging), a thumb that follows the pointer with no detents, and a closed-hand cursor only while the slider is pressed or dragged (hover keeps the arrow). winit shows `Cursor::Grabbing` as the four-way move arrow on Windows, so the hand is an image cursor, `assets/cursors/grabbing.png`, drawn by `tools/cursors.py`. Rune lands drag commits at once, so each drag phase sets `tx.motion_curve(...)`.
 

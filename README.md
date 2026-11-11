@@ -228,6 +228,9 @@ cargo run -- --demo --snap artifacts\shina-narrow.png --size 620x720 --scale 1
 cargo run -- --demo --scene captain --snap artifacts\shina-captain.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-workspace --snap artifacts\shina-captain-workspace.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-workspace-dark --snap artifacts\shina-captain-workspace-dark.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-worker --snap artifacts\shina-captain-worker.png --size 1280x840 --scale 1
+cargo run -- --demo --scene captain-attention --snap artifacts\shina-captain-attention.png --size 960x840 --scale 1
+cargo run -- --demo --scene harness-picker --snap artifacts\shina-harness-picker.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-search --snap artifacts\shina-captain-search.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-crews-dark --snap artifacts\shina-captain-crews.png --size 1280x840 --scale 1
 cargo run -- --demo --scene picker --snap artifacts\shina-picker.png --size 1280x840 --scale 1

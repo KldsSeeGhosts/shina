@@ -1862,6 +1862,8 @@ pub struct State {
     pub row_menu: Option<RowTarget>,
     /// The footer's settings menu is open.
     pub settings_menu: bool,
+    /// The sidebar's "N need you" popover is open.
+    pub attention_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
     pub hovered_row: Option<RowTarget>,
@@ -1985,6 +1987,7 @@ impl State {
             thread_menu: false,
             row_menu: None,
             settings_menu: false,
+            attention_menu: false,
             row_menu_at: None,
             hovered_row: None,
             rename_thread: None,
