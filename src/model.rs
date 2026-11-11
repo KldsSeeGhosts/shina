@@ -240,6 +240,31 @@ pub enum ProjectPicker {
     AssignCaptain,
     /// Add a workspace, as T3 Code's Add project palette: pick a source, then browse.
     AddProject,
+    /// Add or remove a workspace in the open captain's scope, from its Brief panel.
+    CaptainScope,
+}
+
+/// UI-only state for the captain Brief panel and the profile editor in `captain_ui.rs`.
+/// Nothing here is persisted; committed values go through the State memory and scope APIs.
+#[derive(Default)]
+pub struct BriefUi {
+    /// The memory whose text is being edited inline, and its draft.
+    pub editing: Option<String>,
+    pub edit: TextEdit,
+    /// The Add memory field is open, and its draft.
+    pub adding: bool,
+    pub draft: TextEdit,
+    /// The Reset conversation confirmation is open.
+    pub confirm_reset: bool,
+    /// The last rejected action, shown in the panel until the next success.
+    pub error: Option<String>,
+    /// The "You" profile editor is open, with its three drafts.
+    pub profile_open: bool,
+    pub profile_name: TextEdit,
+    pub profile_zone: TextEdit,
+    pub profile_preferences: TextEdit,
+    /// Demo scenes only: a stand-in for the live background status.
+    pub demo_status: Option<background::BackgroundStatus>,
 }
 
 pub struct Thread {
@@ -1983,6 +2008,7 @@ pub struct State {
     captain_homes: std::collections::BTreeMap<usize, usize>,
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
+    pub brief: BriefUi,
     pub settings_picker: Option<SettingsPicker>,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
     /// (highest). The level is chosen on release.
@@ -2105,6 +2131,7 @@ impl State {
             captain_homes: Default::default(),
             memory: Arc::default(),
             captain_editor: None,
+            brief: BriefUi::default(),
             settings_picker: None,
             thinking_drag: None,
             model_search: TextEdit::default(),

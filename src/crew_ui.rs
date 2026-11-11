@@ -18,23 +18,23 @@ const CARD_INDENT: f32 = 22.0;
 /// Below this lane width the crew tray stacks its chips, as KSG's composer bars drop to a column.
 const TRAY_STACK_WIDTH: f32 = 560.0;
 
-fn motion() -> rune::Curve {
+pub(super) fn motion() -> rune::Curve {
     rune::Curve::tween(0.18, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0))
 }
 /// Ink washes. Rune blends in linear light, where a light ink on a dark ground reads stronger,
 /// so the dark theme takes a little over half the alpha for the same visible step.
-fn hover_wash(s: &State, p: Palette) -> Color {
+pub(super) fn hover_wash(s: &State, p: Palette) -> Color {
     p.ink.alpha(if s.dark { 0.035 } else { 0.06 })
 }
-fn active_wash(s: &State, p: Palette) -> Color {
+pub(super) fn active_wash(s: &State, p: Palette) -> Color {
     p.ink.alpha(if s.dark { 0.05 } else { 0.08 })
 }
-fn hairline(p: Palette) -> Color {
+pub(super) fn hairline(p: Palette) -> Color {
     p.ink.alpha(0.10)
 }
 
 /// A quiet, outlined action: Decline, Dismiss, Open.
-fn ghost_button(
+pub(super) fn ghost_button(
     s: &State,
     key: String,
     title: &str,
@@ -59,7 +59,12 @@ fn ghost_button(
         .child(label(title, TextStyle::new(12.5, 500.0), p.ink))
 }
 /// The one filled action in a group: Approve, Resume, Open to answer.
-fn solid_button(key: String, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+pub(super) fn solid_button(
+    key: String,
+    title: &str,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
     row()
         .key(key)
         .role("button")

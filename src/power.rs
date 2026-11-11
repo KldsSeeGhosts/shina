@@ -12,20 +12,6 @@ pub enum KeepAwake {
 }
 
 impl KeepAwake {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "Keep awake: Off",
-            Self::WhileRunning => "Keep awake: While tasks run",
-            Self::OnAcPower => "Keep awake: On AC power",
-        }
-    }
-    pub fn next(self) -> Self {
-        match self {
-            Self::Off => Self::WhileRunning,
-            Self::WhileRunning => Self::OnAcPower,
-            Self::OnAcPower => Self::Off,
-        }
-    }
     pub fn qualifies(self, working: bool, ac: Option<bool>) -> bool {
         working
             && match self {
