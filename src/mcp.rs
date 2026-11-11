@@ -54,6 +54,11 @@ substitutes a model or clamps a level.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
 status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
 after your current work. These messages are labeled Shina, not user instructions.
+- Shina saves task records and completion delivery IDs. Each coordinator can have at most \
+3 running children and 8 unfinished tasks. Extra children queue; task_status reports queue_position. \
+After a restart, Shina checks Pi's active history without replaying briefs or tool actions. \
+Uncertain tasks become interrupted and require the user to resume or dismiss them. Recovered \
+results wait for the parent's next user turn or an explicit user resume, never a boot-time turn.
 - `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
 A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop. \
 `task_status`, `read_thread` and `list_threads` report each thread's effective model and \
@@ -257,7 +262,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "task_status",
-            "description": "Read a thread's parent, status, effective model selection, latest reply and error. Optionally wait for completion or timeout. Do not poll running children in a loop; completion wakes their parent.",
+            "description": "Read a thread's parent, durable task id, state, queue position, effective model selection, latest reply and error. Interrupted tasks require a user resume or dismiss action. Optionally wait for completion or timeout. Do not poll running children in a loop; completion wakes their parent.",
             "inputSchema": {"type":"object","properties":{"thread_id": id,"wait_seconds":wait},"required":["thread_id"]},
             "annotations": {"readOnlyHint": true}
         },
@@ -738,6 +743,53 @@ mod tests {
         );
         worker.join().unwrap();
         assert!(body.contains("list_threads"), "{body}");
+    }
+
+    #[test]
+    fn the_shipped_read_only_hook_policy_blocks_writes_without_approval() {
+        // Execute the exact pure policy shipped in the bridge, not a Rust imitation.
+        let source = EXTENSION.replace("\r\n", "\n");
+        let body = source
+            .split_once("builtinEdit: boolean): \"allow\" | \"deny\" | \"confirm\" {\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let script = format!(
+            r#"
+const assert = require("node:assert/strict");
+const decide = (mode, builtinRead, ownBridge, ownReadOnly, builtinEdit) => {{
+{body}
+}};
+for (const name of ["read", "grep", "find", "ls", "tool_search"]) {{
+  assert.equal(decide("read-only", true, false, false, false), "allow", name);
+}}
+for (const name of ["delegate_task", "task_send", "task_cancel", "read_thread"]) {{
+  assert.equal(decide("read-only", false, true, false, false), "allow", name);
+}}
+for (const name of ["bash", "edit", "write", "external", "spoofed_read", "spoofed_mcp__shina__delegate_task"]) {{
+  assert.equal(decide("read-only", false, false, false, name === "edit" || name === "write"), "deny", name);
+}}
+assert.equal(decide("approval-required", false, true, false, false), "confirm");
+assert.equal(decide("approval-required", false, true, true, false), "allow");
+assert.equal(decide("auto-accept-edits", false, false, false, true), "allow");
+assert.equal(decide("auto-accept-edits", false, false, false, false), "confirm");
+assert.equal(decide("full-access", false, false, false, false), "allow");
+"#
+        );
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("Node is required by Pi and the bridge policy test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(EXTENSION.contains("resolve(tool.sourceInfo.path) === resolve(bridgePath)"));
+        assert!(EXTENSION.contains("tool?.sourceInfo?.path === `builtin:${event.toolName}`"));
+        assert!(EXTENSION.contains("Delegate code changes to a thread"));
     }
 
     #[test]

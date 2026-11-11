@@ -488,6 +488,8 @@ fn quit_hook(state: &mut State) {
     if let Err(error) = state.checkpoint_and_flush() {
         state.cancel_update_exit();
         eprintln!("Could not save Shina before quitting: {error}");
+    } else {
+        state.mark_clean_quit();
     }
 }
 

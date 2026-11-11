@@ -86,6 +86,7 @@ pub enum ConversationMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AccessMode {
+    ReadOnly,
     Supervised,
     Edits,
     #[default]
@@ -94,6 +95,7 @@ pub enum AccessMode {
 impl AccessMode {
     pub fn id(self) -> &'static str {
         match self {
+            Self::ReadOnly => "read-only",
             Self::Supervised => "approval-required",
             Self::Edits => "auto-accept-edits",
             Self::Full => "full-access",
@@ -101,6 +103,7 @@ impl AccessMode {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::ReadOnly => "Read only",
             Self::Supervised => "Supervised",
             Self::Edits => "Auto-accept edits",
             Self::Full => "Full access",
@@ -108,6 +111,7 @@ impl AccessMode {
     }
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "read-only" => Some(Self::ReadOnly),
             "approval-required" => Some(Self::Supervised),
             "auto-accept-edits" => Some(Self::Edits),
             "full-access" => Some(Self::Full),
