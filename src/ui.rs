@@ -656,7 +656,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let main = if captain_ui::is_earlier(s) {
             main.child(conversation(s, p, wide, main_width))
                 .child(captain_ui::earlier_bar(s, p, wide, main_width))
-        } else if s.current().messages.is_empty() && s.current().tools.is_empty() {
+        } else if s.current().messages.is_empty()
+            && s.current().tools.is_empty()
+            && s.current().native.compactions.is_empty()
+        {
             main.child(empty_thread(s, p, narrow, wide, main_width))
         } else {
             main.child(conversation(s, p, wide, main_width))
@@ -6249,7 +6252,7 @@ fn context_ring(t: &Thread, p: Palette) -> El {
     el().key("context-usage-ring")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(t.context.accessible_label(limit))
+        .label(t.context_harness_text(&t.context.accessible_label(limit)))
         .focusable(true)
         .expanded(open)
         .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
@@ -6416,10 +6419,14 @@ fn context_popover(s: &State, p: Palette) -> El {
     }
     if let Some(state) = t.context.state_text() {
         card = card.child(
-            label(state, TextStyle::new(11.0, 500.0).lh(16.0), p.muted)
-                .key("context-details-state")
-                .wrap()
-                .mt(4.0),
+            label(
+                t.context_harness_text(state),
+                TextStyle::new(11.0, 500.0).lh(16.0),
+                p.muted,
+            )
+            .key("context-details-state")
+            .wrap()
+            .mt(4.0),
         );
     }
     let can_compact = !s.demo && t.can_compact();
@@ -6454,10 +6461,12 @@ fn context_popover(s: &State, p: Palette) -> El {
             "Demo threads cannot compact."
         } else if t.session.is_none() {
             "Available once the conversation has a saved session."
-        } else if t.model_provider != "cpa" {
+        } else if !crate::harness::supports_compaction(&t.harness) {
+            "This ACP agent has no native compaction API."
+        } else if t.harness == "pi" && t.model_provider != "cpa" {
             "Compaction needs a CPA model."
         } else {
-            "Available when Pi is idle."
+            "Available when the agent is idle."
         };
         card = card.child(label(reason, secondary, p.muted).wrap());
     }
@@ -7250,6 +7259,48 @@ pub(crate) mod tests {
             assert_eq!(rt.state.current().phase, "Compacting context");
             rt.state.current_mut().stop();
             assert!(!rt.state.current().status.busy());
+        }
+    }
+
+    #[test]
+    fn codex_compact_button_and_progress_rows_fit_at_supported_widths() {
+        // Uses the existing KSG ContextWindowMeter and context-compaction row layout.
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, commands, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.harness = "codex".into();
+            t.session = Some("codex-fixture-thread".into());
+            t.model_provider = "codex".into();
+            t.context_window = Some(200000);
+            t.context
+                .absorb(&json!({"contextUsage":{"tokens":100000,"contextWindow":200000}}));
+            t.context.details_open = true;
+            rt.frame(0.0);
+            press(&mut rt, "compact-context");
+            assert!(commands.try_iter().any(|r| r["type"] == "compact"));
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"compaction_start"}));
+            rt.state.current_mut().context.details_open = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            for key in ["compact-context", "compaction-0"] {
+                let (r, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    r[0] >= 0.0 && r[0] + r[2] <= width + 1.0,
+                    "{width}: {key} {r:?}"
+                );
+            }
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"compaction_end"}));
+            rt.state.current_mut().native.compaction_expanded = true;
+            rt.frame(0.0);
+            assert!(rt.presented("compaction-0").is_some());
         }
     }
 

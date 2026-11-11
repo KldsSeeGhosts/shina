@@ -2,19 +2,29 @@
 import argparse
 import json
 import sys
+import threading
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--log", required=True)
 parser.add_argument("--auth-denial", action="store_true")
+parser.add_argument("--compact-failure", action="store_true")
+parser.add_argument("--compact-rejection", action="store_true")
+parser.add_argument("--hold-compaction", action="store_true")
+parser.add_argument("--automatic-compaction", action="store_true")
+parser.add_argument("--legacy-compaction", action="store_true")
 args = parser.parse_args()
 initialized = False
 thread_id = "codex-fixture-thread"
 turn_id = "codex-turn"
 pending = None
+turn_serial = 0
+compacting = False
+output_lock = threading.Lock()
 
 
 def send(value):
-    print(json.dumps(value), flush=True)
+    with output_lock:
+        print(json.dumps(value), flush=True)
 
 
 def notify(method, params):
@@ -22,7 +32,41 @@ def notify(method, params):
 
 
 def complete(status="completed"):
-    notify("turn/completed", {"turn": {"id": turn_id, "status": status, "items": []}})
+    turn = {"id": turn_id, "status": status, "items": []}
+    if status == "failed":
+        turn["error"] = {"message": "Fixture compaction failure"}
+    notify("turn/completed", {"turn": turn})
+
+
+def finish_compaction(automatic=False):
+    global compacting
+    if not compacting:
+        return
+    compacting = False
+    if args.compact_failure:
+        # Failed compact turns can omit item/completed.
+        notify("error", {"willRetry": False, "error": {"message": "Fixture compaction failure"}})
+        complete("failed")
+        return
+    if not args.legacy_compaction:
+        notify("item/completed", {"item": {"type": "contextCompaction", "id": turn_id + "-compact"}})
+    notify("thread/compacted", {"turnId": turn_id})
+    if automatic:
+        stream()
+    else:
+        complete()
+
+
+def start_compaction(automatic=False):
+    global compacting
+    compacting = True
+    if not args.legacy_compaction:
+        notify("item/started", {"item": {"type": "contextCompaction", "id": turn_id + "-compact"}})
+    if not args.hold_compaction:
+        # Allow a racing prompt while the native turn is active.
+        timer = threading.Timer(0.3, finish_compaction, args=(automatic,))
+        timer.daemon = True
+        timer.start()
 
 
 def stream():
@@ -78,18 +122,35 @@ for line in sys.stdin:
             assert params["threadId"] == thread_id
             turns = [{"id": "old", "status": "completed", "items": [
                 {"type": "userMessage", "id": "old-user", "content": [{"type": "text", "text": "Prior prompt"}]},
-                {"type": "agentMessage", "id": "old-answer", "text": "Prior reply"}
+                {"type": "agentMessage", "id": "old-answer", "text": "Prior reply"},
+                {"type": "contextCompaction", "id": "old-compaction"}
             ]}]
         send({"id": request_id, "result": {"thread": {"id": thread_id, "turns": turns},
              "model": "fixture-model", "reasoningEffort": "high"}})
+    elif method == "thread/compact/start":
+        assert params == {"threadId": thread_id}
+        if args.compact_rejection:
+            send({"id": request_id, "error": {"code": -32000, "message": "Fixture compaction rejection"}})
+            continue
+        turn_serial += 1
+        turn_id = "codex-turn-" + str(turn_serial)
+        send({"id": request_id, "result": {}})
+        notify("turn/started", {"turn": {"id": turn_id, "status": "inProgress"}})
+        start_compaction()
     elif method == "turn/start":
         assert params["threadId"] == thread_id
+        assert not compacting, "Prompt raced compaction"
+        turn_serial += 1
+        turn_id = "codex-turn-" + str(turn_serial)
         send({"id": request_id, "result": {"turn": {"id": turn_id, "status": "inProgress"}}})
         notify("turn/started", {"turn": {"id": turn_id, "status": "inProgress"}})
         text = "\n".join(item.get("text", "") for item in params["input"])
         notify("item/completed", {"item": {"type": "userMessage", "id": "user",
                "content": params["input"]}})
-        if "interrupt" in text:
+        if args.automatic_compaction:
+            start_compaction(automatic=True)
+            continue
+        elif "interrupt" in text:
             continue
         if "approval" in text or "write" in text:
             pending = "write" if "write" in text else "command"
@@ -100,9 +161,11 @@ for line in sys.stdin:
         else:
             stream()
     elif method == "turn/interrupt":
+        compacting = False
         send({"id": request_id, "result": {}})
         complete("interrupted")
     elif method == "turn/steer":
+        assert not compacting, "Steering raced compaction"
         assert params["expectedTurnId"] == turn_id
         send({"id": request_id, "result": {"turnId": turn_id}})
     elif method is None and request_id == 999:

@@ -241,18 +241,31 @@ impl Thread {
             description: "Switch response model for this thread".into(),
             source: "Shina".into(),
         }];
-        if self.harness == "pi" {
+        if crate::harness::supports_compaction(&self.harness) {
             commands.push(SlashCommand {
                 name: "compact".into(),
-                description: "Summarize context, with optional instructions".into(),
-                source: "Pi".into(),
+                description: if self.harness == "codex" {
+                    "Compact context with Codex".into()
+                } else {
+                    "Summarize context, with optional instructions".into()
+                },
+                source: if self.harness == "codex" {
+                    "Codex"
+                } else {
+                    "Pi"
+                }
+                .into(),
             });
         }
         commands.extend(
             self.native
                 .commands
                 .iter()
-                .filter(|c| c.name != "model" && (self.harness != "pi" || c.name != "compact"))
+                .filter(|c| {
+                    c.name != "model"
+                        && (!crate::harness::supports_compaction(&self.harness)
+                            || c.name != "compact")
+                })
                 .cloned(),
         );
         commands.retain(|c| {
@@ -269,12 +282,14 @@ impl Thread {
             && self.context.phase != crate::context::ContextPhase::Compacting
             && self.request.is_none()
             && self.session.is_some()
-            && self.model_provider == "cpa"
+            && crate::harness::supports_compaction(&self.harness)
+            && (self.harness == "codex" && !self.status.busy()
+                || self.harness == "pi" && self.model_provider == "cpa")
     }
 
     pub fn compact(&mut self, instructions: Option<String>) {
-        if self.harness != "pi" {
-            self.error = Some("Native compaction is Pi-only in Shina. Use the ACP agent's own commands if it advertises them.".into());
+        if !crate::harness::supports_compaction(&self.harness) {
+            self.error = Some("This ACP agent has no native compaction API. Use its own commands if it advertises them.".into());
             return;
         }
         if self.archived()
@@ -282,6 +297,7 @@ impl Thread {
             || self.native.operating()
             || self.request.is_some()
             || self.context.phase == crate::context::ContextPhase::Compacting
+            || self.harness == "codex" && self.status.busy()
         {
             return;
         }
@@ -446,7 +462,7 @@ impl Thread {
             self.load_fork_points();
         }
         if let Some(instructions) = self.native.compact.take() {
-            if self.model_provider != "cpa" {
+            if self.harness == "pi" && self.model_provider != "cpa" {
                 self.error = Some("Choose a CPA model before compacting.".into());
                 self.status = Status::Ready;
                 return true;
@@ -825,6 +841,9 @@ impl Thread {
 
     /// Returns true when this record is fully handled here rather than by the chat reducer.
     pub(super) fn apply_native(&mut self, record: &Value) -> bool {
+        if self.apply_codex(record) {
+            return true;
+        }
         match string(record, "type") {
             "tool_execution_start" if record["toolName"] == "ask_user_question" => {
                 if let Some(id) = record["toolCallId"].as_str()
@@ -1062,7 +1081,15 @@ impl Thread {
                     self.native.compact_id = None;
                     if record["success"] == false {
                         self.error = Some(string(record, "error").into());
-                        self.record_compaction(json!({"errorMessage":string(record,"error")}));
+                        if self.harness != "codex"
+                            || self
+                                .native
+                                .compactions
+                                .last()
+                                .is_none_or(|row| row["errorMessage"] != record["error"])
+                        {
+                            self.record_compaction(json!({"errorMessage":string(record,"error")}));
+                        }
                     }
                     self.context.finish_compaction();
                     self.refresh_context_usage();

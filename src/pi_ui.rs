@@ -493,7 +493,8 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
 }
 
 /// KSG Code's context meter exposes its native compact action next to context details.
-/// Ported from KSG Code's compaction activity items: collapsed summary, status and token figures.
+/// Ported from KSG Code's MessagesTimeline.logic.ts `context-compaction` rows:
+/// collapsed summary, status and token figures.
 pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
     let t = s.current();
     if t.native.compactions.is_empty() {
@@ -556,7 +557,15 @@ pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
             let summary = item["errorMessage"]
                 .as_str()
                 .or_else(|| result["summary"].as_str())
-                .unwrap_or("Pi is summarizing the conversation.");
+                .unwrap_or(if t.harness == "codex" {
+                    if item["running"] == true {
+                        "Codex is compacting the conversation."
+                    } else {
+                        "Codex did not report a compaction summary or token counts."
+                    }
+                } else {
+                    "Pi is summarizing the conversation."
+                });
             card = card.child(
                 col()
                     .max_h(240.0)

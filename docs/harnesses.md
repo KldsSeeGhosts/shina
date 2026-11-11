@@ -21,7 +21,11 @@ The first three map KSG's runtime modes. Read only additionally refuses all comm
 
 Command and patch approvals use Shina's existing confirmation dialogs. Agent text, reasoning, plans, commands, patches and MCP/tool items enter Shina's event reducer. `thread/tokenUsage/updated.last` supplies the context meter; cumulative totals are not context usage. Stop calls `turn/interrupt`. Steering uses `turn/steer` with an expected turn id, while follow-ups remain queued. Resume reconstructs the transcript from returned turns and reapplies session overrides.
 
-Codex's non-secret user-input questions use Shina's existing questionnaire. Native compaction, conversation forks and rewinds remain Pi-only. Codex dynamic tool requests receive method-not-found errors, not automatic approvals.
+Codex's non-secret user-input questions use Shina's existing questionnaire. Conversation forks and rewinds remain Pi-only. Codex dynamic tool requests receive method-not-found errors, not automatic approvals.
+
+`/compact` and the context popover's Compact context button call native `thread/compact/start` with the thread id, never a model prompt. Codex's protocol does not accept custom compaction instructions. Shina ignores `/compact` arguments with a visible notice. The request acknowledges startup only; Shina waits for the native turn to finish before releasing waiting prompts. Stop sends `turn/interrupt`, including when startup has not yet supplied the turn id.
+
+Manual and automatic `contextCompaction` items use the same progress, completed, failed and stopped rows as Pi. A failed or interrupted turn closes a running compaction even if Codex omits `item/completed`. The deprecated `thread/compacted` notification also works without duplicating an item-backed row. Resume restores compaction rows from native thread history. Codex's current compaction item contains only an id and type, so Shina does not invent a summary or before/after token counts. Compaction clears current context usage to the dashed unknown state until a fresh `thread/tokenUsage/updated.last` report arrives.
 
 ## Registry
 
@@ -59,7 +63,7 @@ Stop sends `session/cancel`. An unresponsive stop triggers Shina's existing ten-
 
 Shina loads saved sessions with `session/load`, or `session/resume` when advertised instead. Load replay rebuilds the transcript. A resume implementation that does not replay history can continue the agent's context but cannot restore Shina's visible transcript. Agents without either capability cannot reconnect a saved thread, including after idle process reclamation. They show an error instead of starting a replacement session.
 
-Model selection supports advertised legacy `models` and model-category select config options. Reasoning selection, native compaction, conversation forks and rewinds remain Pi-only. Filesystem and terminal client capabilities are explicitly false. Requests for them receive method-not-found responses and a visible thread error. ACP v2, native ACP MCP transport and SSE-only MCP agents are unsupported.
+Model selection supports advertised legacy `models` and model-category select config options. Native compaction, reasoning selection, conversation forks and rewinds are unavailable for ACP. Filesystem and terminal client capabilities are explicitly false. Requests for them receive method-not-found responses and a visible thread error. ACP v2, native ACP MCP transport and SSE-only MCP agents are unsupported.
 
 ## Shina awareness and process ownership
 
@@ -79,4 +83,4 @@ ACP and Codex use the same bounded connection queues, shutdown registry and per-
 
 `cargo test acp::tests` runs a Python ACP fixture from an owned temporary Shina profile. Python must be installed as `python` on Windows or `python3` on Unix. No third-party agents or external inference run in automated tests. Tests cover initialization, authenticated MCP registration and relay, stream reduction, permission responses and policy, cancellation, load/resume, images, queues, model switching, authentication denial and unsupported capabilities. Layout tests cover the harness picker at 620, 960, 1280 and 1920 pixels.
 
-`cargo test codex` runs a temporary Python app-server fixture and harness integration tests. They cover initialization, streaming text and reasoning, command output, plans, approval responses, read-only write refusal, interrupt, resume, current usage, attachment input, model efforts, awareness and harness delegation. The ignored `real_codex_pong_smoke` test sends one paid prompt in an isolated temporary workspace and passes a temporary `LOCALAPPDATA` to Codex. It never uses the real Shina profile.
+`cargo test codex` runs a temporary Python app-server fixture and harness integration tests. They cover initialization, streaming text and reasoning, command output, plans, approval responses, read-only write refusal, interrupt, resume, current usage, attachment input, model efforts, awareness and harness delegation. Compaction tests cover manual success, request rejection, failed turns, automatic and deprecated notifications, prompt races, cancellation, usage invalidation and refresh, and resume history. The ignored `real_codex_pong_smoke` test sends one paid prompt followed by native compaction in an isolated temporary workspace and passes a temporary `LOCALAPPDATA` to Codex. It never uses the real Shina profile.

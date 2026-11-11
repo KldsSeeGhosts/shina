@@ -13,6 +13,12 @@ use std::{
 
 pub use crate::backend::Pi as Session;
 
+/// Native compaction uses the shared `compact` command and compaction_start/end
+/// events. ACP has no standard equivalent. Acknowledgement is not completion.
+pub fn supports_compaction(id: &str) -> bool {
+    matches!(id, "pi" | "codex")
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agent {

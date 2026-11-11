@@ -137,6 +137,11 @@ struct Client {
     running: bool,
     cancelling: bool,
     interrupt_sent: bool,
+    compact_request: Option<Value>,
+    compacting: bool,
+    compaction_error: Option<String>,
+    compactions: Vec<Value>,
+    compacted_turns: HashSet<String>,
     serial: usize,
     pending: HashMap<String, Pending>,
     approvals: HashMap<String, Approval>,
@@ -166,6 +171,11 @@ impl Client {
             running: false,
             cancelling: false,
             interrupt_sent: false,
+            compact_request: None,
+            compacting: false,
+            compaction_error: None,
+            compactions: vec![],
+            compacted_turns: HashSet::new(),
             serial: 0,
             pending: HashMap::new(),
             approvals: HashMap::new(),
@@ -240,6 +250,7 @@ impl Client {
 
     fn state(&self) -> Value {
         json!({"sessionFile":self.session,"isStreaming":self.running,
+            "isCompacting":self.compacting || self.compact_request.is_some(),
             "model":self.model,"thinkingLevel":self.effort})
     }
 
@@ -291,6 +302,22 @@ impl Client {
             if matches!(kind, "initialize" | "start" | "models" | "prompt") {
                 // Never retry an accepted turn, or attempt login after a denial.
                 return Err(error);
+            }
+            if kind == "compact" {
+                self.end_compaction(json!({"errorMessage":error}), true);
+                self.compact_request = None;
+                self.running = false;
+                self.turn = None;
+            }
+            if kind == "steer" {
+                if (self.compacting || self.compact_request.is_some()) && self.queued.len() < 32 {
+                    self.queued.push_back(request["original"].clone());
+                    self.reply(&request["original"], json!({"disposition":"queued"}));
+                    self.queue_update();
+                    return Ok(());
+                }
+                self.reject(&request["original"], error);
+                return Ok(());
             }
             self.reject(&request, error);
             return Ok(());
@@ -387,8 +414,11 @@ impl Client {
                 self.reply(&json!({"type":"get_state","id":"state"}), self.state());
                 self.reply(
                     &json!({"type":"get_messages","id":"history"}),
-                    json!({"messages":self.history}),
+                    json!({"messages":self.history,"compactions":self.compactions}),
                 );
+                if self.compacting {
+                    self.events.push(json!({"type":"compaction_start"}));
+                }
                 self.reply(
                     &json!({"type":"get_commands","id":"commands"}),
                     json!({"commands":[]}),
@@ -411,6 +441,8 @@ impl Client {
                 self.reply(&request, json!({}));
             }
             "abort" => self.reply(&request, json!({})),
+            // thread/compact/start returns {} before the compact turn finishes.
+            "compact" => {}
             "steer" => self.reply(&request["original"], json!({})),
             _ => self.reply(&request, result.clone()),
         }
@@ -484,13 +516,45 @@ impl Client {
             "get_messages" | "get_entries" => {
                 let mut record = record;
                 record["type"] = json!("get_messages");
-                self.reply(&record, json!({"messages":self.history}));
+                self.reply(
+                    &record,
+                    json!({"messages":self.history,"compactions":self.compactions}),
+                );
             }
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":self.levels()})),
             "get_session_stats" => self.reply(&record, json!({"contextUsage":self.usage})),
             "get_commands" => self.reply(&record, json!({"commands":[]})),
             "set_session_name" => self.reply(&record, json!({})),
+            "compact" => {
+                if self.running {
+                    self.reject(
+                        &record,
+                        "Wait for Codex to finish before compacting context.",
+                    );
+                } else {
+                    if record["customInstructions"]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        self.events.push(json!({"type":"extension_ui_request","method":"notify",
+                            "message":"Codex native compaction does not accept custom instructions. The instructions were ignored."}));
+                    }
+                    self.running = true;
+                    self.cancelling = false;
+                    self.interrupt_sent = false;
+                    self.turn = None;
+                    self.compact_request = Some(record.clone());
+                    self.begin_compaction(true);
+                    // Ported from CodexAdapterV2.compactThread. The generated
+                    // ThreadCompactStartParams has only threadId, never input.
+                    self.request(
+                        "thread/compact/start",
+                        json!({"threadId":self.session}),
+                        record,
+                    );
+                }
+            }
             "clear_queue" => {
                 let texts: Vec<_> = self
                     .queued
@@ -524,6 +588,8 @@ impl Client {
             "prompt" if self.running => {
                 // KSG uses turn/steer with expectedTurnId. Follow-ups retain FIFO ordering.
                 if record["streamingBehavior"] == "steer"
+                    && !self.compacting
+                    && self.compact_request.is_none()
                     && let Some(turn) = &self.turn
                 {
                     let input = codex_input(&record)?;
@@ -745,6 +811,9 @@ impl Client {
                 .events
                 .push(json!({"type":"harness_update","field":"plan","value":params})),
             "thread/tokenUsage/updated" => {
+                if self.compacting {
+                    return Ok(());
+                }
                 // KSG uses last, not total. total is cumulative across turns.
                 let usage = &params["tokenUsage"];
                 let window = usage["modelContextWindow"].as_u64().filter(|n| *n > 0);
@@ -752,6 +821,18 @@ impl Client {
                 self.usage = json!({"tokens":tokens,"contextWindow":window});
                 if let Some(window) = window {
                     self.model["contextWindow"] = json!(window);
+                }
+                self.events.push(json!({"type":"context_usage",
+                    "data":{"contextUsage":self.usage}}));
+            }
+            // Deprecated app-server notification. New versions send a
+            // contextCompaction item as well; do not show a second divider.
+            "thread/compacted" => {
+                let turn = params["turnId"].as_str().unwrap_or("");
+                if self.compacting || !self.compacted_turns.contains(turn) {
+                    self.begin_compaction(true);
+                    self.end_compaction(json!({}), true);
+                    self.compacted_turns.insert(turn.into());
                 }
             }
             "turn/completed" => {
@@ -764,16 +845,36 @@ impl Client {
                 {
                     return Err("Codex completed a different active turn.".into());
                 }
-                for item in turn["items"].as_array().into_iter().flatten() {
-                    self.item(item, true, true);
-                }
                 let failed = turn["status"] == "failed";
+                let aborted = self.cancelling || turn["status"] == "interrupted";
+                for item in turn["items"].as_array().into_iter().flatten() {
+                    if item["type"] == "contextCompaction" {
+                        self.replay_compaction(item, turn, true);
+                    } else {
+                        self.item(item, true, true);
+                    }
+                }
+                if self.compacting {
+                    self.end_compaction(self.compaction_outcome(turn), true);
+                }
+                if let Some(request) = self.compact_request.take() {
+                    if failed {
+                        self.reject(
+                            &request,
+                            self.compaction_outcome(turn)["errorMessage"]
+                                .as_str()
+                                .unwrap_or("Codex compaction failed.")
+                                .to_owned(),
+                        );
+                    } else {
+                        self.reply(&request, json!({"aborted":aborted}));
+                    }
+                }
                 self.finish_history_turn(turn);
                 if failed {
                     self.events.push(json!({"type":"message_end","message":{"role":"assistant","stopReason":"error",
                         "errorMessage":self.redact(turn["error"]["message"].as_str().unwrap_or("Codex turn failed."))}}));
                 }
-                let aborted = self.cancelling || turn["status"] == "interrupted";
                 self.running = false;
                 self.turn = None;
                 self.cancelling = false;
@@ -786,6 +887,15 @@ impl Client {
                     self.queue_update();
                     self.prompt(record)?;
                 }
+            }
+            "error" if params["willRetry"] != true && self.compacting => {
+                self.compaction_error = Some(
+                    self.redact(
+                        params["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex compaction failed."),
+                    ),
+                );
             }
             "error" if params["willRetry"] != true => {
                 return Err(self.redact(
@@ -851,6 +961,26 @@ impl Client {
         self.items.insert(id.into(), item.clone());
         let kind = item["type"].as_str().unwrap_or("");
         match kind {
+            "contextCompaction" => {
+                // Some versions send the deprecated notification first. It already
+                // completed this divider; a late item must not erase fresher usage.
+                let legacy_completed = done
+                    && !self.compacting
+                    && self
+                        .turn
+                        .as_ref()
+                        .is_some_and(|turn| self.compacted_turns.contains(turn));
+                if !legacy_completed {
+                    self.begin_compaction(emit);
+                    if done {
+                        let outcome = self
+                            .compaction_error
+                            .as_ref()
+                            .map_or_else(|| json!({}), |error| json!({"errorMessage":error}));
+                        self.end_compaction(outcome, emit);
+                    }
+                }
+            }
             "userMessage" if done => {
                 let content = replay_input(&item["content"]);
                 self.history.push(json!({"role":"user","content":content}));
@@ -941,9 +1071,97 @@ impl Client {
 
     fn replay(&mut self, turn: &Value) {
         for item in turn["items"].as_array().into_iter().flatten() {
-            self.item(item, true, false);
+            if item["type"] == "contextCompaction" {
+                self.replay_compaction(item, turn, false);
+            } else {
+                self.item(item, true, false);
+            }
         }
         self.finish_history_turn(turn);
+    }
+
+    fn replay_compaction(&mut self, item: &Value, turn: &Value, emit: bool) {
+        let Some(id) = item["id"].as_str() else {
+            return;
+        };
+        if self.completed.contains(id) {
+            return;
+        }
+        if emit
+            && !self.compacting
+            && turn["id"]
+                .as_str()
+                .is_some_and(|turn| self.compacted_turns.contains(turn))
+        {
+            self.completed.insert(id.into());
+            return;
+        }
+        self.begin_compaction(emit);
+        if turn["status"] == "inProgress" {
+            self.items.insert(id.into(), item.clone());
+        } else {
+            self.completed.insert(id.into());
+            self.end_compaction(self.compaction_outcome(turn), emit);
+            if let Some(turn) = turn["id"].as_str() {
+                self.compacted_turns.insert(turn.into());
+            }
+        }
+    }
+
+    fn begin_compaction(&mut self, emit: bool) {
+        if self.compacting {
+            return;
+        }
+        self.compacting = true;
+        self.compaction_error = None;
+        self.invalidate_usage();
+        if self.compactions.len() >= 32 {
+            self.compactions.remove(0);
+        }
+        self.compactions.push(json!({"running":true}));
+        if emit {
+            self.events.push(json!({"type":"compaction_start"}));
+        }
+    }
+
+    fn end_compaction(&mut self, mut outcome: Value, emit: bool) {
+        self.compacting = false;
+        self.invalidate_usage();
+        outcome["type"] = json!("compaction_end");
+        if self
+            .compactions
+            .last()
+            .is_some_and(|row| row["running"] == true)
+        {
+            *self.compactions.last_mut().unwrap() = outcome.clone();
+        } else {
+            return;
+        }
+        if let Some(turn) = &self.turn {
+            self.compacted_turns.insert(turn.clone());
+        }
+        if emit {
+            self.events.push(outcome);
+        }
+    }
+
+    fn invalidate_usage(&mut self) {
+        self.usage = json!({"tokens":null,"percent":null,
+            "contextWindow":self.usage.get("contextWindow").cloned().unwrap_or(Value::Null)});
+    }
+
+    fn compaction_outcome(&self, turn: &Value) -> Value {
+        if let Some(error) = &self.compaction_error {
+            return json!({"errorMessage":error});
+        }
+        match turn["status"].as_str() {
+            Some("failed") => json!({"errorMessage":self.redact(
+                turn["error"]["message"].as_str().unwrap_or("Codex compaction failed.")
+            )}),
+            Some("interrupted") => json!({"aborted":true}),
+            _ if self.cancelling => json!({"aborted":true}),
+            _ => json!({}),
+        }
     }
 
     fn begin_message(&mut self, id: &str) {
@@ -957,7 +1175,14 @@ impl Client {
     fn finish_history_turn(&mut self, turn: &Value) {
         // Only a successfully settled turn proves a final reply. Commentary before an
         // interrupt or crash must never make durable task recovery report success.
-        if let Some(message) = self.history.last_mut().filter(|m| m["role"] == "assistant") {
+        let has_message =
+            self.active_message.is_some()
+                || turn["items"].as_array().into_iter().flatten().any(|item| {
+                    matches!(item["type"].as_str(), Some("agentMessage" | "reasoning"))
+                });
+        if has_message
+            && let Some(message) = self.history.last_mut().filter(|m| m["role"] == "assistant")
+        {
             message["stopReason"] = json!(match turn["status"].as_str() {
                 Some("completed") => "stop",
                 Some("failed") => "error",

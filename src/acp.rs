@@ -464,7 +464,7 @@ impl Client {
                     self.request("session/set_model", json!({"sessionId":self.session,"modelId":record["modelId"]}), record);
                 }
             }
-            _ => self.reject(&record, format!("ACP does not support the {kind} operation in Shina. Native compaction, reasoning selection and conversation forks remain Pi-only.")),
+            _ => self.reject(&record, format!("ACP does not support the {kind} operation in Shina. Native compaction, reasoning selection and conversation forks are unavailable for ACP.")),
         }
         Ok(())
     }

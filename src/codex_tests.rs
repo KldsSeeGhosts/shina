@@ -161,6 +161,14 @@ fn interrupt_and_resume_rebuild_history_and_refresh_awareness() {
     );
     pump(&mut thread, |t| t.native.commands_loaded);
     assert!(thread.messages.iter().any(|m| m.text == "Prior reply"));
+    assert_eq!(thread.native.compactions.len(), 1);
+    assert_ne!(thread.native.compactions[0]["running"], true);
+    assert!(
+        !thread
+            .tools
+            .iter()
+            .any(|tool| tool.name == "contextCompaction")
+    );
     let log = records(&log);
     let resume = log.iter().find(|r| r["method"] == "thread/resume").unwrap();
     assert!(
@@ -398,7 +406,296 @@ fn image_turns_and_local_image_replay_keep_typed_attachments() {
 }
 
 #[test]
-#[ignore = "One paid Codex prompt in a temporary workspace, with the installed provider login"]
+fn manual_compaction_leaves_usage_unknown_until_a_fresh_report() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.apply(json!({"type":"context_usage","data":{"contextUsage":{
+        "tokens":90000,"contextWindow":200000}}}));
+    assert_eq!(thread.context.usage.percent, Some(45.0));
+    assert!(thread.can_compact());
+    thread.compact(Some("Keep the plan".into()));
+    pump(&mut thread, |t| {
+        t.native
+            .compactions
+            .last()
+            .is_some_and(|r| r["running"] == true)
+    });
+    assert_eq!(
+        thread.context.phase,
+        crate::context::ContextPhase::Compacting
+    );
+    assert_eq!(thread.context.usage.percent, None);
+    assert!(!thread.can_compact());
+    pump(&mut thread, |t| !t.status.busy() && !t.native.operating());
+    assert_eq!(thread.native.compactions.len(), 1);
+    assert_eq!(
+        thread.context.phase,
+        crate::context::ContextPhase::AwaitingUsage
+    );
+    assert_eq!(thread.context.usage.tokens, None);
+    assert!(
+        thread
+            .diagnostics
+            .iter()
+            .any(|note| note.contains("instructions were ignored"))
+    );
+    let log = records(&log);
+    let request = log
+        .iter()
+        .find(|r| r["method"] == "thread/compact/start")
+        .unwrap();
+    assert_eq!(
+        request["params"],
+        json!({"threadId":"codex-fixture-thread"})
+    );
+    assert!(
+        !log.iter()
+            .any(|r| matches!(r["method"].as_str(), Some("turn/start" | "turn/steer")))
+    );
+    thread.draft.replace_text("Fresh usage");
+    thread.send();
+    pump(&mut thread, |t| {
+        t.status == Status::Completed && t.context.usage.tokens == Some(1234)
+    });
+    assert_eq!(thread.context.phase, crate::context::ContextPhase::Idle);
+    assert_eq!(thread.context.usage.context_window, Some(200000));
+}
+
+#[test]
+fn compact_acknowledgement_does_not_release_a_racing_prompt() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.compact(None);
+    pump(&mut thread, |t| !t.native.compactions.is_empty());
+    // Bypass Shina's local waiting queue to exercise the transport's race guard.
+    thread
+        .pi
+        .as_ref()
+        .unwrap()
+        .send(json!({
+            "type":"prompt","id":"racing-prompt","message":"Wait for compaction",
+            "streamingBehavior":"steer"
+        }))
+        .unwrap();
+    pump(&mut thread, |t| !t.native.follow_ups.is_empty());
+    assert_eq!(
+        thread.context.phase,
+        crate::context::ContextPhase::Compacting
+    );
+    assert!(!records(&log).iter().any(|r| r["method"] == "turn/steer"));
+    pump(&mut thread, |t| {
+        t.status == Status::Completed && t.context.usage.tokens == Some(1234)
+    });
+    let log = records(&log);
+    assert_eq!(
+        log.iter().filter(|r| r["method"] == "turn/start").count(),
+        1
+    );
+    assert!(!log.iter().any(|r| r["method"] == "turn/steer"));
+    assert_eq!(thread.native.compactions.len(), 1);
+}
+
+#[test]
+fn ui_prompts_wait_locally_for_manual_compaction() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.compact(None);
+    thread.draft.replace_text("Queued in Shina");
+    thread.send_during_run();
+    assert!(thread.draft.text.is_empty());
+    pump(&mut thread, |t| {
+        t.status == Status::Completed && t.messages.iter().any(|m| m.text == "Hello Codex")
+    });
+    assert!(records(&log).iter().any(|r| r["method"] == "turn/start"));
+    assert_eq!(thread.native.compactions.len(), 1);
+}
+
+#[test]
+fn native_compaction_failures_replace_progress_and_allow_retry() {
+    for flag in ["--compact-failure", "--compact-rejection"] {
+        let (mut thread, _) = fixture(SessionSource::New, "read-only", &[flag]);
+        pump(&mut thread, |t| t.native.commands_loaded);
+        thread.compact(None);
+        pump(&mut thread, |t| {
+            !t.status.busy() && !t.native.operating() && t.error.is_some()
+        });
+        assert_eq!(thread.native.compactions.len(), 1, "{flag}");
+        assert!(
+            thread.native.compactions[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .contains("Fixture compaction")
+        );
+        assert_eq!(thread.context.usage.percent, None);
+        assert!(thread.can_compact());
+    }
+}
+
+#[test]
+fn automatic_and_legacy_compaction_notifications_use_the_same_rows() {
+    for flags in [
+        vec!["--automatic-compaction"],
+        vec!["--automatic-compaction", "--legacy-compaction"],
+        vec!["--automatic-compaction", "--compact-failure"],
+    ] {
+        let (mut thread, log) = fixture(SessionSource::New, "read-only", &flags);
+        pump(&mut thread, |t| t.native.commands_loaded);
+        thread.draft.replace_text("Automatic compaction");
+        thread.send();
+        if !flags.contains(&"--legacy-compaction") {
+            pump(&mut thread, |t| {
+                t.context.phase == crate::context::ContextPhase::Compacting
+            });
+            assert_eq!(thread.context.usage.percent, None);
+        }
+        pump(&mut thread, |t| !t.status.busy());
+        assert_eq!(thread.native.compactions.len(), 1, "{flags:?}");
+        assert_ne!(thread.native.compactions[0]["running"], true);
+        assert_eq!(
+            thread.native.compactions[0]["errorMessage"].is_string(),
+            flags.contains(&"--compact-failure")
+        );
+        assert!(
+            !thread
+                .tools
+                .iter()
+                .any(|tool| tool.name == "contextCompaction")
+        );
+        assert!(
+            !records(&log)
+                .iter()
+                .any(|r| r["method"] == "thread/compact/start")
+        );
+    }
+}
+
+#[test]
+fn stop_interrupts_native_compaction_and_recovers_queued_input() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &["--hold-compaction"]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.compact(None);
+    pump(&mut thread, |t| !t.native.compactions.is_empty());
+    thread.native.follow_up = true;
+    thread.draft.replace_text("Keep this queued prompt");
+    thread.send_during_run();
+    thread.stop();
+    pump(&mut thread, |t| !t.status.busy() && !t.native.operating());
+    assert!(thread.draft.text.contains("Keep this queued prompt"));
+    assert_eq!(thread.native.compactions.len(), 1);
+    assert_eq!(thread.native.compactions[0]["aborted"], true);
+    assert!(
+        thread.pi.is_some(),
+        "Codex supports turn/interrupt without retiring the process"
+    );
+    assert!(
+        records(&log)
+            .iter()
+            .any(|r| r["method"] == "turn/interrupt")
+    );
+    assert_eq!(thread.context.usage.percent, None);
+}
+
+#[test]
+fn cancelling_an_in_flight_compaction_start_interrupts_once() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.session = Some("fixture".into());
+    client.ready = true;
+    client
+        .command(json!({"type":"compact","id":"compact"}))
+        .unwrap();
+    let request_id = client.wire[0]["id"].clone();
+    client.command(json!({"type":"abort","id":"stop"})).unwrap();
+    client
+        .incoming(json!({"id":request_id,"result":{}}))
+        .unwrap();
+    assert!(client.compact_request.is_some());
+    for _ in 0..2 {
+        client
+            .incoming(json!({"method":"turn/started","params":{
+            "threadId":"fixture","turn":{"id":"compact-turn"}}}))
+            .unwrap();
+    }
+    assert_eq!(
+        client
+            .wire
+            .iter()
+            .filter(|r| r["method"] == "turn/interrupt")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn compaction_only_turns_do_not_change_prior_reply_outcomes() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.replay(&json!({"id":"answer-turn","status":"completed","items":[
+        {"type":"agentMessage","id":"answer","text":"Prior reply"}
+    ]}));
+    client.replay(&json!({"id":"compact-turn","status":"failed",
+        "error":{"message":"Compaction failed"},"items":[
+        {"type":"contextCompaction","id":"compact"}
+    ]}));
+    assert_eq!(client.history.last().unwrap()["stopReason"], "stop");
+    assert_eq!(client.compactions[0]["errorMessage"], "Compaction failed");
+}
+
+#[test]
+fn resumed_in_progress_compaction_accepts_completion_and_fresh_usage() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.replay(&json!({"id":"turn","status":"inProgress","items":[
+        {"type":"contextCompaction","id":"compact"}
+    ]}));
+    assert!(client.compacting);
+    client.item(
+        &json!({"type":"contextCompaction","id":"compact"}),
+        true,
+        true,
+    );
+    assert!(!client.compacting);
+    client
+        .notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{
+                "last":{"totalTokens":1000},"modelContextWindow":200000
+            }}),
+        )
+        .unwrap();
+    assert_eq!(client.usage["tokens"], 1000);
+    assert_eq!(client.compactions.len(), 1);
+}
+
+#[test]
+fn legacy_notification_before_item_completion_does_not_duplicate_or_erase_fresh_usage() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.turn = Some("turn".into());
+    let item = json!({"type":"contextCompaction","id":"compact"});
+    client.item(&item, false, true);
+    client
+        .notification("thread/compacted", &json!({"turnId":"turn"}))
+        .unwrap();
+    client
+        .notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{
+                "last":{"totalTokens":1000},"modelContextWindow":200000
+            }}),
+        )
+        .unwrap();
+    client.item(&item, true, true);
+    assert_eq!(client.compactions.len(), 1);
+    assert_eq!(
+        client
+            .events
+            .iter()
+            .filter(|event| event["type"] == "compaction_end")
+            .count(),
+        1
+    );
+    assert_eq!(client.usage["tokens"], 1000);
+}
+
+#[test]
+#[ignore = "One paid Codex prompt and native compaction in a temporary workspace, with the installed provider login"]
 fn real_codex_pong_smoke() {
     let directory = crate::store::directory().unwrap();
     let local = directory.join("local-app-data");
@@ -414,6 +711,9 @@ fn real_codex_pong_smoke() {
     let session = start_process(command, start, Arc::new(|| {})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut sent = false;
+    let mut compact_sent = false;
+    let mut compact_finished = false;
+    let mut compact_acknowledged = false;
     let mut answer = String::new();
     loop {
         assert!(Instant::now() < deadline, "Codex smoke timed out");
@@ -435,10 +735,24 @@ fn real_codex_pong_smoke() {
                             .unwrap_or(""),
                     );
                 }
-                if record["type"] == "agent_settled" {
+                if record["type"] == "compaction_end" {
+                    assert!(record["errorMessage"].is_null(), "{record}");
+                    compact_finished = true;
+                }
+                if record["command"] == "compact" {
+                    assert_eq!(record["success"], true, "{record}");
+                    compact_acknowledged = true;
+                }
+                if record["type"] == "agent_settled" && !compact_sent {
                     assert_eq!(answer.trim(), "PONG");
+                    session
+                        .send(json!({"type":"compact","id":"smoke-compact"}))
+                        .unwrap();
+                    compact_sent = true;
+                } else if record["type"] == "agent_settled" && compact_sent {
+                    assert!(compact_finished && compact_acknowledged);
                     println!(
-                        "Codex real smoke returned PONG in {:.1}s",
+                        "Codex real smoke returned PONG and completed native compaction in {:.1}s",
                         120.0
                             - deadline
                                 .saturating_duration_since(Instant::now())

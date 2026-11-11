@@ -1,6 +1,29 @@
 //! Harness settings and delegation metadata, kept outside the shared model reducer.
 use super::*;
 
+impl Thread {
+    /// Native app-server usage is push-based, including refreshes after compaction.
+    pub(super) fn apply_codex(&mut self, record: &Value) -> bool {
+        if self.harness != "codex" || record["type"] != "context_usage" {
+            return false;
+        }
+        if self.context.phase != crate::context::ContextPhase::Compacting {
+            self.context.cancel_request();
+            self.context.absorb(&record["data"]);
+            self.native.stats = record["data"].clone();
+        }
+        true
+    }
+
+    pub(crate) fn context_harness_text(&self, text: &str) -> String {
+        if self.harness == "codex" {
+            text.replace("Pi", "Codex")
+        } else {
+            text.into()
+        }
+    }
+}
+
 impl State {
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
         if matches!(id, "pi" | "codex") {
@@ -81,6 +104,38 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_slash_compact_is_native_and_acp_keeps_its_own_commands() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (session, commands, _) = Pi::test_connection();
+        let thread = state.current_mut();
+        thread.harness = "codex".into();
+        thread.model_provider = "codex".into();
+        thread.pi = Some(session);
+        thread.session = Some("codex-thread".into());
+        thread.draft.focused = true;
+        thread.draft.replace_text("/comp");
+        assert!(
+            thread
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == "compact" && c.source == "Codex")
+        );
+        thread.draft.replace_text("/compact Keep the plan");
+        state.send();
+        let sent: Vec<_> = commands.try_iter().collect();
+        assert!(
+            sent.iter()
+                .any(|r| r["type"] == "compact" && r["customInstructions"] == "Keep the plan")
+        );
+        assert!(!sent.iter().any(|r| r["type"] == "prompt"));
+        let thread = state.current_mut();
+        thread.harness = "fixture-acp".into();
+        assert!(!thread.can_compact());
+        thread.compact(None);
+        assert!(thread.error.as_deref().unwrap().contains("ACP"));
+    }
 
     #[test]
     fn codex_delegation_targets_inheritance_and_capabilities() {

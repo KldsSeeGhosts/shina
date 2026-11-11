@@ -883,9 +883,10 @@ impl Thread {
         self.operation_deadline = None;
         if self.initializing
             || self.queued_prompt.is_some()
-            || self.native.operating()
+            || self.native.operating() && self.harness != "codex"
             || self.has_pending_sends()
             || self.context.phase == crate::context::ContextPhase::Compacting
+                && self.harness != "codex"
         {
             self.disconnect();
             self.complete_task("cancelled");
@@ -4338,7 +4339,7 @@ impl State {
                 self.choose_slash("model".into());
                 return;
             }
-            Some("/compact") if self.current().harness == "pi" => {
+            Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
                         Some("Compaction does not accept attachments. Your draft was kept.".into());

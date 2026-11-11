@@ -319,7 +319,7 @@ fn capabilities_images_model_selection_queue_and_unknown_requests() {
         client.events.last().unwrap()["error"]
             .as_str()
             .unwrap()
-            .contains("Pi-only")
+            .contains("unavailable for ACP")
     );
 
     client.configure_models(&json!({"configOptions":[{"category":"model","id":"model","type":"select","currentValue":"a","options":[{"value":"a","name":"A"}]}]}));
