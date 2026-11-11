@@ -507,8 +507,37 @@ fn budget_meter(memories: &[MemoryView], p: Palette) -> El {
 
 /// Reserved for the memory backend's one-line status (another change adds
 /// `State::memory_backend_status`). Nothing is shown until it exists.
-fn memory_backend_line(_: &State) -> Option<String> {
-    None
+/// One quiet line about learned memory (Honcho). Nothing shows while it is disabled.
+fn memory_backend_line(s: &State) -> Option<String> {
+    use crate::model::MemoryBackendStatus as M;
+    let queued = |n: usize| {
+        if n == 0 {
+            String::new()
+        } else {
+            format!(" · {n} waiting to sync")
+        }
+    };
+    match s.memory_backend_status() {
+        M::Disabled => None,
+        M::Connected {
+            queued_count,
+            deriver_pending,
+        } => Some(format!(
+            "Learned memory: Honcho connected{}{}",
+            match deriver_pending {
+                Some(n) if n > 0 => format!(" · learning from {n} new messages"),
+                _ => String::new(),
+            },
+            queued(queued_count)
+        )),
+        M::Offline {
+            last_error,
+            queued_count,
+        } => Some(format!(
+            "Learned memory offline{}. {last_error}",
+            queued(queued_count)
+        )),
+    }
 }
 
 fn memory_input(s: &State, p: Palette, edit: &rune::TextEdit, key: String, title: &str) -> El {
