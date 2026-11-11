@@ -49,15 +49,25 @@ impl Service {
     pub fn descriptor(&self) -> PathBuf {
         self.directory.join("service.json")
     }
+    /// Where the server's output goes. macOS keeps it in ~/Library/Logs: launchd opens the
+    /// file before Shina runs, and its sandbox refuses paths on other volumes, which a
+    /// symlinked ~/.local can point at.
+    pub fn log_path(&self) -> PathBuf {
+        match self.platform {
+            Platform::Mac => self
+                .home
+                .join("Library")
+                .join("Logs")
+                .join("Shina")
+                .join("service.log"),
+            _ => self.directory.join("service.log"),
+        }
+    }
     /// No provider secret or service.env content is included in any generated unit.
     pub fn render(&self) -> String {
         let exe = self.executable.to_string_lossy();
         let descriptor = self.descriptor().to_string_lossy().into_owned();
-        let log = self
-            .directory
-            .join("service.log")
-            .to_string_lossy()
-            .into_owned();
+        let log = self.log_path().to_string_lossy().into_owned();
         let windows_arguments = format!(
             "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"$p = Start-Process -FilePath '{}' -ArgumentList '--service-run', '\\\"{}\\\"' -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode\"",
             exe.replace('\'', "''"),
@@ -311,6 +321,10 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             return Err("--enable-linger is Linux-only.".into());
         }
         fs::create_dir_all(&service.directory).map_err(|e| e.to_string())?;
+        // launchd opens the log itself and does not create missing folders.
+        if let Some(parent) = service.log_path().parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         crate::server_auth::protect(&service.directory)?;
         fs::create_dir_all(service.unit.parent().ok_or("No service directory.")?)
             .map_err(|e| e.to_string())?;
@@ -478,10 +492,14 @@ pub fn launch(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
+    let log_path = service.log_path();
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(service.directory.join("service.log"))
+        .open(&log_path)
         .map_err(|e| e.to_string())?;
     command
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
@@ -500,7 +518,10 @@ pub fn launch(path: &Path) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("Server exited with {status}. See service.log."))
+        Err(format!(
+            "Server exited with {status}. See {}.",
+            log_path.display()
+        ))
     }
 }
 
@@ -539,7 +560,8 @@ mod tests {
             let rendered = service
                 .render()
                 .replace("/data/Shina\\\\", "/data/Shina/")
-                .replace("/data/Shina\\", "/data/Shina/");
+                .replace("/data/Shina\\", "/data/Shina/")
+                .replace(r"\Library\Logs\Shina\", "/Library/Logs/Shina/");
             assert_eq!(rendered.replace("\r\n", "\n"), golden.replace("\r\n", "\n"));
             assert!(!service.render().contains("CPA_API_KEY"));
             assert!(!service.render().contains("service.env"));

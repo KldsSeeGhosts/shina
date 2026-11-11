@@ -9,6 +9,6 @@
 <key>ThrottleInterval</key><integer>5</integer>
 <key>ExitTimeOut</key><integer>90</integer>
 <key>ProcessType</key><string>Interactive</string>
-<key>StandardOutPath</key><string>/data/Shina/service.log</string>
-<key>StandardErrorPath</key><string>/data/Shina/service.log</string>
+<key>StandardOutPath</key><string>/home/test/Library/Logs/Shina/service.log</string>
+<key>StandardErrorPath</key><string>/home/test/Library/Logs/Shina/service.log</string>
 </dict></plist>
