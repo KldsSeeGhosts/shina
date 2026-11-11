@@ -1,0 +1,503 @@
+use super::*;
+
+fn thread(status: Status) -> (Thread, mpsc::Receiver<Value>) {
+    let mut thread = Thread::new(1);
+    let (pi, commands, _) = Pi::test_connection();
+    thread.pi = Some(pi);
+    thread.status = status;
+    thread.model_provider = "cpa".into();
+    thread.model_id = "fixture".into();
+    thread.session = Some("source.jsonl".into());
+    thread.context_window = Some(200_000);
+    thread.native.session_name = Some(thread.title.clone());
+    (thread, commands)
+}
+fn image_fixture() -> Attachment {
+    use image::ImageEncoder;
+    let mut bytes = vec![];
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(&[0, 255, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    attachments::attach_bytes("fixture.png", bytes).unwrap()
+}
+
+fn answer(thread: &mut Thread, request: &Value, data: Value) {
+    thread.apply(json!({"type":"response","id":request["id"],"command":request["type"],"success":true,"data":data}));
+}
+fn command(commands: &mpsc::Receiver<Value>, kind: &str) -> Value {
+    for value in commands.try_iter() {
+        if value["type"] == kind {
+            return value;
+        }
+    }
+    panic!("missing {kind}");
+}
+
+#[test]
+fn rewind_recovers_images_by_entry_id_instead_of_repeated_prompt_text() {
+    let (mut t, commands) = thread(Status::Ready);
+    let image = image_fixture();
+    t.native.fork_points = vec![
+        json!({"entryId":"first","text":"Same prompt","content":"Same prompt"}),
+        json!({"entryId":"second","text":"Same prompt","content":[{"type":"text","text":"Same prompt"},{"type":"image","shinaAttachment":image.to_value()}]}),
+    ];
+    t.rewind("second".into());
+    let fork = command(&commands, "fork");
+    answer(
+        &mut t,
+        &fork,
+        json!({"text":"Same prompt","cancelled":false}),
+    );
+    assert_eq!(t.draft.text, "Same prompt");
+    assert_eq!(t.draft_images[0].id, image.id);
+}
+
+#[test]
+fn native_subagent_results_keep_individual_status_and_bounded_output() {
+    let (mut t, _) = thread(Status::Running);
+    t.apply(json!({"type":"tool_execution_start","toolCallId":"agents","toolName":"subagent","args":{}}));
+    t.apply(json!({"type":"tool_execution_update","toolCallId":"agents","partialResult":{"content":[],"details":{"results":[
+        {"agent":"Research","task":"Read source","model":"fixture","messages":[{"role":"assistant","content":"Progress"}]},
+        {"agent":"Review","task":"Review code","finished":true,"exitCode":1,"errorMessage":"Failed"}
+    ]}}}));
+    assert_eq!(t.tools[0].subagents[0]["status"], "Working");
+    assert_eq!(t.tools[0].subagents[0]["output"], "Progress");
+    assert_eq!(t.tools[0].subagents[1]["status"], "Failed");
+}
+
+#[test]
+fn user_events_do_not_duplicate_initial_prompts_or_internal_deliveries() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.draft.replace_text("/template");
+    t.send();
+    command(&commands, "prompt");
+    t.apply(json!({"type":"message_start","message":{"role":"user","content":"Expanded template content"}}));
+    assert_eq!(t.messages.len(), 1);
+    assert_eq!(t.messages[0].text, "/template");
+    t.enqueue_injection("Result".into());
+    t.flush_injection();
+    let injection = command(&commands, "prompt");
+    t.apply(
+        json!({"type":"message_start","message":{"role":"user","content":injection["message"]}}),
+    );
+    assert_eq!(t.messages.iter().filter(|m| m.role == "Shina").count(), 1);
+}
+
+#[test]
+fn expanded_steers_are_owned_even_when_user_events_precede_the_ack() {
+    let (mut t, commands) = thread(Status::Running);
+    t.draft.replace_text("/skill:review");
+    t.send_during_run();
+    let steer = command(&commands, "prompt");
+    t.apply(json!({"type":"message_start","message":{"role":"user","content":"Expanded skill"}}));
+    answer(&mut t, &steer, json!({"disposition":"queued"}));
+    assert!(t.native.queued_inputs.is_empty());
+    assert_eq!(t.messages[0].text, "/skill:review");
+    t.disconnect();
+    assert!(t.draft.text.is_empty());
+}
+
+#[test]
+fn fork_metadata_preserves_the_source_and_the_permission_policy() {
+    let mut s = State::new(".".into(), false);
+    let source = s.current().id;
+    s.current_mut().session = Some("original.jsonl".into());
+    s.current_mut().native.access = AccessMode::Supervised;
+    // A missing workspace fails before process startup. This test never starts an installed Pi.
+    s.projects.entries[0].path = s.data_dir.join("missing-fork-workspace");
+    s.fork_conversation(None);
+    assert_ne!(s.current().id, source);
+    assert_eq!(s.threads[0].session.as_deref(), Some("original.jsonl"));
+    assert!(s.current().session.is_none());
+    assert_eq!(
+        s.current().native.fork_source.as_deref(),
+        Some("original.jsonl")
+    );
+    assert_eq!(s.current().native.access, AccessMode::Supervised);
+    let saved = s.snapshot();
+    let mut restored = State::new(PathBuf::new(), false);
+    restored.restore_global(&saved).unwrap();
+    assert_eq!(restored.current().native.access, AccessMode::Supervised);
+    assert_eq!(
+        restored.current().native.fork_source.as_deref(),
+        Some("original.jsonl")
+    );
+}
+
+#[test]
+fn a_stale_state_response_cannot_rebind_a_rewound_thread_to_its_source() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.command("get_state", json!({}));
+    let stale = command(&commands, "get_state");
+    t.native.fork_points = vec![json!({"entryId":"entry"})];
+    t.rewind("entry".into());
+    let fork = command(&commands, "fork");
+    answer(&mut t, &fork, json!({"cancelled":false}));
+    let state = command(&commands, "get_state");
+    answer(
+        &mut t,
+        &state,
+        json!({"sessionFile":"rewound.jsonl","isStreaming":false}),
+    );
+    answer(&mut t, &stale, json!({"sessionFile":"source.jsonl"}));
+    assert_eq!(t.session.as_deref(), Some("rewound.jsonl"));
+    let history = command(&commands, "get_entries");
+    let mut record = json!({"type":"response","id":history["id"],"command":"get_entries","success":true,"data":{"entries":[],"leafId":null}});
+    session_history(&mut record);
+    t.apply(record);
+    answer(&mut t, &stale, json!({"sessionFile":"source.jsonl"}));
+    assert_eq!(t.session.as_deref(), Some("rewound.jsonl"));
+}
+
+#[test]
+fn native_compaction_sends_the_rpc_and_settles_without_an_agent_turn() {
+    let (mut t, commands) = thread(Status::Completed);
+    t.compact(Some("Keep implementation decisions".into()));
+    let compact = command(&commands, "compact");
+    assert_eq!(
+        compact["customInstructions"],
+        "Keep implementation decisions"
+    );
+    assert!(t.status.busy());
+    t.apply(json!({"type":"compaction_start","reason":"manual"}));
+    t.apply(json!({"type":"compaction_end","reason":"manual","result":{"summary":"Kept decisions","tokensBefore":100000,"estimatedTokensAfter":12000}}));
+    assert_eq!(t.native.compactions.len(), 1);
+    answer(&mut t, &compact, json!({"summary":"Kept decisions"}));
+    let probe = command(&commands, "get_state");
+    answer(
+        &mut t,
+        &probe,
+        json!({"isStreaming":false,"isCompacting":false,"sessionFile":"source.jsonl"}),
+    );
+    assert_eq!(t.status, Status::Ready);
+    assert!(!t.native.operating());
+    assert!(t.context.usage.percent.is_none());
+    assert_eq!(
+        t.native.compactions[0]["result"]["estimatedTokensAfter"],
+        12000
+    );
+}
+
+#[test]
+fn stop_during_native_compaction_retires_the_process_and_keeps_the_draft() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.draft.replace_text("Unsent text");
+    t.compact(None);
+    command(&commands, "compact");
+    t.apply(json!({"type":"compaction_start","reason":"manual"}));
+    t.stop();
+    assert!(t.pi.is_none());
+    assert_eq!(t.draft.text, "Unsent text");
+    assert_eq!(t.status, Status::Ready);
+    assert_eq!(t.native.compactions.last().unwrap()["aborted"], true);
+}
+
+#[test]
+fn compaction_failure_and_extension_cancellation_leave_the_thread_usable() {
+    let (mut t, commands) = thread(Status::Completed);
+    t.compact(None);
+    let compact = command(&commands, "compact");
+    t.apply(json!({"type":"response","id":compact["id"],"command":"compact","success":false,"error":"Cancelled by extension"}));
+    let probe = command(&commands, "get_state");
+    answer(
+        &mut t,
+        &probe,
+        json!({"isStreaming":false,"isCompacting":false,"sessionFile":"source.jsonl"}),
+    );
+    assert!(!t.status.busy());
+    assert!(!t.native.operating());
+    assert_eq!(t.error.as_deref(), Some("Cancelled by extension"));
+    t.draft.replace_text("Still usable");
+    t.send();
+    assert_eq!(command(&commands, "prompt")["message"], "Still usable");
+}
+
+#[test]
+fn a_steer_does_not_reset_the_current_assistant_or_fail_the_run_when_rejected() {
+    let (mut t, commands) = thread(Status::Running);
+    t.assistant().text = "Already writing".into();
+    let assistant = t.assistant;
+    t.draft.replace_text("Focus on the tests");
+    t.send_during_run();
+    let steer = command(&commands, "prompt");
+    assert_eq!(steer["streamingBehavior"], "steer");
+    assert_eq!(t.assistant, assistant);
+    assert!(t.draft.text.is_empty());
+    t.apply(json!({"type":"response","id":steer["id"],"command":"prompt","success":false,"error":"Rejected steer"}));
+    assert_eq!(t.status, Status::Running);
+    assert_eq!(t.draft.text, "Focus on the tests");
+    assert_eq!(t.messages[0].text, "Already writing");
+}
+
+#[test]
+fn a_compaction_race_defers_a_steer_and_submits_it_once_after_compaction() {
+    let (mut t, commands) = thread(Status::Running);
+    t.draft.replace_text("After compaction");
+    t.send_during_run();
+    let first = command(&commands, "prompt");
+    t.apply(json!({"type":"response","id":first["id"],"command":"prompt","success":false,"error":"Cannot submit a prompt while compaction is in progress."}));
+    assert!(commands.try_recv().is_err());
+    t.apply(json!({"type":"compaction_start"}));
+    t.apply(json!({"type":"compaction_end","result":{"summary":"Summary"}}));
+    let retry = command(&commands, "prompt");
+    assert_eq!(retry["message"], "After compaction");
+    assert_ne!(retry["id"], first["id"]);
+    answer(&mut t, &retry, json!({"disposition":"queued"}));
+    assert!(t.native.sends.is_empty());
+    assert_eq!(t.native.queued_inputs.len(), 1);
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn follow_up_stop_and_clear_queue_keep_original_text_and_images() {
+    let (mut t, commands) = thread(Status::Running);
+    let image = crate::attachments::attach_bytes("queued.png", {
+        use image::ImageEncoder;
+        let mut bytes = vec![];
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    })
+    .unwrap();
+    t.supports_images = Some(true);
+    t.native.follow_up = true;
+    t.draft.replace_text("Do this later");
+    t.draft_images.push(image.clone());
+    t.send_during_run();
+    assert!(
+        commands.try_recv().is_err(),
+        "application follow-ups are not sent until settlement"
+    );
+    assert_eq!(t.native.queue[0].prompt.images[0].id, image.id);
+    t.stop();
+    let clear = command(&commands, "clear_queue");
+    answer(&mut t, &clear, json!({"steering":[],"followUp":[]}));
+    assert_eq!(t.draft.text, "Do this later");
+    assert_eq!(t.draft_images[0].id, image.id);
+    assert!(t.native.queued_inputs.is_empty());
+}
+
+#[test]
+fn queued_messages_can_be_edited_cancelled_promoted_and_run_after_settlement() {
+    let (mut t, commands) = thread(Status::Running);
+    t.native.follow_up = true;
+    t.draft.replace_text("Queued A");
+    t.send_during_run();
+    let a = t.native.queue[0].id;
+    t.draft.replace_text("Queued B");
+    t.send_during_run();
+    let b = t.native.queue[1].id;
+    t.cancel_queued(a);
+    assert_eq!(t.native.queue.len(), 1);
+    t.edit_queued(b);
+    assert_eq!(t.draft.text, "Queued B");
+    assert!(t.native.queue.is_empty());
+    t.send_during_run();
+    let b = t.native.queue[0].id;
+    t.steer_queued(b);
+    let steer = command(&commands, "prompt");
+    assert_eq!(steer["streamingBehavior"], "steer");
+    answer(&mut t, &steer, json!({"disposition":"queued"}));
+    t.draft.replace_text("Queued C");
+    t.send_during_run();
+    t.draft.replace_text("Keep typing");
+    t.apply(json!({"type":"agent_settled","aborted":false}));
+    let next = command(&commands, "prompt");
+    assert_eq!(next["message"], "Queued C");
+    assert_eq!(t.draft.text, "Keep typing");
+    assert_eq!(t.status, Status::Running);
+}
+
+#[test]
+fn delivered_queued_messages_are_not_restored_after_a_disconnect() {
+    let (mut t, commands) = thread(Status::Running);
+    t.draft.replace_text("Steer");
+    t.send_during_run();
+    let send = command(&commands, "prompt");
+    answer(&mut t, &send, json!({"disposition":"queued"}));
+    t.apply(json!({"type":"message_start","message":{"role":"user","content":"Steer"}}));
+    assert_eq!(t.messages.len(), 1);
+    t.disconnect();
+    assert!(t.draft.text.is_empty());
+}
+
+#[test]
+fn pending_steers_survive_profile_save_and_return_to_draft_without_auto_resending() {
+    let (mut t, commands) = thread(Status::Running);
+    t.draft.replace_text("Unacknowledged");
+    t.send_during_run();
+    command(&commands, "prompt");
+    let pending = t.pending_inputs_value();
+    let (mut restored, commands) = thread(Status::Ready);
+    restored.restore_pending_inputs(&pending).unwrap();
+    restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[]}}));
+    assert_eq!(restored.draft.text, "Unacknowledged");
+    assert!(!commands.try_iter().any(|r| r["type"] == "prompt"));
+}
+
+#[test]
+fn authoritative_history_prevents_recovering_a_prompt_pi_already_saved() {
+    let (mut t, _) = thread(Status::Ready);
+    t.restore_pending_inputs(&json!([{"text":"Saved","images":[],"after":0}]))
+        .unwrap();
+    t.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[{"role":"user","content":"Saved"}]}}));
+    assert!(t.draft.text.is_empty());
+}
+
+#[test]
+fn rewind_uses_entry_ids_and_waits_for_authoritative_state_and_history() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.native.fork_points = vec![json!({"entryId":"target","text":"Repeated prompt"})];
+    t.rewind("target".into());
+    let fork = command(&commands, "fork");
+    assert_eq!(fork["entryId"], "target");
+    assert!(t.configuring);
+    answer(
+        &mut t,
+        &fork,
+        json!({"text":"Repeated prompt","cancelled":false}),
+    );
+    let state = command(&commands, "get_state");
+    answer(
+        &mut t,
+        &state,
+        json!({"sessionFile":"rewound.jsonl","isStreaming":false}),
+    );
+    let history = command(&commands, "get_entries");
+    let mut record = json!({"type":"response","id":history["id"],"command":"get_entries","success":true,"data":{"entries":[],"leafId":null}});
+    session_history(&mut record);
+    t.apply(record);
+    assert_eq!(t.session.as_deref(), Some("rewound.jsonl"));
+    assert_eq!(t.native.previous_session.as_deref(), Some("source.jsonl"));
+    assert_eq!(t.draft.text, "Repeated prompt");
+    assert!(!t.configuring);
+    assert!(t.messages.is_empty());
+}
+
+#[test]
+fn a_rewind_reapplies_the_pinned_selection_before_another_prompt_can_run() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.selected_model = Some(("cpa".into(), "pinned".into()));
+    t.native.fork_points = vec![json!({"entryId":"target","text":"Prompt"})];
+    t.rewind("target".into());
+    let fork = command(&commands, "fork");
+    answer(&mut t, &fork, json!({"cancelled":false}));
+    let state = command(&commands, "get_state");
+    answer(
+        &mut t,
+        &state,
+        json!({"sessionFile":"rewound.jsonl","isStreaming":false,"model":{"provider":"cpa","id":"old-model"}}),
+    );
+    let history = command(&commands, "get_entries");
+    let mut response = json!({"type":"response","id":history["id"],"command":"get_entries","success":true,"data":{"entries":[],"leafId":null}});
+    session_history(&mut response);
+    t.apply(response);
+    let model = command(&commands, "set_model");
+    assert_eq!(model["modelId"], "pinned");
+    assert!(t.configuring);
+    assert!(!commands.try_iter().any(|c| c["type"] == "prompt"));
+}
+
+#[test]
+fn cancelled_rewind_does_not_rebind_or_clear_the_original_conversation() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.messages.push(Message {
+        role: "You",
+        text: "Keep".into(),
+        images: vec![],
+    });
+    t.native.fork_points = vec![json!({"entryId":"target"})];
+    t.rewind("target".into());
+    let fork = command(&commands, "fork");
+    answer(&mut t, &fork, json!({"cancelled":true}));
+    assert_eq!(t.session.as_deref(), Some("source.jsonl"));
+    assert_eq!(t.messages[0].text, "Keep");
+    assert!(!t.configuring);
+}
+
+#[test]
+fn history_uses_leaf_ancestry_and_keeps_pre_compaction_messages() {
+    let mut record = json!({"type":"response","command":"get_entries","success":true,"data":{"leafId":"compact","entries":[
+        {"id":"u","type":"message","parentId":null,"message":{"role":"user","content":"Before"}},
+        {"id":"abandoned","type":"message","parentId":"u","message":{"role":"assistant","content":"Wrong branch"}},
+        {"id":"a","type":"message","parentId":"u","message":{"role":"assistant","content":"Right branch"}},
+        {"id":"compact","type":"compaction","parentId":"a","summary":"Summary","tokensBefore":10000}
+    ]}});
+    session_history(&mut record);
+    assert_eq!(record["data"]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(record["data"]["messages"][0]["content"], "Before");
+    assert_eq!(record["data"]["messages"][1]["content"], "Right branch");
+    assert_eq!(record["data"]["compactions"][0]["summary"], "Summary");
+    let mut broken = json!({"type":"response","command":"get_entries","success":true,"data":{"leafId":"missing","entries":[]}});
+    session_history(&mut broken);
+    assert_eq!(broken["success"], false);
+}
+
+#[test]
+fn command_discovery_is_workspace_local_and_retains_a_previous_inventory_on_failure() {
+    let (mut t, _) = thread(Status::Ready);
+    t.apply(
+        json!({"type":"response","command":"get_commands","success":true,"data":{"commands":[
+            {"name":"skill:review","source":"skill","description":"Review changes"},
+            {"name":"fix","source":"prompt"},{"name":"fix","source":"extension"}
+        ]}}),
+    );
+    assert_eq!(t.native.commands.len(), 2);
+    t.draft.replace_text("/skill:");
+    t.draft.focused = true;
+    assert_eq!(t.slash_matches()[0].name, "skill:review");
+    t.apply(json!({"type":"response","command":"get_commands","success":false,"error":"Failed discovery"}));
+    assert_eq!(t.native.commands.len(), 2);
+    assert!(t.error.is_none());
+    let other = Thread::new(2);
+    assert!(other.native.commands.is_empty());
+}
+
+#[test]
+fn overlapping_dialogs_expire_without_losing_the_next_request_or_timing_out_startup() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.initializing = true;
+    t.session_started = Some(Instant::now() - Duration::from_secs(100));
+    t.apply(json!({"type":"extension_ui_request","id":"first","method":"confirm","title":"Trust?","timeout":1}));
+    t.apply(
+        json!({"type":"extension_ui_request","id":"second","method":"input","prefill":"Prefill"}),
+    );
+    assert!(!t.check_deadlines(Instant::now()));
+    t.native_tick(Instant::now() + Duration::from_secs(1));
+    assert_eq!(t.request.as_ref().unwrap()["id"], "second");
+    t.respond(json!({"value":"Answer"}));
+    let response = command(&commands, "extension_ui_response");
+    assert_eq!(response["id"], "second");
+    assert_eq!(t.status, Status::Ready);
+    assert!(t.session_started.unwrap().elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn session_approvals_are_scoped_to_the_process_and_other_dialogs_still_need_the_user() {
+    let (mut t, commands) = thread(Status::Running);
+    let mut request = json!({"type":"extension_ui_request","id":"first","method":"confirm","title":"Allow write?","message":"file"});
+    t.apply(request.clone());
+    t.approve_for_session();
+    command(&commands, "extension_ui_response");
+    request["id"] = json!("second");
+    t.apply(request.clone());
+    assert_eq!(command(&commands, "extension_ui_response")["id"], "second");
+    request["id"] = json!("third");
+    request["message"] = json!("another file");
+    t.apply(request);
+    assert!(t.request.is_some());
+    t.disconnect();
+    assert!(t.native.session_approvals.is_empty());
+}
+
+#[test]
+fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
+    let (mut t, _) = thread(Status::Running);
+    t.apply(json!({"type":"tool_execution_start","toolCallId":"parent/1","parentToolCallId":"parent","toolName":"powershell","args":{"command":"exit 7"}}));
+    t.apply(json!({"type":"tool_execution_end","toolCallId":"parent/1","result":{"content":[{"type":"text","text":"Output"}],"structuredContent":{"exit_code":7},"details":{"custom":"value"}},"isError":true}));
+    assert_eq!(t.tools[0].parent_call.as_deref(), Some("parent"));
+    assert_eq!(t.tools[0].exit_code, Some(7));
+    assert_eq!(t.tools[0].structured["details"]["custom"], "value");
+    assert_eq!(t.tools[0].output, "Output");
+}

@@ -4,6 +4,7 @@
 // running inside Shina. Modeled on T3 Code's Pi MCP bridge.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { request as httpRequest } from "node:http";
+import { resolve } from "node:path";
 import { Type } from "typebox";
 
 const PROTOCOL = "2025-06-18";
@@ -13,6 +14,8 @@ type McpTool = {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: { readOnlyHint?: boolean };
 };
 type ModelContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -97,6 +100,32 @@ function client(endpoint: string, token: string) {
 }
 
 export default async function shinaExtension(pi: ExtensionAPI) {
+  // Ported from KSG Code's provider-pi mcpExtensionSource. This is a tool approval policy,
+  // not an OS sandbox. The mode is immutable for this process; Shina restarts on changes.
+  const mode = process.env.SHINA_RUNTIME_MODE ?? "full-access";
+  const readOnlyMcp = new Set<string>();
+  pi.on("tool_call", async (event, ctx) => {
+    if (mode === "full-access") return;
+    const tool = pi.getAllTools().find((tool) => tool.name === event.toolName);
+    const builtinRead = (["read", "grep", "find", "ls"].includes(event.toolName) &&
+      tool?.sourceInfo?.path === `builtin:${event.toolName}`) ||
+      (event.toolName === "tool_search" && tool?.sourceInfo?.path === "builtin:tool-search");
+    const bridgePath = process.env.SHINA_PI_BRIDGE_PATH;
+    const ownReadOnly = readOnlyMcp.has(event.toolName) && bridgePath !== undefined &&
+      typeof tool?.sourceInfo?.path === "string" && resolve(tool.sourceInfo.path) === resolve(bridgePath);
+    if (builtinRead || ownReadOnly) return;
+    if (mode === "auto-accept-edits" && ["edit", "write"].includes(event.toolName) &&
+      tool?.sourceInfo?.path === `builtin:${event.toolName}`) return;
+    const approved = await ctx.ui.confirm(`Allow ${event.toolName}?`,
+      JSON.stringify(event.input, null, 2).slice(0, 4_000), { signal: ctx.signal });
+    if (!approved) return { block: true, reason: `${event.toolName} was declined in Shina.` };
+  });
+  pi.on("input", (_event, ctx) => {
+    if (ctx.model && ctx.model.provider !== "cpa") {
+      ctx.ui.notify("Shina uses CPA proxy models only. Choose a CPA model before starting work.", "error");
+      return { action: "handled" };
+    }
+  });
   const endpoint = process.env.SHINA_MCP_URL;
   const token = process.env.SHINA_MCP_TOKEN;
   if (!endpoint || !token) return;
@@ -109,17 +138,21 @@ export default async function shinaExtension(pi: ExtensionAPI) {
       const signal = AbortSignal.timeout(10_000);
       instructions = await mcp.connect(signal);
       for (const tool of await mcp.tools(signal)) {
+        if (tool.annotations?.readOnlyHint === true) readOnlyMcp.add(PREFIX + tool.name);
         pi.registerTool({
           name: PREFIX + tool.name,
           label: tool.name,
           description: tool.description ?? tool.name,
           parameters: schema(tool.inputSchema),
+          ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
           async execute(_id, params, signal) {
             const result = await mcp.call(tool.name, (params ?? {}) as Record<string, unknown>, signal);
             const isError = (result as { isError?: boolean })?.isError === true;
             return {
               content: modelContent(result),
               details: { server: "shina", tool: tool.name },
+              ...((result as { structuredContent?: unknown })?.structuredContent !== undefined
+                ? { structuredContent: (result as { structuredContent: unknown }).structuredContent } : {}),
               ...(isError ? { isError: true } : {}),
             };
           },

@@ -40,6 +40,7 @@ pub struct HostLink {
     pub url: String,
     pub token: String,
     pub extension: PathBuf,
+    pub access_mode: String,
 }
 
 pub struct Pi {
@@ -91,6 +92,12 @@ pub enum BackendHost {
     Local,
 }
 
+pub enum SessionSource {
+    New,
+    Resume(String),
+    Fork(String),
+}
+
 impl BackendHost {
     pub fn resolve(machine: &str) -> Result<Self, String> {
         match machine {
@@ -104,14 +111,14 @@ impl BackendHost {
     pub fn start(
         &self,
         directory: PathBuf,
-        session: Option<String>,
+        source: SessionSource,
         wake: Waker,
         instructions: Option<String>,
         link: Option<HostLink>,
         owner: Arc<SessionOwner>,
     ) -> Pi {
         match self {
-            Self::Local => Pi::start(directory, session, wake, instructions, link, false, owner),
+            Self::Local => Pi::start(directory, source, wake, instructions, link, false, owner),
         }
     }
 }
@@ -119,6 +126,7 @@ impl BackendHost {
 struct Launch {
     workspace: PathBuf,
     session: Option<String>,
+    fork_source: Option<String>,
     instructions: Option<String>,
     host: Option<HostLink>,
     ephemeral: bool,
@@ -159,7 +167,7 @@ impl Pi {
     ) -> Self {
         Self::start(
             workspace,
-            session,
+            session.map_or(SessionSource::New, SessionSource::Resume),
             wake,
             instructions,
             host,
@@ -170,18 +178,31 @@ impl Pi {
 
     /// Read provider metadata without creating a saved conversation or exposing Shina tools.
     pub fn discover(workspace: PathBuf, wake: Waker) -> Self {
-        Self::start(workspace, None, wake, None, None, true, Arc::default())
+        Self::start(
+            workspace,
+            SessionSource::New,
+            wake,
+            None,
+            None,
+            true,
+            Arc::default(),
+        )
     }
 
     fn start(
         workspace: PathBuf,
-        session: Option<String>,
+        source: SessionSource,
         wake: Waker,
         instructions: Option<String>,
         host: Option<HostLink>,
         ephemeral: bool,
         owner: Arc<SessionOwner>,
     ) -> Self {
+        let (session, fork_source) = match source {
+            SessionSource::New => (None, None),
+            SessionSource::Resume(path) => (Some(path), None),
+            SessionSource::Fork(path) => (None, Some(path)),
+        };
         let (commands, input) = mpsc::sync_channel::<Value>(32);
         let (events, output) = mpsc::sync_channel(256);
         let stopped = Arc::new(AtomicBool::new(false));
@@ -235,6 +256,7 @@ impl Pi {
             let launch = Launch {
                 workspace,
                 session,
+                fork_source,
                 instructions,
                 host,
                 ephemeral,
@@ -367,6 +389,21 @@ fn cpa_extension_in(agent_directory: &Path) -> Result<Option<PathBuf>, String> {
     ))
 }
 
+fn resource_args(ephemeral: bool) -> &'static [&'static str] {
+    if ephemeral {
+        &[
+            "--mode",
+            "rpc",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-prompt-templates",
+        ]
+    } else {
+        &["--mode", "rpc"]
+    }
+}
+
 fn run(
     launch: &Launch,
     input: Receiver<Value>,
@@ -376,21 +413,16 @@ fn run(
     owner: &SessionOwner,
 ) -> Result<(), String> {
     let mut command = command()?;
+    // Catalog probes stay offline and isolated. Real sessions use Pi's normal resource discovery
+    // and trust flow, like KSG Code's buildPiRpcLaunch, without rewriting the user's settings.
+    command.args(resource_args(launch.ephemeral));
     command
-        .args([
-            "--mode",
-            "rpc",
-            "--no-extensions",
-            "--no-mcp",
-            "--no-skills",
-            "--no-prompt-templates",
-        ])
         .current_dir(&launch.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Explicit extensions still load with --no-extensions. Load only the user's
-    // catalog-backed provider, not unrelated packages, project extensions or MCP.
+    // The explicit CPA provider also works for restricted catalog probes. Pi deduplicates
+    // a path that normal discovery has already loaded in a live session.
     if let Some(extension) = cpa_extension()? {
         command.arg("--extension").arg(extension);
     }
@@ -402,18 +434,24 @@ fn run(
     // Shina's credentials belong to this thread only; never pass along inherited ones.
     command
         .env_remove(crate::mcp::URL_ENV)
-        .env_remove(crate::mcp::TOKEN_ENV);
+        .env_remove(crate::mcp::TOKEN_ENV)
+        .env_remove("SHINA_RUNTIME_MODE")
+        .env_remove("SHINA_PI_BRIDGE_PATH");
     if let Some(host) = &launch.host {
         command
             .arg("--extension")
             .arg(&host.extension)
             .env(crate::mcp::URL_ENV, &host.url)
-            .env(crate::mcp::TOKEN_ENV, &host.token);
+            .env(crate::mcp::TOKEN_ENV, &host.token)
+            .env("SHINA_RUNTIME_MODE", &host.access_mode)
+            .env("SHINA_PI_BRIDGE_PATH", &host.extension);
     }
     if let Some(instructions) = &launch.instructions {
         command.arg("--append-system-prompt").arg(instructions);
     }
-    if let Some(session) = &launch.session {
+    if let Some(source) = &launch.fork_source {
+        command.args(["--fork", source]);
+    } else if let Some(session) = &launch.session {
         command.args(["--session", session]);
     } else if launch.ephemeral {
         command.args(["--no-session", "--offline"]);
@@ -439,7 +477,14 @@ fn run(
         loop {
             match read_record(&mut reader) {
                 Ok(Some(mut record)) => {
-                    if record["type"] == "response" && record["command"] == "get_state" {
+                    if record["type"] == "response" && record["command"] == "get_state"
+                        || record["type"] == "extension_ui_request"
+                            && matches!(
+                                record["method"].as_str(),
+                                Some("confirm" | "select" | "input" | "editor")
+                            )
+                    {
+                        // A trust or extension dialog is a live Pi, not a failed startup.
                         received_state.store(true, Ordering::Relaxed);
                     }
                     #[cfg(test)]
@@ -448,6 +493,7 @@ fn run(
                     });
                     #[cfg(not(test))]
                     crate::attachments::import_history(&mut record);
+                    crate::model::session_history(&mut record);
                     if !publish(&events, &waker, Event::Record(record)) {
                         break;
                     }
@@ -495,9 +541,10 @@ fn run(
         let result = (|| {
             for record in [
                 json!({"id":"state", "type":"get_state"}),
-                json!({"id":"history", "type":"get_messages"}),
+                json!({"id":"history", "type":"get_entries"}),
                 json!({"id":"models", "type":"get_available_models"}),
                 json!({"id":"levels", "type":"get_available_thinking_levels"}),
+                json!({"id":"commands", "type":"get_commands"}),
             ]
             .into_iter()
             .chain(records)
@@ -597,6 +644,20 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_discovery_is_enabled_only_in_real_sessions() {
+        assert_eq!(resource_args(false), &["--mode", "rpc"]);
+        for flag in [
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-prompt-templates",
+        ] {
+            assert!(resource_args(true).contains(&flag));
+            assert!(!resource_args(false).contains(&flag));
+        }
+    }
 
     #[test]
     fn waiting_for_the_previous_session_is_cancellable_without_starting_pi() {

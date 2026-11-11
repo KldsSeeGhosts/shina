@@ -224,25 +224,53 @@ pub fn from_history_part(part: &Value) -> Option<Attachment> {
 
 /// Called by the RPC reader, before the record enters the UI event queue.
 pub fn import_history(record: &mut Value) {
-    if record["command"] != "get_messages" {
-        return;
+    for key in ["message", "result", "partialResult"] {
+        if let Some(content) = record.get_mut(key).and_then(|m| m.get_mut("content")) {
+            import_parts(content);
+        }
     }
-    if let Some(messages) = record["data"]["messages"].as_array_mut() {
+    if let Some(entries) = record
+        .get_mut("data")
+        .and_then(|d| d.get_mut("entries"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            if let Some(content) = entry.get_mut("message").and_then(|m| m.get_mut("content")) {
+                import_parts(content);
+            }
+            if entry["type"] == "custom_message"
+                && let Some(content) = entry.get_mut("content")
+            {
+                import_parts(content);
+            }
+        }
+    }
+    if let Some(messages) = record
+        .get_mut("data")
+        .and_then(|d| d.get_mut("messages"))
+        .and_then(Value::as_array_mut)
+    {
         for message in messages {
-            if let Some(parts) = message["content"].as_array_mut() {
-                for part in parts {
-                    if part["type"] != "image" {
-                        continue;
-                    }
-                    let attachment = from_history_part(part);
-                    if let Some(object) = part.as_object_mut() {
-                        object.remove("data");
-                        object.insert(
-                            "shinaAttachment".into(),
-                            attachment.map_or(Value::Null, |image| image.to_value()),
-                        );
-                    }
-                }
+            if let Some(content) = message.get_mut("content") {
+                import_parts(content);
+            }
+        }
+    }
+}
+
+fn import_parts(content: &mut Value) {
+    if let Some(parts) = content.as_array_mut() {
+        for part in parts {
+            if part["type"] != "image" {
+                continue;
+            }
+            let attachment = from_history_part(part);
+            if let Some(object) = part.as_object_mut() {
+                object.remove("data");
+                object.insert(
+                    "shinaAttachment".into(),
+                    attachment.map_or(Value::Null, |image| image.to_value()),
+                );
             }
         }
     }
@@ -576,6 +604,20 @@ pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_import_accepts_string_notifications_and_mixed_rpc_shapes_without_mutating_them() {
+        for mut record in [
+            json!({"type":"extension_ui_request","method":"confirm","message":"Trust this workspace?"}),
+            json!({"type":"extension_ui_request","method":"notify","message":"Done"}),
+            json!({"type":"response","command":"get_state","data":{"sessionFile":"saved.jsonl"}}),
+            json!({"type":"tool_execution_end","result":{"content":[{"type":"text","text":"Output"}]}}),
+        ] {
+            let before = record.clone();
+            import_history(&mut record);
+            assert_eq!(record, before);
+        }
+    }
     use std::io::Cursor;
 
     fn image_bytes(format: ImageFormat) -> Vec<u8> {

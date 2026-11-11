@@ -21,6 +21,10 @@ pub const DEFAULT_MODEL: &str = "Default model";
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
 const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
+#[path = "pi_session.rs"]
+mod pi_session;
+pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+
 struct Injection {
     text: String,
     shown: bool,
@@ -125,6 +129,11 @@ pub struct Tool {
     pub done: bool,
     pub failed: bool,
     pub output: String,
+    pub images: Vec<Attachment>,
+    pub structured: Value,
+    pub parent_call: Option<String>,
+    pub exit_code: Option<i64>,
+    pub subagents: Vec<Value>,
     /// Position in the transcript, including tool calls between text blocks in one message.
     pub anchor: ToolAnchor,
     pub block: usize,
@@ -150,6 +159,11 @@ impl Tool {
             done: false,
             failed: false,
             output: String::new(),
+            images: vec![],
+            structured: Value::Null,
+            parent_call: None,
+            exit_code: None,
+            subagents: vec![],
             anchor,
             block: usize::MAX,
             expanded: false,
@@ -232,6 +246,7 @@ pub struct Thread {
     pub context_window: Option<u64>,
     /// Live context-window usage and its refresh state, kept separate from cumulative tokens.
     pub context: ContextMeter,
+    pub native: PiSession,
     pub models: Vec<AgentModel>,
     pub thinking_levels: Vec<String>,
     pub configuring: bool,
@@ -408,6 +423,7 @@ impl Thread {
             model_id: String::new(),
             context_window: None,
             context: ContextMeter::default(),
+            native: PiSession::default(),
             models: vec![],
             thinking_levels: vec![],
             configuring: false,
@@ -497,14 +513,25 @@ impl Thread {
         self.startup_selection_verified = false;
         self.context_startup_requested = false;
         self.context.begin_model_change();
-        self.pi = Some(backend.start(
-            path,
-            self.session.clone(),
-            wake,
-            instructions,
-            self.host.clone(),
-            self.connection_owner.clone(),
-        ));
+        self.pi = Some(
+            backend.start(
+                path,
+                self.native
+                    .fork_source
+                    .clone()
+                    .map(crate::backend::SessionSource::Fork)
+                    .or_else(|| {
+                        self.session
+                            .clone()
+                            .map(crate::backend::SessionSource::Resume)
+                    })
+                    .unwrap_or(crate::backend::SessionSource::New),
+                wake,
+                instructions,
+                self.host.clone(),
+                self.connection_owner.clone(),
+            ),
+        );
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
@@ -669,6 +696,13 @@ impl Thread {
             return;
         }
         let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
+        self.draft.replace_text("");
+        self.draft_images.clear();
+        self.begin_prompt(prompt);
+    }
+
+    fn begin_prompt(&mut self, prompt: Prompt) {
+        self.native.initial_user = true;
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
         self.retry_prompt = Some(prompt.clone());
         self.arm_task();
@@ -691,8 +725,6 @@ impl Thread {
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
         });
-        self.draft.replace_text("");
-        self.draft_images.clear();
         self.attachment_error = None;
         self.status = Status::Running;
         self.updated = crate::projects::now();
@@ -712,20 +744,24 @@ impl Thread {
     }
 
     fn stop_task(&mut self) -> Result<(), String> {
+        self.return_local_queue();
         self.pending_injections.clear();
         self.injection_id = None;
         self.injection_retry_at = None;
         self.operation_deadline = None;
-        if self.initializing || self.queued_prompt.is_some() {
+        if self.initializing
+            || self.queued_prompt.is_some()
+            || self.native.operating()
+            || self.has_pending_sends()
+            || self.context.phase == crate::context::ContextPhase::Compacting
+        {
             self.disconnect();
             self.complete_task("cancelled");
             return Ok(());
         }
         if self.status == Status::Running || self.status == Status::Waiting {
             // Release a blocking extension dialog before asking Pi to wait for idle.
-            if self.request.is_some() {
-                self.respond(json!({"cancelled":true}));
-            }
+            self.cancel_native_dialogs();
             if !self.command("clear_queue", json!({})) || !self.command("abort", json!({})) {
                 let error = self
                     .error
@@ -758,13 +794,14 @@ impl Thread {
             Ok(()) => {
                 self.request = None;
                 self.forwarded_question = None;
-                self.status = Status::Running;
+                self.native_dialog_done();
             }
             Err(error) => self.error = Some(error),
         }
     }
 
     pub fn disconnect(&mut self) {
+        self.native_disconnect();
         self.finish_thoughts();
         if let Some((prompt, index)) = self.queued_prompt.take() {
             self.remove_optimistic_prompt(&prompt, index);
@@ -896,6 +933,9 @@ impl Thread {
     }
 
     fn check_deadlines(&mut self, now: Instant) -> bool {
+        if self.request.is_some() {
+            return false;
+        }
         let Some((operation, deadline)) = self.operation_deadline else {
             return false;
         };
@@ -909,10 +949,9 @@ impl Thread {
             self.error =
                 Some("Pi did not stop within ten seconds. Its process was terminated.".into());
         } else {
-            self.fail_session(
-                "Pi did not answer the settings command within thirty seconds. Retry to resume."
-                    .into(),
-            );
+            self.fail_session(format!(
+                "Pi did not answer the {operation} operation before its deadline. Retry to resume."
+            ));
         }
         true
     }
@@ -1001,6 +1040,9 @@ impl Thread {
                 self.status = Status::Ready;
                 self.phase.clear();
             }
+        }
+        if self.drive_native() {
+            return;
         }
         // Pi has answered its session handshake, so it can report the context window it
         // resumed. A directly wired transport in a test has not answered that handshake.
@@ -1200,6 +1242,10 @@ impl Thread {
 
     pub fn apply(&mut self, record: Value) {
         self.last_activity = Instant::now();
+        if self.apply_native(&record) {
+            self.drive_session();
+            return;
+        }
         match string(&record, "type") {
             "response" => {
                 let command = string(&record, "command");
@@ -1357,6 +1403,20 @@ impl Thread {
                             self.thoughts.clear();
                             self.work.clear();
                             self.assistant = None;
+                            if let Some(points) = record["data"]["forkMessages"].as_array() {
+                                self.native.fork_points = points.clone();
+                            }
+                            if let Some(compactions) = record["data"]["compactions"].as_array() {
+                                self.native.compactions = compactions
+                                    .iter()
+                                    .rev()
+                                    .take(32)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                            }
                             for message in messages {
                                 let role = string(message, "role");
                                 let index = self.messages.len();
@@ -1385,6 +1445,13 @@ impl Thread {
                                         });
                                     }
                                 }
+                                if role == "custom" && message["display"] != false {
+                                    self.messages.push(Message {
+                                        role: "Shina",
+                                        text: content_text(&message["content"]),
+                                        images: content_images(&message["content"]),
+                                    });
+                                }
                                 if role == "assistant" {
                                     self.anchor_content_work(&message["content"], index, true);
                                 }
@@ -1396,8 +1463,7 @@ impl Thread {
                                         .find(|t| t.id == string(message, "toolCallId"))
                                 {
                                     tool.failed = message["isError"] == true;
-                                    tool.output =
-                                        truncate(&content_text(&message["content"]), 6000);
+                                    tool.accept_result(message);
                                     tool.duration_ms = message["durationMs"].as_u64();
                                 }
                             }
@@ -1420,6 +1486,7 @@ impl Thread {
                                 images: prompt.images.to_vec(),
                             });
                         }
+                        self.recover_native_inputs();
                         self.history_loaded = true;
                     }
                     "prompt" => {
@@ -1434,10 +1501,8 @@ impl Thread {
                         if record["data"]["disposition"] == "handled"
                             && self.status == Status::Running
                         {
-                            self.status = Status::Ready;
-                            self.started = None;
-                            self.phase.clear();
-                            self.complete_task("done");
+                            // A command can launch work independently. Check Pi before settling it.
+                            self.probe_command_idle();
                         }
                         // Capture the newly created session path before a long first run finishes.
                         self.command("get_state", json!({}));
@@ -1541,6 +1606,7 @@ impl Thread {
                     let mut tool =
                         Tool::new(id, string(&record, "toolName"), &record["args"], anchor);
                     tool.started = Some(Instant::now());
+                    tool.parent_call = record["parentToolCallId"].as_str().map(str::to_owned);
                     self.tools.push(tool);
                 }
             }
@@ -1586,14 +1652,11 @@ impl Thread {
                             tool.started.map(|start| start.elapsed().as_millis() as u64)
                         });
                     }
-                    tool.output = truncate(
-                        &content_text(if ending {
-                            &record["result"]["content"]
-                        } else {
-                            &record["partialResult"]["content"]
-                        }),
-                        6000,
-                    );
+                    tool.accept_result(if ending {
+                        &record["result"]
+                    } else {
+                        &record["partialResult"]
+                    });
                 }
             }
             "extension_ui_request" => {
@@ -3427,6 +3490,7 @@ impl State {
                 url: server.url.clone(),
                 token: server.token_for(thread_id),
                 extension: crate::mcp::extension_path()?,
+                access_mode: self.threads[index].native.access.id().into(),
             })
         });
         let thread = &mut self.threads[index];
@@ -3434,6 +3498,12 @@ impl State {
             Ok(host) => thread.host = Some(host),
             Err(error) => {
                 thread.host = None;
+                if thread.native.access != AccessMode::Full {
+                    thread.fail_session(format!(
+                        "The permission bridge could not start. Pi was not launched: {error}"
+                    ));
+                    return;
+                }
                 thread.diagnostic(&error);
             }
         }
@@ -3619,6 +3689,7 @@ impl State {
                     .collect();
                 thread.captain = captain;
                 thread.delegated = true;
+                thread.native.access = self.threads[caller_index].native.access;
                 thread.parent = Some(caller);
                 thread.models = models;
                 if let Some(selection) = &selection {
@@ -3833,7 +3904,11 @@ impl State {
         } else if self.threads[index].archived() {
             Some("Restore this thread before attaching images.".into())
         } else if self.threads[index].status.busy() {
-            Some("Wait for Pi to finish before attaching images.".into())
+            if self.threads[index].request.is_some() || self.threads[index].native.operating() {
+                Some("Wait for Pi's current operation before attaching images.".into())
+            } else {
+                None
+            }
         } else if self.threads[index].configuring {
             Some("Wait for the model change to finish before attaching images.".into())
         } else {
@@ -3911,10 +3986,55 @@ impl State {
     pub fn send(&mut self) {
         if self.demo
             || self.current().archived()
-            || self.current().status.busy()
             || self.current().configuring
             || !self.current().has_draft_content()
         {
+            return;
+        }
+        let text = self.current().draft.text.trim().to_owned();
+        let mut words = text.splitn(2, char::is_whitespace);
+        match words.next() {
+            Some("/model") => {
+                self.choose_slash("model".into());
+                return;
+            }
+            Some("/compact") => {
+                if !self.current().draft_images.is_empty() {
+                    self.current_mut().attachment_error =
+                        Some("Compaction does not accept attachments. Your draft was kept.".into());
+                    return;
+                }
+                if self.current().can_compact() {
+                    let instructions = words
+                        .next()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    self.current_mut().draft.replace_text("");
+                    self.compact_context(instructions);
+                }
+                return;
+            }
+            Some(command) if command.starts_with('/') => {
+                let name = command.trim_start_matches('/');
+                if !self
+                    .current()
+                    .native
+                    .commands
+                    .iter()
+                    .any(|c| c.name == name)
+                {
+                    self.current_mut().error = Some(format!(
+                        "Unknown Pi command {command}. Use / to browse the workspace's commands."
+                    ));
+                    return;
+                }
+            }
+            _ => {}
+        }
+        if self.current().status.busy() {
+            self.current_mut().send_during_run();
+            self.checkpoint();
             return;
         }
         self.current_mut().send();
@@ -4167,6 +4287,13 @@ impl State {
                         return None;
                     }
                     let mut thread = Thread::new(id);
+                    thread.native.fork_source = record["forkSource"].as_str().map(str::to_owned);
+                    thread.native.fork_entry = record["forkEntry"].as_str().map(str::to_owned);
+                    thread.native.previous_session =
+                        record["previousSession"].as_str().map(str::to_owned);
+                    if let Some(access) = record.get("accessMode") {
+                        thread.native.access = AccessMode::parse(access.as_str()?)?;
+                    }
                     if index["version"] == 4 && record.get("lifecycle").is_none() {
                         return None;
                     }
@@ -4361,6 +4488,7 @@ impl State {
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
+            "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
                 let value = if t.draft_images.is_empty() {
                     json!(t.draft.text)
@@ -4442,6 +4570,17 @@ impl State {
                 } else {
                     attachments::validate_prompt_images(&t.draft_images).err()
                 };
+            }
+        }
+        if let Some(pending) = ui["pendingMessages"].as_object() {
+            for (id, value) in pending {
+                if let Some(thread) = id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+                {
+                    thread.restore_pending_inputs(value)?;
+                }
             }
         }
         self.capture_opened_draft();
@@ -4582,6 +4721,8 @@ impl State {
                 !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
+                "forkSource":thread.native.fork_source, "forkEntry":thread.native.fork_entry,
+                "previousSession":thread.native.previous_session,"accessMode":thread.native.access.id(),
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
@@ -4625,6 +4766,8 @@ impl State {
                 group_expanded: false,
                 started: None,
                 duration_ms: Some(180),
+                subagents: vec![],
+                images: vec![], structured: Value::Null, parent_call: None, exit_code: None,
             },
             Tool {
                 id: "example-2".into(),
@@ -4639,6 +4782,8 @@ impl State {
                 group_expanded: false,
                 started: None,
                 duration_ms: Some(120),
+                subagents: vec![],
+                images: vec![], structured: Value::Null, parent_call: None, exit_code: None,
             },
             Tool {
                 id: "example-3".into(),
@@ -4653,6 +4798,8 @@ impl State {
                 group_expanded: true,
                 started: None,
                 duration_ms: Some(240),
+                subagents: vec![],
+                images: vec![], structured: Value::Null, parent_call: None, exit_code: None,
             },
             Tool {
                 id: "example-4".into(),
@@ -4667,6 +4814,8 @@ impl State {
                 group_expanded: false,
                 started: None,
                 duration_ms: Some(1100),
+                subagents: vec![],
+                images: vec![], structured: Value::Null, parent_call: None, exit_code: None,
             },
         ];
         thread.thoughts.push(Thought {
@@ -4852,9 +5001,11 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
         thread.drive_session();
         changed |= thread.check_deadlines(Instant::now());
-        if thread
-            .session_started
-            .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
+        changed |= thread.native_tick(Instant::now());
+        if thread.request.is_none()
+            && thread
+                .session_started
+                .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
         {
             thread.fail_session(
                 "Pi did not finish preparing the session. Retry to resume it.".into(),
@@ -8052,15 +8203,19 @@ mod tests {
         );
         thread.apply(json!({"type":"response","command":"set_thinking_level","success":true}));
         assert_eq!(commands.try_recv().unwrap()["type"], "get_state");
+        assert_eq!(commands.try_recv().unwrap()["type"], "set_session_name");
         assert_eq!(commands.try_recv().unwrap()["type"], "prompt");
         assert!(!thread.initializing);
         assert_eq!(thread.session.as_deref(), Some("saved.jsonl"));
     }
 
     fn next_stats_request(commands: &mpsc::Receiver<Value>) -> Value {
-        let request = commands
+        let mut request = commands
             .try_recv()
             .expect("expected a context stats request");
+        if request["type"] == "set_session_name" {
+            request = commands.try_recv().unwrap();
+        }
         assert_eq!(request["type"], "get_session_stats");
         request
     }
@@ -8332,6 +8487,7 @@ mod tests {
                 "model":{"provider":"cpa","id":"restored"},"sessionFile":"saved.jsonl"
             }}),
         );
+        assert_eq!(commands.try_recv().unwrap()["type"], "set_session_name");
         assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         assert_eq!(commands.try_recv().unwrap()["message"], "Continue");
         assert_eq!(thread.messages.len(), 2);

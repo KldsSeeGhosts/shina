@@ -10,6 +10,8 @@ use rune::{
 };
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
+#[path = "pi_ui.rs"]
+mod pi_ui;
 
 // Warm neutral chrome, a paper-like reading area, and Shina's teal action color.
 #[derive(Clone, Copy)]
@@ -604,6 +606,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(captain_picker(s, p));
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
+    } else if s.current().native.access_picker {
+        root = root.child(pi_ui::access_picker(s, p));
+    } else if s.current().native.conversation.is_some() {
+        root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
     }
@@ -3081,6 +3087,48 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
+    if id == s.current().id && thread.pi.is_some() {
+        actions = actions.child(
+            menu_item("menu-refresh-commands", "Refresh Pi commands", "refresh", p).on_press(
+                |s: &mut State| {
+                    s.thread_menu = false;
+                    s.row_menu = None;
+                    s.current_mut().refresh_commands();
+                },
+            ),
+        );
+    }
+    if id == s.current().id && thread.session.is_some() {
+        let locked = s.demo || thread.status.busy() || thread.configuring || thread.archived();
+        actions = actions
+            .child(
+                menu_item("menu-fork-conversation", "Fork conversation", "thread", p)
+                    .disabled(locked)
+                    .on_press(|s: &mut State| {
+                        s.thread_menu = false;
+                        s.row_menu = None;
+                        s.fork_conversation(None);
+                    }),
+            )
+            .child(
+                menu_item("menu-fork-message", "Fork from message...", "thread", p)
+                    .disabled(locked)
+                    .on_press(|s: &mut State| {
+                        s.thread_menu = false;
+                        s.row_menu = None;
+                        s.conversation_points(crate::model::ConversationMode::Fork);
+                    }),
+            )
+            .child(
+                menu_item("menu-rewind", "Edit from here...", "edit", p)
+                    .disabled(locked)
+                    .on_press(|s: &mut State| {
+                        s.thread_menu = false;
+                        s.row_menu = None;
+                        s.conversation_points(crate::model::ConversationMode::Rewind);
+                    }),
+            );
+    }
     if !captain {
         actions = actions
             .child(
@@ -4559,6 +4607,9 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             tool.expanded = !tool.expanded;
         }),
     );
+    if !tool.subagents.is_empty() {
+        content = content.child(pi_ui::subagent_results(tool, p));
+    }
     if tool.expanded {
         content = content.child(
             col()
@@ -4611,6 +4662,49 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                         ),
                 ),
         );
+    }
+    if tool.expanded {
+        if let Some(exit) = tool.exit_code {
+            content = content.child(label(format!("Exit code {exit}"), SMALL, p.muted));
+        }
+        if let Some(parent) = &tool.parent_call {
+            content =
+                content.child(label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere());
+        }
+        if !tool.images.is_empty() {
+            content = content.child(message_images(
+                s,
+                p,
+                &tool.images,
+                &format!("tool-image-{}-{index}", t.id),
+            ));
+        }
+        if tool.subagents.is_empty()
+            && tool
+                .structured
+                .as_object()
+                .is_some_and(|data| data.values().any(|v| !v.is_null()))
+        {
+            content = content.child(
+                col()
+                    .max_h(200.0)
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .child(
+                        label(
+                            truncate(
+                                &serde_json::to_string_pretty(&tool.structured).unwrap_or_default(),
+                                50_000,
+                            ),
+                            SMALL,
+                            p.ink,
+                        )
+                        .wrap_anywhere()
+                        .selectable(true),
+                    ),
+            );
+        }
     }
     content
 }
@@ -5115,6 +5209,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             messages = messages.child(body.key(key));
             index += 1;
         }
+        messages = messages.child(pi_ui::compaction_activity(s, p));
         if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
             messages = messages.child(assistant_turn(
                 s,
@@ -5539,6 +5634,15 @@ fn context_details(t: &Thread, p: Palette) -> El {
         details = details
             .child(label(state, TextStyle::new(11.5, 420.0), p.muted).key("context-details-state"));
     }
+    if let Some(tokens) = t.native.stats["tokens"]["total"].as_u64() {
+        details = details.child(label(format!("{tokens} total processed"), SMALL, p.muted));
+    }
+    if let Some(cost) = t.native.stats["cost"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+    {
+        details = details.child(label(format!("${cost:.4}"), SMALL, p.muted));
+    }
     details
 }
 
@@ -5582,13 +5686,26 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
     if t.request.is_some() {
         area = area.child(dialog(s, p));
     }
-    let can_send =
-        !s.demo && !t.archived() && !t.status.busy() && !t.configuring && t.has_draft_content();
+    let can_send = !s.demo
+        && !t.archived()
+        && !t.configuring
+        && t.request.is_none()
+        && !t.native.operating()
+        && t.phase != "Stopping"
+        && t.has_draft_content();
     let mut send = el()
         .key("send-message")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label("Send message")
+        .label(if t.status.busy() {
+            if t.native.follow_up {
+                "Queue message"
+            } else {
+                "Steer message"
+            }
+        } else {
+            "Send message"
+        })
         .size(32.0, 32.0)
         .radius(16.0)
         .center()
@@ -5607,9 +5724,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .child(icon("send", if can_send { p.on_teal } else { p.muted }))
         .disabled(!can_send);
     if can_send {
-        send = send.focusable(true).on_press(|s: &mut State| s.send());
+        send = send.focusable(true).on_press_tx(|s: &mut State, tx| {
+            let previous = s.current().native.follow_up;
+            if tx.mods().cmd || tx.mods().ctrl {
+                s.current_mut().native.follow_up = !previous;
+            }
+            s.send();
+            s.current_mut().native.follow_up = previous;
+        });
     }
-    let action = if t.status.busy() && !s.demo {
+    let action = if t.status.busy() && !s.demo && !t.has_draft_content() {
         icon_button("stop-agent", "Stop agent", "stop", p, |s| {
             s.current_mut().stop()
         })
@@ -5620,6 +5744,10 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         send
     };
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
+    let attach_locked =
+        s.demo || t.archived() || t.configuring || t.native.operating() || t.request.is_some();
+    area = area.child(pi_ui::slash_menu(s, p));
+    area = area.child(pi_ui::queued_messages(s, p));
     // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
     let mut card = col()
@@ -5679,7 +5807,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             .px(16.0)
             .pt(14.0)
             .pb(6.0)
-            .on_edit(|s: &mut State| &mut s.current_mut().draft)
+            .on_edit(|s: &mut State| {
+                s.current_mut().native.slash_index = 0;
+                &mut s.current_mut().draft
+            })
+            .on_input_key(|s: &mut State, event, _| pi_ui::composer_pi_key(s, event))
             .on_input_paste(|s: &mut State, content, _| {
                 let has_image = content.image().is_some();
                 if let Some(image) = content.image() {
@@ -5697,7 +5829,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             }),
     );
     if t.context.details_open && context_available(t) {
-        card = card.child(context_details(t, p).px(16.0).pb(4.0));
+        card = card.child(
+            col()
+                .gap(8.0)
+                .px(16.0)
+                .pb(8.0)
+                .child(context_details(t, p))
+                .child(pi_ui::compact_control(s, p)),
+        );
     }
     let mut actions = row()
         .key("composer-actions")
@@ -5705,9 +5844,28 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .gap(2.0)
         .px(8.0)
         .pb(8.0)
-        .child(attach_control(locked, p).size(28.0, 28.0).radius(8.0))
+        .child(
+            attach_control(attach_locked, p)
+                .size(28.0, 28.0)
+                .radius(8.0),
+        )
         .child(spacer())
         .child(model_effort_trigger(s, p, narrow, locked));
+    if t.status.busy() && t.has_draft_content() {
+        actions = actions
+            .child(button(
+                "dispatch-mode",
+                if t.native.follow_up { "Queue" } else { "Steer" },
+                p,
+                |s| {
+                    let n = &mut s.current_mut().native;
+                    n.follow_up = !n.follow_up;
+                },
+            ))
+            .child(icon_button("stop-agent", "Stop agent", "stop", p, |s| {
+                s.current_mut().stop()
+            }));
+    }
     if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
     }
@@ -5763,6 +5921,13 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 .truncate()
                 .shrink()
                 .min_w(0.0),
+            )
+            .child(spacer())
+            .child(
+                button("access-mode", t.native.access.label(), p, |s| {
+                    s.current_mut().native.access_picker = true
+                })
+                .disabled(t.status.busy() || t.configuring || t.archived()),
             )
     };
     area = area.child(footer);
@@ -5898,9 +6063,13 @@ fn dialog(s: &State, p: Palette) -> El {
     let mut actions = row().gap(6.0).flex_wrap();
     match crate::model::string(request, "method") {
         "confirm" => {
-            actions = actions.child(button("dialog-confirm", "Confirm", p, |s| {
-                s.current_mut().respond(json!({"confirmed":true}))
-            }));
+            actions = actions
+                .child(button("dialog-confirm", "Confirm", p, |s| {
+                    s.current_mut().respond(json!({"confirmed":true}))
+                }))
+                .child(button("dialog-session", "Allow for session", p, |s| {
+                    s.current_mut().approve_for_session()
+                }));
         }
         "select" => {
             if let Some(options) = request["options"].as_array() {
@@ -5970,6 +6139,122 @@ pub(crate) mod tests {
             .as_array()?
             .iter()
             .find_map(|c| find(c, key))
+    }
+
+    #[test]
+    fn native_subagent_cards_and_queued_messages_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, _, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.status = Status::Running;
+            t.apply(json!({"type":"tool_execution_start","toolCallId":"native","toolName":"subagent","args":{}}));
+            t.apply(json!({"type":"tool_execution_update","toolCallId":"native","partialResult":{"content":[],"details":{"results":[{"agent":"Research","task":"Read the source","model":"Fixture"}]}}}));
+            t.tools[0].expanded = true;
+            t.native.follow_up = true;
+            t.draft.replace_text(
+                "A queued message with a long enough sentence to wrap on narrow windows.",
+            );
+            t.send_during_run();
+            rt.frame(0.0);
+            for key in ["queued-messages", "pi-subagents-native", "composer"] {
+                let (r, _) = rt.presented(key).unwrap_or_else(|| panic!("{width} {key}"));
+                assert!(
+                    r[0] >= 0.0 && r[0] + r[2] <= width + 1.0,
+                    "{width} {key} {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pi_controls_fit_and_native_compaction_is_an_action_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, commands, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.session = Some("fixture.jsonl".into());
+            t.model_provider = "cpa".into();
+            t.context_window = Some(200000);
+            t.context.details_open = true;
+            t.context.absorb(
+                &json!({"contextUsage":{"tokens":100000,"contextWindow":200000,"percent":50}}),
+            );
+            rt.frame(0.0);
+            for key in ["composer", "compact-context", "access-mode"] {
+                let (r, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    r[0] >= 0.0 && r[0] + r[2] <= width + 1.0,
+                    "{width}: {key} {r:?}"
+                );
+            }
+            press(&mut rt, "compact-context");
+            assert!(commands.try_iter().any(|r| r["type"] == "compact"));
+            assert_eq!(rt.state.current().phase, "Compacting context");
+            rt.state.current_mut().stop();
+            assert!(!rt.state.current().status.busy());
+        }
+    }
+
+    #[test]
+    fn slash_menu_supports_keyboard_selection_and_provider_commands_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().apply(json!({"type":"response","command":"get_commands","success":true,"data":{"commands":[{"name":"skill:review","description":"Review the patch","source":"skill"}]}}));
+            rt.state.current_mut().draft.replace_text("/skill:");
+            rt.invalidate();
+            rt.frame(0.0);
+            let (r, _) = rt.presented("slash-menu").unwrap();
+            assert!(r[0] >= 0.0 && r[0] + r[2] <= width + 1.0);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "/skill:review ");
+            assert!(rt.find("slash-menu").is_none());
+        }
+    }
+
+    #[test]
+    fn steering_and_rewind_controls_send_native_commands_without_overflow() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, commands, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.status = Status::Running;
+            t.draft.replace_text("Steer now");
+            rt.frame(0.0);
+            for key in ["dispatch-mode", "send-message", "stop-agent"] {
+                let (r, _) = rt.presented(key).unwrap();
+                assert!(r[0] + r[2] <= width + 1.0, "{key}");
+            }
+            press(&mut rt, "send-message");
+            let send = commands.try_iter().find(|r| r["type"] == "prompt").unwrap();
+            assert_eq!(send["streamingBehavior"], "steer");
+            assert_eq!(rt.state.current().status, Status::Running);
+            let t = rt.state.current_mut();
+            t.status = Status::Ready;
+            t.session = Some("source.jsonl".into());
+            t.native.conversation = Some(crate::model::ConversationMode::Rewind);
+            t.native.fork_points = vec![json!({"entryId":"point","text":"Repeated prompt"})];
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "fork-point-0");
+            assert!(rt.find("rewind-confirm").is_some());
+            press(&mut rt, "rewind-confirm");
+            let rewind = commands.try_iter().find(|r| r["type"] == "fork").unwrap();
+            assert_eq!(rewind["entryId"], "point");
+        }
     }
 
     #[test]
