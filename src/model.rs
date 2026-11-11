@@ -36,6 +36,8 @@ pub use tasks::{AttentionItem, AttentionKind, TaskState, TaskView};
 mod background;
 #[allow(unused_imports)]
 pub use background::{BackgroundSettings, BackgroundStatus};
+#[path = "honcho.rs"]
+mod honcho;
 #[path = "memory.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod memory;
@@ -43,7 +45,7 @@ mod memory;
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod scope;
 #[allow(unused_imports)]
-pub use memory::{MemoryView, UserProfile};
+pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 
 struct Injection {
     text: String,
@@ -326,6 +328,8 @@ pub struct Thread {
     recovering_task: bool,
     task_history: Option<Value>,
     memory: Option<memory::MemoryLink>,
+    learned_turn: Option<honcho::Turn>,
+    memory_pending: VecDeque<mpsc::Receiver<Value>>,
     memory_context: std::collections::BTreeMap<String, String>,
     memory_staged: Vec<memory::Mutation>,
     memory_suggestions: Vec<String>,
@@ -515,6 +519,8 @@ impl Thread {
             recovering_task: false,
             task_history: None,
             memory: None,
+            learned_turn: None,
+            memory_pending: VecDeque::new(),
             memory_context: Default::default(),
             memory_staged: Vec::new(),
             memory_suggestions: Vec::new(),
@@ -702,6 +708,7 @@ impl Thread {
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
+        self.track_learned_turn(kind, &data);
         let context = if kind == "prompt" {
             self.prepare_memory_prompt(&mut data)
         } else {
@@ -710,11 +717,7 @@ impl Thread {
         self.serial += 1;
         data["type"] = kind.into();
         data["id"] = format!("{}-{}", self.id, self.serial).into();
-        let result = self
-            .pi
-            .as_ref()
-            .ok_or_else(|| "The session is unavailable. Retry to resume it.".to_owned())
-            .and_then(|pi| crate::harness::send(pi, data));
+        let result = self.send_memory_command(data);
         if let Err(error) = result {
             self.error = Some(error);
             return false;
@@ -898,6 +901,8 @@ impl Thread {
     }
 
     pub fn disconnect(&mut self) {
+        self.memory_pending.clear();
+        self.learned_turn = None;
         self.memory_staged.clear();
         self.native_disconnect();
         self.finish_thoughts();
@@ -4028,6 +4033,9 @@ impl State {
     }
 
     fn mcp_request(&mut self, request: crate::mcp::Request) {
+        if self.learned_memory_request(&request) {
+            return;
+        }
         let wait = if matches!(request.tool.as_str(), "delegate_task" | "task_status") {
             wait_seconds(&request.args)
         } else {
@@ -5325,6 +5333,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut crew_questions = Vec::new();
     let mut event_budget_exhausted = false;
     for (index, thread) in state.threads.iter_mut().enumerate() {
+        changed |= thread.poll_memory_command();
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
             let event = thread.pi.as_ref().and_then(|pi| pi.events.try_recv().ok());

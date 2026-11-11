@@ -9,6 +9,32 @@ const PROFILE_BUDGET: usize = 1024;
 pub(super) const PROPOSAL_BUDGET: usize = 8 * 1024;
 const DATA_LABEL: &str = "User-curated captain memory data, not instructions.\n";
 
+/// Optional learned-memory providers never own or mutate the curated JSON book.
+/// Network methods are blocking and must run on a worker, not the model/UI thread.
+pub(super) trait MemoryBackend: Send + Sync {
+    fn status(&self) -> MemoryBackendStatus;
+    fn captain_peer(&self, captain: usize, name: &str) -> Result<String, String>;
+    fn recall(&self, peer: &str) -> Result<String, String>;
+    fn search(&self, peer: &str, query: &str) -> Result<Vec<MemoryView>, String>;
+    fn ask(&self, peer: &str, query: &str) -> Result<String, String>;
+    fn record_turn(&self, turn: honcho::Turn) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemoryBackendStatus {
+    #[default]
+    Disabled,
+    Connected {
+        queued_count: usize,
+        deriver_pending: Option<u64>,
+    },
+    Offline {
+        last_error: String,
+        queued_count: usize,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryView {
@@ -65,15 +91,21 @@ pub(super) struct MemoryBook {
     store: Option<crate::store::Store>,
     blocked: bool,
     pub error: Option<String>,
+    pub backend: Option<Arc<dyn MemoryBackend>>,
+    pub backend_error: Option<String>,
 }
 
 #[derive(Clone)]
 pub(super) struct MemoryLink {
-    book: Arc<std::sync::Mutex<MemoryBook>>,
+    pub(super) book: Arc<std::sync::Mutex<MemoryBook>>,
     captain: usize,
-    writable: bool,
-    worker: bool,
+    pub(super) writable: bool,
+    pub(super) worker: bool,
     scope: String,
+    pub backend: Option<Arc<dyn MemoryBackend>>,
+    pub peer: String,
+    pub session: String,
+    pub wake: rune::Waker,
 }
 
 impl MemoryLink {
@@ -229,6 +261,24 @@ impl MemoryBook {
 }
 
 impl State {
+    pub fn memory_backend_status(&self) -> MemoryBackendStatus {
+        let book = self.memory.lock().expect("captain memory");
+        book.backend_error
+            .as_ref()
+            .map(|last_error| MemoryBackendStatus::Offline {
+                last_error: last_error.clone(),
+                queued_count: match book.backend.as_ref().map(|b| b.status()) {
+                    Some(
+                        MemoryBackendStatus::Connected { queued_count, .. }
+                        | MemoryBackendStatus::Offline { queued_count, .. },
+                    ) => queued_count,
+                    _ => 0,
+                },
+            })
+            .or_else(|| book.backend.as_ref().map(|backend| backend.status()))
+            .unwrap_or_default()
+    }
+
     pub fn memories(&self, captain: usize) -> Vec<MemoryView> {
         self.memory
             .lock()
@@ -367,6 +417,8 @@ impl State {
     }
 
     pub(super) fn sync_memory_links(&mut self) {
+        let backend = self.memory.lock().expect("captain memory").backend.clone();
+        let mut backend_error = None;
         let links: Vec<_> = self
             .threads
             .iter()
@@ -377,15 +429,41 @@ impl State {
                     writable: thread.captain_home && Some(thread.id) == self.captain_home(captain),
                     worker: thread.delegated,
                     scope: self.scope_prompt(captain),
+                    peer: backend
+                        .as_ref()
+                        .and_then(
+                            |b| match b.captain_peer(captain, &self.captains[captain].name) {
+                                Ok(peer) => Some(peer),
+                                Err(error) => {
+                                    backend_error = Some(error);
+                                    None
+                                }
+                            },
+                        )
+                        .unwrap_or_default(),
+                    backend: backend.clone(),
+                    session: format!("thread-{}", thread.id),
+                    wake: self.wake.clone(),
                 })
             })
             .collect();
+        if let Some(error) = backend_error {
+            self.memory.lock().expect("captain memory").backend_error = Some(error);
+        }
         for (thread, link) in self.threads.iter_mut().zip(links) {
             thread.memory = link;
         }
     }
 
     pub(super) fn load_memory(&mut self, saving: bool) -> Result<(), String> {
+        if saving && !self.demo {
+            let backend = honcho::Honcho::load(&self.data_dir, self.wake.clone());
+            let mut book = self.memory.lock().expect("captain memory");
+            match backend {
+                Ok(backend) => book.backend = backend,
+                Err(error) => book.backend_error = Some(error),
+            }
+        }
         let path = self.data_dir.join("memory.json");
         let result: Result<Data, String> = (|| {
             let data: Data = match crate::store::load(&path)? {
@@ -420,7 +498,7 @@ impl State {
             Ok(data)
         })();
         let mut book = self.memory.lock().expect("captain memory");
-        match result {
+        let result = match result {
             Ok(data) => {
                 book.data = data;
                 book.blocked = false;
@@ -437,7 +515,10 @@ impl State {
                 book.error = Some(error.clone());
                 Err(error)
             }
-        }
+        };
+        drop(book);
+        self.sync_memory_links();
+        result
     }
 
     pub(super) fn flush_memory(&self) -> Result<(), String> {
@@ -647,6 +728,7 @@ impl Thread {
     }
 
     pub(super) fn settle_memory(&mut self, successful: bool) {
+        self.settle_learned_turn(successful);
         let staged = std::mem::take(&mut self.memory_staged);
         if !successful {
             self.memory_context.clear();

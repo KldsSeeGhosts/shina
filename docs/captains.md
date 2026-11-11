@@ -51,6 +51,55 @@ Shina saves committed memory and the profile in a separate `memory.json`, using 
 
 `reset_captain_conversation` requires an idle home. It retains the old thread and session file, creates a fresh primary thread with no session or transcript, and keeps the captain profile, scope, memory and user profile. It preserves the harness and pinned model choices. Task control and completion route to the new home without changing task ids, delivery ids, attempts, or historical parent links. The next send starts a fresh Pi or ACP session. The old thread remains in "Earlier conversations".
 
+## Optional Honcho learned memory
+
+Honcho is a second, optional memory backend. Without configuration, Shina keeps its existing local-only behavior. `memory.json` still owns explicit memories, essential flags, user edits and locks, and the global user profile. Honcho cannot edit them. Enabling Honcho does not upload that file or import earlier conversation history.
+
+Create `honcho.json` in Shina's data directory, outside the repository. Windows uses `%LOCALAPPDATA%\Shina`; other platforms use the same data directory as the index. Restart Shina after changing settings.
+
+```json
+{
+  "enabled": true,
+  "base_url": "http://127.0.0.1:18766",
+  "workspace": "shina",
+  "token_file": "C:/private/shina-honcho.jwt",
+  "recall_tokens": 1500,
+  "recall_timeout_ms": 1500
+}
+```
+
+The base URL is an HTTP or HTTPS origin, without `/v3`, credentials, query parameters or a fragment. Workspace defaults to `shina`. Use a separate workspace from other applications. Set `SHINA_HONCHO_TOKEN` in Shina's launch environment instead of an absolute `token_file` path if preferred. The environment variable takes precedence. Shina reads the token at startup, never logs it and never writes it. It does not create the token file or change authentication. An authentication denial suspends requests until the user repairs the token and restarts Shina.
+
+For a loopback-only server, the user can establish a tunnel before launching Shina:
+
+```sh
+ssh -N -L 127.0.0.1:18766:127.0.0.1:18765 user@example-server
+```
+
+This is an example, not a tunnel Shina starts. Point `base_url` at the local forwarded port. Use HTTPS for a non-loopback network connection. Redirects and automatic HTTP proxy discovery are disabled so credentials cannot follow a redirect or an inherited proxy.
+
+### What Shina sends
+
+One workspace contains a `user` peer, one peer per captain, and one generic `worker` peer. A captain's initial peer id combines its stable roster index and a hash of its name. Shina persists that mapping in the outbox ledger so renaming the captain does not change its identity. Each home and worker thread has a separate session. Session ids include an installation id and the local thread id, so resets and independent profiles do not collide.
+
+After a successful settled turn, Shina queues the submitted user text and final assistant reply, each capped at 4,000 Unicode characters. Steering text joins the submitted text under the same cap. Internal task-result wakeups do not become human messages. For a delegated worker, Shina sends only its brief and final report. The captain authors the brief and the generic worker authors the report. A generic worker avoids creating a permanent peer for every task; sessions already distinguish the workers.
+
+Shina does not send tool calls, tool output, reasoning traces, attachments or file contents separately, full worker transcripts, failed or aborted turns, user-curated memory records, or the global user profile. A user message or final report can itself contain sensitive information, including quoted file content. Those texts go to the configured server when enabled.
+
+`honcho-outbox.json` atomically stores pending pairs, installation/message counters and captain mappings. It contains conversation text, so protect it like the local transcript. A single uploader retries pairs in order. It checks `metadata.shina_message_id` through Honcho's message-list endpoint before writing each message. This handles restarts, partial batches and a lost acknowledgement after a committed write without resending messages already visible on the server. Honcho v3.5.0 has no server-enforced client idempotency key, so this requires one Shina writer per data directory and read-your-writes visibility from the configured server. It is not a distributed exactly-once guarantee. Delivered pairs leave the outbox; an offline backlog grows until connectivity returns. A write failure reports a passive error and preserves the existing queued pairs. Shina refuses to reuse an outbox against a different server or workspace.
+
+### Recall, tools and health
+
+Before each primary captain prompt, Shina retrieves the captain's context for `target=user`, including its representation and peer card. Network work runs off the UI thread. The total recall deadline, including get-or-create calls, is at most 1.5 seconds. A timeout skips remote recall and sends the prompt with local memory unchanged. `recall_tokens` bounds the serialized learned-data block using a conservative one-UTF-8-byte-per-token upper bound. It includes the label and JSON overhead. Very small budgets omit recall. The block lives inside `<shina_memory_diff>` and labels the content as untrusted data, not instructions.
+
+Primary captain homes merge local `search_memories` results with Honcho user-message search. Remote search failures retain local results and add `honcho_error`. `ask_memory(query)` asks the captain peer's dialectic chat endpoint about the user and returns a labelled answer. It has a 15-second deadline. Workers keep local memory search and proposals but get neither automatic Honcho recall nor `ask_memory`.
+
+`State::memory_backend_status()` returns `MemoryBackendStatus::Disabled`, `Connected { queued_count, deriver_pending }`, or `Offline { last_error, queued_count }`. Status errors do not fail a conversation turn. The uploader checks `/queue/status` after draining and every ten seconds while enabled. Pending deriver work is separate from Shina's queued messages.
+
+Honcho's deriver runs its own LLM and embedding calls on the server. Those calls use that server's provider configuration and can incur costs independently of Shina's selected chat model.
+
+The integration targets Honcho v3.5.0. Routes and payloads were checked against its tagged `docs/v3/openapi.json`, `src/routers`, message-filter implementation and TypeScript SDK, plus the public Honcho v3 documentation. Fake HTTP server tests require no live server, token or SSH tunnel.
+
 ## Backend UI API
 
 These methods belong to `model::State`. Captain and thread ids are `usize`; `ProjectId` is a `usize` alias. All mutations report validation errors without changing persisted data.
@@ -73,6 +122,7 @@ pub fn set_memory_essential(&mut self, captain: usize, id: &str, essential: bool
     -> Result<(), String>;
 pub fn user_profile(&self) -> UserProfile;
 pub fn set_user_profile(&mut self, profile: UserProfile) -> Result<(), String>;
+pub fn memory_backend_status(&self) -> MemoryBackendStatus;
 ```
 
 `model::MemoryView` has public `id: String`, `text: String`, `essential: bool`, and `user_controlled: bool` fields. `model::UserProfile` has public `name: String`, `time_zone: String`, and `preferences: String` fields and implements `Default`. Memory user actions save through the separate memory store; the existing application checkpoint-and-flush waits for it along with the index and draft stores.
