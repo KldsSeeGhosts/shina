@@ -11,10 +11,11 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc, Mutex, OnceLock,
-        mpsc::{self, Receiver, Sender},
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const PROTOCOL: &str = "2025-06-18";
@@ -130,7 +131,7 @@ fn random_hex(words: usize) -> String {
 fn start() -> std::io::Result<Arc<Server>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(32);
     let server = Arc::new(Server {
         url: format!("http://127.0.0.1:{port}/mcp"),
         tokens: Mutex::new(HashMap::new()),
@@ -138,12 +139,24 @@ fn start() -> std::io::Result<Arc<Server>> {
         wake: Mutex::new(Arc::new(|| {})),
     });
     let shared = server.clone();
+    let connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            if connections
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < 32).then_some(count + 1)
+                })
+                .is_err()
+            {
+                drop(stream);
+                continue;
+            }
+            let connections = connections.clone();
             let server = shared.clone();
             let sender = sender.clone();
             thread::spawn(move || {
                 let _ = serve(stream, &server, &sender);
+                connections.fetch_sub(1, Ordering::AcqRel);
             });
         }
     });
@@ -264,29 +277,150 @@ pub fn tools() -> Value {
     ])
 }
 
-fn serve(stream: TcpStream, server: &Server, requests: &Sender<Request>) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+const MAX_BODY: usize = 4 * 1024 * 1024;
+
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+impl Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP deadline expired.",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(bytes)
+    }
+}
+
+fn limited_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    Read::by_ref(reader)
+        .take(limit as u64 + 1)
+        .read_until(b'\n', &mut bytes)?;
+    if bytes.len() > limit || !bytes.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP line too long or incomplete.",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn chunked_body(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut framing = 0;
+    for _ in 0..4096 {
+        let line = limited_line(reader, 1024)?;
+        framing += line.len();
+        if framing > 64 * 1024 {
+            return Err(std::io::Error::other("Too much chunk framing."));
+        }
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
+            .map_err(|_| std::io::Error::other("Invalid HTTP chunk size."))?;
+        if size == 0 {
+            loop {
+                let trailer = limited_line(reader, 8192)?;
+                framing += trailer.len();
+                if framing > 64 * 1024 {
+                    return Err(std::io::Error::other("Too many HTTP trailers."));
+                }
+                if trailer == "\r\n" {
+                    return Ok(body);
+                }
+            }
+        }
+        if size > MAX_BODY.saturating_sub(body.len()) {
+            return Err(std::io::Error::other("HTTP body too large."));
+        }
+        let offset = body.len();
+        body.resize(offset + size, 0);
+        reader.read_exact(&mut body[offset..])?;
+        let mut end = [0; 2];
+        reader.read_exact(&mut end)?;
+        if end != *b"\r\n" {
+            return Err(std::io::Error::other("Invalid chunk terminator."));
+        }
+    }
+    Err(std::io::Error::other("Too many HTTP chunks."))
+}
+
+fn serve(
+    mut stream: TcpStream,
+    server: &Server,
+    requests: &SyncSender<Request>,
+) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(DeadlineStream {
+        stream: stream.try_clone()?,
+        deadline: Instant::now() + Duration::from_secs(5),
+    });
+    let line = match limited_line(&mut reader, 8192) {
+        Ok(line) => line,
+        Err(_) => {
+            return respond(
+                &mut stream,
+                431,
+                None,
+                &json!({"error":"invalid request headers"}),
+            );
+        }
+    };
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let mut length = 0usize;
+    let mut length = None;
+    let mut encoding = String::new();
+    let mut expect = String::new();
     let mut authorization = String::new();
+    let mut total_headers = line.len();
     loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
+        let header = match limited_line(&mut reader, 8192) {
+            Ok(header) => header,
+            Err(_) => {
+                return respond(
+                    &mut stream,
+                    431,
+                    None,
+                    &json!({"error":"invalid request headers"}),
+                );
+            }
+        };
+        total_headers += header.len();
+        if total_headers > 32 * 1024 {
+            return respond(
+                &mut stream,
+                431,
+                None,
+                &json!({"error":"request headers too large"}),
+            );
+        }
+        if header.trim().is_empty() {
             break;
         }
         if let Some((name, value)) = header.split_once(':') {
             match name.trim().to_ascii_lowercase().as_str() {
-                "content-length" => length = value.trim().parse().unwrap_or(0),
+                "content-length" => {
+                    if length.is_some() || value.trim().parse::<usize>().is_err() {
+                        return respond(
+                            &mut stream,
+                            400,
+                            None,
+                            &json!({"error":"invalid content-length"}),
+                        );
+                    }
+                    length = value.trim().parse::<usize>().ok();
+                }
                 "authorization" => authorization = value.trim().to_owned(),
+                "transfer-encoding" => encoding = value.trim().to_ascii_lowercase(),
+                "expect" => expect = value.trim().to_ascii_lowercase(),
                 _ => {}
             }
         }
     }
-    let mut stream = stream;
     if path.split('?').next() != Some("/mcp") {
         return respond(&mut stream, 404, None, &json!({"error":"not found"}));
     }
@@ -306,7 +440,7 @@ fn serve(stream: TcpStream, server: &Server, requests: &Sender<Request>) -> std:
             &json!({"error":"invalid_shina_credential"}),
         );
     };
-    if length > 4 * 1024 * 1024 {
+    if length.unwrap_or(0) > MAX_BODY {
         return respond(
             &mut stream,
             413,
@@ -314,8 +448,45 @@ fn serve(stream: TcpStream, server: &Server, requests: &Sender<Request>) -> std:
             &json!({"error":"request too large"}),
         );
     }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
+    if (!encoding.is_empty() && encoding != "chunked") || (!encoding.is_empty() && length.is_some())
+    {
+        return respond(
+            &mut stream,
+            400,
+            None,
+            &json!({"error":"invalid transfer encoding"}),
+        );
+    }
+    if !expect.is_empty() && expect != "100-continue" {
+        return respond(
+            &mut stream,
+            417,
+            None,
+            &json!({"error":"unsupported expectation"}),
+        );
+    }
+    if expect == "100-continue" {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        stream.flush()?;
+    }
+    reader.get_mut().deadline = Instant::now() + Duration::from_secs(30);
+    let body = if encoding == "chunked" {
+        match chunked_body(&mut reader) {
+            Ok(body) => body,
+            Err(_) => {
+                return respond(
+                    &mut stream,
+                    400,
+                    None,
+                    &json!({"error":"invalid or oversized chunked body"}),
+                );
+            }
+        }
+    } else {
+        let mut body = vec![0; length.unwrap_or(0)];
+        reader.read_exact(&mut body)?;
+        body
+    };
     let Ok(message) = serde_json::from_slice::<Value>(&body) else {
         return respond(
             &mut stream,
@@ -351,8 +522,8 @@ fn serve(stream: TcpStream, server: &Server, requests: &Sender<Request>) -> std:
                 args: message["params"]["arguments"].clone(),
                 reply,
             };
-            if requests.send(request).is_err() {
-                Err("Shina is shutting down.".to_owned())
+            if requests.try_send(request).is_err() {
+                Err("Shina's request queue is full or shutting down. Retry later.".to_owned())
             } else {
                 (server.wake.lock().expect("mcp waker"))();
                 let outcome = answer
@@ -407,6 +578,8 @@ fn respond(
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large",
         _ => "Payload Too Large",
     };
     let text = if body.is_null() {
@@ -430,6 +603,77 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_http_lines_and_chunks_reject_oversize_or_invalid_framing() {
+        let mut line = std::io::Cursor::new(vec![b'x'; 8193]);
+        assert!(limited_line(&mut line, 8192).is_err());
+        for body in [
+            b"400001\r\n".as_slice(),
+            b"1\r\nxZZ".as_slice(),
+            b"not-hex\r\n".as_slice(),
+        ] {
+            assert!(chunked_body(&mut std::io::Cursor::new(body)).is_err());
+        }
+        let mut body =
+            std::io::Cursor::new(b"3;extension=ok\r\nabc\r\n2\r\nde\r\n0\r\nX-End: yes\r\n\r\n");
+        assert_eq!(chunked_body(&mut body).unwrap(), b"abcde");
+    }
+
+    #[test]
+    fn chunked_posts_and_expect_continue_work_with_real_local_sockets() {
+        let server = start().unwrap();
+        let token = server.token_for(1);
+        let address = server
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp");
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut connection = BufReader::new(stream);
+        write!(connection.get_mut(), "POST /mcp HTTP/1.1\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        assert!(
+            limited_line(&mut connection, 1024)
+                .unwrap()
+                .contains("100 Continue")
+        );
+        assert_eq!(limited_line(&mut connection, 1024).unwrap(), "\r\n");
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"ping"}).to_string();
+        write!(
+            connection.get_mut(),
+            "{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        connection.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"result\":{}"));
+    }
+
+    #[test]
+    fn oversized_pre_auth_headers_are_rejected() {
+        let server = start().unwrap();
+        let address = server
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp");
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nX-Long: {}\r\n\r\n",
+            "x".repeat(9000)
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        let status = limited_line(&mut reader, 1024).unwrap();
+        assert!(status.contains("431"), "{status}");
+    }
 
     fn post(url: &str, token: &str, body: &Value) -> (u16, String) {
         let address = url.trim_start_matches("http://").trim_end_matches("/mcp");

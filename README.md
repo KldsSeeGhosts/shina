@@ -86,7 +86,7 @@ The button is disabled while any thread is running, waiting for you, configuring
 
 A normal quit always saves and flushes, but does not install an update. The download stays ready for the next launch. Only the restart button approves installation. This avoids stale install approvals when Windows cancels a session end. macOS uses an atomic bundle exchange. Windows starts a copy of the previous executable as a helper, waits for the UI process to exit, then replaces the executable with `ReplaceFileW`. A failed launch restores and reopens the previous build when the platform reports the failure.
 
-Checks and downloads that fail quietly retry at the next interval: a missing `gh`, no network, a release without this platform's asset, a partial download or a checksum mismatch never shows an error in a thread. A real authentication denial stops update attempts until you restart Shina and records the manual remedy, `gh auth login`, in updater diagnostics. Shina never runs a login or stores a token. Development builds, `--demo` runs and snapshot runs never update themselves.
+Failed checks and downloads retry at the next interval. The sidebar shows the last failure and a retry button, and session details include bounded updater diagnostics. A real authentication denial suspends automatic attempts and shows the manual remedy, `gh auth login`. After repairing the login yourself, use Retry update check or restart Shina. HTTP 403 alone does not count as an authentication denial. Shina never runs a login or stores a token. Development builds, `--demo` runs and snapshot runs never update themselves.
 
 macOS updates need release assets that `release.ps1` did not publish before: a complete `Shina.app` zipped per architecture, as `Shina-macos-aarch64.zip` (Apple silicon) and `Shina-macos-x86_64.zip` (Intel), plus a `SHA256SUMS` file covering every asset. Build a Mac zip on the matching Mac:
 
@@ -190,7 +190,13 @@ Each thread starts Pi in its own project's folder. A project-less thread uses `%
 
 Pi keeps its session files and credentials in its normal locations outside this repository. Drafts survive thread and project switches and app restarts. Run only one Shina instance at a time to avoid competing global-index writes.
 
-Closing Shina closes the agent input pipes and waits for shutdown. After a short grace period, it terminates any remaining agent process. This is cleanup, not process-tree isolation.
+Closing Shina terminates its owned agent and clone process trees. Windows assigns each subprocess to a kill-on-close Job Object before allowing it to run; Unix uses process groups. Pipe writes run separately from process supervision, and shutdown waits have deadlines. Reconnecting to a saved session waits for its previous Pi owner to exit. A stop that gets no settlement forces a disconnect after ten seconds; model and thinking commands time out after thirty seconds.
+
+Failed index writes retry while idle and on flush, even if the state has not changed. Flush waits at most five seconds per store. A persistent disk failure can still prevent saving. File replacement and directory flushing are best effort against power loss, especially on Windows filesystems that do not support directory flushes.
+
+History images import on the RPC reader rather than the UI thread. Validated blobs and previews are reused. The transcript draws at most the latest 32 image previews and labels older omitted previews. Large project icons use cached 64-pixel thumbnails; oversized or invalid icon sources use the project initial. Thread diagnostics retain at most 128 entries, each limited to about 2 KiB.
+
+The loopback MCP transport accepts fixed-length and chunked POST bodies and `Expect: 100-continue`. It limits bodies to 4 MiB, headers to 32 KiB, individual header lines to 8 KiB, concurrent connections and queued calls to 32, and UI request processing to 16 calls per frame. Header reads have a five-second absolute deadline.
 
 ## Validation
 

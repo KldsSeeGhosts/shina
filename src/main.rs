@@ -9,6 +9,7 @@ mod install;
 mod lifecycle;
 mod mcp;
 mod model;
+mod process;
 mod projects;
 mod session;
 mod store;
@@ -232,7 +233,22 @@ fn main() {
     }
     if args.iter().any(|a| a == "--uninstall") {
         if let Err(error) = install::uninstall() {
+            #[cfg(windows)]
+            install::show_uninstall_error(&error);
             eprintln!("Could not uninstall Shina: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--finish-uninstall") {
+        if let Err(error) = install::finish_uninstall() {
+            install::report_notice(&error);
+            if store::directory()
+                .is_some_and(|directory| directory.join("uninstall-started").is_file())
+            {
+                install::show_uninstall_error(&error);
+            }
             std::process::exit(1);
         }
         return;
@@ -454,6 +470,8 @@ fn close_hook(state: &mut State) {
 /// Always save on each quit attempt. Windows can cancel session end and call this again.
 /// Normal quits never approve an install, so cancellation cannot leave a stale approval.
 fn quit_hook(state: &mut State) {
+    // Kill the owned clone tree before native host teardown drops its worker threads.
+    state.projects.clone_job.take();
     if let Err(error) = state.checkpoint_and_flush() {
         state.cancel_update_exit();
         eprintln!("Could not save Shina before quitting: {error}");
@@ -468,6 +486,7 @@ fn install_recorded_update() {
     #[cfg(windows)]
     {
         if let Err(error) = update::start_windows_helper(&exit.update) {
+            install::report_notice(&format!("Could not start the update helper: {error}"));
             eprintln!("Could not start the update helper: {error}");
             let _ = update::relaunch(&exit.update.launcher(), &exit.update.target);
         }

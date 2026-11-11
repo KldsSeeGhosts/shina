@@ -7,15 +7,14 @@
 use crate::model::State;
 use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::sync::mpsc::channel;
 use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        mpsc::{Receiver, channel},
-    },
+    process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc::Receiver},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -37,7 +36,7 @@ pub struct Project {
     pub captain: Option<usize>,
     /// The designated coordinator. Older home flags remain historical metadata.
     pub captain_thread: Option<usize>,
-    /// A PNG icon found in the project, shown beside its threads as T3 Code shows favicons.
+    /// A bounded cached PNG derived from the project's icon.
     pub icon: Option<PathBuf>,
 }
 
@@ -105,7 +104,57 @@ fn find_icon(root: &Path) -> Option<PathBuf> {
     ]
     .iter()
     .map(|candidate| root.join(candidate))
-    .find(|path| path.is_file())
+    .find_map(|path| bounded_icon(&path))
+}
+
+fn bounded_icon(path: &Path) -> Option<PathBuf> {
+    use sha2::Digest;
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return None;
+    }
+    // Rune ignores raster display sizes. Cache a small content-keyed file instead.
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > LIMIT {
+        return None;
+    }
+    let (width, height) =
+        image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png)
+            .into_dimensions()
+            .ok()?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 4 * 1024 * 1024 {
+        return None;
+    }
+    let cache = crate::store::directory()?.join("project-icons");
+    let thumbnail = cache.join(format!("{:x}.png", sha2::Sha256::digest(&bytes)));
+    if thumbnail.is_file() {
+        return Some(thumbnail);
+    }
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok()?;
+    fs::create_dir_all(cache).ok()?;
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = thumbnail.with_extension(format!(
+        "{}-{}.png",
+        std::process::id(),
+        SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    decoded
+        .thumbnail(width.min(64), height.min(64))
+        .save(&staged)
+        .ok()?;
+    if fs::rename(&staged, &thumbnail).is_err() {
+        let _ = fs::remove_file(staged);
+        if !thumbnail.is_file() {
+            return None;
+        }
+    }
+    Some(thumbnail)
 }
 
 fn optional_id(value: &Value) -> Option<Option<usize>> {
@@ -498,7 +547,7 @@ enum CloneEvent {
 
 pub struct CloneJob {
     events: Receiver<CloneEvent>,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<crate::process::Process>>>,
     canceled: Arc<std::sync::atomic::AtomicBool>,
     pub target: PathBuf,
     pub parent: PathBuf,
@@ -506,7 +555,7 @@ pub struct CloneJob {
 
 impl CloneJob {
     fn start(source: &Source, parent: PathBuf, target: PathBuf, wake: Waker) -> Self {
-        let (tx, events) = channel();
+        let (tx, events) = std::sync::mpsc::sync_channel(32);
         let child = Arc::new(Mutex::new(None));
         let canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut command = clone_command(source, &target);
@@ -518,10 +567,21 @@ impl CloneJob {
         let (slot, stop) = (child.clone(), canceled.clone());
         std::thread::spawn(move || {
             let send = |event| {
-                let _ = tx.send(event);
+                match event {
+                    CloneEvent::Progress(_) => {
+                        let _ = tx.try_send(event);
+                    }
+                    CloneEvent::Done(_) => {
+                        let _ = tx.send(event);
+                    }
+                }
                 wake();
             };
-            let mut process = match command.spawn() {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                send(CloneEvent::Done(Err("Clone canceled.".into())));
+                return;
+            }
+            let mut process = match crate::process::Process::spawn(&mut command) {
                 Ok(process) => process,
                 Err(error) => {
                     send(CloneEvent::Done(Err(format!(
@@ -532,6 +592,11 @@ impl CloneJob {
             };
             let mut stderr = process.stderr.take();
             *slot.lock().unwrap() = Some(process);
+            if stop.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(process) = slot.lock().unwrap().as_mut()
+            {
+                process.terminate();
+            }
             let mut tail: Vec<String> = vec![];
             let mut line = Vec::new();
             let mut buffer = [0u8; 1024];
@@ -550,13 +615,33 @@ impl CloneJob {
                             }
                             tail.push(text);
                         }
-                    } else {
+                    } else if line.len() < 2048 {
                         line.push(byte);
                     }
                 }
             }
-            let process = slot.lock().unwrap().take();
-            let status = process.map(|mut p| p.wait());
+            let status = loop {
+                let mut child = slot.lock().unwrap();
+                let Some(process) = child.as_mut() else {
+                    break None;
+                };
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    process.terminate();
+                }
+                match process.try_wait() {
+                    Ok(Some(status)) => {
+                        child.take();
+                        break Some(Ok(status));
+                    }
+                    Err(error) => {
+                        child.take();
+                        break Some(Err(error));
+                    }
+                    Ok(None) => {}
+                }
+                drop(child);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
             let result = if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 Err("Clone canceled.".into())
             } else {
@@ -588,8 +673,14 @@ impl CloneJob {
         self.canceled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
+            child.terminate();
         }
+    }
+}
+
+impl Drop for CloneJob {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -704,10 +795,13 @@ impl State {
                 CloneEvent::Done(result) => finished = Some(result),
             }
         }
-        let Some(result) = finished else {
+        let Some(mut result) = finished else {
             return changed;
         };
         let job = self.projects.clone_job.take().unwrap();
+        if job.canceled.load(std::sync::atomic::Ordering::SeqCst) {
+            result = Err("Clone canceled.".into());
+        }
         match result {
             Ok(()) => {
                 self.projects.recents.clone_parent = Some(job.parent.clone());
@@ -861,6 +955,58 @@ pub fn pick_clone_parent(s: &mut State, tx: &mut Tx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_project_icons_are_not_sent_to_the_full_resolution_decoder() {
+        let root = crate::store::directory().unwrap().join("icons");
+        fs::create_dir_all(&root).unwrap();
+        let icon = root.join("favicon.png");
+        image::DynamicImage::new_rgb8(4096, 1).save(&icon).unwrap();
+        let cached = find_icon(&root).unwrap();
+        assert_ne!(cached, icon);
+        let dimensions = image::ImageReader::open(cached)
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert!(dimensions.0 <= 64 && dimensions.1 <= 64);
+        image::DynamicImage::new_rgb8(32, 32).save(&icon).unwrap();
+        let cached = find_icon(&root).unwrap();
+        assert_ne!(cached, icon);
+        assert_eq!(
+            image::ImageReader::open(cached)
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (32, 32)
+        );
+    }
+
+    #[test]
+    fn cancelling_a_queued_clone_completion_does_not_add_the_project() {
+        let root = crate::store::directory().unwrap().join("cancelled-clone");
+        fs::create_dir_all(&root).unwrap();
+        let mut state = State::new(PathBuf::new(), false);
+        let mut job = CloneJob::test_finished("finished", Ok(()));
+        job.target = root.clone();
+        job.cancel();
+        state.projects.clone_job = Some(job);
+        state.poll_projects();
+        assert!(
+            !state
+                .projects
+                .entries
+                .iter()
+                .any(|project| same_path(&project.path, &root))
+        );
+        assert!(
+            state
+                .projects
+                .clone_error
+                .as_deref()
+                .unwrap()
+                .contains("canceled")
+        );
+    }
 
     #[test]
     fn browse_queries_split_into_a_folder_and_a_filter_and_list_matching_folders() {

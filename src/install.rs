@@ -35,8 +35,7 @@ pub fn adopt_app_id() {
         unsafe {
             SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
         }
-        // Best effort: a failed shortcut refresh must not stop an already-replaced app.
-        let _ = refresh_windows_registration();
+        // Registration belongs to install/update, never the window's startup path.
     }
 }
 
@@ -336,10 +335,17 @@ pub fn restore_exe(dir: &Path, _running: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Makes a folder's renames durable. Without it a rename survives in memory but not after a
-/// crash, and a reopened app can find a name whose contents never reached the disk.
+/// Best-effort directory flush. Some Windows filesystems do not support flushing directory
+/// handles; a successful executable replacement is not a power-loss durability guarantee.
 pub fn sync_directory(dir: &Path) {
-    if let Ok(directory) = fs::File::open(dir) {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x02000000); // FILE_FLAG_BACKUP_SEMANTICS
+    }
+    if let Ok(directory) = options.open(dir) {
         let _ = directory.sync_all();
     }
 }
@@ -390,16 +396,59 @@ impl InstallLock {
 /// Starts Shina without sharing this process's console or pipes, so a script that ran
 /// `--install` (or the app that relaunched for an update) is never held open by it.
 pub fn launch_with(exe: &Path, args: &[&str]) -> Result<(), String> {
-    Command::new(exe)
+    launch_child(exe, args).map(drop)
+}
+
+pub fn launch_child(exe: &Path, args: &[&str]) -> Result<std::process::Child, String> {
+    let mut command = Command::new(exe);
+    #[cfg(windows)]
+    hidden(&mut command);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(drop)
         .map_err(|e| format!("Could not start {}: {e}", exe.display()))
 }
 
+pub fn report_notice(message: &str) {
+    if let Some(directory) = crate::store::directory() {
+        let _ = fs::create_dir_all(&directory);
+        let _ = fs::write(
+            directory.join("startup-warning.txt"),
+            crate::update::redact(message),
+        );
+    }
+}
+
+#[cfg(windows)]
+pub fn show_uninstall_error(message: &str) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(
+            window: *mut std::ffi::c_void,
+            text: *const u16,
+            title: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "Shina uninstall failed"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10);
+    }
+}
+
+#[cfg(windows)]
+fn registration_command(command: &mut Command) -> Result<std::process::ExitStatus, String> {
+    crate::process::output(command, std::time::Duration::from_secs(15), 64 * 1024)
+        .map(|output| output.status)
+        .map_err(|e| e.to_string())
+}
 #[cfg(windows)]
 fn hidden(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -416,32 +465,29 @@ fn powershell_quote(text: &str) -> String {
 }
 
 /// Recreates the Start Menu shortcut and the Apps & Features entry for the installed build.
-/// Runs on launch, so an update replaced the executable without repeating the copy-and-launch.
+/// Runs only during install or update, never before opening the window.
 #[cfg(windows)]
 pub fn refresh_windows_registration() -> Result<(), String> {
     let target = install_dir()
         .map(|dir| dir.join("shina.exe"))
         .ok_or("LOCALAPPDATA is not set.")?;
     let shortcut = start_menu_shortcut().ok_or("APPDATA is not set.")?;
-    // Recreate rather than overwrite: launchers such as Caelestia watch the Start Menu folder
-    // for added and removed files, and an in-place rewrite would leave them with a stale entry.
-    let _ = fs::remove_file(&shortcut);
+    let staged_shortcut = shortcut.with_file_name("Shina.new.lnk");
     let home = env::var("USERPROFILE").unwrap_or_default();
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({}); $s.TargetPath = {}; \
          $s.WorkingDirectory = {}; $s.IconLocation = {}; $s.Description = 'Shina'; $s.Save()",
-        powershell_quote(&shortcut.to_string_lossy()),
+        powershell_quote(&staged_shortcut.to_string_lossy()),
         powershell_quote(&target.to_string_lossy()),
         powershell_quote(&home),
         powershell_quote(&format!("{},0", target.to_string_lossy())),
     );
-    let status = hidden(Command::new("powershell").args([
+    let status = registration_command(Command::new("powershell").args([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
         &script,
     ]))
-    .status()
     .map_err(|e| format!("Could not create the Start Menu shortcut: {e}"))?;
     if !status.success() {
         return Err("Could not create the Start Menu shortcut.".into());
@@ -449,22 +495,26 @@ pub fn refresh_windows_registration() -> Result<(), String> {
     let helper = target.with_file_name("set-app-id.ps1");
     fs::write(&helper, SET_APP_ID)
         .map_err(|e| format!("Could not write {}: {e}", helper.display()))?;
-    let status = hidden(Command::new("powershell").args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-    ]))
-    .arg(&helper)
-    .arg("-Shortcut")
-    .arg(&shortcut)
-    .args(["-AppId", APP_ID])
-    .status()
+    let status = registration_command(
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&helper)
+            .arg("-Shortcut")
+            .arg(&staged_shortcut)
+            .args(["-AppId", APP_ID]),
+    )
     .map_err(|e| format!("Could not set the shortcut's app ID: {e}"))?;
     if !status.success() {
         return Err("Could not set the shortcut's app ID.".into());
     }
+    fs::rename(&staged_shortcut, &shortcut)
+        .map_err(|e| format!("Could not replace the Start Menu shortcut: {e}"))?;
     let exe = target.to_string_lossy().into_owned();
     let dir = target
         .parent()
@@ -488,7 +538,7 @@ pub fn refresh_windows_registration() -> Result<(), String> {
         ("NoModify", "REG_DWORD", "1".to_owned()),
         ("NoRepair", "REG_DWORD", "1".to_owned()),
     ] {
-        let status = hidden(Command::new("reg").args([
+        let status = registration_command(Command::new("reg").args([
             "add",
             UNINSTALL_KEY,
             "/v",
@@ -499,7 +549,6 @@ pub fn refresh_windows_registration() -> Result<(), String> {
             &value,
             "/f",
         ]))
-        .status()
         .map_err(|e| format!("Could not register Shina with Windows: {e}"))?;
         if !status.success() {
             return Err(format!("Could not write the {name} uninstall value."));
@@ -518,7 +567,11 @@ pub fn refresh_windows_registration() -> Result<(), String> {
 pub fn install() -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|e| e.to_string())?;
     let target = place_exe(&current)?;
-    refresh_windows_registration()?;
+    if let Err(error) = refresh_windows_registration() {
+        report_notice(&format!(
+            "Shina installed, but Windows registration failed: {error}"
+        ));
+    }
     Ok(target)
 }
 
@@ -526,28 +579,137 @@ pub fn install() -> Result<PathBuf, String> {
 /// once this process has exited. Thread indexes in `%LOCALAPPDATA%\Shina` are kept.
 #[cfg(windows)]
 pub fn uninstall() -> Result<(), String> {
+    let root = crate::store::directory().ok_or("No Shina data directory.")?;
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let helper = root.join("uninstall-helper.exe");
+    fs::copy(env::current_exe().map_err(|e| e.to_string())?, &helper).map_err(|e| e.to_string())?;
+    let marker = root.join("uninstall-started");
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not reset the uninstall handshake: {error}")),
+    }
+    let mut child = launch_child(
+        &helper,
+        &["--finish-uninstall", &std::process::id().to_string()],
+    )?;
+    wait_for_marker(&mut child, &marker, std::time::Duration::from_secs(10))
+}
+
+#[cfg(windows)]
+pub fn wait_for_marker(
+    child: &mut std::process::Child,
+    marker: &Path,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if marker.is_file() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let mut details = String::new();
+            if let Some(directory) = crate::store::directory()
+                && let Ok(file) = fs::File::open(directory.join("startup-warning.txt"))
+            {
+                let _ = file.take(4096).read_to_string(&mut details);
+            }
+            return Err(format!(
+                "The Shina helper exited before acknowledging: {status}. {details}"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = crate::process::wait_child(child, std::time::Duration::from_secs(1));
+            return Err("The Shina helper did not acknowledge in time.".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(windows)]
+pub fn finish_uninstall() -> Result<(), String> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    let root = crate::store::directory().ok_or("No Shina data directory.")?;
+    if env::current_exe().map_err(|e| e.to_string())? != root.join("uninstall-helper.exe") {
+        return Err("Only the staged helper may finish uninstall.".into());
+    }
+    let target = install_dir().ok_or("No install folder.")?;
+    // Never recurse into a redirected, relative, or unexpected directory.
+    let metadata = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+    if !target.is_absolute()
+        || metadata.file_type().is_symlink()
+        || target.file_name().and_then(|name| name.to_str()) != Some("Shina")
+        || target
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("Programs")
+    {
+        return Err("Unsafe uninstall target.".into());
+    }
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("No local app directory.")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let expected = crate::projects::clean_path(&base.join("Programs").join("Shina"));
+    let resolved = crate::projects::clean_path(&target.canonicalize().map_err(|e| e.to_string())?);
+    if !resolved
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return Err(
+            "The install directory resolves outside its expected location. No files were removed."
+                .into(),
+        );
+    }
+    let parent = env::args()
+        .nth(2)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&id| id != 0 && id != std::process::id())
+        .ok_or("Invalid uninstall parent.")?;
+    let handle = unsafe { OpenProcess(0x00100000, 0, parent) };
+    if handle.is_null() {
+        return Err("Could not open the uninstall parent.".into());
+    }
+    let acknowledged = fs::write(root.join("uninstall-started"), b"ready");
+    let result = if acknowledged.is_ok() {
+        unsafe { WaitForSingleObject(handle, 30_000) }
+    } else {
+        u32::MAX
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if result != 0 {
+        return Err("Shina did not exit. Registration was preserved.".into());
+    }
+    fs::remove_dir_all(&resolved).map_err(|e| {
+        format!(
+            "Could not remove {}: {e}. Registration was preserved. Close all Shina windows and retry uninstall.",
+            target.display()
+        )
+    })?;
+    if target.exists() {
+        return Err("The install folder still exists. Retry uninstall.".into());
+    }
     if let Some(shortcut) = start_menu_shortcut() {
         let _ = fs::remove_file(shortcut);
     }
-    let _ = hidden(Command::new("reg").args(["delete", UNINSTALL_KEY, "/f"])).status();
-    if let Some(dir) = install_dir().filter(|d| d.is_dir()) {
-        let path = dir.to_string_lossy().into_owned();
-        let mut command = Command::new("cmd");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // cmd parses its own quoting, so pass the line verbatim.
-            command.raw_arg(format!(
-                "/C \"timeout /t 2 /nobreak >nul & rmdir /s /q \"{path}\"\""
-            ));
-        }
-        hidden(&mut command)
-            .spawn()
-            .map_err(|e| format!("Could not schedule removal of {path}: {e}"))?;
+    let status = registration_command(Command::new("reg").args(["delete", UNINSTALL_KEY, "/f"]))?;
+    if !status.success() {
+        return Err("The files were removed but Windows registration could not be removed.".into());
     }
+    let _ = fs::remove_file(root.join("uninstall-started"));
     Ok(())
 }
-
 #[cfg(not(windows))]
 pub fn uninstall() -> Result<(), String> {
     Err("Shina installs as an app bundle on this platform.".into())
@@ -751,14 +913,29 @@ pub fn restore_mac_bundle(app: &Path) -> Result<(), String> {
 pub fn open_mac_bundle(app: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("/usr/bin/open")
+        // This launcher intentionally starts a long-lived app, so it must not own a
+        // kill-on-drop process tree. Only the launcher's wait is bounded.
+        let mut child = Command::new("/usr/bin/open")
             .arg("-n")
             .arg(app)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
+            .spawn()
             .map_err(|e| format!("Could not open {}: {e}", app.display()))?;
+        let status =
+            match crate::process::wait_child(&mut child, std::time::Duration::from_secs(30)) {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ =
+                        crate::process::wait_child(&mut child, std::time::Duration::from_secs(1));
+                    return Err(format!(
+                        "Could not finish opening {}: {error}",
+                        app.display()
+                    ));
+                }
+            };
         if status.success() {
             Ok(())
         } else {
@@ -775,6 +952,25 @@ pub fn open_mac_bundle(app: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_exit_is_detected_without_waiting_for_the_handshake_timeout() {
+        let root = crate::store::directory().unwrap();
+        let mut command = Command::new("cmd");
+        command.args(["/C", "exit", "1"]);
+        let mut child = crate::process::Process::spawn(&mut command).unwrap();
+        let start = std::time::Instant::now();
+        assert!(
+            wait_for_marker(
+                &mut child,
+                &root.join("no-marker"),
+                std::time::Duration::from_secs(20)
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary(label: &str) -> PathBuf {

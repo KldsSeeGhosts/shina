@@ -251,6 +251,7 @@ pub struct Thread {
     pub parent: Option<usize>,
     /// How this thread's Pi reaches the Shina MCP, set when it connects.
     pub host: Option<HostLink>,
+    connection_owner: Arc<crate::backend::SessionOwner>,
     assistant: Option<usize>,
     serial: usize,
     state_loaded: bool,
@@ -272,6 +273,8 @@ pub struct Thread {
     pending_prompt: Option<(String, Prompt, usize)>,
     pending_injections: VecDeque<Injection>,
     injection_id: Option<String>,
+    injection_retry_at: Option<Instant>,
+    operation_deadline: Option<(&'static str, Instant)>,
     task_result: Option<&'static str>,
     completion_notified: bool,
     forwarded_question: Option<String>,
@@ -422,6 +425,7 @@ impl Thread {
             delegated: false,
             parent: None,
             host: None,
+            connection_owner: Arc::default(),
             assistant: None,
             serial: 0,
             state_loaded: false,
@@ -443,6 +447,8 @@ impl Thread {
             pending_prompt: None,
             pending_injections: VecDeque::new(),
             injection_id: None,
+            injection_retry_at: None,
+            operation_deadline: None,
             task_result: None,
             completion_notified: true,
             forwarded_question: None,
@@ -497,6 +503,7 @@ impl Thread {
             wake,
             instructions,
             self.host.clone(),
+            self.connection_owner.clone(),
         ));
     }
 
@@ -609,6 +616,22 @@ impl Thread {
             return false;
         }
         self.last_activity = Instant::now();
+        match kind {
+            "set_model" => {
+                self.operation_deadline =
+                    Some(("set_model", Instant::now() + Duration::from_secs(30)))
+            }
+            "set_thinking_level" => {
+                self.operation_deadline = Some((
+                    "set_thinking_level",
+                    Instant::now() + Duration::from_secs(30),
+                ))
+            }
+            "abort" => {
+                self.operation_deadline = Some(("abort", Instant::now() + Duration::from_secs(10)))
+            }
+            _ => {}
+        }
         true
     }
 
@@ -691,6 +714,8 @@ impl Thread {
     fn stop_task(&mut self) -> Result<(), String> {
         self.pending_injections.clear();
         self.injection_id = None;
+        self.injection_retry_at = None;
+        self.operation_deadline = None;
         if self.initializing || self.queued_prompt.is_some() {
             self.disconnect();
             self.complete_task("cancelled");
@@ -702,10 +727,14 @@ impl Thread {
                 self.respond(json!({"cancelled":true}));
             }
             if !self.command("clear_queue", json!({})) || !self.command("abort", json!({})) {
-                return Err(self
+                let error = self
                     .error
                     .clone()
-                    .unwrap_or_else(|| "Pi could not stop the task.".into()));
+                    .unwrap_or_else(|| "Pi could not stop the task.".into());
+                self.disconnect();
+                self.complete_task("cancelled");
+                self.error = Some(error.clone());
+                return Err(error);
             }
             self.phase = "Stopping".into();
         } else {
@@ -755,6 +784,8 @@ impl Thread {
         self.configuring = false;
         self.pending_thinking = None;
         self.injection_id = None;
+        self.injection_retry_at = None;
+        self.operation_deadline = None;
         self.context.cancel_request();
         self.started = None;
         self.phase.clear();
@@ -789,12 +820,22 @@ impl Thread {
     }
 
     fn flush_injection(&mut self) -> bool {
+        if self
+            .injection_retry_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.injection_retry_at = None;
+        }
         if self.pending_injections.is_empty()
             || self.pi.is_none()
             || self.initializing
             || self.queued_prompt.is_some()
             || self.injection_id.is_some()
             || self.configuring
+            || self.context.phase == crate::context::ContextPhase::Compacting
+            || self
+                .injection_retry_at
+                .is_some_and(|at| Instant::now() < at)
             || self.phase == "Stopping"
             || !matches!(
                 self.status,
@@ -839,6 +880,39 @@ impl Thread {
             self.error = None;
             self.phase = "Waiting for Pi".into();
             self.ensure_work();
+        }
+        true
+    }
+
+    fn diagnostic(&mut self, text: &str) {
+        const LIMIT: usize = 128;
+        if self.diagnostics.len() >= LIMIT {
+            self.diagnostics.drain(..self.diagnostics.len() + 1 - LIMIT);
+        }
+        self.diagnostics
+            .push(crate::update::redact(&crate::projects::redact(&truncate(
+                text, 2048,
+            ))));
+    }
+
+    fn check_deadlines(&mut self, now: Instant) -> bool {
+        let Some((operation, deadline)) = self.operation_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        if operation == "abort" {
+            self.disconnect();
+            self.pending_injections.clear();
+            self.complete_task("cancelled");
+            self.error =
+                Some("Pi did not stop within ten seconds. Its process was terminated.".into());
+        } else {
+            self.fail_session(
+                "Pi did not answer the settings command within thirty seconds. Retry to resume."
+                    .into(),
+            );
         }
         true
     }
@@ -1129,6 +1203,12 @@ impl Thread {
         match string(&record, "type") {
             "response" => {
                 let command = string(&record, "command");
+                if self
+                    .operation_deadline
+                    .is_some_and(|(kind, _)| kind == command && kind != "abort")
+                {
+                    self.operation_deadline = None;
+                }
                 let injection = command == "prompt"
                     && self
                         .injection_id
@@ -1138,6 +1218,16 @@ impl Thread {
                     self.injection_id = None;
                     if record["success"] != false {
                         self.pending_injections.pop_front();
+                        self.injection_retry_at = None;
+                    } else if string(&record, "error")
+                        .to_ascii_lowercase()
+                        .contains("compaction")
+                    {
+                        self.injection_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                        self.diagnostic(
+                            "Completion delivery deferred until Pi finishes compaction.",
+                        );
+                        return;
                     }
                 }
                 // Context stats are optional telemetry. A rejected or stale request must never
@@ -1365,6 +1455,12 @@ impl Thread {
             }
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
+                if self
+                    .operation_deadline
+                    .is_some_and(|(kind, _)| kind == "abort")
+                {
+                    self.operation_deadline = None;
+                }
                 self.life.last_completed_at = Some(lifecycle::now());
                 self.request = None;
                 let aborted = record["aborted"] == true;
@@ -1450,8 +1546,7 @@ impl Thread {
             }
             "auto_retry_start" => {
                 self.phase = format!("Retrying, attempt {}", record["attempt"]);
-                self.diagnostics
-                    .push(string(&record, "errorMessage").into());
+                self.diagnostic(string(&record, "errorMessage"));
             }
             "auto_retry_end" => {
                 if record["success"] == true {
@@ -1473,6 +1568,7 @@ impl Thread {
                 // Pi reports null usage until its next assistant response, so this request
                 // legitimately leaves the ring unknown rather than reusing the old figure.
                 self.refresh_context_usage();
+                self.flush_injection();
             }
             "thinking_level_changed" => self.thinking = string(&record, "level").into(),
             "tool_execution_update" | "tool_execution_end" => {
@@ -1509,7 +1605,7 @@ impl Thread {
                     self.request = Some(record);
                     self.status = Status::Waiting;
                 } else if record["method"] == "notify" {
-                    self.diagnostics.push(string(&record, "message").into());
+                    self.diagnostic(string(&record, "message"));
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
                 }
@@ -1952,7 +2048,12 @@ impl State {
             .enumerate()
             .filter(|(_, t)| {
                 t.archived() == self.show_archive
-                    && !t.delegated
+                    && (!t.delegated
+                        || t.parent.is_some_and(|id| {
+                            self.threads
+                                .iter()
+                                .any(|parent| parent.id == id && !parent.captain_home)
+                        }))
                     && !self.is_captain_home(t)
                     && (!t.is_draft() || self.draft_listed(t))
             })
@@ -2117,6 +2218,9 @@ impl State {
     }
     /// Open the workspace picker with an empty search.
     pub fn open_picker(&mut self, mode: ProjectPicker) {
+        if self.captain_editor.is_none() {
+            self.cancel_captain_flow();
+        }
         self.picker_browsing = false;
         self.project_picker = Some(mode);
         self.picker_query = TextEdit::default();
@@ -2998,6 +3102,7 @@ impl State {
     }
 
     pub fn edit_captain(&mut self, captain: usize) {
+        self.cancel_captain_flow();
         let Some(profile) = self.captains.get(captain) else {
             return;
         };
@@ -3008,6 +3113,13 @@ impl State {
         editor.instructions.replace_text(&profile.instructions);
         editor.portrait = profile.portrait;
         self.captain_editor = Some(editor);
+    }
+
+    pub fn cancel_captain_flow(&mut self) {
+        self.captain_picker = false;
+        self.captain_editor = None;
+        self.captain_project = None;
+        self.projects.captain_target = None;
     }
 
     pub fn save_captain(&mut self) {
@@ -3318,7 +3430,7 @@ impl State {
             Ok(host) => thread.host = Some(host),
             Err(error) => {
                 thread.host = None;
-                thread.diagnostics.push(error);
+                thread.diagnostic(&error);
             }
         }
         thread.connect_with_instructions(path, wake, instructions);
@@ -3368,7 +3480,11 @@ impl State {
                             && (all
                                 || match coordinator {
                                     Some(home) => t.id == home || t.parent == Some(home),
-                                    None => t.project == project && !t.captain_home && !t.delegated,
+                                    None => {
+                                        t.project == project
+                                            && !t.captain_home
+                                            && (!t.delegated || t.parent == Some(caller))
+                                    }
                                 })
                     })
                     .map(|t| {
@@ -4058,6 +4174,20 @@ impl State {
                             return None;
                         }
                     }
+                    for field in ["session", "model", "thinking"] {
+                        if record
+                            .get(field)
+                            .is_some_and(|v| !v.is_null() && !v.is_string())
+                        {
+                            return None;
+                        }
+                    }
+                    if record
+                        .get("updated")
+                        .is_some_and(|v| !v.is_null() && !v.is_u64())
+                    {
+                        return None;
+                    }
                     thread.project = if record["project"].is_null() {
                         None
                     } else {
@@ -4107,16 +4237,18 @@ impl State {
                 .collect();
             let ids: std::collections::HashSet<_> = restored.iter().map(|t| t.id).collect();
             let parents_valid = restored.iter().all(|thread| {
-                thread.parent.is_none_or(|parent| {
-                    thread.delegated
-                        && parent != thread.id
-                        && restored.iter().any(|t| {
-                            t.id == parent
-                                && !t.delegated
-                                && t.project == thread.project
-                                && t.machine == thread.machine
-                        })
-                })
+                (!thread.captain_home || thread.captain.is_some() && !thread.delegated)
+                    && thread.delegated == thread.parent.is_some()
+                    && thread.parent.is_none_or(|parent| {
+                        thread.delegated
+                            && parent != thread.id
+                            && restored.iter().any(|t| {
+                                t.id == parent
+                                    && !t.delegated
+                                    && t.project == thread.project
+                                    && t.machine == thread.machine
+                            })
+                    })
             });
             if restored.len() != threads.len() || ids.len() != restored.len() || !parents_valid {
                 return Err("The saved index contains invalid or duplicate threads.".into());
@@ -4642,9 +4774,13 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         && !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
     {
-        while let Some(request) = server.next_request() {
+        for _ in 0..16 {
+            let Some(request) = server.next_request() else {
+                break;
+            };
             state.mcp_request(request);
             changed = true;
+            tx.wake_after(Duration::ZERO);
         }
     }
     let mut run_ended = false;
@@ -4698,16 +4834,20 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                     run_ended = true;
                     thread.fail_session(error);
                 }
-                Event::Diagnostic(diagnostic) => thread.diagnostics.push(diagnostic),
+                Event::Diagnostic(diagnostic) => thread.diagnostic(&diagnostic),
                 Event::Exited => {
                     run_ended = true;
-                    thread.fail_session(
-                        "Pi stopped unexpectedly. Retry to resume the saved conversation.".into(),
-                    );
+                    if thread.status != Status::Failed {
+                        thread.fail_session(
+                            "Pi stopped unexpectedly. Retry to resume the saved conversation."
+                                .into(),
+                        );
+                    }
                 }
             }
         }
         thread.drive_session();
+        changed |= thread.check_deadlines(Instant::now());
         if thread
             .session_started
             .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
@@ -4724,6 +4864,12 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
         if thread.pi.is_some() {
+            if let Some((_, deadline)) = thread.operation_deadline {
+                tx.wake_after(deadline.saturating_duration_since(Instant::now()));
+            }
+            if let Some(deadline) = thread.injection_retry_at {
+                tx.wake_after(deadline.saturating_duration_since(Instant::now()));
+            }
             let remaining = if let Some(started) = thread.session_started {
                 START_TIMEOUT.saturating_sub(started.elapsed())
             } else if !thread.status.busy() && !thread.configuring {
@@ -4829,6 +4975,19 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         .and_then(|store| store.errors.try_recv().ok())
     {
         state.storage_error = Some(error);
+        changed = true;
+    }
+    if state.storage_error.is_some()
+        && state
+            .store
+            .as_ref()
+            .is_some_and(crate::store::Store::healthy)
+        && state
+            .ui_store
+            .as_ref()
+            .is_some_and(crate::store::Store::healthy)
+    {
+        state.storage_error = None;
         changed = true;
     }
     if changed {
@@ -5009,8 +5168,9 @@ fn tool_detail(args: &Value) -> String {
         .unwrap_or_default()
 }
 pub fn truncate(text: &str, count: usize) -> String {
-    let mut result: String = text.chars().take(count).collect();
-    if text.chars().count() > count {
+    let mut characters = text.chars();
+    let mut result: String = characters.by_ref().take(count).collect();
+    if characters.next().is_some() {
         result.push_str("...");
     }
     result
@@ -5019,6 +5179,133 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_rejects_invalid_relationships_and_wrong_typed_session_fields() {
+        let state = State::new(PathBuf::new(), false);
+        let baseline = state.snapshot();
+        for (field, value) in [
+            ("captainHome", json!(true)),
+            ("delegated", json!(true)),
+            ("session", json!(123)),
+            ("model", json!(false)),
+            ("thinking", json!(4)),
+            ("updated", json!("bad")),
+        ] {
+            let mut index = baseline.clone();
+            index["threads"][0][field] = value;
+            let mut restored = State::new(PathBuf::new(), false);
+            assert!(restored.restore_global(&index).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn ordinary_parents_children_are_visible_in_navigation_and_mcp_listing() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (index, _commands, _events) = child(&mut state);
+        assert!(state.sidebar_navigation().contains(&index));
+        let listing = state
+            .mcp_call(state.threads[0].id, "list_threads", &json!({}))
+            .unwrap();
+        assert!(
+            listing["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["thread_id"] == state.threads[index].id)
+        );
+    }
+
+    #[test]
+    fn completion_injections_wait_for_compaction_and_retry_a_compaction_race() {
+        let mut thread = Thread::new(1);
+        let (commands, _events) = fake_pi(&mut thread, Status::Running);
+        thread.enqueue_injection("child finished".into());
+        thread.apply(json!({"type":"compaction_start"}));
+        assert!(!thread.flush_injection());
+        assert!(commands.try_recv().is_err());
+        thread.apply(json!({"type":"compaction_end"}));
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .unwrap();
+        thread.apply(
+            json!({"type":"response","id":prompt["id"],"command":"prompt",
+            "success":false,"error":"Cannot submit a prompt while compaction is in progress."}),
+        );
+        assert_ne!(thread.status, Status::Failed);
+        assert_eq!(thread.pending_injections.len(), 1);
+        assert!(!thread.flush_injection());
+        thread.injection_retry_at = Some(Instant::now());
+        assert!(thread.flush_injection());
+        let retry = commands.try_recv().unwrap();
+        acknowledge(&mut thread, &retry);
+        assert!(thread.pending_injections.is_empty());
+    }
+
+    #[test]
+    fn stop_and_configuration_deadlines_disconnect_unresponsive_sessions() {
+        for operation in ["abort", "set_model", "set_thinking_level"] {
+            let mut thread = Thread::new(1);
+            let (_commands, _events) = fake_pi(&mut thread, Status::Running);
+            thread.configuring = operation != "abort";
+            thread.operation_deadline = Some((operation, Instant::now()));
+            assert!(thread.check_deadlines(Instant::now()));
+            assert!(thread.pi.is_none());
+            assert!(!thread.configuring);
+            assert!(!thread.status.busy());
+            assert!(thread.error.is_some());
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_redacted_and_truncated_at_ingestion() {
+        let mut thread = Thread::new(1);
+        for _ in 0..1000 {
+            thread.diagnostic(&format!("ghp_secret {}", "x".repeat(9000)));
+        }
+        assert_eq!(thread.diagnostics.len(), 128);
+        assert!(
+            thread
+                .diagnostics
+                .iter()
+                .all(|line| line.len() < 2100 && !line.contains("ghp_secret"))
+        );
+    }
+
+    #[test]
+    fn cancelling_a_captain_flow_clears_all_project_overrides() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.projects.captain_target = Some(99);
+        state.captain_project = Some(Some(99));
+        state.captain_picker = true;
+        state.cancel_captain_flow();
+        assert!(state.projects.captain_target.is_none());
+        assert!(state.captain_project.is_none());
+        assert!(!state.captain_picker);
+    }
+
+    #[test]
+    fn a_threads_process_owner_survives_disconnect_before_its_session_path_is_known() {
+        let mut thread = Thread::new(1);
+        let owner = thread.connection_owner.clone();
+        assert!(thread.session.is_none());
+        thread.disconnect();
+        thread.session = Some("newly-learned-session.jsonl".into());
+        assert!(Arc::ptr_eq(&owner, &thread.connection_owner));
+    }
+
+    #[test]
+    fn a_specific_backend_error_survives_a_following_exit_event() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (_commands, events) = fake_pi(&mut state.threads[0], Status::Ready);
+        events
+            .send(Event::Error("Pi was not found.".into()))
+            .unwrap();
+        events.send(Event::Exited).unwrap();
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.threads[0].error.as_deref(), Some("Pi was not found."));
+    }
 
     #[test]
     fn captain_scope_search_and_keyboard_order_share_the_visible_hierarchy() {

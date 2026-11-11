@@ -148,7 +148,7 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
             clean_name(&name)
         )
     };
-    let metadata = fs::metadata(path).map_err(&read_error)?;
+    let metadata = fs::metadata(path).map_err(read_error)?;
     if !metadata.is_file() {
         return Err("Choose an image file, not a folder or device.".into());
     }
@@ -171,18 +171,35 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
 /// Validate and store image bytes, with the name shown in the composer chip.
 pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     let name = clean_name(name);
+    use sha2::Digest;
+    let cache = directory().map(|dir| dir.join(format!("{:x}.json", sha2::Sha256::digest(&bytes))));
+    if let Some(path) = &cache
+        && let Ok(file) = fs::File::open(path)
+        && let Ok(value) = serde_json::from_reader::<_, Value>(file.take(4096))
+        && let Some(mut attachment) = Attachment::from_value(&value)
+        && preview_path_for(&attachment).is_some()
+        && read(&attachment).is_ok_and(|stored| stored == bytes)
+    {
+        attachment.name = name;
+        return Ok(attachment);
+    }
     let (validated, decoded) = validate(&bytes).map_err(|error| format!("{name}: {error}"))?;
     let bytes_len = bytes.len() as u64;
     let id = store_blob(&bytes, validated.format)?;
     store_preview(&id, decoded)?;
-    Ok(Attachment {
+    let attachment = Attachment {
         id,
         name,
         mime: mime(validated.format).into(),
         width: validated.width,
         height: validated.height,
         bytes: bytes_len,
-    })
+    };
+    if let Some(cache) = cache {
+        // Cache metadata is optional. The validated blob remains the source of truth.
+        let _ = fs::write(cache, attachment.to_value().to_string());
+    }
+    Ok(attachment)
 }
 
 /// Import an image part from Pi's saved conversation history.
@@ -190,6 +207,9 @@ pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
 /// The returned reference points at the same local store, so later reads of history keep their
 /// images without Shina's JSON retaining Pi's base64 copy.
 pub fn from_history_part(part: &Value) -> Option<Attachment> {
+    if let Some(value) = part.get("shinaAttachment") {
+        return Attachment::from_value(value);
+    }
     let data = part["data"].as_str()?;
     if data.len() as u64 > MAX_IMAGE_BYTES.div_ceil(3) * 4 + 128 {
         return None;
@@ -200,6 +220,32 @@ pub fn from_history_part(part: &Value) -> Option<Attachment> {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("Image from conversation");
     attach_bytes(name, bytes).ok()
+}
+
+/// Called by the RPC reader, before the record enters the UI event queue.
+pub fn import_history(record: &mut Value) {
+    if record["command"] != "get_messages" {
+        return;
+    }
+    if let Some(messages) = record["data"]["messages"].as_array_mut() {
+        for message in messages {
+            if let Some(parts) = message["content"].as_array_mut() {
+                for part in parts {
+                    if part["type"] != "image" {
+                        continue;
+                    }
+                    let attachment = from_history_part(part);
+                    if let Some(object) = part.as_object_mut() {
+                        object.remove("data");
+                        object.insert(
+                            "shinaAttachment".into(),
+                            attachment.map_or(Value::Null, |image| image.to_value()),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Encode the typed Pi RPC `images` field. Call only when a prompt is submitted.
@@ -320,7 +366,7 @@ fn store_preview(id: &str, decoded: image::DynamicImage) -> Result<(), String> {
     if path.is_file() {
         return Ok(());
     }
-    let thumbnail = decoded.thumbnail(512, 512);
+    let thumbnail = decoded.thumbnail(decoded.width().min(512), decoded.height().min(512));
     let mut bytes = Cursor::new(Vec::new());
     thumbnail
         .write_to(&mut bytes, ImageFormat::Png)
@@ -561,6 +607,22 @@ mod tests {
         assert!(decode_base64("Zm=9").is_none());
         assert!(decode_base64("Zg==Zg==").is_none());
         assert!(decode_base64("!!!!").is_none());
+    }
+
+    #[test]
+    fn history_import_replaces_base64_with_reusable_validated_references() {
+        let png = image_bytes(ImageFormat::Png);
+        let mut record = json!({"command":"get_messages","data":{"messages":[{
+            "role":"user","content":[{"type":"image","data":encode_base64(&png)}]
+        }]}});
+        import_history(&mut record);
+        let part = &record["data"]["messages"][0]["content"][0];
+        assert!(part.get("data").is_none());
+        let image = from_history_part(part).unwrap();
+        assert_eq!(read(&image).unwrap(), png);
+        let reused = attach_bytes("renamed.png", png).unwrap();
+        assert_eq!(reused.id, image.id);
+        assert_eq!(reused.name, "renamed.png");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver},
@@ -307,15 +307,8 @@ pub fn start_windows_helper(update: &PreparedUpdate) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("Could not reset the helper handshake: {error}")),
     }
-    install::launch_with(&helper, &["--apply-update", &parent])?;
-    let deadline = Instant::now() + METADATA_TIMEOUT;
-    while !handshake.is_file() {
-        if Instant::now() >= deadline {
-            return Err("The update helper did not start in time.".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Ok(())
+    let mut child = install::launch_child(&helper, &["--apply-update", &parent])?;
+    install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT)
 }
 
 #[cfg(windows)]
@@ -374,6 +367,11 @@ pub fn run_windows_helper() {
         }
         match apply_prepared_update(&update) {
             Ok(installed) => {
+                if let Err(error) = install::refresh_windows_registration() {
+                    install::report_notice(&format!(
+                        "Update installed, but Windows registration failed: {error}"
+                    ));
+                }
                 let outcome = relaunch_or_restore(
                     &update,
                     &installed,
@@ -389,7 +387,9 @@ pub fn run_windows_helper() {
         }
     })();
     if let Err(error) = result {
+        install::report_notice(&format!("Shina update helper failed: {error}"));
         eprintln!("Shina update helper: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -430,15 +430,19 @@ pub fn apply_prepared_update(update: &PreparedUpdate) -> Result<PathBuf, String>
 
 /// Runs the same Launch Services registration the installer uses. Best effort.
 fn register_mac_bundle(app: &Path) {
-    let _ = std::process::Command::new(
+    let result = crate::process::output(std::process::Command::new(
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
     )
     .arg("-f")
     .arg(app)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status();
+    .stderr(Stdio::null()), METADATA_TIMEOUT, 64 * 1024);
+    if !result.is_ok_and(|output| output.status.success()) {
+        install::report_notice(
+            "The update installed, but macOS LaunchServices registration failed.",
+        );
+    }
 }
 
 /// Opens the replaced app after an explicit restart.
@@ -666,6 +670,7 @@ pub struct Updater {
     next_check: Option<Instant>,
     /// Set after a real authentication denial: no networked attempts until the next launch.
     suspended: Option<String>,
+    notice: Option<String>,
     diagnostics: VecDeque<String>,
     storage: Storage,
     /// Shared with the one operation that may use it at a time.
@@ -682,6 +687,7 @@ impl Default for Updater {
             events: None,
             next_check: None,
             suspended: None,
+            notice: None,
             diagnostics: VecDeque::new(),
             storage: Storage::default_storage(),
             host: Arc::new(Mutex::new(Box::new(Gh))),
@@ -945,7 +951,6 @@ fn failure_from_stderr(stderr: &str) -> Failure {
         "not logged",
         "bad credentials",
         "http 401",
-        "http 403",
     ]
     .iter()
     .any(|text| lower.contains(text))
@@ -997,7 +1002,7 @@ fn run_bounded_with_limit(
         .stderr(Stdio::piped())
         .env("GH_PROMPT_DISABLED", "1");
     let program = command.get_program().to_string_lossy().into_owned();
-    let mut child: Child = command.spawn().map_err(|error| {
+    let mut child = crate::process::Process::spawn(&mut command).map_err(|error| {
         if program == "gh" && error.kind() == std::io::ErrorKind::NotFound {
             Failure::quiet("Install the GitHub CLI (gh) so Shina can check for updates.")
         } else {
@@ -1011,18 +1016,19 @@ fn run_bounded_with_limit(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.terminate();
+                let _ = child.reap(Duration::from_secs(1));
                 return Err(Failure::quiet("The update command did not finish in time."));
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.terminate();
+                let _ = child.reap(Duration::from_secs(1));
                 return Err(Failure::quiet("Could not wait for the update command."));
             }
         }
     };
+    child.terminate();
     let receive = |reader: Receiver<Result<Vec<u8>, Failure>>| {
         reader
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -1299,6 +1305,18 @@ impl Updater {
         self.suspended.as_deref()
     }
 
+    pub fn notice(&self) -> Option<&str> {
+        self.suspended().or(self.notice.as_deref())
+    }
+
+    pub fn retry(&mut self) {
+        if matches!(self.status, Status::Idle) && self.events.is_none() && self.installed {
+            self.suspended = None;
+            self.notice = None;
+            self.next_check = Some(Instant::now());
+        }
+    }
+
     pub fn prepared_update(&self) -> Option<&PreparedUpdate> {
         match &self.status {
             Status::Ready { update } => Some(update),
@@ -1342,6 +1360,16 @@ impl Updater {
         if !enabled {
             self.status = Status::Disabled;
             return;
+        }
+        if let Some(directory) = crate::store::directory() {
+            let warning = directory.join("startup-warning.txt");
+            if let Ok(file) = fs::File::open(&warning) {
+                let mut message = String::new();
+                let _ = file.take(4096).read_to_string(&mut message);
+                self.notice = Some(redact(&message));
+                self.record(message);
+                let _ = fs::remove_file(warning);
+            }
         }
         if !self.installed {
             match install::installed_target() {
@@ -1407,6 +1435,19 @@ impl Updater {
     #[cfg(test)]
     pub fn test_idle() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub fn test_suspended() -> Self {
+        let mut updater = Self {
+            installed: true,
+            ..Self::default()
+        };
+        updater.failed(
+            Failure::Auth("Run gh auth login manually to enable updates.".into()),
+            Instant::now(),
+        );
+        updater
     }
 
     /// Turns updating off for this build. `start` leaves a disabled updater alone.
@@ -1531,10 +1572,12 @@ impl Updater {
                 true
             }
             Event::Checked(Ok(Some(release))) => {
+                self.notice = None;
                 self.begin_download(release, wake);
                 true
             }
             Event::Checked(Ok(None)) => {
+                self.notice = None;
                 self.idle_from(now);
                 true
             }
@@ -1578,6 +1621,7 @@ impl Updater {
     }
 
     fn failed(&mut self, failure: Failure, now: Instant) {
+        self.notice = Some(failure_text(&failure));
         self.record(failure_text(&failure));
         if let Failure::Auth(remedy) = failure {
             // No networked attempt runs again this session, so no timer is scheduled.
@@ -1619,6 +1663,30 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forbidden_is_not_automatically_an_authentication_denial() {
+        assert!(matches!(
+            failure_from_stderr("HTTP 403: API rate limit exceeded"),
+            Failure::Quiet(_)
+        ));
+        assert!(matches!(
+            failure_from_stderr("HTTP 401: bad credentials"),
+            Failure::Auth(_)
+        ));
+        let mut updater = Updater {
+            installed: true,
+            ..Updater::default()
+        };
+        updater.failed(
+            Failure::Auth("Run gh auth login manually.".into()),
+            Instant::now(),
+        );
+        assert!(updater.notice().unwrap().contains("manually"));
+        updater.retry();
+        assert!(updater.suspended().is_none());
+        assert!(updater.next_check.is_some());
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     type Check = dyn Fn() -> Result<Option<Release>, Failure> + Send + Sync;

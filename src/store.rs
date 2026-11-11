@@ -1,13 +1,24 @@
 //! One app-wide index. Legacy workspace files are read, never changed or deleted.
 use rune::Waker;
 use serde_json::Value;
-use std::{fs, path::PathBuf, sync::mpsc, thread};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 pub struct Store {
     sender: Option<mpsc::Sender<Message>>,
     pub errors: mpsc::Receiver<String>,
     last: String,
     worker: Option<thread::JoinHandle<()>>,
+    healthy: Arc<AtomicBool>,
 }
 
 /// A queued write, or a barrier that is acknowledged after every earlier write finished.
@@ -35,6 +46,7 @@ pub fn directory() -> Option<PathBuf> {
 #[cfg(test)]
 thread_local! {
     static TEST_DIRECTORY: TestDirectory = TestDirectory::new();
+    static TEST_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -67,7 +79,21 @@ impl Drop for TestDirectory {
 
 #[cfg(test)]
 pub fn directory() -> Option<PathBuf> {
-    Some(TEST_DIRECTORY.with(|directory| directory.0.clone()))
+    TEST_OVERRIDE
+        .with(|directory| directory.borrow().clone())
+        .or_else(|| Some(TEST_DIRECTORY.with(|directory| directory.0.clone())))
+}
+
+#[cfg(test)]
+pub fn with_directory<T>(directory: PathBuf, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_OVERRIDE.with(|directory| *directory.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(TEST_OVERRIDE.with(|slot| slot.replace(Some(directory))));
+    action()
 }
 
 pub fn legacy_path(directory: &std::path::Path, workspace: &std::path::Path) -> PathBuf {
@@ -92,6 +118,21 @@ pub fn load_global(
         let projects = index["projects"].as_array().cloned().unwrap_or_default();
         if let Some(threads) = index["threads"].as_array_mut() {
             for record in threads {
+                if !record.is_object() {
+                    return Err("The saved index contains a non-object thread.".into());
+                }
+                for field in ["updated", "session"] {
+                    if record.get(field).is_some_and(|value| {
+                        !value.is_null()
+                            && if field == "updated" {
+                                !value.is_u64()
+                            } else {
+                                !value.is_string()
+                            }
+                    }) {
+                        return Err(format!("The saved index contains an invalid {field}."));
+                    }
+                }
                 let workspace = projects
                     .iter()
                     .find(|p| p["id"] == record["project"])
@@ -352,20 +393,39 @@ impl Store {
     pub fn new(path: PathBuf, wake: Waker) -> Self {
         let (sender, receiver) = mpsc::channel::<Message>();
         let (errors, error_receiver) = mpsc::channel();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let status = healthy.clone();
         let worker = thread::spawn(move || {
             let mut last: Result<(), String> = Ok(());
-            while let Ok(message) = receiver.recv() {
+            let mut latest: Option<String> = None;
+            loop {
+                let message = match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(message) => message,
+                    Err(mpsc::RecvTimeoutError::Timeout) if last.is_err() => {
+                        Message::Save(latest.clone().expect("failed snapshot"))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let mut barrier = None;
                 let mut snapshot = match message {
                     Message::Save(snapshot) => snapshot,
                     Message::Flush(ack) => {
-                        // Every earlier write is done here; barriers are never coalesced.
-                        let _ = ack.send(last.clone());
-                        continue;
+                        if last.is_ok() {
+                            let _ = ack.send(last.clone());
+                            continue;
+                        }
+                        // Retry the latest failed snapshot even when the caller's state has
+                        // not changed. A flush is not just a replay of the previous error.
+                        barrier = Some(ack);
+                        latest.clone().expect("failed snapshot")
                     }
                 };
                 // Coalesce newer writes, but never across a barrier.
-                let mut barrier = None;
-                while let Ok(newer) = receiver.try_recv() {
+                while barrier.is_none() {
+                    let Ok(newer) = receiver.try_recv() else {
+                        break;
+                    };
                     match newer {
                         Message::Save(newer) => snapshot = newer,
                         Message::Flush(ack) => {
@@ -374,6 +434,7 @@ impl Store {
                         }
                     }
                 }
+                latest = Some(snapshot.clone());
                 let result = (|| -> std::io::Result<()> {
                     fs::create_dir_all(path.parent().expect("index directory"))?;
                     let temporary = path.with_extension("json.tmp");
@@ -386,13 +447,21 @@ impl Store {
                     Ok(())
                 })();
                 last = match result {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        if !status.swap(true, Ordering::AcqRel) {
+                            wake();
+                        }
+                        Ok(())
+                    }
                     Err(error) => {
+                        status.store(false, Ordering::Release);
                         let message = format!(
                             "Could not save the thread index: {error}. Pi still owns its session files."
                         );
-                        let _ = errors.send(message.clone());
-                        wake();
+                        if last.as_ref().err() != Some(&message) {
+                            let _ = errors.send(message.clone());
+                            wake();
+                        }
                         Err(message)
                     }
                 };
@@ -406,6 +475,7 @@ impl Store {
             errors: error_receiver,
             last: String::new(),
             worker: Some(worker),
+            healthy,
         }
     }
 
@@ -421,6 +491,10 @@ impl Store {
         }
     }
 
+    pub fn healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
     /// Waits until every write queued so far is on disk, and reports the last write's result.
     pub fn flush(&self) -> Result<(), String> {
         let Some(sender) = &self.sender else {
@@ -431,8 +505,8 @@ impl Store {
             .send(Message::Flush(ack))
             .map_err(|_| "The store is no longer running.".to_string())?;
         result
-            .recv()
-            .map_err(|_| "The store stopped before flushing.".to_string())?
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "The store did not finish flushing within five seconds.".to_string())?
     }
 }
 
@@ -440,7 +514,7 @@ impl Drop for Store {
     fn drop(&mut self) {
         self.sender = None;
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            crate::process::join_for(worker, Duration::from_secs(1));
         }
     }
 }
@@ -712,5 +786,62 @@ mod tests {
         assert_eq!(load(&file).unwrap().unwrap()["value"], "second");
         fs::remove_file(&file).unwrap();
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_thread_entries_and_activity_types_fail_without_panicking() {
+        let root = directory().unwrap();
+        for record in [
+            serde_json::json!(1),
+            serde_json::json!("x"),
+            serde_json::json!(null),
+            serde_json::json!({"id":1,"updated":"wrong"}),
+            serde_json::json!({"id":1,"session":123}),
+        ] {
+            fs::write(
+                root.join("index.json"),
+                serde_json::json!({"version":4,"projects":[],"threads":[record]}).to_string(),
+            )
+            .unwrap();
+            assert!(load_global(&root, None).is_err());
+        }
+    }
+
+    #[test]
+    fn flush_retries_an_unchanged_snapshot_after_a_transient_failure() {
+        let root = directory().unwrap().join("retry");
+        let file = root.join("index.json");
+        fs::create_dir_all(&file).unwrap();
+        let mut store = Store::new(file.clone(), Arc::new(|| {}));
+        let snapshot = serde_json::json!({"draft":"must survive"});
+        store.save(snapshot.clone());
+        assert!(store.flush().is_err());
+        assert!(!store.healthy());
+        fs::remove_dir(&file).unwrap();
+        store.save(snapshot.clone()); // Deduplicated at the caller, but flush must retry.
+        store.flush().unwrap();
+        assert!(store.healthy());
+        assert_eq!(load(&file).unwrap().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn a_failed_snapshot_retries_while_idle_and_wakes_after_recovery() {
+        let file = directory().unwrap().join("idle-retry/index.json");
+        fs::create_dir_all(&file).unwrap();
+        let (wake, events) = mpsc::channel();
+        let mut store = Store::new(
+            file.clone(),
+            Arc::new(move || {
+                let _ = wake.send(());
+            }),
+        );
+        let snapshot = serde_json::json!({"draft":"idle"});
+        store.save(snapshot.clone());
+        assert!(store.flush().is_err());
+        events.try_iter().for_each(drop);
+        fs::remove_dir(&file).unwrap();
+        events.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(store.healthy());
+        assert_eq!(load(&file).unwrap().unwrap(), snapshot);
     }
 }

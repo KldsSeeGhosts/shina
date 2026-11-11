@@ -1460,6 +1460,19 @@ fn clone_dialog(s: &State, p: Palette) -> El {
 fn update_row(s: &State, p: Palette) -> Option<El> {
     use crate::update::Status;
     match s.updater.status() {
+        Status::Idle if s.updater.notice().is_some() => {
+            let notice = s.updater.notice().unwrap();
+            Some(
+                col()
+                    .mx(8.0)
+                    .mb(8.0)
+                    .gap(4.0)
+                    .child(label(truncate(notice, 300), SMALL, p.muted).wrap_anywhere())
+                    .child(button("retry-update", "Retry update check", p, |s| {
+                        s.updater.retry()
+                    })),
+            )
+        }
         Status::Disabled | Status::Idle | Status::Checking => None,
         Status::Downloading { tag } => {
             let title = format!("Downloading update {tag}");
@@ -1860,8 +1873,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     // Captains: a portrait beside their name, with what they work in and their crew below.
     if captain_home {
         let mut context = vec![];
-        if thread.renamed {
-            context.push(s.captains[thread.captain.unwrap()].name.clone());
+        if thread.renamed
+            && let Some(profile) = thread.captain.and_then(|id| s.captains.get(id))
+        {
+            context.push(profile.name.clone());
         }
         context.extend(workspace);
         if !s.captain_expanded(id) {
@@ -1890,7 +1905,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .child(avatar(
                     s,
                     p,
-                    thread.captain.expect("captain home"),
+                    thread.captain.unwrap_or(usize::MAX),
                     32.0,
                     row_status,
                 ))
@@ -2151,7 +2166,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
     modal_frame(
         "captain-picker-backdrop",
         s,
-        |s| s.captain_picker = false,
+        |s| s.cancel_captain_flow(),
         card,
     )
 }
@@ -2384,7 +2399,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     "Close",
                     "close",
                     p,
-                    |s| s.captain_editor = None,
+                    |s| s.cancel_captain_flow(),
                 )),
         )
         .child(body)
@@ -2394,7 +2409,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
-                    button("cancel-captain", "Cancel", p, |s| s.captain_editor = None)
+                    button("cancel-captain", "Cancel", p, |s| s.cancel_captain_flow())
                         .h(32.0)
                         .px(14.0)
                         .border(0.5, p.line),
@@ -2436,8 +2451,8 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .padding(16.0)
         .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.28 }))
         .center()
-        .modal(false, |s: &mut State| s.captain_editor = None)
-        .on_press(|s: &mut State| s.captain_editor = None)
+        .modal(false, |s: &mut State| s.cancel_captain_flow())
+        .on_press(|s: &mut State| s.cancel_captain_flow())
         .child(card)
 }
 
@@ -4607,6 +4622,11 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
             messages = messages.child(label("Showing recent turns.", SMALL, p.muted));
         }
         let mut index = start;
+        let mut hidden_images = t.messages[start..]
+            .iter()
+            .map(|message| message.images.len())
+            .sum::<usize>()
+            .saturating_sub(32);
         while index < t.messages.len() {
             let message = &t.messages[index];
             if message.role == "Pi" {
@@ -4628,7 +4648,16 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     .shrink()
                     .min_w(0.0);
                 if !message.images.is_empty() {
-                    user = user.child(message_images(s, p, &message.images, &key));
+                    let skip = hidden_images.min(message.images.len());
+                    hidden_images -= skip;
+                    if skip > 0 {
+                        user = user.child(label(
+                            format!("{skip} older image previews omitted."),
+                            SMALL,
+                            p.muted,
+                        ));
+                    }
+                    user = user.child(message_images(s, p, &message.images[skip..], &key));
                 }
                 if !message.text.trim().is_empty() {
                     user = user.child(
@@ -5342,6 +5371,13 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                 .selectable(true),
         );
     }
+    for diagnostic in s.updater.diagnostics() {
+        details = details.child(
+            label(diagnostic, SMALL, p.muted)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
     pane.child(
         col()
             .grow(1.0)
@@ -5601,6 +5637,48 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+    }
+
+    #[test]
+    fn an_update_authentication_failure_has_a_visible_manual_remedy_and_retry() {
+        let mut rt = runtime(1280.0);
+        rt.state.updater = crate::update::Updater::test_suspended();
+        rt.frame(0.0);
+        assert!(rt.find("retry-update").is_some());
+        assert!(rt.state.updater.notice().unwrap().contains("gh auth login"));
+        press(&mut rt, "retry-update");
+        assert!(rt.state.updater.suspended().is_none());
+    }
+
+    #[test]
+    fn image_heavy_transcripts_render_at_most_thirty_two_previews() {
+        let mut rt = Runtime::with_text(
+            State::new(".".into(), false),
+            view,
+            (1280.0, 8000.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        for message in 0..6 {
+            rt.state.current_mut().messages.push(crate::model::Message {
+                role: "You",
+                text: format!("Screenshot batch {message}"),
+                images: (0..8)
+                    .map(|image| Attachment {
+                        id: format!("missing-{message}-{image}.png"),
+                        name: format!("image {message}-{image}"),
+                        mime: "image/png".into(),
+                        width: 512,
+                        height: 512,
+                        bytes: 1,
+                    })
+                    .collect(),
+            });
+        }
+        rt.frame(0.0);
+        let tree = rt.accessibility_json().to_string();
+        assert_eq!(tree.matches("Attached image:").count(), 32);
+        assert!(tree.contains("older image previews omitted"));
     }
 
     #[test]
@@ -6496,12 +6574,15 @@ pub(crate) mod tests {
         assert!(!rt.state.settings_menu);
         // This repository ships assets/project-icon.png.
         let project = crate::projects::Project::new(99, std::env::current_dir().unwrap());
-        assert!(
-            project
-                .icon
-                .as_ref()
-                .is_some_and(|icon| icon.ends_with("assets/project-icon.png"))
-        );
+        let icon = project
+            .icon
+            .as_ref()
+            .expect("the project icon or its thumbnail");
+        let dimensions = image::ImageReader::open(icon)
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert!(dimensions.0 <= 256 && dimensions.1 <= 256);
     }
 
     #[test]

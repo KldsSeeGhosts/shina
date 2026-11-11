@@ -27,8 +27,9 @@ static WORKERS: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 /// Only called after Rune's window closes. Releasing a session never waits on the UI thread.
 pub fn shutdown_all() {
     let workers = std::mem::take(&mut *WORKERS.lock().expect("worker registry"));
+    let deadline = Instant::now() + Duration::from_secs(3);
     for worker in workers {
-        let _ = worker.join();
+        crate::process::join_for(worker, deadline.saturating_duration_since(Instant::now()));
     }
 }
 
@@ -44,6 +45,44 @@ pub struct HostLink {
 pub struct Pi {
     commands: SyncSender<Value>,
     pub events: Receiver<Event>,
+    stopped: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct SessionOwner {
+    lock: Mutex<()>,
+    quarantined: AtomicBool,
+}
+
+impl Drop for Pi {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+// A reconnect must wait off the UI thread until the previous owner has reaped Pi.
+type SessionLocks = std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>;
+static SESSIONS: std::sync::LazyLock<Mutex<SessionLocks>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn acquire_session<'a>(
+    lock: &'a Mutex<()>,
+    stopped: &AtomicBool,
+) -> Result<Option<std::sync::MutexGuard<'a, ()>>, String> {
+    loop {
+        if stopped.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match lock.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(
+                    "The previous session worker panicked. Restart Shina before resuming.".into(),
+                );
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 /// Machine dispatch lives here, not in the UI or orchestration reducer. A remote host
@@ -69,11 +108,10 @@ impl BackendHost {
         wake: Waker,
         instructions: Option<String>,
         link: Option<HostLink>,
+        owner: Arc<SessionOwner>,
     ) -> Pi {
         match self {
-            Self::Local => {
-                Pi::start_with_instructions(directory, session, wake, instructions, link)
-            }
+            Self::Local => Pi::start(directory, session, wake, instructions, link, false, owner),
         }
     }
 }
@@ -100,9 +138,18 @@ impl Pi {
     ) -> (Self, Receiver<Value>, SyncSender<Event>) {
         let (commands, input) = mpsc::sync_channel(32);
         let (output, events) = mpsc::sync_channel(capacity);
-        (Self { commands, events }, input, output)
+        (
+            Self {
+                commands,
+                events,
+                stopped: Arc::new(AtomicBool::new(false)),
+            },
+            input,
+            output,
+        )
     }
 
+    #[cfg(test)]
     pub fn start_with_instructions(
         workspace: PathBuf,
         session: Option<String>,
@@ -110,12 +157,20 @@ impl Pi {
         instructions: Option<String>,
         host: Option<HostLink>,
     ) -> Self {
-        Self::start(workspace, session, wake, instructions, host, false)
+        Self::start(
+            workspace,
+            session,
+            wake,
+            instructions,
+            host,
+            false,
+            Arc::default(),
+        )
     }
 
     /// Read provider metadata without creating a saved conversation or exposing Shina tools.
     pub fn discover(workspace: PathBuf, wake: Waker) -> Self {
-        Self::start(workspace, None, wake, None, None, true)
+        Self::start(workspace, None, wake, None, None, true, Arc::default())
     }
 
     fn start(
@@ -125,14 +180,58 @@ impl Pi {
         instructions: Option<String>,
         host: Option<HostLink>,
         ephemeral: bool,
+        owner: Arc<SessionOwner>,
     ) -> Self {
         let (commands, input) = mpsc::sync_channel::<Value>(32);
         let (events, output) = mpsc::sync_channel(256);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let session_lock = session.as_ref().map(|session| {
+            let path = Path::new(session);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace.join(path)
+            };
+            let path = crate::projects::normalize_path(&path);
+            let mut sessions = SESSIONS.lock().expect("session owners");
+            sessions.retain(|_, owner| owner.strong_count() > 0);
+            let owner = sessions
+                .get(&path)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            sessions.insert(path, Arc::downgrade(&owner));
+            owner
+        });
         #[cfg(test)]
         let session_directory = crate::store::directory()
             .expect("test profile")
             .join("pi-sessions");
         let worker = thread::spawn(move || {
+            let _connection_guard = match acquire_session(&owner.lock, &stop) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => return,
+                Err(error) => {
+                    publish(&events, &wake, Event::Error(error));
+                    return;
+                }
+            };
+            if owner.quarantined.load(Ordering::Acquire) {
+                publish(&events, &wake, Event::Error("The previous Pi process could not be reaped. Restart Shina before resuming this session.".into()));
+                return;
+            }
+            let _session_guard = if let Some(owner) = &session_lock {
+                match acquire_session(owner, &stop) {
+                    Ok(Some(guard)) => Some(guard),
+                    Ok(None) => return,
+                    Err(error) => {
+                        publish(&events, &wake, Event::Error(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let launch = Launch {
                 workspace,
                 session,
@@ -142,10 +241,14 @@ impl Pi {
                 #[cfg(test)]
                 session_directory,
             };
-            if let Err(error) = run(&launch, input, &events, &wake) {
-                publish(&events, &wake, Event::Error(error));
+            match run(&launch, input, &events, &wake, &stop, &owner) {
+                Err(error) => {
+                    publish(&events, &wake, Event::Error(error));
+                }
+                Ok(()) => {
+                    publish(&events, &wake, Event::Exited);
+                }
             }
-            publish(&events, &wake, Event::Exited);
         });
         let mut workers = WORKERS.lock().expect("worker registry");
         workers.retain(|worker| !worker.is_finished());
@@ -153,6 +256,7 @@ impl Pi {
         Self {
             commands,
             events: output,
+            stopped,
         }
     }
 
@@ -268,6 +372,8 @@ fn run(
     input: Receiver<Value>,
     output: &SyncSender<Event>,
     wake: &Waker,
+    stopped: &AtomicBool,
+    owner: &SessionOwner,
 ) -> Result<(), String> {
     let mut command = command()?;
     command
@@ -317,8 +423,7 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = command
-        .spawn()
+    let mut child = crate::process::Process::spawn(&mut command)
         .map_err(|e| format!("Could not start Pi: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -327,14 +432,22 @@ fn run(
     let waker = wake.clone();
     let ready = Arc::new(AtomicBool::new(false));
     let received_state = ready.clone();
+    #[cfg(test)]
+    let import_directory = launch.session_directory.parent().unwrap().to_path_buf();
     let stdout_worker = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_record(&mut reader) {
-                Ok(Some(record)) => {
+                Ok(Some(mut record)) => {
                     if record["type"] == "response" && record["command"] == "get_state" {
                         received_state.store(true, Ordering::Relaxed);
                     }
+                    #[cfg(test)]
+                    crate::store::with_directory(import_directory.clone(), || {
+                        crate::attachments::import_history(&mut record);
+                    });
+                    #[cfg(not(test))]
+                    crate::attachments::import_history(&mut record);
                     if !publish(&events, &waker, Event::Record(record)) {
                         break;
                     }
@@ -374,24 +487,52 @@ fn run(
             }
         }
     });
+    let (writes, records) = mpsc::sync_channel(32);
+    let (write_result, written) = mpsc::channel();
+    let writing = Arc::new(Mutex::new(None::<Instant>));
+    let writer_state = writing.clone();
+    let writer = thread::spawn(move || {
+        let result = (|| {
+            for record in [
+                json!({"id":"state", "type":"get_state"}),
+                json!({"id":"history", "type":"get_messages"}),
+                json!({"id":"models", "type":"get_available_models"}),
+                json!({"id":"levels", "type":"get_available_thinking_levels"}),
+            ]
+            .into_iter()
+            .chain(records)
+            {
+                *writer_state.lock().expect("write deadline") = Some(Instant::now());
+                write_record(&mut stdin, &record)?;
+                *writer_state.lock().expect("write deadline") = None;
+            }
+            Ok::<_, String>(())
+        })();
+        let _ = write_result.send(result);
+    });
     let result = (|| {
         let started = Instant::now();
-        write_record(&mut stdin, &json!({"id":"state", "type":"get_state"}))?;
-        write_record(&mut stdin, &json!({"id":"history", "type":"get_messages"}))?;
-        write_record(
-            &mut stdin,
-            &json!({"id":"models", "type":"get_available_models"}),
-        )?;
-        write_record(
-            &mut stdin,
-            &json!({"id":"levels", "type":"get_available_thinking_levels"}),
-        )?;
         loop {
+            if stopped.load(Ordering::Acquire) {
+                break;
+            }
+            if let Ok(result) = written.try_recv() {
+                return result;
+            }
+            if writing
+                .lock()
+                .expect("write deadline")
+                .is_some_and(|at| at.elapsed() > Duration::from_secs(30))
+            {
+                return Err("Pi stopped reading commands. Retry to resume the session.".into());
+            }
             if !ready.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(15) {
                 return Err("Pi did not answer within 15 seconds. Check its CLI configuration and workspace trust, then retry.".into());
             }
             match input.recv_timeout(Duration::from_millis(100)) {
-                Ok(record) => write_record(&mut stdin, &record)?,
+                Ok(record) => writes
+                    .try_send(record)
+                    .map_err(|_| "Pi stopped accepting commands.".to_owned())?,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -407,24 +548,18 @@ fn run(
         }
         Ok(())
     })();
-    // Dropping Pi disconnects the command channel. Close stdin, allow graceful shutdown, then reap.
-    drop(stdin);
-    let deadline = Instant::now() + Duration::from_millis(700);
-    let mut exited = false;
-    while Instant::now() < deadline {
-        if child.try_wait().ok().flatten().is_some() {
-            exited = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+    drop(writes);
+    child.terminate();
+    if let Err(error) = child.reap(Duration::from_secs(1)) {
+        owner.quarantined.store(true, Ordering::Release);
+        return Err(format!(
+            "Could not reap Pi. Reconnect is disabled until restart: {error}"
+        ));
     }
     // Deliver all buffered records before Event::Exited makes the UI drop its receiver.
-    let _ = stdout_worker.join();
-    let _ = stderr_worker.join();
+    crate::process::join_for(writer, Duration::from_millis(200));
+    crate::process::join_for(stdout_worker, Duration::from_millis(200));
+    crate::process::join_for(stderr_worker, Duration::from_millis(200));
     result
 }
 
@@ -463,6 +598,27 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn waiting_for_the_previous_session_is_cancellable_without_starting_pi() {
+        let owner = Arc::new(Mutex::new(()));
+        let guard = owner.lock().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (started, ready) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let worker_owner = owner.clone();
+        let stop = stopped.clone();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            done.send(acquire_session(&worker_owner, &stop).unwrap().is_none())
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(result.try_recv().is_err());
+        stopped.store(true, Ordering::Release);
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+        drop(guard);
+        worker.join().unwrap();
+    }
     #[test]
     fn cpa_enrollment_accepts_generated_models_without_loading_other_extensions() {
         let directory = crate::store::directory().unwrap();
