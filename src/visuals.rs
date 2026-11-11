@@ -6,6 +6,10 @@
 //! `<workspace>/assets/crew` with the same layout. Each captain needs Normal, Happy,
 //! Determined, Surprised, Dizzy and Sad. An incomplete set falls back to the embedded
 //! artwork instead of failing startup.
+//!
+//! The embedded captains also have short animation strips (`<Clip>.strip.png`), which
+//! `crate::portraits` plays in the sidebar. A drop-in set may add the same four strips; a
+//! set without them, or with a strip of the wrong length, keeps static faces.
 use rune::{Image, ImageCache, Waker};
 use std::{
     env,
@@ -54,12 +58,135 @@ impl Face {
     }
 }
 
+/// A short animation for one status. Frame 0 of every strip is the matching static face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Clip {
+    /// Ready: breathing and a blink, built on Normal.
+    Idle,
+    /// Working: typing dots and a nod, built on Determined.
+    Working,
+    /// Needs you: a startled hop, built on Surprised.
+    Attention,
+    /// Done: one small hop, built on Happy.
+    Happy,
+}
+
+impl Clip {
+    pub const ALL: [Clip; 4] = [Clip::Idle, Clip::Working, Clip::Attention, Clip::Happy];
+
+    /// The clip a status plays, if any. Failed stays on its static face.
+    pub fn for_face(face: Face) -> Option<Clip> {
+        match face {
+            Face::Normal => Some(Clip::Idle),
+            Face::Determined => Some(Clip::Working),
+            Face::Surprised => Some(Clip::Attention),
+            Face::Happy => Some(Clip::Happy),
+            Face::Dizzy | Face::Sad => None,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    fn file(self) -> &'static str {
+        match self {
+            Clip::Idle => "Idle",
+            Clip::Working => "Working",
+            Clip::Attention => "Attention",
+            Clip::Happy => "Happy",
+        }
+    }
+
+    /// Frames in the strip, as `tools/crew_originals.py` draws them.
+    pub fn frames(self) -> usize {
+        match self {
+            Clip::Happy => 3,
+            _ => 4,
+        }
+    }
+
+    /// (frame, milliseconds) steps. Idle changes about once a second, Working about four times
+    /// a second, Attention hops then holds for five seconds, and Happy plays once.
+    pub fn timeline(self) -> &'static [(usize, u32)] {
+        match self {
+            Clip::Idle => &[
+                (0, 1700),
+                (1, 1400),
+                (0, 1600),
+                (1, 1400),
+                (0, 600),
+                (2, 50),
+                (3, 90),
+                (2, 50),
+            ],
+            Clip::Working => &[
+                (1, 220),
+                (2, 220),
+                (0, 260),
+                (1, 220),
+                (2, 220),
+                (0, 260),
+                (1, 220),
+                (2, 220),
+                (0, 260),
+                (3, 110),
+            ],
+            Clip::Attention => &[
+                (1, 110),
+                (2, 90),
+                (0, 120),
+                (1, 110),
+                (2, 90),
+                (3, 700),
+                (0, 5200),
+            ],
+            Clip::Happy => &[(1, 120), (2, 100), (0, 120), (1, 120), (2, 100)],
+        }
+    }
+
+    /// Whether the clip loops. A one-shot clip ends on frame 0 and stays there.
+    pub fn repeats(self) -> bool {
+        self != Clip::Happy
+    }
+}
+
+/// One clip's frames as RGBA, ready for `rune::Pixels::set`.
+pub struct Strip {
+    pub size: u32,
+    pub frames: Vec<Vec<u8>>,
+}
+
+impl Strip {
+    /// Splits a strip of square frames. None unless it has exactly the clip's frame count.
+    fn decode(png: &[u8], clip: Clip) -> Option<Self> {
+        let sheet = image::load_from_memory(png).ok()?.to_rgba8();
+        let size = sheet.height();
+        if size == 0 || sheet.width() != size * clip.frames() as u32 {
+            return None;
+        }
+        let frames = (0..clip.frames() as u32)
+            .map(|i| {
+                image::imageops::crop_imm(&sheet, i * size, 0, size, size)
+                    .to_image()
+                    .into_raw()
+            })
+            .collect();
+        Some(Self { size, frames })
+    }
+}
+
+/// Every clip for one captain, or none.
+pub type Motion = [Strip; 4];
+
 type Set = [Image; Face::COUNT];
 
 pub struct Artwork {
     crew: [Set; CAPTAIN_NAMES.len()],
     /// Head crops for tiles of 24 px and below, where the full bust is too small to read.
     small: [Set; CAPTAIN_NAMES.len()],
+    /// Animation strips for full busts. A captain without all four stays static.
+    motion: [Option<Motion>; CAPTAIN_NAMES.len()],
     pub mark: Image,
     /// The same mark with a light badge, for the dark theme.
     pub mark_dark: Image,
@@ -72,10 +199,10 @@ impl Artwork {
         let wake: Waker = Arc::new(|| {});
         let cache = ImageCache::new(wake);
         let root = sprite_root(workspace);
-        let sets: [(Set, Set); CAPTAIN_NAMES.len()] =
+        let sets: [(Set, Set, Option<Motion>); CAPTAIN_NAMES.len()] =
             std::array::from_fn(|captain| portraits(&cache, captain, root.as_deref()));
-        let [(c0, s0), (c1, s1), (c2, s2), (c3, s3)] = sets;
-        let (crew, small) = ([c0, c1, c2, c3], [s0, s1, s2, s3]);
+        let [(c0, s0, m0), (c1, s1, m1), (c2, s2, m2), (c3, s3, m3)] = sets;
+        let (crew, small, motion) = ([c0, c1, c2, c3], [s0, s1, s2, s3], [m0, m1, m2, m3]);
         let mark_dark = mark(&cache, true);
         let mark = mark(&cache, false);
         let antigravity = provider_mark(
@@ -94,6 +221,7 @@ impl Artwork {
         Arc::new(Self {
             crew,
             small,
+            motion,
             mark,
             mark_dark,
             antigravity,
@@ -108,6 +236,11 @@ impl Artwork {
     pub fn small_face(&self, captain: usize, face: Face) -> &Image {
         &self.small[captain.min(CAPTAIN_NAMES.len() - 1)][face.index()]
     }
+
+    /// A captain's animation strips, if its set has them.
+    pub fn motion(&self, captain: usize) -> Option<&Motion> {
+        self.motion.get(captain)?.as_ref()
+    }
 }
 
 /// An explicit drop-in folder wins over the workspace folder. Neither is required.
@@ -121,14 +254,60 @@ fn sprite_root(workspace: &Path) -> Option<PathBuf> {
         })
 }
 
-fn portraits(cache: &ImageCache, captain: usize, root: Option<&Path>) -> (Set, Set) {
-    let loaded = root.and_then(|root| load_set(cache, root, captain));
-    loaded.unwrap_or_else(|| embedded(cache, captain))
+fn portraits(
+    cache: &ImageCache,
+    captain: usize,
+    root: Option<&Path>,
+) -> (Set, Set, Option<Motion>) {
+    if let Some((set, small, folder)) = root.and_then(|root| load_set(cache, root, captain)) {
+        return (set, small, load_motion(&folder));
+    }
+    let (set, small) = embedded(cache, captain);
+    (set, small, embedded_motion(captain))
+}
+
+/// All four strips from a drop-in folder, or none: a partial set would animate some states
+/// and not others.
+fn load_motion(folder: &Path) -> Option<Motion> {
+    let strips: Vec<Strip> = Clip::ALL
+        .iter()
+        .map(|clip| {
+            let png = std::fs::read(folder.join(format!("{}.strip.png", clip.file()))).ok()?;
+            Strip::decode(&png, *clip)
+        })
+        .collect::<Option<_>>()?;
+    Motion::try_from(strips).ok()
+}
+
+fn embedded_motion(captain: usize) -> Option<Motion> {
+    macro_rules! strips {
+        ($name:literal) => {
+            [
+                include_bytes!(concat!("../assets/crew/", $name, "/Idle.strip.png")).as_slice(),
+                include_bytes!(concat!("../assets/crew/", $name, "/Working.strip.png")).as_slice(),
+                include_bytes!(concat!("../assets/crew/", $name, "/Attention.strip.png"))
+                    .as_slice(),
+                include_bytes!(concat!("../assets/crew/", $name, "/Happy.strip.png")).as_slice(),
+            ]
+        };
+    }
+    let pngs = match captain {
+        0 => strips!("ember"),
+        1 => strips!("juniper"),
+        2 => strips!("sable"),
+        _ => strips!("pip"),
+    };
+    let strips: Vec<Strip> = Clip::ALL
+        .iter()
+        .zip(pngs)
+        .map(|(clip, png)| Strip::decode(png, *clip))
+        .collect::<Option<_>>()?;
+    Motion::try_from(strips).ok()
 }
 
 /// A set is either the named folder or the numeric captain index. All six faces must
 /// decode as files before the whole set is accepted.
-fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set)> {
+fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
     let folders = [
         root.join(CAPTAIN_KEYS[captain]),
         root.join(captain.to_string()),
@@ -153,7 +332,7 @@ fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set
             crops.push(crop);
         }
         if let (Ok(set), Ok(small)) = (Set::try_from(images), Set::try_from(crops)) {
-            return Some((set, small));
+            return Some((set, small, folder));
         }
     }
     None

@@ -1840,6 +1840,8 @@ pub struct State {
     pub store: Option<crate::store::Store>,
     pub storage_error: Option<String>,
     pub artwork: Arc<crate::visuals::Artwork>,
+    /// Sidebar portrait animation: frame stages and when they may play.
+    pub portraits: crate::portraits::Portraits,
     /// Decodes composer and conversation thumbnails off the UI thread.
     pub attachment_cache: rune::ImageCache,
     /// The composer is showing a valid drop highlight.
@@ -1952,6 +1954,7 @@ impl State {
             wake: Arc::new(|| {}),
             store: None,
             storage_error: None,
+            portraits: crate::portraits::Portraits::new(artwork.clone()),
             artwork,
             attachment_cache,
             attachment_drop_hover: false,
@@ -5044,6 +5047,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     changed |= state.poll_tasks(Instant::now());
+    if let Some(wait) = crate::ui::tick_portraits(state, Instant::now()) {
+        tx.wake_after(wait);
+    }
     // A restart click only asks for one. The guard runs after Pi events drained and tasks
     // were delivered, and an approved request stops all further work in this poll.
     if state.restart_for_update {
