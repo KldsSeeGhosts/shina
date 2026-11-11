@@ -2337,6 +2337,76 @@ mod tests {
         }
     }
     #[test]
+    fn coordinated_replacement_backs_up_an_open_database_and_refuses_backup_failure() {
+        let directory = crate::store::directory().unwrap();
+        let database = crate::database::Database::open(&directory).unwrap();
+        database
+            .write(
+                "memory.json",
+                serde_json::json!({"verified":"before replacement"}),
+            )
+            .unwrap();
+        let install_directory = directory.join("fixture-install");
+        fs::create_dir_all(&install_directory).unwrap();
+        let exe = install_directory.join("shina.exe");
+        fs::write(&exe, b"original binary").unwrap();
+        let staged = install_directory.join("shina.new.exe");
+        fs::write(&staged, b"replacement binary").unwrap();
+        let download = directory.join("download.exe");
+        fs::write(&download, b"replacement binary").unwrap();
+        let update = PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: InstalledTarget::Windows { exe: exe.clone() },
+            asset: "shina.exe".into(),
+            size: 18,
+            sha256: bytes_sha256(b"replacement binary"),
+            download,
+            prepared: staged,
+        };
+        let mut helper = CoordinatedUpdate {
+            update,
+            directory: directory.clone(),
+            service: None,
+            clients: vec![],
+            server: None,
+            launcher: None,
+            update_id: None,
+            desktop_owned: false,
+            reopen: 0,
+            closed_clients: 0,
+            backup: None,
+            replaced: false,
+        };
+        // A failed database backup must happen before any executable or marker changes.
+        fs::write(directory.join("damaged.sqlite"), b"damaged database").unwrap();
+        assert!(helper.replace().is_err());
+        assert!(!helper.replaced && helper.backup.is_none());
+        assert_eq!(fs::read(&exe).unwrap(), b"original binary");
+        assert!(!directory.join("update-validation").exists());
+        fs::remove_file(directory.join("damaged.sqlite")).unwrap();
+        helper.replace().unwrap();
+        assert!(helper.replaced);
+        assert_eq!(fs::read(&exe).unwrap(), b"replacement binary");
+        let saved =
+            rusqlite::Connection::open(helper.backup.as_ref().unwrap().join("state.sqlite"))
+                .unwrap();
+        let document: String = saved
+            .query_row(
+                "SELECT payload FROM documents WHERE name='memory.json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&document).unwrap(),
+            serde_json::json!({"verified":"before replacement"})
+        );
+        assert_eq!(
+            database.read("memory.json").unwrap().unwrap()["verified"],
+            "before replacement"
+        );
+    }
+    #[test]
     fn linux_archive_rejects_links_traversal_and_duplicate_entries() {
         let valid = "-rwxr-xr-x tester/tester 123 2026-11-11 12:00 Shina/shina\n";
         assert!(linux_archive_safe(valid));

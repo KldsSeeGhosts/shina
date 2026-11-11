@@ -8,12 +8,14 @@ mod captains;
 mod client;
 mod codex;
 mod context;
+mod database;
 mod harness;
 mod install;
 mod lifecycle;
 mod maintenance;
 mod mcp;
 mod model;
+mod outbox;
 mod portraits;
 mod power;
 mod process;
@@ -489,6 +491,7 @@ fn main() {
     }
     // The window icon follows the saved theme: the night sail for dark, the day sail for light.
     let saved_dark = store::directory()
+        .filter(|dir| !dir.join("state.sqlite").exists())
         .and_then(|dir| std::fs::read_to_string(dir.join("index.json")).ok())
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .is_some_and(|index| index["dark"] == true);

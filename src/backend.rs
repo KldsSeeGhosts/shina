@@ -350,9 +350,7 @@ impl Pi {
     }
 
     pub fn send(&self, record: Value) -> Result<(), String> {
-        self.commands
-            .try_send(record)
-            .map_err(|e| format!("The agent did not accept the command: {e}"))
+        crate::outbox::send(&self.commands, record)
     }
 }
 

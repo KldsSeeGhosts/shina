@@ -4874,6 +4874,11 @@ impl State {
         if self.demo {
             return;
         }
+        // Migrated profiles always attach/supervise a server, including plain launches.
+        // Keep load_global's refusal as a defense against direct legacy access.
+        if self.client.is_none() && self.data_dir.join("state.sqlite").exists() {
+            self.client = Some(crate::client::Client::new(self.data_dir.clone()));
+        }
         if self.client.is_some() {
             self.setup_client(wake);
             return;
@@ -4893,6 +4898,9 @@ impl State {
             return;
         }
         self.load_global(wake.clone());
+        if self.ownership_denied {
+            return;
+        }
         self.setup_background();
         self.runtime_enabled = true;
         self.start_task_recovery();
@@ -4910,6 +4918,11 @@ impl State {
     }
 
     fn load_global(&mut self, wake: Waker) {
+        if !self.headless && self.data_dir.join("state.sqlite").exists() {
+            self.ownership_denied = true;
+            self.storage_error = Some("This profile uses the durable server database. Launch with --server-client. Legacy JSON mode cannot write a migrated profile.".into());
+            return;
+        }
         if self.run_marker.is_none() {
             match crate::store::RunMarker::start(&self.data_dir) {
                 Ok(marker) => self.run_marker = Some(marker),
@@ -4964,6 +4977,15 @@ impl State {
         });
         match saved_ui {
             Ok(Some(mut ui)) => {
+                if self.headless {
+                    let mut defaults = self.ui_snapshot();
+                    for key in ["pendingMessages", "background"] {
+                        if let Some(value) = ui.get(key) {
+                            defaults[key] = value.clone();
+                        }
+                    }
+                    ui = defaults;
+                }
                 if let Some(inputs) = &runtime_inputs {
                     ui["pendingMessages"] = inputs.clone();
                 }
@@ -5448,7 +5470,11 @@ impl State {
         if let Some(store) = &mut self.store {
             store.save(snapshot);
         }
-        let ui = self.ui_snapshot();
+        let mut ui = self.ui_snapshot();
+        if self.headless && crate::database::for_path(&self.data_dir.join("index.json")).is_some() {
+            ui = json!({"version":1,"pendingMessages":ui["pendingMessages"],
+                "background":{"keep_awake":ui["background"]["keep_awake"]}});
+        }
         if let Some(store) = &mut self.ui_store {
             store.save(ui);
         }

@@ -117,6 +117,28 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 
+pub(super) fn validate_import(value: &Value) -> Result<(), String> {
+    let ledger: Outbox =
+        serde_json::from_value(value.clone()).map_err(|e| format!("Invalid Honcho outbox: {e}"))?;
+    let mut ids = std::collections::HashSet::new();
+    if ledger.version != 1
+        || ledger.next == 0
+        || !valid_id(&ledger.instance)
+        || ledger.captains.values().any(|id| !valid_id(id))
+        || ledger.pending.iter().any(|turn| {
+            !valid_id(&turn.id)
+                || !ids.insert(&turn.id)
+                || !valid_id(&turn.peer)
+                || !valid_id(&turn.session)
+                || turn.user.chars().count() > 4000
+                || turn.reply.chars().count() > 4000
+        })
+    {
+        return Err("Invalid Honcho outbox.".into());
+    }
+    Ok(())
+}
+
 /// Owns the one ordered writer. Read/recall requests use independent worker threads.
 pub(super) struct Honcho {
     api: Arc<Api>,
@@ -342,11 +364,10 @@ impl Honcho {
         config.base_url = config.base_url.trim_end_matches('/').into();
         config.recall_timeout_ms = config.recall_timeout_ms.clamp(1, 1500);
         let path = directory.join("honcho-outbox.json");
-        let mut ledger: Outbox = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        let mut ledger: Outbox = match crate::store::load(&path)? {
+            Some(value) => serde_json::from_value(value)
                 .map_err(|_| "Invalid Honcho outbox. The file was not overwritten.")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outbox::default(),
-            Err(_) => return Err("Could not read Honcho outbox.".into()),
+            None => Outbox::default(),
         };
         let destination = format!("{}/{}", config.base_url, config.workspace);
         if !ledger.destination.is_empty() && ledger.destination != destination {
@@ -400,7 +421,15 @@ impl Honcho {
                 if stopped.load(Ordering::Acquire) {
                     break;
                 }
+                let database = crate::database::for_path(&path);
+                let dispatch = database.as_ref().map(|db| db.claim_dispatch()).transpose();
+                // Includes health requests. No network dispatch starts during a drain.
+                if matches!(dispatch, Ok(Some(None))) {
+                    let _ = receiver.recv_timeout(Duration::from_millis(100));
+                    continue;
+                }
                 let result = (|| {
+                    let _dispatch = dispatch?.flatten();
                     loop {
                         if stopped.load(Ordering::Acquire) {
                             return Err("Honcho stopped.".into());
@@ -412,11 +441,36 @@ impl Honcho {
                             .front()
                             .cloned();
                         let Some(turn) = turn else { break };
+                        if let Some(database) = crate::database::for_path(&path) {
+                            let committed = database.read("honcho-outbox.json")?;
+                            if !committed.as_ref().is_some_and(|value| {
+                                value["pending"].as_array().is_some_and(|pending| {
+                                    pending.iter().any(|item| item["id"] == turn.id)
+                                })
+                            }) {
+                                // The reducer has staged this turn but not committed it yet.
+                                break;
+                            }
+                        }
+                        if let Some(database) = crate::database::for_path(&path) {
+                            database.effect_status(
+                                &format!("honcho:{}", turn.id),
+                                "dispatching",
+                                None,
+                            )?;
+                        }
                         api.upload(&turn)?;
                         let mut ledger = ledger.lock().expect("Honcho outbox");
                         let mut updated = ledger.clone();
                         updated.pending.pop_front();
                         save(&path, &updated)?;
+                        if let Some(database) = crate::database::for_path(&path) {
+                            database.effect_status(
+                                &format!("honcho:{}", turn.id),
+                                "completed",
+                                None,
+                            )?;
+                        }
                         *ledger = updated;
                     }
                     let deadline = Instant::now() + Duration::from_secs(3);
@@ -460,6 +514,17 @@ impl Honcho {
         Ok(backend)
     }
 
+    fn claim_dispatch(&self) -> Result<Option<crate::database::Dispatch>, String> {
+        crate::database::for_path(&self.path)
+            .map(|db| {
+                db.claim_dispatch()?.ok_or(
+                    "Server is draining. Retry memory requests after cancellation or restart."
+                        .into(),
+                )
+            })
+            .transpose()
+    }
+
     fn read_health<T>(&self, result: Result<T, String>) -> Result<T, String> {
         if let Err(last_error) = &result {
             *self.health.lock().expect("Honcho health") = MemoryBackendStatus::Offline {
@@ -500,6 +565,7 @@ impl MemoryBackend for Honcho {
 
     fn recall(&self, peer: &str) -> Result<String, String> {
         self.read_health((|| {
+            let _dispatch = self.claim_dispatch()?;
             let deadline = Instant::now() + Duration::from_millis(self.api.config.recall_timeout_ms);
             self.api.ensure(peer, None, false, deadline)?;
             let context = self.api.request(Method::GET,
@@ -517,6 +583,7 @@ impl MemoryBackend for Honcho {
 
     fn search(&self, peer: &str, query: &str) -> Result<Vec<MemoryView>, String> {
         self.read_health((|| {
+            let _dispatch = self.claim_dispatch()?;
             let deadline = Instant::now() + Duration::from_millis(1500);
             self.api.ensure(peer, None, false, deadline)?;
             let results = self.api.request(
@@ -544,6 +611,7 @@ impl MemoryBackend for Honcho {
 
     fn ask(&self, peer: &str, query: &str) -> Result<String, String> {
         self.read_health((|| {
+            let _dispatch = self.claim_dispatch()?;
             if query.trim().is_empty() || query.chars().count() > 10000 {
                 return Err("query must contain 1 to 10000 characters.".into());
             }
@@ -1067,6 +1135,47 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn durable_dispatch_fence_pauses_honcho_outbox_health_and_direct_requests() {
+        let fake = Fake::new();
+        let database =
+            crate::database::Database::open(&crate::store::directory().unwrap()).unwrap();
+        database.fence_dispatch(true);
+        let (backend, wakes) = fake.backend();
+        let peer = backend.captain_peer(0, "Fixture").unwrap();
+        backend
+            .record_turn(turn(&peer, "queued during maintenance"))
+            .unwrap();
+        assert!(backend.recall(&peer).unwrap_err().contains("draining"));
+        assert!(
+            backend
+                .search(&peer, "query")
+                .unwrap_err()
+                .contains("draining")
+        );
+        assert!(
+            backend
+                .ask(&peer, "query")
+                .unwrap_err()
+                .contains("draining")
+        );
+        assert!(wakes.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(fake.data.lock().unwrap().requests.is_empty());
+        database.fence_dispatch(false);
+        let _ = backend.signal.try_send(());
+        wait_for(&backend, &wakes, |status| {
+            matches!(
+                status,
+                MemoryBackendStatus::Connected {
+                    queued_count: 0,
+                    ..
+                }
+            )
+        });
+        assert!(!fake.data.lock().unwrap().requests.is_empty());
+        shutdown(&backend);
     }
 
     fn turn(peer: &str, text: &str) -> Turn {

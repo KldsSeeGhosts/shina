@@ -269,6 +269,164 @@ impl ThreadView {
 }
 
 impl State {
+    pub fn validate_import(
+        directory: &std::path::Path,
+        documents: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), String> {
+        let mut state = Self::headless(directory.to_path_buf());
+        if let Some(index) = documents.get("index.json") {
+            if index["version"] != 3 && index["version"] != 4 {
+                return Err("Unsupported legacy index version.".into());
+            }
+            state.restore_global(index)?;
+            if let Some(views) = index.get("threadViews") {
+                state.restore_persisted_history(views)?;
+            }
+            if let Some(inputs) = index.get("runtimeInputs") {
+                for (id, inputs) in inputs.as_object().ok_or("Invalid runtime inputs.")? {
+                    let thread = state
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id.to_string() == *id)
+                        .ok_or("Runtime input references an unknown thread.")?;
+                    thread.restore_pending_inputs(inputs)?;
+                }
+            }
+        }
+        if let Some(ui) = documents.get("ui-state.json") {
+            state.restore_ui(ui)?;
+        }
+        if let Some(inputs) = documents.get("server-inputs.json") {
+            if inputs["version"] != 1 {
+                return Err("Unsupported server input version.".into());
+            }
+            if let Some(background) = inputs.get("background") {
+                let _: BackgroundSettings = serde_json::from_value(background.clone())
+                    .map_err(|e| format!("Invalid server background settings: {e}"))?;
+            }
+            if let Some(pending) = inputs.get("pendingMessages") {
+                for (id, inputs) in pending.as_object().ok_or("Invalid pending messages.")? {
+                    let thread = state
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id.to_string() == *id)
+                        .ok_or("Pending input references an unknown thread.")?;
+                    thread.restore_pending_inputs(inputs)?;
+                }
+            }
+        }
+        if let Some(pending) = documents
+            .get("ui-state.json")
+            .and_then(|ui| ui.get("pendingMessages"))
+        {
+            for (id, inputs) in pending.as_object().ok_or("Invalid pending messages.")? {
+                let thread = state
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.id.to_string() == *id)
+                    .ok_or("Pending input references an unknown thread.")?;
+                thread.restore_pending_inputs(inputs)?;
+            }
+        }
+        state.load_memory(false)?;
+        let routines = crate::routines::Routines::load(directory.join("routines.json"));
+        if let Some(error) = &routines.error {
+            return Err(error.clone());
+        }
+        for routine in routines.entries() {
+            if !state.threads.iter().any(|thread| {
+                thread.id == routine.home
+                    && thread.captain == Some(routine.captain)
+                    && thread.captain_home
+                    && !thread.delegated
+            }) {
+                return Err("Routine references an unknown captain home.".into());
+            }
+        }
+        if let Some(value) = documents.get("honcho-outbox.json") {
+            honcho::validate_import(value)?;
+        }
+        if state
+            .threads
+            .iter()
+            .any(|thread| thread.attachment_error.is_some())
+        {
+            return Err("Import contains missing or invalid input images. Legacy files were left unchanged.".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn write_realistic_legacy_fixture(directory: &std::path::Path) {
+        let mut state = Self::headless(directory.to_path_buf());
+        state.load_global_for_test();
+        state.captains = Captain::presets();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let project = state.add_project(workspace).unwrap();
+        state.captain_project = Some(Some(project));
+        state.open_captain(0);
+        let home = state.current().id;
+        let mut child = Thread::new(state.next_id);
+        state.next_id += 1;
+        child.title = "Inspect a realistic fixture".into();
+        child.project = Some(project);
+        child.parent = Some(home);
+        child.delegated = true;
+        child.captain = Some(0);
+        let child_id = child.id;
+        state.threads.push(child);
+        state.demo_task(
+            child_id,
+            TaskState::Completed,
+            Some(1000),
+            "Fixture result",
+            "",
+        );
+        let mut archived = Thread::new(state.next_id);
+        state.next_id += 1;
+        archived.title = "Archived history".into();
+        archived.project = Some(project);
+        archived.life.archived_at = Some(lifecycle::now());
+        archived.messages.push(Message {
+            role: "Pi",
+            text: "Retained archived reply".into(),
+            images: vec![],
+        });
+        state.threads.push(archived);
+        state
+            .add_memory(0, "The fixture uses a temporary workspace.".into(), true)
+            .unwrap();
+        state.background.routines =
+            crate::routines::Routines::load(directory.join("routines.json"));
+        state
+            .background
+            .routines
+            .create(
+                0,
+                home,
+                "Check fixtures".into(),
+                "Inspect status".into(),
+                crate::routines::Schedule::Every { minutes: 15 },
+                crate::routines::MissedPolicy::Skip,
+                chrono::Local::now(),
+            )
+            .unwrap();
+        state
+            .current_mut()
+            .draft
+            .replace_text("Unsent local draft, never server-owned.");
+        state
+            .current_mut()
+            .native
+            .queue
+            .push_back(pi_session::QueuedMessage {
+                id: 1,
+                prompt: Prompt::new("Previously queued input".into(), vec![]),
+            });
+        state.checkpoint_and_flush().unwrap();
+    }
+
     pub fn headless(directory: PathBuf) -> Self {
         let mut state = Self::construct(PathBuf::new(), false);
         state.data_dir = directory;
@@ -298,6 +456,9 @@ impl State {
             self.install_thread_views(views)?;
         }
         self.setup_headless_background();
+        if let Some(error) = &self.background.routines.error {
+            return Err(error.clone());
+        }
         self.runtime_enabled = true;
         self.start_task_recovery();
         self.refresh_catalog();
@@ -542,6 +703,9 @@ impl State {
             && let Err(error) = self.apply_projection(projection)
         {
             self.storage_error = Some(error);
+        }
+        if let Some(client) = &self.client {
+            client.show_history(self.current().id);
         }
         while let Some(event) = self.client.as_ref().and_then(|client| client.event()) {
             changed = true;
@@ -1448,6 +1612,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_mode_refuses_a_migrated_profile_without_starting_stores_or_harnesses() {
+        let directory = crate::store::directory().unwrap();
+        let database = crate::database::Database::open(&directory).unwrap();
+        drop(database);
+        let mut legacy = State::new(PathBuf::new(), false);
+        legacy.load_global_for_test();
+        assert!(
+            legacy
+                .storage_error
+                .as_ref()
+                .unwrap()
+                .contains("--server-client")
+        );
+        assert!(legacy.store.is_none() && legacy.ui_store.is_none());
+        assert!(!legacy.runtime_enabled && legacy.current().pi.is_none());
+    }
+
+    #[test]
+    fn plain_migrated_desktop_launch_automatically_attaches_without_legacy_writes() {
+        let directory = crate::store::directory().unwrap();
+        drop(crate::database::Database::open(&directory).unwrap());
+        // Prevent the client supervisor from spawning a test binary as a server.
+        let _owner = crate::server_lock::Owner::acquire(&directory).unwrap();
+        let legacy_index = b"legacy index must not be loaded or changed";
+        std::fs::write(directory.join("index.json"), legacy_index).unwrap();
+        let mut desktop = State::new(PathBuf::new(), false);
+        assert!(desktop.client.is_none());
+        desktop.setup(Arc::new(|| {}));
+        assert!(desktop.client.is_some());
+        assert!(desktop.store.is_none() && desktop.ui_store.is_some());
+        assert!(!desktop.runtime_enabled && desktop.current().pi.is_none());
+        assert!(desktop.storage_error.is_none());
+        desktop.checkpoint_and_flush().unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("index.json")).unwrap(),
+            legacy_index
+        );
+        desktop.client.as_mut().unwrap().shutdown();
+    }
     #[test]
     fn client_clocks_expire_local_undo_and_wake_snoozed_rows_without_a_server_tick() {
         let mut state = State::new(PathBuf::new(), false);

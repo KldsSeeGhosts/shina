@@ -171,6 +171,17 @@ pub fn backup_state(directory: &Path) -> Result<std::path::PathBuf, String> {
             connection
                 .execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
                 .map_err(|e| e.to_string())?;
+            let saved = rusqlite::Connection::open_with_flags(
+                &target,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| e.to_string())?;
+            let integrity: String = saved
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if integrity != "ok" {
+                return Err("SQLite backup verification failed. Update cancelled.".into());
+            }
         } else if path.extension().is_some_and(|ext| ext == "json") && name != "service.json" {
             std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
         }
@@ -298,6 +309,42 @@ mod tests {
             "kept"
         );
         assert!(path.exists());
+    }
+    #[test]
+    fn update_backup_includes_open_durable_database_and_preserves_source_documents() {
+        let directory = crate::store::directory().unwrap();
+        let database = crate::database::Database::open(&directory).unwrap();
+        database
+            .write("memory.json", json!({"committed":"in WAL"}))
+            .unwrap();
+        database.issue_device("fixture", "protected-token").unwrap();
+        let backup = backup_state(&directory).unwrap();
+        let saved = rusqlite::Connection::open(backup.join("state.sqlite")).unwrap();
+        let value: String = saved
+            .query_row(
+                "SELECT payload FROM documents WHERE name='memory.json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&value).unwrap(),
+            json!({"committed":"in WAL"})
+        );
+        assert_eq!(
+            saved
+                .query_row("SELECT count(*) FROM devices", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(database.device_active("fixture").unwrap());
+    }
+    #[test]
+    fn damaged_database_backup_cancels_without_returning_a_rollback_path() {
+        let directory = crate::store::directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("state.sqlite"), b"not sqlite").unwrap();
+        assert!(backup_state(&directory).is_err());
     }
     #[test]
     fn rollback_restores_the_matched_schema_and_quarantines_new_databases() {

@@ -1,10 +1,181 @@
-//! Slice 1 JSON-RPC contract. Snapshots replace replay until the SQLite migration.
+//! Durable JSON-RPC contract. Patches use typed set/remove operations and path segments.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 1;
+pub const MINOR: u32 = 2;
 pub const MAX_CONTROL: usize = 1024 * 1024;
+pub const PAGE_BYTES: usize = 64 * 1024;
+pub const MAX_PAGE_BYTES: usize = 256 * 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub const HISTORY_FIELDS: [&str; 13] = [
+    "messages",
+    "tools",
+    "thoughts",
+    "work",
+    "diagnostics",
+    "compactions",
+    "fork_points",
+    "commands",
+    "models",
+    "queue",
+    "steering",
+    "follow_ups",
+    "stats",
+];
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum Patch {
+    Set { path: Vec<String>, value: Value },
+    Remove { path: Vec<String> },
+}
+
+pub fn diff(before: &Value, after: &Value) -> Value {
+    fn walk(before: &Value, after: &Value, path: &mut Vec<String>, out: &mut Vec<Patch>) {
+        if before == after {
+            return;
+        }
+        match (before, after) {
+            (Value::Object(a), Value::Object(b)) => {
+                for key in a.keys().filter(|key| !b.contains_key(*key)) {
+                    path.push(key.clone());
+                    out.push(Patch::Remove { path: path.clone() });
+                    path.pop();
+                }
+                for (key, value) in b {
+                    path.push(key.clone());
+                    if let Some(before) = a.get(key) {
+                        walk(before, value, path, out);
+                    } else {
+                        out.push(Patch::Set {
+                            path: path.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                    path.pop();
+                }
+            }
+            (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+                for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                    path.push(index.to_string());
+                    walk(a, b, path, out);
+                    path.pop();
+                }
+            }
+            _ => out.push(Patch::Set {
+                path: path.clone(),
+                value: after.clone(),
+            }),
+        }
+    }
+    let mut patches = Vec::new();
+    walk(before, after, &mut Vec::new(), &mut patches);
+    json!(patches)
+}
+
+pub fn apply(state: &mut Value, patches: Value) -> Result<(), String> {
+    let patches: Vec<Patch> = serde_json::from_value(patches).map_err(|e| e.to_string())?;
+    for patch in patches {
+        let (path, value) = match patch {
+            Patch::Set { path, value } => (path, Some(value)),
+            Patch::Remove { path } => (path, None),
+        };
+        if path.is_empty() {
+            *state = value.ok_or("Cannot remove projection root.")?;
+            continue;
+        }
+        let mut target = &mut *state;
+        for segment in &path[..path.len() - 1] {
+            target = match target {
+                Value::Object(object) => object.get_mut(segment),
+                Value::Array(array) => segment.parse::<usize>().ok().and_then(|i| array.get_mut(i)),
+                _ => None,
+            }
+            .ok_or("Projection patch has a missing parent.")?;
+        }
+        let key = path.last().expect("nonempty path");
+        match (target, value) {
+            (Value::Object(object), Some(value)) => {
+                object.insert(key.clone(), value);
+            }
+            (Value::Object(object), None) => {
+                object.remove(key);
+            }
+            (Value::Array(array), Some(value)) => {
+                let index = key
+                    .parse::<usize>()
+                    .map_err(|_| "Invalid patch array index.")?;
+                *array
+                    .get_mut(index)
+                    .ok_or("Patch array index out of bounds.")? = value;
+            }
+            _ => return Err("Invalid projection patch target.".into()),
+        }
+    }
+    Ok(())
+}
+
+pub fn revision(value: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value.to_string()))
+}
+
+pub fn history_payload(thread: &Value) -> Value {
+    let mut history = json!({"id":thread["id"]});
+    for key in HISTORY_FIELDS {
+        history[key] = thread[key].clone();
+    }
+    history
+}
+
+/// History payloads travel separately. The workspace holds only lightweight thread fields.
+pub fn compact(state: &Value) -> Value {
+    let mut state = state.clone();
+    if let Some(threads) = state["threads"].as_array_mut() {
+        for thread in threads {
+            let revision = revision(&history_payload(thread));
+            for key in HISTORY_FIELDS {
+                thread[key] = if key == "stats" { json!({}) } else { json!([]) };
+            }
+            thread["historyRevision"] = json!(revision);
+        }
+    }
+    state
+}
+
+/// Cursor pins both identity and content. A changing transcript asks the reader to restart.
+/// JSON text is split only on UTF-8 boundaries, including a single oversized message.
+pub fn text_page(text: &str, identity: &str, params: &Value) -> Result<Value, String> {
+    let revision = revision(&json!({"identity":identity,"text":text}));
+    let offset = match params["cursor"].as_str() {
+        None => 0,
+        Some(cursor) => {
+            let (saved, offset) = cursor.split_once(':').ok_or("Invalid history cursor.")?;
+            if saved != revision {
+                return Err("History changed. Restart paging without a cursor.".into());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| "Invalid history cursor offset.")?
+        }
+    };
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return Err("Invalid history cursor offset.".into());
+    }
+    let budget = params["byteBudget"]
+        .as_u64()
+        .unwrap_or(PAGE_BYTES as u64)
+        .clamp(1024, MAX_PAGE_BYTES as u64) as usize;
+    let mut end = offset.saturating_add(budget).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(
+        json!({"encoding":"utf8-json","data":&text[offset..end],"revision":revision,
+        "nextCursor":(end < text.len()).then(|| format!("{revision}:{end}")),"totalBytes":text.len()}),
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -113,5 +284,56 @@ mod tests {
         let mut changed = b;
         changed.params["choice"]["model"] = json!("b");
         assert_ne!(a.hash(), changed.hash());
+    }
+
+    #[test]
+    fn typed_patches_roundtrip_add_remove_arrays_and_escaped_keys() {
+        let before = json!({"threads":[{"id":1,"status":"ready"}],"old":true,"a/b":{"~key":1}});
+        let after = json!({"threads":[{"id":1,"status":"working"}],"new":null,"a/b":{"~key":2}});
+        let mut projected = before.clone();
+        apply(&mut projected, diff(&before, &after)).unwrap();
+        assert_eq!(projected, after);
+        assert!(projected.as_object().unwrap().contains_key("new"));
+    }
+
+    #[test]
+    fn history_pages_bound_large_unicode_messages_and_reject_stale_or_cross_thread_cursors() {
+        let text = json!({"messages":[{"text":"😀 image transcript\n".repeat(10000)}]}).to_string();
+        let mut cursor = Value::Null;
+        let mut assembled = String::new();
+        let mut first_cursor = None;
+        loop {
+            let page = text_page(
+                &text,
+                "thread-1",
+                &json!({"cursor":cursor,"byteBudget":1024}),
+            )
+            .unwrap();
+            assert!(page["data"].as_str().unwrap().len() <= 1024);
+            assembled.push_str(page["data"].as_str().unwrap());
+            cursor = page["nextCursor"].clone();
+            if first_cursor.is_none() {
+                first_cursor = Some(cursor.clone());
+            }
+            if cursor.is_null() {
+                break;
+            }
+        }
+        assert_eq!(assembled, text);
+        let params = json!({"cursor":first_cursor.unwrap()});
+        assert!(text_page("changed", "thread-1", &params).is_err());
+        assert!(text_page(&text, "thread-2", &params).is_err());
+    }
+
+    #[test]
+    fn status_only_changes_do_not_invalidate_the_history_revision() {
+        let mut state =
+            json!({"threads":[{"id":1,"status":"Running","messages":[{"text":"Stable"}]}]});
+        let before = compact(&state);
+        state["threads"][0]["status"] = json!("Completed");
+        assert_eq!(
+            before["threads"][0]["historyRevision"],
+            compact(&state)["threads"][0]["historyRevision"]
+        );
     }
 }

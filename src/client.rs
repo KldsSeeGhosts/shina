@@ -1,6 +1,6 @@
 //! KSG DesktopBackendManager lifecycle: attach first, supervise only our own child.
 use crate::{
-    protocol::{Command, MAX_CONTROL},
+    protocol::{self, Command},
     server_auth::Discovery,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -11,7 +11,7 @@ use std::{
     process::{Child, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -83,6 +83,7 @@ pub struct Client {
     snapshot: Arc<Mutex<Option<Value>>>,
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
+    history_thread: Arc<AtomicUsize>,
 }
 
 impl Client {
@@ -102,6 +103,7 @@ impl Client {
             snapshot: Arc::default(),
             stop: Arc::default(),
             worker: Arc::default(),
+            history_thread: Arc::default(),
         }
     }
     pub fn set_device_directory(&mut self, directory: PathBuf) {
@@ -117,13 +119,14 @@ impl Client {
         let snapshot = self.snapshot.clone();
         let stop = self.stop.clone();
         let ready = self.commands.ready.clone();
+        let history_thread = self.history_thread.clone();
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("client runtime");
             runtime.block_on(supervise(
-                (directory, device_directory),
+                (directory, device_directory, history_thread),
                 input,
                 output,
                 snapshot,
@@ -139,6 +142,9 @@ impl Client {
     }
     pub fn snapshot(&self) -> Option<Value> {
         self.snapshot.lock().expect("client snapshot").take()
+    }
+    pub fn show_history(&self, thread: usize) {
+        self.history_thread.store(thread, Ordering::Release);
     }
     pub fn event(&self) -> Option<Event> {
         self.events.try_recv().ok()
@@ -185,7 +191,7 @@ async fn authenticate(discovery: &Discovery, device: &str) -> Result<String, Str
         .read_to_string(&mut reply)
         .await
         .map_err(|e| e.to_string())?;
-    if reply.starts_with("HTTP/1.1 401") {
+    if reply.starts_with("HTTP/1.1 401") || reply.starts_with("HTTP/1.1 403") {
         return Err("Authentication denied. Restart the client after checking this profile's server.json permissions.".into());
     }
     if !reply.starts_with("HTTP/1.1 200") {
@@ -229,13 +235,224 @@ fn spawn() -> Result<Child, String> {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(discovery: &Discovery, device: &str, desktop: bool) -> Result<Socket, String> {
+#[derive(Default)]
+struct ProjectionCache {
+    state: Value,
+    seq: Option<u64>,
+    epoch: Value,
+    snapshot_pages: String,
+    histories: std::collections::HashMap<u64, (String, Value, usize)>,
+    history_order: VecDeque<u64>,
+    desired_thread: Option<u64>,
+    inflight: Option<History>,
+    dirty: bool,
+    maintenance: Value,
+}
+
+struct History {
+    thread: u64,
+    revision: String,
+    cursor: Value,
+    text: String,
+    waiting: bool,
+}
+
+impl ProjectionCache {
+    fn receive(&mut self, value: &Value) -> Result<(), String> {
+        let params = &value["params"];
+        match value["method"].as_str() {
+            Some("subscription.snapshotPage") => {
+                self.snapshot_pages
+                    .push_str(params["data"].as_str().ok_or("Invalid snapshot page.")?);
+                if self.snapshot_pages.len() > protocol::MAX_SNAPSHOT_BYTES {
+                    return Err("Workspace metadata exceeded the client memory budget.".into());
+                }
+                if params["nextCursor"].is_null() {
+                    let snapshot: Value =
+                        serde_json::from_str(&std::mem::take(&mut self.snapshot_pages))
+                            .map_err(|e| e.to_string())?;
+                    self.receive(&protocol::notification("subscription.snapshot", snapshot))?;
+                }
+            }
+            Some("subscription.snapshot") => {
+                self.state = params["state"].clone();
+                self.seq = params["seq"].as_u64();
+                self.epoch = params["epoch"].clone();
+                self.dirty = true;
+                self.maintenance = params["maintenance"].clone();
+            }
+            Some("subscription.ready") if params.get("maintenance").is_some() => {
+                // Replay may contain no patches. Clear a stale drain after reconnect.
+                self.maintenance = params["maintenance"].clone();
+            }
+            Some("subscription.patch") => {
+                let seq = params["seq"].as_u64().ok_or("Invalid patch sequence.")?;
+                if self.seq.is_some_and(|previous| seq <= previous) {
+                    return Ok(());
+                }
+                if self.seq.and_then(|seq| seq.checked_add(1)) != Some(seq)
+                    || self.epoch != params["epoch"]
+                {
+                    return Err("Projection replay gap. Reconnecting for a snapshot.".into());
+                }
+                protocol::apply(&mut self.state, params["patch"].clone())?;
+                self.seq = Some(seq);
+                self.dirty = true;
+            }
+            _ if value["id"] == "history" => {
+                let Some(mut history) = self.inflight.take() else {
+                    return Ok(());
+                };
+                if self.desired_thread.is_some_and(|id| id != history.thread) {
+                    return Ok(());
+                }
+                if !value["error"].is_null() {
+                    return Ok(());
+                }
+                let page = &value["result"];
+                if history.text.is_empty()
+                    && let Some(revision) = page["historyRevision"].as_str()
+                {
+                    history.revision = revision.to_owned();
+                }
+                history
+                    .text
+                    .push_str(page["data"].as_str().ok_or("Invalid transcript page.")?);
+                if history.text.len() > protocol::MAX_SNAPSHOT_BYTES {
+                    return Err("Thread history exceeded the client memory budget.".into());
+                }
+                history.cursor = page["nextCursor"].clone();
+                if history.cursor.is_null() {
+                    let view = serde_json::from_str(&history.text).map_err(|e| e.to_string())?;
+                    self.histories
+                        .insert(history.thread, (history.revision, view, history.text.len()));
+                    self.history_order.retain(|id| *id != history.thread);
+                    self.history_order.push_back(history.thread);
+                    while self
+                        .histories
+                        .values()
+                        .map(|(_, _, bytes)| *bytes)
+                        .sum::<usize>()
+                        > protocol::MAX_SNAPSHOT_BYTES
+                    {
+                        let Some(oldest) = self.history_order.pop_front() else {
+                            break;
+                        };
+                        self.histories.remove(&oldest);
+                    }
+                    self.dirty = true;
+                } else {
+                    history.waiting = false;
+                    self.inflight = Some(history);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn next_history(&mut self) -> Option<Value> {
+        if self.inflight.is_none() {
+            for thread in self.state["threads"].as_array()? {
+                let id = thread["id"].as_u64()?;
+                let desired = self
+                    .desired_thread
+                    .or_else(|| self.state["index"]["active"].as_u64());
+                if desired.is_some_and(|desired| desired != id) {
+                    continue;
+                }
+                let revision = thread["historyRevision"].as_str()?;
+                if self
+                    .histories
+                    .get(&id)
+                    .is_none_or(|(old, _, _)| old != revision)
+                {
+                    self.inflight = Some(History {
+                        thread: id,
+                        revision: revision.into(),
+                        cursor: Value::Null,
+                        text: String::new(),
+                        waiting: false,
+                    });
+                    break;
+                }
+            }
+        }
+        let history = self.inflight.as_mut()?;
+        if history.waiting {
+            return None;
+        }
+        history.waiting = true;
+        Some(
+            json!({"jsonrpc":"2.0","id":"history","method":"thread.history",
+            "params":{"threadId":history.thread,"cursor":history.cursor,"byteBudget":protocol::PAGE_BYTES}}),
+        )
+    }
+
+    fn projected(&mut self) -> Option<Value> {
+        if !self.dirty || self.seq.is_none() {
+            return None;
+        }
+        self.dirty = false;
+        if let Some(threads) = self.state["threads"].as_array() {
+            self.histories
+                .retain(|id, _| threads.iter().any(|thread| thread["id"] == *id));
+            self.history_order
+                .retain(|id| self.histories.contains_key(id));
+        }
+        let mut state = self.state.clone();
+        if let Some(threads) = state["threads"].as_array_mut() {
+            for thread in threads {
+                if let Some((_, history, _)) =
+                    thread["id"].as_u64().and_then(|id| self.histories.get(&id))
+                {
+                    for key in protocol::HISTORY_FIELDS {
+                        thread[key] = history[key].clone();
+                    }
+                }
+            }
+        }
+        Some(state)
+    }
+}
+
+async fn connect(
+    discovery: &Discovery,
+    device: &str,
+    device_directory: &std::path::Path,
+    cache: &ProjectionCache,
+    desktop: bool,
+) -> Result<Socket, String> {
     if discovery.protocol_major != crate::protocol::MAJOR {
         return Err("Protocol major mismatch. Update the server and client together.".into());
     }
-    let token = tokio::time::timeout(Duration::from_secs(2), authenticate(discovery, device))
-        .await
-        .map_err(|_| "Server authentication timed out.")??;
+    let credential_path = device_directory.join("client-credential.json");
+    let saved = crate::store::load(&credential_path)?;
+    let token = if let Some(saved) = saved {
+        if saved["serverId"] != discovery.server_id || saved["deviceId"] != device {
+            return Err(
+                "Authentication denied. The saved credential belongs to another server or device."
+                    .into(),
+            );
+        }
+        saved["token"]
+            .as_str()
+            .ok_or("Invalid saved device credential.")?
+            .to_owned()
+    } else {
+        let token = tokio::time::timeout(Duration::from_secs(2), authenticate(discovery, device))
+            .await
+            .map_err(|_| "Server authentication timed out.")??;
+        crate::server_auth::protect(device_directory)?;
+        crate::store::write_atomic(
+            &credential_path,
+            json!({"serverId":discovery.server_id,"deviceId":device,"token":token})
+                .to_string()
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        token
+    };
     let mut request = format!("ws://127.0.0.1:{}/v1/ws", discovery.port)
         .into_client_request()
         .map_err(|e| e.to_string())?;
@@ -246,16 +463,20 @@ async fn connect(discovery: &Discovery, device: &str, desktop: bool) -> Result<S
             .map_err(|_| "Invalid local credential.")?,
     );
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(2 * MAX_CONTROL))
-        .max_frame_size(Some(2 * MAX_CONTROL));
+        .max_message_size(Some(protocol::MAX_SNAPSHOT_BYTES))
+        .max_frame_size(Some(protocol::MAX_SNAPSHOT_BYTES));
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(3),
         tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
     .await
     .map_err(|_| "Server connection timed out.")?
-    .map_err(|_| "Server listener is unavailable.")?;
-    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":crate::protocol::MAJOR,"protocolMinor":crate::protocol::MINOR,"projectionSchema":1,"clientPid":desktop.then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
+    .map_err(|error| match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) if matches!(response.status().as_u16(),401|403) =>
+            "Authentication denied. This device may have been revoked. Re-enrollment requires user action.".to_owned(),
+        _ => "Server listener is unavailable.".to_owned(),
+    })?;
+    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":protocol::MAJOR,"protocolMinor":protocol::MINOR,"projectionSchema":1,"clientPid":desktop.then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
     let reply: Value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match socket.next().await {
@@ -276,27 +497,31 @@ async fn connect(discovery: &Discovery, device: &str, desktop: bool) -> Result<S
     })
     .await
     .map_err(|_| "Server hello timed out.")??;
-    if !reply["error"].is_null()
-        || reply["result"]["instanceId"] != discovery.instance_id
+    if let Some(error) = reply["error"]["message"].as_str() {
+        return Err(format!("Server handshake refused: {error}"));
+    }
+    if reply["result"]["instanceId"] != discovery.instance_id
         || reply["result"]["serverId"] != discovery.server_id
     {
         return Err(
             "Server handshake refused or instance changed. Check client/server versions.".into(),
         );
     }
-    socket
+    if desktop {
+        socket
         .send(Message::Text(
-            json!({"jsonrpc":"2.0","id":"subscribe","method":"workspace.subscribe","params":{}})
+            json!({"jsonrpc":"2.0","id":"subscribe","method":"workspace.subscribe","params":{"lastSeq":cache.seq,"epoch":cache.epoch}})
                 .to_string()
                 .into(),
         ))
         .await
         .map_err(|e| e.to_string())?;
+    }
     Ok(socket)
 }
 
 async fn supervise(
-    profile: (PathBuf, PathBuf),
+    profile: (PathBuf, PathBuf, Arc<AtomicUsize>),
     mut input: tokio::sync::mpsc::Receiver<Command>,
     output: mpsc::SyncSender<Event>,
     snapshot: Arc<Mutex<Option<Value>>>,
@@ -304,7 +529,7 @@ async fn supervise(
     ready: Arc<AtomicBool>,
     wake: rune::Waker,
 ) {
-    let (directory, device_directory) = profile;
+    let (directory, device_directory, history_thread) = profile;
     let report = |error: String| {
         let _ = output.try_send(Event::Error(error));
         wake();
@@ -328,7 +553,12 @@ async fn supervise(
     let mut socket: Option<Socket> = None;
     let mut updating = false;
     let mut server_stopped = false;
+    let mut cache = ProjectionCache::default();
     while !stop.load(Ordering::Acquire) {
+        cache.desired_thread = match history_thread.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id as u64),
+        };
         if socket.is_none() {
             ready.store(false, Ordering::Release);
             if let Some(process) = &mut child
@@ -342,10 +572,12 @@ async fn supervise(
             }
             if let Ok(discovery) = Discovery::read(&directory) {
                 match tokio::select! {
-                    result = connect(&discovery, &device, true) => result,
+                    result = connect(&discovery, &device, &device_directory, &cache, true) => result,
                     _ = stopped(&stop) => break,
                 } {
                     Ok(mut connected) => {
+                        cache.inflight = None;
+                        cache.snapshot_pages.clear();
                         if child
                             .as_ref()
                             .is_some_and(|child| child.id() == discovery.pid)
@@ -407,30 +639,46 @@ async fn supervise(
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            let mut disconnect = false;
                             if let Some(method) = value["method"].as_str().filter(|m| matches!(*m, "server.draining" | "server.restarting" | "server.drainCancelled" | "server.stopping")) {
                                 let draining = method != "server.drainCancelled";
                                 server_stopped |= method == "server.stopping";
+                                cache.maintenance = value["params"].clone();
                                 ready.store(!draining, Ordering::Release);
                                 if output.try_send(Event::Maintenance(method.into(), value["params"].clone())).is_err() {
-                                    socket = None;
+                                    disconnect = true;
                                 }
                                 if method == "server.restarting" { updating = true; }
-                            } else if value["method"] == "subscription.snapshot" {
-                                *snapshot.lock().expect("client snapshot") = Some(value["params"]["state"].clone());
-                                let phase = value["params"]["maintenance"]["phase"].as_str().unwrap_or("ready");
-                                let draining = phase != "ready";
+                            }
+                            if let Err(error) = cache.receive(&value) {
+                                cache = ProjectionCache::default();
+                                socket = None;
+                                report(error);
+                                continue;
+                            }
+                            if let Some(projected) = cache.projected() {
+                                *snapshot.lock().expect("client snapshot") = Some(projected);
+                            }
+                            if value["method"] == "subscription.ready" || value["id"] == "subscribe" {
+                                let phase = cache.maintenance["phase"].as_str().unwrap_or("ready");
                                 server_stopped |= phase == "stopping";
                                 updating |= phase == "restarting";
-                                ready.store(!draining,Ordering::Release);
-                            } else if let Some(id) = value["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
+                                ready.store(cache.seq.is_some() && phase == "ready",Ordering::Release);
+                            }
+                            if let Some(id) = value["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
                                 && let Some(command) = pending.iter().find(|command| command.command_id == id) {
                                     let transient = value["error"]["message"].as_str().is_some_and(|text| text.contains("queue is full") || text.contains("Runtime unavailable"));
-                                    if transient { socket = None; }
+                                    if transient { disconnect = true; }
                                     else if output.try_send(Event::Receipt(command.clone(), value)).is_ok() {
                                         if let Some(index) = pending.iter().position(|command| command.command_id == id) { pending.remove(index); }
                                     }
-                                    else { socket = None; }
+                                    else { disconnect = true; }
                             }
+                            if !disconnect && let Some(request) = cache.next_history()
+                                && !send(connected, Message::Text(request.to_string().into())).await {
+                                    disconnect = true;
+                                }
+                            if disconnect { socket = None; }
                             wake();
                         }
                     }
@@ -439,7 +687,12 @@ async fn supervise(
                     _ => { socket = None; report("Server disconnected. Reconnecting with the same command IDs.".into()); }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if let Some(request) = cache.next_history()
+                    && !send(connected, Message::Text(request.to_string().into())).await {
+                        socket = None;
+                    }
+            }
         }
     }
     ready.store(false, Ordering::Release);
@@ -473,10 +726,15 @@ pub async fn local_rpc(
 ) -> Result<Value, String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let discovery = Discovery::read(directory)?;
-        static DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let device_directory = directory.join("clients").join("maintenance");
+        std::fs::create_dir_all(&device_directory).map_err(|e| e.to_string())?;
+        let _owner = crate::server_lock::Owner::acquire(&device_directory)?;
+        let device = device_id(&device_directory)?;
         let mut socket = connect(
             &discovery,
-            DEVICE.get_or_init(|| uuid::Uuid::new_v4().to_string()),
+            &device,
+            &device_directory,
+            &ProjectionCache::default(),
             false,
         )
         .await?;
@@ -563,5 +821,67 @@ mod tests {
                 .send("thread.send", json!({"text":"kept locally"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reconnect_cache_applies_replay_without_losing_history_and_detects_gaps() {
+        let mut cache = ProjectionCache::default();
+        cache.receive(&protocol::notification("subscription.snapshot",
+            json!({"epoch":"epoch","seq":10,"state":{"threads":[{"id":1,"historyRevision":"a","messages":[]}]}}))).unwrap();
+        let request = cache.next_history().unwrap();
+        assert_eq!(request["params"]["threadId"], 1);
+        cache.receive(&json!({"id":"history","result":{"data":"{\"messages\":[{\"text\":\"retained\"}]}","nextCursor":null}})).unwrap();
+        assert_eq!(
+            cache.projected().unwrap()["threads"][0]["messages"][0]["text"],
+            "retained"
+        );
+        cache.receive(&protocol::notification("subscription.patch",
+            json!({"epoch":"epoch","seq":11,"patch":[{"op":"set","path":["threads","0","status"],"value":"completed"}]}))).unwrap();
+        assert_eq!(
+            cache.projected().unwrap()["threads"][0]["messages"][0]["text"],
+            "retained"
+        );
+        assert!(
+            cache
+                .receive(&protocol::notification(
+                    "subscription.patch",
+                    json!({"epoch":"epoch","seq":13,"patch":[]})
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replay_ready_refreshes_maintenance_even_without_projection_changes() {
+        let mut cache = ProjectionCache {
+            maintenance: json!({"phase":"draining"}),
+            seq: Some(42),
+            ..ProjectionCache::default()
+        };
+        cache
+            .receive(&protocol::notification(
+                "subscription.ready",
+                json!({"seq":42,"maintenance":{"phase":"ready"}}),
+            ))
+            .unwrap();
+        assert_eq!(cache.maintenance["phase"], "ready");
+        assert_eq!(cache.seq, Some(42));
+    }
+
+    #[test]
+    fn native_history_fetch_is_lazy_and_follows_the_local_selection() {
+        let mut cache = ProjectionCache {
+            desired_thread: Some(2),
+            state: json!({"index":{"active":1},"threads":[
+                {"id":1,"historyRevision":"a"},{"id":2,"historyRevision":"b"}]}),
+            ..ProjectionCache::default()
+        };
+        assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 2);
+        cache.desired_thread = Some(1);
+        cache
+            .receive(&json!({"id":"history","result":{"data":"{}","nextCursor":null}}))
+            .unwrap();
+        assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 1);
+        assert!(cache.histories.is_empty());
     }
 }

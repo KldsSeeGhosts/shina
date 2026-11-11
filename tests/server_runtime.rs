@@ -40,6 +40,9 @@ impl Profile {
         }
     }
     fn launch(&mut self, args: &[&str]) -> usize {
+        self.launch_with_fault(args, None)
+    }
+    fn launch_with_fault(&mut self, args: &[&str], fault: Option<&str>) -> usize {
         let mut command = Command::new(env!("CARGO_BIN_EXE_shina"));
         command
             .args(args)
@@ -57,6 +60,9 @@ impl Profile {
                 )
                 .unwrap(),
             );
+        if let Some(fault) = fault {
+            command.env("SHINA_TEST_CRASH_EFFECT", fault);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -115,8 +121,28 @@ impl Profile {
 impl Drop for Profile {
     fn drop(&mut self) {
         for child in &mut self.children {
+            #[cfg(windows)]
+            if child.try_wait().ok().flatten().is_none() {
+                use std::os::windows::process::CommandExt;
+                // A failing service-launcher test must also reap its owned serve child.
+                let _ = Command::new("taskkill.exe")
+                    .args(["/F", "/T", "/PID", &child.id().to_string()])
+                    .creation_flags(0x08000000)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if std::thread::panicking() {
+            for index in 0..self.children.len() {
+                eprintln!(
+                    "fixture server {index}: {}",
+                    fs::read_to_string(self.root.join(format!("server-{index}.log")))
+                        .unwrap_or_default()
+                );
+            }
         }
         // This path was created under temp_dir with a fresh UUID, never the real profile.
         let _ = fs::remove_dir_all(&self.root);
@@ -126,6 +152,10 @@ impl Drop for Profile {
 struct Client {
     socket: WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     snapshot: Value,
+    seq: u64,
+    epoch: Value,
+    notifications: Vec<Value>,
+    token: String,
 }
 impl Client {
     fn connect(discovery: &Value, device: uuid::Uuid) -> Self {
@@ -160,6 +190,10 @@ impl Client {
         let mut client = Self {
             socket,
             snapshot: Value::Null,
+            seq: 0,
+            epoch: Value::Null,
+            notifications: Vec::new(),
+            token: auth["token"].as_str().unwrap().to_owned(),
         };
         let hello = client.rpc(
             "hello",
@@ -196,6 +230,57 @@ impl Client {
                     let value: Value = serde_json::from_str(&text).unwrap();
                     if value["method"] == "subscription.snapshot" {
                         self.snapshot = value["params"]["state"].clone();
+                        self.seq = value["params"]["seq"].as_u64().unwrap();
+                        self.epoch = value["params"]["epoch"].clone();
+                    }
+                    if value["method"] == "subscription.patch" {
+                        for patch in value["params"]["patch"].as_array().unwrap() {
+                            let path = patch["path"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|part| {
+                                    part.as_str().unwrap().replace('~', "~0").replace('/', "~1")
+                                })
+                                .collect::<Vec<_>>();
+                            if path.is_empty() {
+                                self.snapshot = patch["value"].clone();
+                                continue;
+                            }
+                            let parent = if path.len() == 1 {
+                                String::new()
+                            } else {
+                                format!("/{}", path[..path.len() - 1].join("/"))
+                            };
+                            let key = patch["path"]
+                                .as_array()
+                                .unwrap()
+                                .last()
+                                .unwrap()
+                                .as_str()
+                                .unwrap();
+                            let target = self.snapshot.pointer_mut(&parent).unwrap();
+                            if let Some(object) = target.as_object_mut() {
+                                if patch["op"] == "remove" {
+                                    object.remove(key);
+                                } else {
+                                    object.insert(key.into(), patch["value"].clone());
+                                }
+                            } else {
+                                target.as_array_mut().unwrap()[key.parse::<usize>().unwrap()] =
+                                    patch["value"].clone();
+                            }
+                        }
+                        self.seq = value["params"]["seq"].as_u64().unwrap();
+                    }
+                    if value["method"]
+                        .as_str()
+                        .is_some_and(|method| method.starts_with("subscription."))
+                    {
+                        self.notifications.push(value.clone());
+                        if self.notifications.len() > 512 {
+                            self.notifications.remove(0);
+                        }
                     }
                     return value;
                 }
@@ -205,8 +290,11 @@ impl Client {
         }
     }
     fn until(&mut self, predicate: impl Fn(&Value) -> bool) {
+        self.until_sequence(0, predicate);
+    }
+    fn until_sequence(&mut self, seq: u64, predicate: impl Fn(&Value) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !predicate(&self.snapshot) {
+        while self.seq < seq || !predicate(&self.snapshot) {
             assert!(
                 Instant::now() < deadline,
                 "snapshot condition timed out: {}",
@@ -280,16 +368,15 @@ fn pi_and_acp_survive_disconnect_and_a_second_client_sees_the_same_state() {
                 .unwrap()
                 .contains("different payload")
         );
-        let index: Value =
-            serde_json::from_slice(&fs::read(profile.root.join("Shina/index.json")).unwrap())
-                .unwrap();
+        let database = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
         assert_eq!(
-            index["commandReceipts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|receipt| receipt["commandId"] == id.to_string())
-                .count(),
+            database
+                .query_row(
+                    "SELECT count(*) FROM command_receipts WHERE command_id=?1",
+                    [id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
             1
         );
         let user_count = reconnected.snapshot["threads"][0]["messages"]
@@ -546,7 +633,7 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
         json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
         json!("good-version"),
     );
-    assert_eq!(hello["result"]["protocolMinor"], 1);
+    assert_eq!(hello["result"]["protocolMinor"], 2);
     let prepared =
         client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
     assert_eq!(prepared["phase"], "draining");
@@ -585,6 +672,271 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
 }
 
 #[test]
+fn durable_subscriptions_replay_patches_and_fall_back_to_compact_snapshots() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut reader = profile.client(uuid::Uuid::new_v4());
+    reader.rpc("subscription.cancel", json!({}), json!("cancel"));
+    let after = reader.seq;
+    let epoch = reader.epoch.clone();
+    let mut writer = profile.client(uuid::Uuid::new_v4());
+    writer.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"Durable rename"}),
+        uuid::Uuid::new_v4(),
+    );
+    writer.until(|state| state["index"]["threads"][0]["title"] == "Durable rename");
+    reader.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":1,"projectionSchema":1}),
+        json!("hello-v1"),
+    );
+    reader.notifications.clear();
+    reader.rpc(
+        "workspace.subscribe",
+        json!({"lastSeq":after,"epoch":epoch}),
+        json!("resume"),
+    );
+    assert!(
+        reader
+            .notifications
+            .iter()
+            .any(|value| value["method"] == "subscription.patch")
+    );
+    assert!(
+        !reader
+            .notifications
+            .iter()
+            .any(|value| value["method"] == "subscription.snapshot")
+    );
+    reader.notifications.clear();
+    reader.rpc(
+        "workspace.subscribe",
+        json!({"lastSeq":u64::MAX,"epoch":epoch}),
+        json!("future-cursor"),
+    );
+    assert!(
+        reader
+            .notifications
+            .iter()
+            .any(|value| value["method"] == "subscription.snapshot")
+    );
+    assert!(reader.snapshot["threads"][0]["historyRevision"].is_string());
+    assert!(
+        reader.snapshot["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    profile.stop();
+}
+
+#[test]
+fn protocol_one_zero_negotiates_snapshots_and_clear_restart_guidance() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert_eq!(hello["result"]["protocolMinor"], 0);
+    assert!(
+        !hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "projection-patches")
+    );
+    client.notifications.clear();
+    client.rpc(
+        "workspace.subscribe",
+        json!({"lastSeq":client.seq,"epoch":client.epoch}),
+        json!("old-subscribe"),
+    );
+    assert!(
+        client
+            .notifications
+            .iter()
+            .any(|n| n["method"] == "subscription.snapshot")
+    );
+    assert!(
+        !client
+            .notifications
+            .iter()
+            .any(|n| n["method"] == "subscription.patch")
+    );
+    let prepared = client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4());
+    assert!(
+        prepared["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Close older clients")
+    );
+    profile.stop();
+}
+
+#[test]
+fn unauthorized_socket_cannot_prepare_restart() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let discovery = profile.discovery();
+    let mut request = format!(
+        "ws://127.0.0.1:{}/v1/ws",
+        discovery["port"].as_u64().unwrap()
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        "Bearer not-a-device-credential".parse().unwrap(),
+    );
+    assert!(
+        matches!(tungstenite::connect(request), Err(tungstenite::Error::Http(response)) if response.status().as_u16() == 401)
+    );
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        client.rpc("server.status", json!({}), json!("status"))["result"]["phase"],
+        "ready"
+    );
+    profile.stop();
+}
+
+#[test]
+fn service_restart_keeps_sqlite_open_and_retains_atomic_receipts_and_backups() {
+    let mut profile = Profile::new();
+    let directory = profile.root.join("Shina");
+    let descriptor = directory.join("service.json");
+    fs::write(&descriptor, json!({
+        "platform":if cfg!(windows) { "Windows" } else if cfg!(target_os="macos") { "Mac" } else { "Linux" },
+        "name":"Shina-integration-only","executable":env!("CARGO_BIN_EXE_shina"),
+        "directory":directory,"unit":directory.join("unused-unit"),"home":profile.root,"environment":{}
+    }).to_string()).unwrap();
+    // Exercise the real launcher without registering any operating-system service.
+    let launcher = profile.launch(&["--service-run", descriptor.to_str().unwrap()]);
+    let device = uuid::Uuid::new_v4();
+    let mut client = profile.client(device);
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":2,"projectionSchema":1,"maintenanceClient":true}),
+        json!("maintenance"),
+    );
+    let id = uuid::Uuid::new_v4();
+    let args = json!({"threadId":1,"title":"saved across service restart"});
+    let receipt = client.command("thread.rename", args.clone(), id);
+    assert_eq!(receipt["result"]["status"], "accepted");
+    let database = rusqlite::Connection::open_with_flags(
+        directory.join("state.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let prepared =
+        client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
+    assert_eq!(prepared["phase"], "draining");
+    assert_eq!(
+        client.command("server.commitRestart", prepared, uuid::Uuid::new_v4())["result"]["phase"],
+        "restarting"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while profile.children[launcher].try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "service launcher did not exit");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        profile.children[launcher]
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    drop(client);
+    assert_eq!(
+        database
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    let stored: String = database
+        .query_row(
+            "SELECT payload FROM command_receipts WHERE command_id=?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap(),
+        receipt["result"]
+    );
+    let consistent: bool = database
+        .query_row(
+            "SELECT p.seq=(SELECT max(seq) FROM events) FROM projection p WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(consistent);
+    // Force the same pre-open backup hook used when an update changes binary version.
+    fs::write(
+        directory.join("server-binary-version.json"),
+        "previous-version",
+    )
+    .unwrap();
+    profile.launch(&["--service-run", descriptor.to_str().unwrap()]);
+    let mut resumed = profile.client(device);
+    assert_eq!(
+        resumed.command("thread.rename", args, id)["result"],
+        receipt["result"]
+    );
+    assert_eq!(
+        resumed.snapshot["index"]["threads"][0]["title"],
+        "saved across service restart"
+    );
+    let saved = fs::read_dir(directory.join("backups"))
+        .unwrap()
+        .flatten()
+        .any(|entry| {
+            let path = entry.path().join("state.sqlite");
+            if !path.is_file() {
+                return false;
+            }
+            let backup = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            backup
+                .query_row(
+                    "SELECT count(*) FROM command_receipts WHERE command_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                == Some(1)
+        });
+    assert!(saved, "pre-open backup did not retain the durable receipt");
+    drop(database);
+    #[cfg(windows)]
+    {
+        // Uses authenticated IPC without installing or ending any scheduled task.
+        let stopping = profile.launch(&["service", "stop"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while profile.children[stopping].try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "service stop did not finish");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            profile.children[stopping]
+                .try_wait()
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+    profile.stop();
+}
+
+#[test]
 fn committed_restart_waits_for_client_acknowledgement_then_exits_cleanly() {
     let mut profile = Profile::new();
     let process = profile.launch(&["serve"]);
@@ -615,4 +967,218 @@ fn committed_restart_waits_for_client_acknowledgement_then_exits_cleanly() {
         fs::read_to_string(profile.root.join("Shina/restart-flushed")).unwrap(),
         commit["result"]["updateId"].as_str().unwrap()
     );
+}
+
+#[test]
+fn history_over_two_mib_and_blobs_stream_in_bounded_pages() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":1,"projectionSchema":1}),
+        json!("paging-hello"),
+    );
+    client.rpc("workspace.subscribe", json!({}), json!("paging-subscribe"));
+    let mut expected = Vec::new();
+    for index in 0..3 {
+        let text = format!("{} {index}", "x".repeat(800_000));
+        let receipt = client.command(
+            "thread.send",
+            json!({"threadId":1,"text":text,"attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(receipt["result"]["status"], "accepted");
+        client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |state| {
+            state["threads"][0]["status"] == "Completed"
+        });
+        expected.push(text);
+    }
+    let mut text = String::new();
+    let mut cursor = Value::Null;
+    loop {
+        let response = client.rpc(
+            "thread.history",
+            json!({"threadId":1,"cursor":cursor,"byteBudget":262144}),
+            json!("history-page"),
+        );
+        assert!(response["error"].is_null(), "{response}");
+        let page = &response["result"];
+        assert!(page["data"].as_str().unwrap().len() <= 262144);
+        text.push_str(page["data"].as_str().unwrap());
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert!(text.len() > 2 * 1024 * 1024);
+    let history: Value = serde_json::from_str(&text).unwrap();
+    for text in expected {
+        assert_eq!(
+            history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["text"] == text)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        client.snapshot["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let bytes = vec![42u8; 600_000];
+    fs::create_dir_all(profile.root.join("Shina/attachments")).unwrap();
+    fs::write(profile.root.join("Shina/attachments/fixture.png"), &bytes).unwrap();
+    let port = profile.discovery()["port"].as_u64().unwrap() as u16;
+    let mut assembled = Vec::new();
+    while assembled.len() < bytes.len() {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(stream,"GET /v1/blobs/fixture.png?offset={}&limit=65536 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",assembled.len(),client.token).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.len() - end <= 65536);
+        assembled.extend_from_slice(&response[end..]);
+    }
+    assert_eq!(assembled, bytes);
+    profile.stop();
+}
+
+#[test]
+fn slow_subscribers_do_not_block_the_runtime_or_other_clients() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let _slow = profile.client(uuid::Uuid::new_v4());
+    let mut fast = profile.client(uuid::Uuid::new_v4());
+    let started = Instant::now();
+    for index in 0..30 {
+        let receipt = fast.command(
+            "thread.rename",
+            json!({"threadId":1,"title":format!("{} {index}","x".repeat(128_000))}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(receipt["result"]["status"], "accepted");
+    }
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let receipt = fast.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"Still responsive"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(receipt["result"]["status"], "accepted");
+    profile.stop();
+}
+
+#[test]
+fn process_crashes_at_dispatch_boundaries_never_repeat_the_prompt() {
+    for phase in ["pending", "dispatching", "sent"] {
+        let mut profile = Profile::new();
+        let child = profile.launch_with_fault(&["serve"], Some(phase));
+        let device = uuid::Uuid::new_v4();
+        let mut client = profile.client(device);
+        let id = uuid::Uuid::new_v4();
+        let args =
+            json!({"threadId":1,"text":"crash-boundary-fixture","attachments":[],"mode":"prompt"});
+        client.socket.send(Message::Text(json!({
+            "jsonrpc":"2.0","id":id,"method":"thread.send","params":{"commandId":id,"args":args}
+        }).to_string().into())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while profile.children[child].try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "did not reach {phase} boundary");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            profile.children[child].try_wait().unwrap().unwrap().code(),
+            Some(86)
+        );
+        drop(client);
+        profile.launch(&["serve"]);
+        let mut resumed = profile.client(device);
+        let receipt = resumed.command("thread.send", args, id);
+        assert_ne!(receipt["result"]["status"], "rejected");
+        assert!(
+            !resumed.snapshot["threads"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["text"] == "Fixture complete")
+        );
+        let database = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
+        let interrupted: i64 = database
+            .query_row(
+                "SELECT count(*) FROM effect_outbox WHERE kind='harness' AND status='interrupted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(interrupted > 0);
+        profile.stop();
+    }
+}
+
+#[test]
+fn durable_credentials_survive_restart_and_revoked_sockets_cannot_mutate() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let victim_id = uuid::Uuid::new_v4();
+    let mut victim = profile.client(victim_id);
+    let token = victim.token.clone();
+    profile.stop();
+    profile.launch(&["serve"]);
+    let discovery = profile.discovery();
+    let mut request = format!(
+        "ws://127.0.0.1:{}/v1/ws",
+        discovery["port"].as_u64().unwrap()
+    )
+    .into_client_request()
+    .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (socket, _) = tungstenite::connect(request.clone()).unwrap();
+    victim.socket = socket;
+    victim.rpc(
+        "hello",
+        json!({"protocolMajor":1,"projectionSchema":1}),
+        json!("restarted-hello"),
+    );
+    let mut admin = profile.client(uuid::Uuid::new_v4());
+    assert!(
+        admin.rpc("devices.list", json!({}), json!("devices"))["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["deviceId"] == victim_id.to_string())
+    );
+    assert_eq!(
+        admin.command(
+            "devices.revoke",
+            json!({"deviceId":victim_id}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert!(tungstenite::connect(request).is_err());
+    victim
+        .socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"revoked","method":"server.status","params":{}})
+                .to_string()
+                .into(),
+        ))
+        .ok();
+    assert!(!matches!(victim.socket.read(), Ok(Message::Text(_))));
+    profile.stop();
 }
