@@ -119,7 +119,7 @@ pub struct Routine {
     pub active_delivery: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutineView {
     pub id: u64,
     pub name: String,

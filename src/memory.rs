@@ -230,6 +230,12 @@ impl MemoryBook {
 
 impl State {
     pub fn memories(&self, captain: usize) -> Vec<MemoryView> {
+        if self.client.is_some() {
+            return serde_json::from_value(
+                self.client_views["memories"][captain.to_string()].clone(),
+            )
+            .unwrap_or_default();
+        }
         self.memory
             .lock()
             .expect("captain memory")
@@ -246,6 +252,12 @@ impl State {
         text: String,
         essential: bool,
     ) -> Result<String, String> {
+        if let Some(result) = self.remote(
+            "memory.put",
+            json!({"captain":captain,"text":text,"essential":essential}),
+        ) {
+            return result.map(|id| id.to_string());
+        }
         self.require_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
@@ -285,6 +297,11 @@ impl State {
     }
 
     pub fn edit_memory(&mut self, captain: usize, id: &str, text: String) -> Result<(), String> {
+        if let Some(result) =
+            self.remote("memory.put", json!({"captain":captain,"id":id,"text":text}))
+        {
+            return result.map(|_| ());
+        }
         self.require_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
@@ -311,6 +328,9 @@ impl State {
     }
 
     pub fn delete_memory(&mut self, captain: usize, id: &str) -> Result<(), String> {
+        if let Some(result) = self.remote("memory.remove", json!({"captain":captain,"id":id})) {
+            return result.map(|_| ());
+        }
         self.require_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -333,6 +353,12 @@ impl State {
         id: &str,
         essential: bool,
     ) -> Result<(), String> {
+        if let Some(result) = self.remote(
+            "memory.put",
+            json!({"captain":captain,"id":id,"essential":essential}),
+        ) {
+            return result.map(|_| ());
+        }
         self.require_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -349,6 +375,10 @@ impl State {
     }
 
     pub fn user_profile(&self) -> UserProfile {
+        if self.client.is_some() {
+            return serde_json::from_value(self.client_views["profile"].clone())
+                .unwrap_or_default();
+        }
         self.memory
             .lock()
             .expect("captain memory")
@@ -358,6 +388,9 @@ impl State {
     }
 
     pub fn set_user_profile(&mut self, profile: UserProfile) -> Result<(), String> {
+        if let Some(result) = self.remote("profile.put", json!({"profile":profile})) {
+            return result.map(|_| ());
+        }
         profile.validate()?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;

@@ -28,7 +28,7 @@ pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const NAME_LIMIT: usize = 120;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attachment {
     /// A blob filename for images, or a hash of the absolute ordinary-file path.
     pub id: String,

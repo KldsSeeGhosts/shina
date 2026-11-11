@@ -2209,6 +2209,15 @@ fn clone_dialog(s: &State, p: Palette) -> El {
 fn update_row(s: &State, p: Palette) -> Option<El> {
     use crate::update::Status;
     match s.updater.status() {
+        // KSG Code's sidebar/SidebarUpdatePill.tsx keeps denied updates passive.
+        // Its Electron policy has no Shina slice-3 equivalent. Reuse our quiet notice row.
+        Status::Disabled if s.updater.notice().is_some() => Some(
+            label(s.updater.notice().unwrap(), SMALL, p.muted)
+                .key("server-update-disabled")
+                .wrap()
+                .mx(8.0)
+                .mb(8.0),
+        ),
         Status::Idle if s.updater.notice().is_some() => {
             let notice = s.updater.notice().unwrap();
             Some(
@@ -3825,14 +3834,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                     p,
                 )
                 .on_press(move |s: &mut State| {
-                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
-                        t.life.auto_settle_disabled_at = if t.life.auto_settle_disabled_at.is_some()
-                        {
-                            None
-                        } else {
-                            Some(lifecycle::now())
-                        };
-                    }
+                    s.toggle_thread_auto_settle(id);
                     s.row_menu = None;
                     s.thread_menu = false;
                     s.checkpoint();
@@ -3846,16 +3848,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                 p,
             )
             .on_press(|s: &mut State| {
-                s.auto_settle_days = match s.auto_settle_days {
-                    0 => 1,
-                    1 => 3,
-                    3 => 7,
-                    7 => 14,
-                    14 => 30,
-                    _ => 0,
-                };
-                s.sweep_lifecycle(lifecycle::now());
-                s.checkpoint();
+                s.cycle_auto_settle_days();
             }),
         );
         if !thread.draft.text.is_empty() {
@@ -6986,6 +6979,21 @@ pub(crate) mod tests {
                 assert!(item[0] >= menu[0] && item[0] + item[2] <= menu[0] + menu[2] + 0.5);
                 assert!(item[1] >= 0.0 && item[1] + item[3] <= 720.5);
             }
+        }
+    }
+    #[test]
+    fn server_update_notice_fits_all_supported_widths_without_an_install_action() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.updater.disable_for_server();
+            rt.frame(0.0);
+            let (notice, _) = rt
+                .presented("server-update-disabled")
+                .expect("server update notice");
+            assert!(notice[0] >= 0.0 && notice[1] >= 0.0);
+            assert!(notice[2] <= rt.state.sidebar_width, "{width}: {notice:?}");
+            assert!(rt.find("restart-update").is_none());
         }
     }
     #[test]

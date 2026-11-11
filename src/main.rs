@@ -5,6 +5,7 @@ mod attachments;
 mod backend;
 mod brand;
 mod captains;
+mod client;
 mod context;
 mod harness;
 mod install;
@@ -15,7 +16,12 @@ mod portraits;
 mod power;
 mod process;
 mod projects;
+mod protocol;
 mod routines;
+mod runtime;
+mod server;
+mod server_auth;
+mod server_lock;
 mod session;
 mod store;
 mod tray;
@@ -32,6 +38,9 @@ static OPTIONS: OnceLock<(PathBuf, bool, bool)> = OnceLock::new();
 fn init() -> State {
     let (path, demo, snapshot) = OPTIONS.get().expect("startup options");
     let mut state = State::new(path.clone(), *demo);
+    if std::env::args().any(|arg| arg == "--server-client") {
+        state.client = Some(client::Client::new(state.data_dir.clone()));
+    }
     if *snapshot && !demo {
         state.load_snapshot();
     }
@@ -338,6 +347,13 @@ fn captain_crews_demo(state: &mut State) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        if let Err(error) = server::serve() {
+            eprintln!("Shina server: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--mcp-bridge") {
         if let Err(error) = acp::mcp_bridge() {
             eprintln!("{error}");
@@ -413,6 +429,7 @@ fn main() {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--demo" => demo = true,
+            "--server-client" => {}
             "--workspace" => {
                 let Some(path) = iter.next() else {
                     eprintln!("--workspace needs a directory path.");
@@ -439,6 +456,10 @@ fn main() {
         std::process::exit(2);
     }
     let snapshot = std::env::args().any(|arg| arg == "--snap");
+    if args.iter().any(|arg| arg == "--server-client") && (demo || snapshot) {
+        eprintln!("--server-client cannot be combined with --demo or --snap.");
+        std::process::exit(2);
+    }
     OPTIONS.set((workspace, demo, snapshot)).ok();
     let app = rune::App::new(AppSpec {
         fonts: ui::FONTS,
@@ -659,6 +680,7 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
     let shared = handle.clone();
     handle.update(move |state, _| state.background.handle = Some(shared));
     app.run();
+    client::shutdown_all();
     backend::shutdown_all();
     install_recorded_update();
 }

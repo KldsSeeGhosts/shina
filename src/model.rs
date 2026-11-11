@@ -36,6 +36,8 @@ pub use tasks::{AttentionItem, AttentionKind, TaskState, TaskView};
 mod background;
 #[allow(unused_imports)]
 pub use background::{BackgroundSettings, BackgroundStatus};
+#[path = "client_state.rs"]
+mod client_state;
 #[path = "memory.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod memory;
@@ -82,7 +84,7 @@ struct DelegationTarget {
     reasoning: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Ready,
     Running,
@@ -144,7 +146,7 @@ impl Message {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tool {
     pub id: String,
     pub name: String,
@@ -160,13 +162,18 @@ pub struct Tool {
     /// Position in the transcript, including tool calls between text blocks in one message.
     pub anchor: ToolAnchor,
     pub block: usize,
+    #[serde(skip)]
     pub expanded: bool,
+    #[serde(skip)]
     pub group_expanded: bool,
+    #[serde(skip)]
     pub started: Option<Instant>,
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ToolAnchor {
     pub message: usize,
     /// UTF-8 byte offset into the message text. Zero also anchors tool-only messages.
@@ -197,19 +204,24 @@ impl Tool {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Thought {
     pub anchor: ToolAnchor,
     pub block: usize,
     pub text: String,
+    #[serde(skip)]
     pub expanded: bool,
     pub done: bool,
+    #[serde(skip)]
     pub started: Option<Instant>,
     /// Pi saves thinking text, but does not save thinking timings.
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssistantWork {
     pub start: usize,
+    #[serde(skip)]
     pub expanded: bool,
     pub elapsed: Option<u64>,
 }
@@ -243,6 +255,12 @@ pub enum ProjectPicker {
 }
 
 pub struct Thread {
+    pub remote: Option<crate::client::Commands>,
+    remote_send: Option<(uuid::Uuid, TextEdit, Vec<Attachment>)>,
+    request_generation: String,
+    server_owned: bool,
+    recovery_command: Option<uuid::Uuid>,
+    projected_harness_choice: bool,
     pub id: usize,
     /// `pi` or an ACP registry id. Pi remains the default for legacy indexes.
     pub harness: String,
@@ -334,6 +352,9 @@ pub struct Thread {
 
 impl Thread {
     pub fn can_choose_harness(&self) -> bool {
+        if self.remote.is_some() {
+            return self.projected_harness_choice;
+        }
         !self.delegated
             && !self.archived()
             && !self.status.busy()
@@ -394,7 +415,8 @@ impl Thread {
             || matches!(self.status, Status::Failed | Status::Paused)
     }
     pub fn queued(&self) -> bool {
-        self.queued_prompt.is_some()
+        self.native.projected_queued
+            || self.queued_prompt.is_some()
             || self.pending_prompt.is_some()
             || !self.pending_injections.is_empty()
             || self.native_pending_turns()
@@ -440,6 +462,12 @@ impl Thread {
     }
     pub fn new(id: usize) -> Self {
         Self {
+            remote: None,
+            remote_send: None,
+            request_generation: uuid::Uuid::new_v4().to_string(),
+            server_owned: false,
+            recovery_command: None,
+            projected_harness_choice: false,
             id,
             harness: "pi".into(),
             harness_context_sent: false,
@@ -536,6 +564,7 @@ impl Thread {
         if self.pi.is_some() {
             return;
         }
+        self.request_generation = uuid::Uuid::new_v4().to_string();
         let backend = match crate::backend::BackendHost::resolve(&self.machine) {
             Ok(host) => host,
             Err(error) => {
@@ -594,6 +623,12 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
+        if self.forward(
+            "thread.configure",
+            json!({"provider":provider,"model":model_id}),
+        ) {
+            return;
+        }
         if self.harness == "pi" && provider != "cpa"
             || self.harness != "pi" && provider != self.harness
         {
@@ -639,6 +674,9 @@ impl Thread {
     }
 
     pub fn set_thinking(&mut self, level: String) {
+        if self.forward("thread.configure", json!({"thinking":level})) {
+            return;
+        }
         if self.harness != "pi" {
             self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
@@ -831,6 +869,9 @@ impl Thread {
     }
 
     pub fn stop(&mut self) {
+        if self.forward("thread.stop", json!({})) {
+            return;
+        }
         let _ = self.stop_task();
     }
 
@@ -874,6 +915,12 @@ impl Thread {
     }
 
     pub fn respond(&mut self, mut response: Value) {
+        if self.remote.is_some() {
+            let request = self.request.clone().unwrap_or(Value::Null);
+            self.forward("request.respond", json!({"requestId":request["id"],"generation":request["runtimeGeneration"],
+                "session":response["allowForSession"] == true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response}));
+            return;
+        }
         if response["cancelled"] == true {
             self.cancel_questionnaire();
         }
@@ -1525,6 +1572,20 @@ impl Thread {
                         self.configuring = false;
                     }
                     "get_messages" if record["id"] == "history" => {
+                        if self.server_owned
+                            && self.harness != "pi"
+                            && record["data"]["messages"]
+                                .as_array()
+                                .is_some_and(Vec::is_empty)
+                            && !self.messages.is_empty()
+                        {
+                            // ACP resume need not replay history. Keep the server transcript
+                            // and the existing optimistic prompt index in that case.
+                            self.recover_native_inputs();
+                            self.history_loaded = true;
+                            self.drive_session();
+                            return;
+                        }
                         if let Some(messages) = record["data"]["messages"].as_array() {
                             self.messages.clear();
                             self.tools.clear();
@@ -1899,6 +1960,17 @@ impl Thread {
 }
 
 pub struct State {
+    pub client: Option<crate::client::Client>,
+    headless: bool,
+    command_receipts: Vec<crate::protocol::Receipt>,
+    command_intents: std::collections::BTreeMap<String, crate::protocol::Command>,
+    server_epoch: String,
+    server_seq: u64,
+    persist_transcripts: bool,
+    client_views: Value,
+    client_select: Option<usize>,
+    client_recover: std::collections::HashMap<usize, uuid::Uuid>,
+    recovered_inputs: std::collections::BTreeMap<usize, Value>,
     pub background: background::Background,
     pub data_dir: PathBuf,
     /// The open thread's id and whether it was a draft with content when it was opened. Like
@@ -1969,11 +2041,11 @@ pub struct State {
     pub wake: Waker,
     pub store: Option<crate::store::Store>,
     pub storage_error: Option<String>,
-    pub artwork: Arc<crate::visuals::Artwork>,
+    pub artwork: crate::runtime::UiResource<Arc<crate::visuals::Artwork>>,
     /// Sidebar portrait animation: frame stages and when they may play.
-    pub portraits: crate::portraits::Portraits,
+    pub portraits: crate::runtime::UiResource<crate::portraits::Portraits>,
     /// Decodes composer and conversation thumbnails off the UI thread.
-    pub attachment_cache: rune::ImageCache,
+    pub attachment_cache: crate::runtime::UiResource<rune::ImageCache>,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub captain_picker: bool,
@@ -2004,6 +2076,10 @@ pub struct State {
     pub catalog: Catalog,
     pub harnesses: crate::harness::Registry,
     runtime_enabled: bool,
+    ownership_denied: bool,
+    pub runtime_stop_requested: bool,
+    // Drop the owner only after every store has flushed and stopped its writer.
+    owner: Option<crate::server_lock::Owner>,
 }
 
 impl State {
@@ -2027,14 +2103,42 @@ impl State {
         }
     }
     pub fn new(workspace: PathBuf, demo: bool) -> Self {
+        let state = Self::construct(workspace, demo);
+        // Preserve desktop startup timing. Headless construction never touches these.
+        let _ = &*state.artwork;
+        let _ = &*state.portraits;
+        let _ = &*state.attachment_cache;
+        state
+    }
+    fn construct(workspace: PathBuf, demo: bool) -> Self {
         let workspace = if workspace.as_os_str().is_empty() {
             workspace
         } else {
             crate::projects::normalize_path(&workspace)
         };
-        let artwork = crate::visuals::Artwork::load(&workspace);
-        let attachment_cache = rune::ImageCache::new(Arc::new(|| {}));
+        let art_path = workspace.clone();
+        let portrait_path = workspace.clone();
+        let art = Arc::new(std::sync::OnceLock::new());
+        let portrait_art = art.clone();
+        let artwork = crate::runtime::UiResource::new(move || {
+            art.get_or_init(|| crate::visuals::Artwork::load(&art_path))
+                .clone()
+        });
+        let attachment_cache =
+            crate::runtime::UiResource::new(|| rune::ImageCache::new(Arc::new(|| {})));
         let mut state = Self {
+            client: None,
+            headless: false,
+            owner: None,
+            command_receipts: Vec::new(),
+            command_intents: Default::default(),
+            server_epoch: uuid::Uuid::new_v4().to_string(),
+            server_seq: 0,
+            persist_transcripts: false,
+            client_views: json!({}),
+            client_select: None,
+            client_recover: Default::default(),
+            recovered_inputs: Default::default(),
             background: Default::default(),
             data_dir: crate::store::directory()
                 .unwrap_or_else(|| std::env::temp_dir().join("Shina")),
@@ -2094,7 +2198,13 @@ impl State {
             wake: Arc::new(|| {}),
             store: None,
             storage_error: None,
-            portraits: crate::portraits::Portraits::new(artwork.clone()),
+            portraits: crate::runtime::UiResource::new(move || {
+                crate::portraits::Portraits::new(
+                    portrait_art
+                        .get_or_init(|| crate::visuals::Artwork::load(&portrait_path))
+                        .clone(),
+                )
+            }),
             artwork,
             attachment_cache,
             attachment_drop_hover: false,
@@ -2117,6 +2227,8 @@ impl State {
             catalog: Catalog::default(),
             harnesses: crate::harness::Registry::read(),
             runtime_enabled: false,
+            ownership_denied: false,
+            runtime_stop_requested: false,
             tasks: Vec::new(),
             recovery_notice: None,
             run_marker: None,
@@ -2162,6 +2274,7 @@ impl State {
             return;
         }
         self.active = index;
+        self.forward("thread.visit", json!({"threadId":self.current().id}));
         self.selected_threads.clear();
         let id = self.current().id;
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
@@ -2190,6 +2303,21 @@ impl State {
     /// Closing a blank draft's tab closes the draft. Otherwise the selection returns to the last
     /// remaining tab.
     pub fn close_tab(&mut self, id: usize) {
+        if self.client.is_some() {
+            if self.tabs.len() > 1 {
+                self.tabs.retain(|tab| *tab != id);
+                if self.current().id == id
+                    && let Some(index) = self
+                        .threads
+                        .iter()
+                        .position(|t| self.tabs.last() == Some(&t.id))
+                {
+                    self.select_thread(index);
+                }
+                self.checkpoint();
+            }
+            return;
+        }
         let Some(index) = self.threads.iter().position(|t| t.id == id) else {
             return;
         };
@@ -2687,6 +2815,9 @@ impl State {
         }
     }
     pub fn remove_project(&mut self, id: ProjectId) {
+        if self.forward("project.remove", json!({"projectId":id})) {
+            return;
+        }
         if let Some(project) = self.projects.entries.iter_mut().find(|p| p.id == id) {
             project.hidden = true;
         }
@@ -2702,6 +2833,16 @@ impl State {
         }
     }
     pub fn save_thread_name(&mut self) {
+        if self.client.is_some() {
+            if let Some(id) = self.rename_thread {
+                self.forward(
+                    "thread.rename",
+                    json!({"threadId":id,"title":self.rename_edit.text}),
+                );
+                self.rename_thread = None;
+            }
+            return;
+        }
         let name = self.rename_edit.text.trim();
         if name.is_empty() || name.chars().any(char::is_control) {
             return;
@@ -2743,6 +2884,18 @@ impl State {
     }
     /// Explicit confirmation deletes the thread and its delegated descendants, never files.
     pub fn confirm_delete(&mut self) {
+        if self.client.is_some() {
+            let roots = if self.delete_roots.is_empty() {
+                self.delete_thread.into_iter().collect()
+            } else {
+                std::mem::take(&mut self.delete_roots)
+            };
+            for id in roots {
+                self.forward("thread.delete", json!({"threadId":id}));
+            }
+            self.delete_thread = None;
+            return;
+        }
         let Some(id) = self.delete_thread.take() else {
             return;
         };
@@ -2823,6 +2976,9 @@ impl State {
         self.checkpoint();
     }
     pub fn pin_thread(&mut self, id: usize) {
+        if self.forward("thread.lifecycle", json!({"threadId":id,"action":"pin"})) {
+            return;
+        }
         if self
             .threads
             .iter()
@@ -2849,6 +3005,12 @@ impl State {
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
+        if self.forward(
+            "thread.lifecycle",
+            json!({"threadId":id,"action":"archive"}),
+        ) {
+            return;
+        }
         let Some(index) = self
             .threads
             .iter()
@@ -2928,6 +3090,9 @@ impl State {
         UndoNotice::push(&mut self.undo, action, t.id, steps, lifecycle::now());
     }
     pub fn settle_thread(&mut self, id: usize) {
+        if self.forward("thread.lifecycle", json!({"threadId":id,"action":"settle"})) {
+            return;
+        }
         if self
             .threads
             .iter()
@@ -3025,6 +3190,13 @@ impl State {
         self.lifecycle_error = None;
     }
     pub fn snooze_thread(&mut self, id: usize, until: u64) {
+        if self.forward(
+            "thread.lifecycle",
+            json!({"threadId":id,"action":"snooze","until":until}),
+        ) {
+            self.snooze_menu = None;
+            return;
+        }
         if until <= lifecycle::now() || !self.can_snooze(id) {
             self.lifecycle_error =
                 Some("Choose a future snooze time after answering pending requests.".into());
@@ -3038,6 +3210,12 @@ impl State {
         self.checkpoint();
     }
     pub fn unsnooze_thread(&mut self, id: usize) {
+        if self.forward(
+            "thread.lifecycle",
+            json!({"threadId":id,"action":"unsnooze"}),
+        ) {
+            return;
+        }
         self.invalidate_undo(id);
         if let Some(t) = self
             .threads
@@ -3049,6 +3227,15 @@ impl State {
         self.checkpoint();
     }
     pub fn discard_draft(&mut self, id: usize) {
+        if self.client.is_some() {
+            if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+                self.remember(Action::Discard, index);
+                self.threads[index].draft.replace_text("");
+                self.threads[index].draft_images.clear();
+                self.checkpoint();
+            }
+            return;
+        }
         let Some(i) = self.threads.iter().position(|t| t.id == id) else {
             return;
         };
@@ -3072,6 +3259,15 @@ impl State {
         self.checkpoint();
     }
     pub fn undo_thread_action(&mut self) {
+        if self.client.is_some()
+            && self
+                .undo
+                .as_ref()
+                .is_some_and(|notice| notice.action != Action::Discard)
+        {
+            self.forward("thread.undo", json!({"expected":self.undo}));
+            return;
+        }
         let at = lifecycle::now();
         let Some(notice) = self.undo.take().filter(|n| n.expires > at) else {
             return;
@@ -3107,6 +3303,12 @@ impl State {
         self.checkpoint();
     }
     pub fn drop_thread(&mut self, id: usize, to: Section, before: Option<usize>) {
+        if self.forward(
+            "thread.drop",
+            json!({"threadId":id,"to":format!("{to:?}"),"before":before}),
+        ) {
+            return;
+        }
         if self
             .threads
             .iter()
@@ -3207,11 +3409,45 @@ impl State {
             self.captain_picker = true;
         }
     }
+    pub fn toggle_thread_auto_settle(&mut self, id: usize) {
+        let disabled = self
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.life.auto_settle_disabled_at.is_none());
+        if self.forward(
+            "thread.lifecycle",
+            json!({"threadId":id,"action":"autoSettle","disabled":disabled}),
+        ) {
+            return;
+        }
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+            thread.life.auto_settle_disabled_at = disabled.then(lifecycle::now);
+        }
+        self.checkpoint();
+    }
+    pub fn cycle_auto_settle_days(&mut self) {
+        let days = match self.auto_settle_days {
+            0 => 1,
+            1 => 3,
+            3 => 7,
+            7 => 14,
+            14 => 30,
+            _ => 0,
+        };
+        if self.forward("settings.autoSettle", json!({"days":days})) {
+            return;
+        }
+        self.auto_settle_days = days;
+        self.sweep_lifecycle(lifecycle::now());
+        self.checkpoint();
+    }
     pub fn new_thread(&mut self) {
         let project = self.current().project;
         self.new_thread_in(project);
     }
     pub fn new_thread_in(&mut self, project: Option<ProjectId>) {
+        if self.forward("thread.create", json!({"project":project,"occupiedDrafts":self.threads.iter().filter(|t| t.has_draft_content()).map(|t| t.id).collect::<Vec<_>>()})) { self.project_picker = None; return; }
         if project.is_some() && self.project(project).is_none() {
             return;
         }
@@ -3246,6 +3482,10 @@ impl State {
         }
     }
     pub fn open_captain(&mut self, captain: usize) {
+        if self.forward("captain.open", json!({"threadId":self.current().id,"captain":captain,"project":self.captain_project,"assignProject":self.projects.captain_target})) {
+            self.captain_picker = false;
+            return;
+        }
         if captain >= self.captains.len() {
             return;
         }
@@ -3362,6 +3602,14 @@ impl State {
     }
 
     pub fn save_captain(&mut self) {
+        if self.client.is_some() {
+            if let Some(editor) = &self.captain_editor {
+                let params = json!({"threadId":self.current().id,"captain":editor.editing,"record":editor.profile().to_value(),"project":self.captain_project,"assignProject":self.projects.captain_target});
+                self.forward("captain.put", params);
+                self.captain_editor = None;
+            }
+            return;
+        }
         let Some(editor) = &self.captain_editor else {
             return;
         };
@@ -3622,9 +3870,14 @@ impl State {
 
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
     pub fn connect_thread(&mut self, index: usize) {
-        if self.demo || index >= self.threads.len() {
+        if self.demo
+            || self.client.is_some()
+            || self.ownership_denied
+            || index >= self.threads.len()
+        {
             return;
         }
+        self.threads[index].server_owned = self.headless || self.persist_transcripts;
         let path = match self.thread_directory(index) {
             Ok(path) => path,
             Err(error) => {
@@ -4223,6 +4476,34 @@ impl State {
         self.checkpoint();
     }
     pub fn send(&mut self) {
+        if self.ownership_denied {
+            return;
+        }
+        if self.client.is_some() {
+            if self.current().draft.text.trim() == "/model" {
+                self.choose_slash("model".into());
+                return;
+            }
+            if self.current().remote_send.is_some() || !self.current().has_draft_content() {
+                return;
+            }
+            // Do not clear until its receipt arrives and this exact editor content still matches.
+            let revision = uuid::Uuid::new_v4();
+            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":self.current().draft.text,
+                "attachments":self.current().draft_images,"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+            match result {
+                Some(Ok(id)) => {
+                    self.current_mut().remote_send = Some((
+                        id,
+                        self.current().draft.clone(),
+                        self.current().draft_images.clone(),
+                    ))
+                }
+                Some(Err(error)) => self.storage_error = Some(error),
+                None => {}
+            }
+            return;
+        }
         if self.network_blocked() {
             self.current_mut().error =
                 Some("Waiting for the network after resume. Your draft has not been sent.".into());
@@ -4301,6 +4582,9 @@ impl State {
     }
 
     pub fn retry(&mut self) {
+        if self.forward("thread.retry", json!({"threadId":self.current().id})) {
+            return;
+        }
         if self.demo
             || self.network_blocked()
             || self.current().archived()
@@ -4324,6 +4608,9 @@ impl State {
     }
 
     pub fn refresh_catalog(&mut self) {
+        if self.forward("catalog.refresh", json!({})) {
+            return;
+        }
         self.harnesses = crate::harness::Registry::read();
         if !self.demo && self.runtime_enabled {
             self.catalog
@@ -4336,6 +4623,12 @@ impl State {
 
     /// Changing a new thread's harness retires only its unused prewarmed process.
     pub fn choose_harness(&mut self, id: &str) {
+        if self.forward(
+            "thread.configure",
+            json!({"threadId":self.current().id,"harness":id}),
+        ) {
+            return;
+        }
         if !self.current().can_choose_harness() || self.current().harness == id {
             return;
         }
@@ -4425,6 +4718,10 @@ impl State {
         false
     }
     pub fn add_project(&mut self, path: PathBuf) -> Result<ProjectId, String> {
+        if let Some(result) = self.remote("project.put", json!({"path":path})) {
+            result?;
+            return Ok(0);
+        }
         let path = match path.canonicalize() {
             Ok(path) if path.is_dir() => crate::projects::clean_path(&path),
             _ => return Err("That project folder could not be opened.".into()),
@@ -4468,9 +4765,25 @@ impl State {
     }
     pub fn setup(&mut self, wake: Waker) {
         self.wake = wake.clone();
-        self.attachment_cache = rune::ImageCache::new(wake.clone());
+        let image_wake = wake.clone();
+        self.attachment_cache =
+            crate::runtime::UiResource::new(move || rune::ImageCache::new(image_wake));
         if self.demo {
             return;
+        }
+        if self.client.is_some() {
+            self.setup_client(wake);
+            return;
+        }
+        if self.owner.is_none() {
+            match crate::server_lock::Owner::acquire(&self.data_dir) {
+                Ok(owner) => self.owner = Some(owner),
+                Err(error) => {
+                    self.ownership_denied = true;
+                    self.storage_error = Some(error);
+                    return;
+                }
+            }
         }
         if let Err(error) = std::fs::create_dir_all(&self.data_dir) {
             self.storage_error = Some(format!("Could not create Shina's data folder: {error}"));
@@ -4501,12 +4814,23 @@ impl State {
             }
         }
         let path = self.data_dir.join("index.json");
+        let mut runtime_inputs = None;
         match crate::store::load_global(&self.data_dir, self.launch_project.as_deref()) {
             Ok(Some(index)) if index["version"] == 3 || index["version"] == 4 => {
                 if let Err(error) = self.restore_global(&index) {
                     self.storage_error =
                         Some(format!("{error} The index has not been overwritten."));
                     return;
+                }
+                if let Some(inputs) = index.get("runtimeInputs") {
+                    if !inputs.is_object() {
+                        self.storage_error = Some(
+                            "Invalid durable runtime inputs. The index has not been overwritten."
+                                .into(),
+                        );
+                        return;
+                    }
+                    runtime_inputs = Some(inputs.clone());
                 }
             }
             Ok(Some(_)) => {
@@ -4519,22 +4843,53 @@ impl State {
                 return;
             }
         }
-        let ui_path = self.data_dir.join("ui-state.json");
+        let ui_path = self.data_dir.join(if self.headless {
+            "server-inputs.json"
+        } else {
+            "ui-state.json"
+        });
         if let Err(error) = self.load_memory(true) {
             self.storage_error = Some(error);
             return;
         }
-        match crate::store::load(&ui_path) {
-            Ok(Some(ui)) => {
+        let saved_ui = crate::store::load(&ui_path).and_then(|ui| {
+            if self.headless && ui.is_none() {
+                crate::store::load(&self.data_dir.join("ui-state.json"))
+            } else {
+                Ok(ui)
+            }
+        });
+        match saved_ui {
+            Ok(Some(mut ui)) => {
+                if let Some(inputs) = &runtime_inputs {
+                    ui["pendingMessages"] = inputs.clone();
+                }
                 if let Err(error) = self.restore_ui(&ui) {
                     self.storage_error = Some(error);
                     return;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(inputs) = &runtime_inputs {
+                    for thread in &mut self.threads {
+                        if let Err(error) =
+                            thread.restore_pending_inputs(&inputs[thread.id.to_string()])
+                        {
+                            self.storage_error = Some(error);
+                            return;
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 self.storage_error = Some(error);
                 return;
+            }
+        }
+        if self.headless {
+            for thread in &mut self.threads {
+                thread.draft.replace_text("");
+                thread.draft_images.clear();
             }
         }
         self.ui_store = Some(crate::store::Store::new(ui_path, wake.clone()));
@@ -4561,10 +4916,26 @@ impl State {
         {
             self.current_mut().error = Some(error);
         }
-        self.checkpoint();
+        if !self.headless {
+            self.checkpoint();
+        }
     }
 
     fn restore_global(&mut self, index: &Value) -> Result<(), String> {
+        self.persist_transcripts = self.headless || index["threadViews"].is_array();
+        self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
+        self.command_receipts =
+            serde_json::from_value(index.get("commandReceipts").cloned().unwrap_or(json!([])))
+                .map_err(|e| format!("Invalid command receipts: {e}"))?;
+        self.command_intents =
+            serde_json::from_value(index.get("commandIntents").cloned().unwrap_or(json!({})))
+                .map_err(|e| format!("Invalid command intents: {e}"))?;
+        self.recovered_inputs =
+            serde_json::from_value(index.get("recoveredInputs").cloned().unwrap_or(json!({})))
+                .map_err(|e| format!("Invalid recovered inputs: {e}"))?;
+        if let Some(epoch) = index["serverEpoch"].as_str() {
+            self.server_epoch = epoch.into();
+        }
         let Some(profiles) = index["captains"].as_array() else {
             return Err("The saved captain profiles are invalid.".into());
         };
@@ -4840,6 +5211,9 @@ impl State {
         };
         self.capture_opened_draft();
         self.restore_tasks(index, &project_remap)?;
+        if self.persist_transcripts && !self.headless && self.client.is_none() {
+            self.restore_persisted_history(&index["threadViews"])?;
+        }
         Ok(())
     }
     fn ui_snapshot(&self) -> Value {
@@ -4955,6 +5329,10 @@ impl State {
         if self.demo {
             return;
         }
+        if self.client.is_some() {
+            self.checkpoint_client();
+            return;
+        }
         let snapshot = self.snapshot();
         if let Some(store) = &mut self.store {
             store.save(snapshot);
@@ -4994,6 +5372,13 @@ impl State {
     }
 
     fn flush_stores(&mut self) -> Result<(), String> {
+        if self.client.is_some() {
+            return self
+                .ui_store
+                .as_ref()
+                .ok_or("Client drafts are not saving.")?
+                .flush();
+        }
         if self.demo {
             return Err("Demo runs do not save.".into());
         }
@@ -5078,7 +5463,7 @@ impl State {
     }
 
     fn snapshot(&self) -> Value {
-        json!({
+        let mut index = json!({
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
@@ -5090,7 +5475,7 @@ impl State {
             "captainHomes":self.captain_homes,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
-                !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
+                self.headless || self.persist_transcripts || !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
@@ -5103,7 +5488,22 @@ impl State {
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
                 "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
             })).collect::<Vec<_>>()
-        })
+        });
+        index["commandReceipts"] = json!(self.command_receipts);
+        index["commandIntents"] = json!(self.command_intents);
+        index["serverEpoch"] = json!(self.server_epoch);
+        index["serverSeq"] = json!(self.server_seq);
+        index["recoveredInputs"] = json!(self.recovered_inputs);
+        if self.headless || self.persist_transcripts {
+            index["threadViews"] = self.thread_views();
+            index["runtimeInputs"] = json!(
+                self.threads
+                    .iter()
+                    .map(|thread| (thread.id.to_string(), thread.runtime_inputs_value()))
+                    .collect::<serde_json::Map<_, _>>()
+            );
+        }
+        index
     }
     pub fn populate_demo(&mut self) {
         self.demo = true;
@@ -5281,6 +5681,9 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    if state.client.is_some() {
+        return state.poll_client(tx);
+    }
     let background_changed = state.poll_background_start(tx);
     if state.background.quitting {
         return true;
@@ -5366,7 +5769,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                     if settled {
                         thread.command("get_state", json!({}));
                     }
-                    if index == state.active {
+                    if !state.headless && index == state.active {
                         thread.life.last_visited_at = Some(lifecycle::now());
                     }
                 }
@@ -5442,7 +5845,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     changed |= state.pause_offline_errors();
     changed |= state.poll_tasks(Instant::now());
     changed |= state.poll_background_end(tx);
-    if let Some(wait) = crate::ui::tick_portraits(state, Instant::now()) {
+    if !state.headless
+        && let Some(wait) = crate::ui::tick_portraits(state, Instant::now())
+    {
         tx.wake_after(wait);
     }
     // A restart click only asks for one. The guard runs after Pi events drained and tasks
@@ -5495,7 +5900,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         if let Some(wake) = t.life.snoozed_until.filter(|wake| *wake > at) {
             tx.wake_after(Duration::from_millis(wake - at));
         }
-        if i == state.active && t.life.woke(at) {
+        if !state.headless && i == state.active && t.life.woke(at) {
             t.life.last_visited_at = Some(at);
             changed = true;
         }

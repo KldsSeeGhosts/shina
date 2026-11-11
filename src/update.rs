@@ -1289,6 +1289,11 @@ fn running_architecture() -> &'static str {
 }
 
 impl Updater {
+    pub fn disable_for_server(&mut self) {
+        self.status = Status::Disabled;
+        self.next_check = None;
+        self.notice = Some("In-app installation is disabled in server mode. Coordinated server updates are planned for slice 3.".into());
+    }
     pub fn status(&self) -> &Status {
         &self.status
     }

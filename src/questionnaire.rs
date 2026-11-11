@@ -3,14 +3,14 @@
 //! then answer only the exact remaining dialogs from that same live tool call.
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OptionItem {
     pub label: String,
     pub description: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Question {
     pub id: String,
     pub header: String,
@@ -19,13 +19,13 @@ pub struct Question {
     pub options: Vec<OptionItem>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Answer {
     pub selected: Vec<String>,
     pub other: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Questionnaire {
     pub questions: Vec<Question>,
     pub answers: Vec<Answer>,

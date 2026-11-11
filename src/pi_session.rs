@@ -73,7 +73,7 @@ fn approval_key(request: &Value) -> String {
     format!("{}:{}{}", title.len(), title, string(request, "message"))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SlashCommand {
     pub name: String,
     pub description: String,
@@ -124,6 +124,8 @@ impl AccessMode {
 
 #[derive(Default)]
 pub struct PiSession {
+    pub projected_operating: bool,
+    pub projected_queued: bool,
     pub questionnaire: Option<questionnaire::Questionnaire>,
     questionnaires: HashMap<String, Value>,
     questionnaire_replies: Vec<(String, String, String)>,
@@ -188,7 +190,8 @@ struct PendingSend {
 
 impl PiSession {
     pub fn operating(&self) -> bool {
-        self.compact.is_some()
+        self.projected_operating
+            || self.compact.is_some()
             || self.compact_id.is_some()
             || self.lifecycle.is_some()
             || self.lifecycle_id.is_some()
@@ -273,6 +276,9 @@ impl Thread {
     }
 
     pub fn compact(&mut self, instructions: Option<String>) {
+        if self.forward("thread.compact", json!({"instructions":instructions})) {
+            return;
+        }
         if self.harness != "pi" {
             self.error = Some("Native compaction is Pi-only in Shina. Use the ACP agent's own commands if it advertises them.".into());
             return;
@@ -335,6 +341,12 @@ impl Thread {
     }
 
     pub fn edit_queued(&mut self, id: usize) {
+        if self.forward(
+            "queue.edit",
+            json!({"inputId":id,"generation":self.request_generation}),
+        ) {
+            return;
+        }
         if let Some(i) = self.native.queue.iter().position(|q| q.id == id)
             && let Some(queued) = self.native.queue.remove(i)
         {
@@ -344,10 +356,22 @@ impl Thread {
     }
 
     pub fn cancel_queued(&mut self, id: usize) {
+        if self.forward(
+            "queue.remove",
+            json!({"inputId":id,"generation":self.request_generation}),
+        ) {
+            return;
+        }
         self.native.queue.retain(|q| q.id != id);
     }
 
     pub fn steer_queued(&mut self, id: usize) {
+        if self.forward(
+            "queue.sendNow",
+            json!({"inputId":id,"generation":self.request_generation}),
+        ) {
+            return;
+        }
         if self.request.is_some() || self.configuring {
             return;
         }
@@ -532,6 +556,9 @@ impl Thread {
     }
 
     pub fn rewind(&mut self, entry: String) {
+        if self.forward("thread.rewind", json!({"entry":entry})) {
+            return;
+        }
         if self.status.busy() || self.configuring || self.native.operating() {
             return;
         }
@@ -603,6 +630,10 @@ impl Thread {
     }
 
     pub fn approve_for_session(&mut self) {
+        if self.remote.is_some() {
+            self.respond(json!({"confirmed":true,"allowForSession":true}));
+            return;
+        }
         if let Some(request) = self.request.as_ref().filter(|r| r["method"] == "confirm") {
             self.native.session_approvals.insert(approval_key(request));
             self.respond(json!({"confirmed":true}));
@@ -628,6 +659,47 @@ impl Thread {
             self.draft.focused = false;
             self.reply.focused = false;
         }
+    }
+    pub(super) fn prepare_remote_questionnaire(&mut self) {
+        if let Some(request) = self.request.clone() {
+            self.prepare_questionnaire(&request);
+        } else {
+            self.native.questionnaire = None;
+        }
+    }
+    pub(super) fn projected_form(&self) -> Value {
+        json!(self.native.questionnaire)
+    }
+    pub(super) fn apply_projected_form(&mut self, value: Value) -> Result<(), String> {
+        self.native.questionnaire = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub(super) fn respond_projected_form(&mut self, answers: Value) -> Result<(), String> {
+        let answers: Vec<questionnaire::Answer> =
+            serde_json::from_value(answers).map_err(|e| e.to_string())?;
+        let form = self
+            .native
+            .questionnaire
+            .as_mut()
+            .ok_or("Questionnaire expired.")?;
+        if answers.len() != form.questions.len() || answers.is_empty() {
+            return Err("Invalid questionnaire answers.".into());
+        }
+        for (answer, question) in answers.iter().zip(&form.questions) {
+            if answer.other.len() > 32_768
+                || answer
+                    .selected
+                    .iter()
+                    .any(|value| !question.options.iter().any(|option| option.value == *value))
+            {
+                return Err("Invalid questionnaire option.".into());
+            }
+        }
+        form.answers = answers;
+        form.index = form.questions.len() - 1;
+        self.reply.replace_text(&form.answers[form.index].other);
+        self.questionnaire_step(false);
+        Ok(())
     }
 
     pub fn questionnaire_toggle(&mut self, index: usize) {
@@ -690,6 +762,9 @@ impl Thread {
     }
 
     pub fn refresh_commands(&mut self) {
+        if self.forward("commands.refresh", json!({})) {
+            return;
+        }
         self.native.commands_error = None;
         self.command("get_commands", json!({}));
     }
@@ -1338,6 +1413,12 @@ impl Thread {
 
 impl State {
     pub fn set_access_mode(&mut self, access: AccessMode) {
+        if self.forward(
+            "thread.configure",
+            json!({"threadId":self.current().id,"access":access.id()}),
+        ) {
+            return;
+        }
         if self.demo
             || self.current().status.busy()
             || self.current().configuring
@@ -1377,6 +1458,13 @@ impl State {
     }
 
     pub fn conversation_points(&mut self, mode: ConversationMode) {
+        if self.forward(
+            "thread.forkPoints",
+            json!({"threadId":self.current().id,"rewind":mode == ConversationMode::Rewind}),
+        ) {
+            self.current_mut().native.conversation = Some(mode);
+            return;
+        }
         if self.demo || self.current().archived() {
             return;
         }
@@ -1388,6 +1476,12 @@ impl State {
 
     /// Fork in a separate process, as KSG does, so the source session and its owner never move.
     pub fn fork_conversation(&mut self, entry: Option<String>) {
+        if self.forward(
+            "thread.fork",
+            json!({"threadId":self.current().id,"entry":entry}),
+        ) {
+            return;
+        }
         if self.current().harness != "pi" {
             self.current_mut().error = Some("Conversation forks are Pi-only in Shina.".into());
             return;
