@@ -75,20 +75,45 @@ pub fn bind_addresses(
     Ok(addresses)
 }
 
-pub fn tailscale_addresses() -> Result<Vec<IpAddr>, String> {
-    let executable = if cfg!(windows) {
+/// Where to look for the Tailscale CLI, in order. The macOS app keeps its CLI inside the
+/// bundle and launchd services get a minimal PATH, so PATH alone is not enough there.
+fn tailscale_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = vec![std::path::PathBuf::from(if cfg!(windows) {
         "tailscale.exe"
     } else {
         "tailscale"
-    };
-    let output = crate::process::output(
-        std::process::Command::new(executable).args(["status", "--json"]),
-        Duration::from_millis(3500),
-        1024 * 1024,
-    )
-    .map_err(
-        |_| "Could not read Tailscale status. Check that Tailscale is installed and running.",
-    )?;
+    })];
+    if cfg!(target_os = "macos") {
+        candidates.push("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into());
+        candidates.push("/opt/homebrew/bin/tailscale".into());
+        candidates.push("/usr/local/bin/tailscale".into());
+    } else if cfg!(windows) {
+        if let Some(programs) = std::env::var_os("ProgramFiles") {
+            candidates.push(
+                std::path::Path::new(&programs)
+                    .join("Tailscale")
+                    .join("tailscale.exe"),
+            );
+        }
+    } else {
+        candidates.push("/usr/bin/tailscale".into());
+        candidates.push("/usr/local/bin/tailscale".into());
+    }
+    candidates
+}
+
+pub fn tailscale_addresses() -> Result<Vec<IpAddr>, String> {
+    let output = tailscale_candidates()
+        .into_iter()
+        .find_map(|executable| {
+            crate::process::output(
+                std::process::Command::new(executable).args(["status", "--json"]),
+                Duration::from_millis(3500),
+                1024 * 1024,
+            )
+            .ok()
+        })
+        .ok_or("Could not read Tailscale status. Check that Tailscale is installed and running.")?;
     if !output.status.success() {
         return Err(
             "Tailscale status failed. Sign in using Tailscale before enabling --tailnet.".into(),
