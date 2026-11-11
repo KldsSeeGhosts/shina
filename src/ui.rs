@@ -83,10 +83,10 @@ const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
 /// Assistant answers use Cursor's agent-window text: 15/24 sans with slightly tight tracking.
 const PROSE: TextStyle = TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.20);
 const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
-const HEADING: TextStyle = TextStyle::new(30.0, 450.0)
-    .family(rune::Family::Named(SERIF_FAMILY))
-    .lh(38.0)
-    .tracking(-0.45);
+/// The new-thread greeting, ported from KSG Code's `DraftHeroHeadline`: centred sans,
+/// `text-3xl font-normal tracking-tight`, or `text-2xl` when the pane is narrow.
+const HEADING: TextStyle = TextStyle::new(30.0, 400.0).lh(36.0).tracking(-0.75);
+const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0).lh(32.0).tracking(-0.6);
 /// Wide windows (1600 px and up) get a longer measure and larger body text.
 const WIDE_WINDOW: f32 = 1600.0;
 fn body_style(wide: bool) -> TextStyle {
@@ -279,8 +279,13 @@ fn icon(kind: &str, ink: Color) -> El {
         IMAGE,
         r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" fill="none" stroke="currentColor"/><circle cx="5.5" cy="6" r="1.3" fill="currentColor"/><path d="m2.5 11 3-3 2.5 2.5 2-2 3 3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
     );
+    glyph!(
+        MONITOR,
+        r#"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1.25" fill="none" stroke="currentColor"/><path d="M5.5 13.5h5M8 11v2.5" stroke="currentColor" stroke-linecap="round"/>"#
+    );
     let glyph = match kind {
         "plus" => &PLUS,
+        "monitor" => &MONITOR,
         "sidebar" => &SIDEBAR,
         "compose" => &COMPOSE,
         "edit" => &PENCIL,
@@ -337,33 +342,6 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
         .fill(p.teal)
         .on_press(action)
         .child(label(title, TextStyle::new(13.0, 560.0), p.on_teal))
-}
-/// A compact picker trigger: the text truncates, the chevron always stays visible.
-fn dropdown(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(title)
-        .focusable(true)
-        .center_y()
-        .gap(3.0)
-        .h(24.0)
-        .pl(5.0)
-        .pr(3.0)
-        .radius(5.0)
-        .shrink()
-        .min_w(0.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(action)
-        .child(
-            label(title, TextStyle::new(12.0, 450.0), p.ink)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
-        .child(icon("chevron", p.muted))
 }
 fn thinking_label(level: &str) -> String {
     if level.is_empty() {
@@ -588,13 +566,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .min_h(0.0)
             .child(chat_header(s, p, narrow, compact));
         let main = if s.current().messages.is_empty() && s.current().tools.is_empty() {
-            main.items_center()
-                .child(spacer())
-                .child(conversation(s, p, wide))
-                .child(composer(s, p, narrow, wide))
-                .child(spacer())
+            let pane_width = cx.layout_with("chat-pane", |r| r[2]).unwrap_or(900.0);
+            main.child(empty_thread(s, p, narrow, wide, pane_width))
         } else {
-            main.child(conversation(s, p, wide))
+            main.child(conversation(s, p, wide, 0.0))
                 .child(composer(s, p, narrow, wide))
         };
         body = body.child(main);
@@ -4459,7 +4434,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     response
 }
 
-fn conversation(s: &State, p: Palette, wide: bool) -> El {
+fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let mut messages = col()
         .w_full()
@@ -4566,51 +4541,17 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
                     ),
             );
         } else {
-            introduction = introduction.child(
-                label("What are we working on?", HEADING, p.ink)
-                    .key("empty-heading")
-                    .wrap(),
-            );
-            introduction = introduction.child(
-                row()
-                    .gap(6.0)
-                    .center_y()
-                    .child(icon("folder", p.muted))
-                    .child(label(
-                        if s.demo {
-                            "native-workspace".into()
-                        } else {
-                            s.project_name()
-                        },
-                        SMALL,
-                        p.muted,
-                    )),
-            );
+            introduction = introduction
+                .items_center()
+                .px(0.0)
+                .pb(16.0)
+                .gap(8.0)
+                .child(draft_headline(s, p, pane_width));
         }
         if t.restoring_history() {
             introduction = introduction.child(label("Restoring conversation...", SMALL, p.muted));
         }
-        return introduction.child(
-            row()
-                .gap(8.0)
-                .flex_wrap()
-                .child(suggestion(
-                    "suggest-review",
-                    "Understand project",
-                    "Read this project and explain its architecture. Do not change any files.",
-                    p,
-                )
-                .opacity(if s.demo { 0.5 } else { 1.0 })
-                .disabled(s.demo))
-                .child(suggestion(
-                    "suggest-plan",
-                    "Plan a change",
-                    "Help me plan a change to this project. Start by asking what I want to build.",
-                    p,
-                )
-                .opacity(if s.demo { 0.5 } else { 1.0 })
-                .disabled(s.demo)),
-        );
+        return introduction;
     } else {
         let cutoff = t.messages.len().saturating_sub(100);
         // Do not cut through an assistant turn and hide the tools that led to its answer.
@@ -4711,16 +4652,101 @@ fn conversation(s: &State, p: Palette, wide: bool) -> El {
         .child(messages)
 }
 
-fn suggestion(key: &str, title: &str, prompt: &'static str, p: Palette) -> El {
-    button(key, title, p, move |s| {
-        s.current_mut().draft.replace_text(prompt)
-    })
-    .self_start()
-    .h(30.0)
-    .px(12.0)
-    .radius(15.0)
-    .fill(p.card)
-    .border(0.5, p.line)
+/// The new-thread screen, laid out like KSG Code's draft hero: the composer sits at the
+/// vertical centre of the pane and the headline rests 16 px above it. Two equal zero-height
+/// boxes do the centring, so attachments or a long draft grow the composer without moving
+/// the headline off it.
+fn empty_thread(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
+    let above = col()
+        .w_full()
+        .h(0.0)
+        .grow(1.0)
+        .min_h(0.0)
+        .justify_end()
+        .items_center()
+        .child(conversation(s, p, wide, pane_width));
+    let below = col().w_full().h(0.0).grow(1.0).min_h(0.0);
+    col()
+        .key("empty-thread")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .items_center()
+        .child(above)
+        .child(composer(s, p, narrow, wide))
+        .child(below)
+}
+
+/// "What should we build in <project>?" with the project as an inline picker, as in KSG Code.
+/// When the sentence does not fit on one line, the project moves under it at body size.
+fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
+    let name = if s.demo {
+        "native-workspace".to_string()
+    } else {
+        s.project_name()
+    };
+    // Sans at 30 px averages about 15 px a character; keep the 16 px gutters free.
+    let available = pane_width.min(measure(true)) - 32.0;
+    let inline = pane_width > 0.0
+        && ("What should we build in ?".len() + name.chars().count()) as f32 * 15.0 <= available;
+    let picker = |style: TextStyle| {
+        let mut picker = row()
+            .key("draft-project")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("Project: {name}. Choose a project"))
+            .help(name.clone())
+            .center_y()
+            .pl(4.0)
+            .pr(1.0)
+            .radius(6.0)
+            .shrink()
+            .min_w(0.0)
+            .hover(p.selected)
+            .press(p.selected)
+            .child(
+                label(
+                    name.clone(),
+                    TextStyle {
+                        weight: 500.0,
+                        ..style
+                    },
+                    p.ink,
+                )
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+            );
+        if !s.demo {
+            picker = picker
+                .focusable(true)
+                .on_press(|s: &mut State| s.open_picker(ProjectPicker::NewThread));
+        }
+        picker
+    };
+    if inline {
+        row()
+            .key("empty-heading")
+            .w_full()
+            .justify_center()
+            .center_y()
+            .child(label("What should we build in", HEADING, p.ink).pr(4.0))
+            .child(picker(HEADING))
+            .child(label("?", HEADING, p.ink))
+    } else {
+        col()
+            .key("empty-heading")
+            .w_full()
+            .items_center()
+            .gap(6.0)
+            .child(
+                label("What should we build?", HEADING_NARROW, p.ink)
+                    .align(rune::Align::Center)
+                    .wrap()
+                    .w_full(),
+            )
+            .child(picker(TextStyle::new(16.0, 500.0).lh(24.0)).max_w(measure(true)))
+    }
 }
 
 fn image_preview(
@@ -4743,7 +4769,8 @@ fn image_preview(
         if rune::is_headless() {
             let _ = handle.wait();
         }
-        preview = preview.pixels(handle.pixels());
+        // Cover and crop, as `object-cover` does, so square tiles never stretch a screenshot.
+        preview = preview.pixels_fit(handle.pixels(), rune::SurfaceFit::Fill);
     } else {
         preview = preview
             .center()
@@ -4762,35 +4789,28 @@ fn image_size(image: &Attachment, maximum: f32) -> (f32, f32) {
     }
 }
 
+/// A draft image as a bare 64 px thumbnail with a close button in its corner, ported from
+/// KSG Code's `ComposerAttachmentStrip`. The file name lives in the tooltip and the label.
+const ATTACHMENT_THUMB: f32 = 64.0;
 fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
     let id = image.id.clone();
-    row()
-        .key(format!("attachment-{}", image.id))
+    el().key(format!("attachment-{}", image.id))
         .role("group")
         .label(format!("Attached image: {}", image.name))
-        .center_y()
-        .h(36.0)
-        .pl(4.0)
-        .pr(3.0)
-        .gap(7.0)
-        .radius(8.0)
-        .fill(if s.dark {
-            Color::WHITE.alpha(0.05)
-        } else {
-            Color::BLACK.alpha(0.035)
-        })
-        .border(0.5, p.line)
-        .shrink()
-        .min_w(0.0)
+        .help(image.name.clone())
+        .size(ATTACHMENT_THUMB, ATTACHMENT_THUMB)
         .child(
-            image_preview(s, p, image, 28.0, 28.0, format!("attachment-thumb-{id}")).a11y_hidden(),
-        )
-        .child(
-            label(&image.name, TextStyle::new(11.5, 450.0), p.ink)
-                .truncate()
-                .max_w(140.0)
-                .shrink()
-                .min_w(0.0),
+            image_preview(
+                s,
+                p,
+                image,
+                ATTACHMENT_THUMB,
+                ATTACHMENT_THUMB,
+                format!("attachment-thumb-{id}"),
+            )
+            .radius(8.0)
+            .clip_rounded(8.0)
+            .a11y_hidden(),
         )
         .child(
             el().key(format!("remove-attachment-{id}"))
@@ -4798,12 +4818,14 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .label(format!("Remove {}", image.name))
                 .focusable(true)
-                .size(22.0, 22.0)
+                .pin(None, Some(4.0), Some(4.0), None)
+                .size(18.0, 18.0)
                 .center()
-                .radius(4.0)
-                .hover(p.selected)
+                .radius(9.0)
+                .fill(Color::BLACK.alpha(0.6))
+                .hover(Color::BLACK.alpha(0.8))
                 .on_press(move |s: &mut State| s.remove_attachment(&id))
-                .child(icon("close", p.muted)),
+                .child(icon("close", Color::WHITE).size(12.0, 12.0)),
         )
 }
 
@@ -4870,7 +4892,7 @@ fn pick_attachment(s: &mut State, tx: &mut Tx) {
     );
 }
 
-const CONTEXT_RING_SIZE: f32 = 26.0;
+const CONTEXT_RING_SIZE: f32 = 28.0;
 
 fn context_limit(t: &Thread) -> Option<u64> {
     t.context.usage.limit(t.context_window)
@@ -4879,6 +4901,14 @@ fn context_limit(t: &Thread) -> Option<u64> {
 /// The ring appears once Pi or the model catalog knows a capacity, or once Pi reports usage.
 fn context_available(t: &Thread) -> bool {
     t.context.usage.has_usage() || context_limit(t).is_some()
+}
+
+/// A fresh draft has nothing to measure yet, so it shows no empty dashed ring.
+fn context_ring_shown(t: &Thread) -> bool {
+    context_available(t)
+        && (t.context.usage.has_usage()
+            || t.context.phase != ContextPhase::Idle
+            || !t.messages.is_empty())
 }
 
 fn context_ink(percent: f64, p: Palette) -> Color {
@@ -4923,8 +4953,8 @@ fn arc_points(
 /// usage is unknown, so looking full is never implied by empty data.
 fn context_ring_shape(context: &ContextMeter, p: Palette) -> Shape {
     let center = CONTEXT_RING_SIZE / 2.0;
-    let radius = 9.4;
-    let width = 2.4;
+    let radius = 7.5;
+    let width = 2.0;
     let track = if context.phase == ContextPhase::Compacting {
         p.gold.alpha(0.65)
     } else {
@@ -5076,7 +5106,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .cursor(rune::Cursor::Pointer)
         .label("Send message")
         .size(32.0, 32.0)
-        .radius(10.0)
+        .radius(16.0)
         .center()
         .hover(if can_send {
             p.teal.alpha(0.85)
@@ -5086,9 +5116,9 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
         .fill(if can_send {
             p.teal
         } else if s.dark {
-            Color::WHITE.alpha(0.12)
+            Color::WHITE.alpha(0.10)
         } else {
-            p.selected
+            Color::BLACK.alpha(0.06)
         })
         .child(icon("send", if can_send { p.on_teal } else { p.muted }))
         .disabled(!can_send);
@@ -5100,20 +5130,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             s.current_mut().stop()
         })
         .size(32.0, 32.0)
+        .radius(16.0)
         .border(1.0, p.line)
     } else {
         send
     };
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
-    let tray = if t.draft_images.is_empty() {
-        None
-    } else {
-        let mut chips = row().gap(6.0).flex_wrap();
-        for image in &t.draft_images {
-            chips = chips.child(attachment_chip(s, p, image));
-        }
-        Some(chips)
-    };
+    // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
+    // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
     let mut card = col()
         .key("composer")
         .radius(16.0)
@@ -5129,21 +5153,26 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             },
         )
         .shadow(
-            3.0,
-            10.0,
-            Color::BLACK.alpha(if s.dark { 0.10 } else { 0.035 }),
+            1.0,
+            2.0,
+            Color::BLACK.alpha(if s.dark { 0.0 } else { 0.05 }),
         )
-        .px(16.0)
-        .pt(14.0)
-        .pb(12.0)
-        .gap(12.0)
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
             s.attach_paths(files);
             s.checkpoint();
         })
         .on_drop_hover(|s: &mut State, over, _| s.attachment_drop_hover = over);
-    if let Some(tray) = tray {
+    if !t.draft_images.is_empty() {
+        let mut tray = row()
+            .key("composer-attachments")
+            .gap(8.0)
+            .flex_wrap()
+            .px(12.0)
+            .pt(12.0);
+        for image in &t.draft_images {
+            tray = tray.child(attachment_chip(s, p, image));
+        }
         card = card.child(tray);
     }
     card = card.child(
@@ -5154,15 +5183,18 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 if s.demo {
                     "Open a real workspace to send messages"
                 } else {
-                    "Describe a task or ask a question..."
+                    "Ask anything. Shift Enter for a new line"
                 },
                 p.muted,
             )
             .color(p.ink)
             .caret(p.teal, p.teal_bg)
             .w_full()
-            .min_h(52.0)
-            .max_h(170.0)
+            .min_h(48.0)
+            .max_h(200.0)
+            .px(16.0)
+            .pt(14.0)
+            .pb(6.0)
             .on_edit(|s: &mut State| &mut s.current_mut().draft)
             .on_input_paste(|s: &mut State, content, _| {
                 let has_image = content.image().is_some();
@@ -5181,29 +5213,31 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
             }),
     );
     if t.context.details_open && context_available(t) {
-        card = card.child(context_details(t, p));
+        card = card.child(context_details(t, p).px(16.0).pb(4.0));
     }
     let mut actions = row()
         .key("composer-actions")
         .center_y()
-        .gap(4.0)
-        .child(attach_control(locked, p).size(28.0, 28.0))
+        .gap(2.0)
+        .px(8.0)
+        .pb(8.0)
+        .child(attach_control(locked, p).size(28.0, 28.0).radius(8.0))
         .child(spacer())
         .child(
-            dropdown("choose-pi-model", &t.model, p, |s| {
+            composer_picker("choose-pi-model", &t.model, p.ink, p, |s| {
                 s.model_search.replace_text("");
                 s.settings_picker = Some(SettingsPicker::Model);
                 s.refresh_catalog();
             })
-            .h(28.0)
-            .max_w(if narrow { 104.0 } else { 230.0 })
+            .max_w(if narrow { 120.0 } else { 260.0 })
             .opacity(if locked { 0.65 } else { 1.0 })
             .disabled(locked),
         )
         .child(
-            dropdown(
+            composer_picker(
                 "choose-pi-thinking",
                 thinking_label(&t.thinking).trim_end_matches(" thinking"),
+                p.muted,
                 p,
                 |s| {
                     s.settings_picker = Some(SettingsPicker::Thinking);
@@ -5211,44 +5245,28 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                 },
             )
             .label(format!("Reasoning effort: {}", thinking_label(&t.thinking)))
-            .h(28.0)
-            .max_w(if narrow { 76.0 } else { 130.0 })
+            .max_w(if narrow { 80.0 } else { 130.0 })
             .opacity(if locked { 0.65 } else { 1.0 })
             .disabled(locked),
         );
-    if context_available(t) {
+    if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
     }
-    area = area.child(card.child(actions.child(action)));
-    area = area.child(
-        row()
-            .key("composer-footer")
-            .min_h(24.0)
-            .flex_wrap()
-            .center_y()
-            .gap(5.0)
-            .child(icon("folder", p.muted))
+    area = area.child(card.child(actions.child(action.ml(4.0))));
+    // KSG Code's context strip: a bare muted row under the card, machine on the left and the
+    // access mode on the right, inset to line up with the card's controls.
+    let mut footer = row()
+        .key("composer-footer")
+        .min_h(24.0)
+        .px(10.0)
+        .flex_wrap()
+        .center_y()
+        .gap(6.0);
+    footer = if s.demo {
+        footer
+            .child(label("Demo data", SMALL, p.muted))
+            .child(spacer())
             .child(
-                dropdown(
-                    "composer-project",
-                    &format!("{} · {}", s.project_name(), t.machine),
-                    p,
-                    |s| s.open_picker(ProjectPicker::NewThread),
-                )
-                .max_w(if narrow { 150.0 } else { 360.0 }),
-            )
-            // The dropdown chevron already separates the picker from this note.
-            .child(
-                label(
-                    if s.demo { "Demo data" } else { "No sandbox" },
-                    SMALL,
-                    p.muted,
-                )
-                .ml(4.0)
-                .wrap()
-                .grow(1.0),
-            )
-            .child(if s.demo {
                 row()
                     .key("leave-example")
                     .role("button")
@@ -5267,14 +5285,62 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool) -> El {
                         "Open a real workspace",
                         TextStyle::new(11.5, 500.0),
                         p.teal,
-                    ))
-            } else if !narrow {
-                label("Shift Enter for newline", SMALL, p.muted)
-            } else {
-                el()
-            }),
-    );
+                    )),
+            )
+    } else {
+        let local = t.machine == "local";
+        footer
+            .child(icon(if local { "monitor" } else { "cloud" }, p.muted))
+            .child(
+                label(
+                    if local {
+                        "Local".to_string()
+                    } else {
+                        t.machine.clone()
+                    },
+                    SMALL,
+                    p.muted,
+                )
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+            )
+    };
+    area = area.child(footer);
     col().w_full().items_center().child(area)
+}
+
+/// A borderless composer control, as KSG Code's model and effort triggers: no chevron,
+/// a hover fill, and text that truncates before it can push the send button out.
+fn composer_picker(
+    key: &str,
+    title: &str,
+    ink: Color,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .help(title)
+        .focusable(true)
+        .center_y()
+        .h(28.0)
+        .px(8.0)
+        .radius(8.0)
+        .shrink()
+        .min_w(0.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(action)
+        .child(
+            label(title, TextStyle::new(13.0, 500.0), ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
 }
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
@@ -5919,17 +5985,11 @@ pub(crate) mod tests {
         std::mem::replace(&mut rt.state.threads[0], Thread::new(1))
     }
     #[test]
-    fn new_thread_and_suggestion_are_native_interactions() {
+    fn new_thread_is_a_native_interaction() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
-        press(&mut rt, "suggest-review");
-        assert!(
-            rt.state
-                .current()
-                .draft
-                .text
-                .starts_with("Read this project")
-        );
+        // A blank draft is reused, so give this one text before asking for another.
+        rt.state.current_mut().draft.replace_text("Read this project");
         assert!(rt.state.current().pi.is_none());
         // One workspace in view: New thread starts there at once, as in T3 Code.
         press(&mut rt, "new-thread");
@@ -7222,6 +7282,63 @@ pub(crate) mod tests {
         assert_eq!(
             rt.state.current().draft_images[0].name,
             path.file_name().unwrap().to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn new_thread_centres_the_composer_with_the_headline_above_it() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            let (card, _) = rt.presented("composer").unwrap();
+            let (heading, _) = rt.presented("empty-heading").unwrap();
+            let (project, _) = rt.presented("draft-project").unwrap();
+            let centre = card[1] + card[3] / 2.0;
+            let pane_centre = pane[1] + pane[3] / 2.0;
+            assert!(
+                (centre - pane_centre).abs() < 60.0,
+                "composer is off centre at {width}: {card:?} in {pane:?}"
+            );
+            assert!(
+                heading[1] + heading[3] <= card[1] && card[1] - (heading[1] + heading[3]) < 40.0,
+                "headline must sit just above the composer at {width}: {heading:?} {card:?}"
+            );
+            for rect in [heading, project] {
+                assert!(
+                    rect[0] >= pane[0] - 0.5 && rect[0] + rect[2] <= pane[0] + pane[2] + 0.5,
+                    "headline overflows the pane at {width}: {rect:?} in {pane:?}"
+                );
+            }
+            assert!(rt.find("suggest-review").is_none(), "no starter prompts");
+            assert!(
+                rt.find("context-usage-ring").is_none(),
+                "no empty ring on a fresh draft"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_images_are_square_thumbnails_with_a_corner_close_button() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        rt.state.attach_image("Pasted image.png", &ui_png(40));
+        rt.frame(0.0);
+        let id = rt.state.current().draft_images[0].id.clone();
+        let (tile, _) = rt.presented(&format!("attachment-{id}")).unwrap();
+        assert_eq!((tile[2], tile[3]), (ATTACHMENT_THUMB, ATTACHMENT_THUMB));
+        let (close, _) = rt.presented(&format!("remove-attachment-{id}")).unwrap();
+        assert!(
+            close[0] >= tile[0] && close[0] + close[2] <= tile[0] + tile[2] + 0.5,
+            "close button must sit inside the thumbnail: {close:?} in {tile:?}"
+        );
+        assert!(
+            !rt.elements()
+                .into_iter()
+                .any(|element| element.text.as_deref() == Some("Pasted image.png")),
+            "the file name is not drawn as text"
         );
     }
 
