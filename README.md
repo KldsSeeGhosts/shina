@@ -4,16 +4,6 @@ A native desktop chat workspace built with [Rune](https://github.com/anomalyco/r
 
 The standalone app's interface is entirely Rune. Pi runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
 
-## Native Herdr workspace on macOS
-
-The [Shina-on-Herdr workspace](experiments/herdr/workspace/README.md) combines
-native Herdr Chat, T3 thread management, and Shina's theme. It runs separately
-from the Rune app and preserves the existing provider configuration.
-
-```sh
-node experiments/herdr/workspace.mjs open
-```
-
 ## Run on Windows
 
 The development tools and Pi are already installed on this workstation.
