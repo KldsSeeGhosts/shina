@@ -36,6 +36,14 @@ pub use tasks::{AttentionItem, AttentionKind, TaskState, TaskView};
 mod background;
 #[allow(unused_imports)]
 pub use background::{BackgroundSettings, BackgroundStatus};
+#[path = "memory.rs"]
+#[allow(dead_code)] // Public entry points are shared with the captain records UI.
+mod memory;
+#[path = "scope.rs"]
+#[allow(dead_code)] // Public entry points are shared with the captain records UI.
+mod scope;
+#[allow(unused_imports)]
+pub use memory::{MemoryView, UserProfile};
 
 struct Injection {
     text: String,
@@ -317,6 +325,11 @@ pub struct Thread {
     accepted_deliveries: Vec<String>,
     recovering_task: bool,
     task_history: Option<Value>,
+    memory: Option<memory::MemoryLink>,
+    memory_context: std::collections::BTreeMap<String, String>,
+    memory_staged: Vec<memory::Mutation>,
+    memory_suggestions: Vec<String>,
+    scope_context_pending: bool,
 }
 
 impl Thread {
@@ -501,6 +514,11 @@ impl Thread {
             accepted_deliveries: Vec::new(),
             recovering_task: false,
             task_history: None,
+            memory: None,
+            memory_context: Default::default(),
+            memory_staged: Vec::new(),
+            memory_suggestions: Vec::new(),
+            scope_context_pending: false,
         }
     }
 
@@ -684,6 +702,11 @@ impl Thread {
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
+        let context = if kind == "prompt" {
+            self.prepare_memory_prompt(&mut data)
+        } else {
+            None
+        };
         self.serial += 1;
         data["type"] = kind.into();
         data["id"] = format!("{}-{}", self.id, self.serial).into();
@@ -695,6 +718,10 @@ impl Thread {
         if let Err(error) = result {
             self.error = Some(error);
             return false;
+        }
+        if let Some(context) = context {
+            self.memory_context = context;
+            self.scope_context_pending = false;
         }
         self.last_activity = Instant::now();
         match kind {
@@ -808,6 +835,9 @@ impl Thread {
     }
 
     fn stop_task(&mut self) -> Result<(), String> {
+        self.memory_staged.clear();
+        self.memory_context.clear();
+        self.scope_context_pending = true;
         self.return_local_queue();
         self.pending_injections.clear();
         self.injection_id = None;
@@ -868,6 +898,7 @@ impl Thread {
     }
 
     pub fn disconnect(&mut self) {
+        self.memory_staged.clear();
         self.native_disconnect();
         self.finish_thoughts();
         if let Some((prompt, index)) = self.queued_prompt.take() {
@@ -1052,6 +1083,9 @@ impl Thread {
     }
 
     fn fail_session(&mut self, error: String) {
+        self.memory_staged.clear();
+        self.memory_context.clear();
+        self.scope_context_pending = true;
         self.disconnect();
         self.error = Some(error);
         self.status = Status::Failed;
@@ -1368,6 +1402,11 @@ impl Thread {
                     return;
                 }
                 if record["success"] == false {
+                    if command == "prompt" {
+                        self.memory_staged.clear();
+                        self.memory_context.clear();
+                        self.scope_context_pending = true;
+                    }
                     self.error = Some(string(&record, "error").to_owned());
                     if self.initializing {
                         self.fail_session(self.error.clone().unwrap());
@@ -1628,6 +1667,7 @@ impl Thread {
                 } else {
                     status_word(self.status)
                 });
+                self.settle_memory(!aborted && self.status == Status::Completed);
                 // The turn that just finished is what changed the live context window.
                 self.context.cancel_request();
                 self.refresh_context_usage();
@@ -1939,6 +1979,9 @@ pub struct State {
     pub captain_picker: bool,
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
+    captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
+    captain_homes: std::collections::BTreeMap<usize, usize>,
+    memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
     pub settings_picker: Option<SettingsPicker>,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
@@ -1973,6 +2016,7 @@ impl State {
                 }
                 self.restore_global(&index)?;
             }
+            self.load_memory(false)?;
             if let Some(ui) = crate::store::load(&self.data_dir.join("ui-state.json"))? {
                 self.restore_ui(&ui)?;
             }
@@ -2057,6 +2101,9 @@ impl State {
             captain_picker: false,
             captain_project: None,
             captains: Vec::new(),
+            captain_scopes: Default::default(),
+            captain_homes: Default::default(),
+            memory: Arc::default(),
             captain_editor: None,
             settings_picker: None,
             thinking_drag: None,
@@ -2183,6 +2230,16 @@ impl State {
                 }
                 Ok(project.path.clone())
             }
+            None if thread.captain_home => Ok(self
+                .data_dir
+                .join("captains")
+                .join(
+                    thread
+                        .captain
+                        .ok_or("Captain home has no profile.")?
+                        .to_string(),
+                )
+                .join("scratch")),
             None => Ok(self.data_dir.join("chats").join(thread.id.to_string())),
         }
     }
@@ -2248,11 +2305,31 @@ impl State {
         self.threads
             .iter()
             .enumerate()
-            .filter(|(_, home)| self.is_captain_home(home) && self.in_scope(home))
+            .filter(|(_, home)| {
+                self.is_captain_home(home)
+                    && home
+                        .captain
+                        .is_some_and(|captain| self.captain_home(captain) == Some(home.id))
+                    && (self.in_scope(home)
+                        || home.captain.is_some_and(|captain| {
+                            self.captain_scope(captain)
+                                .iter()
+                                .any(|id| match self.project_scope {
+                                    ProjectScope::All => true,
+                                    ProjectScope::Project(primary) => {
+                                        *id == primary || self.scope_additional.contains(id)
+                                    }
+                                    ProjectScope::NoProject => false,
+                                })
+                        }))
+            })
             .filter(|(_, home)| {
                 let children = || {
                     self.threads.iter().filter(|child| {
-                        child.parent == Some(home.id) && child.archived() == self.show_archive
+                        child
+                            .parent
+                            .is_some_and(|parent| self.effective_home(parent) == home.id)
+                            && child.archived() == self.show_archive
                     })
                 };
                 let own_match =
@@ -2300,7 +2377,9 @@ impl State {
             .iter()
             .enumerate()
             .filter(|(_, child)| {
-                child.parent == Some(home)
+                child
+                    .parent
+                    .is_some_and(|parent| self.effective_home(parent) == home)
                     && child.archived() == self.show_archive
                     && (self.thread_search_matches(parent) || self.thread_search_matches(child))
             })
@@ -2311,7 +2390,12 @@ impl State {
     pub fn captain_worker_count(&self, home: usize) -> usize {
         self.threads
             .iter()
-            .filter(|child| child.parent == Some(home) && child.archived() == self.show_archive)
+            .filter(|child| {
+                child
+                    .parent
+                    .is_some_and(|parent| self.effective_home(parent) == home)
+                    && child.archived() == self.show_archive
+            })
             .count()
     }
     /// Keyboard traversal follows the rows that the sidebar actually displays.
@@ -2512,7 +2596,7 @@ impl State {
             })
     }
     pub fn selected_row(&self) -> usize {
-        self.current().parent.unwrap_or(self.current().id)
+        self.effective_home(self.current().parent.unwrap_or(self.current().id))
     }
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
@@ -2697,6 +2781,8 @@ impl State {
             }
         }
         self.threads.retain(|t| !ids.contains(&t.id));
+        self.captain_homes.retain(|_, home| !ids.contains(home));
+        self.sync_memory_links();
         self.tasks.retain(|task| {
             !ids.contains(&task.parent_thread_id) && !ids.contains(&task.child_thread_id)
         });
@@ -3164,30 +3250,36 @@ impl State {
             return;
         }
         let explicit = self.captain_project.take();
-        let project_id =
+        let existing_home = self.captain_home(captain);
+        let requested_project =
             explicit.unwrap_or(self.projects.captain_target.or(self.current().project));
+        if !self.captain_scopes.contains_key(&captain) {
+            let scope = if existing_home.is_some() {
+                self.captain_scope(captain)
+            } else {
+                requested_project.into_iter().collect()
+            };
+            self.captain_scopes.insert(captain, scope);
+        } else if self.projects.captain_target.is_some()
+            && let Some(project) = requested_project
+        {
+            let mut scope = self.captain_scope(captain);
+            if !scope.contains(&project) {
+                scope.push(project);
+                if let Err(error) = self.set_captain_scope(captain, scope) {
+                    self.lifecycle_error = Some(error);
+                    return;
+                }
+            }
+        }
+        let project_id = self.captain_scope(captain).first().copied();
         let machine = self
             .project(project_id)
             .map(|p| p.machine.clone())
             .unwrap_or_else(|| "local".into());
         if let Some(index) = self
-            .threads
-            .iter()
-            .enumerate()
-            .filter(|(_, thread)| {
-                thread.captain_home
-                    && thread.captain == Some(captain)
-                    && (explicit.is_none() && self.projects.captain_target.is_none()
-                        || thread.project == project_id)
-            })
-            .min_by_key(|(_, t)| {
-                (
-                    t.archived(),
-                    t.project != project_id,
-                    std::cmp::Reverse(t.id),
-                )
-            })
-            .map(|(i, _)| i)
+            .captain_home(captain)
+            .and_then(|home| self.threads.iter().position(|t| t.id == home))
         {
             self.active = index;
             self.current_mut().life.archived_at = None;
@@ -3205,17 +3297,19 @@ impl State {
             self.active = self.threads.len() - 1;
         }
         let home = self.current().id;
-        let project_id = self.current().project;
+        self.captain_homes.insert(captain, home);
         if let Some(project) = self
             .projects
             .entries
             .iter_mut()
-            .find(|p| Some(p.id) == project_id)
+            .find(|p| Some(p.id) == requested_project)
             && project.captain.is_none()
+            && (existing_home.is_none() || self.projects.captain_target.is_some())
         {
             project.captain = Some(captain);
             project.captain_thread = Some(home);
         }
+        self.sync_memory_links();
         self.show_archive = false;
         self.captain_picker = false;
         self.projects.captain_target = None;
@@ -3224,35 +3318,6 @@ impl State {
             self.apply_catalog();
         }
         self.checkpoint();
-    }
-
-    /// Earlier versions seeded every roster with four named presets. Remove the ones nobody
-    /// has used or edited, and renumber the captains that remain.
-    fn drop_unused_presets(&mut self) {
-        let presets = Captain::presets();
-        let used = |id: usize| {
-            self.threads.iter().any(|t| t.captain == Some(id))
-                || self.projects.entries.iter().any(|p| p.captain == Some(id))
-        };
-        let mut remap = vec![None; self.captains.len()];
-        let mut kept = Vec::new();
-        for (id, captain) in self.captains.iter().enumerate() {
-            if presets.contains(captain) && !used(id) {
-                continue;
-            }
-            remap[id] = Some(kept.len());
-            kept.push(captain.clone());
-        }
-        if kept.len() == self.captains.len() {
-            return;
-        }
-        for thread in &mut self.threads {
-            thread.captain = thread.captain.and_then(|id| remap[id]);
-        }
-        for project in &mut self.projects.entries {
-            project.captain = project.captain.and_then(|id| remap[id]);
-        }
-        self.captains = kept;
     }
 
     pub fn begin_new_captain(&mut self) {
@@ -3356,33 +3421,19 @@ impl State {
     }
     /// The captain's most urgent live thread. Archived conversations do not vote.
     pub fn captain_status(&self, captain: usize) -> Status {
-        self.project_captain_status(
-            self.projects.captain_target.or(self.current().project),
-            captain,
-        )
-    }
-    pub fn project_captain_status(&self, project: Option<ProjectId>, captain: usize) -> Status {
-        self.threads
-            .iter()
-            .filter(|thread| {
-                thread.project == project
-                    && thread.captain == Some(captain)
-                    && !thread.archived()
-                    && (thread.captain_home || thread.delegated)
-                    && (thread.captain_home
-                        || thread
-                            .request
-                            .as_ref()
-                            .is_none_or(|r| r["method"] == "confirm"))
-            })
-            .map(|thread| thread.status)
-            .max_by_key(|status| status.urgency())
+        self.captain_home(captain)
+            .map(|home| self.home_status(home))
             .unwrap_or(Status::Ready)
     }
     pub fn home_status(&self, home: usize) -> Status {
         self.threads
             .iter()
-            .filter(|t| !t.archived() && (t.id == home || t.parent == Some(home)))
+            .filter(|t| {
+                !t.archived()
+                    && (t.id == home
+                        || t.parent
+                            .is_some_and(|parent| self.effective_home(parent) == home))
+            })
             .filter(|t| t.id == home || t.request.as_ref().is_none_or(|r| r["method"] == "confirm"))
             .map(|t| t.status)
             .max_by_key(|s| s.urgency())
@@ -3533,6 +3584,8 @@ impl State {
             .collect();
         json!({
             "ready": !models.is_empty(),
+            "scope": self.scope_value(caller.captain),
+            "workspace_required": caller.captain.is_some_and(|id| self.captain_scope(id).len() > 1),
             "discovery": {
                 "state": self.discovery_state(source),
                 "source": source,
@@ -3559,7 +3612,7 @@ impl State {
             "models": model_values,
             "notes": [
                 "Shina delegates only through Pi's CPA provider. Direct providers are never offered or used.",
-                "Only the local machine is supported. A child inherits the caller's project, machine and captain.",
+                "Only the local machine is supported. Captain workers use a selected workspace in the captain's scope and inherit its captain.",
                 "Pass exact model ids and reasoning levels. Unknown or unsupported choices are rejected before the child is created and are never silently substituted or clamped.",
                 "Omit target to inherit inherit_selection. Given target fields override the inherited selection.",
                 "When ready is false, discovery has not produced a usable catalog. Do not invent model ids or levels."
@@ -3587,10 +3640,24 @@ impl State {
         }
         let wake = self.wake.clone();
         let thread_id = self.threads[index].id;
+        self.sync_memory_links();
         let instructions = self.threads[index]
             .captain
             .and_then(|id| self.captains.get(id))
-            .map(Captain::prompt);
+            .map(|captain| {
+                format!(
+                    "{}\n\n{}",
+                    captain.prompt(),
+                    self.threads[index].memory_prompt()
+                )
+            });
+        if self.threads[index].harness == "pi" || self.threads[index].session.is_none() {
+            self.threads[index].memory_context = self.threads[index]
+                .memory
+                .as_ref()
+                .map(|link| link.seen())
+                .unwrap_or_default();
+        }
         // Future project notes can augment this prompt using (thread.machine, thread.project).
         // Context storage is deliberately separate from persona and session persistence.
         // Shina's tools are an addition. If the MCP cannot start, Pi still works without them.
@@ -3655,15 +3722,19 @@ impl State {
                 .unwrap_or(Value::Null)
         };
         match tool {
+            "remember" | "forget_memory" | "list_memories" | "search_memories"
+            | "propose_memory" => self.memory_call(caller_index, tool, args),
             "orchestrator_capabilities" => Ok(self.orchestrator_capabilities(caller_index)),
             "list_threads" => {
                 let archived = args["include_archived"] == true;
                 let all = args["all_projects"] == true;
                 let project = self.threads[caller_index].project;
                 let coordinator = if self.threads[caller_index].captain_home {
-                    Some(caller)
+                    Some(self.effective_home(caller))
                 } else {
-                    self.threads[caller_index].parent
+                    self.threads[caller_index]
+                        .parent
+                        .map(|parent| self.effective_home(parent))
                 };
                 let threads: Vec<Value> = self
                     .threads
@@ -3672,7 +3743,12 @@ impl State {
                         (archived || !t.archived())
                             && (all
                                 || match coordinator {
-                                    Some(home) => t.id == home || t.parent == Some(home),
+                                    Some(home) => {
+                                        t.id == home
+                                            || t.parent.is_some_and(|parent| {
+                                                self.effective_home(parent) == home
+                                            })
+                                    }
                                     None => {
                                         t.project == project
                                             && !t.captain_home
@@ -3687,6 +3763,7 @@ impl State {
                             "project": self.project(t.project).map(Project::to_value),
                             "machine": t.machine,
                             "captain": captain_name(self, t.captain),
+                            "scope": self.scope_value(t.captain),
                             "captain_home": self.is_captain_home(t),
                             "status": status_word(t.status),
                             "archived": t.archived(),
@@ -3731,8 +3808,12 @@ impl State {
                     .map(|(i, c)| {
                         json!({
                             "name": c.name,
+                            "captain_id": i,
+                            "home_thread_id": self.captain_home(i),
+                            "scope": self.scope_value(Some(i)),
+                            "earlier_conversations": self.earlier_conversations(i),
                             "role": c.role,
-                            "status": status_word(self.project_captain_status(self.threads[caller_index].project, i)),
+                            "status": status_word(self.captain_status(i)),
                             "assigned": self.threads.iter().any(|t| t.captain_home && t.captain == Some(i)),
                         })
                     })
@@ -3776,7 +3857,12 @@ impl State {
                 if let Some(selection) = &selection {
                     self.validate_delegation_selection(&models, selection, target.is_some())?;
                 }
-                let project = self.threads[caller_index].project;
+                let project = self.delegation_workspace(caller_index, args)?;
+                if let Some(project) = self.project(project)
+                    && project.machine != "local"
+                {
+                    return Err("Shina delegates only into local workspaces.".into());
+                }
                 let assigned = self.threads[caller_index]
                     .captain
                     .filter(|_| self.threads[caller_index].captain_home);
@@ -3827,6 +3913,7 @@ impl State {
                 let id = thread.id;
                 self.threads.push(thread);
                 self.tasks.push(task);
+                self.sync_memory_links();
                 self.start_queued_tasks();
                 self.checkpoint();
                 self.mcp_call(caller, "task_status", &json!({"thread_id":id}))
@@ -3876,13 +3963,13 @@ impl State {
                         &json!({"thread_id":self.threads[index].id}),
                     );
                 }
-                let thread = &mut self.threads[index];
-                if !thread.delegated || thread.parent != Some(caller) {
+                if !self.owns_child(caller, index) {
                     return Err(format!(
                         "Only the parent that delegated thread {} may cancel or send to it.",
-                        thread.id
+                        self.threads[index].id
                     ));
                 }
+                let thread = &mut self.threads[index];
                 if tool == "task_cancel" {
                     thread.stop_task()?;
                 } else {
@@ -4433,6 +4520,10 @@ impl State {
             }
         }
         let ui_path = self.data_dir.join("ui-state.json");
+        if let Err(error) = self.load_memory(true) {
+            self.storage_error = Some(error);
+            return;
+        }
         match crate::store::load(&ui_path) {
             Ok(Some(ui)) => {
                 if let Err(error) = self.restore_ui(&ui) {
@@ -4535,6 +4626,21 @@ impl State {
                     if let Some(sent) = record.get("harnessContextSent") {
                         thread.harness_context_sent = sent.as_bool()?;
                     }
+                    if let Some(context) = record.get("memoryContext") {
+                        thread.memory_context = serde_json::from_value(context.clone()).ok()?;
+                        if thread.memory_context.len() > 257
+                            || thread.memory_context.iter().any(|(id, hash)| {
+                                id != "profile" && !id.starts_with("memory-")
+                                    || hash.len() != 64
+                                    || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                        {
+                            return None;
+                        }
+                    }
+                    if let Some(pending) = record.get("scopeContextPending") {
+                        thread.scope_context_pending = pending.as_bool()?;
+                    }
                     thread.native.fork_source = record["forkSource"].as_str().map(str::to_owned);
                     thread.native.fork_entry = record["forkEntry"].as_str().map(str::to_owned);
                     thread.native.previous_session =
@@ -4629,7 +4735,8 @@ impl State {
                             && restored.iter().any(|t| {
                                 t.id == parent
                                     && !t.delegated
-                                    && t.project == thread.project
+                                    && (t.project == thread.project
+                                        || t.captain_home && t.captain == thread.captain)
                                     && t.machine == thread.machine
                             })
                     })
@@ -4642,7 +4749,6 @@ impl State {
                     || project.captain_thread.is_some_and(|id| {
                         !restored.iter().any(|t| {
                             t.id == id
-                                && t.project == Some(project.id)
                                 && t.captain == project.captain
                                 && t.captain_home
                                 && !t.delegated
@@ -4676,7 +4782,7 @@ impl State {
             }
             self.captains = captains;
             self.projects.entries = projects;
-            self.drop_unused_presets();
+            self.restore_captain_records(index, &project_remap)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             self.tabs = index["tabs"]
@@ -4897,7 +5003,8 @@ impl State {
         // Flush both even if the first one failed.
         let index = store.flush();
         let drafts = ui.flush();
-        index.and(drafts)
+        let memory = self.flush_memory();
+        index.and(drafts).and(memory)
     }
 
     /// Why a restart to update must wait, or `None` when nothing is active. It checks every
@@ -4979,12 +5086,16 @@ impl State {
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
+            "captainScopes":self.captain_scopes,
+            "captainHomes":self.captain_homes,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
                 !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(|thread|json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
+                "memoryContext":thread.memory_context,
+                "scopeContextPending":thread.scope_context_pending,
                 "forkSource":thread.native.fork_source, "forkEntry":thread.native.fork_entry,
                 "previousSession":thread.native.previous_session,"accessMode":thread.native.access.id(),
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
@@ -5320,6 +5431,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     for (parent, question) in crew_questions {
+        let parent = state.effective_home(parent);
         if let Some(i) = state.threads.iter().position(|t| t.id == parent) {
             state.threads[i].enqueue_injection(question);
             if state.threads[i].pi.is_none() {
@@ -5421,7 +5533,13 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         state.storage_error = Some(error);
         changed = true;
     }
+    let (memory_error, memory_healthy) = state.memory_storage_status();
+    if let Some(error) = memory_error {
+        state.storage_error = Some(error);
+        changed = true;
+    }
     if state.storage_error.is_some()
+        && memory_healthy
         && state
             .store
             .as_ref()
@@ -5576,20 +5694,22 @@ pub fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 fn content_text(content: &Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.into();
-    }
-    content
-        .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+    let text = if let Some(text) = content.as_str() {
+        text.to_owned()
+    } else {
+        content
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    memory::without_diff(&text).into()
 }
 /// Pi keeps user images as typed content blocks. Import each into the local store so the
 /// conversation can draw it again without retaining Pi's base64 copy in Shina state.
@@ -5907,7 +6027,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_drops_unused_presets_and_renumbers_the_captains_that_remain() {
+    fn restoring_preserves_profiles_and_stable_ids_including_untouched_presets() {
         let mut old = State::new(".".into(), false);
         old.captains = crate::captains::Captain::presets();
         let mut custom = old.captains[0].clone();
@@ -5916,23 +6036,26 @@ mod tests {
         // Sable (2) has a home; Riku (4) is custom; the other presets are untouched.
         old.open_captain(2);
         let sable_home = old.current().id;
-        let index = old.snapshot();
+        let mut index = old.snapshot();
+        // Legacy indexes also keep ids stable. Migration must not delete unused profiles.
+        index.as_object_mut().unwrap().remove("captainHomes");
+        index.as_object_mut().unwrap().remove("captainScopes");
         let mut restored = State::new(PathBuf::new(), false);
         restored.restore_global(&index).unwrap();
         let names: Vec<_> = restored.captains.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["Sable", "Riku"]);
+        assert_eq!(names, ["Ember", "Juniper", "Sable", "Pip", "Riku"]);
         let home = restored
             .threads
             .iter()
             .find(|t| t.id == sable_home)
             .unwrap();
-        assert_eq!(home.captain, Some(0));
+        assert_eq!(home.captain, Some(2));
         assert!(
             restored
                 .projects
                 .entries
                 .iter()
-                .all(|p| p.captain.is_none_or(|id| id < 2))
+                .all(|p| p.captain.is_none_or(|id| id < 5))
         );
     }
 
@@ -6007,9 +6130,12 @@ mod tests {
                 .filter(|t| t.captain_home)
                 .all(|t| !t.life.settled())
         );
-        // No-project homes are valid entities, too.
+        // Opening an existing captain ignores a workspace hint. Scope changes are explicit.
+        let original_home = restored.captain_home(0);
         restored.captain_project = Some(None);
         restored.open_captain(0);
+        assert_eq!(Some(restored.current().id), original_home);
+        restored.set_captain_scope(0, vec![]).unwrap();
         assert!(restored.current().project.is_none());
         let mut again = State::new(PathBuf::new(), false);
         again.restore_global(&restored.snapshot()).unwrap();
@@ -8021,6 +8147,7 @@ mod tests {
     #[test]
     fn captain_portrait_follows_the_most_urgent_thread() {
         let mut state = State::new(PathBuf::from("."), false);
+        state.captains = Captain::presets();
         state.open_captain(0);
         let home = state.current().id;
         state.current_mut().status = Status::Completed;

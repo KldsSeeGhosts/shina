@@ -1,4 +1,4 @@
-//! Workspace-owned captain profiles. Portrait indices are separate from profile indices.
+//! Assistant profiles. Portrait indices are separate from stable captain profile indices.
 use crate::visuals;
 use rune::TextEdit;
 use serde_json::{Value, json};
@@ -59,8 +59,8 @@ impl Captain {
             format!("Role: {}\n", self.role)
         };
         format!(
-            "Shina captain profile\nName: {}\n{role}Workspace-specific instructions:\n{}\n\n\
-             Follow the workspace's instructions and the user's current request. \
+            "Shina captain profile\nName: {}\n{role}Captain instructions:\n{}\n\n\
+             Follow applicable workspace instructions and the user's current request. \
              This profile does not grant tool permissions or access to other agents. \
              Do not claim to have delegated work unless a real delegation tool was used.",
             self.name, self.instructions
