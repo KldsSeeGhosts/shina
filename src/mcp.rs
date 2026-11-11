@@ -36,8 +36,8 @@ Ordinary coding tasks need no Shina tools.
 ids, each model's supported reasoning levels, the default and caller selections, and the \
 runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
 exact entry from that model's `reasoning_levels`. `ready: false` means model discovery \
-has not produced a usable catalog; do not invent model ids or reasoning levels. Shina delegates \
-only through Pi's CPA provider on local machines.
+has not produced a usable catalog; do not invent model ids or reasoning levels. Delegated work \
+currently runs in CPA-backed Pi threads on local machines, regardless of your own thread's harness.
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, under the same \
 project, machine and calling captain, if any. Each captain owns its crew even when several \
 captains share a folder. Use it for parallel, self-contained work, and give the new \
@@ -47,8 +47,8 @@ Pass an optional `target` shaped like `{\"provider\":\"cpa\",\"model\":\"<id fro
 orchestrator_capabilities>\",\"options\":{\"reasoning\":\"<level for that model>\"}}`. \
 `target.model` is required when `target` is present. `provider` defaults to `cpa`, and \
 `thinking` is accepted as an alias for `reasoning`. Omit \
-`target` to inherit your current or pinned selection, or Shina's catalog default when you have \
-none. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
+`target` to inherit your current or pinned CPA selection, or Shina's CPA catalog default when \
+your harness has no CPA selection. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
 level before starting the child, and rejects an unknown or unsupported choice. It never silently \
 substitutes a model or clamps a level.
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
@@ -647,10 +647,13 @@ mod tests {
             body.len()
         )
         .unwrap();
-        let mut response = String::new();
-        connection.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.contains("\"result\":{}"));
+        let (status, response) = crate::acp::http_response(&mut connection).unwrap();
+        assert_eq!(status, 200);
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("\"result\":{}")
+        );
     }
 
     #[test]
@@ -685,11 +688,8 @@ mod tests {
             text.len()
         )
         .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let status = response[9..12].parse().unwrap();
-        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
-        (status, body)
+        let (status, body) = crate::acp::http_response(&mut BufReader::new(stream)).unwrap();
+        (status, String::from_utf8(body).unwrap())
     }
 
     #[test]

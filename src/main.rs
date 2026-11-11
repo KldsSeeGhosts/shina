@@ -1,10 +1,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod acp;
 mod attachments;
 mod backend;
 mod brand;
 mod captains;
 mod context;
+mod harness;
 mod install;
 mod lifecycle;
 mod mcp;
@@ -212,6 +214,13 @@ fn captain_crews_demo(state: &mut State) {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--mcp-bridge") {
+        if let Err(error) = acp::mcp_bridge() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) =
         rune::set_app_icon(include_bytes!(concat!(env!("OUT_DIR"), "/shina-icon.png")).to_vec())
     {
