@@ -90,14 +90,25 @@ impl State {
 
     /// One default for new lone threads and captain homes. Workers inherit their parent.
     pub fn cycle_default_harness(&mut self) {
-        let mut ids = vec!["pi", "codex"];
-        ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.as_str()));
+        let ids = self.harness_ids();
         let position = ids
             .iter()
             .position(|id| *id == self.default_harness)
             .unwrap_or(0);
-        self.default_harness = ids[(position + 1) % ids.len()].into();
+        let next = ids[(position + 1) % ids.len()].clone();
+        // In client mode the server owns this setting; its projection brings it back.
+        if self.forward("settings.defaultHarness", json!({"harness": next})) {
+            return;
+        }
+        self.default_harness = next;
         self.checkpoint();
+    }
+
+    /// Harness ids a thread can use: Pi, Codex, then registered ACP agents.
+    pub(crate) fn harness_ids(&self) -> Vec<String> {
+        let mut ids = vec!["pi".to_string(), "codex".to_string()];
+        ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
+        ids
     }
 }
 

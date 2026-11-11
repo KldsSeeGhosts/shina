@@ -11,7 +11,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,

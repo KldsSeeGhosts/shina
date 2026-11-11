@@ -687,6 +687,7 @@ impl Drop for CloneJob {
 /// The switcher menu and the clone sheet.
 #[derive(Default)]
 pub struct Projects {
+    pub remote_cloning: bool,
     pub entries: Vec<Project>,
     pub next_id: ProjectId,
     pub captain_target: Option<ProjectId>,
@@ -710,7 +711,7 @@ impl Projects {
         }
     }
     pub fn cloning(&self) -> bool {
-        self.clone_job.is_some()
+        self.remote_cloning || self.clone_job.is_some()
     }
 }
 
@@ -738,6 +739,10 @@ impl State {
             .unwrap_or_else(|| self.data_dir.clone());
     }
     pub fn close_clone_dialog(&mut self) {
+        if self.forward("project.cancelClone", serde_json::json!({})) {
+            self.projects.clone_open = false;
+            return;
+        }
         if let Some(job) = &self.projects.clone_job {
             job.cancel();
             return;
@@ -752,6 +757,7 @@ impl State {
         Ok((source, self.projects.clone_parent.join(name)))
     }
     pub fn start_clone(&mut self) {
+        if self.forward("project.clone", serde_json::json!({"source":self.projects.clone_source.text,"parent":self.projects.clone_parent})) { return; }
         if self.projects.cloning() {
             return;
         }

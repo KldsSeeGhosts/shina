@@ -508,17 +508,7 @@ impl Store {
                     }
                 }
                 latest = Some(snapshot.clone());
-                let result = (|| -> std::io::Result<()> {
-                    fs::create_dir_all(path.parent().expect("index directory"))?;
-                    let temporary = path.with_extension("json.tmp");
-                    use std::io::Write;
-                    let mut staged = fs::File::create(&temporary)?;
-                    staged.write_all(snapshot.as_bytes())?;
-                    staged.sync_all()?;
-                    drop(staged);
-                    fs::rename(temporary, &path)?;
-                    Ok(())
-                })();
+                let result = write_atomic(&path, snapshot.as_bytes());
                 last = match result {
                     Ok(()) => {
                         if !status.swap(true, Ordering::AcqRel) {

@@ -2,6 +2,7 @@
 import argparse
 import json
 import sys
+import time
 
 args = argparse.ArgumentParser()
 args.add_argument("--log", required=True)
@@ -9,6 +10,8 @@ args.add_argument("--stdio", action="store_true")
 args.add_argument("--no-load", action="store_true")
 args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
+args.add_argument("--delay-seconds", type=float, default=0)
+args.add_argument("--no-history", action="store_true")
 opts = args.parse_args()
 session = "fixture-session"
 pending = None
@@ -29,6 +32,7 @@ def update(session_update, **value):
 
 
 def finish(req_id, text="Hello ACP"):
+    time.sleep(opts.delay_seconds)
     update("agent_message_chunk", content={"type": "text", "text": text[:5]})
     update("agent_message_chunk", content={"type": "text", "text": text[5:]})
     result(req_id, {"stopReason": "end_turn"})
@@ -66,8 +70,9 @@ for line in sys.stdin:
             assert mcp["headers"][0]["value"].startswith("Bearer ")
         if method != "session/new":
             assert params["sessionId"] == session
-            update("user_message_chunk", content={"type": "text", "text": "Earlier user"})
-            update("agent_message_chunk", content={"type": "text", "text": "Earlier reply"})
+            if not opts.no_history:
+                update("user_message_chunk", content={"type": "text", "text": "Earlier user"})
+                update("agent_message_chunk", content={"type": "text", "text": "Earlier reply"})
         update("available_commands_update", availableCommands=[{
             "name": "fixture", "description": "A fake command"}])
         update("plan", entries=[{"content": "Read fixture", "priority": "high", "status": "pending"}])

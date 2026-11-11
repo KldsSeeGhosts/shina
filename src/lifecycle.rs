@@ -353,7 +353,7 @@ pub fn spread_pin_keys(count: usize) -> Vec<String> {
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Settle,
     Snooze,
@@ -372,7 +372,7 @@ impl Action {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UndoStep {
     Unsettle,
     Unsnooze,
@@ -398,12 +398,12 @@ pub fn plan_undo(action: Action, old: &Lifecycle, draft: &str) -> Vec<UndoStep> 
     }
     steps
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UndoEntry {
     pub id: usize,
     pub steps: Vec<UndoStep>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UndoNotice {
     pub action: Action,
     pub entries: Vec<UndoEntry>,

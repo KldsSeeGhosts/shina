@@ -16,7 +16,7 @@ pub struct BackgroundSettings {
     pub keep_awake: KeepAwake,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundStatus {
     pub hidden_to_tray: bool,
     pub working: usize,
@@ -113,7 +113,11 @@ impl State {
         &self.background.settings
     }
     pub fn background_status(&self) -> BackgroundStatus {
-        let mut status = self.background.status.clone();
+        let mut status = if self.client.is_some() {
+            serde_json::from_value(self.client_views["background"].clone()).unwrap_or_default()
+        } else {
+            self.background.status.clone()
+        };
         status.working = self.background_work_count();
         status.hidden_to_tray = self
             .background
@@ -141,11 +145,18 @@ impl State {
         (self.wake)();
     }
     pub fn set_keep_awake(&mut self, policy: KeepAwake) {
+        self.forward("background.keepAwake", json!({"policy":policy}));
         self.background.settings.keep_awake = policy;
         self.checkpoint();
         (self.wake)();
     }
     pub fn routines(&self, captain: usize) -> Vec<RoutineView> {
+        if self.client.is_some() {
+            return serde_json::from_value(
+                self.client_views["routines"][captain.to_string()].clone(),
+            )
+            .unwrap_or_default();
+        }
         self.threads
             .iter()
             .find(|t| t.captain_home && t.captain == Some(captain))
@@ -153,11 +164,17 @@ impl State {
             .unwrap_or_default()
     }
     pub fn set_routine_paused(&mut self, id: u64, paused: bool) -> Result<(), String> {
+        if let Some(result) = self.remote("routine.pause", json!({"id":id,"paused":paused})) {
+            return result.map(|_| ());
+        }
         self.background.routines.set_paused(id, paused)?;
         (self.wake)();
         Ok(())
     }
     pub fn delete_routine(&mut self, id: u64) -> Result<(), String> {
+        if let Some(result) = self.remote("routine.remove", json!({"id":id})) {
+            return result.map(|_| ());
+        }
         self.background.routines.delete(id)?;
         (self.wake)();
         Ok(())
@@ -177,7 +194,11 @@ impl State {
     pub fn close_in_background(&mut self) -> bool {
         let allowed = close_to_tray(
             self.background.settings.keep_working,
-            self.background_work_count(),
+            if self.client.is_some() {
+                self.background_work_count().max(1)
+            } else {
+                self.background_work_count()
+            },
             self.background.tray.is_some(),
             rune::quitting(),
         );
@@ -218,6 +239,47 @@ impl State {
             Err(error) if cfg!(windows) => self.background.status.error = Some(error),
             Err(_) => {}
         }
+    }
+    pub(super) fn setup_headless_background(&mut self) {
+        self.background.routines = Routines::load(self.data_dir.join("routines.json"));
+        self.background.endpoint = discover_endpoint();
+        self.background.started = true;
+    }
+    pub(super) fn setup_client_background(&mut self) {
+        self.background.started = true;
+        match crate::tray::Tray::start(self.wake.clone()) {
+            Ok(tray) => self.background.tray = Some(tray),
+            Err(error) => self.background.status.error = Some(error),
+        }
+    }
+    pub(super) fn poll_client_background(&mut self, tx: &mut Tx) -> bool {
+        let Some(tray) = &self.background.tray else {
+            return false;
+        };
+        let changed = match tray.action() {
+            1 => {
+                if let Some(handle) = &self.background.handle {
+                    handle.open();
+                }
+                true
+            }
+            2 => {
+                self.background.quitting = true;
+                tx.quit();
+                true
+            }
+            _ => false,
+        };
+        let hidden = self
+            .background
+            .handle
+            .as_ref()
+            .is_some_and(|h| !h.is_visible());
+        tray.update(
+            self.background_work_count(),
+            self.background.settings.keep_working || hidden,
+        );
+        changed
     }
     pub(super) fn routine_mcp(
         &mut self,

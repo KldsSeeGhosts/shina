@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextPhase {
     #[default]
     Idle,
@@ -19,7 +19,7 @@ pub enum ContextPhase {
     AwaitingUsage,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub context_window: Option<u64>,

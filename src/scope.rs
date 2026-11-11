@@ -65,6 +65,12 @@ impl State {
         captain: usize,
         projects: Vec<ProjectId>,
     ) -> Result<(), String> {
+        if let Some(result) = self.remote(
+            "captain.scope",
+            json!({"captain":captain,"projects":projects}),
+        ) {
+            return result.map(|_| ());
+        }
         self.require_captain(captain)?;
         let mut scope = Vec::new();
         for id in projects {
@@ -105,6 +111,9 @@ impl State {
     }
 
     pub fn reset_captain_conversation(&mut self, captain: usize) -> Result<(), String> {
+        if let Some(result) = self.remote("captain.reset", json!({"captain":captain})) {
+            return result.map(|_| ());
+        }
         self.require_captain(captain)?;
         let old = self.captain_home(captain);
         if let Some(index) = self.threads.iter().position(|t| Some(t.id) == old) {

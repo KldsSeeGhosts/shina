@@ -417,6 +417,14 @@ impl State {
 
     /// User-only entry point. The response has the same shape as Thread::respond.
     pub fn respond_to_request(&mut self, thread_id: usize, response: Value) -> Result<(), String> {
+        if self.client.is_some() {
+            self.threads
+                .iter_mut()
+                .find(|thread| thread.id == thread_id)
+                .ok_or("Unknown thread.")?
+                .respond(response);
+            return Ok(());
+        }
         let thread = self
             .threads
             .iter_mut()
@@ -448,6 +456,9 @@ impl State {
 
     /// Explicit user action. An interrupted brief is never automatically replayed.
     pub fn resume_task(&mut self, task_id: &str) -> Result<(), String> {
+        if let Some(result) = self.remote("task.resume", json!({"taskId":task_id})) {
+            return result.map(|_| ());
+        }
         let index = self
             .tasks
             .iter()
@@ -468,6 +479,9 @@ impl State {
 
     /// Explicit user action. The cancellation result is durable and goes to the parent.
     pub fn dismiss_task(&mut self, task_id: &str) -> Result<(), String> {
+        if let Some(result) = self.remote("task.dismiss", json!({"taskId":task_id})) {
+            return result.map(|_| ());
+        }
         let index = self
             .tasks
             .iter()
@@ -493,6 +507,11 @@ impl State {
 
     /// Explicitly delivers recovered results without using or replacing the composer draft.
     pub fn resume_task_results(&mut self, parent_thread_id: usize) -> Result<(), String> {
+        if let Some(result) =
+            self.remote("task.resumeResults", json!({"threadId":parent_thread_id}))
+        {
+            return result.map(|_| ());
+        }
         if !self
             .threads
             .iter()
