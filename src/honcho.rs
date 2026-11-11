@@ -117,6 +117,28 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 
+pub(super) fn validate_import(value: &Value) -> Result<(), String> {
+    let ledger: Outbox =
+        serde_json::from_value(value.clone()).map_err(|e| format!("Invalid Honcho outbox: {e}"))?;
+    let mut ids = std::collections::HashSet::new();
+    if ledger.version != 1
+        || ledger.next == 0
+        || !valid_id(&ledger.instance)
+        || ledger.captains.values().any(|id| !valid_id(id))
+        || ledger.pending.iter().any(|turn| {
+            !valid_id(&turn.id)
+                || !ids.insert(&turn.id)
+                || !valid_id(&turn.peer)
+                || !valid_id(&turn.session)
+                || turn.user.chars().count() > 4000
+                || turn.reply.chars().count() > 4000
+        })
+    {
+        return Err("Invalid Honcho outbox.".into());
+    }
+    Ok(())
+}
+
 /// Owns the one ordered writer. Read/recall requests use independent worker threads.
 pub(super) struct Honcho {
     api: Arc<Api>,
@@ -342,11 +364,10 @@ impl Honcho {
         config.base_url = config.base_url.trim_end_matches('/').into();
         config.recall_timeout_ms = config.recall_timeout_ms.clamp(1, 1500);
         let path = directory.join("honcho-outbox.json");
-        let mut ledger: Outbox = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        let mut ledger: Outbox = match crate::store::load(&path)? {
+            Some(value) => serde_json::from_value(value)
                 .map_err(|_| "Invalid Honcho outbox. The file was not overwritten.")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outbox::default(),
-            Err(_) => return Err("Could not read Honcho outbox.".into()),
+            None => Outbox::default(),
         };
         let destination = format!("{}/{}", config.base_url, config.workspace);
         if !ledger.destination.is_empty() && ledger.destination != destination {
@@ -412,11 +433,36 @@ impl Honcho {
                             .front()
                             .cloned();
                         let Some(turn) = turn else { break };
+                        if let Some(database) = crate::database::for_path(&path) {
+                            let committed = database.read("honcho-outbox.json")?;
+                            if !committed.as_ref().is_some_and(|value| {
+                                value["pending"].as_array().is_some_and(|pending| {
+                                    pending.iter().any(|item| item["id"] == turn.id)
+                                })
+                            }) {
+                                // The reducer has staged this turn but not committed it yet.
+                                break;
+                            }
+                        }
+                        if let Some(database) = crate::database::for_path(&path) {
+                            database.effect_status(
+                                &format!("honcho:{}", turn.id),
+                                "dispatching",
+                                None,
+                            )?;
+                        }
                         api.upload(&turn)?;
                         let mut ledger = ledger.lock().expect("Honcho outbox");
                         let mut updated = ledger.clone();
                         updated.pending.pop_front();
                         save(&path, &updated)?;
+                        if let Some(database) = crate::database::for_path(&path) {
+                            database.effect_status(
+                                &format!("honcho:{}", turn.id),
+                                "completed",
+                                None,
+                            )?;
+                        }
                         *ledger = updated;
                     }
                     let deadline = Instant::now() + Duration::from_secs(3);

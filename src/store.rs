@@ -69,6 +69,8 @@ impl Drop for RunMarker {
 }
 
 pub struct Store {
+    database: Option<(crate::database::Database, String)>,
+    database_error: Option<String>,
     sender: Option<mpsc::Sender<Message>>,
     pub errors: mpsc::Receiver<String>,
     last: String,
@@ -78,6 +80,18 @@ pub struct Store {
 
 /// Synchronous durable replacement for small ledgers that must commit before dispatch.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(database) = crate::database::for_path(path) {
+        let value = serde_json::from_slice(bytes)?;
+        return database
+            .write(
+                path.file_name()
+                    .expect("database document")
+                    .to_str()
+                    .expect("UTF-8"),
+                value,
+            )
+            .map_err(std::io::Error::other);
+    }
     use std::io::Write;
     fs::create_dir_all(
         path.parent()
@@ -187,6 +201,9 @@ pub fn load_global(
     launch: Option<&std::path::Path>,
 ) -> Result<Option<Value>, String> {
     let global_path = directory.join("index.json");
+    if let Some(database) = crate::database::for_path(&global_path) {
+        return database.read("index.json");
+    }
     if let Some(mut index) = load(&global_path)? {
         let projects = index["projects"].as_array().cloned().unwrap_or_default();
         if let Some(threads) = index["threads"].as_array_mut() {
@@ -454,6 +471,14 @@ fn migrate_legacy(
 }
 
 pub fn load(path: &std::path::Path) -> Result<Option<Value>, String> {
+    if let Some(database) = crate::database::for_path(path) {
+        return database.read(
+            path.file_name()
+                .expect("database document")
+                .to_str()
+                .expect("UTF-8"),
+        );
+    }
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e|
             format!("Could not read the saved thread index: {e}. The existing file has not been overwritten.")),
@@ -464,6 +489,21 @@ pub fn load(path: &std::path::Path) -> Result<Option<Value>, String> {
 
 impl Store {
     pub fn new(path: PathBuf, wake: Waker) -> Self {
+        if let Some(database) = crate::database::for_path(&path) {
+            let (_, errors) = mpsc::channel();
+            return Self {
+                database: Some((
+                    database,
+                    path.file_name().expect("document").to_string_lossy().into(),
+                )),
+                database_error: None,
+                sender: None,
+                errors,
+                last: String::new(),
+                worker: None,
+                healthy: Arc::new(AtomicBool::new(true)),
+            };
+        }
         let (sender, receiver) = mpsc::channel::<Message>();
         let (errors, error_receiver) = mpsc::channel();
         let healthy = Arc::new(AtomicBool::new(true));
@@ -534,6 +574,8 @@ impl Store {
             }
         });
         Self {
+            database: None,
+            database_error: None,
             sender: Some(sender),
             errors: error_receiver,
             last: String::new(),
@@ -543,6 +585,19 @@ impl Store {
     }
 
     pub fn save(&mut self, value: Value) {
+        if let Some((database, name)) = &self.database {
+            let serialized = value.to_string();
+            if serialized == self.last {
+                return;
+            }
+            if let Err(error) = database.write(name, value) {
+                self.database_error = Some(error);
+                self.healthy.store(false, Ordering::Release);
+            } else {
+                self.last = serialized;
+            }
+            return;
+        }
         let serialized = value.to_string();
         if self.last != serialized
             && self
@@ -560,6 +615,9 @@ impl Store {
 
     /// Waits until every write queued so far is on disk, and reports the last write's result.
     pub fn flush(&self) -> Result<(), String> {
+        if self.database.is_some() {
+            return self.database_error.clone().map_or(Ok(()), Err);
+        }
         let Some(sender) = &self.sender else {
             return Err("The store is no longer running.".into());
         };

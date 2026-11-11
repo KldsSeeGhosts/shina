@@ -166,7 +166,7 @@ fn path_for_id(id: &str) -> Option<PathBuf> {
 }
 
 /// A blob id is one filename with a supported image extension.
-fn safe_id(id: &str) -> bool {
+pub(crate) fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 96
         && !id.starts_with('.')
