@@ -1948,13 +1948,18 @@ mod tests {
         let counted = Arc::clone(&started);
         let host = Scripted::new(move || {
             counted.fetch_add(1, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(1000));
             Ok(Some(release("v99.0.0")))
         });
         let (mut updater, _, _) = installed(host);
         let start = Instant::now();
         updater.start(true, start, wake());
         updater.poll(start + FIRST_CHECK, wake());
+        // Under a loaded test run the worker can take a while to begin; wait for it, not a clock.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while started.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         for tick in 0..10 {
             thread::sleep(Duration::from_millis(5));
             updater.poll(start + FIRST_CHECK + Duration::from_millis(tick), wake());
