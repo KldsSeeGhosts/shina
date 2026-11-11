@@ -3,6 +3,9 @@ use crate::visuals;
 use rune::TextEdit;
 use serde_json::{Value, json};
 
+/// How many named presets earlier versions seeded.
+const LEGACY_PRESETS: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Captain {
     pub name: String,
@@ -14,8 +17,10 @@ pub struct Captain {
 impl Captain {
     /// The named roster earlier versions created on first run. New rosters start empty; this
     /// remains for migrating old indexes, recognising untouched presets, and the demo.
+    /// Always the original four, even though more portraits ship now: migrations compare
+    /// stored rosters against exactly what those versions wrote.
     pub fn presets() -> Vec<Self> {
-        (0..visuals::CAPTAIN_NAMES.len())
+        (0..LEGACY_PRESETS)
             .map(|portrait| Self {
                 name: visuals::CAPTAIN_NAMES[portrait].into(),
                 role: visuals::CAPTAIN_ROLES[portrait].into(),
@@ -128,5 +133,21 @@ mod tests {
         let mut blank = Captain::presets().remove(0);
         blank.name = " \n".into();
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn every_shipped_portrait_is_valid_and_presets_stay_the_original_four() {
+        assert_eq!(Captain::presets().len(), 4);
+        let mut captain = Captain::presets().remove(0);
+        for portrait in 0..visuals::PORTRAITS {
+            captain.portrait = portrait;
+            assert!(captain.validate().is_ok(), "portrait {portrait}");
+            assert_eq!(
+                Captain::from_value(&captain.to_value()),
+                Some(captain.clone())
+            );
+        }
+        captain.portrait = visuals::PORTRAITS;
+        assert!(captain.validate().is_err());
     }
 }

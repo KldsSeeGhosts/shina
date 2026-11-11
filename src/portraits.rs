@@ -305,6 +305,12 @@ mod tests {
         let art = Artwork::load(&root);
         assert!(art.motion(0).is_none(), "the drop-in Ember has no strips");
         assert!(art.motion(1).is_some(), "the embedded Juniper keeps hers");
+        for portrait in 4..CAPTAIN_NAMES.len() {
+            assert!(
+                art.motion(portrait).is_some(),
+                "captain {portrait} has no drop-in folder and keeps the embedded art"
+            );
+        }
         let mut p = Portraits::new(art);
         p.set_visible(1, true);
         assert!(p.pixels(0, Face::Normal).is_none());

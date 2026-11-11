@@ -1,8 +1,9 @@
 """Generate Shina's original crew portraits.
 
 Usage: py -I tools/crew_originals.py [output-dir]   (default: assets/crew)
+       py -I tools/crew_originals.py --sheet out.png   (a review sheet of every captain)
 
-Four original captains drawn as 40x40 busts in the style of Pokemon Mystery Dungeon
+Twelve original captains drawn as 40x40 busts in the style of Pokemon Mystery Dungeon
 portraits: a close crop, outlines tinted by the region they border, and three-tone
 shading. Each sits on the square colored tile Capy uses for its crew. Six expressions
 are exported per captain at 6x nearest-neighbor scale so Rune's linear filtering stays
@@ -12,6 +13,14 @@ crisp at sidebar sizes, plus four animation strips (`<Clip>.strip.png`, see CLIP
   juniper  Release   long mint hime-cut hair, star clip, cream cardigan with navy collar
   sable    Support   long straight indigo hair, coral headphones, grey hoodie
   pip      Research  long white-blonde waves, a ribboned top bun, green scholar coat
+  bram     Operations  white captain's cap, grey moustache, navy peacoat
+  wren     Interface   mustard beanie with a pompom, chestnut bob, freckles, striped scarf
+  rook     Security    indigo hood, dark fringe, gold eyes, silver clasp
+  nia      Data        centre-parted braids with gold cuffs, yellow headband, teal turtleneck
+  jett     Performance pink mohawk, shaved sides, leather jacket, cheek plaster
+  otto     Review      bald, white beard and brows, round glasses, burgundy cardigan
+  bolt     Automation  robot with an antenna, ear bolts and a glowing screen face
+  kit      Testing     fox ears, spiky russet hair, cream hoodie, blue neckerchief
 """
 import sys
 from pathlib import Path
@@ -24,7 +33,9 @@ FACES = ["Normal", "Happy", "Determined", "Surprised", "Dizzy", "Sad"]
 HAIR = set("hHg")
 # Outline color comes from the neighbor with the highest priority.
 PRIORITY = {"h": 5, "H": 5, "g": 5, "a": 4, "A": 4, "d": 4, "q": 4, "Q": 4,
-            "c": 3, "C": 3, "e": 3, "E": 3, "s": 1, "S": 1}
+            "c": 3, "C": 3, "e": 3, "E": 3, "s": 1, "S": 1,
+            # Headwear and accessories used only by the later captains.
+            "p": 5, "P": 5, "r": 5, "R": 5, "n": 4, "u": 3, "U": 3, "y": 3, "D": 4}
 COMMON = {
     "s": "#f8e0cc", "S": "#e4b8a2", "k": "#d39a86", "l": "#2a1b26", "w": "#ffffff",
     "b": "#f3a0a8", "m": "#b45d68", "M": "#7e3846", "t": "#9ad9f4",
@@ -371,6 +382,315 @@ def glasses(cv):
     cv.span(17, 18, 21, "d")
 
 
+def ears(cv):
+    """Ears for captains whose hair or headwear leaves them showing."""
+    for y in range(15, 21):
+        cv.put(8, y, "s"); cv.put(31, y, "S")
+    for y in range(16, 20):
+        cv.put(7, y, "s"); cv.put(32, y, "S")
+    cv.put(8, 17, "k"); cv.put(8, 18, "k"); cv.put(31, 17, "k"); cv.put(31, 18, "k")
+
+
+def bram(cv):
+    ears(cv)
+    head(cv)
+    bust(cv)
+    # Double-breasted peacoat over a white collar, with brass buttons.
+    cv.spans({31: (16, 23), 32: (17, 22), 33: (18, 21), 34: (19, 20)}, "e")
+    for i in range(4):
+        cv.put(15 + i, 32 + i, "C"); cv.put(24 - i, 32 + i, "C")
+    for x, y in ((14, 35), (14, 38), (25, 35), (25, 38)):
+        cv.put(x, y, "a")
+    # Close-cropped grey hair and a grey moustache.
+    for y in range(11, 19):
+        cv.span(y, 9, 10, "h"); cv.span(y, 29, 30, "h")
+    cv.put(10, 19, "h"); cv.put(29, 19, "h")
+    cv.span(22, 16, 23, "h")
+    cv.mask(23, 15, "hhh....hhh", None)
+    cv.put(16, 22, "H"); cv.put(23, 22, "H")
+    # Captain's cap: a white crown wider than the band, a navy band, a black peak.
+    cv.spans({1: (13, 26), 2: (10, 29), 3: (8, 31), 4: (8, 31), 5: (8, 31)}, "p")
+    cv.span(6, 8, 31, "P")
+    for y in range(2, 6):
+        cv.span(y, 28, 31 if y > 2 else 29, "P")
+    cv.mask(2, 13, "xxx", None); cv.mask(3, 11, "xx", None)
+    cv.spans({7: (9, 30), 8: (9, 30)}, "n")
+    cv.spans({9: (9, 30), 10: (10, 29)}, "d")
+    cv.mask(9, 12, "DDDDDD", None)
+    cv.span(11, 11, 28, "S")
+    # Brass badge on the band.
+    cv.mask(4, 19, "aa", None); cv.mask(5, 18, "aAAa", None)
+    cv.mask(6, 18, "aaaa", None); cv.mask(7, 19, "AA", None)
+
+
+def wren(cv):
+    head(cv)
+    bust(cv)
+    # Chestnut bob under the beanie, flicking out at the ends.
+    for y in range(11, 26):
+        cv.span(y, 7, 10, "h"); cv.span(y, 29, 32, "h")
+        cv.put(7, y, "H"); cv.put(32, y, "H")
+    cv.mask(26, 6, "HH.", None); cv.mask(26, 32, ".HH", None)
+    cv.mask(25, 6, "h", None); cv.mask(25, 33, "h", None)
+    cv.span(12, 9, 30, "h")
+    cv.mask(13, 9, "####.#####.##.#####.##", "h")
+    cv.mask(14, 9, "##....###.....##....##", "h")
+    cv.mask(13, 14, "g", None); cv.mask(12, 24, "gg", None)
+    # Mustard knit beanie with a ribbed cuff and a cream pompom.
+    cv.spans({0: (18, 21), 1: (17, 22), 2: (17, 22)}, "p")
+    cv.mask(0, 18, "x", None); cv.mask(1, 17, "x", None); cv.mask(2, 21, "PP", None)
+    cv.spans({3: (14, 25), 4: (12, 27), 5: (10, 29), 6: (9, 30), 7: (9, 30), 8: (9, 30)}, "r")
+    for x in range(11, 30, 3):
+        for y in range(4, 9):
+            if cv.get(x, y) == "r":
+                cv.put(x, y, "R")
+    cv.spans({9: (8, 31), 10: (8, 31), 11: (8, 31)}, "r")
+    for x in range(8, 32, 2):
+        for y in (9, 10, 11):
+            cv.put(x, y, "R")
+    # Freckles.
+    for x, y in ((11, 22), (13, 22), (12, 23), (26, 22), (28, 22), (27, 23)):
+        cv.put(x, y, "f")
+    # Striped scarf wrapped high, one end hanging.
+    cv.spans({28: (15, 24), 29: (14, 25), 30: (13, 26), 31: (13, 26), 32: (14, 25)}, "u")
+    for y in (29, 31):
+        cv.span(y, 14, 25, "y")
+    cv.span(32, 14, 25, "U")
+    for y in range(33, N):
+        cv.span(y, 21, 24, "u" if y % 3 else "y")
+        cv.put(24, y, "U")
+
+
+def rook(cv):
+    # The hood's outer shape, then the face, then the hood again around the opening.
+    cv.spans({1: (18, 21), 2: (16, 23), 3: (14, 25), 4: (12, 27), 5: (11, 28), 6: (10, 29), 7: (9, 30)}, "h")
+    for y in range(8, 34):
+        w = 1 if y > 18 else 0
+        cv.span(y, 8 - w, 31 + w, "h")
+    head(cv)
+    bust(cv, "h", "H")
+    for y in range(8, 11):
+        cv.span(y, 8, 31, "h")
+    for y in range(11, 28):
+        w = 1 if y > 18 else 0
+        cv.span(y, 8 - w, 9, "h"); cv.span(y, 30, 31 + w, "h")
+        cv.put(9, y, "H"); cv.put(30, y, "H")
+    cv.span(10, 11, 28, "H")
+    # The hood folds in under the chin to the clasp.
+    for y in range(26, 33):
+        inset = min(y - 25, 6)
+        cv.span(y, 9, 9 + inset, "h"); cv.span(y, 30 - inset, 30, "h")
+        cv.put(9 + inset, y, "H"); cv.put(30 - inset, y, "H")
+    cv.mask(3, 15, "gg", None); cv.mask(4, 13, "gg", None); cv.mask(5, 12, "g", None)
+    for y in range(6, 12):
+        cv.put(11 if y < 9 else 10, y, "g")
+    # A dark fringe falling from under the hood.
+    cv.span(11, 11, 28, "n")
+    cv.mask(12, 11, "nnn.nnnnnn..nnn.nn", None)
+    cv.mask(13, 11, "n...nn.nn.....n..n", None)
+    for x in range(11, 29):
+        if cv.get(x, 13) == "s":
+            cv.put(x, 13, "S")
+        if cv.get(x, 12) == "s":
+            cv.put(x, 12, "S")
+    # Silver clasp.
+    cv.mask(31, 18, ".aa.", None); cv.mask(32, 18, "aAAa", None); cv.mask(33, 18, ".AA.", None)
+
+
+def nia(cv):
+    head(cv)
+    bust(cv)
+    # Turtleneck.
+    cv.spans({28: (16, 23), 29: (15, 24), 30: (15, 24)}, "c")
+    cv.span(28, 16, 23, "C"); cv.span(30, 15, 24, "C")
+    cv.mask(31, 17, "e", None); cv.mask(32, 18, "e", None); cv.mask(33, 19, "ee", None)
+    cv.mask(32, 21, "e", None); cv.mask(31, 22, "e", None)
+    # Hair pulled back from a centre part into two long braids.
+    cv.spans({3: (15, 24), 4: (13, 26), 5: (11, 28), 6: (10, 29)}, "h")
+    for y in range(7, 11):
+        cv.span(y, 9, 30, "h")
+    cv.mask(11, 9, "####..............####", "h")
+    cv.mask(12, 9, "##..................##", "h")
+    for y in range(13, 17):
+        cv.put(9, y, "h"); cv.put(30, y, "h")
+    for y in range(4, 11):
+        cv.put(19, y, "H")
+    cv.mask(5, 14, "gg", None); cv.mask(6, 12, "gg", None); cv.mask(5, 23, "gg", None)
+    # Headband.
+    cv.span(8, 9, 30, "q"); cv.span(9, 9, 30, "Q")
+    for side in (6, 30):
+        for y in range(12, 37):
+            seg = (y - 12) % 3
+            cv.span(y, side, side + 3, "H" if seg == 2 else "h")
+            if seg == 0:
+                cv.put(side + 1, y, "g")
+        cv.span(33, side, side + 3, "a"); cv.span(34, side, side + 3, "A")
+        cv.span(37, side + 1, side + 2, "h"); cv.span(38, side + 1, side + 2, "H")
+    # Gold studs.
+    cv.put(9, 20, "a"); cv.put(30, 20, "a")
+
+
+MOHAWK = [
+    "...#........",
+    "..##...#....",
+    "..###.##....",
+    "..######..#.",
+    "..#########.",
+]
+
+
+def jett(cv):
+    ears(cv)
+    head(cv)
+    bust(cv)
+    # Leather jacket open over a white tee, with a silver zip and a pin.
+    cv.spans({31: (16, 23), 32: (17, 22), 33: (18, 21)}, "e")
+    for i in range(4):
+        cv.put(15 + i, 31 + i, "C"); cv.put(24 - i, 31 + i, "C")
+    cv.mask(31, 12, "CCC", None); cv.mask(31, 25, "CCC", None)
+    for y in range(34, N):
+        cv.put(24, y, "a")
+    cv.put(13, 35, "q"); cv.put(12, 36, "q"); cv.put(14, 36, "q"); cv.put(13, 37, "q")
+    # Shaved sides.
+    for y in range(8, 13):
+        for x in range(N):
+            if cv.get(x, y) == "s":
+                cv.put(x, y, "u")
+    for y in range(11, 15):
+        cv.put(9, y, "u"); cv.put(30, y, "u")
+    # A tall pink fin with a lock falling forward.
+    for i, row in enumerate(MOHAWK):
+        cv.mask(i, 14, row, "h")
+    for y in range(5, 12):
+        cv.span(y, 16, 23, "h")
+    cv.mask(12, 18, "hhhhhh", None); cv.mask(13, 20, "hhh", None); cv.mask(14, 21, "hh", None)
+    for y in range(3, 11):
+        cv.put(17, y, "g"); cv.put(23, y, "H")
+    cv.put(24, 4, "H"); cv.put(22, 11, "H"); cv.put(23, 12, "H")
+    cv.put(17, 0, "g"); cv.put(16, 1, "g")
+    # Silver earring and a plaster on the cheek.
+    cv.put(7, 21, "a")
+    cv.mask(22, 25, "xXx", None)
+
+
+def otto(cv):
+    ears(cv)
+    head(cv)
+    bust(cv)
+    # Cardigan over a collared shirt.
+    cv.spans({31: (13, 26), 32: (15, 24)}, "e")
+    for y in range(33, N):
+        cv.span(y, 17, 22, "E")
+    for y in range(34, N, 2):
+        cv.put(16, y, "a")
+    # Shiny scalp and a white fringe around the back.
+    cv.mask(9, 15, "xx", None); cv.mask(10, 13, "xx", None); cv.put(12, 11, "x")
+    for y in range(12, 20):
+        cv.span(y, 9, 10, "h"); cv.span(y, 29, 30, "h")
+        cv.put(9, y, "H"); cv.put(30, y, "H")
+    # Full white beard and moustache.
+    beard = {20: [(9, 11), (28, 30)], 21: [(9, 12), (27, 30)], 22: [(9, 14), (25, 30)],
+             23: [(10, 17), (22, 29)], 24: [(10, 17), (22, 29)], 25: [(11, 28)], 26: [(11, 28)],
+             27: [(12, 27)], 28: [(13, 26)], 29: [(14, 25)], 30: [(16, 23)], 31: [(18, 21)]}
+    for y, parts in beard.items():
+        for a, b in parts:
+            cv.span(y, a, b, "h")
+    for y in range(23, 31):
+        a, b = beard[y][-1]
+        cv.put(b, y, "H")
+    cv.mask(26, 15, "H...H...H", None); cv.mask(28, 17, "H...H", None)
+    cv.span(22, 16, 23, "h")
+    cv.mask(23, 15, "hhH....Hhh", None)
+    glasses(cv)
+
+
+def otto_brows(cv, face):
+    """Bushy white brows: the face's own brows recoloured, or a resting pair."""
+    if face in ("Normal", "Happy", "Dizzy", "Sad"):
+        cv.mask(12, 12, "#####", "l"); cv.mask(12, 23, "#####", "l")
+    for y in (11, 12, 13):
+        for x in range(N):
+            if cv.get(x, y) == "l":
+                cv.put(x, y, "h")
+                if cv.get(x, y + 1) in ("s", "S"):
+                    cv.put(x, y + 1, "H")
+
+
+def bolt(cv):
+    # Antenna.
+    for y in range(2, 6):
+        cv.span(y, 19, 20, "a")
+    cv.mask(0, 18, ".qq.", None); cv.mask(1, 18, "qwqq", None); cv.mask(2, 18, "QqqQ", None)
+    # Rounded metal head with a dark face screen.
+    cv.spans({5: (13, 26), 6: (10, 29), 7: (9, 30)}, "s")
+    for y in range(8, 26):
+        cv.span(y, 8, 31, "s")
+    cv.spans({26: (9, 30), 27: (11, 28)}, "s")
+    for y in range(8, 26):
+        cv.span(y, 30, 31, "S")
+    cv.span(26, 9, 30, "S"); cv.span(27, 11, 28, "S"); cv.span(7, 28, 30, "S")
+    cv.mask(6, 12, "xxx", None); cv.mask(7, 10, "xx", None)
+    for y in range(8, 12):
+        cv.put(9, y, "x")
+    cv.mask(9, 13, "S", None); cv.mask(9, 26, "S", None)
+    cv.spans({11: (11, 28), 25: (11, 28)}, "n")
+    for y in range(12, 25):
+        cv.span(y, 10, 29, "n")
+    # Ear bolts.
+    for y in range(14, 20):
+        cv.span(y, 5, 7, "a")
+    cv.span(13, 6, 7, "a"); cv.span(20, 6, 7, "a")
+    for y in range(15, 19):
+        cv.put(6, y, "A")
+    for y in range(14, 20):
+        cv.span(y, 32, 34, "a")
+    cv.span(13, 32, 33, "a"); cv.span(20, 32, 33, "a")
+    for y in range(15, 19):
+        cv.put(33, y, "A")
+    # Ribbed neck and a chest plate with a status light.
+    for y in range(28, 31):
+        cv.span(y, 16, 23, "d" if y != 29 else "D")
+    bust(cv)
+    cv.span(31, 12, 27, "e")
+    cv.mask(34, 18, "qq", None); cv.mask(35, 18, "QQ", None)
+    for y in (34, 36, 38):
+        cv.span(y, 10, 13, "e")
+
+
+def kit(cv):
+    head(cv)
+    bust(cv)
+    # Cream hoodie with a blue neckerchief.
+    cv.spans({31: (15, 24), 32: (16, 23), 33: (17, 22), 34: (18, 21), 35: (19, 20)}, "q")
+    cv.span(31, 15, 24, "Q")
+    cv.put(16, 32, "Q"); cv.put(23, 32, "Q")
+    # Fox ears with dark tips and cream insides.
+    for y in range(0, 8):
+        cv.span(y, 9, min(9 + y, 15), "h")
+        cv.span(y, max(30 - y, 24), 30, "h")
+        cv.put(9, y, "H"); cv.put(30, y, "H")
+    for y in (0, 1):
+        cv.span(y, 9, 9 + y, "d"); cv.span(y, 30 - y, 30, "d")
+    for y in range(3, 7):
+        cv.span(y, 10, 8 + y - 1 if y < 6 else 13, "p")
+        cv.span(y, 31 - y + 1 if y < 6 else 26, 29, "p")
+    # Spiky russet hair.
+    cv.spans({5: (13, 26), 6: (11, 28)}, "h")
+    for y in range(7, 12):
+        cv.span(y, 9, 30, "h")
+    cv.mask(12, 9, "##########.###########", "h")
+    cv.mask(13, 9, "##.####...####..####.#", "h")
+    cv.mask(14, 9, "#...##.....##....##..#", "h")
+    cv.mask(15, 9, "#....#............#...", "h")
+    for y in range(12, 24):
+        cv.span(y, 7, 9, "h"); cv.span(y, 30, 32, "h")
+        cv.put(7, y, "H"); cv.put(32, y, "H")
+    # Cheek tufts tipped in cream.
+    cv.mask(24, 6, "Hhh", None); cv.mask(25, 6, "yh", None); cv.mask(26, 6, "y", None)
+    cv.mask(24, 31, "hhH", None); cv.mask(25, 32, "hy", None); cv.mask(26, 33, "y", None)
+    cv.mask(8, 13, "gg", None); cv.mask(9, 12, "g", None); cv.mask(8, 22, "ggg", None)
+
+
 CREW = [
     ("ember", ember, None, "#6a92b8", {
         "h": "#c8643a", "H": "#8e3f26", "g": "#f0a06a",
@@ -395,6 +715,64 @@ CREW = [
         "i": "#3f78d8", "I": "#1f3f8c", "j": "#8cb8f4",
         "c": "#2f5a44", "C": "#1f3e2f", "e": "#f4f0e6", "E": "#cfc8b8",
         "a": "#e2607a", "A": "#a83a52", "d": "#5a3e2c", "q": "#5a3e2c", "Q": "#5a3e2c",
+    }),
+    # Added later. Indices are saved in captain profiles, so new captains only append.
+    ("bram", bram, None, "#4e9c94", {
+        "s": "#a26a46", "S": "#7e4e32", "k": "#6a3a24", "b": "#c47a62",
+        "h": "#d6d2cc", "H": "#a29c98", "g": "#f4f2ee",
+        "i": "#8a5a2a", "I": "#4a2a14", "j": "#e0a868",
+        "c": "#2c3c66", "C": "#1c274a", "e": "#f2efe6", "E": "#cfc8b8",
+        "a": "#e8b844", "A": "#a87e26", "d": "#1e2230", "D": "#3c4258",
+        "p": "#f4f2ec", "P": "#c4c0b8", "x": "#ffffff", "n": "#2a3658",
+    }),
+    ("wren", wren, None, "#9a6098", {
+        "s": "#f8e2cc", "S": "#e6b8a0", "k": "#d89a84", "f": "#d08a6a",
+        "h": "#7a4630", "H": "#52301f", "g": "#a8684a",
+        "i": "#3f8a5a", "I": "#1f5232", "j": "#94d4a4",
+        "c": "#3f8a86", "C": "#2a625e", "e": "#efe6d2", "E": "#c9bda4",
+        "r": "#e8ac3c", "R": "#b07a22", "p": "#f6efe0", "P": "#cfc4ae", "x": "#ffffff",
+        "u": "#d4504a", "U": "#982e2c", "y": "#f4ead6",
+    }),
+    ("rook", rook, None, "#8f9e5e", {
+        "s": "#dca47e", "S": "#b67e5c", "k": "#a86c4c",
+        "h": "#3a3a6e", "H": "#232448", "g": "#5e5e9a",
+        "i": "#e0b040", "I": "#9a6a1a", "j": "#f8e08a",
+        "n": "#1e1a26", "a": "#d4d8e0", "A": "#8a8e9c",
+    }),
+    ("nia", nia, None, "#cf6f5c", {
+        "s": "#7c4a32", "S": "#5e3524", "k": "#4a2818", "b": "#b0604c",
+        "h": "#2e2430", "H": "#18121a", "g": "#5e4c62",
+        "i": "#c87a3a", "I": "#7a3e14", "j": "#f0b070",
+        "c": "#2f8a7a", "C": "#1e5e52", "e": "#f4c040",
+        "q": "#f4c040", "Q": "#c0901e", "a": "#f4c040", "A": "#b08020",
+    }),
+    ("jett", jett, None, "#c9a23c", {
+        "s": "#f0cca8", "S": "#d4a684", "k": "#c08a6a", "u": "#c8a088",
+        "h": "#ec4f8c", "H": "#a82a5e", "g": "#ff9ec4",
+        "i": "#2aa0c4", "I": "#16607e", "j": "#8adcf0",
+        "c": "#36323c", "C": "#1e1c22", "e": "#f2f0ec", "E": "#c8c4bc",
+        "a": "#d4d8e0", "A": "#8a8e9c", "q": "#ec4f8c", "x": "#f4e2bc", "X": "#d4b88a",
+    }),
+    ("otto", otto, otto_brows, "#7c8a9c", {
+        "s": "#f4c8b0", "S": "#dca088", "k": "#c88872", "b": "#ee9c9c",
+        "h": "#f0f0f2", "H": "#b4b8c4", "g": "#ffffff", "x": "#fff2e8",
+        "i": "#4a72b8", "I": "#24427e", "j": "#a4c2f0",
+        "c": "#8a3442", "C": "#5e2230", "e": "#f2ece0", "E": "#d8cfbe",
+        "a": "#e8c070", "A": "#a8843e", "d": "#6a4a2e",
+    }),
+    ("bolt", bolt, None, "#4c6cc4", {
+        "s": "#d4dae4", "S": "#9ea8ba", "x": "#ffffff", "n": "#1c2436",
+        "l": "#7ef4e4", "w": "#ffffff", "i": "#4fe0e0", "I": "#2aa6b8", "j": "#c0fff6",
+        "m": "#7ef4e4", "M": "#4fd0d0", "b": "#ff8ab0", "t": "#7ef4e4",
+        "a": "#5a6478", "A": "#3a4254", "q": "#ff6a5a", "Q": "#c84038",
+        "d": "#3a4254", "D": "#262c3a", "c": "#bcc6d6", "C": "#8a96aa", "e": "#6a7488",
+    }),
+    ("kit", kit, None, "#4a9a6a", {
+        "s": "#f8dcc0", "S": "#e2b498", "k": "#d29a80",
+        "h": "#e0702e", "H": "#a04418", "g": "#ffa868", "y": "#fff0dc",
+        "i": "#e8a030", "I": "#a0601a", "j": "#ffd27a",
+        "c": "#efe4cc", "C": "#cbbd9c", "e": "#efe4cc", "E": "#cbbd9c",
+        "q": "#3a7ac0", "Q": "#28568c", "d": "#3a2418", "p": "#fbe6d0",
     }),
 ]
 
@@ -423,7 +801,7 @@ def render(draw, extra, tile, colors, face, marks=True, eyes=None, dy=0, whole=F
     draw(cv)
     expression(cv, face, eyes)
     if extra:
-        extra(cv)
+        extra(cv, face)
     shift(cv, dy, whole)
     corner(cv, face, mark)
     finish(cv)
@@ -492,7 +870,35 @@ def strip(draw, extra, tile, colors, frames):
     return sheet
 
 
+def review_sheet(path):
+    """A review sheet: one row per captain with the six faces at 2x (80 px), then the
+    Normal face at the sidebar's 44, 36 and 24 px (head crop) sizes, smoothly scaled the
+    way Rune samples them."""
+    big, gap = 80, 8
+    sizes = (44, 36, 24)
+    width = gap + len(FACES) * (big + gap) + sum(s + gap for s in sizes) + gap
+    img = Image.new("RGBA", (width, gap + len(CREW) * (big + gap)), (32, 30, 38, 255))
+    for row, (name, draw, extra, tile, colors) in enumerate(CREW):
+        y = gap + row * (big + gap)
+        for col, face in enumerate(FACES):
+            full = render(draw, extra, tile, colors, face)
+            img.paste(full.resize((big, big), Image.NEAREST), (gap + col * (big + gap), y))
+        x = gap + len(FACES) * (big + gap) + gap
+        for size in sizes:
+            if size <= 24:
+                box = tuple(v * SCALE for v in SMALL_CROP)
+                face = render(draw, extra, tile, colors, "Normal", marks=False).crop(box)
+            else:
+                face = render(draw, extra, tile, colors, "Normal")
+            img.paste(face.resize((size, size), Image.LANCZOS), (x, y + (big - size) // 2))
+            x += size + gap
+    img.save(path)
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--sheet":
+        review_sheet(sys.argv[2])
+        return
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "assets/crew")
     for name, draw, extra, tile, colors in CREW:
         (out / name).mkdir(parents=True, exist_ok=True)

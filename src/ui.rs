@@ -3060,51 +3060,51 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     let editing = editor.editing.is_some();
     let profile = editor.profile();
     let field = if s.dark { p.bg } else { p.panel };
-    let mut portraits = row().gap(8.0).w_full();
-    for portrait in 0..crate::visuals::CAPTAIN_NAMES.len() {
-        portraits = portraits.child(
-            col()
-                .key(format!("captain-portrait-{portrait}"))
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(format!(
-                    "Use {} portrait",
-                    crate::visuals::PORTRAIT_NAMES[portrait]
-                ))
-                .focusable(true)
-                .grow(1.0)
-                .padding(7.0)
-                .gap(5.0)
-                .items_center()
-                .radius(7.0)
-                .border(
-                    if editor.portrait == portrait {
-                        2.0
+    // The portrait grid is ported from KSG Code's `ProjectIconPickerDialog` emoji grid: square
+    // cells with `gap-1`, `rounded-md` and a transparent border, the chosen one bordered on an
+    // accent fill. Names stay in the accessible label, and the chosen one shows by the heading.
+    // Six columns fit the editor's fixed 480 px card, so the grid is the same at every width.
+    const COLUMNS: usize = 6;
+    let chosen = editor.portrait.min(crate::visuals::PORTRAITS - 1);
+    let mut portraits = col().key("captain-portraits").gap(4.0).w_full();
+    for first in (0..crate::visuals::PORTRAITS).step_by(COLUMNS) {
+        let mut line = row().gap(4.0).w_full();
+        for portrait in first..(first + COLUMNS).min(crate::visuals::PORTRAITS) {
+            let selected = chosen == portrait;
+            line = line.child(
+                col()
+                    .key(format!("captain-portrait-{portrait}"))
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label(format!(
+                        "Use {} portrait",
+                        crate::visuals::PORTRAIT_NAMES[portrait]
+                    ))
+                    .checked(selected)
+                    .focusable(true)
+                    .w(0.0)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .h(64.0)
+                    .center()
+                    .radius(8.0)
+                    .border(
+                        if selected { 2.0 } else { 1.0 },
+                        if selected { p.teal } else { Color::TRANSPARENT },
+                    )
+                    .fill(if selected {
+                        p.teal_bg
                     } else {
-                        0.5
-                    },
-                    if editor.portrait == portrait {
-                        p.teal
-                    } else {
-                        p.line
-                    },
-                )
-                .fill(if editor.portrait == portrait {
-                    p.teal_bg
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(p.selected)
-                .on_press(move |s: &mut State| {
-                    s.captain_editor.as_mut().unwrap().portrait = portrait;
-                })
-                .child(portrait_avatar(s, p, portrait, 48.0, Status::Ready))
-                .child(label(
-                    crate::visuals::PORTRAIT_NAMES[portrait],
-                    SMALL,
-                    p.ink,
-                )),
-        );
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .on_press(move |s: &mut State| {
+                        s.captain_editor.as_mut().unwrap().portrait = portrait;
+                    })
+                    .child(portrait_avatar(s, p, portrait, 48.0, Status::Ready)),
+            );
+        }
+        portraits = portraits.child(line);
     }
     let captain_project = s.captain_project.unwrap_or(s.current().project);
     let mut body = col()
@@ -3166,7 +3166,12 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(
             col()
                 .gap(6.0)
-                .child(label("Portrait", SMALL, p.muted))
+                .child(
+                    row()
+                        .gap(6.0)
+                        .child(label("Portrait", SMALL, p.muted))
+                        .child(label(crate::visuals::PORTRAIT_NAMES[chosen], SMALL, p.ink)),
+                )
                 .child(portraits),
         )
         .child(
@@ -8549,6 +8554,39 @@ pub(crate) mod tests {
         assert!(rt.state.current().pi.is_none());
         assert_eq!(rt.state.threads[0].draft.text, "Keep this draft");
         assert!(rt.find("thread-2").is_some());
+    }
+    #[test]
+    fn captain_editor_shows_every_portrait_in_a_grid_of_six_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.begin_new_captain();
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+            let (card, _) = rt.presented("captain-editor").unwrap();
+            let cells: Vec<[f32; 4]> = (0..crate::visuals::PORTRAITS)
+                .map(|i| rt.presented(&format!("captain-portrait-{i}")).unwrap().0)
+                .collect();
+            for (i, cell) in cells.iter().enumerate() {
+                let (row, col) = (i / 6, i % 6);
+                assert!(
+                    cell[0] >= card[0] && cell[0] + cell[2] <= card[0] + card[2] + 0.5,
+                    "portrait {i} leaves the card at {width}: {cell:?}"
+                );
+                assert!(cell[2] >= 60.0 && cell[3] >= 60.0, "portrait {i}: {cell:?}");
+                assert!((cell[2] - cells[0][2]).abs() < 0.5, "equal columns");
+                assert!(
+                    (cell[1] - cells[row * 6][1]).abs() < 0.5,
+                    "row {row} aligns"
+                );
+                assert!((cell[0] - cells[col][0]).abs() < 0.5, "column {col} aligns");
+                if col > 0 {
+                    assert!(cell[0] >= cells[i - 1][0] + cells[i - 1][2]);
+                }
+            }
+            assert!(cells[6][1] >= cells[0][1] + cells[0][3]);
+            press(&mut rt, "captain-portrait-11");
+            assert_eq!(rt.state.captain_editor.as_ref().unwrap().portrait, 11);
+        }
     }
     #[test]
     fn captain_editor_footer_stays_visible_at_minimum_window_size() {
