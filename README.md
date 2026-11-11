@@ -16,6 +16,29 @@ The development tools and Pi are already installed on this workstation.
 cargo run
 ```
 
+### Experimental local server
+
+Legacy single-process mode remains the default. Slice 1 of the [server architecture](docs/server-architecture.md) is opt-in:
+
+```powershell
+.\target\debug\shina.exe serve
+.\target\debug\shina.exe --server-client
+```
+
+`serve` is headless and owns harnesses, tasks, memory, routines and MCP. The desktop attaches to an authenticated loopback WebSocket endpoint described by the user-only `server.json`. If no server owns the profile, the desktop starts one and supervises it with 0.5 to 10 second restart backoff. Quitting stops only a server that desktop spawned, with a five-second grace. An independently started server keeps running after its clients close. Windows' background tray setting keeps the desktop and its owned server alive even after idle windows close.
+
+Both execution modes take the same `server-owner.sqlite` exclusive transaction before opening writable state. Do not delete that file. A legacy app cannot execute against a profile owned by `serve`. No login, provider environment or authentication settings are copied or changed.
+
+Clients render projected records through the existing `State` and `Thread` APIs. Editors, attachments not yet submitted, selection, menus and expansion state stay local. Concurrent desktop launches reserve separate persistent draft slots under `clients/<slot>/ui-state.json`. Existing legacy drafts are read without rewriting their source. The server atomically keeps accepted inputs, transcripts and command receipts in `index.json`. `server-inputs.json` is a compatibility checkpoint for existing pending-input recovery. Memory and routines keep their existing files. Stop leaves recovered input for an `input.claim`. Only the initiating client automatically claims its stop/rewind results, never another client's editor.
+
+The slice uses Tokio/Axum and the same Tungstenite implementation on both ends. This reuses HTTP authentication and WebSocket limits without a custom HTTP upgrade parser. SQLite is used only for the KSG-style owner lock, not state migration yet. Reconnect sends a consistent full workspace snapshot, not patches. Requests are limited to 1 MiB, snapshots to 2 MiB, and the runtime queue to 32 commands. Oversized snapshots disconnect instead of allocating unbounded outbound queues. Paging and replay belong to slice 2. New commands, including approvals, are refused while disconnected.
+
+Every mutation has a client UUID. The index atomically journals its payload hash, receipt and uncertain dispatch intent before harness dispatch, then commits its result. Retrying the same ID returns its receipt; changed payloads fail. An uncertain intent is not automatically replayed after a crash. This does not promise exactly-once provider tools or a transaction across the separate memory and routine files.
+
+In-app update installation is disabled in server mode until slice 3 coordinates server and client replacement. Browser connections, remote listeners, pairing and services are not part of this slice.
+
+For any development GUI check, set `LOCALAPPDATA` to a new temporary directory before launching either process. Never use the real profile for fixtures. `cargo test --test server_runtime` starts real servers and fake Pi/ACP subprocesses in isolated profiles without consuming quota.
+
 Shina 0.9 keeps all your projects and chats in one window. Use Add project for **Open folder...** or **Clone repository...**. New thread opens a project picker, including **No project**. Threads from different projects run concurrently and can share the tab strip.
 
 Lone threads use the [T3 Code lifecycle](docs/t3-thread-management.md). Pinned and Active read as one list, followed by collapsed Snoozed and Settled shelves. A running thread stays in its place and shows Working. A collapsed shelf keeps the open thread visible. Settled starts with 10 rows and adds 25 per page. Hovering a row shows Snooze and Settle; right-click opens the rest of its actions at the pointer. Shift-click projects in the scope picker to select several.

@@ -1,5 +1,23 @@
 # Headless server and clients
 
+## Implementation status
+
+Slice 1 is implemented behind `--server-client`; legacy mode remains the default. The same binary's `serve` command owns the existing reducer, subprocess workers, JSON stores, MCP queue and background scheduling. `runtime.rs` serializes commands and ticks without initializing artwork, portrait animation or image caches. This deliberately moves ownership before attempting a pure reducer.
+
+`server_lock.rs` uses the never-unlinked `server-owner.sqlite` exclusive transaction in both execution modes. `server_auth.rs` publishes loopback discovery only after recovery/listener setup, with stable server and epoch IDs, a fresh instance ID and a 256-bit OS-random bootstrap token. Windows applies a protected current-user-only DACL without changing ownership, auditing privileges or authentication. Native bootstrap exchange issues ephemeral device credentials. Origins are refused in this native-only slice.
+
+Tokio/Axum handles authenticated HTTP and WebSockets; Tokio-Tungstenite shares Axum's wire implementation with the native client. Existing blocking harness workers remain unchanged. A bounded 32-command queue feeds the runtime, and a latest-value snapshot channel prevents slow clients from blocking harness drains. Slice 1 sends full projected snapshots after changes and on reconnect. It limits control requests to 1 MiB and encoded snapshots to 2 MiB; larger profiles need slice 2 paging.
+
+`State` remains the UI facade. `client_state.rs` projects records and forwards execution methods, including direct `Thread` controls. Existing captain scope, memory, task and routine getters remain callable. Their mutations return local enqueue errors immediately; server validation/results arrive through receipts. Returned IDs from asynchronous facade mutations are provisional until their projection arrives. Editors and disclosure state are never part of a server projection. Concurrent desktop processes reserve separate persistent `clients/<slot>/ui-state.json` files. The original legacy UI file is retained.
+
+Receipts, pending accepted inputs and uncertain command intents are part of the atomically replaced JSON index. Dispatch follows a flushed intent; duplicates are keyed by device and command ID and checked against the canonical payload hash. A crash leaves an interrupted receipt and never triggers automatic redispatch. Existing Pi/task recovery still decides what history proves. This is not a multi-file transaction or a SQLite effect outbox. The server also checkpoints transcript DTOs for ACP agents without replay. A later legacy-mode launch preserves those records rather than discarding the server extension fields.
+
+The desktop attaches first or supervises its own `serve` child with 0.5 to 10 second backoff. Quit stops only that owned child, with five seconds before termination. An attached headless server remains alive. Windows tray opt-in keeps the desktop alive after an idle close. Server clients show why in-app installation is disabled until slice 3.
+
+Validation uses real `serve` processes, authenticated WebSockets and fake Pi/ACP subprocesses in temporary profiles. It covers ownership races, zero-client MCP completion, lost acknowledgements, reconnect deduplication, restart persistence and ACP resume without history. Native Windows checks covered two attached clients, separate drafts, legacy ownership refusal, close/reattach persistence and owned-server shutdown with no submitted prompts.
+
+Slice 2 still needs database migration/backups, transactional receipts and effects, durable devices, bounded history/blob paging, typed incremental patches/replay, and crash-boundary/slow-subscriber tests. Slice 3 owns service installation and coordinated updates. No pairing, browser tickets, remote server binding or automatic continuation has been added.
+
 ## Decision and evidence
 
 Run `shina serve` from the same binary as an independent per-user process. It owns execution and durable state. Rune, and later mobile, authenticate as clients. Closing every window leaves accepted work running. This is shared access to server-owned sessions, not replication of live agent processes.
@@ -13,7 +31,7 @@ Shina's `README.md`, `AGENTS.md`, `docs/harnesses.md` and `docs/pi-integration.m
 - `src/mcp.rs` runs authenticated loopback HTTP inside the app, but queues calls for the UI poll. `src/store.rs` saves JSON and a run marker, not an exclusive owner lock. `src/tasks.rs` reconciles durable delegation against Pi history without blindly repeating work.
 - `src/main.rs` shuts down on window close. `src/process.rs` kills owned descendants through Windows Job Objects or Unix process groups. `src/update.rs` assumes app exit before replacement.
 
-`docs/captains.md`, `src/background.rs`, routines and memory persistence are absent here. Integrate their merged implementations later; do not invent their current schemas.
+At the research baseline, `docs/captains.md`, `src/background.rs`, routines and memory persistence were absent. Slice 1 now uses their merged implementations and existing schemas.
 
 KSG Code provides the following verified precedents:
 
