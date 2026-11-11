@@ -1294,7 +1294,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .pt(8.0)
             .pb(4.0),
     );
-    let harnesses = std::iter::once(("pi", "Pi")).chain(
+    let harnesses = [("pi", "Pi"), ("codex", "Codex")].into_iter().chain(
         s.harnesses
             .agents
             .iter()
@@ -1329,7 +1329,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                     .shrink()
                     .min_w(0.0),
             );
-        if id != "pi" {
+        if !matches!(id, "pi" | "codex") {
             // KSG Code's `ModelListRow` "New" tag, here naming the protocol the agent speaks.
             item = item.child(
                 label("ACP", TextStyle::new(9.5, 650.0).tracking(0.4), p.muted)
@@ -1903,6 +1903,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
 
 /// Preferences behind the footer's gear. BackgroundActivitySettings in KSG Code has no
 /// close-to-tray/routine equivalent; these requested plain items reuse the existing menu.
+// Default selection follows KSG Code's settings/ProjectDefaultsSettings.tsx.
+// This interim menu item reuses Shina's existing menu spacing.
 fn settings_menu(s: &State, p: Palette) -> El {
     let mut menu = col()
         .key("settings-menu")
@@ -1922,6 +1924,15 @@ fn settings_menu(s: &State, p: Palette) -> El {
             10.0,
             30.0,
             Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
+        )
+        .child(
+            menu_item(
+                "default-harness",
+                &format!("Default harness: {}", s.default_harness),
+                "settings",
+                p,
+            )
+            .on_press(|s: &mut State| s.cycle_default_harness()),
         )
         .child(
             menu_item(
@@ -6981,7 +6992,12 @@ pub(crate) mod tests {
             rt.state.settings_menu = true;
             rt.frame(0.0);
             let (menu, _) = rt.presented("settings-menu").unwrap();
-            for key in ["background-toggle", "keep-awake-toggle", "theme-toggle"] {
+            for key in [
+                "default-harness",
+                "background-toggle",
+                "keep-awake-toggle",
+                "theme-toggle",
+            ] {
                 let (item, _) = rt.presented(key).unwrap();
                 assert!(item[0] >= menu[0] && item[0] + item[2] <= menu[0] + menu[2] + 0.5);
                 assert!(item[1] >= 0.0 && item[1] + item[3] <= 720.5);
@@ -7167,6 +7183,7 @@ pub(crate) mod tests {
             for key in [
                 "harness-group",
                 "choose-harness-pi",
+                "choose-harness-codex",
                 "choose-harness-fixture",
                 "harness-tag-fixture",
                 "model-list",
@@ -7184,6 +7201,7 @@ pub(crate) mod tests {
                 rt.presented("harness-tag-pi").is_none(),
                 "Pi is built in, not an ACP agent"
             );
+            assert!(rt.presented("harness-tag-codex").is_none());
             press(&mut rt, "choose-harness-fixture");
             assert_eq!(rt.state.current().harness, "fixture");
             assert!(rt.state.current().selected_model.is_none());

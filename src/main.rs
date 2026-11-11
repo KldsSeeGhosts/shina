@@ -5,6 +5,7 @@ mod attachments;
 mod backend;
 mod brand;
 mod captains;
+mod codex;
 mod context;
 mod harness;
 mod install;

@@ -46,6 +46,8 @@ mod memory;
 mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
+#[path = "codex_model.rs"]
+mod codex_model;
 
 struct Injection {
     text: String,
@@ -70,7 +72,8 @@ struct Selection {
 
 impl Selection {
     fn to_value(&self) -> Value {
-        let mut value = json!({"provider": self.provider, "model": self.model});
+        let mut value = json!({"harness":if self.provider == "cpa" {"pi"} else {&self.provider},
+            "provider": self.provider, "model": self.model});
         if let Some(reasoning) = &self.reasoning {
             value["options"] = json!({"reasoning": reasoning});
         }
@@ -80,7 +83,9 @@ impl Selection {
 
 /// The validated fields of a `delegate_task.target` request.
 struct DelegationTarget {
-    model: String,
+    harness: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     reasoning: Option<String>,
 }
 
@@ -645,7 +650,7 @@ impl Thread {
     }
 
     pub fn set_thinking(&mut self, level: String) {
-        if self.harness != "pi" {
+        if !matches!(self.harness.as_str(), "pi" | "codex") {
             self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
         }
@@ -663,12 +668,17 @@ impl Thread {
 
     /// The pinned choice if one exists, otherwise the model Pi last applied.
     fn selected_or_effective_model(&self) -> Option<(String, String)> {
+        let expected = if self.harness == "pi" {
+            "cpa"
+        } else {
+            &self.harness
+        };
         self.selected_model
             .as_ref()
-            .filter(|(provider, model)| provider == "cpa" && !model.trim().is_empty())
+            .filter(|(provider, model)| provider == expected && !model.trim().is_empty())
             .cloned()
             .or_else(|| {
-                (self.model_provider == "cpa" && !self.model_id.trim().is_empty())
+                (self.model_provider == expected && !self.model_id.trim().is_empty())
                     .then(|| (self.model_provider.clone(), self.model_id.clone()))
             })
     }
@@ -1947,6 +1957,7 @@ pub struct State {
     pub snooze_edit: TextEdit,
     pub lifecycle_error: Option<String>,
     pub auto_settle_days: u32,
+    pub default_harness: String,
     pub drag_thread: Option<usize>,
     pub drag_target: Option<(Section, Option<usize>)>,
     pub drop_rects: std::collections::HashMap<String, [f32; 4]>,
@@ -2075,6 +2086,7 @@ impl State {
             snooze_edit: TextEdit::default(),
             lifecycle_error: None,
             auto_settle_days: 3,
+            default_harness: "pi".into(),
             drag_thread: None,
             drag_target: None,
             drop_rects: Default::default(),
@@ -3226,6 +3238,7 @@ impl State {
         });
         let index = reuse.unwrap_or_else(|| {
             let mut thread = Thread::new(self.next_id);
+            thread.harness = self.default_harness.clone();
             thread.project = project;
             if let Some(project) = self.project(project) {
                 thread.machine = project.machine.clone();
@@ -3291,6 +3304,7 @@ impl State {
             self.current_mut().life.last_visited_at = Some(lifecycle::now());
         } else {
             let mut thread = Thread::new(self.next_id);
+            thread.harness = self.default_harness.clone();
             self.next_id += 1;
             thread.title = self.captains[captain].name.clone();
             thread.captain = Some(captain);
@@ -3460,6 +3474,9 @@ impl State {
     /// Models Shina can validate against, preferring the live catalog over the caller's last
     /// handshake metadata. The string records which source was used.
     fn delegation_models(&self, caller: &Thread) -> (Vec<AgentModel>, &'static str) {
+        if caller.harness != "pi" {
+            return (self.harness_models(&caller.harness), "caller");
+        }
         let mut models = self.catalog.models.clone();
         if let Some(default) = &self.catalog.default_model
             && !models
@@ -3493,10 +3510,12 @@ impl State {
     }
 
     fn inherited_selection(&self, caller_index: usize) -> Option<Selection> {
-        self.threads
-            .get(caller_index)?
-            .inherited_selection()
-            .or_else(|| self.default_selection())
+        let caller = self.threads.get(caller_index)?;
+        caller.inherited_selection().or_else(|| {
+            (caller.harness == "pi")
+                .then(|| self.default_selection())
+                .flatten()
+        })
     }
 
     fn discovery_state(&self, source: &str) -> &'static str {
@@ -3523,6 +3542,11 @@ impl State {
         selection: &Selection,
         explicit: bool,
     ) -> Result<(), String> {
+        let provider_name = if selection.provider == "cpa" {
+            "CPA"
+        } else {
+            &selection.provider
+        };
         if models.is_empty() {
             return if explicit {
                 Err("Model discovery is not ready, so Shina cannot validate the requested target. Call orchestrator_capabilities and retry when ready is true.".into())
@@ -3542,12 +3566,12 @@ impl State {
                 .join(", ");
             return Err(if explicit {
                 format!(
-                    "The requested CPA model {} is not in the current catalog. Available model ids include: {available}. Call orchestrator_capabilities for the full list.",
+                    "The requested {provider_name} model {} is not in the current catalog. Available model ids include: {available}. Call orchestrator_capabilities for the full list.",
                     selection.model
                 )
             } else {
                 format!(
-                    "The inherited CPA model {} is not in the current catalog. Pass target with an available model from orchestrator_capabilities.",
+                    "The inherited {provider_name} model {} is not in the current catalog. Pass target with an available model from orchestrator_capabilities.",
                     selection.model
                 )
             });
@@ -3561,7 +3585,7 @@ impl State {
                 model.thinking_levels.join(", ")
             };
             return Err(format!(
-                "Reasoning level {reasoning} is not supported by CPA model {}. Supported levels: {supported}. Pass an exact level; Shina will not substitute or clamp one.",
+                "Reasoning level {reasoning} is not supported by {provider_name} model {}. Supported levels: {supported}. Pass an exact level; Shina will not substitute or clamp one.",
                 model.id
             ));
         }
@@ -3573,9 +3597,7 @@ impl State {
         let (models, source) = self.delegation_models(caller);
         let default_selection = self.default_selection();
         let caller_selection = caller.inherited_selection();
-        let inherit_selection = caller_selection
-            .clone()
-            .or_else(|| default_selection.clone());
+        let inherit_selection = self.inherited_selection(caller_index);
         let model_values: Vec<Value> = models
             .iter()
             .map(|model| {
@@ -3587,7 +3609,7 @@ impl State {
                 })
             })
             .collect();
-        json!({
+        let mut capabilities = json!({
             "ready": !models.is_empty(),
             "scope": self.scope_value(caller.captain),
             "workspace_required": caller.captain.is_some_and(|id| self.captain_scope(id).len() > 1),
@@ -3597,7 +3619,7 @@ impl State {
                 "error": self.catalog.error,
             },
             "runtime": {
-                "harness": "pi",
+                "harness": caller.harness,
                 "providers": ["cpa"],
                 "hosts": ["local"],
                 "machine": caller.machine,
@@ -3616,13 +3638,15 @@ impl State {
             "inherit_selection": inherit_selection.map_or(Value::Null, |selection| selection.to_value()),
             "models": model_values,
             "notes": [
-                "Shina delegates only through Pi's CPA provider. Direct providers are never offered or used.",
+                "Pi uses CPA. Codex and ACP use their own configured providers and login.",
                 "Only the local machine is supported. Captain workers use a selected workspace in the captain's scope and inherit its captain.",
                 "Pass exact model ids and reasoning levels. Unknown or unsupported choices are rejected before the child is created and are never silently substituted or clamped.",
                 "Omit target to inherit inherit_selection. Given target fields override the inherited selection.",
                 "When ready is false, discovery has not produced a usable catalog. Do not invent model ids or levels."
             ],
-        })
+        });
+        self.add_harness_capabilities(&mut capabilities);
+        capabilities
     }
 
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
@@ -3656,7 +3680,9 @@ impl State {
                     self.threads[index].memory_prompt()
                 )
             });
-        if self.threads[index].harness == "pi" || self.threads[index].session.is_none() {
+        if matches!(self.threads[index].harness.as_str(), "pi" | "codex")
+            || self.threads[index].session.is_none()
+        {
             self.threads[index].memory_context = self.threads[index]
                 .memory
                 .as_ref()
@@ -3844,21 +3870,51 @@ impl State {
                     ));
                 }
                 let target = parse_delegation_target(args)?;
-                let (models, _) = self.delegation_models(&self.threads[caller_index]);
+                let harness = target
+                    .as_ref()
+                    .and_then(|t| t.harness.clone())
+                    .unwrap_or_else(|| self.threads[caller_index].harness.clone());
+                self.validate_harness(&harness)?;
+                let provider = if harness == "pi" { "cpa" } else { &harness };
+                if target
+                    .as_ref()
+                    .and_then(|t| t.provider.as_deref())
+                    .is_some_and(|p| p != provider)
+                {
+                    return Err(format!(
+                        "target.provider must be {provider} for harness {harness}."
+                    ));
+                }
+                let models = if harness == self.threads[caller_index].harness {
+                    self.delegation_models(&self.threads[caller_index]).0
+                } else {
+                    self.harness_models(&harness)
+                };
+                let inherited = if harness == self.threads[caller_index].harness {
+                    self.inherited_selection(caller_index)
+                } else if harness == "pi" {
+                    self.default_selection()
+                } else {
+                    None
+                };
                 let selection = match &target {
-                    Some(target) => {
-                        let inherited = self.inherited_selection(caller_index);
-                        Some(Selection {
-                            provider: "cpa".into(),
-                            model: target.model.clone(),
+                    Some(target) => target
+                        .model
+                        .clone()
+                        .or_else(|| inherited.as_ref().map(|s| s.model.clone()))
+                        .map(|model| Selection {
+                            provider: provider.into(),
+                            model,
                             reasoning: target
                                 .reasoning
                                 .clone()
                                 .or_else(|| inherited.and_then(|choice| choice.reasoning)),
-                        })
-                    }
-                    None => self.inherited_selection(caller_index),
+                        }),
+                    None => inherited,
                 };
+                if selection.is_none() && target.as_ref().is_some_and(|t| t.reasoning.is_some()) {
+                    return Err("A reasoning target requires an advertised model so Shina can validate the level.".into());
+                }
                 if let Some(selection) = &selection {
                     self.validate_delegation_selection(&models, selection, target.is_some())?;
                 }
@@ -3887,6 +3943,7 @@ impl State {
                     None => assigned,
                 };
                 let mut thread = Thread::new(self.next_id);
+                thread.harness = harness;
                 thread.project = project;
                 thread.machine = self.threads[caller_index].machine.clone();
                 self.next_id += 1;
@@ -4333,6 +4390,15 @@ impl State {
 
     pub fn refresh_catalog(&mut self) {
         self.harnesses = crate::harness::Registry::read();
+        if self.current().harness == "codex"
+            && self.current().pi.is_none()
+            && self.current().status != Status::Failed
+            && !self.current().archived()
+            && !self.demo
+            && self.runtime_enabled
+        {
+            self.connect_thread(self.active);
+        }
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh(self.data_dir.clone(), self.wake.clone());
@@ -4347,9 +4413,7 @@ impl State {
         if !self.current().can_choose_harness() || self.current().harness == id {
             return;
         }
-        if id != "pi"
-            && let Err(error) = self.harnesses.find(id)
-        {
+        if let Err(error) = self.validate_harness(id) {
             self.current_mut().error = Some(error);
             return;
         }
@@ -4378,6 +4442,9 @@ impl State {
             self.apply_catalog();
         }
         self.checkpoint();
+        if id == "codex" && self.runtime_enabled && !self.demo {
+            self.connect_thread(self.active);
+        }
     }
 
     fn apply_catalog(&mut self) {
@@ -4831,6 +4898,14 @@ impl State {
             return Err("The saved index has no valid thread list.".into());
         }
         self.dark = index["dark"] == true;
+        self.default_harness = match index.get("defaultHarness") {
+            None => "pi".into(),
+            Some(value) => value
+                .as_str()
+                .filter(|id| crate::harness::valid_id(id))
+                .ok_or("Invalid default harness.")?
+                .into(),
+        };
         self.auto_settle_days = index["autoSettleAfterDays"].as_u64().unwrap_or(3).min(3650) as u32;
         if let Some(zoom) = index["zoom"].as_f64() {
             self.zoom = snap_zoom(zoom as f32);
@@ -5090,6 +5165,7 @@ impl State {
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
+            "defaultHarness": self.default_harness,
             "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
@@ -5588,37 +5664,52 @@ fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, Str
     let Some(target) = args.get("target") else {
         return Ok(None);
     };
-    let object = target
-        .as_object()
-        .ok_or("target must be an object with model and optional provider and options.")?;
+    let object = target.as_object().ok_or(
+        "target must be an object with harness or model, and optional provider and options.",
+    )?;
     if let Some(key) = object
         .keys()
-        .find(|key| !matches!(key.as_str(), "provider" | "model" | "options"))
+        .find(|key| !matches!(key.as_str(), "harness" | "provider" | "model" | "options"))
     {
         return Err(format!(
-            "Unknown target setting {key}. Use provider, model and options."
+            "Unknown target setting {key}. Use harness, provider, model and options."
         ));
+    }
+    let harness = object
+        .get("harness")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| crate::harness::valid_id(id))
+                .map(str::to_owned)
+                .ok_or("target.harness must be pi, codex, or an installed ACP id.")
+        })
+        .transpose()?;
+    if !object.contains_key("model") && harness.is_none() {
+        return Err("target.model is required when target is set without a harness.".into());
     }
     let model = object
         .get("model")
-        .ok_or("target.model is required when target is set.")?
-        .as_str()
+        .map(|value| {
+            value.as_str()
         .map(str::trim)
         .filter(|model| !model.is_empty())
+        .map(str::to_owned)
         .ok_or(
-            "target.model must be a non-empty exact CPA model id from orchestrator_capabilities.",
-        )?;
-    if let Some(provider) = object.get("provider") {
-        let provider = provider
-            .as_str()
-            .ok_or("target.provider must be the string cpa.")?;
-        if provider != "cpa" {
-            return Err(
-                "Only Shina's CPA provider is supported. Set target.provider to cpa or omit it."
-                    .into(),
-            );
-        }
-    }
+            "target.model must be a non-empty exact model id from orchestrator_capabilities.",
+        )
+        })
+        .transpose()?;
+    let provider = object
+        .get("provider")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .ok_or("target.provider must be a nonempty string.")
+        })
+        .transpose()?;
     let reasoning = match object.get("options") {
         None => None,
         Some(options) => {
@@ -5657,7 +5748,9 @@ fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, Str
         }
     };
     Ok(Some(DelegationTarget {
-        model: model.to_owned(),
+        harness,
+        provider,
+        model,
         reasoning,
     }))
 }
@@ -7813,7 +7906,10 @@ mod tests {
         );
         assert_eq!(capabilities["inherit_selection"]["model"], "deep");
         assert_eq!(capabilities["runtime"]["harness"], "pi");
-        assert_eq!(capabilities["runtime"]["providers"], json!(["cpa"]));
+        assert_eq!(
+            capabilities["runtime"]["providers"],
+            json!(["cpa", "codex"])
+        );
         assert_eq!(capabilities["runtime"]["hosts"], json!(["local"]));
         assert_eq!(capabilities["runtime"]["machine"], "local");
         assert_eq!(capabilities["runtime"]["host_supported"], true);

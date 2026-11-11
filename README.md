@@ -2,9 +2,9 @@
 
 A native desktop chat workspace built with [Rune](https://github.com/anomalyco/rune) and the [Pi coding agent](https://github.com/earendil-works/pi). Shina is a working-name prototype, not a T3 Code or Capy client.
 
-The standalone app's interface is entirely Rune. Pi or a selected ACP agent runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
+The standalone app's interface is entirely Rune. Pi, Codex, or a selected ACP agent runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
 
-Threads default to Pi and its CPA-only provider. A new thread can instead select an installed ACP agent from the Harness group in the model picker. ACP agents use their own configured providers and authentication. Shina never installs agents or changes their login state. See [thread harnesses](docs/harnesses.md) for `harnesses.json`, PATH discovery, MCP setup and protocol limits.
+Threads default to Pi and its CPA-only provider. A new thread can instead select Codex or an installed ACP agent from the Harness group in the model picker. Settings has a Default harness item for new threads and captain homes. Workers inherit their parent's harness unless a delegation target selects another. Codex uses `codex app-server`, not ACP. Codex and ACP agents use their own configured providers and login. Shina never reads or copies their credentials, changes their configuration, installs agents, or changes their login state. See [thread harnesses](docs/harnesses.md) for discovery, MCP setup and protocol limits.
 
 Captains are assistants with one continuous home, explicit memory, and an ordered scope of zero or more workspaces. Opening a captain always opens its primary home, regardless of the sidebar filter. Earlier homes and reset conversations remain in its records. Captains coordinate read-only work and delegate changes to durable tasks. See [captains, scope and memory](docs/captains.md) for the data model, migration, tools, and backend UI API.
 
