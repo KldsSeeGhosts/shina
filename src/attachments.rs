@@ -310,6 +310,47 @@ pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     Ok(attachment)
 }
 
+/// Network uploads specify bytes, never a destination path. Validate before atomic promotion.
+pub fn store_uploaded(directory: &Path, name: &str, bytes: &[u8]) -> Result<Attachment, String> {
+    use sha2::Digest;
+    let (validated, _) = validate(bytes)?;
+    let extension = match validated.format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Gif => "gif",
+        ImageFormat::WebP => "webp",
+        _ => return Err("Unsupported image format.".into()),
+    };
+    let id = format!("{:x}.{extension}", sha2::Sha256::digest(bytes));
+    fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let path = directory.join(&id);
+    if !path.exists() {
+        use std::io::Write;
+        let staged = directory.join(format!("{}.upload", uuid::Uuid::new_v4()));
+        let promoted = (|| {
+            let mut file = fs::File::create_new(&staged)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            match fs::rename(&staged, &path) {
+                Ok(()) => Ok(()),
+                Err(_) if fs::read(&path).is_ok_and(|existing| existing == bytes) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })();
+        let _ = fs::remove_file(&staged);
+        promoted.map_err(|e: std::io::Error| e.to_string())?;
+    }
+    Ok(Attachment {
+        id,
+        name: clean_name(name),
+        mime: mime(validated.format).into(),
+        width: validated.width,
+        height: validated.height,
+        bytes: bytes.len() as u64,
+        path: None,
+    })
+}
+
 /// Import an image part from Pi's saved conversation history.
 ///
 /// The returned reference points at the same local store, so later reads of history keep their

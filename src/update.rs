@@ -1557,7 +1557,21 @@ fn start_server(
         InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.clone(),
         InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
     };
-    install::launch_with(&exe, &["serve"])
+    let mut args = vec!["serve".to_owned()];
+    if let Some(directory) = crate::store::directory()
+        && let Some(listen) = crate::store::load(&directory.join("server-listen.json"))?
+    {
+        if listen["tailnet"] == true {
+            args.push("--tailnet".into());
+        }
+        if let Some(port) = listen["port"]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+        {
+            args.extend(["--port".into(), port.to_string()]);
+        }
+    }
+    install::launch_with(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 fn readiness(directory: &Path, expected: &str) -> Result<(), String> {

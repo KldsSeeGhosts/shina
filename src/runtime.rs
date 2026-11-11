@@ -104,6 +104,9 @@ impl RuntimeState {
         {
             return Err("Authentication denied. This device is unknown or revoked.".into());
         }
+        if let Some(database) = &self.database {
+            database.authorize(device, &command.method, &command.params)?;
+        }
         if let Some(result) = self.maintenance_command(&command) {
             return result;
         }

@@ -74,6 +74,8 @@ pub enum Event {
 }
 
 pub struct Client {
+    pub remote: Option<crate::peer::Link>,
+    pub linked: std::collections::BTreeMap<String, Client>,
     directory: PathBuf,
     device_directory: PathBuf,
     pub commands: Commands,
@@ -91,6 +93,8 @@ impl Client {
         let (sender, input) = tokio::sync::mpsc::channel(32);
         let (output, events) = mpsc::sync_channel(64);
         Self {
+            remote: None,
+            linked: Default::default(),
             device_directory: directory.clone(),
             directory,
             commands: Commands {
@@ -110,6 +114,18 @@ impl Client {
         self.device_directory = directory;
     }
     pub fn start(&mut self, wake: rune::Waker) {
+        if self.remote.is_none() {
+            match crate::peer::Link::load_all(&self.directory) {
+                Ok(links) => {
+                    for link in links {
+                        self.add_link(link, wake.clone());
+                    }
+                }
+                Err(error) => {
+                    let _ = self.output.try_send(Event::Error(error));
+                }
+            }
+        }
         let Some(input) = self.input.take() else {
             return;
         };
@@ -120,13 +136,14 @@ impl Client {
         let stop = self.stop.clone();
         let ready = self.commands.ready.clone();
         let history_thread = self.history_thread.clone();
+        let remote = self.remote.clone();
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("client runtime");
             runtime.block_on(supervise(
-                (directory, device_directory, history_thread),
+                (directory, device_directory, history_thread, remote),
                 input,
                 output,
                 snapshot,
@@ -140,6 +157,44 @@ impl Client {
             .expect("supervisors")
             .push((Arc::downgrade(&self.stop), Arc::downgrade(&self.worker)));
     }
+    pub fn add_link(&mut self, link: crate::peer::Link, wake: rune::Waker) {
+        let mut client = Self::new(self.directory.clone());
+        client.device_directory = self
+            .device_directory
+            .join("linked-views")
+            .join(&link.server_id);
+        client.remote = Some(link.clone());
+        client.start(wake);
+        self.linked.insert(link.server_id, client);
+    }
+    pub fn commands_for(&self, server: &str) -> Option<&Commands> {
+        if server == "local" {
+            Some(&self.commands)
+        } else {
+            self.linked.get(server).map(|client| &client.commands)
+        }
+    }
+    pub fn snapshots(&self) -> Vec<(String, Value)> {
+        let mut views = Vec::new();
+        if let Some(value) = self.snapshot() {
+            views.push(("local".into(), value));
+        }
+        for (id, client) in &self.linked {
+            if let Some(value) = client.snapshot() {
+                views.push((id.clone(), value));
+            }
+        }
+        views
+    }
+    pub fn machine_event(&self) -> Option<(String, Event)> {
+        self.event()
+            .map(|event| ("local".into(), event))
+            .or_else(|| {
+                self.linked
+                    .iter()
+                    .find_map(|(id, client)| client.event().map(|event| (id.clone(), event)))
+            })
+    }
     pub fn snapshot(&self) -> Option<Value> {
         self.snapshot.lock().expect("client snapshot").take()
     }
@@ -150,6 +205,9 @@ impl Client {
         self.events.try_recv().ok()
     }
     pub fn shutdown(&mut self) {
+        for client in self.linked.values_mut() {
+            client.shutdown();
+        }
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.lock().expect("client worker").take() {
             let _ = crate::process::join_for(worker, Duration::from_secs(7));
@@ -232,7 +290,7 @@ fn spawn() -> Result<Child, String> {
     command.spawn().map_err(|e| e.to_string())
 }
 
-type Socket =
+pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Default)]
@@ -422,13 +480,20 @@ async fn connect(
     device_directory: &std::path::Path,
     cache: &ProjectionCache,
     desktop: bool,
+    remote: Option<&crate::peer::Link>,
 ) -> Result<Socket, String> {
     if discovery.protocol_major != crate::protocol::MAJOR {
         return Err("Protocol major mismatch. Update the server and client together.".into());
     }
     let credential_path = device_directory.join("client-credential.json");
-    let saved = crate::store::load(&credential_path)?;
-    let token = if let Some(saved) = saved {
+    let saved = if remote.is_none() {
+        crate::store::load(&credential_path)?
+    } else {
+        None
+    };
+    let token = if let Some(remote) = remote {
+        remote.token.clone()
+    } else if let Some(saved) = saved {
         if saved["serverId"] != discovery.server_id || saved["deviceId"] != device {
             return Err(
                 "Authentication denied. The saved credential belongs to another server or device."
@@ -444,18 +509,19 @@ async fn connect(
             .await
             .map_err(|_| "Server authentication timed out.")??;
         crate::server_auth::protect(device_directory)?;
-        crate::store::write_atomic(
+        crate::server_auth::save_secret(
             &credential_path,
             json!({"serverId":discovery.server_id,"deviceId":device,"token":token})
                 .to_string()
                 .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         token
     };
-    let mut request = format!("ws://127.0.0.1:{}/v1/ws", discovery.port)
-        .into_client_request()
-        .map_err(|e| e.to_string())?;
+    let endpoint = match remote {
+        Some(link) => format!("ws://{}/v1/ws", link.address()?),
+        None => format!("ws://127.0.0.1:{}/v1/ws", discovery.port),
+    };
+    let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert(
         "authorization",
         format!("Bearer {token}")
@@ -476,7 +542,7 @@ async fn connect(
             "Authentication denied. This device may have been revoked. Re-enrollment requires user action.".to_owned(),
         _ => "Server listener is unavailable.".to_owned(),
     })?;
-    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":protocol::MAJOR,"protocolMinor":protocol::MINOR,"projectionSchema":1,"clientPid":desktop.then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
+    socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":protocol::MAJOR,"protocolMinor":protocol::MINOR,"projectionSchema":1,"clientPid":(desktop && remote.is_none()).then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
     let reply: Value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match socket.next().await {
@@ -500,7 +566,7 @@ async fn connect(
     if let Some(error) = reply["error"]["message"].as_str() {
         return Err(format!("Server handshake refused: {error}"));
     }
-    if reply["result"]["instanceId"] != discovery.instance_id
+    if remote.is_none() && reply["result"]["instanceId"] != discovery.instance_id
         || reply["result"]["serverId"] != discovery.server_id
     {
         return Err(
@@ -521,7 +587,12 @@ async fn connect(
 }
 
 async fn supervise(
-    profile: (PathBuf, PathBuf, Arc<AtomicUsize>),
+    profile: (
+        PathBuf,
+        PathBuf,
+        Arc<AtomicUsize>,
+        Option<crate::peer::Link>,
+    ),
     mut input: tokio::sync::mpsc::Receiver<Command>,
     output: mpsc::SyncSender<Event>,
     snapshot: Arc<Mutex<Option<Value>>>,
@@ -529,7 +600,7 @@ async fn supervise(
     ready: Arc<AtomicBool>,
     wake: rune::Waker,
 ) {
-    let (directory, device_directory, history_thread) = profile;
+    let (directory, device_directory, history_thread, remote) = profile;
     let report = |error: String| {
         let _ = output.try_send(Event::Error(error));
         wake();
@@ -538,7 +609,11 @@ async fn supervise(
         report(error.to_string());
         return;
     }
-    let device = match device_id(&device_directory) {
+    let device = match remote
+        .as_ref()
+        .map(|link| Ok(link.device_id.clone()))
+        .unwrap_or_else(|| device_id(&device_directory))
+    {
         Ok(id) => id,
         Err(error) => {
             report(error);
@@ -554,6 +629,27 @@ async fn supervise(
     let mut updating = false;
     let mut server_stopped = false;
     let mut cache = ProjectionCache::default();
+    let image_generation = Arc::new(AtomicUsize::new(0));
+    let mut image_job: Option<tokio::task::JoinHandle<()>> = None;
+    if remote.is_some() {
+        match crate::store::load(&device_directory.join("view.json")) {
+            Ok(Some(saved)) => {
+                cache.state = saved["state"].clone();
+                cache.seq = saved["seq"].as_u64();
+                cache.epoch = saved["epoch"].clone();
+                cache.dirty = true;
+                if let Some(mut projected) = cache.projected() {
+                    if let Some(remote) = &remote {
+                        let _ = cache_images(remote, &directory, &mut projected, false).await;
+                    }
+                    *snapshot.lock().expect("client snapshot") = Some(projected);
+                    wake();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report(error),
+        }
+    }
     while !stop.load(Ordering::Acquire) {
         cache.desired_thread = match history_thread.load(Ordering::Acquire) {
             0 => None,
@@ -570,9 +666,14 @@ async fn supervise(
                 attempt += 1;
                 report("The local server exited. Retrying with backoff. If it stays unavailable, close this client and run shina serve to inspect startup errors.".into());
             }
-            if let Ok(discovery) = Discovery::read(&directory) {
+            let discovery = remote
+                .as_ref()
+                .map(remote_discovery)
+                .map(Ok)
+                .unwrap_or_else(|| Discovery::read(&directory));
+            if let Ok(discovery) = discovery {
                 match tokio::select! {
-                    result = connect(&discovery, &device, &device_directory, &cache, true) => result,
+                    result = connect(&discovery, &device, &device_directory, &cache, true, remote.as_ref()) => result,
                     _ = stopped(&stop) => break,
                 } {
                     Ok(mut connected) => {
@@ -586,7 +687,15 @@ async fn supervise(
                         }
                         let mut sent = true;
                         for command in &pending {
-                            sent &= send(&mut connected, wire_command(command)).await;
+                            match uploaded_command(command, remote.as_ref()).await {
+                                Ok(command) => {
+                                    sent &= send(&mut connected, wire_command(&command)).await
+                                }
+                                Err(_) => {
+                                    sent = false;
+                                    break;
+                                }
+                            }
                         }
                         if sent {
                             socket = Some(connected);
@@ -602,8 +711,18 @@ async fn supervise(
                         report(error);
                         break;
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        next_spawn = Instant::now() + restart_delay(attempt);
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
+            }
+            if remote.is_some() {
+                tokio::select! {
+                    _ = tokio::time::sleep(next_spawn.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))) => {},
+                    _ = stopped(&stop) => break,
+                }
+                continue;
             }
             if !server_stopped && !updating && child.is_none() && Instant::now() >= next_spawn {
                 match crate::server_lock::Owner::acquire(&directory) {
@@ -631,7 +750,15 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
-                let message = wire_command(&command);
+                let prepared = match uploaded_command(&command,remote.as_ref()).await {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":error}})));
+                        wake();
+                        continue;
+                    }
+                };
+                let message = wire_command(&prepared);
                 pending.push_back(command);
                 if !send(connected, message).await { socket = None; }
             }
@@ -657,7 +784,31 @@ async fn supervise(
                                 continue;
                             }
                             if let Some(projected) = cache.projected() {
-                                *snapshot.lock().expect("client snapshot") = Some(projected);
+                                let generation = image_generation.fetch_add(1,Ordering::AcqRel)+1;
+                                if remote.is_some() {
+                                    let saved = json!({"state":projected,"seq":cache.seq,"epoch":cache.epoch});
+                                    if let Err(error) = crate::store::write_atomic(&device_directory.join("view.json"), saved.to_string().as_bytes()) {
+                                        report(format!("Could not cache the remote view: {error}"));
+                                    }
+                                }
+                                *snapshot.lock().expect("client snapshot") = Some(projected.clone());
+                                if let Some(remote) = &remote {
+                                    if let Some(job) = image_job.take() { job.abort(); }
+                                    let version = image_generation.clone();
+                                    let remote = remote.clone();
+                                    let profile = directory.clone();
+                                    let snapshot = snapshot.clone();
+                                    let wake = wake.clone();
+                                    image_job = Some(tokio::spawn(async move {
+                                        let mut projected = projected;
+                                        if cache_images(&remote,&profile,&mut projected,true).await.is_ok() {
+                                            let mut snapshot = snapshot.lock().expect("client snapshot");
+                                            if version.load(Ordering::Acquire) != generation { return; }
+                                            *snapshot=Some(projected);
+                                            wake();
+                                        }
+                                    }));
+                                }
                             }
                             if value["method"] == "subscription.ready" || value["id"] == "subscribe" {
                                 let phase = cache.maintenance["phase"].as_str().unwrap_or("ready");
@@ -696,6 +847,9 @@ async fn supervise(
         }
     }
     ready.store(false, Ordering::Release);
+    if let Some(job) = image_job {
+        job.abort();
+    }
     if !updating && let Some(mut process) = child {
         // Only a process handle we spawned, with an authenticated matching instance, may be stopped.
         if owned_instance.is_some()
@@ -718,6 +872,187 @@ async fn supervise(
     }
 }
 
+async fn cache_images(
+    remote: &crate::peer::Link,
+    profile: &std::path::Path,
+    projected: &mut Value,
+    fetch: bool,
+) -> Result<(), String> {
+    fn paths(value: &Value, prefix: String, out: &mut Vec<String>) {
+        if out.len() >= 32 {
+            return;
+        }
+        match value {
+            Value::Object(object)
+                if object
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mime| mime.starts_with("image/"))
+                    && object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::attachments::safe_id)
+                    && object.get("path").is_none_or(Value::is_null) =>
+            {
+                out.push(prefix)
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    paths(
+                        value,
+                        format!("{prefix}/{}", key.replace('~', "~0").replace('/', "~1")),
+                        out,
+                    );
+                }
+            }
+            Value::Array(array) => {
+                for (index, value) in array.iter().enumerate() {
+                    paths(value, format!("{prefix}/{index}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut references = Vec::new();
+    paths(projected, String::new(), &mut references);
+    if references.is_empty() {
+        return Ok(());
+    }
+    let http = crate::peer::http()?;
+    for path in references {
+        let reference = &projected.pointer(&path).ok_or("Missing image reference.")?;
+        let id = reference["id"].as_str().ok_or("Missing image id.")?;
+        let length = reference["bytes"]
+            .as_u64()
+            .filter(|length| *length > 0 && *length <= crate::attachments::MAX_IMAGE_BYTES)
+            .ok_or("Invalid image length.")?;
+        let mapping = remote
+            .directory(profile)
+            .join("blobs")
+            .join(format!("{id}.json"));
+        let cached = crate::store::load(&mapping)
+            .ok()
+            .flatten()
+            .and_then(|value| crate::attachments::Attachment::from_value(&value).map(|_| value));
+        let attachment = if let Some(cached) = cached {
+            cached
+        } else {
+            if !fetch {
+                continue;
+            }
+            let address = remote.address()?;
+            let mut bytes = Vec::new();
+            while (bytes.len() as u64) < length {
+                let response = http
+                    .get(format!(
+                        "http://{address}/v1/blobs/{id}?offset={}&limit={}",
+                        bytes.len(),
+                        protocol::PAGE_BYTES
+                    ))
+                    .bearer_auth(&remote.token)
+                    .send()
+                    .await
+                    .map_err(|_| "Remote image unavailable.")?;
+                if !response.status().is_success()
+                    || response
+                        .content_length()
+                        .is_none_or(|count| count > protocol::MAX_PAGE_BYTES as u64)
+                {
+                    return Err("Invalid remote blob response.".into());
+                }
+                let chunk = response
+                    .bytes()
+                    .await
+                    .map_err(|_| "Remote image interrupted.")?;
+                if chunk.is_empty() || bytes.len() + chunk.len() > length as usize {
+                    return Err("Invalid remote blob length.".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let image = crate::attachments::store_uploaded(
+                &profile.join("attachments"),
+                reference["name"].as_str().unwrap_or("Image"),
+                &bytes,
+            )?;
+            let value = image.to_value();
+            crate::store::write_atomic(&mapping, value.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            value
+        };
+        *projected
+            .pointer_mut(&path)
+            .ok_or("Missing image reference.")? = attachment;
+    }
+    Ok(())
+}
+
+async fn uploaded_command(
+    command: &Command,
+    remote: Option<&crate::peer::Link>,
+) -> Result<Command, String> {
+    let mut prepared = command.clone();
+    let Some(remote) = remote.filter(|_| command.method == "thread.send") else {
+        return Ok(prepared);
+    };
+    let Some(attachments) = prepared.params["attachments"].as_array_mut() else {
+        return Ok(prepared);
+    };
+    let http = crate::peer::http()?;
+    let address = remote.address()?;
+    let base = format!("http://{address}");
+    for attachment in attachments {
+        if !attachment["path"].is_null() {
+            return Err("Local file paths cannot be sent to another machine. Attach an image or reference a path on that server in your message.".into());
+        }
+        let image = crate::attachments::Attachment::from_value(attachment)
+            .ok_or("The image is missing from this device.")?;
+        let bytes = crate::attachments::read(&image)?;
+        use sha2::Digest;
+        let response = http.post(format!("{base}/v1/uploads")).bearer_auth(&remote.token)
+            .json(&json!({"name":image.name,"length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}))
+            .send().await.map_err(|_| "Image upload could not start. Your draft was kept.")?;
+        if !response.status().is_success() {
+            return Err("Image upload refused. Your draft was kept.".into());
+        }
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|_| "Invalid upload response.")?;
+        let id = value["uploadId"]
+            .as_str()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .ok_or("Invalid upload identity.")?;
+        let mut offset = 0;
+        for chunk in bytes.chunks(protocol::MAX_PAGE_BYTES) {
+            let response = http
+                .put(format!("{base}/v1/uploads/{id}?offset={offset}"))
+                .bearer_auth(&remote.token)
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .map_err(|_| "Image upload interrupted. Your draft was kept.")?;
+            if !response.status().is_success() {
+                return Err("Image upload offset refused. Your draft was kept.".into());
+            }
+            offset += chunk.len();
+        }
+        let response = http
+            .post(format!("{base}/v1/uploads/{id}/commit"))
+            .bearer_auth(&remote.token)
+            .send()
+            .await
+            .map_err(|_| "Image commit interrupted. Your draft was kept.")?;
+        if !response.status().is_success() {
+            return Err("Image validation failed. Your draft was kept.".into());
+        }
+        *attachment = response
+            .json()
+            .await
+            .map_err(|_| "Invalid committed image.")?;
+    }
+    Ok(prepared)
+}
+
 /// Used by the service CLI and detached updater. Does not register a desktop PID.
 pub async fn local_rpc(
     directory: &std::path::Path,
@@ -736,6 +1071,7 @@ pub async fn local_rpc(
             &device_directory,
             &ProjectionCache::default(),
             false,
+            None,
         )
         .await?;
         let command = Command::new(method, args);
@@ -765,6 +1101,68 @@ pub async fn local_rpc(
     })
     .await
     .map_err(|_| "Maintenance request timed out.".to_string())?
+}
+
+fn remote_discovery(link: &crate::peer::Link) -> Discovery {
+    Discovery {
+        server_id: link.server_id.clone(),
+        instance_id: String::new(),
+        epoch: String::new(),
+        pid: 0,
+        started_at: 0,
+        port: 0,
+        protocol_major: protocol::MAJOR,
+        protocol_minor: protocol::MINOR,
+        binary_version: String::new(),
+        bootstrap_token: String::new(),
+    }
+}
+
+pub async fn remote_rpc(
+    link: &crate::peer::Link,
+    method: &str,
+    args: Value,
+) -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut socket = connect(
+            &remote_discovery(link),
+            &link.device_id,
+            std::path::Path::new(""),
+            &ProjectionCache::default(),
+            false,
+            Some(link),
+        )
+        .await?;
+        let command = Command::new(method, args);
+        socket
+            .send(wire_command(&command))
+            .await
+            .map_err(|_| "Remote command could not be sent.")?;
+        while let Some(message) = socket.next().await {
+            match message.map_err(|_| "Remote server disconnected.")? {
+                Message::Ping(payload) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|_| "Remote server disconnected.")?;
+                }
+                Message::Text(text) => {
+                    let value: Value =
+                        serde_json::from_str(&text).map_err(|_| "Invalid remote response.")?;
+                    if value["id"] == command.command_id.to_string() {
+                        if let Some(error) = value["error"]["message"].as_str() {
+                            return Err(error.into());
+                        }
+                        return Ok(value["result"].clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("Remote server disconnected before its receipt.".into())
+    })
+    .await
+    .map_err(|_| "Remote request timed out.".to_string())?
 }
 
 fn wire_command(command: &Command) -> Message {

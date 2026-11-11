@@ -350,7 +350,7 @@ pub struct Thread {
     serial: usize,
     state_loaded: bool,
     history_loaded: bool,
-    initializing: bool,
+    pub(crate) initializing: bool,
     session_started: Option<Instant>,
     last_activity: Instant,
     prewarm_attempted: bool,
@@ -2002,6 +2002,7 @@ impl Thread {
 
 pub struct State {
     pub client: Option<crate::client::Client>,
+    pub machines: crate::peer::Machines,
     headless: bool,
     command_receipts: Vec<crate::protocol::Receipt>,
     command_intents: std::collections::BTreeMap<String, crate::protocol::Command>,
@@ -2171,6 +2172,7 @@ impl State {
             crate::runtime::UiResource::new(|| rune::ImageCache::new(Arc::new(|| {})));
         let mut state = Self {
             client: None,
+            machines: Default::default(),
             headless: false,
             owner: None,
             command_receipts: Vec::new(),
@@ -2392,6 +2394,12 @@ impl State {
     }
     pub fn thread_directory(&self, index: usize) -> Result<PathBuf, String> {
         let thread = self.threads.get(index).ok_or("Thread does not exist.")?;
+        if self.client.is_some() && self.machines.selected != "local" {
+            return self.client_views["directories"][thread.id.to_string()]
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or("The remote server has not reported this thread's host directory.".into());
+        }
         crate::backend::BackendHost::resolve(&thread.machine)?;
         match thread.project {
             Some(id) => {
@@ -2657,6 +2665,10 @@ impl State {
     /// Switch the Add workspace palette to browsing folders, starting beside the current
     /// workspace or in the home folder.
     pub fn browse_for_project(&mut self) {
+        if self.machines.selected != "local" {
+            self.project_picker = Some(ProjectPicker::AddProject);
+            return;
+        }
         let start = self
             .project(self.current().project)
             .and_then(|p| p.path.parent().map(std::path::Path::to_path_buf))
@@ -2673,6 +2685,13 @@ impl State {
     }
     /// Add the typed folder, creating it first when it does not exist yet.
     pub fn add_browsed_project(&mut self) {
+        if self.machines.selected != "local" {
+            let path = PathBuf::from(&self.machines.project_path.text);
+            if let Err(error) = self.add_project(path) {
+                self.projects.menu_error = Some(error);
+            }
+            return;
+        }
         let path = crate::projects::expand_path(&self.picker_query.text);
         if path.as_os_str().is_empty() {
             return;
@@ -4825,6 +4844,9 @@ impl State {
             result?;
             return Ok(0);
         }
+        if !path.is_absolute() {
+            return Err("A workspace needs an absolute path on this server.".into());
+        }
         let path = match path.canonicalize() {
             Ok(path) if path.is_dir() => crate::projects::clean_path(&path),
             _ => return Err("That project folder could not be opened.".into()),
@@ -5072,7 +5094,7 @@ impl State {
             .as_array()
             .ok_or("Invalid project list.")?
             .iter()
-            .map(Project::from_value)
+            .map(|value| Project::from_record(value, self.client.is_none()))
             .collect();
         let mut canonical_projects: Vec<Project> = Vec::new();
         let mut project_remap = std::collections::HashMap::new();
@@ -5084,7 +5106,11 @@ impl State {
             }
             if let Some(existing) = canonical_projects.iter_mut().find(|existing| {
                 existing.machine == project.machine
-                    && crate::projects::same_path(&existing.path, &project.path)
+                    && if self.client.is_some() {
+                        existing.path == project.path
+                    } else {
+                        crate::projects::same_path(&existing.path, &project.path)
+                    }
             }) {
                 project_remap.insert(project.id, existing.id);
                 existing.hidden &= project.hidden;

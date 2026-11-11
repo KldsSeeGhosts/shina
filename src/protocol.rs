@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 2;
+pub const MINOR: u32 = 3;
 pub const MAX_CONTROL: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_BYTES: usize = 256 * 1024;
