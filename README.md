@@ -263,7 +263,7 @@ cargo run --example export-icons -- assets
 
 ## Crew artwork
 
-The four captains are original characters drawn as 40x40 pixel art by [`tools/crew_originals.py`](tools/crew_originals.py), framed like a Pokémon Mystery Dungeon bust and presented on the square crew tiles Capy uses. See [the artwork notes](assets/crew/README.md).
+The twelve captain portraits are original characters drawn as 40x40 pixel art by [`tools/crew_originals.py`](tools/crew_originals.py), framed like a Pokémon Mystery Dungeon bust and presented on the square crew tiles Capy uses. See [the artwork notes](assets/crew/README.md).
 
 Captains are the sidebar's first section. Each captain row shows a 36 px portrait, or 44 px for the open captain (otherwise the most urgent one), its name, and one status line such as "Working · 2 threads" or "Needs you · approval". The portrait slot, badge slot and timer slot have fixed sizes, so a status change never moves the row or its neighbors.
 
@@ -280,9 +280,9 @@ assets/crew/ember/Determined.png
 assets/crew/ember/Surprised.png
 assets/crew/ember/Dizzy.png
 assets/crew/ember/Sad.png
-...same six for juniper, sable, and pip
+...same six for juniper, sable, pip, bram, wren, rook, nia, jett, otto, bolt and kit
 ```
 
-A numeric folder (`assets/crew/0/Normal.png`) also works. `SHINA_SPRITES` wins over the workspace folder. All six faces must exist for a captain to use the override; otherwise that captain keeps the embedded artwork. The loader accepts any square PNG size and the app scales it into tiles from 20 px to 48 px.
+A numeric folder (`assets/crew/0/Normal.png`, up to `11`) also works. `SHINA_SPRITES` wins over the workspace folder. All six faces must exist for a captain to use the override; otherwise that captain keeps the embedded artwork. A set made for the original four therefore still works: the eight later captains have no folder in it and keep their embedded art. The loader accepts any square PNG size and the app scales it into tiles from 20 px to 48 px.
 
 A drop-in set with only the six faces keeps static portraits. To animate it, add all four strips beside the faces: `Idle.strip.png` (4 frames), `Working.strip.png` (4), `Attention.strip.png` (4) and `Happy.strip.png` (3). A strip is square frames side by side, and frame 0 should match the static face. The frame order is described in [the artwork notes](assets/crew/README.md). A missing strip or a strip with the wrong frame count leaves that captain static.
