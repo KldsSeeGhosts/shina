@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 7;
+pub const MINOR: u32 = 8;
 pub const HISTORY_ITEMS: &str = "history-items";
 pub const HISTORY_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use scoped history and live items.";
@@ -13,6 +13,7 @@ pub const HISTORY_LEASE_GONE_CODE: i64 = -32010;
 pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
 pub const PEER_TASKS: &str = "peer-tasks-v2";
 pub const THREAD_READ: &str = "thread-read-v2";
+pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
 pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;

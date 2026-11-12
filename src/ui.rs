@@ -5633,7 +5633,8 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
         .client
         .as_ref()
         .is_some_and(|client| !client.linked.is_empty());
-    let across = mode == ProjectPicker::Scope || mode == ProjectPicker::NewThread && multiple;
+    let across = matches!(mode, ProjectPicker::Scope | ProjectPicker::CaptainScope)
+        || mode == ProjectPicker::NewThread && multiple;
     if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
@@ -5643,11 +5644,33 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             choices.push((
                 PickerChoice::Project(id),
                 project.name.clone(),
-                (across && s.client.is_some()).then(|| s.machine_label(&s.machines.selected)),
+                (across && (s.client.is_some() || mode == ProjectPicker::CaptainScope))
+                    .then(|| s.machine_label(&s.machines.selected)),
             ));
         }
     }
-    if across && s.client.is_some() {
+    if mode == ProjectPicker::CaptainScope {
+        for peer in &s.peers {
+            for project in peer.capabilities["projects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if project["hidden"] == true {
+                    continue;
+                }
+                if let (Some(id), Some(name)) = (project["id"].as_u64(), project["name"].as_str()) {
+                    let choice = PickerChoice::MachineProject(peer.server_id.clone(), id as usize);
+                    if !choices.iter().any(|(existing, _, _)| *existing == choice) {
+                        choices.push((choice, name.into(), Some(peer.label.clone())));
+                    }
+                }
+            }
+        }
+    }
+    // Scope is authorized by the captain owner's peer links, not this desktop's
+    // device links. Their ids can differ, especially when its owner is remote.
+    if across && s.client.is_some() && mode != ProjectPicker::CaptainScope {
         for (server, view) in &s.machines.views {
             if server == &s.machines.selected {
                 continue;
@@ -5674,6 +5697,12 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
                 }
             }
         }
+    }
+    if mode == ProjectPicker::CaptainScope {
+        choices.sort_by_key(|(choice, _, _)| match choice {
+            PickerChoice::MachineProject(server, _) => (true, server.clone()),
+            _ => (false, String::new()),
+        });
     }
     if mode == ProjectPicker::NewThread && multiple {
         choices.retain(|(choice, _, _)| match choice {
@@ -5737,7 +5766,9 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         PickerChoice::NoProject => None,
         PickerChoice::Project(id) => Some(id),
         PickerChoice::MachineProject(server, id) => {
-            if mode == ProjectPicker::Scope {
+            if mode == ProjectPicker::CaptainScope {
+                captain_ui::toggle_remote_scope(s, server, id);
+            } else if mode == ProjectPicker::Scope {
                 s.set_machine_scope(server, Some(id), shift);
             } else if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
                 s.select_machine(&server);
@@ -5769,7 +5800,9 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
     }
 }
 
-/// Ported from KSG Code's CommandPalette: a centred modal that starts with a
+/// Ported from KSG Code's CommandPalette and CommandPaletteLookups project/environment
+/// grouping. Captain scope membership is Shina-specific.
+/// A centred modal that starts with a
 /// search field and moves with the arrow keys. Enter picks the highlighted row; Shift adds a
 /// workspace to the filter.
 fn project_picker(s: &State, p: Palette) -> El {
@@ -5868,7 +5901,9 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
-        if mode == ProjectPicker::NewThread && machine != &last_machine {
+        if matches!(mode, ProjectPicker::NewThread | ProjectPicker::CaptainScope)
+            && machine != &last_machine
+        {
             if let Some(machine) = machine {
                 list = list.child(
                     label(machine, SMALL, p.muted)
@@ -5888,6 +5923,13 @@ fn project_picker(s: &State, p: Palette) -> El {
                     projects
                         .iter()
                         .find(|project| project["id"].as_u64() == Some(*id as u64))
+                })
+                .or_else(|| {
+                    s.peers
+                        .iter()
+                        .find(|p| &p.server_id == server)
+                        .and_then(|p| p.capabilities["projects"].as_array())
+                        .and_then(|ps| ps.iter().find(|p| p["id"].as_u64() == Some(*id as u64)))
                 })
                 .and_then(|project| crate::projects::Project::from_record(project, false))
         } else {
@@ -5913,6 +5955,9 @@ fn project_picker(s: &State, p: Palette) -> El {
         let checked = match (mode, choice) {
             (ProjectPicker::CaptainScope, PickerChoice::Project(id)) => {
                 captain_ui::in_scope(s, *id)
+            }
+            (ProjectPicker::CaptainScope, PickerChoice::MachineProject(server, id)) => {
+                captain_ui::remote_in_scope(s, server, *id)
             }
             (ProjectPicker::Scope, PickerChoice::All) => s.project_scope == ProjectScope::All,
             (ProjectPicker::Scope, PickerChoice::NoProject) => {
@@ -9473,6 +9518,41 @@ pub(crate) mod tests {
                         "use the host path without joining on the client"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn captain_scope_picker_groups_remote_projects_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            connected_machines(&mut rt);
+            let server = uuid::Uuid::new_v4().to_string();
+            rt.state.peers.push(crate::peer::Peer {
+                server_id:server.clone(),host:"127.0.0.1:1".into(),label:"Studio".into(),
+                linked_at:0,last_reached_at:Some(0),last_error:None,
+                capabilities:json!({"projects":[{"id":1,"name":"Remote project","path":"C:\\project","machine":"local"}]}),
+            });
+            rt.state.open_picker(ProjectPicker::CaptainScope);
+            let choices = picker_choices(&rt.state, ProjectPicker::CaptainScope);
+            assert!(choices.iter().any(|(choice, _, _)|
+                matches!(choice, PickerChoice::MachineProject(owner, _) if owner == &server)));
+            assert!(!choices.iter().any(|(choice, _, _)|
+                matches!(choice, PickerChoice::MachineProject(owner, _) if owner == "studio")),
+                "desktop device links do not grant delegation on the captain owner's server");
+            rt.frame(0.0);
+            for key in [
+                "project-picker",
+                "picker-machine-0",
+                &format!("choose-project-{server}-1"),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {key} {rect:?}"
+                );
             }
         }
     }

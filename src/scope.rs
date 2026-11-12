@@ -2,7 +2,109 @@
 use super::*;
 use std::collections::BTreeMap;
 
+/// Project ids and paths belong to their owning server, never to the caller.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProject {
+    pub server: String,
+    pub project_id: ProjectId,
+}
+
 impl State {
+    pub fn remote_captain_scope(&self, captain: usize) -> Vec<RemoteProject> {
+        self.captain_remote_scopes
+            .get(&captain)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_remote_captain_scope(
+        &mut self,
+        captain: usize,
+        projects: Vec<RemoteProject>,
+    ) -> Result<(), String> {
+        if let Some(client) = &self.client {
+            let owner = if self.machines.selected == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&self.machines.selected)
+            };
+            if owner.is_none_or(|c| {
+                c.info.lock().expect("connection info")["protocolMinor"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    < 8
+            }) {
+                return Err("Update required on the captain's machine. Remote project scope requires a newer Shina server.".into());
+            }
+        }
+        if let Some(result) = self.remote(
+            "captain.scope",
+            json!({
+                "captain":captain,"projects":self.captain_scope(captain),"remoteProjects":projects
+            }),
+        ) {
+            return result.map(|_| ());
+        }
+        let unique = self.validate_remote_captain_scope(captain, projects)?;
+        self.captain_remote_scopes.insert(captain, unique);
+        if let Some(thread) = self
+            .captain_home(captain)
+            .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+        {
+            thread.scope_context_pending = true;
+        }
+        self.checkpoint();
+        Ok(())
+    }
+
+    pub(super) fn validate_remote_captain_scope(
+        &self,
+        captain: usize,
+        projects: Vec<RemoteProject>,
+    ) -> Result<Vec<RemoteProject>, String> {
+        self.require_captain(captain)?;
+        if self
+            .captain_home(captain)
+            .and_then(|id| self.threads.iter().find(|t| t.id == id))
+            .is_some_and(|t| t.status.busy() || t.configuring || t.queued())
+        {
+            return Err("Stop the captain's current turn before changing its scope.".into());
+        }
+        let mut unique = Vec::new();
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .map(|db| db.peers())
+            .transpose()?
+            .unwrap_or_else(|| self.peers.clone());
+        for project in projects {
+            if uuid::Uuid::parse_str(&project.server).is_err()
+                || project.project_id == 0
+                || project.project_id == usize::MAX
+            {
+                return Err(
+                    "Invalid remote scope project. Use its owning server id and project id.".into(),
+                );
+            }
+            let peer = peers
+                .iter()
+                .find(|p| p.server_id == project.server)
+                .ok_or("Unknown linked machine.")?;
+            if !peer.capabilities["projects"].as_array().is_some_and(|ps| {
+                ps.iter().any(|p| {
+                    p["id"].as_u64() == Some(project.project_id as u64) && p["hidden"] != true
+                })
+            }) {
+                return Err(format!(
+                    "Unknown project {} on {}.",
+                    project.project_id, peer.label
+                ));
+            }
+            if !unique.contains(&project) {
+                unique.push(project);
+            }
+        }
+        Ok(unique)
+    }
     /// Route a retained home's crew to the captain's current home without rewriting history.
     pub(super) fn effective_home(&self, home: usize) -> usize {
         self.threads
@@ -173,15 +275,31 @@ impl State {
     }
 
     pub(super) fn scope_value(&self, captain: Option<usize>) -> Value {
-        json!(
-            captain
-                .map(|id| self.captain_scope(id))
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|id| self.project(Some(*id)))
-                .map(Project::to_value)
-                .collect::<Vec<_>>()
-        )
+        let mut projects = captain
+            .map(|id| self.captain_scope(id))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| self.project(Some(*id)))
+            .map(Project::to_value)
+            .collect::<Vec<_>>();
+        for entry in captain
+            .map(|id| self.remote_captain_scope(id))
+            .unwrap_or_default()
+        {
+            let peer = self.peers.iter().find(|p| p.server_id == entry.server);
+            let mut value = peer
+                .and_then(|p| p.capabilities["projects"].as_array())
+                .and_then(|ps| {
+                    ps.iter()
+                        .find(|p| p["id"].as_u64() == Some(entry.project_id as u64))
+                })
+                .cloned()
+                .unwrap_or_else(|| json!({"id":entry.project_id}));
+            value["environmentId"] = json!(entry.server);
+            value["machine"] = json!(peer.map(|p| p.label.as_str()).unwrap_or(&entry.server));
+            projects.push(value);
+        }
+        json!(projects)
     }
 
     pub(super) fn scope_prompt(&self, captain: usize) -> String {
@@ -310,6 +428,22 @@ impl State {
             }
         }
         self.captain_scopes = scopes;
+        self.captain_remote_scopes = index
+            .get("captainRemoteScopes")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| "Invalid remote captain scopes.")?
+            .unwrap_or_default();
+        for (&captain, scope) in &self.captain_remote_scopes {
+            self.require_captain(captain)?;
+            if scope.iter().any(|p| {
+                uuid::Uuid::parse_str(&p.server).is_err()
+                    || p.project_id == 0
+                    || p.project_id == usize::MAX
+            }) {
+                return Err("Invalid remote captain scope project.".into());
+            }
+        }
         self.captain_homes = homes;
         for thread in &mut self.threads {
             let legacy_scratch =
@@ -371,6 +505,31 @@ fn activity(thread: &Thread) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_scope_requires_a_capable_owner_and_sends_an_additive_command() {
+        let mut state = fixture();
+        let (client, mut commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.info.lock().unwrap()["protocolMinor"] = json!(7);
+        state.client = Some(client);
+        let entry = RemoteProject {
+            server: uuid::Uuid::new_v4().to_string(),
+            project_id: 9,
+        };
+        let error = state
+            .set_remote_captain_scope(0, vec![entry.clone()])
+            .unwrap_err();
+        assert!(error.contains("Update required"));
+        assert!(commands.try_recv().is_err());
+        state.client.as_ref().unwrap().info.lock().unwrap()["protocolMinor"] = json!(8);
+        state
+            .set_remote_captain_scope(0, vec![entry.clone()])
+            .unwrap();
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.method, "captain.scope");
+        assert_eq!(command.params["projects"], json!([1]));
+        assert_eq!(command.params["remoteProjects"], json!([entry]));
+    }
 
     fn fixture() -> State {
         let mut state = State::new(".".into(), false);

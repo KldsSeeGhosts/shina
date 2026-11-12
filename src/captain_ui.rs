@@ -342,6 +342,7 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
 /// Workspace chips, added and removed through the workspace picker.
 fn scope_section(s: &State, p: Palette, captain: usize) -> El {
     let scope = s.captain_scope(captain);
+    let remote_scope = s.remote_captain_scope(captain);
     let add = icon_action(
         s,
         "brief-scope-add".into(),
@@ -353,11 +354,12 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
     let mut section = section(
         "brief-scope",
         "Scope",
-        (!scope.is_empty()).then(|| scope.len().to_string()),
+        (!(scope.is_empty() && remote_scope.is_empty()))
+            .then(|| (scope.len() + remote_scope.len()).to_string()),
         vec![add],
         p,
     );
-    if scope.is_empty() {
+    if scope.is_empty() && remote_scope.is_empty() {
         return section.child(quiet_note(
             "No workspace. This captain works as a general assistant in its own folder.",
             p,
@@ -407,6 +409,48 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                         let result = s.set_captain_scope(captain, scope);
                         report(s, result);
                     },
+                )),
+        );
+    }
+    for entry in remote_scope {
+        let peer = s.peers.iter().find(|peer| peer.server_id == entry.server);
+        let name = peer
+            .and_then(|p| p.capabilities["projects"].as_array())
+            .and_then(|ps| {
+                ps.iter()
+                    .find(|p| p["id"].as_u64() == Some(entry.project_id as u64))
+            })
+            .and_then(|p| p["name"].as_str())
+            .unwrap_or("Missing workspace");
+        let machine = peer.map(|p| p.label.as_str()).unwrap_or(&entry.server);
+        let text = format!("{name}, {machine}");
+        let server = entry.server.clone();
+        let id = entry.project_id;
+        chips = chips.child(
+            row()
+                .key(format!("brief-scope-{server}-{id}"))
+                .label(&text)
+                .h(28.0)
+                .pl(8.0)
+                .pr(2.0)
+                .gap(6.0)
+                .center_y()
+                .max_w(PANEL_WIDTH - 32.0)
+                .radius(4.0)
+                .border(1.0, hairline(p))
+                .child(
+                    label(text.clone(), TextStyle::new(12.5, 500.0), p.ink)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                .child(icon_action(
+                    s,
+                    format!("brief-scope-remove-{server}-{id}"),
+                    &format!("Remove {text} from scope"),
+                    icon("close", p.muted),
+                    p,
+                    move |s| toggle_remote_scope(s, server.clone(), id),
                 )),
         );
     }
@@ -1334,6 +1378,33 @@ pub(super) fn in_scope(s: &State, project: crate::projects::ProjectId) -> bool {
     brief_captain(s).is_some_and(|captain| s.captain_scope(captain).contains(&project))
 }
 
+pub(super) fn remote_in_scope(s: &State, server: &str, project: usize) -> bool {
+    brief_captain(s).is_some_and(|captain| {
+        s.remote_captain_scope(captain)
+            .iter()
+            .any(|entry| entry.server == server && entry.project_id == project)
+    })
+}
+
+pub(super) fn toggle_remote_scope(s: &mut State, server: String, project: usize) {
+    s.project_picker = None;
+    let Some(captain) = brief_captain(s) else {
+        return;
+    };
+    let entry = crate::model::RemoteProject {
+        server,
+        project_id: project,
+    };
+    let mut scope = s.remote_captain_scope(captain);
+    if scope.contains(&entry) {
+        scope.retain(|p| p != &entry);
+    } else {
+        scope.push(entry);
+    }
+    let result = s.set_remote_captain_scope(captain, scope);
+    report(s, result);
+}
+
 /// Settings rows for background work, as KSG's `SettingsRow` (`settings/settingsLayout.tsx`):
 /// a `text-sm font-medium` title over a one-line `text-xs` muted description, with the
 /// control at the end, and Keep awake's three choices as KSG's segmented `ToggleGroup`.
@@ -2010,6 +2081,36 @@ mod tests {
             );
             let (flag, _) = rt.presented("brief-pennant").unwrap();
             assert!(flag[1] >= rule[1] + rule[3], "{width}: {flag:?} {rule:?}");
+        }
+    }
+
+    #[test]
+    fn remote_scope_chips_and_picker_preserve_machine_and_project_ids() {
+        for width in WIDTHS {
+            let (mut rt, _) = brief_runtime(width);
+            let server = uuid::Uuid::new_v4().to_string();
+            rt.state.peers.push(crate::peer::Peer {
+                server_id: server.clone(), host:"127.0.0.1:1".into(), label:"Studio".into(),
+                linked_at:0, last_reached_at:Some(0), last_error:None,
+                capabilities:json!({"projects":[{"id":9,"name":"Scratch","path":"C:\\scratch","machine":"local"}]}),
+            });
+            press(&mut rt, "brief-scope-add");
+            let key = format!("choose-project-{server}-9");
+            assert!(rt.presented(&key).is_some(), "{width}");
+            press(&mut rt, &key);
+            assert_eq!(
+                rt.state.remote_captain_scope(0),
+                vec![crate::model::RemoteProject {
+                    server: server.clone(),
+                    project_id: 9,
+                }]
+            );
+            assert!(
+                rt.presented(&format!("brief-scope-{server}-9")).is_some(),
+                "{width}"
+            );
+            press(&mut rt, &format!("brief-scope-remove-{server}-9"));
+            assert!(rt.state.remote_captain_scope(0).is_empty());
         }
     }
 

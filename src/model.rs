@@ -48,6 +48,7 @@ mod memory;
 mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
+pub use scope::RemoteProject;
 #[path = "codex_model.rs"]
 mod codex_model;
 #[path = "remote_tasks.rs"]
@@ -2434,6 +2435,7 @@ pub struct State {
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
+    captain_remote_scopes: std::collections::BTreeMap<usize, Vec<RemoteProject>>,
     captain_homes: std::collections::BTreeMap<usize, usize>,
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
@@ -2615,6 +2617,7 @@ impl State {
             captain_project: None,
             captains: Vec::new(),
             captain_scopes: Default::default(),
+            captain_remote_scopes: Default::default(),
             captain_homes: Default::default(),
             memory: Arc::default(),
             captain_editor: None,
@@ -4980,7 +4983,8 @@ impl State {
                             .into(),
                     );
                 }
-                if args["target"].get("machine").is_some() && args["target"]["machine"] != "local" {
+                parse_delegation_target(args)?;
+                if remote_tasks::target_machine(args)?.is_some_and(|machine| machine != "local") {
                     return self.delegate_remote(caller_index, args);
                 }
                 self.check_task_capacity(caller)?;
@@ -6689,6 +6693,7 @@ impl State {
             "cloneParent": self.projects.recents.clone_parent,
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "captainScopes":self.captain_scopes,
+            "captainRemoteScopes":self.captain_remote_scopes,
             "captainHomes":self.captain_homes,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
@@ -7274,7 +7279,13 @@ pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationT
     if let Some(key) = object.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "machine" | "harness" | "provider" | "model" | "options"
+            "machine"
+                | "environmentId"
+                | "projectId"
+                | "harness"
+                | "provider"
+                | "model"
+                | "options"
         )
     }) {
         return Err(format!(
@@ -7291,7 +7302,27 @@ pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationT
                 .ok_or("target.harness must be pi, codex, claude, or an installed ACP id.")
         })
         .transpose()?;
-    if !object.contains_key("model") && harness.is_none() && !object.contains_key("machine") {
+    remote_tasks::target_machine(args)?;
+    if let Some(project) = object.get("projectId") {
+        if project
+            .as_u64()
+            .is_none_or(|id| id == 0 || id >= usize::MAX as u64)
+        {
+            return Err(
+                "target.projectId must be a positive project id on the named machine.".into(),
+            );
+        }
+        if remote_tasks::target_machine(args)?.is_none_or(|machine| machine == "local") {
+            return Err("target.projectId requires target.environmentId or target.machine.".into());
+        }
+        if args.get("workspace").is_some() {
+            return Err("Pass target.projectId or workspace, not both.".into());
+        }
+    }
+    if !object.contains_key("model")
+        && harness.is_none()
+        && remote_tasks::target_machine(args)?.is_none()
+    {
         return Err("target.model is required when target is set without a harness.".into());
     }
     let model = object

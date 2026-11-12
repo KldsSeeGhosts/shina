@@ -235,6 +235,68 @@ pub struct PeerOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_explicit_project_cannot_use_git_identity_as_scope_authorization() {
+        let mut state = fixture();
+        let error = state.mcp_call(1, "delegate_task", &json!({
+            "prompt":"Do not bypass scope with a matching origin",
+            "target":{"environmentId":state.peers[0].server_id,"projectId":9,"model":"fixture"}
+        })).unwrap_err();
+        assert!(
+            error.contains("Project")
+                && error.contains("Target")
+                && error.contains("outside the caller's scope"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_remote_scope_does_not_require_a_local_repository() {
+        let mut state = fixture();
+        state.tasks.clear();
+        state.threads.truncate(1);
+        state.captains = Captain::presets();
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.threads[0].project = None;
+        state.set_captain_scope(0, vec![]).unwrap();
+        let server = state.peers[0].server_id.clone();
+        state
+            .set_remote_captain_scope(
+                0,
+                vec![RemoteProject {
+                    server: server.clone(),
+                    project_id: 9,
+                }],
+            )
+            .unwrap();
+        state.peers[0].capabilities["projects"][0]["gitRemote"] = Value::Null;
+        let result = state.mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Remote-only workspace",
+                "target":{"environmentId":server,"projectId":9,"model":"fixture"}
+            }),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let denied = state.mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Outside scope",
+                "target":{"environmentId":server,"projectId":99,"model":"fixture"}
+            }),
+        );
+        assert!(denied.is_err());
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        assert_eq!(
+            restored.remote_captain_scope(0),
+            state.remote_captain_scope(0)
+        );
+    }
     fn fixture() -> State {
         let directory =
             std::env::temp_dir().join(format!("shina-peer-model-{}", uuid::Uuid::new_v4()));
@@ -270,6 +332,11 @@ mod tests {
                 .success()
         );
         state.projects.entries.push(Project::new(1, workspace));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while repository(&state.projects.entries[0].path).is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         state.projects.next_id = 2;
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
@@ -278,7 +345,7 @@ mod tests {
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
         });
-        let args = json!({"prompt":"A bounded brief","workspace":9,"client_request_id":"stable",
+        let args = json!({"prompt":"A bounded brief","client_request_id":"stable",
             "target":{"machine":"Target","model":"fixture","options":{"reasoning":"off"}}});
         state.mcp_call(1, "delegate_task", &args).unwrap();
         assert_eq!(
@@ -539,7 +606,7 @@ mod tests {
     fn remote_tasks_share_the_existing_capacity_limits() {
         let mut state = fixture();
         for number in 1..8 {
-            state.mcp_call(1,"delegate_task",&json!({"prompt":"A bounded brief","workspace":9,
+            state.mcp_call(1,"delegate_task",&json!({"prompt":"A bounded brief",
                 "client_request_id":format!("task-{number}"),"target":{"machine":"Target","model":"fixture"}})).unwrap();
         }
         assert_eq!(
@@ -558,7 +625,7 @@ mod tests {
                 .count(),
             5
         );
-        assert!(state.mcp_call(1,"delegate_task",&json!({"prompt":"One too many","workspace":9,"target":{"machine":"Target","model":"fixture"}})).unwrap_err().contains("8 unfinished"));
+        assert!(state.mcp_call(1,"delegate_task",&json!({"prompt":"One too many","target":{"machine":"Target","model":"fixture"}})).unwrap_err().contains("8 unfinished"));
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -888,8 +955,37 @@ pub fn retry_delay(attempt: u32) -> u64 {
     2_000u64.saturating_mul(1u64 << attempt.min(8)).min(300_000)
 }
 
-/// Canonical repository identity, never a path translation or checkout synchronization.
+/// KSG RepositoryIdentityResolver's one-minute cache. Reducers only read the cache;
+/// bounded git processes run on a worker, including cold and negative lookups.
 pub(super) fn repository(path: &std::path::Path) -> Option<String> {
+    repository_entry(path).0
+}
+
+fn repository_entry(path: &std::path::Path) -> (Option<String>, bool) {
+    type Entry = (Option<Option<String>>, Instant, bool);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Entry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut entries = cache.lock().expect("repository cache");
+    let entry = entries
+        .entry(path.to_owned())
+        .or_insert_with(|| (None, Instant::now() - Duration::from_secs(60), false));
+    let value = (entry.0.clone().flatten(), entry.0.is_some());
+    if !entry.2 && entry.1.elapsed() >= Duration::from_secs(60) {
+        entry.2 = true;
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            let value = read_repository(&path);
+            cache
+                .lock()
+                .expect("repository cache")
+                .insert(path, (Some(value), Instant::now(), false));
+        });
+    }
+    value
+}
+
+fn read_repository(path: &std::path::Path) -> Option<String> {
     let output = crate::process::output(
         std::process::Command::new("git").arg("-C").arg(path).args([
             "config",
@@ -907,6 +1003,25 @@ pub(super) fn repository(path: &std::path::Path) -> Option<String> {
         .flatten()
 }
 
+pub(super) fn target_machine(args: &Value) -> Result<Option<&str>, String> {
+    let target = &args["target"];
+    let read = |key: &str| {
+        target
+            .get(key)
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("target.{key} must name a linked machine."))
+            })
+            .transpose()
+    };
+    let environment = read("environmentId")?;
+    let machine = read("machine")?;
+    if environment.is_some() && machine.is_some() && environment != machine {
+        return Err("target.environmentId and target.machine disagree. Pass one.".into());
+    }
+    Ok(environment.or(machine))
+}
 fn canonical_remote(remote: &str) -> Option<String> {
     let remote = remote.trim();
     let (host, path) = if remote.contains("://") {
@@ -946,6 +1061,7 @@ pub(super) fn match_project(
         .ok_or("Peer projects are unavailable.")?;
     let matches: Vec<_> = projects
         .iter()
+        .filter(|p| p["hidden"] != true)
         .filter(|p| match workspace {
             Some(Value::Number(id)) => p["id"].as_number() == Some(id),
             Some(Value::String(name)) => {
@@ -960,8 +1076,18 @@ pub(super) fn match_project(
         .collect();
     if matches.len() != 1 {
         return Err(format!(
-            "No single target project matches. Pass workspace as an id or path on that machine. Projects: {}",
-            serde_json::to_string(projects).expect("projects")
+            "{} Pass target.projectId on the named machine. Projects: {}",
+            if matches.is_empty() {
+                "No target project matches. Repository identities may still be refreshing."
+            } else {
+                "Several projects there have this repository. Choose an explicit project."
+            },
+            serde_json::to_string(&if matches.is_empty() {
+                projects.clone()
+            } else {
+                matches.into_iter().cloned().collect()
+            })
+            .expect("projects")
         ));
     }
     Ok(matches[0].clone())
@@ -1235,10 +1361,7 @@ impl State {
         {
             return Err("Open the captain's primary home to delegate new work. This is an earlier conversation.".into());
         }
-        let machine = args["target"]["machine"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("target.machine must name a linked server.")?;
+        let machine = target_machine(args)?.ok_or("target.machine must name a linked server.")?;
         let request = args
             .get("client_request_id")
             .map(|v| {
@@ -1287,13 +1410,22 @@ impl State {
             .map(str::trim)
             .filter(|s| !s.is_empty() && s.len() <= 48 * 1024)
             .ok_or("prompt must contain a brief of at most 48 KiB.")?;
-        let source = self.project(self.threads[caller].project);
-        let remote = source.and_then(|p| repository(&p.path));
-        let project = match_project(
-            &peer.capabilities["projects"],
-            args.get("workspace"),
-            remote.as_deref(),
-        )?;
+        let explicit = args["target"]
+            .get("projectId")
+            .or_else(|| args.get("workspace"));
+        if explicit.is_none() && peer.capabilities["repositoryIdentitiesReady"] == false {
+            return Err(format!(
+                "Repository identities on {} are still refreshing. Retry discovery or pass target.projectId from the captain's scope.",
+                peer.label
+            ));
+        }
+        let remote = if explicit.is_none() {
+            self.project(self.threads[caller].project)
+                .and_then(|p| repository(&p.path))
+        } else {
+            None
+        };
+        let project = match_project(&peer.capabilities["projects"], explicit, remote.as_deref())?;
         let scope = if self.threads[caller].captain_home {
             self.threads[caller]
                 .captain
@@ -1302,15 +1434,28 @@ impl State {
         } else {
             self.threads[caller].project.into_iter().collect()
         };
-        if !project["gitRemote"].as_str().is_some_and(|remote| {
-            scope
-                .into_iter()
-                .filter_map(|id| self.project(Some(id)))
-                .any(|project| repository(&project.path).as_deref() == Some(remote))
-        }) {
+        let explicitly_scoped = self.threads[caller]
+            .captain
+            .filter(|_| self.threads[caller].captain_home)
+            .is_some_and(|id| {
+                self.remote_captain_scope(id).iter().any(|entry| {
+                    entry.server == peer.server_id
+                        && project["id"].as_u64() == Some(entry.project_id as u64)
+                })
+            });
+        let automatic_scope = explicit.is_none()
+            && project["gitRemote"].as_str().is_some_and(|remote| {
+                scope
+                    .into_iter()
+                    .filter_map(|id| self.project(Some(id)))
+                    .any(|project| repository(&project.path).as_deref() == Some(remote))
+            });
+        if !explicitly_scoped && !automatic_scope {
             return Err(format!(
-                "The remote workspace is outside the caller's scope. It must have the git remote of a scoped home workspace. Projects: {}",
-                peer.capabilities["projects"]
+                "Project {} ({}) on {} is outside the caller's scope. Add it to the captain's scope before delegating.",
+                project["name"].as_str().unwrap_or("Unknown"),
+                project["id"],
+                peer.label
             ));
         }
         let target = parse_delegation_target(args)?;
@@ -1484,6 +1629,13 @@ impl State {
                         value
                     })
                     .collect::<Vec<_>>()
+            );
+            capabilities["repositoryIdentitiesReady"] = json!(
+                self.projects
+                    .entries
+                    .iter()
+                    .filter(|p| !p.hidden)
+                    .all(|p| repository_entry(&p.path).1)
             );
             return Ok(capabilities);
         }
@@ -1764,6 +1916,11 @@ impl State {
     pub fn dispatch_peer_work(&mut self) {
         if !self.headless {
             return;
+        }
+        for project in &self.projects.entries {
+            if project.machine == "local" {
+                repository(&project.path);
+            }
         }
         let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) else {
             return;

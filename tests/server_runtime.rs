@@ -610,7 +610,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
         "accepted"
     );
     let parent=client.command("thread.create",json!({"project":1}),uuid::Uuid::new_v4())["result"]["result"]["threadId"].as_u64().unwrap();
-    let args = json!({"prompt":"remote-long-fixture","workspace":1,"client_request_id":"one-launch",
+    let args = json!({"prompt":"remote-long-fixture","client_request_id":"one-launch",
         "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
     let delegated = client.command(
         "task.delegate",
@@ -899,6 +899,193 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     drop(target_client);
     home.stop();
     target.stop();
+}
+
+#[test]
+fn remote_project_scope_selects_remote_only_git_plain_and_scratch_and_survives_reconnect() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let discovery = target.discovery();
+    let mut there = target.client(uuid::Uuid::new_v4());
+    for name in ["remote-only", "plain", "scratch", "duplicate", "outside"] {
+        let path = target.root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        if matches!(name, "remote-only" | "duplicate") {
+            assert!(
+                Command::new("git")
+                    .args(["init", "--quiet"])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&path)
+                    .args([
+                        "remote",
+                        "add",
+                        "origin",
+                        "https://example.com/only-there.git"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert_eq!(
+            there.command("project.put", json!({"path":path}), uuid::Uuid::new_v4())["result"]["status"],
+            "accepted"
+        );
+    }
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(code.status.success());
+    let output = String::from_utf8(code.stdout).unwrap();
+    let code = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let linked = home.cli(&[
+        "peer",
+        "link",
+        &format!("127.0.0.1:{}", discovery["port"]),
+        code,
+    ]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut here = home.client(uuid::Uuid::new_v4());
+    here.until(|state| {
+        state["peers"]
+            .as_array()
+            .is_some_and(|ps| ps.iter().any(|p| p["serverId"] == discovery["serverId"]))
+    });
+    assert_eq!(
+        here.command(
+            "captain.put",
+            json!({"record":{"name":"Remote captain","role":"","instructions":"","portrait":0}}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let opened = here.command(
+        "captain.open",
+        json!({"captain":0,"project":null}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(opened["result"]["status"], "accepted", "{opened}");
+    let parent = opened["result"]["result"]["threadId"].clone();
+    let scoped = json!(
+        [1, 2, 3, 4]
+            .into_iter()
+            .map(|id| json!({"server":discovery["serverId"],"projectId":id}))
+            .collect::<Vec<_>>()
+    );
+    let scope = here.command(
+        "captain.scope",
+        json!({"captain":0,"projects":[],"remoteProjects":scoped}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(scope["result"]["status"], "accepted", "{scope}");
+    for project in [1, 2, 3, 4] {
+        let args = json!({"prompt":"remote-long-fixture","client_request_id":format!("project-{project}"),
+            "target":{"environmentId":discovery["serverId"],"projectId":project,"model":"fixture"}});
+        let response = here.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(response["result"]["status"], "accepted", "{response}");
+        assert_eq!(response["result"]["result"]["project"]["id"], project);
+        assert_eq!(
+            response["result"]["result"]["machine"],
+            discovery["serverId"]
+        );
+        here.until(|s| {
+            s["index"]["tasks"].as_array().unwrap().iter().any(|t| {
+                t["remote"]["project"]["id"] == project && t["remote"]["threadId"].is_number()
+            })
+        });
+        there.until(|s| {
+            s["index"]["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["project"] == project && t["peerOrigin"]["taskId"].is_string())
+        });
+    }
+    let denied = here.command("task.delegate", json!({"threadId":parent,"args":{
+        "prompt":"Denied","target":{"environmentId":discovery["serverId"],"projectId":5,"model":"fixture"}}}), uuid::Uuid::new_v4());
+    assert_eq!(denied["result"]["status"], "rejected", "{denied}");
+    assert!(denied.to_string().contains("outside"));
+    drop(here);
+    home.stop();
+    home.launch(&["serve"]);
+    let mut here = home.client(uuid::Uuid::new_v4());
+    let retry = here.command(
+        "task.delegate",
+        json!({"threadId":parent,"args":{
+        "prompt":"remote-long-fixture","client_request_id":"project-4",
+        "target":{"environmentId":discovery["serverId"],"projectId":4,"model":"fixture"}}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(retry["result"]["status"], "accepted", "{retry}");
+    assert_eq!(
+        here.snapshot["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["remote"]["project"]["id"] == 4)
+            .count(),
+        1
+    );
+    let local = home.root.join("local-counterpart");
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&local)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&local)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/only-there.git"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    here.command("project.put", json!({"path":local}), uuid::Uuid::new_v4());
+    let ordinary = here.command("thread.create", json!({"project":1}), uuid::Uuid::new_v4())["result"]["result"]["threadId"].clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ambiguous = here.command("task.delegate", json!({"threadId":ordinary,"args":{
+            "prompt":"Must not guess a checkout","target":{"environmentId":discovery["serverId"],"model":"fixture"}}}), uuid::Uuid::new_v4());
+        assert_eq!(ambiguous["result"]["status"], "rejected", "{ambiguous}");
+        let text = ambiguous.to_string();
+        if text.contains("Several projects") {
+            assert!(
+                text.contains("remote-only") && text.contains("duplicate"),
+                "{text}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "{ambiguous}");
+    }
 }
 
 #[test]

@@ -4,7 +4,7 @@ A Captain is the assistant, with a profile, one primary home conversation, an or
 
 A Thread is a conversation backed by Pi or an ACP session. A captain's home is a thread, not a separate assistant for each project. A Task is a durable delegated brief, state, result and delivery record. Its worker has a separate thread and cannot delegate further. Resetting the captain's conversation does not erase its tasks.
 
-When machines are linked, the new captain editor's "Lives on" row chooses its home server. The choice is read-only after creation. Workspace choices and folder browsing stay on that server, including when adding folders to an existing captain's scope. Switching the home server while creating a captain retains the profile fields and clears the previous server's workspace choice. It does not copy folders or delegate across servers.
+When machines are linked, the new captain editor's "Lives on" row chooses its home server. The choice is read-only after creation. Folder browsing stays on that server. The Brief scope picker also lists projects on linked peers, grouped by machine. Switching the home server while creating a captain retains the profile fields and clears the previous server's workspace choice. It does not copy folders.
 
 ## Continuous homes and migration
 
@@ -19,6 +19,12 @@ Legacy project-less Pi homes used thread scratch folders. Migration resolves the
 A captain may have zero or more workspaces. An empty scope means a general assistant. Its home runs in `captains/<captain-id>/scratch` under Shina's data directory. One workspace uses that project's folder. Several workspaces use the first project's folder, and the prompt lists every scoped project id and path.
 
 `delegate_task` accepts optional `workspace`, either a project id or a path in scope. It is required with several scoped workspaces. A missing value uses the only workspace or the general assistant's project-less worker scratch folder. An explicit workspace outside scope is rejected before a child or task is created. Lone threads may delegate only into their own workspace.
+
+Remote scope entries contain an owning server id and project id in the additive `captainRemoteScopes` index field. They do not change the home conversation's working directory. A home with only remote scope entries keeps its own scratch directory. `captain.scope` accepts optional `remoteProjects`, an array of `{"server":"<server id>","projectId":9}`. Omitting it preserves remote scope.
+
+For remote delegation, discover projects through `orchestrator_capabilities.peers[].capabilities.projects`, then call `delegate_task` with `{"prompt":"Inspect the project","target":{"environmentId":"<server id>","projectId":9,"model":"<advertised model>"}}`. `target.machine` remains an alias for `environmentId`; `workspace` remains an alias for a target-owned project id or exact opaque path. An explicit project must be in the captain's remote scope. It needs no local counterpart or Git origin. When no explicit project is given, Shina matches the caller's primary local project's Git origin and requires exactly one matching target project. Ambiguous matches return the candidates, never the first checkout. Paths stay on their owning machine.
+
+Remote scope editing requires protocol minor 8 and advertises `remote-project-scope-v1`. Older owners produce an update-required error. The peer launch contract remains unchanged, so targets supporting `peer-tasks-v2` and `thread-read-v2` still accept these tasks. Repository identities refresh on background workers, with a one-minute cache and a two-second Git timeout. Cold discovery reports `repositoryIdentitiesReady:false`; automatic matching returns a retry message until identities are complete, while explicit scoped projects remain usable.
 
 Scope is an application routing limit, not an OS sandbox. The agent still has the user's filesystem permissions. Captain homes start in read-only mode and receive instructions to delegate code changes. Existing saved permission modes remain user-controlled. Delegated workers use the selected workspace even when it differs from the home.
 

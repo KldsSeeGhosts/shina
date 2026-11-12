@@ -578,6 +578,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         history_items = minor >= 7;
                         if history_items { capabilities.push(protocol::HISTORY_ITEMS); }
                         if minor >= 7 { capabilities.extend([protocol::PEER_TASKS, protocol::THREAD_READ]); }
+                        if minor >= 8 { capabilities.push(protocol::REMOTE_PROJECT_SCOPE); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -1308,7 +1309,9 @@ mod tests {
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;
-            let mut target=Fixture::new("peer-target").await;
+            // The project scope lives on the current home. Launch remains compatible
+            // with the prior peer contract; no new permission is sent to the target.
+            let mut target=Fixture::with_minor("peer-target", 7).await;
             let user=target.link(&target.shared.directory.join("client")).await;
             let workspace=target.shared.directory.join("workspace");
             std::fs::create_dir_all(&workspace).unwrap();

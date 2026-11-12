@@ -1486,6 +1486,7 @@ impl State {
             self.projects.entries.clear();
             self.captains.clear();
             self.captain_scopes.clear();
+            self.captain_remote_scopes.clear();
             self.captain_homes.clear();
             self.tasks.clear();
         }
@@ -2550,10 +2551,24 @@ impl State {
                     return Err(editor.error.unwrap_or("Could not save the captain.".into()));
                 }
             }
-            "captain.scope" => self.set_captain_scope(
-                number("captain")?,
-                serde_json::from_value(args["projects"].clone()).map_err(|e| e.to_string())?,
-            )?,
+            "captain.scope" => {
+                let captain = number("captain")?;
+                let remote = args
+                    .get("remoteProjects")
+                    .map(|value| serde_json::from_value::<Vec<RemoteProject>>(value.clone()))
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                if let Some(remote) = &remote {
+                    self.validate_remote_captain_scope(captain, remote.clone())?;
+                }
+                self.set_captain_scope(
+                    captain,
+                    serde_json::from_value(args["projects"].clone()).map_err(|e| e.to_string())?,
+                )?;
+                if let Some(remote) = remote {
+                    self.set_remote_captain_scope(captain, remote)?;
+                }
+            }
             "captain.reset" => self.reset_captain_conversation(number("captain")?)?,
             "memory.put" => {
                 let captain = number("captain")?;
