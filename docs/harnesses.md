@@ -8,7 +8,13 @@ Pi remains CPA-only. Codex, Claude and ACP agents use their own configured provi
 
 The built-in `codex` harness runs `codex app-server` over JSONL stdio. It is ported from KSG Code's MIT-licensed effect-codex-app-server client, replay protocol, CodexAdapterV2 and CodexDeveloperInstructions. It does not use codex-acp. Shina finds Codex on PATH or in its Windows per-user installation directory. `SHINA_CODEX_CLI` may name a native executable or a JavaScript entry point. Codex inherits its own provider environment and configuration directories.
 
-Shina initializes the connection once, sends `initialized`, discovers models and exact reasoning efforts with paginated `model/list`, then creates or resumes the saved Codex thread. Model selections are per-turn protocol overrides. No configuration file or login changes occur. Text and file/folder paths use Codex text input items. Images use typed image items with data URLs, as KSG does.
+Protocol verification used Codex CLI **0.167.2**, with `codex app-server generate-json-schema --experimental --out <temporary-directory>`, and KSG's generated `packages/effect-codex-app-server/src/_generated/schema.gen.ts` and `meta.gen.ts`. The checked contracts include initialization, model and skill listing, thread start/resume/fork/revert, full turn pagination, goal get/set/clear, feedback upload, turn service-tier overrides, account rate-limit updates and every `ThreadItem` variant. The installed schema additionally includes `thread/settings/update`, absent from KSG's generated request types, which Shina uses to apply the current policy and model before native goal activation. The official protocol guide is <https://developers.openai.com/codex/app-server/>.
+
+At app startup, an off-UI-thread, short-lived app-server runs `initialize`, `initialized`, paginated `model/list` and project-scoped `skills/list`, then exits. It creates no Codex thread and sends no prompt. Models and exact reasoning efforts stay in memory for draft pickers, all Codex threads and `orchestrator_capabilities`. Server projections also carry this metadata to desktop drafts. Refresh models repeats discovery, and refreshes the active session's model and command lists. Changing the working directory refreshes the skill inventory without rereading the shared Codex model catalog. A live `thread/settings/updated` working-directory change also clears the old skills and forces a new directory-scoped `skills/list`. A missing CLI or failed probe leaves a visible picker explanation and retains session-time discovery as a fallback. Authentication denial stops automatic startup until the user takes an explicit recovery action.
+
+Conversation connections initialize independently, discover their live metadata, then create, resume or fork the saved thread. Model selections are per-turn protocol overrides. No configuration file or login changes occur. Text and file/folder paths use Codex text input items. Images use typed image items with data URLs, as KSG does.
+
+When a model advertises `serviceTiers`, or the deprecated `additionalSpeedTiers`, its reasoning picker has KSG's small service-tier segments. Standard uses the documented `default` id; other ids and labels come from the catalog. The choice belongs to the thread, survives app restart and goes in `turn/start.serviceTierForTurn`. It never changes the CLI configuration or the native thread's default service tier. A model change clears the explicit choice. Models without tier metadata have no control.
 
 | Shina access mode | Codex approval policy | Codex sandbox |
 | --- | --- | --- |
@@ -19,19 +25,37 @@ Shina initializes the connection once, sends `initialized`, discovers models and
 
 The first three map KSG's runtime modes. Read only additionally refuses all command, file-change and permission escalation requests without a dialog. Codex enforces its filesystem sandbox. Shina does not disable Windows security settings or set up a sandbox with elevation. If the installed Codex cannot enforce the requested sandbox, the operation fails instead of falling back to Full access.
 
-Command and patch approvals use Shina's existing confirmation dialogs. Agent text, reasoning, plans, commands, patches and MCP/tool items enter Shina's event reducer. `thread/tokenUsage/updated.last` supplies the context meter; cumulative totals are not context usage. Stop calls `turn/interrupt`. Steering uses `turn/steer` with an expected turn id, while follow-ups remain queued. Resume reconstructs the transcript from returned turns and reapplies session overrides.
+Command and patch approvals use Shina's existing confirmation dialogs. Agent text, reasoning, plans, commands, patches and MCP/tool items enter Shina's event reducer. Commands retain output and exit codes. File changes retain each file's diff and move path. MCP and dynamic tools retain server or namespace, tool, arguments, typed content and structured results. Web results remain in `webResults`. Image views import typed previews when the native path is a readable image. Collaborative calls and subagent activity use subagent cards. Notifications for known child threads retain `parentToolCallId` on nested tool calls and never settle the root turn. Unknown thread ids still fail closed.
 
-Codex's non-secret user-input questions use Shina's existing questionnaire. Conversation forks and rewinds remain Pi-only. Codex dynamic tool requests receive method-not-found errors, not automatic approvals.
+The 0.167.2 `ThreadItem` union has user messages, hook prompts, agent messages, function-call outputs, plans, reasoning, command executions, file changes, MCP calls, dynamic calls, collaborative calls, subagent activity, web searches, image views, sleep, image generation, entered/exited review mode and context compaction. Hook prompts, standalone function-call output, sleep, image generation and review markers keep the generic view and their full native payload. There is no standalone file-search, read-file, directory-list or todo-list item in this version's union. Compatibility handlers retain these typed extension items when reported, including supplied `fileSearchResults`; Shina never parses shell prose into search results. Plans and todo-list extensions use the plan card. Opaque web results and unrecognized items keep their native data.
+
+`thread/tokenUsage/updated.last` supplies the context meter; cumulative totals are not context usage. Stop calls `turn/interrupt`. Steering uses `turn/steer` with an expected turn id, while follow-ups remain queued. Resume reconstructs the transcript from native history and reapplies session overrides.
+
+Codex's non-secret user-input questions use Shina's existing questionnaire. Codex dynamic tool execution requests still receive method-not-found errors, not automatic approvals. Rendering a reported dynamic tool item does not authorize executing it.
+
+Whole-conversation forks call `thread/fork` in a separate owned process and preserve the source. `deferGoalContinuation` prevents an inherited goal from starting inference just because the user forked. The installed schema has no `thread/rollback`; conversation rewind uses `thread/revert` with `beforeTurnId`, excluding the selected user turn and every later turn. New verified-version threads request `historyMode: "paginated"`. Resume, fork and rewind hydrate paginated history through `thread/turns/list` with `itemsView: "full"`, ascending pages, bounded history and repeated-cursor checks. The existing fork-message picker uses native turn ids rather than matching prompt text. Fork-from-message first forks, then reverts only the new thread. Rewind restores the selected prompt to the composer and can replace the transcript with an empty history. It does not restore or undo files on disk. Native legacy-history threads can fork in full, but Codex cannot revert them, so rewind and fork-from-message stay disabled.
+
+The slash menu exposes KSG's `/compact`, `/goal` and `/feedback`. `/goal` calls `thread/goal/get`, `thread/goal/set` or `thread/goal/clear`; pause and resume set the native status, and mutations mark their origin as `user`. Before setting an objective or resuming, `thread/settings/update` applies the current working directory, approval policy, sandbox, model and effort without a prompt. An objective activates the native goal. Goal updates remain in `harness_state.goal`. `/feedback [reason]` explicitly uploads the thread and Codex logs to OpenAI with `feedback/upload`. Descriptions name that disclosure. These commands never become model prompts, including a command queued while the first session initializes. Native automatic goal turns still enter the ordinary reducer. Stop first pauses an active native goal, then interrupts its turn so automatic continuation cannot immediately restart it. Autonomous goal turns use the native service-tier default; Shina's explicit tier remains a per-user-turn override.
+
+Goal inspection, pause and clear, and feedback upload remain available during a running turn. Setting or resuming a goal requires idle state. Stop, pause and clear cancel an activation whose settings update is still in flight.
+
+Optional goals, feedback, fork/revert and the associated new history contract are enabled only when `initialize.userAgent` identifies Codex 0.167.2 or later, the minimum version checked here. Unknown and older versions keep the preexisting compact-only behavior. No generic slash-command enumeration method is assumed.
+
+Authentication failures name the exact manual command, `codex login`, and the composer offers Copy command. It copies only that literal command. Shina never runs login, accesses credentials or retries a denied startup automatically.
 
 `/compact` and the context popover's Compact context button call native `thread/compact/start` with the thread id, never a model prompt. Codex's protocol does not accept custom compaction instructions. Shina ignores `/compact` arguments with a visible notice. The request acknowledges startup only; Shina waits for the native turn to finish before releasing waiting prompts. Stop sends `turn/interrupt`, including when startup has not yet supplied the turn id.
 
 Manual and automatic `contextCompaction` items use the same progress, completed, failed and stopped rows as Pi. A failed or interrupted turn closes a running compaction even if Codex omits `item/completed`. The deprecated `thread/compacted` notification also works without duplicating an item-backed row. Resume restores compaction rows from native thread history. Codex's current compaction item contains only an id and type, so Shina does not invent a summary or before/after token counts. Compaction clears current context usage to the dashed unknown state until a fresh `thread/tokenUsage/updated.last` report arrives.
+
+`account/rateLimits/updated` populates `harness_state.usageLimits` through the shared usage-window normalizer below. Sparse updates retain other reported windows. As in KSG, model-specific pools do not replace the main Codex allowance. A reported individual spend limit becomes a Monthly credit limit window.
 
 ## Claude
 
 The built-in `claude` harness runs the user's Claude Code CLI over stream-json stdio directly from Rust. There is no Agent SDK runtime or Node sidecar. The protocol port uses installed `@anthropic-ai/claude-agent-sdk` **0.3.321**, its `ProcessTransport`, `Query` and type definitions, and Claude Code **2.1.322**. Behavior follows KSG Code's `ClaudeAdapterV2.ts`, `ClaudeProvider.ts` and `provider/Drivers/ClaudeSkills.ts`. Shina checks PATH, `~/.local/bin`, the legacy `~/.claude/local` installation, and per-user npm locations on Windows and Unix. `SHINA_CLAUDE_CLI` overrides discovery. Missing installations have an unavailable notice in the harness picker.
 
 Launch uses `--print --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool=stdio`. A `control_request` with subtype `initialize` registers a blocking `PreToolUse` callback and requests nested subagent events. Its `control_response` supplies models, supported effort levels and slash commands before any prompt or inference request. Shina also lists Claude's documented model aliases. Aliases without advertised effort metadata do not claim supported effort levels.
+
+A short-lived initialization-only probe now warms that model catalog at app startup, independently of a conversation. It uses `--no-session-persistence`, no Shina MCP endpoint and no prompt. Drafts and `orchestrator_capabilities` share the in-memory catalog, including through server projections. Refresh models repeats the probe. Discovery failure keeps the same visible session-time fallback as Codex.
 
 The installed CLI's help calls supervised mode `manual`; SDK 0.3.321 calls it `default`. Shina uses `manual` at launch and `default` in `set_permission_mode`. Both control spellings were accepted by CLI 2.1.322 in an initialization-only probe. The SDK's `--permission-prompt-tool=stdio` flag is hidden from this CLI's help but works. `apply_flag_settings` with `effortLevel` changes effort in memory, never through `update_settings` or a configuration file. `set_model` changes the live session model.
 
@@ -54,7 +78,9 @@ Stop sends `interrupt` with `cancel_queued: true`; Shina retains the existing te
 
 Slash commands come from initialization and `commands_changed`. Filesystem discovery adds `skill:` entries for user and project skills and enabled user, project, local and managed plugin installations, including manifest-declared skill directories. Managed settings participate in plugin enablement and skill overrides. The CLI's non-builtin command list supplies account-scoped synced plugin skills without Shina reading account or authentication files. `/skill:name` becomes the CLI's native `/name` invocation.
 
-The context meter uses the last top-level assistant request's `input_tokens`, cache-read tokens, cache-creation tokens and output tokens. It never uses cumulative `result.modelUsage` token totals. Only that metadata's model context capacity is used. Native `/compact`, including optional instructions, drives the Compact context button. Status and compact-boundary messages open and close existing compaction rows. Failure, Stop and disconnect also close a running row. Compaction invalidates usage until another assistant request reports it. The latest rate-limit or usage-window event stays in `harness_state.usageLimits`, with the CLI's `status`, `rateLimitType`, `resetsAt`, `utilization` and optional overage fields. This change adds no usage-limit UI.
+The context meter uses the last top-level assistant request's `input_tokens`, cache-read tokens, cache-creation tokens and output tokens. It never uses cumulative `result.modelUsage` token totals. Only that metadata's model context capacity is used. Native `/compact`, including optional instructions, drives the Compact context button. Status and compact-boundary messages open and close existing compaction rows. Failure, Stop and disconnect also close a running row. Compaction invalidates usage until another assistant request reports it. Rate-limit events now use the shared normalized `harness_state.usageLimits` contract below instead of retaining an incompatible raw CLI event. Distinct `rateLimitType` windows merge rather than replacing one another.
+
+Authentication failures name `claude auth login` and offer the same Copy command control as Codex. Shina copies only the literal command, never credentials, and never runs it.
 
 The process receives a thread-scoped HTTP MCP server through an inline `--mcp-config` JSON argument, including the loopback URL and bearer header. `--append-system-prompt` adds `mcp::INSTRUCTIONS` and captain instructions. `--system-prompt-snapshot off` keeps those instructions current on resume. No token enters the saved index or diagnostics. User-curated memory changes use the common `<shina_memory_diff>` prompt path.
 
@@ -108,7 +134,7 @@ The MCP initialize response contains the same harness-neutral Shina instructions
 
 Codex receives `mcp::INSTRUCTIONS` and the same captain profile, scope and essential-memory prompt as Pi in `developerInstructions` on both `thread/start` and `thread/resume`. This leaves Codex's own base instructions intact. `config["mcp_servers.shina"]` registers the thread's loopback URL and bearer header as a required server. Shina does not save these tokens in its index or diagnostics. Later user-curated memory changes use the existing `<shina_memory_diff>` prompt path, identical to Pi.
 
-`delegate_task.target.harness` accepts `pi`, `codex`, `claude`, or an installed ACP id. With no target, children inherit their parent's harness and pinned or effective selection. A harness-only target uses that harness's configured default. Explicit models and reasoning levels require discovered metadata. `orchestrator_capabilities` reports harnesses and native models and efforts once their sessions have discovered them. Pi still rejects direct providers.
+`delegate_task.target.harness` accepts `pi`, `codex`, `claude`, or an installed ACP id. With no target, children inherit their parent's harness and pinned or effective selection. A harness-only target uses that harness's configured default. Explicit models and reasoning levels require discovered metadata. `orchestrator_capabilities` reports the shared prompt-free native catalogs before any session, then supplements them with live session metadata. Codex models also report `service_tiers`. Pi still rejects direct providers.
 
 ACP and Codex use the same bounded connection queues, shutdown registry and per-thread process owner as Pi. Windows assigns the agent and its descendants to a kill-on-close Job Object before allowing execution. Unix uses a process group. Reads and writes run off the UI thread, writes and startup have deadlines, and a failed reap quarantines the owner until restart.
 
@@ -134,6 +160,31 @@ Adapters replace the same plan ID's payload in place, including in replay histor
 Tool and thought `order` values preserve events at the same text offset and default
 to the old content-block order for legacy records.
 
+### Usage limits
+
+Codex and Claude use one `harness_state.usageLimits` shape:
+
+```json
+{
+  "windows": [
+    {"id": "codex:primary", "name": "5 hour", "usedPercent": 92.0, "resetsAt": 2100000000}
+  ]
+}
+```
+
+`resetsAt` is Unix seconds, or null when unreported. Percentages are finite and
+clamped to 0 through 100. Codex supplies `usedPercent` directly. Claude's
+`utilization` fraction becomes percent, and `rateLimitType` identifies its window.
+Missing windows preserve earlier reports. These are account usage allowances,
+not the thread's context-window capacity.
+
+The context popover shows a Usage block only when windows exist. Each row has its
+window name, used percent, a 6 px bar and the local reset date and time, or
+"Reset not reported". Counts and times use 11 px Departure Mono. Bars use the
+existing faint ink and coral at 90 percent or more. The card keeps its existing
+palette, frame, spacing and Compact context action. Service-tier segments follow
+KSG's `ComposerModelEffort.SpeedControl` footer style.
+
 Compaction records retain a transcript `anchor` and their original `historyIndex`
 in provider history. Completion replaces the running record without moving it.
 Legacy compactions without position metadata remain at the transcript's end.
@@ -144,6 +195,12 @@ retry errors do not always include an attempt limit; Shina does not invent one.
 
 `cargo test acp::tests` runs a Python ACP fixture from an owned temporary Shina profile. Python must be installed as `python` on Windows or `python3` on Unix. No third-party agents or external inference run in automated tests. Tests cover initialization, authenticated MCP registration and relay, stream reduction, permission responses and policy, cancellation, load/resume, images, queues, model switching, authentication denial and unsupported capabilities. Layout tests cover the harness picker at 620, 960, 1280 and 1920 pixels.
 
-`cargo test codex` runs a temporary Python app-server fixture and harness integration tests. They cover initialization, streaming text and reasoning, command output, plans, approval responses, read-only write refusal, interrupt, resume, current usage, attachment input, model efforts, awareness and harness delegation. Compaction tests cover manual success, request rejection, failed turns, automatic and deprecated notifications, prompt races, cancellation, usage invalidation and refresh, and resume history. The ignored `real_codex_pong_smoke` test sends one paid prompt followed by native compaction in an isolated temporary workspace and passes a temporary `LOCALAPPDATA` to Codex. It never uses the real Shina profile.
+`cargo test codex` runs a temporary Python app-server fixture and harness integration tests. They cover initialization, prompt-free paginated discovery and failure, pre-send model capabilities, project skills, streaming text and reasoning, command output, every schema item and generic fallbacks, live/history metadata parity, nested calls, plans, approval responses, read-only write refusal, interrupt, fork/revert and full turn history, normalized usage windows, native goal/feedback dispatch, turn-only service tiers, attachment input, model efforts, awareness and harness delegation. Compaction tests cover manual success, request rejection, failed turns, automatic and deprecated notifications, prompt races, cancellation, usage invalidation and refresh, and resume history. The ignored `real_codex_pong_smoke` test sends one paid prompt followed by native compaction in an isolated temporary workspace and passes a temporary `LOCALAPPDATA` to Codex. It never uses the real Shina profile.
 
 `cargo test claude` runs a Python stream-json fixture under an owned temporary Shina profile and Claude transcript directory. Tests cover the handshake, MCP registration, streamed text and thinking, tool results, nested calls, all permission policies, plan and questionnaire responses, steering, interruption and recovery, saved-session history, model and effort controls, image input, native compaction, authentication denial, missing executables, skill discovery and delegation capabilities. The ignored `real_claude_pong_smoke` test sends one real prompt in an isolated temporary workspace and Shina profile. It uses the CLI's existing authentication without reading or changing it. Run it only when the CLI is already signed in.
+
+Claude tests also cover the prompt-free non-persistent catalog probe, normalized
+multi-window limits and the exact manual login command. Headless UI tests cover
+usage rows and service-tier controls at 620, 960, 1280 and 1920 px, plus both
+authentication copy controls. No real provider prompt was run for this change;
+both paid smoke tests stayed ignored.
