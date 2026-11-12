@@ -346,6 +346,7 @@ pub struct Thread {
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
+    pub submission_error: Option<String>,
     pub pi: Option<Pi>,
     /// Image input support from Pi or the catalog. `None` when metadata is unavailable.
     pub supports_images: Option<bool>,
@@ -576,6 +577,7 @@ impl Thread {
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
             attachment_error: None,
+            submission_error: None,
             pi: None,
             supports_images: None,
             model: DEFAULT_MODEL.into(),
@@ -931,6 +933,23 @@ impl Thread {
         self.draft.replace_text("");
         self.draft_images.clear();
         self.begin_prompt(prompt);
+    }
+
+    pub fn validate_prompt_length(&self, prompt: &Prompt) -> Option<String> {
+        let expanded =
+            crate::attachments::pi_message(prompt).unwrap_or_else(|_| prompt.text.clone());
+        crate::composer::prompt_length_validation_message(&expanded)
+    }
+
+    pub fn update_submission_error(&mut self) {
+        if self.submission_error.is_none() {
+            return;
+        }
+        let expanded = crate::composer_tokens::prompt(&self.draft, &self.draft_images)
+            .ok()
+            .and_then(|p| crate::attachments::pi_message(&p).ok())
+            .unwrap_or_else(|| crate::composer_rich::markdown(&self.draft));
+        self.submission_error = crate::composer::prompt_length_validation_message(&expanded);
     }
 
     fn begin_prompt(&mut self, prompt: Prompt) {
@@ -5495,6 +5514,13 @@ impl State {
                     return;
                 }
             };
+            if !self.headless
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return;
+            }
+            self.current_mut().submission_error = None;
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
                 "attachments":prompt.images.as_ref(),"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
@@ -5615,9 +5641,30 @@ impl State {
         }
         self.release_task_results(self.current().id);
         if self.current().status.busy() {
+            if !self.headless {
+                if let Ok(prompt) = crate::composer_tokens::prompt(
+                    &self.current().draft,
+                    &self.current().draft_images,
+                ) && let Some(error) = self.current().validate_prompt_length(&prompt)
+                {
+                    self.current_mut().submission_error = Some(error);
+                    return;
+                }
+                self.current_mut().submission_error = None;
+            }
             self.current_mut().send_during_run();
             self.checkpoint();
             return;
+        }
+        if !self.headless {
+            if let Ok(prompt) =
+                crate::composer_tokens::prompt(&self.current().draft, &self.current().draft_images)
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return;
+            }
+            self.current_mut().submission_error = None;
         }
         self.current_mut().send();
         let id = self.current().id;

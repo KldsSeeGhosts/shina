@@ -8560,7 +8560,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             &mut s.current_mut().draft
         })
         .on_input_key(|s: &mut State, event, tx| {
-            if pi_ui::composer_pi_key(s, event) {
+            if pi_ui::composer_pi_key(s, event, tx) {
                 composer_menu::scroll_selected(s, tx);
                 return true;
             }
@@ -8591,6 +8591,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .on_input_change(|s: &mut State, _| {
             let t = s.current_mut();
             t.composer_rules.changed(&mut t.draft);
+            t.update_submission_error();
             s.ensure_composer_commands();
         })
         .on_input_paste(|s: &mut State, content, _| {
@@ -8667,6 +8668,15 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     }
     if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
+    }
+    if let Some(error) = &t.submission_error {
+        card = card.child(
+            col()
+                .key("composer-prompt-length-error")
+                .px(16.0)
+                .pb(8.0)
+                .child(label(error, SMALL, p.danger).wrap().selectable(true)),
+        );
     }
     area = area.child(card.child(actions.child(action.ml(4.0))));
     // KSG Code's context strip: a bare muted row under the card, machine on the left and the
@@ -15685,5 +15695,63 @@ pub(crate) mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submission_policy_and_prompt_limit_work_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+
+            // Under ModEnter, plain Enter inserts a newline instead of sending.
+            rt.state.preferences.send_shortcut = crate::composer::SendShortcut::ModEnter;
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "hello\n");
+            assert!(rt.state.current().messages.is_empty());
+
+            // Key-repeat Enter under Enter policy does not submit.
+            rt.state.preferences.send_shortcut = crate::composer::SendShortcut::Enter;
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.repeat_key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "hello");
+            assert!(rt.state.current().messages.is_empty());
+
+            // Oversized prompt blocks send and displays the limit error within the viewport.
+            let oversized = "x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1);
+            rt.state.current_mut().draft.replace_text(&oversized);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.current().messages.is_empty());
+            assert_eq!(
+                rt.state.current().submission_error.as_deref(),
+                Some(
+                    "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending."
+                )
+            );
+            let (rect, _) = rt
+                .presented("composer-prompt-length-error")
+                .unwrap_or_else(|| panic!("{width}: composer-prompt-length-error"));
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                "{width}: {rect:?}"
+            );
+            assert!(
+                rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                "{width}: {rect:?}"
+            );
+        }
     }
 }

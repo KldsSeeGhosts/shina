@@ -1,5 +1,115 @@
-//! Composer editing rules, ported from KSG Code's chat/composerCommandKey.ts.
+//! Composer editing rules, ported from KSG Code's chat/composerCommandKey.ts,
+//! composerSubmission.ts, and composer-logic.ts.
 use rune::{Key, KeyEvent, TextEdit};
+
+pub const PROVIDER_SEND_TURN_MAX_INPUT_CHARS: usize = 120_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SendShortcut {
+    #[default]
+    Enter,
+    ModEnterMultiline,
+    ModEnter,
+}
+
+impl SendShortcut {
+    pub const ALL: [Self; 3] = [Self::Enter, Self::ModEnterMultiline, Self::ModEnter];
+
+    pub fn label(self) -> String {
+        let mod_label = if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        };
+        match self {
+            Self::Enter => "Enter".to_owned(),
+            Self::ModEnterMultiline => format!("{mod_label} + Enter for multiline prompts"),
+            Self::ModEnter => format!("{mod_label} + Enter always"),
+        }
+    }
+}
+
+pub fn requires_modifier(send_shortcut: SendShortcut, prompt: &str) -> bool {
+    match send_shortcut {
+        SendShortcut::Enter => false,
+        SendShortcut::ModEnter => true,
+        SendShortcut::ModEnterMultiline => prompt.contains('\n') || prompt.contains('\r'),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmissionIntent {
+    Foreground,
+    Alternate,
+}
+
+pub fn submission_intent_for_key(
+    event: &KeyEvent,
+    key_repeat: bool,
+    is_composing: bool,
+    is_running: bool,
+    send_shortcut: SendShortcut,
+    prompt: &str,
+) -> Option<SubmissionIntent> {
+    if is_composing || key_repeat {
+        return None;
+    }
+    if event.key != Key::Enter || event.mods.alt {
+        return None;
+    }
+    let has_mod = event.mods.cmd || event.mods.ctrl;
+    let needs_mod = requires_modifier(send_shortcut, prompt);
+    if is_running && has_mod && !event.mods.logo {
+        if needs_mod {
+            if event.mods.shift {
+                return Some(SubmissionIntent::Alternate);
+            }
+            return Some(SubmissionIntent::Foreground);
+        } else if !event.mods.shift {
+            return Some(SubmissionIntent::Alternate);
+        }
+    }
+    if event.mods.shift {
+        return None;
+    }
+    if needs_mod && !has_mod {
+        return None;
+    }
+    Some(SubmissionIntent::Foreground)
+}
+
+pub fn format_count_en_us(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Ported from KSG Code's `getComposerPromptLengthValidationMessage`.
+pub fn prompt_length_validation_message(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    let len = trimmed.chars().count();
+    let excess = len.saturating_sub(PROVIDER_SEND_TURN_MAX_INPUT_CHARS);
+    if excess == 0 {
+        return None;
+    }
+    let unit = if excess == 1 {
+        "character"
+    } else {
+        "characters"
+    };
+    Some(format!(
+        "Prompt is {} {unit} over the {}-character limit. Shorten or split it before sending.",
+        format_count_en_us(excess),
+        format_count_en_us(PROVIDER_SEND_TURN_MAX_INPUT_CHARS),
+    ))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trigger {
@@ -168,5 +278,144 @@ mod tests {
         let mut edit = TextEdit::new("before /rev after");
         edit.set_caret(11);
         assert_eq!(trigger(&edit).unwrap().range, 7..11);
+    }
+
+    #[test]
+    fn submission_policy_matches_ksg_rules() {
+        let enter = KeyEvent {
+            key: Key::Enter,
+            mods: Default::default(),
+        };
+        let mut mod_enter = enter.clone();
+        mod_enter.mods.cmd = true;
+        let mut shift_enter = enter.clone();
+        shift_enter.mods.shift = true;
+        let mut mod_shift_enter = mod_enter.clone();
+        mod_shift_enter.mods.shift = true;
+        let mut alt_enter = enter.clone();
+        alt_enter.mods.alt = true;
+
+        assert_eq!(
+            submission_intent_for_key(&enter, false, false, false, SendShortcut::Enter, "hi"),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(&enter, false, false, false, SendShortcut::Enter, "a\nb"),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &enter,
+                false,
+                false,
+                false,
+                SendShortcut::ModEnterMultiline,
+                "hi"
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &enter,
+                false,
+                false,
+                false,
+                SendShortcut::ModEnterMultiline,
+                "a\nb"
+            ),
+            None
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &mod_enter,
+                false,
+                false,
+                false,
+                SendShortcut::ModEnterMultiline,
+                "a\nb"
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(&enter, false, false, false, SendShortcut::ModEnter, "hi"),
+            None
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &mod_enter,
+                false,
+                false,
+                false,
+                SendShortcut::ModEnter,
+                "hi"
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(&shift_enter, false, false, false, SendShortcut::Enter, "hi"),
+            None
+        );
+        assert_eq!(
+            submission_intent_for_key(&alt_enter, false, false, false, SendShortcut::Enter, "hi"),
+            None
+        );
+        // Key repeat and composition never submit.
+        assert_eq!(
+            submission_intent_for_key(&enter, true, false, false, SendShortcut::Enter, "hi"),
+            None
+        );
+        assert_eq!(
+            submission_intent_for_key(&enter, false, true, false, SendShortcut::Enter, "hi"),
+            None
+        );
+        // Running thread alternate send shortcuts.
+        assert_eq!(
+            submission_intent_for_key(&mod_enter, false, false, true, SendShortcut::Enter, "hi"),
+            Some(SubmissionIntent::Alternate)
+        );
+        assert_eq!(
+            submission_intent_for_key(&mod_enter, false, false, true, SendShortcut::ModEnter, "hi"),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &mod_shift_enter,
+                false,
+                false,
+                true,
+                SendShortcut::ModEnter,
+                "hi"
+            ),
+            Some(SubmissionIntent::Alternate)
+        );
+    }
+
+    #[test]
+    fn prompt_length_validation_matches_ksg_messages() {
+        assert_eq!(
+            prompt_length_validation_message(&"x".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+            None
+        );
+        assert_eq!(
+            prompt_length_validation_message(&format!(
+                "  {}  \n",
+                "x".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)
+            )),
+            None
+        );
+        assert_eq!(
+            prompt_length_validation_message(&"x".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1)),
+            Some(
+                "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending."
+                    .into()
+            )
+        );
+        assert_eq!(
+            prompt_length_validation_message(&"x".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1234)),
+            Some(
+                "Prompt is 1,234 characters over the 120,000-character limit. Shorten or split it before sending."
+                    .into()
+            )
+        );
     }
 }
