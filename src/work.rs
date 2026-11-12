@@ -83,6 +83,9 @@ impl Tool {
 
     pub(crate) fn accept_work_result(&mut self, result: &Value) {
         self.accept_metadata(result);
+        if let Some(input) = result.get("input").filter(|v| !v.is_null()) {
+            self.input = input.clone();
+        }
         if self.resolved_kind() == ToolKind::FileChange && self.changes.is_empty() {
             let path = self.input["path"]
                 .as_str()
@@ -153,6 +156,62 @@ pub fn result_metadata(kind: ToolKind, changes: Vec<FileChange>, source: &Value)
         "fileSearchResults":source.get("results").filter(|_|kind == ToolKind::FileSearch),
         "webResults":source.get("results").filter(|_|kind == ToolKind::WebSearch)
     })
+}
+
+/// Codex steps and ACP entries share KSG's pending/running/completed contract.
+pub fn plan_data(source: &Value) -> Value {
+    let steps = ["steps", "plan", "entries", "items"]
+        .iter()
+        .find_map(|key| source[*key].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|step| {
+            let text = step["text"]
+                .as_str()
+                .or_else(|| step["step"].as_str())
+                .or_else(|| step["content"].as_str())
+                .or_else(|| step.as_str())?;
+            let status = match step["status"].as_str().unwrap_or("") {
+                "completed" | "done" => "completed",
+                "in_progress" | "inProgress" | "running" => "running",
+                _ => "pending",
+            };
+            Some(json!({"text":text,"status":status}))
+        })
+        .collect::<Vec<_>>();
+    json!({"steps":steps,
+        "markdown":source["markdown"].as_str().or_else(||source["text"].as_str()).or_else(||source["plan"].as_str()),
+        "explanation":source["explanation"]})
+}
+
+/// The first call owns its position. Subsequent updates replace that call's payload.
+/// Use ordinary tool history so existing projection and persistence paths carry plans.
+pub fn save_plan(history: &mut Vec<Value>, id: &str, source: &Value) {
+    let mut found = false;
+    for message in history.iter_mut() {
+        for block in message["content"].as_array_mut().into_iter().flatten() {
+            if block["type"] == "toolCall" && block["id"] == id {
+                block["arguments"] = source.clone();
+                found = true;
+            }
+        }
+    }
+    let result = json!({"role":"toolResult","toolCallId":id,"isError":false,
+        "content":[],"toolKind":"plan","structuredContent":{"plan":plan_data(source)}});
+    if found {
+        if let Some(previous) = history
+            .iter_mut()
+            .find(|m| m["role"] == "toolResult" && m["toolCallId"] == id)
+        {
+            *previous = result;
+        }
+    } else {
+        history.push(
+            json!({"role":"assistant","content":[{"type":"toolCall","id":id,
+            "name":"plan","toolKind":"plan","arguments":source}]}),
+        );
+        history.push(result);
+    }
 }
 
 /// KSG's summarizeToolGroup: two highest-priority actions, in first-seen order,

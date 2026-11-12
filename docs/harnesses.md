@@ -53,7 +53,7 @@ Shina also detects `claude-code-acp`, `codex-acp`, `gemini --experimental-acp`, 
 
 ## ACP protocol and limits
 
-The client implements ACP protocol version 1 as JSON-RPC 2.0 JSONL over stdio. It negotiates capabilities, starts sessions in the thread's project or scratch directory, and supports text and negotiated image prompts. Agent text, thoughts, tool calls and tool results use Shina's existing transcript reducer. Plans and mode updates remain in per-thread runtime metadata. Advertised commands enter the composer command menu.
+The client implements ACP protocol version 1 as JSON-RPC 2.0 JSONL over stdio. It negotiates capabilities, starts sessions in the thread's project or scratch directory, and supports text and negotiated image prompts. Agent text, thoughts, tool calls and tool results use Shina's existing transcript reducer. Plans also enter the transcript as typed cards, with later updates replacing the first card. Mode updates remain in per-thread runtime metadata. Advertised commands enter the composer command menu.
 
 When the agent advertises `promptCapabilities.embeddedContext`, file attachments use `resource` blocks for valid UTF-8 text without NULs up to 256 KiB, and `resource_link` blocks for binary files, larger files and folders. Without embedded context, Shina sends absolute path text. Images keep their negotiated typed image blocks. Files remain at their original paths; missing files block sending without clearing the draft.
 

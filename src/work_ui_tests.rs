@@ -6,7 +6,7 @@ fn expanded_kinds_fit_the_lane_and_each_output_block_is_capped() {
     use ToolKind::*;
     for width in [620.0, 960.0, 1280.0, 1920.0] {
         for kind in [
-            Command, FileChange, FileSearch, WebSearch, Read, List, Subagent, Plan, Other,
+            Command, FileChange, FileSearch, WebSearch, Read, List, Subagent, Other,
         ] {
             let mut rt = runtime(width);
             let root = rt.state.working_directory();
@@ -167,5 +167,68 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn plans_fit_at_all_widths_and_updates_do_not_add_a_card() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for markdown in [false, true] {
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.apply(json!({"type":"harness_update","field":"plan","value":{
+                "planId":"stable","steps":[{"text":"First step","status":"pending"}]}}));
+            let anchor = t.tools[0].anchor;
+            t.apply(json!({"type":"tool_execution_start","toolCallId":"later","toolName":"read","args":{"path":"a.rs"}}));
+            let source = if markdown {
+                json!({"planId":"stable","markdown":"## Proposed plan\n\nUse **Rust** and the existing protocol."})
+            } else {
+                json!({"planId":"stable","explanation":"An example plan.","steps":[
+                    {"text":"First step","status":"completed"},{"text":"A wrapping step ".repeat(10),"status":"in_progress"},
+                    {"text":"Last step","status":"pending"}]})
+            };
+            t.apply(json!({"type":"harness_update","field":"plan","value":source}));
+            assert_eq!(t.tools.len(), 2);
+            assert_eq!(t.tools[0].anchor, anchor);
+            t.work[0].expanded = true;
+            let id = t.id;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            let (card, _) = rt.presented(&format!("plan-card-{id}-0")).unwrap();
+            assert!(
+                card[0] >= lane[0] && card[0] + card[2] <= lane[0] + lane[2] + 0.5,
+                "{width}: {card:?}"
+            );
+            assert_eq!(
+                rt.elements()
+                    .iter()
+                    .filter(|e| e
+                        .key
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("plan-card-")))
+                    .count(),
+                1
+            );
+            let block = if markdown {
+                "plan-markdown"
+            } else {
+                "plan-steps"
+            };
+            let (rect, _) = rt.presented(&format!("{block}-{id}-0")).unwrap();
+            assert!(rect[3] <= 200.5);
+            if !markdown {
+                for (index, status) in ["Done", "In progress", "Pending"].iter().enumerate() {
+                    let status_el = rt
+                        .elements()
+                        .into_iter()
+                        .find(|e| {
+                            e.key.as_deref() == Some(&format!("plan-step-status-{id}-0-{index}"))
+                        })
+                        .unwrap();
+                    assert_eq!(status_el.label.as_deref(), Some(*status));
+                }
+            }
+        }
     }
 }

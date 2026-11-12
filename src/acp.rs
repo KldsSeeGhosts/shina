@@ -150,6 +150,19 @@ impl Client {
         json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":""})
     }
 
+    fn history_value(&self) -> Value {
+        let replayed = self.history.iter().any(|m| {
+            m["role"] == "user"
+                || m["role"] == "toolResult" && m["toolKind"] != "plan"
+                || m["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b["type"] != "toolCall" || b["toolKind"] != "plan")
+                })
+        });
+        json!({"messages":self.history,"historyReplayed":replayed})
+    }
+
     fn mcp_servers(&self) -> Result<Value, String> {
         let host = self
             .start
@@ -304,7 +317,7 @@ impl Client {
                 self.reply(&json!({"id":"state","type":"get_state"}), self.state());
                 self.reply(
                     &json!({"id":"history","type":"get_messages"}),
-                    json!({"messages":self.history}),
+                    self.history_value(),
                 );
                 self.reply(
                     &json!({"id":"commands","type":"get_commands"}),
@@ -418,7 +431,7 @@ impl Client {
             "get_entries" | "get_messages" => {
                 let mut request = record.clone();
                 request["type"] = json!("get_messages");
-                self.reply(&request, json!({"messages":self.history}));
+                self.reply(&request, self.history_value());
             }
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":[]})),
@@ -774,7 +787,19 @@ impl Client {
                     );
                 }
             }
-            "plan" | "plan_update" | "current_mode_update" => {
+            "plan" | "plan_update" => {
+                let turn = self.history.iter().filter(|m| m["role"] == "user").count();
+                let id = update["planId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("acp-plan-{turn}"));
+                let mut value = update.clone();
+                value["_shinaPlanId"] = json!(id);
+                crate::work::save_plan(&mut self.history, &id, &value);
+                self.events
+                    .push(json!({"type":"harness_update","field":"plan","value":value}));
+            }
+            "current_mode_update" => {
                 self.events.push(
                     json!({"type":"harness_update","field":update["sessionUpdate"],"value":update}),
                 );
@@ -862,7 +887,9 @@ fn tool_metadata(tool: &Value) -> Value {
             }
         }
     }
-    result_metadata(kind, changes, &tool["rawOutput"])
+    let mut metadata = result_metadata(kind, changes, &tool["rawOutput"]);
+    metadata["input"] = tool["rawInput"].clone();
+    metadata
 }
 
 fn run(

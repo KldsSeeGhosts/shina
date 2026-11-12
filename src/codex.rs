@@ -807,9 +807,24 @@ impl Client {
                     .push(json!({"type":"tool_execution_update","toolCallId":id,
                     "partialResult":{"content":[{"type":"text","text":output}]}}));
             }
-            "turn/plan/updated" => self
-                .events
-                .push(json!({"type":"harness_update","field":"plan","value":params})),
+            "turn/plan/updated" => {
+                let turn = params["turnId"]
+                    .as_str()
+                    .or(self.turn.as_deref())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        self.history
+                            .iter()
+                            .filter(|m| m["role"] == "user")
+                            .count()
+                            .to_string()
+                    });
+                let id = params["planId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("codex-plan-{turn}"));
+                self.plan(params, &id, true);
+            }
             "thread/tokenUsage/updated" => {
                 if self.compacting {
                     return Ok(());
@@ -1026,9 +1041,7 @@ impl Client {
                     }
                 }
             }
-            "plan" if done => self
-                .events
-                .push(json!({"type":"harness_update","field":"plan","value":item})),
+            "plan" if done => self.plan(item, &format!("codex-plan-{id}"), emit),
             "userMessage" | "agentMessage" | "reasoning" | "plan" => {}
             _ => {
                 let name = match kind {
@@ -1081,6 +1094,16 @@ impl Client {
             self.completed.insert(id.into());
             self.items.remove(id);
             self.text.remove(&format!("output:{id}"));
+        }
+    }
+
+    fn plan(&mut self, source: &Value, id: &str, emit: bool) {
+        let mut source = source.clone();
+        source["_shinaPlanId"] = json!(id);
+        crate::work::save_plan(&mut self.history, id, &source);
+        if emit {
+            self.events
+                .push(json!({"type":"harness_update","field":"plan","value":source}));
         }
     }
 
@@ -1494,5 +1517,7 @@ fn tool_metadata(item: &Value) -> Value {
             Some(file)
         })
         .collect();
-    result_metadata(kind, changes, item)
+    let mut metadata = result_metadata(kind, changes, item);
+    metadata["input"] = item.clone();
+    metadata
 }

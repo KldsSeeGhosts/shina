@@ -6141,6 +6141,10 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
                 }
             } else if previous_anchor == Some(anchor)
                 && let Some(TranscriptPart::Tools(indices)) = parts.last_mut()
+                && t.tools[index].resolved_kind() != crate::work::ToolKind::Plan
+                && indices
+                    .last()
+                    .is_some_and(|i| t.tools[*i].resolved_kind() != crate::work::ToolKind::Plan)
             {
                 indices.push(index);
             } else {
@@ -6215,6 +6219,9 @@ fn activity_line(
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
+    if tool.resolved_kind() == crate::work::ToolKind::Plan {
+        return work_ui::plan_card(s, p, index);
+    }
     let title = tool_title(tool);
     let mut content = col().gap(4.0).child(
         activity_line(

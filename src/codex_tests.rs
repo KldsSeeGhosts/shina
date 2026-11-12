@@ -48,6 +48,52 @@ fn typed_items_survive_live_and_history_reduction() {
     }
 }
 
+#[test]
+fn plan_updates_replace_the_first_card_in_live_and_replayed_history() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.turn = Some("turn-plan".into());
+    client
+        .notification(
+            "turn/plan/updated",
+            &json!({"plan":[{"step":"First","status":"pending"}]}),
+        )
+        .unwrap();
+    client.item(
+        &json!({"id":"cmd","type":"commandExecution","command":"pwd","status":"completed"}),
+        true,
+        true,
+    );
+    client.notification("turn/plan/updated",&json!({"plan":[{"step":"First","status":"completed"},{"step":"Next","status":"in_progress"}]})).unwrap();
+    client.item(
+        &json!({"id":"proposal","type":"plan","text":"## Proposed plan\n\nUse **Rust**."}),
+        true,
+        true,
+    );
+    let mut live = Thread::new(1);
+    for event in client.events {
+        live.apply(event);
+    }
+    let mut restored = Thread::new(2);
+    restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+    for t in [&live, &restored] {
+        assert_eq!(t.tools.len(), 3);
+        assert_eq!(t.tools[0].resolved_kind(), crate::work::ToolKind::Plan);
+        assert_eq!(t.tools[1].resolved_kind(), crate::work::ToolKind::Command);
+        let plan = crate::work::plan_data(&t.tools[0].input);
+        assert_eq!(plan["steps"][0]["status"], "completed");
+        assert_eq!(plan["steps"][1]["status"], "running");
+        assert!(
+            crate::work::plan_data(&t.tools[2].input)["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("**Rust**")
+        );
+        let saved: crate::model::Tool =
+            serde_json::from_value(serde_json::to_value(&t.tools[0]).unwrap()).unwrap();
+        assert_eq!(saved.input, t.tools[0].input);
+    }
+}
+
 fn spec(source: SessionSource, access: &str) -> Start {
     Start {
         id: "codex".into(),

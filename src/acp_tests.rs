@@ -75,6 +75,30 @@ fn file_prompts_use_negotiated_resources_or_path_text() {
     }
 }
 
+#[test]
+fn acp_plan_updates_keep_the_original_position_and_replay_the_latest_steps() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client
+        .update(&json!({"sessionUpdate":"plan","entries":[{"content":"Read","status":"pending"}]}));
+    client.update(&json!({"sessionUpdate":"tool_call","toolCallId":"read","title":"Read","kind":"read","status":"completed","rawInput":{"path":"a.rs"}}));
+    client.update(&json!({"sessionUpdate":"plan_update","entries":[{"content":"Read","status":"completed"},{"content":"Write","status":"in_progress"}]}));
+    let mut live = Thread::new(1);
+    for event in client.events {
+        live.apply(event);
+    }
+    let mut replayed = Thread::new(2);
+    replayed.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+    for t in [&live, &replayed] {
+        assert_eq!(t.tools.len(), 2);
+        assert_eq!(t.tools[0].resolved_kind(), crate::work::ToolKind::Plan);
+        assert_eq!(t.tools[1].resolved_kind(), crate::work::ToolKind::Read);
+        let plan = crate::work::plan_data(&t.tools[0].input);
+        assert_eq!(plan["steps"][0]["status"], "completed");
+        assert_eq!(plan["steps"][1]["status"], "running");
+    }
+}
+
 fn spec(source: SessionSource) -> Start {
     Start {
         id: "fixture".into(),
@@ -193,8 +217,13 @@ fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
     pump(&mut thread, |t| t.status == Status::Completed);
     assert!(thread.messages.iter().any(|m| m.text == "Hello ACP"));
     assert_eq!(thread.thoughts[0].text, "Checking");
-    assert!(thread.tools[0].done);
-    assert_eq!(thread.tools[0].output, "Written");
+    let write = thread
+        .tools
+        .iter()
+        .find(|t| t.resolved_kind() == crate::work::ToolKind::FileChange)
+        .unwrap();
+    assert!(write.done);
+    assert_eq!(write.output, "Written");
     assert!(thread.harness_context_sent);
     let wire = records(&log);
     let prompt = wire

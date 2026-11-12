@@ -57,6 +57,9 @@ fn relative(path: &str, root: &std::path::Path) -> String {
 }
 
 fn input_text(tool: &Tool, keys: &[&str]) -> String {
+    if let Some(input) = tool.input.as_str() {
+        return input.into();
+    }
     for input in [
         &tool.input,
         &tool.input["action"],
@@ -361,7 +364,13 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
             &format!("tool-image-{id}"),
         ));
     }
-    body = body.child(rule(p)).child(
+    body.child(rule(p)).child(raw(s, p, index))
+}
+
+fn raw(s: &State, p: Palette, index: usize) -> El {
+    let tool = &s.current().tools[index];
+    let id = format!("{}-{index}", s.current().id);
+    let mut body = col().min_w(0.0).child(
         row()
             .key(format!("tool-raw-toggle-{id}"))
             .role("button")
@@ -398,4 +407,100 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
         ));
     }
     body
+}
+
+/// Ported from KSG's todo_list/proposed_plan inspector. The informational frame
+/// follows the brief's outlined card, while Markdown uses Shina's existing renderer.
+pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
+    let t = s.current();
+    let tool = &t.tools[index];
+    let id = format!("{}-{index}", t.id);
+    let plan = crate::work::plan_data(&tool.input);
+    let mut body = col().min_w(0.0).gap(8.0).child(
+        row()
+            .center_y()
+            .gap(8.0)
+            .child(icon(kind_icon(ToolKind::Plan), p.muted))
+            .child(label("Plan", TextStyle::new(14.0, 600.0), p.ink)),
+    );
+    if let Some(explanation) = plan["explanation"].as_str().filter(|s| !s.is_empty()) {
+        body = body.child(
+            label(explanation, SMALL, p.muted)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    let mut steps = col().min_w(0.0).gap(8.0);
+    for (i, step) in plan["steps"].as_array().into_iter().flatten().enumerate() {
+        let status = step["status"].as_str().unwrap_or("pending");
+        let word = match status {
+            "running" => "In progress",
+            "completed" => "Done",
+            _ => "Pending",
+        };
+        let mut square = el()
+            .key(format!("plan-step-status-{id}-{i}"))
+            .role("img")
+            .label(word)
+            .size(10.0, 10.0)
+            .border(2.0, p.muted);
+        square = match status {
+            "completed" => square.fill(p.ink),
+            "running" => square.child(el().size(5.0, 10.0).fill(p.muted)),
+            _ => square,
+        };
+        steps = steps.child(
+            row()
+                .key(format!("plan-step-{id}-{i}"))
+                .min_w(0.0)
+                .gap(8.0)
+                .child(el().size(24.0, 20.0).center().child(square))
+                .child(
+                    col()
+                        .min_w(0.0)
+                        .grow(1.0)
+                        .gap(2.0)
+                        .child(
+                            label(step["text"].as_str().unwrap_or(""), SMALL, p.ink)
+                                .wrap_anywhere()
+                                .selectable(true),
+                        )
+                        .child(pixel_text(word, p.muted)),
+                ),
+        );
+    }
+    if plan["steps"]
+        .as_array()
+        .is_some_and(|steps| !steps.is_empty())
+    {
+        body = body.child(block(format!("plan-steps-{id}"), steps, false));
+    }
+    if let Some(markdown) = plan["markdown"].as_str().filter(|s| !s.is_empty()) {
+        body = body.child(block(
+            format!("plan-markdown-{id}"),
+            markdown_ui::render(
+                markdown,
+                p,
+                s.dark,
+                s.viewport_width >= WIDE_PANE,
+                false,
+                !tool.done,
+                &format!("plan-{id}"),
+            ),
+            !tool.done,
+        ));
+    }
+    col()
+        .key(format!("inline-tool-{id}"))
+        .min_w(0.0)
+        .child(outlined(
+            col()
+                .key(format!("plan-card-{id}"))
+                .min_w(0.0)
+                .radius(6.0)
+                .child(body.padding(12.0))
+                .child(rule(p))
+                .child(raw(s, p, index)),
+            p,
+        ))
 }

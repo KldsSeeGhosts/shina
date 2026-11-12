@@ -1470,6 +1470,9 @@ impl Thread {
                     self.harness_context_sent = record["value"] == true;
                 } else if let Some(field) = record["field"].as_str() {
                     self.harness_state[field] = record["value"].clone();
+                    if matches!(field, "plan" | "plan_update") {
+                        self.record_plan(&record["value"]);
+                    }
                 }
             }
             "response" => {
@@ -1636,7 +1639,10 @@ impl Thread {
                             && self.harness != "pi"
                             && record["data"]["messages"]
                                 .as_array()
-                                .is_some_and(Vec::is_empty)
+                                .is_some_and(|messages| {
+                                    messages.is_empty()
+                                        || record["data"]["historyReplayed"] == false
+                                })
                             && !self.messages.is_empty()
                         {
                             // ACP resume need not replay history. Keep the server transcript
@@ -1925,6 +1931,38 @@ impl Thread {
             _ => {}
         }
         self.drive_session();
+    }
+
+    fn record_plan(&mut self, source: &Value) {
+        let turn = self.ensure_work().start;
+        let id = source["_shinaPlanId"]
+            .as_str()
+            .or_else(|| source["planId"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("plan-{turn}"));
+        let index = if let Some(index) = self.tools.iter().position(|t| t.id == id) {
+            index
+        } else {
+            self.assistant();
+            let message = self.assistant.unwrap();
+            let mut tool = Tool::new(
+                &id,
+                "plan",
+                source,
+                ToolAnchor {
+                    message,
+                    offset: self.messages[message].text.len(),
+                },
+            );
+            tool.kind = Some(crate::work::ToolKind::Plan);
+            self.tools.push(tool);
+            self.tools.len() - 1
+        };
+        let tool = &mut self.tools[index];
+        tool.done = true;
+        tool.input = source.clone();
+        tool.structured =
+            json!({"input":source,"structuredContent":{"plan":crate::work::plan_data(source)}});
     }
 
     fn update_model(&mut self, model: &Value) {
