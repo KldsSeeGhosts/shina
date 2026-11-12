@@ -78,6 +78,9 @@ target.harness is present. Omit model to use that harness's configured default. 
 default when no choice is pinned. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
 level before starting the child, and rejects an unknown or unsupported choice. It never silently \
 substitutes a model or clamps a level.
+- Use target.machine only when the work must run on a linked server, and choose its id, host or label from orchestrator_capabilities.peers. \
+For remote work, workspace is a project id or path on that server; omit it only when the caller's git remote matches exactly one project there. \
+Choose the peer's advertised harness and model, and reuse client_request_id with identical arguments when retrying an uncertain launch. \
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
 status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
 after your current work. These messages are labeled Shina, not user instructions.
@@ -231,6 +234,7 @@ pub fn tools() -> Value {
         "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
         "properties":{
             "harness":{"type":"string","description":"pi, codex, claude, or an installed ACP id. Defaults to the parent's harness."},
+            "machine":{"type":"string","description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work."},
             "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{
@@ -286,6 +290,7 @@ pub fn tools() -> Value {
                 "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
                 "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Project id or path in the caller's scope. Required with several scoped workspaces; rejected outside scope."},
                 "target": target,
+                "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable retry key for remote delegation. Reuse it with the identical brief and target after an uncertain response."},
                 "wait_seconds": wait
             },"required":["prompt"]}
         },
