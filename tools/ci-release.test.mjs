@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -97,4 +97,23 @@ test("checksums require all architectures and reject unexpected, empty or linked
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("CI workflows run Core gate in parallel with builds and gate publish on it", () => {
+  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
+  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
+
+  assert.match(updates, /\n  core:\n    name: Core gate\n    runs-on: ubuntu-24\.04\n/);
+  assert.match(updates, /cargo fmt --check/);
+  assert.match(updates, /node --test tools\/\*\.test\.mjs/);
+  assert.match(updates, /cargo test --locked --quiet/);
+  assert.doesNotMatch(updates, /\n  (?:windows|macos|linux):[\s\S]*?\n    needs:/);
+  assert.equal((updates.match(/actions: read/g) ?? []).length, 3);
+
+  assert.match(platform, /\n  publish:\n[\s\S]*?permissions:\n      actions: read\n      contents: write\n/);
+  assert.match(platform, /\n  publish:\n[\s\S]*?steps:\n      - name: Wait for Core gate\n/);
+  assert.match(platform, /gh api --paginate "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{GITHUB_RUN_ID\}\/jobs\?per_page=100"/);
+  assert.match(platform, /select\(\.name == "Core gate"\)/);
+  assert.match(platform, /sleep 15/);
+  assert.match(platform, /1800/);
 });

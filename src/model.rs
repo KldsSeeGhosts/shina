@@ -87,7 +87,7 @@ impl Selection {
 }
 
 /// The validated fields of a `delegate_task.target` request.
-struct DelegationTarget {
+pub(crate) struct DelegationTarget {
     harness: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -5534,9 +5534,12 @@ impl State {
             }
             // Do not clear until its receipt arrives and this exact editor content still matches.
             let revision = uuid::Uuid::new_v4();
-            let prompt = match crate::composer_tokens::prompt(
+            let target_machine = self.current().machine.clone();
+            let prompt = match crate::composer_tokens::prompt_for(
                 &self.current().draft,
                 &self.current().draft_images,
+                Some(&target_machine),
+                &|machine| self.machine_label(machine),
             ) {
                 Ok(prompt) => prompt,
                 Err(error) => {
@@ -6526,6 +6529,7 @@ impl State {
                 .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
             {
                 t.draft = crate::composer_rich::restore(text, draft["richHtml"].as_str());
+                crate::composer_tokens::stamp_thread_owner(&mut t.draft, &t.machine);
                 t.draft_images = images;
                 t.attachment_error = if missing_images {
                     Some("Some saved draft images are missing or invalid. Attach those images again.".into())
@@ -7312,7 +7316,7 @@ fn next_counter(saved: &Value, maximum: usize) -> Result<usize, String> {
     Ok(next)
 }
 
-fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
+pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
     let Some(target) = args.get("target") else {
         return Ok(None);
     };

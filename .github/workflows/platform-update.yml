@@ -100,8 +100,9 @@ jobs:
     name: Publish ${{ inputs.platform }}
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 35
     permissions:
+      actions: read
       contents: write
     # Only metadata/asset writes serialize. Slow builds never hold up another platform.
     concurrency:
@@ -109,6 +110,33 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
+      - name: Wait for Core gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$((SECONDS + 1800))
+          while true; do
+            job_json=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[] | select(.name == "Core gate")')
+            if [ -n "$job_json" ]; then
+              status=$(jq -r '.status' <<<"$job_json" | head -n1)
+              conclusion=$(jq -r '.conclusion // empty' <<<"$job_json" | head -n1)
+              echo "Core gate status=$status conclusion=${conclusion:-pending}"
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ]; then
+                  exit 0
+                fi
+                echo "Core gate failed with conclusion: $conclusion" >&2
+                exit 1
+              fi
+            else
+              echo "Core gate job not yet visible"
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting 30 minutes for Core gate" >&2
+              exit 1
+            fi
+            sleep 15
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

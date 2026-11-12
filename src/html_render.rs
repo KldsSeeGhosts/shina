@@ -575,7 +575,13 @@ pub fn page(directory: &Path, reference: &Reference) -> Result<String, String> {
 }
 
 pub fn result(reference: &Reference) -> Value {
-    json!({"htmlRender":reference,"message":"Shown to the reader above your reply. Don't mention or describe the page; reply with only what it doesn't already say."})
+    let has_preview = reference.light.is_some() || reference.dark.is_some();
+    let message = if has_preview {
+        "Published as a preview card in the conversation; the live page opens in its own window. Don't restate what the preview image already shows; reply with only what it doesn't already say."
+    } else {
+        "Published as an open-only card in the conversation; host screenshot capture is unavailable, so the reader has not seen the page content. The live page opens in its own window."
+    };
+    json!({"htmlRender":reference,"message":message})
 }
 
 /// Providers wrap MCP results differently. Accept only a validated render reference,
@@ -920,6 +926,17 @@ pub(crate) mod tests {
     fn capture_unavailable_still_publishes_and_preview_has_no_publication() {
         let r = fixture(false);
         assert!(r.light.is_none() && r.dark.is_none());
+        let without_capture = result(&r);
+        let msg = without_capture["message"].as_str().unwrap();
+        assert!(msg.contains("open-only card"));
+        assert!(msg.contains("has not seen the page content"));
+        assert!(msg.contains("own window"));
+
+        let with_capture = result(&fixture(true));
+        let msg = with_capture["message"].as_str().unwrap();
+        assert!(msg.contains("preview card"));
+        assert!(msg.contains("own window"));
+
         let input = input(&json!({"html":"<h1>Page</h1>","width":390}), true, false).unwrap();
         let preview = crate::html_window::preview(&input, &Fake(true)).unwrap();
         assert_eq!(preview["width"], 390);
