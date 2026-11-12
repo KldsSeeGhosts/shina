@@ -139,7 +139,6 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 continue;
             }
             let draft = !captain
-                && record["session"].is_null()
                 && life.pinned_at.is_none()
                 && !life.settled()
                 && life.snoozed_at.is_none()
@@ -148,9 +147,14 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 && life.last_completed_at.is_none()
                 && view["messages"].as_array().is_none_or(Vec::is_empty)
                 && status_of_view(view) == Status::Ready;
-            // Match local draft-listing rules. Blank remote landing slots are not chats.
+            // Match local draft-listing rules. Blank remote landing slots are not chats, unless
+            // the thread already has a session (e.g., an existing remote thread).
             if draft
-                && draft_text.is_empty()
+                && record["session"].is_null()
+                && draft_text.trim().is_empty()
+                && !saved["richHtml"]
+                    .as_str()
+                    .is_some_and(|html| html.contains("data-pill"))
                 && record["renamed"] != true
                 && saved["images"].as_array().is_none_or(Vec::is_empty)
             {
@@ -520,7 +524,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .or_else(|| saved["text"].as_str())
         .unwrap_or("");
     let title = label(
-        if entry.draft && !draft.is_empty() {
+        if entry.draft && !draft.trim().is_empty() {
             draft.lines().next().unwrap_or(title)
         } else {
             title
