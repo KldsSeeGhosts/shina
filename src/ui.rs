@@ -1527,18 +1527,23 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .pt(8.0)
             .pb(4.0),
     );
-    let harnesses = [("pi", "Pi", false), ("codex", "Codex", false)]
-        .into_iter()
-        .chain(
-            s.harnesses
-                .agents
-                .iter()
-                .map(|agent| (agent.id.as_str(), agent.name.as_str(), true)),
-        );
+    let harnesses = [
+        ("pi", "Pi", false),
+        ("codex", "Codex", false),
+        ("claude", "Claude", false),
+    ]
+    .into_iter()
+    .chain(
+        s.harnesses
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.name.as_str(), true)),
+    );
     let mut seen: Vec<(&str, &str)> = Vec::new();
     for (id, name, acp) in harnesses {
         let selected = t.harness == id;
-        let enabled = t.can_choose_harness();
+        let available = id != "claude" || acp || crate::claude::process().is_ok();
+        let enabled = t.can_choose_harness() && available;
         let chosen = id.to_owned();
         // An ACP agent can share an id with a built-in harness. One with the same name too is
         // the same entry and is not listed twice. One with another name is listed with its
@@ -1607,6 +1612,15 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 });
         }
         list = list.child(item);
+        if !available {
+            list = list.child(
+                label(crate::claude::MISSING, SMALL, p.muted)
+                    .key("claude-unavailable")
+                    .wrap()
+                    .px(16.0)
+                    .py(4.0),
+            );
+        }
     }
     if let Some(error) = &s.harnesses.error {
         list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
@@ -9843,6 +9857,7 @@ pub(crate) mod tests {
                 "harness-group",
                 "choose-harness-pi",
                 "choose-harness-codex",
+                "choose-harness-claude",
                 "choose-harness-fixture",
                 "harness-tag-fixture",
                 "model-list",
@@ -9861,6 +9876,13 @@ pub(crate) mod tests {
                 "Pi is built in, not an ACP agent"
             );
             assert!(rt.presented("harness-tag-codex").is_none());
+            assert!(rt.presented("harness-tag-claude").is_none());
+            if crate::claude::process().is_ok() {
+                press(&mut rt, "choose-harness-claude");
+                assert_eq!(rt.state.current().harness, "claude");
+            } else {
+                assert!(rt.presented("claude-unavailable").is_some());
+            }
             press(&mut rt, "choose-harness-fixture");
             assert_eq!(rt.state.current().harness, "fixture");
             assert!(rt.state.current().selected_model.is_none());

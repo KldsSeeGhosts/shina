@@ -5,6 +5,7 @@ mod attachments;
 mod backend;
 mod brand;
 mod captains;
+mod claude;
 mod client;
 mod codex;
 mod context;

@@ -576,7 +576,13 @@ pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
             let summary = item["errorMessage"]
                 .as_str()
                 .or_else(|| result["summary"].as_str())
-                .unwrap_or(if t.harness == "codex" {
+                .unwrap_or(if t.harness == "claude" {
+                    if item["running"] == true {
+                        "Claude is compacting the conversation."
+                    } else {
+                        "Claude did not report a compaction summary or token counts."
+                    }
+                } else if t.harness == "codex" {
                     if item["running"] == true {
                         "Codex is compacting the conversation."
                     } else {
