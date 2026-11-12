@@ -327,7 +327,15 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                     .key(format!("machine-detail-{}-{id}", entry.server))
                     .truncate()
                     .shrink()
-                    .grow(1.0)
+                    .beside_tag(
+                        true,
+                        sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                        status.label().chars().count() as f32 * 6.6
+                            + 24.0
+                            + ICON
+                            + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                        &detail.join(", "),
+                    )
                     .min_w(workspace_floor(
                         sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
                         // The status word, three gaps, the machine icon and the timer slot.
@@ -352,7 +360,9 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                         + if timer.is_some() { TIMER_SLOT } else { 0.0 },
                     &detail.join(", "),
                 ),
-            ));
+            ))
+            // The machine sits 8 px after the workspace; the free space comes after it.
+            .child(spacer());
         if let Some(seconds) = timer {
             status_line = status_line.child(
                 label(elapsed_label(seconds), PIXEL.features(TABULAR), p.muted)
@@ -370,7 +380,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 .center_y()
                 .child(
                     el().size(CAPTAIN_SLOT, CAPTAIN_SLOT).center().child(
-                        pixel_portrait(&pixels, CAPTAIN_FACE, p)
+                        pixel_portrait(s, &pixels, CAPTAIN_FACE, p)
                             .key(format!("machine-portrait-{}-{id}", entry.server))
                             .a11y_hidden(),
                     ),
@@ -463,6 +473,12 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                         .key(format!("machine-workspace-{}-{id}", entry.server))
                         .truncate()
                         .shrink()
+                        .beside_tag(
+                            true,
+                            sidebar_row_width(s) - 2.0 * ROW_INSET,
+                            16.0 + ICON + slot_width(age.as_deref()) + 32.0,
+                            workspace,
+                        )
                         .min_w(workspace_floor(
                             sidebar_row_width(s) - 2.0 * ROW_INSET,
                             // The project tile, the machine icon, the status or age text and
@@ -471,7 +487,6 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                             workspace,
                         )),
                 )
-                .child(spacer())
                 .child(machine_tag(
                     s,
                     p,
@@ -483,7 +498,9 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                         16.0 + ICON + slot_width(age.as_deref()) + 32.0,
                         workspace,
                     ),
-                )),
+                ))
+                // The machine sits 8 px after the workspace; the free space comes after it.
+                .child(spacer()),
         );
     if let Some(age) = age {
         let ink = if status == Status::Waiting {

@@ -75,17 +75,64 @@ impl Lcg {
 }
 
 /// How far a captain's backdrop pulls the two lowest sky steps from their own colours: the step
-/// above the sea first, then the one above it.
-const BACKDROP_TINT: [f32; 2] = [0.75, 0.40];
+/// above the sea first, then the one above it, by day and by night.
+const BACKDROP_TINT: [f32; 2] = [0.45, 0.20];
+const NIGHT_BACKDROP_TINT: [f32; 2] = [0.75, 0.40];
+
+fn linear(v: u8) -> f32 {
+    let v = v as f32 / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+fn encode(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let v = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (v * 255.0).round() as u8
+}
+/// Relative luminance, as WCAG defines it.
+fn luminance(c: Rgb) -> f32 {
+    0.2126 * linear(c[0]) + 0.7152 * linear(c[1]) + 0.0722 * linear(c[2])
+}
+/// `step` tinted `t` of the way toward `backdrop`'s hue at `step`'s own luminance. A plain mix
+/// pulls a sky step toward the backdrop's lightness too, which made the lowest day step darker
+/// than the one above it and the lowest night step brighter, so the sky's gradient ran the
+/// wrong way. Tinting at the step's own luminance keeps every step's order whatever the
+/// captain's colour.
+fn tint(step: Rgb, backdrop: Rgb, t: f32) -> Rgb {
+    let mixed = mix(step, backdrop, t);
+    let want = luminance(step);
+    // Scale in linear light toward the step's luminance; channels that would clip give back
+    // what they cannot carry to the others, a few passes deep.
+    let mut lin = mixed.map(linear);
+    for _ in 0..4 {
+        let now = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+        if (now - want).abs() < 1e-4 {
+            break;
+        }
+        let k = want / now.max(1e-6);
+        lin = lin.map(|v| (v * k).min(1.0));
+    }
+    lin.map(encode)
+}
 
 /// Most distant sails on a horizon, one per working thread or crew task.
 pub const FLEET_MAX: usize = 4;
-/// Where each distant sail's mast stands, as a fraction of the band's width. None sits under
-/// the sun or the moon (at four fifths), on the portrait that overlaps the middle of a captain's
-/// band, or on the boat (a third or a quarter along), and they do not bunch on one side.
 /// A distant sail's colours are mixed this far toward the sky behind it.
 const FLEET_HAZE: f32 = 0.25;
-const FLEET_AT: [f32; FLEET_MAX] = [0.70, 0.14, 0.88, 0.38];
+/// Where each distant sail's mast stands, as a fraction of the band's width. None touches the
+/// sun or the moon (at four fifths), the portrait that overlaps the middle of a captain's band,
+/// or the boat (a third or a quarter along), at band widths from 400 pt, and they do not bunch
+/// on one side: two each side of the middle. The fourth used to stand at 0.38, between the boat
+/// and the portrait, where it touched the hull on narrow bands; at 0.60 it would sit under the
+/// portrait on a 400 pt band.
+const FLEET_AT: [f32; FLEET_MAX] = [0.70, 0.14, 0.88, 0.04];
 
 /// Rows of sea at the foot of a band: crest, two of water and the rest deep.
 const SEA_ROWS: usize = 8;
@@ -197,10 +244,13 @@ const DAY_INK: Rgb = [0x1f, 0x25, 0x38];
 /// A tapered pennant of four cells on its top row and two below, in `colour`, with a one cell
 /// outline all round (`mast` leaves out the outline cells where a mast stands to its left). The
 /// cells are (column, row) from the pennant's top-left cell, and the outline has negative ones.
-/// The outline keeps a pale or pastel colour readable on any sky.
+/// The outline, half ink and half the pennant's colour, keeps a pale or pastel colour readable
+/// on any sky.
 pub fn pennant(night: bool, colour: Rgb, mast: bool) -> Vec<(i32, i32, Rgb)> {
     const BODY: [(i32, i32); 6] = [(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (1, 1)];
-    let ink = if night { NIGHT.star } else { DAY_INK };
+    // The outline is mixed halfway toward the pennant, so the captain's colour leads and the
+    // outline only keeps a pale or pastel colour apart from the sky.
+    let ink = mix(if night { NIGHT.star } else { DAY_INK }, colour, 0.5);
     let mut cells = Vec::new();
     for y in -1..=2 {
         for x in -1..=4 {
@@ -260,12 +310,17 @@ pub fn band(width: f32, height: f32, night: bool, subject: Subject, fleet: usize
         } else {
             mix(palette.sky_top, palette.sky_bottom, t)
         };
+        let tints = if night {
+            NIGHT_BACKDROP_TINT
+        } else {
+            BACKDROP_TINT
+        };
         if let Subject::Sky(backdrop) = subject
-            && let Some(tint) = (steps - 1)
+            && let Some(amount) = (steps - 1)
                 .checked_sub(step)
-                .and_then(|from_sea| BACKDROP_TINT.get(from_sea))
+                .and_then(|from_sea| tints.get(from_sea))
         {
-            color = mix(color, backdrop, *tint);
+            color = tint(color, backdrop, *amount);
         }
         grid.fill_rows(from, to, color);
     }
@@ -429,9 +484,47 @@ mod tests {
             for n in 0..2 {
                 assert_eq!(step(&tinted, n), step(&plain, n), "night {night} step {n}");
             }
-            assert_eq!(step(&tinted, 2), mix(step(&plain, 2), backdrop, 0.40));
-            assert_eq!(step(&tinted, 3), mix(step(&plain, 3), backdrop, 0.75));
+            let tints = if night {
+                NIGHT_BACKDROP_TINT
+            } else {
+                BACKDROP_TINT
+            };
+            assert_eq!(step(&tinted, 2), tint(step(&plain, 2), backdrop, tints[1]));
+            assert_eq!(step(&tinted, 3), tint(step(&plain, 3), backdrop, tints[0]));
             assert_ne!(step(&tinted, 3), step(&plain, 3));
+        }
+    }
+
+    #[test]
+    fn a_captain_tint_never_turns_the_sky_gradient_around() {
+        // By day the sky lightens toward the sea and by night it darkens. Ember's #6a92b8 once
+        // made the lowest day step darker than the one above it.
+        let waterline = 108.0 - SEA_ROWS as f32 * CELL;
+        for night in [false, true] {
+            for portrait in 0..12 {
+                let backdrop = crate::visuals::portrait_backdrop(portrait);
+                let rects = band(600.0, 108.0, night, Subject::Sky(backdrop), 0);
+                let steps: Vec<f32> = (0..4)
+                    .map(|n| {
+                        luminance(covered(&rects, 1.0, waterline * (n as f32 + 0.5) / 4.0).unwrap())
+                    })
+                    .collect();
+                for pair in steps.windows(2) {
+                    let ok = if night {
+                        pair[1] <= pair[0] + 1e-4
+                    } else {
+                        pair[1] >= pair[0] - 1e-4
+                    };
+                    assert!(ok, "night {night}, portrait {portrait}: {steps:?}");
+                }
+                // The captain's colour still shows: the lowest step moves off the plain sky.
+                let plain = band(600.0, 108.0, night, Subject::Boat, 0);
+                assert_ne!(
+                    covered(&rects, 1.0, waterline - 1.0),
+                    covered(&plain, 1.0, waterline - 1.0),
+                    "night {night}, portrait {portrait}"
+                );
+            }
         }
     }
 
@@ -452,8 +545,9 @@ mod tests {
             assert_eq!((body[0].w, body[1].w), (4.0 * CELL, 2.0 * CELL));
             assert_eq!(body[0].x, body[1].x);
             assert_eq!(body[1].y - body[0].y, CELL);
-            // A one cell outline in ink by day and the star colour at night.
-            let ink = if night { NIGHT.star } else { DAY_INK };
+            // A one cell outline, ink by day and the star colour at night, mixed halfway toward
+            // the pennant so the captain's colour leads.
+            let ink = mix(if night { NIGHT.star } else { DAY_INK }, backdrop, 0.5);
             let (x, y) = (body[0].x, body[0].y);
             for (dx, dy) in [
                 (0.0, -CELL),
@@ -559,6 +653,89 @@ mod tests {
                     (column - sun).abs() > 12,
                     "{column} is under the sun or moon"
                 );
+            }
+        }
+    }
+
+    /// The cells `band` draws for each part, rebuilt from the same placements.
+    fn parts(width: f32, night: bool, subject: Subject) -> (Vec<(i32, i32)>, Vec<Vec<(i32, i32)>>) {
+        let grid = Grid::new(width, 108.0);
+        let cols = grid.cols as i32;
+        let waterline = grid.rows.saturating_sub(SEA_ROWS) as i32;
+        let mut fixed = Vec::new();
+        // The sun's 5 by 5 disc, or the moon's 10 by 10 crescent box, at four fifths.
+        if night {
+            for dx in 0..10 {
+                for dy in 0..10 {
+                    fixed.push((cols * 4 / 5 + dx, 4 + dy));
+                }
+            }
+        } else {
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    fixed.push((cols * 4 / 5 + dx, 6 + dy));
+                }
+            }
+        }
+        // The boat, and on a captain's band its pennant.
+        let centre = match subject {
+            Subject::Boat => cols / 3,
+            Subject::Sky(_) => cols / 4,
+        };
+        let rise = waterline - 25;
+        brand::boat(night, |x, y, _| {
+            fixed.push((x as i32 - 16 + centre, y as i32 + rise))
+        });
+        if let Subject::Sky(colour) = subject {
+            for (x, y, _) in pennant(night, colour, true) {
+                fixed.push((x + centre, 4 + y + rise));
+            }
+        }
+        let sails = FLEET_AT
+            .iter()
+            .map(|fraction| {
+                let mast = (cols as f32 * fraction) as i32;
+                let mut cells = Vec::new();
+                brand::distant_sail(night, |x, y, _| {
+                    cells.push((mast - 2 + x as i32, waterline - 7 + y as i32))
+                });
+                cells
+            })
+            .collect();
+        (fixed, sails)
+    }
+
+    #[test]
+    fn no_distant_sail_touches_the_boat_the_portrait_the_sun_or_the_moon() {
+        for width in [400.0, 560.0, 736.0] {
+            for night in [false, true] {
+                for subject in [Subject::Boat, Subject::Sky([0x6a, 0x92, 0xb8])] {
+                    let (fixed, sails) = parts(width, night, subject);
+                    for (n, sail) in sails.iter().enumerate() {
+                        let at = format!("width {width}, night {night}, {subject:?}, sail {n}");
+                        // Touching includes a shared edge or corner.
+                        for &(x, y) in sail {
+                            assert!(
+                                !fixed
+                                    .iter()
+                                    .any(|&(fx, fy)| (fx - x).abs() <= 1 && (fy - y).abs() <= 1),
+                                "{at}: the cell ({x}, {y}) touches the boat, the sun or the moon"
+                            );
+                        }
+                        // The hero portrait overlaps a captain band's middle: 72 pt and 8 pt of
+                        // room each side.
+                        if matches!(subject, Subject::Sky(_)) {
+                            let (left, right) = (width / 2.0 - 44.0, width / 2.0 + 44.0);
+                            for &(x, _) in sail {
+                                let (x0, x1) = (x as f32 * CELL, (x + 1) as f32 * CELL);
+                                assert!(
+                                    x1 <= left || x0 >= right,
+                                    "{at}: the cell at {x0} pt is under the portrait"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

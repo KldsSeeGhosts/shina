@@ -149,7 +149,9 @@ fn palette(dark: bool) -> Palette {
             coral_bg: color("#d2643c").alpha(0.12),
             // Cream on #d2643c is 3.7:1. Near-black reaches 5.2:1, so coral fills keep it.
             on_coral: color("#1a0f0a"),
-            brass: color("#8a6a2f"),
+            // The document's #8a6a2f is 3.97:1 as a status word on the sky; the same hue at
+            // 91% reaches 4.6:1 there.
+            brass: color("#7e602b"),
             on_brass: color("#fffdf7"),
             sea: color("#1f6d62"),
             sea_bg: color("#d6ebe4"),
@@ -387,9 +389,14 @@ fn horizon_band(
     )
 }
 /// The number of distant sails: the working count the captain header shows ("Working in the
-/// background, 2 tasks"), so the scenery and the words never disagree. `horizon_band` caps it.
+/// background, 2 tasks"), threads running now, so the scenery and the words never disagree.
+/// `horizon_band` caps it.
 fn fleet_size(s: &State) -> usize {
-    s.background_status().working
+    if let Some(captain) = captain_ui::brief_captain(s) {
+        s.crew_working_now(s.captain_home(captain).unwrap_or(s.current().id))
+    } else {
+        s.working_now_count()
+    }
 }
 /// Height of the horizon band, 36 cells of 3 pt.
 const HORIZON_HEIGHT: f32 = 108.0;
@@ -397,18 +404,20 @@ const HORIZON_HEIGHT: f32 = 108.0;
 const SEA_HEIGHT: f32 = 27.0;
 /// A portrait in a pixel frame. The image sits under a border overlay, because Rune paints a
 /// clipped image over its own border. Below 30 px the frame is 1 px so the face keeps its room.
-fn pixel_portrait(pixels: &rune::Pixels, size: f32, p: Palette) -> El {
-    pixel_portrait_framed(pixels, size, p, None)
+fn pixel_portrait(s: &State, pixels: &rune::Pixels, size: f32, p: Palette) -> El {
+    pixel_portrait_framed(s, pixels, size, p, None)
 }
 /// `pixel_portrait` with an accent for a selected portrait: the frame and the hard shadow both
 /// take that colour. The frame keeps its width and the shadow lies outside the box, so the
 /// outer bounds do not change.
 fn pixel_portrait_framed(
+    s: &State,
     pixels: &rune::Pixels,
     size: f32,
     p: Palette,
     accent: Option<Color>,
 ) -> El {
+    let size = s.artwork.snap_points(size);
     let (radius, frame) = if size >= 30.0 { (4.0, 2.0) } else { (2.0, 1.0) };
     let edge = accent.unwrap_or(p.portrait_frame);
     let mut shadow = hard_shadow(p);
@@ -663,6 +672,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
     cx.foreground(p.ink);
     cx.focus_ring(2.0, 2.0, p.coral);
+    // Every enabled button, tab, link and switch is a Tab stop in document order, as on the web,
+    // even one that never said `focusable(true)`. Disabled controls stay out.
+    cx.web_focus();
     cx.caption_color(p.muted);
     // The sidebar portraits' animation clock lives outside the view and needs this setting.
     s.portraits.set_reduced_motion(cx.is_reduced_motion());
@@ -922,7 +934,17 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(pill);
     }
     if s.attention_menu && !s.attention().is_empty() {
-        root = root.child(crew_ui::attention_menu(s, p));
+        // The pane's top left corner, worked out rather than read from the last layout, so the
+        // popover is in place on its first frame: the workspace's 8 pt inset, the sidebar and
+        // its 4 pt resize handle, under the top strip.
+        let pane = docked.then(|| {
+            let handle = if compact { 0.0 } else { 4.0 };
+            (
+                8.0 + sidebar_width + handle,
+                chrome.height.max(40.0 * zoom) / zoom,
+            )
+        });
+        root = root.child(crew_ui::attention_menu(s, p, pane));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -1469,12 +1491,27 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                         .caret(p.coral, p.coral_bg)
                         .grow(1.0)
                         .min_w(0.0)
-                        .on_edit(|s: &mut State| &mut s.model_search),
+                        .on_edit(|s: &mut State| &mut s.model_search)
+                        // Down from the search field goes into the list, as in KSG Code's
+                        // combobox; the list's own group takes the arrows from there.
+                        .on_input_key(|s: &mut State, event, tx| {
+                            if matches!(event.key, rune::Key::Down) {
+                                // The field's own focus flag would win over `tx.focus`.
+                                s.model_search.focused = false;
+                                tx.focus("model-list", true);
+                                return true;
+                            }
+                            false
+                        }),
                 ),
         );
     let query = s.model_search.text.to_lowercase();
     let mut list = col()
         .key("model-list")
+        .role("listbox")
+        .label("Models")
+        // Up, Down, Home and End move through the harnesses and models, Return chooses.
+        .focus_group()
         .w_full()
         .max_h(max_h)
         .pb(6.0)
@@ -1536,6 +1573,9 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 Color::TRANSPARENT
             })
             .hover(if selected { p.coral_bg } else { p.selected })
+            // Arrow keys show where they are with the hover wash.
+            .focus_fill(p.selected)
+            .focus_selected(selected)
             .disabled(!enabled)
             .child(harness_icon(s, p, id, name))
             .child(
@@ -1611,6 +1651,8 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 Color::TRANSPARENT
             })
             .hover(if selected { p.coral_bg } else { p.selected })
+            .focus_fill(p.selected)
+            .focus_selected(selected)
             .disabled(!can_choose)
             .child(provider_icon(
                 s,
@@ -1707,7 +1749,10 @@ fn sidebar_toggle(p: Palette, compact: bool) -> El {
 /// The ship mark at 24 px with a 1 px `frame` outline.
 fn shina_mark(s: &State, p: Palette) -> El {
     el().key("shina-logo")
-        .size(HEADER_MARK, HEADER_MARK)
+        .size(
+            s.artwork.snap_points(HEADER_MARK),
+            s.artwork.snap_points(HEADER_MARK),
+        )
         .radius(4.0)
         .clip_rounded(4.0)
         .pixels(&s.artwork.mark_pixels(s.dark, HEADER_MARK))
@@ -1738,7 +1783,10 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
         .py(12.0)
         .child(
             el().key(format!("{key}-mark"))
-                .size(EMPTY_MARK, EMPTY_MARK)
+                .size(
+                    s.artwork.snap_points(EMPTY_MARK),
+                    s.artwork.snap_points(EMPTY_MARK),
+                )
                 .radius(4.0)
                 .clip_rounded(4.0)
                 .pixels(&s.artwork.mark_pixels(s.dark, EMPTY_MARK))
@@ -1765,14 +1813,20 @@ fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
     } else {
         0.0
     };
-    let before = HEADER_TOGGLE + HEADER_MARK + WORDMARK_GAP;
-    if line >= before + WORDMARK_WIDTH + badge {
+    let before = HEADER_TOGGLE + HEADER_MARK;
+    if line >= before + wordmark_gap(22.0) + WORDMARK_WIDTH + badge {
         Some(22.0)
-    } else if line >= before + WORDMARK_WIDTH / 2.0 + badge {
+    } else if line >= before + wordmark_gap(11.0) + WORDMARK_WIDTH / 2.0 + badge {
         Some(11.0)
     } else {
         None
     }
+}
+/// The space between the mark and the wordmark: 6 pt at 22 px, 4 pt at 11 px. A 200 pt sidebar
+/// under macOS's real 76 pt traffic-light inset leaves 112 pt, and the 11 px wordmark with the
+/// badge then takes 111.
+fn wordmark_gap(size: f32) -> f32 {
+    if size < 22.0 { 4.0 } else { WORDMARK_GAP }
 }
 
 /// The sidebar's half of the title strip, left-aligned as T3 Code lays it out: the sidebar
@@ -1785,7 +1839,7 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
             header = header.child(
                 label("Shina", pixel(size), p.ink)
                     .key("shina-wordmark")
-                    .ml(WORDMARK_GAP),
+                    .ml(wordmark_gap(size)),
             );
         }
     }
@@ -1811,7 +1865,7 @@ fn undocked_header(s: &State, p: Palette, compact: bool) -> El {
 }
 /// The space between the attention badge, at the header's end, and the first tab.
 const HEADER_TAB_GAP: f32 = 12.0;
-/// The space between the mark and the wordmark. The toggle and the mark touch their boxes.
+/// The space between the mark and the 22 px wordmark. The toggle and the mark touch their boxes.
 const WORDMARK_GAP: f32 = 6.0;
 /// The least space between the wordmark (or the mark) and the attention badge.
 const BADGE_CLEARANCE: f32 = 4.0;
@@ -1988,14 +2042,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 ),
         );
     }
-    // The content fills the scroll area so the shelves sit at the bottom. The area's size is read
-    // from layout in the same units the content is laid out in, so zoom cannot skew it.
-    let viewport = rune::memo::layout_size("sidebar-scroll").map_or(0.0, |size| size[1]);
-    let mut content = col()
-        .key("sidebar-content")
-        .pb(2.0)
-        .gap(2.0)
-        .min_h(viewport);
+    // The content grows to fill the scroll area so the shelves sit at the bottom. Layout does
+    // that in the same pass that sizes the area, so no earlier frame's measurement (stale on the
+    // frame where zoom changes) can make it taller than the area. Its automatic minimum is its
+    // own content, so a long list still scrolls.
+    let mut content = col().key("sidebar-content").pb(2.0).gap(2.0).grow(1.0);
     let entries = sidebar_ui::entries(s);
     let captains: Vec<_> = entries.iter().filter(|entry| entry.captain).collect();
     if !s.show_archive || !captains.is_empty() {
@@ -2125,32 +2176,50 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             let title = format!("{section:?}");
             let marker = format!("drop-{section:?}");
             let open = s.shelves[shelf];
-            content = content.child(dotted_rule(p));
+            // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
+            // above Settled, so both stay whole above the footer when the list is longer than
+            // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
+            // The block carries its rule and the sidebar fill, so rows never show through.
+            let settled_below = section == Section::Snoozed
+                && (dragging
+                    || all.iter().any(|entry| {
+                        !entry.draft
+                            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
+                    }));
+            let inset = if settled_below { SHELF_HEADING } else { 0.0 };
             content = content.child(
-                row()
-                    .key(&key)
-                    .role("button")
-                    .cursor(rune::Cursor::Pointer)
-                    .label(format!("{title}, {} threads", rows.len()))
-                    .focusable(true)
-                    .h(32.0)
-                    .pl(ROW_INSET)
-                    .pr(8.0)
-                    .gap(6.0)
-                    .center_y()
-                    .radius(4.0)
-                    .hover(p.selected)
-                    .on_drawn_layout(move |s: &mut State, rect| {
-                        s.drop_rects.insert(marker.clone(), rect);
-                    })
-                    .on_press(move |s: &mut State| {
-                        s.shelves[shelf] = !s.shelves[shelf];
-                        s.checkpoint();
-                    })
-                    .child(pixel_label(&title, p.muted))
-                    .child(spacer())
-                    .child(pixel_text(rows.len().to_string(), p.muted))
-                    .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                col()
+                    .key(format!("shelf-block-{section:?}"))
+                    .h(SHELF_HEADING)
+                    .fill(p.bg)
+                    .sticky_bottom(inset)
+                    .child(dotted_rule(p))
+                    .child(
+                        row()
+                            .key(&key)
+                            .role("button")
+                            .cursor(rune::Cursor::Pointer)
+                            .label(format!("{title}, {} threads", rows.len()))
+                            .focusable(true)
+                            .h(32.0)
+                            .pl(ROW_INSET)
+                            .pr(8.0)
+                            .gap(6.0)
+                            .center_y()
+                            .radius(4.0)
+                            .hover(p.selected)
+                            .on_drawn_layout(move |s: &mut State, rect| {
+                                s.drop_rects.insert(marker.clone(), rect);
+                            })
+                            .on_press(move |s: &mut State| {
+                                s.shelves[shelf] = !s.shelves[shelf];
+                                s.checkpoint();
+                            })
+                            .child(pixel_label(&title, p.muted))
+                            .child(spacer())
+                            .child(pixel_text(rows.len().to_string(), p.muted))
+                            .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                    ),
             );
         } else if dragging {
             let marker = format!("drop-{section:?}");
@@ -2323,6 +2392,8 @@ fn settings_menu(s: &State, p: Palette) -> El {
     let mut menu = col()
         .key("settings-menu")
         .role("menu")
+        // Up, Down, Home and End move through the rows, Return presses one, Escape closes.
+        .focus_group()
         .label("Settings")
         .w(320.0)
         .max_h(460.0)
@@ -2416,7 +2487,10 @@ fn menu_item_in(
         .gap(10.0)
         .center_y()
         .radius(4.0)
-        .hover(p.selected)
+        // Keys and the pointer share one highlight, as in an NSMenu. Every row asks for focus;
+        // the menu's modal gives it to the first, so arrows work as soon as the menu opens.
+        .focus_highlight(p.selected)
+        .autofocus()
         .child(el().size(ICON, ICON).center().child(icon(glyph, icon_ink)))
         .child(
             label(title, TextStyle::new(13.0, 450.0), ink)
@@ -2697,6 +2771,8 @@ fn section_title(title: &str, p: Palette) -> El {
         .child(spacer())
 }
 /// The dotted divider (2 px on, 2 px off) between sidebar sections.
+/// A shelf heading's block: its dotted rule (1 px and 4 px either side) and the 32 px row.
+const SHELF_HEADING: f32 = 41.0;
 fn dotted_rule(p: Palette) -> El {
     el().h(1.0)
         .mx(ROW_INSET)
@@ -2738,7 +2814,7 @@ fn speaker_avatar(s: &State, p: Palette, captain: usize) -> El {
     let pixels = s
         .artwork
         .bust_window_pixels(portrait, crate::visuals::Face::Normal, SIZE);
-    pixel_portrait_framed(&pixels, SIZE, p, None)
+    pixel_portrait_framed(s, &pixels, SIZE, p, None)
         .key(format!("speaker-avatar-{portrait}"))
         .a11y_hidden()
 }
@@ -2759,7 +2835,7 @@ fn portrait_face(
 ) -> El {
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let pixels = s.artwork.face_pixels(captain, face_for(status), size);
-    let portrait = pixel_portrait_framed(&pixels, size, p, accent)
+    let portrait = pixel_portrait_framed(s, &pixels, size, p, accent)
         .key(format!("avatar-{captain}-{}", size as u32))
         .a11y_hidden();
     status_badge(p, portrait, size, status)
@@ -2805,7 +2881,7 @@ fn sidebar_portrait(
         .portraits
         .pixels(portrait, face, size)
         .unwrap_or_else(|| s.artwork.face_pixels(portrait, face, size));
-    pixel_portrait(&pixels, size, p)
+    pixel_portrait(s, &pixels, size, p)
         .key(format!("portrait-{row}"))
         .a11y_hidden()
         .on_visible(move |s: &mut State, on, tx| {
@@ -2816,13 +2892,13 @@ fn sidebar_portrait(
         })
 }
 
-/// What a count badge counts. Brass is for what needs you, sea for work in progress, and the
-/// neutral card fill with ink digits for what is unread. Coral stays for the one primary action.
+/// What a count badge counts. Brass is for what needs you, and the neutral card fill with ink
+/// digits for what is unread. Coral stays for the one primary action. The crew line counts its
+/// states as status squares with pixel labels, not badges.
 #[derive(Clone, Copy)]
 pub(crate) enum CountKind {
     NeedsYou,
     Unread,
-    Working,
 }
 
 fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
@@ -2834,7 +2910,6 @@ fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
     let (fill, ink, frame) = match kind {
         CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
         CountKind::Unread => (p.card, p.ink, p.frame),
-        CountKind::Working => (p.sea_bg, p.sea, p.sea),
     };
     // A square with Departure Mono digits and a 1 px frame, no shadow.
     row()
@@ -2928,7 +3003,6 @@ fn captain_row(
                 .key(format!("captain-detail-{id}"))
                 .truncate()
                 .shrink()
-                .grow(1.0)
                 .min_w(workspace_floor(
                     sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
                     // The status word, three gaps, the machine icon and the timer slot.
@@ -2937,10 +3011,17 @@ fn captain_row(
                         + if multiple_machines(s) { ICON } else { 0.0 }
                         + if timer.is_some() { TIMER_SLOT } else { 0.0 },
                     &detail,
-                )),
+                ))
+                .beside_tag(
+                    multiple_machines(s),
+                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                    status.label().chars().count() as f32 * 6.6
+                        + 24.0
+                        + ICON
+                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                    &detail,
+                ),
         );
-    } else {
-        status_line = status_line.child(spacer());
     }
     if multiple_machines(s) {
         status_line = status_line.child(machine_tag(
@@ -2959,6 +3040,8 @@ fn captain_row(
             ),
         ));
     }
+    // The machine sits 8 px after the workspace; the free space comes after it.
+    status_line = status_line.child(spacer());
     if let Some(start) = timer {
         status_line = status_line.child(
             label(
@@ -3264,6 +3347,12 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         Some(icon("edit", p.muted))
     } else if thread.pinned() && !nested {
         Some(icon("pin", p.muted))
+    } else if let Some(status) = nested
+        .then(|| crew_ui::worker_task_mark(s, thread))
+        .flatten()
+    {
+        // Interrupted and queued workers carry their chip's mark, so they never look finished.
+        Some(status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
     } else {
         None
     }
@@ -3471,9 +3560,20 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .key(format!("thread-workspace-{id}"))
                     .truncate()
                     .shrink()
-                    .min_w(0.0),
+                    .min_w(0.0)
+                    .beside_tag(
+                        multiple_machines(s),
+                        sidebar_row_width(s) - 2.0 * ROW_INSET,
+                        16.0 + ICON
+                            + slot_width(match state_label {
+                                "" => None,
+                                "Working" => Some("Working 59m 59s"),
+                                other => Some(other),
+                            })
+                            + 32.0,
+                        project.map_or("No workspace", |project| project.name.as_str()),
+                    ),
                 )
-                .child(spacer())
                 .child(if multiple_machines(s) {
                     let workspace = project.map_or("No workspace", |project| project.name.as_str());
                     // The age or the status word, widest while it counts up.
@@ -3496,7 +3596,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     )
                 } else {
                     el()
-                }),
+                })
+                // The machine sits 8 px after the workspace; the free space comes after it.
+                .child(spacer()),
         )
         .child(slot);
     item.child(
@@ -3669,6 +3771,23 @@ fn machine_tag(
     tag
 }
 
+/// A workspace name before a machine tag. When it is estimated to truncate it grows into the
+/// row's real leftover space and keeps 2 px more after its ellipsis, 10 px from the tag in
+/// all; otherwise it keeps its own width and the tag follows 8 px later. `taken` counts the
+/// row's other items and the machine icon, as `room_for_machine_name` does.
+pub(super) trait BesideTag {
+    fn beside_tag(self, machine: bool, row: f32, taken: f32, workspace: &str) -> Self;
+}
+impl BesideTag for El {
+    fn beside_tag(self, machine: bool, row: f32, taken: f32, workspace: &str) -> El {
+        if machine && text_width(workspace) > row - taken {
+            self.grow(1.0).mr(2.0)
+        } else {
+            self
+        }
+    }
+}
+
 /// Whether a row has 36 points to spare for a machine name after its other items and the
 /// workspace, which takes its text (estimated at 6.2 points a character) or its floor,
 /// whichever is wider.
@@ -3720,9 +3839,17 @@ fn captain_picker(s: &State, p: Palette) -> El {
                         .child(label(workspace, TextStyle::new(12.0, 560.0), p.ink)),
                 ),
         );
-    let mut list = col().gap(2.0).min_h(0.0).shrink().scroll(ScrollSpec {
-        stick_bottom: false,
-    });
+    // Up, Down, Home and End move through the captains; Return opens one.
+    let mut list = col()
+        .role("list")
+        .label("Captains")
+        .focus_group()
+        .gap(2.0)
+        .min_h(0.0)
+        .shrink()
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
     for captain in 0..s.captains.len() {
         let state = s.captain_status(captain);
         let open = s.current().captain == Some(captain) && s.is_captain_home(s.current());
@@ -3764,6 +3891,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .cursor(rune::Cursor::Pointer)
             .label(format!("Open Captain {}, {}", profile.name, state.label()))
             .focusable(true)
+            .autofocus()
+            .focus_fill(p.selected)
             .px(10.0)
             .py(10.0)
             .gap(14.0)
@@ -3821,6 +3950,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
     )
 }
 
+/// A portrait's cell in the captain editor's grid: the 40 pt face and 4 pt each side.
+const PICKER_CELL: f32 = 48.0;
 fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     let editor = s.captain_editor.as_ref().unwrap();
     let editing = editor.editing.is_some();
@@ -3832,9 +3963,13 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     // Six columns fit the editor's fixed 480 px card, so the grid is the same at every width.
     const COLUMNS: usize = 6;
     let chosen = editor.portrait.min(crate::visuals::PORTRAITS - 1);
-    let mut portraits = col().key("captain-portraits").gap(4.0).w_full();
+    // Each 40 pt face sits in a 48 pt cell for its hover fill. The rows reach 4 pt past the
+    // fields on each side and space the cells evenly, so the outer faces' edges line up with the
+    // fields' edges and the grid spans the same width.
+    let cell_pad = (PICKER_CELL - PICKER_PORTRAIT) / 2.0;
+    let mut portraits = col().key("captain-portraits").gap(4.0).mx(-cell_pad);
     for first in (0..crate::visuals::PORTRAITS).step_by(COLUMNS) {
-        let mut line = row().gap(4.0).w_full();
+        let mut line = row().justify_between();
         for portrait in first..(first + COLUMNS).min(crate::visuals::PORTRAITS) {
             let selected = chosen == portrait;
             line = line.child(
@@ -3848,10 +3983,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     ))
                     .checked(selected)
                     .focusable(true)
-                    .w(0.0)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .h(48.0)
+                    .size(PICKER_CELL, PICKER_CELL)
                     .center()
                     .radius(4.0)
                     .hover(p.selected)
@@ -4105,6 +4237,9 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .center()
         .modal(false, |s: &mut State| s.cancel_captain_flow())
         .on_press(|s: &mut State| s.cancel_captain_flow())
+        // A press on the scrim closes the editor; Escape does that from the keyboard, so the
+        // scrim is no Tab stop.
+        .focusable(false)
         .child(card)
 }
 
@@ -4311,10 +4446,21 @@ fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
             .min_w(0.0),
         );
     }
-    if let Some(line) = captain_ui::away_status(s, p) {
-        header = header.child(line);
+    // The away status takes the header's free space, so its width from the last layout is
+    // what the line has to fit in.
+    let available = rune::memo::layout_size("captain-away-slot").map(|size| size[0]);
+    if let Some(line) = captain_ui::away_status(s, p, available) {
+        header = header.child(
+            row()
+                .key("captain-away-slot")
+                .grow(1.0)
+                .min_w(0.0)
+                .center_y()
+                .child(line),
+        );
+    } else {
+        header = header.child(spacer());
     }
-    header = header.child(spacer());
     // The thread on a machine this desktop cannot reach says so beside its status.
     if let Some(machine) = s.unreachable_selected() {
         let text = format!("{machine} is unreachable. Reconnecting.");
@@ -4391,6 +4537,7 @@ fn thread_menu(s: &State, p: Palette) -> El {
     col()
         .key("thread-menu")
         .role("menu")
+        .focus_group()
         .label("Thread actions")
         // Wide enough for "Auto-settle after" and its value on one row.
         .w(232.0)
@@ -4686,6 +4833,8 @@ fn snooze_menu(s: &State, p: Palette) -> El {
     let (_, choices) = s.snooze_menu.as_ref().unwrap();
     let mut card = col()
         .key("snooze-menu")
+        .role("menu")
+        .focus_group()
         .w(280.0)
         .padding(4.0)
         .gap(1.0)
@@ -4886,6 +5035,7 @@ fn row_menu(s: &State, p: Palette) -> El {
         .key("row-context-menu")
         .instant_changes()
         .role("menu")
+        .focus_group()
         .label("Row actions")
         .w(222.0)
         .padding(4.0)
@@ -5035,6 +5185,8 @@ fn modal_frame(key: &str, s: &State, close: fn(&mut State), card: El) -> El {
         .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .modal(false, close)
         .on_press(close)
+        // Escape closes it from the keyboard, so the scrim is no Tab stop.
+        .focusable(false)
         .child(card)
 }
 
@@ -5220,17 +5372,28 @@ fn project_picker(s: &State, p: Palette) -> El {
                         .single_line()
                         .grow(1.0)
                         .min_w(0.0)
-                        .on_edit(|s: &mut State| {
-                            s.picker_highlight = 0;
-                            &mut s.picker_query
-                        })
+                        .on_edit(|s: &mut State| &mut s.picker_query)
                         .on_input_key(move |s: &mut State, event, _| {
+                            if edits_text(event) {
+                                s.picker_highlight = 0;
+                            }
                             let count = s
                                 .project_picker
                                 .map_or(0, |mode| picker_choices(s, mode).len());
                             match event.key {
                                 rune::Key::Down if count > 0 => {
                                     s.picker_highlight = (s.picker_highlight + 1).min(count - 1);
+                                    true
+                                }
+                                // The list's ends, as cmdk's Home and End go in KSG Code's
+                                // command palette. The field is one line, so its caret loses
+                                // nothing it cannot reach with the arrows.
+                                rune::Key::Home => {
+                                    s.picker_highlight = 0;
+                                    true
+                                }
+                                rune::Key::End if count > 0 => {
+                                    s.picker_highlight = count - 1;
                                     true
                                 }
                                 rune::Key::Up => {
@@ -5482,6 +5645,15 @@ fn browse_entries(query: &str) -> (String, Vec<String>) {
     )
 }
 
+/// Whether a key changes a search field's text, which sends a palette's highlight back to the
+/// top. Rune also calls `on_edit` for keys that only move the caret or the highlight, so the
+/// reset cannot live there.
+fn edits_text(event: &rune::KeyEvent) -> bool {
+    matches!(
+        event.key,
+        rune::Key::Text(_) | rune::Key::Backspace | rune::Key::Delete
+    ) || matches!(event.key, rune::Key::Command('v' | 'x' | 'z'))
+}
 /// Move the browse field into a listed folder.
 fn browse_into(s: &mut State, name: &str) {
     let (prefix, _) = browse_entries(&s.picker_query.text);
@@ -5587,11 +5759,13 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .grow(1.0)
                 .min_w(0.0)
                 .on_edit(|s: &mut State| {
-                    s.picker_highlight = 0;
                     s.projects.menu_error = None;
                     &mut s.picker_query
                 })
                 .on_input_key(|s: &mut State, event, tx| {
+                    if edits_text(event) {
+                        s.picker_highlight = 0;
+                    }
                     let browsing = s.picker_browsing;
                     let (_, folders) = if browsing {
                         browse_entries(&s.picker_query.text)
@@ -5609,6 +5783,14 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                     match event.key {
                         rune::Key::Down if count > 0 => {
                             s.picker_highlight = (at + 1).min(count - 1);
+                            true
+                        }
+                        rune::Key::Home => {
+                            s.picker_highlight = 0;
+                            true
+                        }
+                        rune::Key::End if count > 0 => {
+                            s.picker_highlight = count - 1;
                             true
                         }
                         rune::Key::Up => {
@@ -6559,7 +6741,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .key("chat-lane")
         .w_full()
         .max_w(measure(wide))
-        .pt(24.0)
+        // 24 pt above the first message, counting the cap.
+        .pt(24.0 - TRANSCRIPT_CAP)
         .pb(24.0)
         .gap(20.0);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
@@ -6725,13 +6908,25 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
-        // under the header's rule. The top fades over 28 pt, with 24 pt of padding above the first
-        // message, so no sliver of a card or bubble shows under the rule.
-        .scroll_edge_fade(28.0)
+        // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
+        // rule, stuck to the viewport's top, and the 28 pt fade starts below it, so nothing
+        // scrolled shows through as a sliver under the rule.
+        .scroll_fade(rune::ScrollFade::strength(28.0).below_sticky())
         .px(gutter)
         .items_center()
+        .child(
+            el().key("transcript-cap")
+                .w_full()
+                .h(TRANSCRIPT_CAP)
+                .fill(p.panel)
+                .sticky_top(0.0)
+                .a11y_hidden(),
+        )
         .child(messages)
 }
+
+/// The opaque strip under the chat header's rule, inside the transcript viewport.
+const TRANSCRIPT_CAP: f32 = 8.0;
 
 /// The sidebar portraits' animation stage also plays the captain hero, under this row id.
 pub(crate) const HERO_PORTRAIT_ROW: usize = usize::MAX;
@@ -6753,7 +6948,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
         .portraits
         .pixels(portrait_index, face, HERO_PORTRAIT)
         .unwrap_or_else(|| s.artwork.face_pixels(portrait_index, face, HERO_PORTRAIT));
-    let portrait = pixel_portrait(&pixels, HERO_PORTRAIT, p)
+    let portrait = pixel_portrait(s, &pixels, HERO_PORTRAIT, p)
         .key("captain-hero-portrait")
         .a11y_hidden()
         .on_visible(|s: &mut State, on, tx| {
@@ -6939,20 +7134,29 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
             .shrink()
             .min_w(0.0)
             .hover(p.selected)
-            .press(p.selected)
-            .child(
-                label(
-                    name.clone(),
-                    TextStyle {
-                        weight: 500.0,
-                        ..style
-                    },
-                    p.ink,
-                )
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-            );
+            .press(p.selected);
+        // With no workspace the picker is a choice still to make: a folder icon, then the
+        // words at weight 400 in the muted colour, unlike a real project's name.
+        if !has_workspace {
+            picker = picker
+                .gap(6.0)
+                .px(6.0)
+                .child(icon("folder", p.muted).key("draft-project-icon"));
+        }
+        picker = picker.child(
+            label(
+                name.clone(),
+                TextStyle {
+                    weight: if has_workspace { 500.0 } else { 400.0 },
+                    ..style
+                },
+                if has_workspace { p.ink } else { p.muted },
+            )
+            .key("draft-project-name")
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        );
         if !s.demo {
             picker = picker
                 .focusable(true)
@@ -7506,6 +7710,25 @@ fn context_popover(s: &State, p: Palette) -> El {
 
 /// The composer sits in KSG Code's `.chat-composer-lane`: the same gutters and 46 rem lane as
 /// the messages above it, with `pb-4` under the footer.
+/// The composer field's height with its 4 pt padding: one line at rest, so the body is 48 pt.
+const COMPOSER_FIELD_MIN: f32 = 36.0;
+/// KSG's `max-h-52`: a 200 pt text window inside the 4 pt padding, then the field scrolls.
+const COMPOSER_FIELD_MAX: f32 = 208.0;
+/// A composer that cannot send: demo data, an archived thread or an unreachable machine.
+fn composer_disabled(s: &State) -> bool {
+    s.demo || s.current().archived() || s.unreachable_selected().is_some()
+}
+/// The composer's 2 px frame: coral while its field has focus, from a click or from Tab, or a
+/// file is over it; `frame` otherwise; and the lighter `line` when it cannot send.
+fn composer_frame(s: &State, p: Palette) -> Color {
+    if composer_disabled(s) {
+        p.line
+    } else if s.attachment_drop_hover || s.current().draft.focused {
+        p.coral
+    } else {
+        p.frame
+    }
+}
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
@@ -7631,22 +7854,15 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
     // A composer that cannot send has nothing to act on, so it drops the hard shadow. Its frame
     // keeps the same 2 px shape in the lighter `line` colour, so the box does not change size.
-    let composer_disabled = s.demo || t.archived() || s.unreachable_selected().is_some();
-    let mut card = col().key("composer").radius(6.0).fill(p.card);
-    // The pixel frame turns coral while the composer has focus or a file is over it.
-    card = if composer_disabled {
-        card.border(2.0, p.line)
-    } else {
-        card.border(
-            2.0,
-            if s.attachment_drop_hover || t.draft.focused {
-                p.coral
-            } else {
-                p.frame
-            },
-        )
-        .box_shadow(hard_shadow(p))
-    };
+    let composer_disabled = composer_disabled(s);
+    let mut card = col()
+        .key("composer")
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, composer_frame(s, p));
+    if !composer_disabled {
+        card = card.box_shadow(hard_shadow(p));
+    }
     card = card
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
@@ -7666,48 +7882,76 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         }
         card = card.child(tray);
     }
+    // Ported from KSG Code's composer body (`px-4 pt-4 pb-2`, `ChatComposer.tsx`) and its
+    // editor (`max-h-52 overflow-y-auto p-1 -m-1`, `ComposerPromptEditorTiptap.tsx`): the field
+    // grows with the draft up to a 200 pt text window, then scrolls inside its own viewport,
+    // which Rune keeps on the caret after each edit. The viewport is what the card sizes to, so
+    // the actions row always sits below the text and the card never grows past the cap. A bare
+    // field with `max_h` laid out at the cap but let the card size to all of its text, which
+    // drew the last lines under the actions and left an empty strip below them.
+    let field = text_input(&t.draft, COMPOSER)
+        .key("composer-input")
+        .label("Message Pi")
+        .placeholder(
+            if s.demo {
+                "Open a real workspace to send messages".to_string()
+            } else if let Some(machine) = s.unreachable_selected() {
+                format!("{machine} is unreachable. Reconnecting.")
+            } else {
+                "Ask anything. Shift Enter for a new line".to_string()
+            },
+            p.muted,
+        )
+        .color(p.ink)
+        .caret(p.coral, p.coral_bg)
+        .w_full()
+        .min_h(COMPOSER_FIELD_MIN)
+        .padding(4.0)
+        .on_edit(|s: &mut State| {
+            s.current_mut().native.slash_index = 0;
+            &mut s.current_mut().draft
+        })
+        .on_input_key(|s: &mut State, event, _| pi_ui::composer_pi_key(s, event))
+        .on_input_paste(|s: &mut State, content, _| {
+            let has_image = content.image().is_some();
+            if let Some(image) = content.image() {
+                s.attach_image("Pasted image.png", image.png());
+            }
+            if !content.files().is_empty() {
+                s.attach_paths(content.files());
+            }
+            (has_image || !content.files().is_empty()) && content.text().is_empty()
+        })
+        .on_submit(|s: &mut State, _| {
+            if !s.demo && !s.current().archived() {
+                s.send();
+            }
+        });
     card = card.child(
-        text_input(&t.draft, COMPOSER)
-            .key("composer-input")
-            .label("Message Pi")
-            .placeholder(
-                if s.demo {
-                    "Open a real workspace to send messages".to_string()
-                } else if let Some(machine) = s.unreachable_selected() {
-                    format!("{machine} is unreachable. Reconnecting.")
-                } else {
-                    "Ask anything. Shift Enter for a new line".to_string()
-                },
-                p.muted,
-            )
-            .color(p.ink)
-            .caret(p.coral, p.coral_bg)
+        col()
+            .key("composer-body")
             .w_full()
-            .min_h(48.0)
-            .max_h(200.0)
-            .px(16.0)
-            .pt(14.0)
-            .pb(6.0)
-            .on_edit(|s: &mut State| {
-                s.current_mut().native.slash_index = 0;
-                &mut s.current_mut().draft
-            })
-            .on_input_key(|s: &mut State, event, _| pi_ui::composer_pi_key(s, event))
-            .on_input_paste(|s: &mut State, content, _| {
-                let has_image = content.image().is_some();
-                if let Some(image) = content.image() {
-                    s.attach_image("Pasted image.png", image.png());
-                }
-                if !content.files().is_empty() {
-                    s.attach_paths(content.files());
-                }
-                (has_image || !content.files().is_empty()) && content.text().is_empty()
-            })
-            .on_submit(|s: &mut State, _| {
-                if !s.demo && !s.current().archived() {
-                    s.send();
-                }
-            }),
+            .px(12.0)
+            .pt(10.0)
+            .pb(2.0)
+            // A press in the body's padding still lands in the field, as KSG's surface does.
+            .on_press_tx(|_: &mut State, tx| tx.focus("composer-input", false))
+            // The field inside is the Tab stop, not this.
+            .focusable(false)
+            .child(
+                col()
+                    .key("composer-scroll")
+                    .w_full()
+                    .shrink()
+                    .min_h(COMPOSER_FIELD_MIN)
+                    .max_h(COMPOSER_FIELD_MAX)
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
+                    .scroll_margin(4.0)
+                    .child(field),
+            ),
     );
     let mut actions = row()
         .key("composer-actions")
@@ -7837,6 +8081,7 @@ fn machine_picker(s: &State, p: Palette) -> El {
     let mut menu = col()
         .key("machine-picker")
         .role("menu")
+        .focus_group()
         .label("Run on")
         .w(270.0)
         .max_h(360.0)
@@ -8172,14 +8417,433 @@ pub(crate) mod tests {
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
     fn runtime(width: f32) -> Runtime<State> {
-        Runtime::with_text(
+        let mut rt = Runtime::with_text(
             State::new(".".into(), false),
             view,
             (width, 720.0),
             Env::new(false, 1.0),
             rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
-        )
+        );
+        // As the app sets it in `main`.
+        rt.set_tab_visits_controls(true);
+        rt
     }
+    /// Tab once and return the focused element.
+    fn tab(rt: &mut Runtime<State>) -> rune::ElementInfo {
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        rt.elements()
+            .into_iter()
+            .find(|e| e.focused)
+            .expect("Tab focuses something")
+    }
+    /// Tab until `key` has focus.
+    fn tab_to(rt: &mut Runtime<State>, key: &str) {
+        for _ in 0..200 {
+            if tab(rt).key.as_deref() == Some(key) {
+                return;
+            }
+        }
+        panic!("Tab never reaches {key}");
+    }
+    fn tap(rt: &mut Runtime<State>, key: rune::Key) {
+        rt.key(rune::KeyEvent {
+            key,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        rt.frame(1.0);
+    }
+    fn focused(rt: &Runtime<State>) -> rune::ElementInfo {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.focused)
+            .expect("something has focus")
+    }
+    /// Walks an open menu or list from the keyboard: Down onto its first row and on to its last,
+    /// then Home, End and Up, and Escape closes it.
+    fn walk_menu(rt: &mut Runtime<State>, menu: &str, wraps: bool, at: &str) {
+        let (frame, _) = rt
+            .presented(menu)
+            .unwrap_or_else(|| panic!("{at}: {menu} is not open"));
+        // Down leaves a search field for the list; Home then starts from the top whether or
+        // not the menu was opened from the keyboard and already shows its first row.
+        tap(rt, rune::Key::Down);
+        tap(rt, rune::Key::Home);
+        let first = focused(rt);
+        let centre = [
+            first.rect[0] + first.rect[2] / 2.0,
+            first.rect[1] + first.rect[3] / 2.0,
+        ];
+        assert!(
+            centre[0] > frame[0]
+                && centre[0] < frame[0] + frame[2]
+                && centre[1] > frame[1]
+                && centre[1] < frame[1] + frame[3],
+            "{at}: Down focuses {:?} outside {menu}",
+            first.key
+        );
+        let mut rows = vec![first];
+        for _ in 0..60 {
+            tap(rt, rune::Key::Down);
+            let next = focused(rt);
+            if next.path == rows[0].path || next.path == rows.last().unwrap().path {
+                assert_eq!(
+                    next.path == rows[0].path,
+                    wraps,
+                    "{at}: Down past the last row of {menu}"
+                );
+                break;
+            }
+            rows.push(next);
+        }
+        assert!(rows.len() >= 2, "{at}: {menu} has one row");
+        for pair in rows.windows(2) {
+            assert!(
+                pair[1].rect[1] > pair[0].rect[1] - 0.5 || pair[1].scrolled != pair[0].scrolled,
+                "{at}: Down goes up from {:?} to {:?}",
+                pair[0].key,
+                pair[1].key
+            );
+        }
+        let (top, bottom) = (rows[0].path.clone(), rows.last().unwrap().path.clone());
+        tap(rt, rune::Key::Home);
+        assert_eq!(focused(rt).path, top, "{at}: Home in {menu}");
+        tap(rt, rune::Key::End);
+        assert_eq!(focused(rt).path, bottom, "{at}: End in {menu}");
+        tap(rt, rune::Key::Home);
+        tap(rt, rune::Key::Up);
+        assert_eq!(
+            focused(rt).path,
+            if wraps { bottom } else { top },
+            "{at}: Up from the top of {menu}"
+        );
+        tap(rt, rune::Key::Escape);
+        assert!(
+            rt.presented(menu).is_none(),
+            "{at}: Escape leaves {menu} open"
+        );
+    }
+    #[test]
+    fn arrow_keys_home_end_return_and_escape_drive_every_menu_and_list() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let fresh = || {
+                let mut rt = runtime(width);
+                rt.state.populate_demo();
+                rt.state.demo = false;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                rt
+            };
+            let at = |name: &str| format!("{width} {name}");
+            // Opened from the keyboard.
+            let mut rt = fresh();
+            tab_to(&mut rt, "thread-actions");
+            tap(&mut rt, rune::Key::Text(" ".into()));
+            walk_menu(&mut rt, "thread-menu", true, &at("thread menu"));
+            assert!(!rt.state.thread_menu);
+            // Return presses the row the keys are on.
+            tab_to(&mut rt, "thread-actions");
+            tap(&mut rt, rune::Key::Enter);
+            tap(&mut rt, rune::Key::Down);
+            let row = focused(&rt).key;
+            tap(&mut rt, rune::Key::Enter);
+            assert!(
+                !rt.state.thread_menu,
+                "{width}: Return on {row:?} did nothing"
+            );
+
+            let mut rt = fresh();
+            if rt.presented("sidebar-settings").is_some() {
+                tab_to(&mut rt, "sidebar-settings");
+                tap(&mut rt, rune::Key::Enter);
+                walk_menu(&mut rt, "settings-menu", true, &at("settings menu"));
+            }
+
+            let mut rt = fresh();
+            rt.state.thread_menu = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "menu-snooze-thread");
+            rt.frame(1.0);
+            walk_menu(&mut rt, "snooze-menu", true, &at("snooze menu"));
+
+            let mut rt = fresh();
+            let id = rt.state.current().id;
+            rt.state.row_menu = Some(crate::model::RowTarget::Thread(id));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            walk_menu(&mut rt, "row-context-menu", true, &at("row menu"));
+
+            let mut rt = fresh();
+            rt.state.captain_picker = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            walk_menu(&mut rt, "captain-picker", false, &at("captain picker"));
+
+            let mut rt = fresh();
+            rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+                {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true},
+                {"provider":"cpa","id":"model-b","name":"Model B","reasoning":true},
+                {"provider":"cpa","id":"model-c","name":"Model C","reasoning":true}
+            ]}}));
+            rt.state.settings_picker = Some(crate::model::SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(focused(&rt).key.as_deref(), Some("model-search"));
+            walk_menu(&mut rt, "model-list", true, &at("model list"));
+
+            let mut rt = runtime(width);
+            crate::captain_workspace_demo(&mut rt.state);
+            rt.state.compact_sidebar = true;
+            rt.state.demo_stop(19);
+            rt.state.attention_menu = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            walk_menu(&mut rt, "attention-menu", true, &at("attention menu"));
+
+            // A palette with a search field keeps its highlight in state; Home and End reach
+            // its ends as well.
+            let mut rt = fresh();
+            rt.state
+                .open_picker(crate::model::ProjectPicker::AddProject);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            tap(&mut rt, rune::Key::Down);
+            assert_eq!(rt.state.picker_highlight, 1, "{width}: Down in the palette");
+            tap(&mut rt, rune::Key::End);
+            assert!(rt.state.picker_highlight > 0, "{width}: End in the palette");
+            tap(&mut rt, rune::Key::Home);
+            assert_eq!(rt.state.picker_highlight, 0, "{width}: Home in the palette");
+        }
+    }
+    /// Whether a key names a slot that draws pixel art: a portrait, an avatar or the mark.
+    fn draws_art(key: &str) -> bool {
+        let numbered = |prefix: &str| {
+            key.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        };
+        numbered("avatar-")
+            || numbered("portrait-")
+            || numbered("speaker-avatar-")
+            || key == "captain-hero-portrait"
+            || key == "shina-logo"
+            || key.ends_with("-mark")
+    }
+    #[test]
+    fn pixel_art_fills_whole_device_pixels_at_every_zoom_and_scale() {
+        for scale in [1.0, 2.0] {
+            for zoom in [0.9, 1.0, 1.1, 1.25, 1.5] {
+                for scene in ["captain", "empty", "example"] {
+                    for width in [960.0, 1280.0] {
+                        let mut rt = Runtime::with_text(
+                            State::new(".".into(), false),
+                            view,
+                            (width, 800.0),
+                            Env::new(false, scale),
+                            rune::text::TextSystem::new(
+                                FONTS,
+                                (SANS_FAMILY, "Cascadia Mono, Consolas"),
+                            ),
+                        );
+                        rt.state.populate_demo();
+                        match scene {
+                            "captain" => rt.state.open_captain(0),
+                            "empty" => rt.state.new_thread_in(None),
+                            _ => {}
+                        }
+                        rt.state.zoom = zoom;
+                        rt.frame(0.0);
+                        rt.frame(1.0);
+                        let mut checked = 0;
+                        for e in rt.elements() {
+                            let Some(key) = e.key.as_deref() else {
+                                continue;
+                            };
+                            if !draws_art(key) || e.visible[2] <= 0.0 {
+                                continue;
+                            }
+                            for side in [e.rect[2], e.rect[3]] {
+                                let device = side * scale;
+                                assert!(
+                                    (device - device.round()).abs() < 0.02,
+                                    "{scene} at {zoom}x zoom, {scale}x scale: {key} is {device} \
+                                     device pixels"
+                                );
+                            }
+                            checked += 1;
+                        }
+                        assert!(checked >= 1, "{scene} {zoom} {scale}: no art slots");
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn the_composer_frame_turns_coral_when_tab_focuses_its_field() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for dark in [false, true] {
+                let mut rt = runtime(width);
+                rt.state.populate_demo();
+                rt.state.demo = false;
+                rt.state.dark = dark;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let p = palette(dark);
+                assert!(!rt.state.current().draft.focused);
+                assert_eq!(composer_frame(&rt.state, p), p.frame, "{width}");
+                tab_to(&mut rt, "composer-input");
+                assert!(rt.state.current().draft.focused, "{width}: Tab focus");
+                assert_eq!(composer_frame(&rt.state, p), p.coral, "{width}");
+                tab(&mut rt);
+                assert!(!rt.state.current().draft.focused, "{width}: Tab away");
+                assert_eq!(composer_frame(&rt.state, p), p.frame, "{width}");
+            }
+        }
+    }
+    #[test]
+    fn tab_visits_every_enabled_control_in_visual_order_and_enter_or_space_presses_it() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for empty in [false, true] {
+                let mut rt = runtime(width);
+                rt.state.populate_demo();
+                rt.state.demo = false;
+                if empty {
+                    rt.state.new_thread_in(None);
+                }
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let stops: Vec<String> = rt
+                    .elements()
+                    .into_iter()
+                    .filter(|e| e.focusable && e.visible[2] > 0.0 && e.visible[3] > 0.0)
+                    .filter_map(|e| e.key)
+                    .collect();
+                let mut seen: Vec<rune::ElementInfo> = Vec::new();
+                for _ in 0..200 {
+                    let focused = tab(&mut rt);
+                    if seen.first().is_some_and(|first| first.path == focused.path) {
+                        break;
+                    }
+                    assert!(
+                        focused.focus_visible,
+                        "{width}: {:?} shows no ring",
+                        focused.key
+                    );
+                    seen.push(focused);
+                }
+                let keys: Vec<&str> = seen.iter().filter_map(|e| e.key.as_deref()).collect();
+                for stop in &stops {
+                    assert!(keys.contains(&stop.as_str()), "{width}: Tab skips {stop}");
+                }
+                // Disabled controls and the layers that only take pointer presses stay out.
+                for key in ["send-message", "composer-body", "machine-selector"] {
+                    assert!(!keys.contains(&key), "{width}/{empty}: Tab stops on {key}");
+                }
+                for key in ["composer-input", "attach-image", "model-effort"] {
+                    assert!(keys.contains(&key), "{width}/{empty}: Tab misses {key}");
+                }
+                // Visual order: the title strip, then the sidebar, then the pane, each top to
+                // bottom and left to right along a line.
+                let region = |e: &rune::ElementInfo| {
+                    if e.rect[1] < 40.0 {
+                        0
+                    } else if e.role == "separator" {
+                        1
+                    } else if rt
+                        .presented("sidebar")
+                        .is_some_and(|(r, _)| e.rect[0] < r[0] + r[2])
+                    {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                for pair in seen.windows(2) {
+                    let (a, b) = (&pair[0], &pair[1]);
+                    let (ra, rb) = (region(a), region(b));
+                    assert!(ra <= rb, "{width}: {:?} comes before {:?}", a.key, b.key);
+                    if ra == rb && b.role != "separator" && a.role != "separator" {
+                        let same_line = (a.rect[1] - b.rect[1]).abs() < 12.0;
+                        assert!(
+                            if same_line {
+                                b.rect[0] >= a.rect[0]
+                            } else {
+                                b.rect[1] >= a.rect[1]
+                            },
+                            "{width}: {:?} at {:?} comes after {:?} at {:?}",
+                            b.key,
+                            b.rect,
+                            a.key,
+                            a.rect
+                        );
+                    }
+                }
+            }
+            // Space and Return press the focused control.
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.demo = false;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            tab_to(&mut rt, "thread-actions");
+            tap(&mut rt, rune::Key::Text(" ".into()));
+            assert!(rt.state.thread_menu, "{width}: Space");
+            tap(&mut rt, rune::Key::Escape);
+            assert!(!rt.state.thread_menu, "{width}: Escape");
+            tab_to(&mut rt, "thread-actions");
+            tap(&mut rt, rune::Key::Enter);
+            assert!(rt.state.thread_menu, "{width}: Return");
+        }
+    }
+
+    #[test]
+    fn an_opaque_cap_sits_under_the_chat_header_rule_over_a_scrolled_transcript() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.compact_sidebar = true;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            // The demo transcript is longer than the pane and rests stuck to its bottom, so
+            // content lies under the top edge.
+            let (rule, _) = rt.presented("chat-header-rule").unwrap();
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            assert!(
+                lane[1] < rule[1],
+                "width {width}: the transcript is not scrolled"
+            );
+            let (cap, _) = rt.presented("transcript-cap").unwrap();
+            assert!(
+                (cap[1] - (rule[1] + rule[3])).abs() <= 0.5
+                    && (cap[3] - TRANSCRIPT_CAP).abs() < 0.01,
+                "width {width}: cap {cap:?} under rule {rule:?}"
+            );
+            let info = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("transcript-cap"))
+                .unwrap();
+            assert_eq!(info.fill, palette(false).panel, "width {width}");
+            assert_eq!(info.opacity, 1.0, "width {width}");
+            // Nothing scrolled draws over it: the topmost element across its strip is the cap.
+            for x in [cap[0] + 4.0, cap[0] + cap[2] / 2.0, cap[0] + cap[2] - 4.0] {
+                let picked = rt
+                    .element_at_in("chat-main", x, cap[1] + cap[3] / 2.0)
+                    .unwrap();
+                assert_eq!(picked.key(), Some("transcript-cap"), "width {width}, x {x}");
+            }
+        }
+    }
+
     #[test]
     fn a_hairline_closes_the_chat_header_and_the_brief_toggle_is_an_icon_when_open() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
@@ -8331,7 +8995,8 @@ pub(crate) mod tests {
                     let floor = if sidebar_row_width(&rt.state) >= 240.0 {
                         WORKSPACE_FLOOR.min(text_width(&text) * 0.9)
                     } else {
-                        24.0
+                        // A name shorter than that keeps its own width, with the tag 8 px later.
+                        24.0_f32.min(text_width(&text) * 0.9)
                     };
                     assert!(
                         workspace[2] >= floor - 0.5,
@@ -9696,24 +10361,421 @@ pub(crate) mod tests {
         assert_eq!(count(&rt.state), 35);
     }
 
+    const LONG_DRAFT: &str = "Go ahead and make this an issue on GitHub, and then I want you to deeply analyze specific features from KSG Code missing from Shina. I am looking for things like:\n1. Gaps in our agent output composition. I think the way KSG formats tool calls, thinking and agent output is far superior.\n2. In the input box, we lack a lot of functionality like the $ for skills and slash commands from the ACP integrations from providers.\n3. On that note, even ACP providers.\n4. I suspect agents don't have the deep knowledge of Shina's tooling and application like they do in KSG Code.\n5. Generally speaking there appear to be bugs.\nWhen you write the issue, list each gap with the KSG Code component it comes from, what Shina does today, and what a port would take, so we can plan the work in slices and review each one on its own.\n6. And bugs.";
+
+    /// A conversation whose composer holds `LONG_DRAFT`, focused, with the caret at its end.
+    fn long_draft(width: f32, zoom: f32) -> Runtime<State> {
+        let mut rt = runtime(width);
+        rt.state.populate_demo();
+        rt.state.demo = false;
+        rt.state.compact_sidebar = true;
+        rt.state.zoom = zoom;
+        rt.frame(0.0);
+        rt.state.current_mut().draft = rune::TextEdit::new(LONG_DRAFT);
+        rt.invalidate();
+        rt.frame(0.0);
+        // Click near the top of the field's viewport: a long field's centre can lie below it.
+        rt.frame(0.25);
+        let (view, _) = rt.presented("composer-scroll").unwrap();
+        rt.pointer_down(view[0] + 24.0, view[1] + 12.0);
+        rt.pointer_up(view[0] + 24.0, view[1] + 12.0);
+        rt.frame(0.0);
+        // The press put the caret where it landed. Type at the end, as the user does, so the
+        // field follows the caret.
+        let draft = &mut rt.state.current_mut().draft;
+        draft.set_caret(draft.text.len());
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text(".".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.5);
+        rt.frame(0.5);
+        rt
+    }
+
     #[test]
-    fn the_sidebar_content_fits_the_viewport_at_every_zoom() {
-        // The content column once took the scroll area's height from an earlier frame, measured
-        // in window points rather than layout points. At 1.25x that was taller than the area.
-        for zoom in [1.0, 1.25, 1.5] {
-            let mut rt = runtime(1440.0);
-            rt.state.zoom = zoom;
+    fn a_long_draft_scrolls_inside_the_composer_above_its_actions() {
+        for zoom in [1.0, 1.25] {
+            for width in [620.0, 960.0, 1280.0, 1920.0] {
+                let rt = long_draft(width, zoom);
+                let at = format!("width {width}, zoom {zoom}");
+                assert!(rt.state.current().draft.focused, "{at}");
+                assert!(
+                    rt.state.current().draft.text.ends_with("And bugs.."),
+                    "{at}"
+                );
+                let (card, _) = rt.presented("composer").unwrap();
+                // The input's visible box is its body: the padding around the field's viewport.
+                let (input, _) = rt.presented("composer-body").unwrap();
+                let (actions, _) = rt.presented("composer-actions").unwrap();
+                // The field scrolled to its end, as typing there keeps the caret in view: its
+                // text ends in its 4 pt padding at the viewport's bottom, above the actions.
+                // (Rune's reported caret rect ignores zoom, so the field's own rect is used.)
+                let (view, _) = rt.presented("composer-scroll").unwrap();
+                let (field, _) = rt.presented("composer-input").unwrap();
+                let text_bottom = field[1] + field[3] - 4.0 * zoom;
+                assert!(
+                    (text_bottom - (view[1] + view[3] - 4.0 * zoom)).abs() <= 1.0,
+                    "{at}: the field {field:?} is not scrolled to its end in {view:?}"
+                );
+                assert!(
+                    text_bottom <= actions[1] + 0.5,
+                    "{at}: the text ends at {text_bottom}, under the actions {actions:?}"
+                );
+                assert!(field[3] > view[3], "{at}: the draft fits; it should not");
+                // The actions (with their own 8 pt bottom padding) sit at the card's bottom, and
+                // the card is the input over the actions. Rune draws the frame over the edge
+                // without insetting layout, so no frame term enters.
+                assert!(
+                    (card[1] + card[3] - (actions[1] + actions[3])).abs() <= 1.0,
+                    "{at}: a strip under the actions {actions:?} in the card {card:?}"
+                );
+                assert!(
+                    (card[3] - (input[3] + actions[3])).abs() <= 1.0,
+                    "{at}: card {card:?} is not input {input:?} plus actions {actions:?}"
+                );
+                assert!(
+                    input[1] + input[3] <= actions[1] + 0.5,
+                    "{at}: the input {input:?} runs under the actions {actions:?}"
+                );
+                // A press on the last visual line lands in the field and places the caret there,
+                // not on the actions row.
+                // Near the start of the last line, where the caret is not already.
+                let (x, y) = (view[0] + 8.0 * zoom, text_bottom - 10.0 * zoom);
+                let picked = rt
+                    .element_at_in("composer", x, y)
+                    .unwrap_or_else(|| panic!("{at}: nothing at ({x}, {y})"));
+                assert!(
+                    picked.path().contains("composer-input")
+                        || picked.key() == Some("composer-input"),
+                    "{at}: the last line at ({x}, {y}) reaches {picked:?}"
+                );
+                let mut rt = rt;
+                let end = rt.state.current().draft.focus;
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                rt.frame(0.0);
+                let draft = &rt.state.current().draft;
+                let last = draft.text.rfind('\n').unwrap();
+                assert!(
+                    draft.focus > last && draft.focus < end,
+                    "{at}: a press on the last line put the caret at {}, not after {last} and before {end}",
+                    draft.focus
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typing_in_the_composer_never_moves_a_scrolled_transcript_or_grows_past_the_cap() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.demo = false;
+            rt.state.compact_sidebar = true;
+            rt.frame(0.0);
+            let id = rt.state.current().id;
+            let viewport = format!("conversation-{id}");
+            rt.update(|_, tx| tx.scroll_to(viewport.clone(), 0.0, 0.0));
+            rt.frame(0.5);
+            press(&mut rt, "composer-input");
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            let mut heights = Vec::new();
+            for _ in 0..14 {
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Text("A line of the draft that is long enough to wrap".into()),
+                    mods: Default::default(),
+                });
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Enter,
+                    mods: rune::Mods {
+                        shift: true,
+                        ..Default::default()
+                    },
+                });
+                rt.frame(0.0);
+                // The transcript keeps its place while the user reads back and types.
+                assert_eq!(
+                    rt.presented("chat-lane").unwrap().0[1],
+                    lane[1],
+                    "width {width}: the transcript moved while typing"
+                );
+                heights.push(rt.presented("composer").unwrap().0[3]);
+            }
+            // The card grows with the draft, then stops at KSG's cap.
+            let cap = heights.last().copied().unwrap();
+            assert!(heights[0] < cap, "width {width}: {heights:?}");
+            assert!(
+                (cap - (10.0 + COMPOSER_FIELD_MAX + 2.0 + 40.0)).abs() <= 0.5,
+                "width {width}: {heights:?}"
+            );
+        }
+    }
+
+    fn element_text(rt: &Runtime<State>, key: &str) -> Option<String> {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.text.or(e.label))
+    }
+
+    #[test]
+    fn the_header_and_the_crew_line_count_only_work_running_now() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::captain_workspace_demo(&mut rt.state);
+            rt.state.compact_sidebar = true;
             rt.frame(0.0);
             rt.frame(1.0);
-            rt.frame(2.0);
-            let (scroll, _) = rt.presented("sidebar-scroll").unwrap();
-            let (content, _) = rt.presented("sidebar-content").unwrap();
+            // Two workers run. The review waits on an approval, and one more waits for a slot.
+            let line = |key| element_text(&rt, key);
             assert!(
-                content[3] <= scroll[3] + 0.5,
-                "zoom {zoom}: content {} in a viewport of {}",
-                content[3],
-                scroll[3]
+                rt.find("crew-tray-working").is_some(),
+                "width {width}: no working count"
             );
+            let words: Vec<String> = rt
+                .elements()
+                .into_iter()
+                .filter(|e| {
+                    e.key.as_deref().is_none() && e.text.is_some() && {
+                        let parent = e.parent.map(|i| rt.elements()[i].key.clone());
+                        matches!(
+                            parent.flatten().as_deref(),
+                            Some("crew-tray-working" | "crew-tray-needs-you" | "crew-tray-queued")
+                        )
+                    }
+                })
+                .filter_map(|e| e.text)
+                .collect();
+            assert_eq!(
+                words,
+                ["2 working", "1 needs you", "1 queued"],
+                "width {width}"
+            );
+            assert_eq!(rt.state.crew_working_now(7), 2, "width {width}");
+            if let Some(status) = line("captain-away-status") {
+                assert!(status.ends_with("2 tasks"), "width {width}: {status}");
+            }
+            // The waiting worker's chip shows the word, not a running timer.
+            assert_eq!(
+                line("crew-chip-clock-2").as_deref(),
+                Some("Needs you"),
+                "width {width}"
+            );
+            assert_ne!(line("crew-chip-clock-16").as_deref(), Some("Needs you"));
+        }
+    }
+
+    #[test]
+    fn interrupted_and_queued_workers_carry_their_chip_marks_in_the_sidebar() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::captain_workspace_demo(&mut rt.state);
+            rt.state.compact_sidebar = true;
+            rt.frame(0.0);
+            let fill = |rt: &Runtime<State>, key: &str| {
+                rt.elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("width {width}: no {key}"))
+            };
+            let p = palette(false);
+            // Interrupted (18): a hollow brass square. Queued (19): a muted square.
+            let interrupted = fill(&rt, "worker-task-mark-18");
+            assert_eq!(interrupted.fill.a, 0.0, "width {width}: hollow");
+            let queued = fill(&rt, "worker-task-mark-19");
+            assert_eq!(queued.fill, p.muted.alpha(0.6), "width {width}");
+            assert!(rt.presented("worker-task-mark-18").is_some());
+            // The finished worker (1) keeps an empty slot.
+            assert!(
+                rt.elements()
+                    .iter()
+                    .all(|e| e.key.as_deref() != Some("worker-task-mark-1")),
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_away_count_never_shrinks_and_the_phrase_shortens_to_background() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for sidebar in [200.0, 232.0, 320.0] {
+                let mut rt = runtime(width);
+                crate::captain_workspace_demo(&mut rt.state);
+                rt.state.compact_sidebar = true;
+                rt.state.sidebar_width = sidebar;
+                rt.state.brief.demo_status = Some(crate::model::BackgroundStatus {
+                    hidden_to_tray: true,
+                    working: 6,
+                    ..Default::default()
+                });
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let at = format!("width {width}, sidebar {sidebar}");
+                let (count, _) = rt.presented("captain-away-count").unwrap();
+                let natural = rune::text::measure("6 tasks", &[], PIXEL, None).0;
+                assert!(
+                    count[2] >= natural - 0.5,
+                    "{at}: the count shrank to {count:?}"
+                );
+                let (line, _) = rt.presented("captain-away-status").unwrap();
+                let (actions, _) = rt.presented("thread-actions").unwrap();
+                assert!(
+                    line[0] + line[2] <= actions[0],
+                    "{at}: {line:?} under the buttons"
+                );
+                // The phrase is whole, or it is the short form; never a truncated long one.
+                let words: Vec<String> = rt
+                    .elements()
+                    .into_iter()
+                    .filter(|e| {
+                        e.text.is_some()
+                            && e.parent.is_some_and(|i| {
+                                rt.elements()[i].key.as_deref() == Some("captain-away-status")
+                            })
+                    })
+                    .filter_map(|e| e.text)
+                    .collect();
+                assert!(
+                    words[0] == "Working in the background" || words[0] == "Background",
+                    "{at}: {words:?}"
+                );
+                if words[0] == "Working in the background" {
+                    let needed = rune::text::measure(&words[0], &[], PIXEL, None).0;
+                    let phrase = rt
+                        .elements()
+                        .into_iter()
+                        .find(|e| e.text.as_deref() == Some(words[0].as_str()))
+                        .unwrap();
+                    assert!(
+                        phrase.rect[2] >= needed - 0.5,
+                        "{at}: the phrase is truncated"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_machine_tag_follows_its_workspace_8_px_later_in_every_fleet_row() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for sidebar in [200.0, 232.0, 320.0] {
+                let mut rt = runtime(width);
+                crate::fleet_demo(&mut rt.state);
+                rt.state.compact_sidebar = true;
+                rt.state.sidebar_width = sidebar;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let elements = rt.elements();
+                let rect = |key: &str| {
+                    elements
+                        .iter()
+                        .find(|e| e.key.as_deref() == Some(key))
+                        .map(|e| e.rect)
+                };
+                let mut pairs = 0;
+                for e in &elements {
+                    let Some(key) = e.key.as_deref() else {
+                        continue;
+                    };
+                    let tag = if let Some(rest) = key.strip_prefix("captain-detail-") {
+                        format!("captain-machine-{rest}")
+                    } else if let Some(rest) = key.strip_prefix("thread-workspace-") {
+                        format!("thread-machine-{rest}")
+                    } else if let Some(rest) = key.strip_prefix("machine-detail-") {
+                        format!("machine-tag-{rest}")
+                    } else if let Some(rest) = key.strip_prefix("machine-workspace-") {
+                        format!("machine-tag-{rest}")
+                    } else {
+                        continue;
+                    };
+                    let Some(tag) = rect(&tag) else { continue };
+                    let workspace = e.rect;
+                    let gap = tag[0] - (workspace[0] + workspace[2]);
+                    let at = format!("width {width}, sidebar {sidebar}, {key}");
+                    // Exactly 8 px, or 10 when the name truncates.
+                    assert!(
+                        (gap - 8.0).abs() < 0.5 || (gap - 10.0).abs() < 0.5,
+                        "{at}: {gap} px between {workspace:?} and {tag:?}"
+                    );
+                    pairs += 1;
+                }
+                assert!(pairs >= 4, "width {width}, sidebar {sidebar}: {pairs} rows");
+            }
+        }
+    }
+
+    #[test]
+    fn the_no_workspace_picker_reads_as_a_choice_to_make() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.compact_sidebar = true;
+            rt.state.new_thread_in(None);
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let name = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("draft-project-name"))
+                .unwrap();
+            assert_eq!(name.text.as_deref(), Some("No workspace"));
+            assert_eq!(name.text_color, Some(palette(false).muted), "width {width}");
+            let (icon, _) = rt.presented("draft-project-icon").unwrap();
+            assert!(
+                icon[0] + icon[2] <= name.rect[0],
+                "width {width}: the icon comes first"
+            );
+            // A real project keeps the ink name and no icon.
+            let project = rt.state.projects.entries[0].id;
+            rt.state.new_thread_in(Some(project));
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(
+                rt.presented("draft-project-icon").is_none(),
+                "width {width}"
+            );
+            let name = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("draft-project-name"))
+                .unwrap();
+            assert_eq!(name.text_color, Some(palette(false).ink), "width {width}");
+        }
+    }
+
+    #[test]
+    fn the_shelf_headings_stay_whole_inside_the_sidebar_at_every_zoom() {
+        // At 1.25x the demo list is taller than the scroll area, and the Snoozed and Settled
+        // headings at its end were cut to slivers above the footer. They stick to the area's
+        // bottom edge instead, from the frame where the zoom takes effect.
+        for width in [960.0, 1280.0, 1920.0] {
+            for zoom in [0.5, 1.0, 1.25, 1.5, 2.0] {
+                let mut rt = runtime(width);
+                rt.state.populate_demo();
+                // A window narrower than 760 layout points docks the sidebar only in compact mode.
+                rt.state.compact_sidebar = true;
+                rt.frame(0.0);
+                rt.state.zoom = zoom;
+                for step in 0..3 {
+                    rt.frame(step as f64 * 0.5);
+                    let (scroll, _) = rt.presented("sidebar-scroll").unwrap();
+                    for key in ["shelf-Snoozed", "shelf-Settled"] {
+                        let (rect, _) = rt
+                            .presented(key)
+                            .unwrap_or_else(|| panic!("{key} missing at zoom {zoom}"));
+                        assert!(
+                            rect[1] >= scroll[1] - 0.5
+                                && rect[1] + rect[3] <= scroll[1] + scroll[3] + 0.5,
+                            "width {width}, zoom {zoom}, frame {step}: {key} {rect:?} is not inside \
+                             the scroll area {scroll:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -11251,7 +12313,7 @@ pub(crate) mod tests {
                     "portrait {i} leaves the card at {width}: {cell:?}"
                 );
                 assert!(
-                    cell[2] >= 60.0 && (cell[3] - 48.0).abs() < 0.5,
+                    (cell[2] - PICKER_CELL).abs() < 0.5 && (cell[3] - PICKER_CELL).abs() < 0.5,
                     "portrait {i}: {cell:?}"
                 );
                 assert!((cell[2] - cells[0][2]).abs() < 0.5, "equal columns");
@@ -11265,6 +12327,23 @@ pub(crate) mod tests {
                 }
             }
             assert!(cells[6][1] >= cells[0][1] + cells[0][3]);
+            // The outer faces line up with the name field's edges, so the grid is the fields'
+            // width.
+            let (name, _) = rt.presented("captain-name").unwrap();
+            let face = |i: usize| {
+                rt.presented(&format!("captain-portrait-face-{i}"))
+                    .unwrap()
+                    .0
+            };
+            let (first, last) = (face(0), face(5));
+            assert!(
+                (first[0] - name[0]).abs() < 1.0,
+                "{width}: {first:?} vs {name:?}"
+            );
+            assert!(
+                (last[0] + last[2] - name[0] - name[2]).abs() < 1.0,
+                "{width}: {last:?} vs {name:?}"
+            );
             press(&mut rt, "captain-portrait-11");
             assert_eq!(rt.state.captain_editor.as_ref().unwrap().portrait, 11);
         }
@@ -12048,9 +13127,12 @@ pub(crate) mod tests {
 
     #[test]
     fn the_attention_popover_is_340_wide_keeps_its_reasons_and_sits_under_its_badge() {
-        for width in [620.0, 960.0, 1280.0] {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
+            rt.state.compact_sidebar = true;
+            rt.state.demo_stop(19);
+            rt.state.recovery_notice = Some("Two tasks stopped.".into());
             rt.state.brief.demo_status = Some(crate::model::BackgroundStatus {
                 hidden_to_tray: true,
                 working: 2,
@@ -12065,11 +13147,27 @@ pub(crate) mod tests {
                 (menu[2] - 340.0f32.min(width - 16.0)).abs() < 0.5,
                 "{width}: {menu:?}"
             );
-            // The popover opens under the badge, 6 px below it, and stays inside the window.
-            let (badge, _) = rt.presented("attention-row").unwrap();
+            // With the sidebar docked, the popover hangs from the top bar with its left edge on
+            // the chat pane's, so it covers neither the sidebar nor the recovery banner's dismiss
+            // control at the lane's right. Closed, it opens 6 px under its badge.
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            let (sidebar, _) = rt.presented("sidebar").unwrap();
             assert!(
-                (menu[1] - (badge[1] + badge[3] + 6.0)).abs() < 1.0,
-                "{width}: {menu:?} {badge:?}"
+                (menu[0] - pane[0]).abs() < 0.5 && (menu[1] - pane[1]).abs() < 0.5,
+                "{width}: {menu:?} {pane:?}"
+            );
+            assert!(
+                menu[0] >= sidebar[0] + sidebar[2],
+                "{width}: over the sidebar"
+            );
+            let (dismiss, _) = rt.presented("dismiss-recovery").unwrap();
+            let apart = menu[0] + menu[2] <= dismiss[0]
+                || dismiss[0] + dismiss[2] <= menu[0]
+                || menu[1] + menu[3] <= dismiss[1]
+                || dismiss[1] + dismiss[3] <= menu[1];
+            assert!(
+                apart,
+                "{width}: {menu:?} covers the dismiss control {dismiss:?}"
             );
             assert!(
                 menu[0] >= 0.0 && menu[0] + menu[2] <= width + 0.5,
@@ -12095,6 +13193,39 @@ pub(crate) mod tests {
         assert_eq!(wordmark_size(line(216.0), true), Some(11.0));
         assert_eq!(wordmark_size(line(200.0), true), Some(11.0));
         assert_eq!(wordmark_size(line(120.0), true), None);
+    }
+
+    #[test]
+    fn a_narrow_sidebar_shows_the_11_px_wordmark_under_the_real_traffic_light_inset() {
+        // macOS reports a 76 pt leading inset; Windows and Linux report none.
+        for leading in [76.0, 0.0] {
+            for sidebar in [200.0, 208.0, 216.0] {
+                let mut rt = runtime(1280.0);
+                crate::captain_workspace_demo(&mut rt.state);
+                rt.state.sidebar_width = sidebar;
+                let mut chrome = rune::ChromeInsets::default();
+                chrome.leading = leading;
+                rt.set_chrome_insets(chrome);
+                rt.frame(0.0);
+                rt.frame(0.5);
+                let at = format!("leading {leading}, sidebar {sidebar}");
+                let (mark, _) = rt
+                    .presented("shina-wordmark")
+                    .unwrap_or_else(|| panic!("{at}: no wordmark"));
+                let size = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some("shina-wordmark"))
+                    .unwrap()
+                    .rect[3];
+                assert!(size < 20.0, "{at}: the wordmark is not 11 px ({size})");
+                let (badge, _) = rt.presented("attention-row").unwrap();
+                assert!(
+                    mark[0] + mark[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
+                    "{at}: wordmark {mark:?} runs into the badge {badge:?}"
+                );
+            }
+        }
     }
 
     #[test]

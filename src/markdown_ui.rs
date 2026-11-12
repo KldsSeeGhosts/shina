@@ -307,6 +307,38 @@ mod tests {
         }
     }
 
+    /// Text that carries meaning: on-coral text on a coral key at rest and pressed (80% coral
+    /// over the card, panel or sky), and every status word on each surface a status sits on,
+    /// including the selected sidebar row.
+    #[test]
+    fn status_words_and_coral_keys_read_at_4_5_to_1_in_both_themes() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            let selected_row = p.bg.mix(p.row, p.row.a);
+            let mut pairs = vec![("on coral, rest", p.on_coral, p.coral)];
+            for (name, under) in [("card", p.card), ("panel", p.panel), ("bg", p.bg)] {
+                pairs.push((name, p.on_coral, under.mix(p.coral, 0.8)));
+            }
+            for status in [
+                Status::Running,
+                Status::Waiting,
+                Status::Failed,
+                Status::Completed,
+                Status::Ready,
+                Status::Paused,
+            ] {
+                let ink = status_ink(status, p);
+                for under in [p.bg, p.panel, p.card, selected_row] {
+                    pairs.push(("status", ink, under));
+                }
+            }
+            for (name, ink, under) in pairs {
+                let ratio = contrast(ink, under);
+                assert!(ratio >= 4.5, "{name} is {ratio:.2}:1, dark={dark}");
+            }
+        }
+    }
+
     #[test]
     fn the_dark_removed_line_is_a_quiet_red_not_a_loud_one() {
         let p = palette(true);

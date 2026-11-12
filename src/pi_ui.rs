@@ -312,6 +312,15 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
                 s.current_mut().native.slash_index = at.saturating_sub(1);
                 return true;
             }
+            // The list's ends, as cmdk goes in KSG Code. The slash draft is one short line.
+            rune::Key::Home => {
+                s.current_mut().native.slash_index = 0;
+                return true;
+            }
+            rune::Key::End => {
+                s.current_mut().native.slash_index = matches.len() - 1;
+                return true;
+            }
             rune::Key::Tab | rune::Key::Enter
                 if !event.mods.shift && !event.mods.ctrl && !event.mods.cmd =>
             {

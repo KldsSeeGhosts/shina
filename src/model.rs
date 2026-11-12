@@ -448,6 +448,12 @@ impl Thread {
             || self.status == Status::Waiting
             || matches!(self.status, Status::Failed | Status::Paused)
     }
+    /// Working, in every count the user reads (the header's background line, the crew line,
+    /// the band's sails): running now. Queued, interrupted, finished and approval-blocked
+    /// threads are not working.
+    pub fn running_now(&self) -> bool {
+        self.status == Status::Running && self.request.is_none() && !self.offline_blocked
+    }
     pub fn queued(&self) -> bool {
         self.native.projected_queued
             || self.queued_prompt.is_some()

@@ -111,6 +111,20 @@ fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
     }
 }
 
+/// The mark a worker's sidebar row shares with its crew chip when its row has no other mark:
+/// brass for interrupted (it needs a look before resuming), muted for queued. Finished workers
+/// have none.
+pub(super) fn worker_task_mark(s: &State, thread: &crate::model::Thread) -> Option<Status> {
+    let task = s
+        .tasks_for(thread.parent?)
+        .into_iter()
+        .find(|task| task.child_id == thread.id)?;
+    match task.state {
+        TaskState::Interrupted | TaskState::Queued => Some(task_status(s, &task).0),
+        _ => None,
+    }
+}
+
 /// The elapsed time, or the queue position while a task waits for a slot.
 fn task_clock(task: &TaskView) -> String {
     if let Some(position) = task.queue_position {
@@ -530,25 +544,42 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
     if tasks.is_empty() {
         return None;
     }
-    let working = tasks
-        .iter()
-        .filter(|task| task.state != TaskState::Queued)
-        .count();
-    let queued = tasks.len() - working;
+    // One definition of working, shared with the chat header: running now. A worker waiting on
+    // an approval needs you instead, and a queued one waits for a slot.
+    let count = |want: Status| {
+        tasks
+            .iter()
+            .filter(|task| task_status(s, task).0 == want)
+            .count()
+    };
+    let (working, needs_you) = (count(Status::Running), count(Status::Waiting));
+    let queued = tasks.len() - working - needs_you;
     let (_, tertiary) = quiet_inks(p);
+    // One label per count, each after its status square, 8 px apart and never joined.
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
-    if working > 0 {
-        summary = summary.child(
-            row()
-                .key("crew-tray-working")
-                .gap(6.0)
-                .center_y()
-                .child(count_pill(working, CountKind::Working, p))
-                .child(label("working", TIMER, tertiary)),
-        );
-    }
-    if queued > 0 {
-        summary = summary.child(label(format!("{queued} queued"), TIMER, tertiary));
+    for (key, n, status, word) in [
+        ("crew-tray-working", working, Status::Running, "working"),
+        (
+            "crew-tray-needs-you",
+            needs_you,
+            Status::Waiting,
+            "needs you",
+        ),
+        ("crew-tray-queued", queued, Status::Ready, "queued"),
+    ] {
+        if n > 0 {
+            summary = summary.child(
+                row()
+                    .key(key)
+                    .gap(6.0)
+                    .center_y()
+                    .child(mark_slot(status, p))
+                    .child(super::pixel_text(
+                        format!("{n} {word}"),
+                        super::status_ink(status, p),
+                    )),
+            );
+        }
     }
     // One column below 560 px. From there on two equal columns, 8 px apart with 6 px between
     // rows, so a title keeps the room beside it and only the longest ones truncate.
@@ -558,7 +589,13 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
     for task in &tasks {
         let (status, word) = task_status(s, task);
         let child = task.child_id;
-        let clock = task_clock(task);
+        // A worker waiting on an approval is not running, so its timer gives way to the word.
+        let waiting = status == Status::Waiting;
+        let clock = if waiting {
+            word.to_string()
+        } else {
+            task_clock(task)
+        };
         let clock_width = super::text_width(&clock) + 4.0;
         let chip = row()
             .key(format!("crew-chip-{child}"))
@@ -586,9 +623,13 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             )
             // The timer never shrinks: the title gives way first.
             .child(
-                label(clock, TIMER, tertiary)
-                    .min_w(clock_width)
-                    .key(format!("crew-chip-clock-{child}")),
+                label(
+                    clock,
+                    if waiting { super::PIXEL } else { TIMER },
+                    if waiting { p.brass } else { tertiary },
+                )
+                .min_w(clock_width)
+                .key(format!("crew-chip-clock-{child}")),
             )
             // A card fill and a 1 px `line` border, so a chip reads as a chip.
             .fill(p.card)
@@ -966,13 +1007,23 @@ const ATTENTION_REASON_WIDTH: f32 = 80.0;
 /// It is 340 pt wide, or the window less 16 pt, and keeps 80 pt at the end of each row for the
 /// reason, so a title truncates before the reason does. With `below_header` it hangs from the
 /// chat header's rule instead of the badge, clear of the header's status text.
-pub(super) fn attention_menu(s: &State, p: Palette) -> El {
-    let mut menu = popover("attention-menu", "Needs you", s, p)
+/// `pane` is the chat pane's top left corner from the last layout, while the sidebar is docked.
+/// The popover then hangs from the top bar with its left edge on the pane's, so it never covers
+/// the sidebar, and it opens over the pane's top left rather than over banners at the lane's
+/// right. With the sidebar closed it opens under the badge that opened it.
+pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) -> El {
+    let menu = popover("attention-menu", "Needs you", s, p)
         .role("menu")
-        .w((s.viewport_width - 16.0).min(ATTENTION_MENU_WIDTH))
-        // Under the badge that opened it, where the eye already is.
-        .anchored_fit("attention-row", rune::Side::Bottom, rune::Align::Start, 6.0)
-        .modal(true, |s: &mut State| s.attention_menu = false);
+        .focus_group();
+    let menu = match pane {
+        Some((x, y)) => menu
+            .w((s.viewport_width - x - 8.0).min(ATTENTION_MENU_WIDTH))
+            .absolute(x, y),
+        None => menu
+            .w((s.viewport_width - 16.0).min(ATTENTION_MENU_WIDTH))
+            .anchored_fit("attention-row", rune::Side::Bottom, rune::Align::Start, 6.0),
+    };
+    let mut menu = menu.modal(true, |s: &mut State| s.attention_menu = false);
     for item in s.attention() {
         let id = item.thread_id;
         let status = attention_status(item.kind);
@@ -987,12 +1038,13 @@ pub(super) fn attention_menu(s: &State, p: Palette) -> El {
                     item.short_title
                 ))
                 .focusable(true)
+                .autofocus()
                 .h(32.0)
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
                 .radius(4.0)
-                .hover(hover_wash(s, p))
+                .focus_highlight(hover_wash(s, p))
                 .press(active_wash(s, p))
                 .on_press(move |s: &mut State| {
                     s.attention_menu = false;

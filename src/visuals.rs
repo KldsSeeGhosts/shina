@@ -373,6 +373,16 @@ impl Artwork {
         (points * scale).round().max(1.0) as u32
     }
 
+    /// The size in points closest to `points` that is a whole number of device pixels at this
+    /// scale and zoom, which is the size of the buffer `device_size` asks for. Rune snaps each
+    /// edge of a box to the device grid, so a slot this size keeps exactly that many pixels
+    /// wherever it sits, and the art is drawn one texel to one pixel. A 28 pt slot at 110% is
+    /// 30.8 pixels, which would draw as 30 or 31 and blur.
+    pub fn snap_points(&self, points: f32) -> f32 {
+        let scale = f32::from_bits(self.scale.load(Ordering::Relaxed));
+        self.device_size(points) as f32 / scale
+    }
+
     fn pixels_for(&self, shown: Shown, target: u32) -> Pixels {
         let mut cache = self.scaled.lock().unwrap();
         // A full cache starts over. The view asks again for what it still draws.

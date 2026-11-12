@@ -48,7 +48,7 @@ Add fields to `Palette` as needed and remove the ones that become unused.
 | `coral_bg` | `#e07a54` at 16% | `#d2643c` at 12% | |
 | `on_coral` | `#1a0f0a` | `#1a0f0a` | cream on `#d2643c` is 3.7:1; near-black is 5.2:1 |
 | `on_brass` | `#1a0f0a` | `#fffdf7` | ink on brass fills such as count badges |
-| `brass` (needs you) | `#d3ba6b` | `#8a6a2f` | mast |
+| `brass` (needs you) | `#d3ba6b` | `#7e602b` | mast |
 | `sea` (working, links, updates, done) | `#7ab4d2` | `#1f6d62` | jib / water; lightened and darkened so `sea` text reaches 4.5:1 on `sea_bg`, `bg` and the cards |
 | `sea_bg` | `#24406a` | `#d6ebe4` | water |
 | `danger` | `#f0a39c` | `#a33e38` | |
@@ -135,7 +135,9 @@ Provider and harness logos stay as they are.
   30 px, and on 16 px project tiles, so the face keeps its room). Sidebar captain portraits are
   40 px in a 44 px slot. The focal captain keeps the larger size. The editor's grid and the
   captain picker use 40 px too. The selected portrait in the editor's grid turns its own 2 px
-  frame coral, with no ring or wash around it, so all twelve keep the same outer bounds.
+  frame coral and casts a coral hard shadow, with no ring or wash around it, so all twelve keep
+  the same outer bounds. The grid is the fields' width: the outer faces line up with the
+  fields' edges.
 - Pixel art is drawn crisp. Rune has no nearest-neighbour sampling, so `src/crisp.rs` scales
   each portrait, strip frame and the app mark itself, to the exact device-pixel size (points
   times the window scale times the app zoom) by a whole factor, and Rune draws that buffer one
@@ -143,7 +145,9 @@ Provider and harness logos stay as they are.
   whole factor and either crops the art's edge or pads it with the tile colour, whichever
   changes less (a 20 pt head crop at 2x crops, the 72 pt hero crops two cells a side). 40 pt
   for a 40 cell bust is exact at every integer scale. Buffers are cached by art and size, and
-  an animation stage keeps one buffer per size in use.
+  an animation stage keeps one buffer per size in use. Each art slot is also sized to a whole
+  number of device pixels (`Artwork::snap_points`), so at zooms such as 110% the buffer is not
+  resampled into a fractional box.
 
 ## 5. Scene art
 
@@ -329,7 +333,8 @@ These replace the earlier text where they differ.
   `code_bg` (near `#2f2126`) so it reads as removed.
 - **Count badges.** Brass counts what needs you, a `card` fill with `ink` digits and a `frame`
   border counts what is unread, and `sea_bg` with `sea` text and a `sea` frame counts work in
-  progress (the crew tray's "working"). Coral stays for the one primary action.
+  progress (superseded in section 14: the crew tray says "2 working, 1 needs you, 1 queued" as
+  status marks and pixel words). Coral stays for the one primary action.
 - **Headline.** "What should we build in" and the workspace name sit one word space apart.
 - **Shadows.** The horizon band casts the hard shadow, which means its scenery clips in its own
   layer. The 72 px hero portrait casts it too.
@@ -442,19 +447,21 @@ These replace the earlier text where they differ.
   delegations now counts as empty, so the hero draws above the crew tray.
 - **Zoom.** The sidebar content column takes its minimum height from the scroll area's layout
   size, read every frame in layout units. The old cache held a window measurement, which at
-  1.25x was taller than the area.
+  1.25x was taller than the area. (Superseded in section 14: shelf headings stick to the
+  bottom instead.)
 - **Recovery banner.** The dismiss control sits at the top right of the text, and the Review
   button is on its own row below.
-- **Attention popover.** It opens under the badge (6 px gap, start aligned, 340 px wide, kept
-  inside the window). Reason words use `status_ink`. It can now cover the chat header's away
+- **Attention popover.** (Placement superseded in section 14.) It opens under the badge (6 px
+  gap, start aligned, 340 px wide, kept inside the window). Reason words use `status_ink`. It can now cover the chat header's away
   status while open.
 - **Band sails.** The captain band and the header's "Working in the background N tasks" both
-  read `background_status().working`.
+  read `background_status().working` (superseded in section 14: every working count is work
+  running now).
 - **Switches.** On is a coral track with the thumb at the right. Off is a `line` track with the
   thumb at the left. At night the on thumb has an `on_coral` border.
 - **Headline.** With no workspace the empty thread reads "What should we build?" above the picker.
 - **Narrow sidebar.** The wordmark drops to 11 px at 216 px or less when a badge is shown, on
-  every platform.
+  every platform. (Section 14: at 11 px it sits 4 px from the mark.)
 - **Clone.** The dialog shows its working state. A remote machine's path keeps that machine's
   separator.
 
@@ -485,9 +492,77 @@ These replace the earlier text where they differ.
 **Scenery**
 
 - The pennant is four cells over two, tapered, with a one-cell outline (ink by day, star colour
-  by night). The captain band tints its two lowest sky steps 75% and 40%. There is no per-captain
+  by night). The captain band tints its two lowest sky steps 75% and 40% (superseded in section
+  14: the tint keeps each step's own lightness, and the outline is half ink, half pennant). There is no per-captain
   colour table.
 - Distant sails mix 25% toward the lowest sky band, have one hull row, and sit at 70%, 14%, 88%
   and 38% of the width. At bands narrower than about 800 px the sail at 38% can touch the boat.
+  (Superseded in section 14: the fourth sail is at 4%.)
 - The Brief header flies the same outlined pennant beside the captain's name, at 2 pt cells
   (12 by 8 pt), which land on whole device pixels at 1x and 2x.
+
+## 14. Round 6 fixes
+
+**Bugs**
+
+- **Long drafts.** The composer field sits in its own scroll area, 36 pt at least and 208 pt at
+  most, ported from KSG Code's editor (`min-h-[calc(2lh+8px)] max-h-52 overflow-y-auto p-1`).
+  The draft scrolls inside the card and Rune keeps the caret in view, so the actions row never
+  covers text, no empty strip sits under the card, and the card stops growing at the cap. A
+  press anywhere in the card body focuses the field. The scenes are `composer-long-draft` and
+  `composer-long-draft-dark`.
+- **Shelf headings at zoom.** Snoozed and Settled stick to the bottom of the sidebar's scroll
+  area, so they stay whole at every zoom.
+- **Chat header.** An 8 px `panel` cap sits under the header rule over a scrolled transcript, and
+  the fade starts below it.
+- **Narrow header status.** The count never shrinks. When the phrase does not fit, it shortens
+  to "Background".
+- **Attention popover.** With the sidebar docked it opens at the pane's top-left, right of the
+  sidebar, and covers neither the sidebar nor its recovery notice.
+- **Working counts.** The header, the crew line and keep-awake count work running now: running,
+  with no question waiting and not blocked offline. A worker waiting on approval counts as
+  "needs you".
+- **Sidebar workers.** An interrupted or queued worker carries the chip's status mark.
+
+**Layout**
+
+- Narrow wordmark: at 11 px it is 4 px from the mark, so it fits under the 76 pt traffic-light
+  inset.
+- Fleet rows: the machine tag follows the workspace 8 px later. A workspace that truncates fills
+  the space up to the tag and keeps 2 px more after its ellipsis.
+- New captain grid: 48 pt cells spread across the fields' width.
+- "No workspace" in the headline is a folder icon and a muted 400 weight label, so it reads as a
+  choice still to make.
+- Dark primary buttons already had the 2 px `frame` and the hard shadow, and the frame shows
+  against the card. Nothing changed.
+
+**Colour**
+
+- Light `brass` is `#7e602b`, the same hue darkened to reach 4.6:1 as a status word on `bg`.
+  `#8a6a2f` was 3.97:1. Every other status word and the on-coral text already passed. A test
+  in `markdown_ui.rs` pins all of them at 4.5:1.
+
+**Keyboard**
+
+- Tab visits every enabled control in visual order: the title strip, the sidebar, then the
+  pane. The app turns on `tab_visits_controls` and the view sets `web_focus`. Disabled controls,
+  scrims and the composer body are not stops. Space and Return press the focused control.
+- The composer frame turns coral when its field has focus, from a click or from Tab.
+- Menus and lists are focus groups: the settings, thread, row, snooze, machine and attention
+  menus, the model list and the captain list. Their first row takes focus when they open. Up
+  and Down move and wrap (lists stop at their ends), Home and End jump, Return presses, Escape
+  closes. Rows show focus with the hover wash. The palettes with a search field also take Home
+  and End. Down moves from the model search into the list.
+- The keep-awake choice is a group of its own inside the settings menu, so arrows through the
+  menu never change it.
+
+**Scenery**
+
+- The fourth distant sail is at 4% of the width, clear of the boat, the portrait, the sun and
+  the moon from 400 to 736 pt.
+- The captain tint keeps each sky step's own lightness, so the gradient never turns around.
+  The pennant outline is half ink (star colour by night), half pennant.
+
+**Snapshots**
+
+- `--zoom 1.25` renders a `--snap` at that zoom.

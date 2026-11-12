@@ -52,6 +52,16 @@ fn init() -> State {
     if *snapshot && !demo {
         state.load_snapshot();
     }
+    // `--zoom 1.25` renders a snapshot at that UI zoom. Rune hands flags it does not know to
+    // the app, and scenes run after this, so a scene that sets its own zoom still wins.
+    if *snapshot
+        && let Some(zoom) = std::env::args()
+            .skip_while(|arg| arg != "--zoom")
+            .nth(1)
+            .and_then(|value| value.parse::<f32>().ok())
+    {
+        state.zoom = zoom.clamp(0.5, 2.0);
+    }
     state
 }
 
@@ -636,6 +646,16 @@ fn main() {
         match arg.as_str() {
             "--demo" => demo = true,
             "--server-client" => {}
+            // Read again in `init`; a snapshot's UI zoom.
+            "--zoom" => {
+                if !iter
+                    .next()
+                    .is_some_and(|value| value.parse::<f32>().is_ok())
+                {
+                    eprintln!("--zoom needs a number, such as 1.25.");
+                    std::process::exit(2);
+                }
+            }
             "--workspace" => {
                 let Some(path) = iter.next() else {
                     eprintln!("--workspace needs a directory path.");
@@ -728,6 +748,12 @@ fn main() {
                 state.populate_demo();
                 state.dark = true;
                 state.show_activity = true;
+            }),
+            // A five paragraph draft that wraps past the composer's 200 pt text window.
+            ("composer-long-draft", long_draft_demo),
+            ("composer-long-draft-dark", |state| {
+                long_draft_demo(state);
+                state.dark = true;
             }),
             ("zoomed", |state| {
                 state.populate_demo();
@@ -905,6 +931,9 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
         }
     })
     .on_quit(|state, _| quit_hook(state))
+    // Tab reaches buttons as well as fields, whatever macOS's keyboard navigation setting,
+    // as it does in KSG Code's web UI.
+    .tab_visits_controls(true)
     .titlebar(rune::Titlebar::new(44.0));
     let handle = app.handle();
     let shared = handle.clone();
@@ -1078,4 +1107,19 @@ mod tests {
         );
         assert!(!update::exit_recorded());
     }
+}
+
+/// The composer holding the long draft a user reported, as a real (not demo) thread would.
+fn long_draft_demo(state: &mut State) {
+    state.populate_demo();
+    state.demo = false;
+    state.current_mut().draft = rune::TextEdit::new(
+        "Go ahead and make this an issue on GitHub, and then I want you to deeply analyze specific features from KSG Code missing from Shina. I am looking for things like:\n\
+         1. Gaps in our agent output composition. I think the way KSG formats tool calls, thinking and agent output is far superior.\n\
+         2. In the input box, we lack a lot of functionality like the $ for skills and slash commands from the ACP integrations from providers.\n\
+         3. On that note, even ACP providers.\n\
+         4. I suspect agents don't have the deep knowledge of Shina's tooling and application like they do in KSG Code.\n\
+         5. Generally speaking there appear to be bugs.",
+    );
+    state.current_mut().draft.focused = true;
 }

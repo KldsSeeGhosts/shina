@@ -117,6 +117,8 @@ pub(super) fn switch(
         .label(title)
         .cursor(rune::Cursor::Pointer)
         .focusable(true)
+        // Its own ring, since a switch in a menu's focus group would otherwise show none.
+        .focus_ring(2.0, 2.0, p.coral)
         .size(34.0, 20.0)
         .min_w(34.0)
         .radius(2.0)
@@ -323,6 +325,8 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
         .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .modal(false, close_brief)
         .on_press(close_brief)
+        // Escape closes it from the keyboard, so the scrim is no Tab stop.
+        .focusable(false)
         .child(
             brief_panel(s, p)
                 .w(width)
@@ -1198,8 +1202,11 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
 
 /// A quiet line in a captain's header when background mode is hiding work or routines are
 /// paused while the user is away. Nothing otherwise.
-pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
-    brief_captain(s)?;
+/// `available` is the width the header leaves the line, from the last layout. The count never
+/// shrinks: the phrase gives way first, and when the whole phrase cannot fit beside the count it
+/// reads "Background".
+pub(super) fn away_status(s: &State, p: Palette, available: Option<f32>) -> Option<El> {
+    let captain = brief_captain(s)?;
     let status: BackgroundStatus = s
         .brief
         .demo_status
@@ -1207,10 +1214,16 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         .unwrap_or_else(|| s.background_status());
     // Both texts are status words, so both are pixel type. Work running in the background is
     // `sea`, as it is in the crew tray; paused routines are muted.
-    let (word, detail, ink) = if status.hidden_to_tray && status.working > 0 {
+    // The same count as the crew line and the band's sails: this captain's threads running now.
+    let working = if s.brief.demo_status.is_some() {
+        status.working
+    } else {
+        s.crew_working_now(s.captain_home(captain).unwrap_or(s.current().id))
+    };
+    let (word, detail, ink) = if status.hidden_to_tray && working > 0 {
         (
             "Working in the background",
-            Some(plural(status.working, "task", "tasks")),
+            Some(plural(working, "task", "tasks")),
             p.sea,
         )
     } else if status.routines_paused_while_away {
@@ -1221,6 +1234,19 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
     let text = match &detail {
         Some(detail) => format!("{word}, {detail}"),
         None => word.to_string(),
+    };
+    let word = match (&detail, available) {
+        (Some(detail), Some(available)) => {
+            let width = |t: &str| rune::text::measure(t, &[], super::PIXEL, None).0;
+            // The line's 4 pt padding each side, the 18 pt icon and two 8 pt gaps.
+            let full = 8.0 + super::ICON + 16.0 + width(word) + width(detail);
+            if full > available + 0.5 {
+                "Background"
+            } else {
+                word
+            }
+        }
+        _ => word,
     };
     let mut line = row()
         .key("captain-away-status")
@@ -1240,12 +1266,7 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         ))
         .child(super::pixel_text(word, ink).truncate().shrink().min_w(0.0));
     if let Some(detail) = detail {
-        line = line.child(
-            super::pixel_text(detail, ink)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
+        line = line.child(super::pixel_text(detail, ink).key("captain-away-count"));
     }
     Some(line)
 }
@@ -1361,6 +1382,9 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
     let mut group = row()
         .key("keep-awake-toggle")
         .role("radiogroup")
+        // Its own group inside the settings menu: Tab reaches it and Left and Right choose, so
+        // Up and Down through the menu never change the setting on the way past.
+        .focus_group()
         .label("Keep awake")
         .w_full()
         .padding(2.0)
@@ -1443,7 +1467,7 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
         .gap(10.0)
         .center_y()
         .radius(6.0)
-        .hover(p.selected)
+        .focus_highlight(p.selected)
         .on_press(open_profile)
         .child(
             el().size(28.0, 28.0)
