@@ -8,6 +8,51 @@ pub fn should_fold(text: &str) -> bool {
     text.len() >= THRESHOLD
 }
 
+/// KSG's handlePaste ignores HTML and parses the normalized plain-text Markdown.
+/// File mentions use this draft's workspace, not this process's working directory.
+pub fn insert(state: &mut crate::model::State, text: &str) {
+    let thread = state.current();
+    let root = state.project(thread.project).map(|p| p.path.clone());
+    let harness = thread.harness.clone();
+    let skills = thread.native.skills.clone();
+    let path_query = crate::composer::trigger(&thread.draft).is_some_and(|trigger| {
+        trigger.marker == '@'
+            && !thread
+                .native
+                .slash_dismissed
+                .as_ref()
+                .is_some_and(|d| d.matches(&trigger))
+    });
+    let thread = state.current_mut();
+    crate::composer_rich::paste_with_path_query(&mut thread.draft, text, path_query, &|source| {
+        if let Some(path) = crate::composer_rich::pasted_mention_path(source) {
+            let path = std::path::PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.as_ref()?.join(path)
+            };
+            let label = path.file_name()?.to_string_lossy().into_owned();
+            let token = crate::composer_tokens::Token::File {
+                directory: source.ends_with('/'),
+                path,
+                source: Some(source.into()),
+            };
+            Some((token.id(), label))
+        } else {
+            let name = &source[source.chars().next()?.len_utf8()..];
+            let skill = skills.iter().find(|skill| skill.name == name)?;
+            let token = crate::composer_tokens::Token::Skill {
+                name: skill.name.clone(),
+                harness: harness.clone(),
+            };
+            Some((token.id(), skill.name.clone()))
+        }
+    });
+    thread.composer_rules.pasted();
+    thread.update_submission_error();
+}
+
 pub fn stage(text: &str, existing: &[Attachment]) -> Result<Attachment, String> {
     let name = (1..)
         .map(|n| {

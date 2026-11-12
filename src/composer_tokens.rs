@@ -8,6 +8,8 @@ pub enum Token {
     File {
         path: std::path::PathBuf,
         directory: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     Thread {
         id: usize,
@@ -43,7 +45,9 @@ impl Token {
         machine_name: &dyn Fn(&str) -> String,
     ) -> String {
         match self {
-            Self::File { path, .. } => path.to_string_lossy().into_owned(),
+            Self::File { path, source, .. } => source
+                .clone()
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
             Self::Thread {
                 id, title, machine, ..
             } => {
@@ -243,6 +247,7 @@ mod tests {
         let token = Token::File {
             path: path.clone(),
             directory: false,
+            source: None,
         };
         let mut edit = crate::composer_rich::draft("read @men");
         edit.undo_group(|e| {

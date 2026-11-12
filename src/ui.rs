@@ -1680,7 +1680,17 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                         // Down from the search field goes into the list, as in KSG Code's
                         // combobox; the list's own group takes the arrows from there.
                         .on_input_key(|s: &mut State, event, tx| {
-                            if matches!(event.key, rune::Key::Down) {
+                            if (event.mods.cmd || event.mods.ctrl || event.mods.alt)
+                                && crate::key(s, event, tx)
+                            {
+                                return true;
+                            }
+                            if matches!(event.key, rune::Key::Down)
+                                && !event.mods.cmd
+                                && !event.mods.ctrl
+                                && !event.mods.alt
+                                && !event.mods.shift
+                            {
                                 // The field's own focus flag would win over `tx.focus`.
                                 s.model_search.focused = false;
                                 tx.focus("model-list", true);
@@ -8716,7 +8726,16 @@ fn composer(
                 return true;
             }
             let t = s.current_mut();
-            t.composer_rules.key(&mut t.draft, event)
+            let before = t.draft.text.clone();
+            let handled = t.composer_rules.key(&mut t.draft, event);
+            if handled {
+                if t.draft.text != before {
+                    t.typing_guard.on_type(std::time::Instant::now());
+                }
+                t.update_submission_error();
+                s.ensure_composer_commands();
+            }
+            handled
         })
         .on_input_change(|s: &mut State, _| {
             composer_menu::clear_dismissed_if_changed(s);
@@ -8735,7 +8754,10 @@ fn composer(
                 s.attach_paths(content.files());
             }
             if !content.text().is_empty() && !has_image && content.files().is_empty() {
-                return s.fold_paste(content.text());
+                if !s.fold_paste(content.text()) {
+                    crate::composer_paste::insert(s, content.text());
+                }
+                return true;
             }
             (has_image || !content.files().is_empty()) && content.text().is_empty()
         })
@@ -8907,6 +8929,89 @@ fn machine_selector(s: &State, p: Palette) -> El {
                 .min_w(0.0),
         )
         .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool {
+    let t = state.current();
+    if t.status.busy()
+        || t.configuring
+        || t.archived()
+        || t.request.is_some()
+        || t.thinking_levels.is_empty()
+    {
+        return false;
+    }
+    let levels = &t.thinking_levels;
+    let current = levels
+        .iter()
+        .position(|level| level == &t.thinking)
+        .unwrap_or(0);
+    let next =
+        (current as isize + direction).clamp(0, levels.len().saturating_sub(1) as isize) as usize;
+    let level = levels[next].clone();
+    state.current_mut().set_thinking(level);
+    state.checkpoint();
+    true
+}
+
+pub(crate) fn cycle_model_picker_harness(state: &mut State, direction: isize) -> bool {
+    let t = state.current();
+    if !t.can_choose_harness() {
+        return false;
+    }
+    let mut available_ids: Vec<String> = Vec::new();
+    for (id, acp) in [("pi", false), ("codex", false), ("claude", false)]
+        .into_iter()
+        .chain(
+            state
+                .harnesses
+                .agents
+                .iter()
+                .map(|agent| (agent.id.as_str(), true)),
+        )
+    {
+        let available = id != "claude" || acp || crate::claude::process().is_ok();
+        if available && !available_ids.iter().any(|existing| existing == id) {
+            available_ids.push(id.to_owned());
+        }
+    }
+    if available_ids.is_empty() {
+        return false;
+    }
+    let current = available_ids
+        .iter()
+        .position(|id| id == &t.harness)
+        .unwrap_or(0);
+    let len = available_ids.len() as isize;
+    let next = (current as isize + direction).rem_euclid(len) as usize;
+    let chosen = available_ids[next].clone();
+    state.choose_harness(&chosen);
+    true
+}
+
+pub(crate) fn jump_model_picker_index(state: &mut State, index: usize) -> bool {
+    let t = state.current();
+    if t.status.busy() || t.configuring {
+        return false;
+    }
+    let query = state.model_search.text.to_lowercase();
+    let chosen = t
+        .models
+        .iter()
+        .filter(|m| {
+            format!("{} {} {}", m.provider, m.id, m.name)
+                .to_lowercase()
+                .contains(&query)
+        })
+        .nth(index)
+        .map(|m| (m.provider.clone(), m.id.clone()));
+    let Some((provider, id)) = chosen else {
+        return false;
+    };
+    state.current_mut().set_model(provider, id);
+    state.settings_picker = Some(SettingsPicker::Thinking);
+    state.checkpoint();
+    true
 }
 
 fn machine_options(s: &State) -> Vec<String> {
@@ -11313,7 +11418,8 @@ pub(crate) mod tests {
                 &rune::KeyEvent {
                     key: rune::Key::Enter,
                     mods: rune::Mods {
-                        ctrl: true,
+                        cmd: true,
+                        ctrl: cfg!(not(target_os = "macos")),
                         shift: true,
                         ..Default::default()
                     },
@@ -15522,6 +15628,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn composer_markdown_paste_and_code_enter_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .native
+                .skills
+                .push(crate::composer_skills::Skill {
+                    name: "fixture".into(),
+                    description: String::new(),
+                    path: None,
+                    user_only: false,
+                });
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.paste("**before $fixture after** $unknown");
+            rt.frame(0.0);
+            let edit = &rt.state.current().draft;
+            assert_eq!(
+                crate::composer_rich::markdown(edit),
+                "**before $fixture after** $unknown"
+            );
+            assert_eq!(edit.pills().count(), 1);
+            let (field, _) = rt.presented("composer-input").unwrap();
+            assert!(field[0] >= 0.0 && field[0] + field[2] <= width + 1.0);
+
+            let edit = &mut rt.state.current_mut().draft;
+            edit.replace_text("  code");
+            edit.set_block(rune::Block::Code);
+            edit.set_caret(edit.text.len());
+            rt.invalidate();
+            rt.frame(0.1);
+            rt.key(rune::KeyEvent::from(rune::Key::Enter));
+            rt.frame(0.2);
+            assert_eq!(rt.state.current().draft.text, "  code\n  ");
+            assert_eq!(rt.state.current().draft.active_block(), rune::Block::Code);
+        }
+    }
+
+    #[test]
     fn long_text_paste_uses_an_attachment_chip_and_undo_preserves_the_draft() {
         let mut rt = runtime(960.0);
         rt.frame(0.0);
@@ -15833,6 +15979,7 @@ pub(crate) mod tests {
             let token = crate::composer_tokens::Token::File {
                 path: std::path::PathBuf::from("src/main.rs"),
                 directory: false,
+                source: None,
             };
             rt.state
                 .current_mut()
@@ -16216,5 +16363,305 @@ pub(crate) mod tests {
             rt.frame(0.0);
             assert!(rt.presented("composer-menu").is_some());
         }
+    }
+
+    #[test]
+    fn composer_control_shortcuts_open_controls_step_providers_and_jump_models() {
+        let mut rt = runtime(1280.0);
+        rt.on_key = Some(crate::key);
+        {
+            let t = rt.state.current_mut();
+            t.models = vec![
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "model-alpha".into(),
+                    name: "Alpha (CPA -> Codex)".into(),
+                    context_window: Some(128_000),
+                    supports_images: Some(true),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![],
+                },
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "model-beta".into(),
+                    name: "Beta (CPA -> Claude)".into(),
+                    context_window: Some(200_000),
+                    supports_images: Some(true),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![],
+                },
+            ];
+            t.model_provider = "cpa".into();
+            t.model_id = "model-alpha".into();
+            t.model = "Alpha (CPA -> Codex)".into();
+            t.thinking = "low".into();
+            t.thinking_levels = vec!["low".into(), "medium".into(), "high".into()];
+        }
+        rt.frame(0.0);
+
+        // Mod+Shift+M opens the model picker, Mod+Shift+M again closes it.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('m'),
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Model));
+        assert!(rt.presented("pi-settings-picker").is_some());
+        assert!(rt.presented("model-list").is_some());
+
+        // Mod+Shift+ArrowDown steps harness in the open model picker.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Down,
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().harness, "codex");
+
+        // Mod+Shift+ArrowUp steps harness back.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Up,
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().harness, "pi");
+
+        // Re-populate models after harness switch and jump to the 2nd model with Mod+2.
+        {
+            let t = rt.state.current_mut();
+            t.models = vec![
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "model-alpha".into(),
+                    name: "Alpha (CPA -> Codex)".into(),
+                    context_window: Some(128_000),
+                    supports_images: Some(true),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![],
+                },
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "model-beta".into(),
+                    name: "Beta (CPA -> Claude)".into(),
+                    context_window: Some(200_000),
+                    supports_images: Some(true),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![],
+                },
+            ];
+        }
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('2'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().model_id, "model-beta");
+        assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+
+        // Mod+Shift+E closes effort when already open, and opens it when closed.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('e'),
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.settings_picker, None);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('e'),
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+        assert!(rt.presented("effort-slider").is_some());
+
+        // Mod+Shift+A opens the access mode picker.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('a'),
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.current().native.access_picker);
+        assert!(rt.presented("access-picker").is_some());
+
+        // Custom-bound composer.increaseEffort / decreaseEffort also work.
+        rt.state.current_mut().thinking = "low".into();
+        crate::keybindings::upsert_custom_rule(
+            &mut rt.state.preferences.keybindings,
+            "composer.increaseEffort",
+            "alt+]",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::keybindings::upsert_custom_rule(
+            &mut rt.state.preferences.keybindings,
+            "composer.decreaseEffort",
+            "alt+[",
+            None,
+            None,
+        )
+        .unwrap();
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("]".into()),
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().thinking, "medium");
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("[".into()),
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().thinking, "low");
+
+        // Mod+Shift+H opens the machine selector when linked machines exist, and custom
+        // composer.cycleHost cycles to the next connected machine.
+        connected_machines(&mut rt);
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('h'),
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.machines.picker);
+        assert!(rt.presented("machine-picker").is_some());
+
+        crate::keybindings::upsert_custom_rule(
+            &mut rt.state.preferences.keybindings,
+            "composer.cycleHost",
+            "alt+h",
+            None,
+            None,
+        )
+        .unwrap();
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("h".into()),
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.machines.selected, "studio");
+
+        // Registered but unimplemented controls (workspace, branch, previousWorktree) return false
+        // without changing state.
+        for ch in ['x', 'g', 'l'] {
+            let mut tx = rune::Tx::default();
+            assert!(!crate::key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Command(ch),
+                    mods: rune::Mods {
+                        cmd: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                },
+                &mut tx
+            ));
+        }
+    }
+
+    #[test]
+    fn queue_and_send_chords_route_through_registry_in_runtime() {
+        let mut rt = runtime(1280.0);
+        rt.on_key = Some(crate::key);
+        let (pi, _cmds, _) = crate::backend::Pi::test_connection();
+        {
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.status = Status::Running;
+            t.native.follow_up = true;
+            t.draft.replace_text("Queued item");
+            t.send_during_run();
+            t.draft.replace_text("Next");
+            t.draft.set_caret(0);
+        }
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        rt.state.current_mut().draft.set_caret(0);
+
+        // Alt+Up edits the latest queued message through the registry.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Up,
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "Queued item");
+
+        // Cancel edit, then unfocus composer and promote queued message with Mod+Shift+Enter.
+        rt.state.current_mut().cancel_queued_edit();
+        rt.state.current_mut().draft.focused = false;
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.current().native.queue.is_empty());
+
+        // Under SendShortcut::ModEnter on a draft thread, Mod+Enter routes through
+        // composer.sendBackground and submits.
+        let mut draft_rt = runtime(1280.0);
+        draft_rt.on_key = Some(crate::key);
+        draft_rt.state.preferences.send_shortcut = crate::composer::SendShortcut::ModEnter;
+        draft_rt.frame(0.0);
+        press(&mut draft_rt, "composer-input");
+        draft_rt.state.current_mut().draft.replace_text("Ship it");
+        draft_rt.key(rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        draft_rt.frame(0.0);
+        assert!(draft_rt.state.current().draft.text.is_empty());
+        assert_eq!(draft_rt.state.current().messages.len(), 1);
     }
 }
