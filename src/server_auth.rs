@@ -10,9 +10,14 @@ pub struct Pairing {
     deadline: Option<std::time::Instant>,
     attempts: u32,
     window: u64,
+    peer: bool,
 }
 impl Pairing {
+    pub fn is_peer(&self) -> bool { self.peer }
     pub fn create(&mut self, now: u64) -> Result<serde_json::Value, String> {
+        self.create_scoped(now, false)
+    }
+    pub fn create_scoped(&mut self, now: u64, peer: bool) -> Result<serde_json::Value, String> {
         if self.expires > now
             && self
                 .deadline
@@ -24,6 +29,7 @@ impl Pairing {
         }
         let code = secret()[..12].to_ascii_uppercase();
         self.code_hash = crate::protocol::revision(&serde_json::json!(code));
+        self.peer = peer;
         self.expires = now + 300_000;
         self.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
         Ok(serde_json::json!({"code":code,"expiresAt":self.expires}))
@@ -56,7 +62,8 @@ impl Pairing {
         self.code_hash.clear();
         self.expires = 0;
         let token = secret();
-        database.issue_scoped_device(device, &token, &["paired", "read", "operate", "approve"])?;
+        let scopes: &[&str] = if self.peer { &["read", "peer-delegate"] } else { &["paired", "read", "operate", "approve"] };
+        database.issue_scoped_device(device, &token, scopes)?;
         Ok(token)
     }
 }
