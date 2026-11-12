@@ -752,6 +752,9 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    s.timeline_positions
+        .borrow_mut()
+        .open(&s.machines.selected, s.current().id, cx);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -9154,6 +9157,7 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
 /// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
+    let visit = s.timeline_positions.borrow().visit();
     let gutter = lane_gutter(pane_width);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
@@ -9205,6 +9209,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let rows = std::rc::Rc::new(build_timeline_rows(t));
     let key_rows = rows.clone();
     let build_rows = rows.clone();
+    let row_visit = visit.clone();
     let lane = col()
         .key("chat-lane")
         .on_layout_tx(|s: &mut State, rect, tx| {
@@ -9222,31 +9227,59 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             rows.len(),
             90.0,
             move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
-            move |s: &State, index| match &build_rows[index] {
-                TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
-                TimelineRow::Boundary { message_index, .. } => {
-                    work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
-                }
-                TimelineRow::UserOrSystem {
-                    index: msg_idx,
-                    message_id,
-                    ..
-                } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
-                TimelineRow::AssistantTurn { start, end, .. } => {
-                    assistant_turn(s, p, wide, *start, *end)
-                }
-                TimelineRow::LiveTurn { start, .. } => assistant_turn(s, p, wide, *start, *start),
+            move |s: &State, index| {
+                let row = match &build_rows[index] {
+                    TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                    TimelineRow::Boundary { message_index, .. } => {
+                        work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
+                    }
+                    TimelineRow::UserOrSystem {
+                        index: msg_idx,
+                        message_id,
+                        ..
+                    } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                    TimelineRow::AssistantTurn { start, end, .. } => {
+                        assistant_turn(s, p, wide, *start, *end)
+                    }
+                    TimelineRow::LiveTurn { start, .. } => {
+                        assistant_turn(s, p, wide, *start, *start)
+                    }
+                };
+                row_visit.row(build_rows[index].key());
+                row
             },
         );
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
+    let layout_visit = visit.clone();
+    let restore_rows = rows.clone();
     let scroller = col()
         .key(format!("conversation-{thread_id}"))
         .animated_changes()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom })
+        .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
+        .on_layout_tx(move |_: &mut State, _, tx| {
+            if layout_visit
+                .opened
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tx.live_only();
+                return;
+            }
+            if let Some(position) = layout_visit.restore.lock().unwrap().take() {
+                if position.at_end {
+                    tx.scroll_to_bottom_instant(format!("conversation-{thread_id}"));
+                } else if restore_rows.iter().any(|row| row.key() == position.row) {
+                    tx.scroll_into_view_in(format!("conversation-{thread_id}"), &position.row);
+                    tx.scroll_key_to(&position.row, -position.offset);
+                } else {
+                    tx.scroll_to_y(format!("conversation-{thread_id}"), position.scroll);
+                }
+            }
+        })
         .on_far_from_bottom(40.0, move |s: &mut State, far| {
             s.set_timeline_far_from_bottom(thread_id, far);
         })
@@ -14511,6 +14544,79 @@ pub(crate) mod tests {
             assert!(
                 rt.find("history-load-error").is_none(),
                 "{width}: error cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_switch_restores_first_visible_timeline_row_and_offset() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            for turn in 0..80 {
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: format!("remember-{turn}"),
+                    role: "You",
+                    text: format!("Question {turn}. {}", "Wrapping prose. ".repeat(12)),
+                    images: vec![],
+                });
+            }
+            rt.frame(0.0);
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-remember-35"));
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            let first = rt
+                .elements()
+                .into_iter()
+                .filter_map(|e| {
+                    let key = e.key?;
+                    if !key.starts_with("row-1-remember-") {
+                        return None;
+                    }
+                    let rect = rt.presented(&key)?.0;
+                    (rect[1] + rect[3] > viewport[1] && rect[1] < viewport[1] + viewport[3])
+                        .then_some((key, rect))
+                })
+                .min_by(|a, b| a.1[1].total_cmp(&b.1[1]))
+                .unwrap();
+            let original = rt.state.active;
+            rt.update(|s, _| s.new_thread());
+            rt.frame(1.0);
+            rt.update(|s, _| s.active = original);
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            let restored = rt.presented(&first.0).expect("remembered row mounted").0;
+            assert!(
+                (restored[1] - first.1[1]).abs() <= 1.0,
+                "{width}: {} moved from {} to {}",
+                first.0,
+                first.1[1],
+                restored[1]
+            );
+            // Following the end is remembered as following, not as a fixed old row.
+            rt.update(|_, tx| tx.scroll_to_bottom_instant("conversation-1"));
+            rt.frame(1.0);
+            let other = rt.state.threads.iter().position(|t| t.id != 1).unwrap();
+            rt.update(|s, _| s.select_thread(other));
+            rt.frame(1.0);
+            rt.state.threads[original]
+                .messages
+                .push(crate::model::Message {
+                    id: "new-end".into(),
+                    role: "You",
+                    text: "Arrived while away.".into(),
+                    images: vec![],
+                });
+            rt.update(|s, _| s.select_thread(original));
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                rt.presented("row-1-new-end").is_some(),
+                "{width}: follow end restored"
             );
         }
     }

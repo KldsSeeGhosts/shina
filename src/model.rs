@@ -2786,6 +2786,7 @@ pub struct State {
     pub sidebar_search: SidebarSearchState,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
+    pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
     pub updater: crate::update::Updater,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
@@ -2988,6 +2989,7 @@ impl State {
             sidebar_search: SidebarSearchState::default(),
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
+            timeline_positions: std::cell::RefCell::default(),
             updater: Default::default(),
             restart_for_update: false,
             restart_approved: false,

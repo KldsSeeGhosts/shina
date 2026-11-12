@@ -56,6 +56,7 @@ mod shell_env;
 mod store;
 mod thread_find;
 mod thread_search;
+mod timeline_position;
 mod tray;
 mod ui;
 mod update;
