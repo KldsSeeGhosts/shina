@@ -133,10 +133,12 @@ pub fn prompt_for(
         }
     }
     attachments::validate_prompt_images(&attachments)?;
-    Ok(Prompt::new(
+    let mut prompt = Prompt::new(
         crate::composer_rich::markdown_for(edit, target_machine, machine_name),
         attachments,
-    ))
+    );
+    prompt.draft = Some(crate::composer_rich::Snapshot::capture(edit, images));
+    Ok(prompt)
 }
 
 /// A server receives serialized text, not the client's pill marks. Do not interpret a leading

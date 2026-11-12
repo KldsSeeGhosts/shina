@@ -11054,6 +11054,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn failed_send_rich_draft_and_later_edits_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.draft.replace_text("Submitted bold text");
+            t.draft.set_selection(0, 9);
+            t.draft.toggle_mark(rune::Mark::Bold);
+            t.send();
+            t.draft.replace_text("Later edits");
+            t.disconnect();
+            assert_eq!(
+                crate::composer_rich::markdown(&t.draft),
+                "**Submitted** bold text\n\nLater edits"
+            );
+            rt.frame(0.0);
+            let (rect, _) = rt.presented("composer").unwrap();
+            assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0);
+        }
+    }
+
+    #[test]
     fn pi_controls_fit_and_native_compaction_is_an_action_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);

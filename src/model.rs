@@ -2227,17 +2227,17 @@ impl Thread {
     }
 
     fn restore_prompt(&mut self, prompt: &Prompt) {
-        let text = if prompt.text.is_empty() {
-            self.draft.text.clone()
-        } else if self.draft.text.is_empty() {
-            prompt.text.clone()
-        } else {
-            format!("{}\n\n{}", prompt.text, self.draft.text)
-        };
-        self.draft.replace_text(&text);
+        let submitted = prompt.draft.as_ref().map_or_else(
+            || crate::composer_rich::draft(&prompt.text),
+            crate::composer_rich::Snapshot::editor,
+        );
+        self.draft = crate::composer_rich::prepend(&submitted, &self.draft);
         // Keep submitted images first. A newer draft may have added images while the process was
         // starting, so merge those after the snapshot without duplicating either set.
-        let mut images = prompt.images.to_vec();
+        let mut images = prompt
+            .draft
+            .as_ref()
+            .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
         for image in &self.draft_images {
             if !images.iter().any(|current| current.id == image.id) {
                 images.push(image.clone());
@@ -8688,6 +8688,7 @@ mod tests {
         state.threads[0].queued_prompt = Some((
             Prompt {
                 text: "queued".into(),
+                draft: None,
                 images: Default::default(),
             },
             0,
@@ -8809,6 +8810,7 @@ mod tests {
         state.threads[0].draft.replace_text("work");
         state.threads[0].queued_prompt = Some((
             Prompt {
+                draft: None,
                 text: "work".into(),
                 images: Default::default(),
             },
@@ -10622,6 +10624,37 @@ mod tests {
         state.restore_ui(&legacy).unwrap();
         assert!(state.current().draft.is_rich());
         assert_eq!(state.current().draft.text, "plain old draft");
+    }
+
+    #[test]
+    fn failed_send_restores_rich_document_pills_and_later_rich_edits() {
+        let mut thread = Thread::new(1);
+        let original_image = test_attachment("original.png", 1);
+        let later_image = test_attachment("later.png", 2);
+        thread.draft_images.push(original_image.clone());
+        thread.draft = crate::composer_rich::draft("Bold reference");
+        thread.draft.set_selection(0, 4);
+        thread.draft.toggle_mark(rune::Mark::Bold);
+        let token = crate::composer_tokens::Token::Skill {
+            name: "review".into(),
+            harness: "pi".into(),
+        };
+        thread.draft.replace_with_pill(5..14, token.id(), "review");
+        let original = crate::composer_rich::markdown(&thread.draft);
+        thread.send();
+        thread.draft.replace_text("Later");
+        thread.draft.set_selection(0, 5);
+        thread.draft.toggle_mark(rune::Mark::Italic);
+        thread.draft_images.push(later_image.clone());
+        thread.disconnect();
+        assert_eq!(
+            crate::composer_rich::markdown(&thread.draft),
+            format!("{original}\n\n*Later*")
+        );
+        assert_eq!(thread.draft.pills().count(), 1);
+        assert_eq!(thread.draft.text, "Bold review\n\nLater");
+        assert!(thread.messages.is_empty());
+        assert_eq!(thread.draft_images, vec![original_image, later_image]);
     }
 
     #[test]
