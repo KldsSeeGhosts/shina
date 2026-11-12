@@ -2802,6 +2802,19 @@ impl State {
     pub fn current_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.active]
     }
+    pub fn expire_undo(&mut self) -> bool {
+        let at = lifecycle::now();
+        let Some(notice) = &self.undo else {
+            return false;
+        };
+        if notice.expires <= at {
+            self.undo = None;
+            self.deleted_threads.clear();
+            self.deleted_records = None;
+            return false;
+        }
+        true
+    }
     pub fn undo_key(&mut self, event: &rune::KeyEvent, text_field: bool) -> bool {
         let at = lifecycle::now();
         let Some(notice) = &mut self.undo else {
