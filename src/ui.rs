@@ -7893,7 +7893,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     // the actions row always sits below the text and the card never grows past the cap. A bare
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
-    let field = text_input(&t.draft, COMPOSER)
+    let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let field = text_input(&t.draft, composer_style)
         .key("composer-input")
         .label("Message Pi")
         .placeholder(
@@ -7926,9 +7927,17 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             &mut s.current_mut().draft
         })
         .on_input_key(|s: &mut State, event, tx| {
+            if pi_ui::composer_pi_key(s, event) {
+                composer_menu::scroll_selected(s, tx);
+                return true;
+            }
             if event.is_command('v') && event.mods.shift && !event.mods.alt {
                 let id = s.current().id;
+                let machine = s.machines.selected.clone();
                 tx.read_clipboard(move |s: &mut State, content, _| {
+                    if s.machines.selected != machine {
+                        return;
+                    }
                     if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
                         t.draft.insert(content.text());
                     }
@@ -7943,16 +7952,13 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 s.checkpoint();
                 return true;
             }
-            if pi_ui::composer_pi_key(s, event) {
-                composer_menu::scroll_selected(s, tx);
-                return true;
-            }
             let t = s.current_mut();
             t.composer_rules.key(&mut t.draft, event)
         })
         .on_input_change(|s: &mut State, _| {
             let t = s.current_mut();
             t.composer_rules.changed(&mut t.draft);
+            s.ensure_composer_commands();
         })
         .on_input_paste(|s: &mut State, content, _| {
             let has_image = content.image().is_some();
@@ -10110,6 +10116,41 @@ pub(crate) mod tests {
             rt.frame(0.0);
             assert_eq!(rt.state.current().draft.text, "@Mention");
             assert_eq!(rt.state.current().draft.pills().count(), 0);
+        }
+    }
+
+    #[test]
+    fn skill_menu_uses_the_same_rows_and_inserts_a_native_skill_pill_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().apply(json!({"type":"response","command":"get_commands","success":true,
+                "data":{"commands":[{"name":"skill:review","description":"Review changes","source":"skill"}]}}));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("please $rev".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("skill-menu").unwrap();
+            let (item, _) = rt.presented("skill-item-0").unwrap();
+            assert_eq!(item[3], 32.0);
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "please $review "
+            );
+            assert!(rt.find("skill-menu").is_none());
         }
     }
 

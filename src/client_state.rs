@@ -43,6 +43,8 @@ struct ThreadView {
     steering: Vec<String>,
     follow_ups: Vec<String>,
     commands: Vec<Value>,
+    #[serde(default)]
+    skills: Vec<crate::composer_skills::Skill>,
     compactions: Vec<Value>,
     stats: Value,
     fork_points: Vec<Value>,
@@ -135,6 +137,7 @@ impl ThreadView {
             steering: thread.native.steering.clone(),
             follow_ups: thread.native.follow_ups.clone(),
             commands: thread.native.commands.iter().map(|c| json!(c)).collect(),
+            skills: thread.native.skills.clone(),
             compactions: thread.native.compactions.clone(),
             stats: thread.native.stats.clone(),
             fork_points: thread.native.fork_points.clone(),
@@ -263,6 +266,7 @@ impl ThreadView {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         thread.native.compactions = self.compactions;
+        thread.native.skills = self.skills;
         thread.native.stats = self.stats;
         thread.native.fork_points = self.fork_points;
         thread.native.projected_operating = self.operating;
@@ -1695,7 +1699,17 @@ impl State {
             }
             "project.cancelClone" => self.close_clone_dialog(),
             "catalog.refresh" => self.refresh_catalog(),
-            "commands.refresh" => self.current_mut().refresh_commands(),
+            "commands.refresh" => {
+                if self.current().pi.is_none()
+                    && self.current().error.is_none()
+                    && self.current().status != Status::Failed
+                    && !self.current().archived()
+                {
+                    self.connect_thread(self.active);
+                } else {
+                    self.current_mut().refresh_commands();
+                }
+            }
             "captain.open" => {
                 self.captain_project =
                     serde_json::from_value(args["project"].clone()).map_err(|e| e.to_string())?;

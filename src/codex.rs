@@ -148,6 +148,7 @@ struct Client {
     queued: VecDeque<Value>,
     models: Vec<Value>,
     raw_models: Vec<Value>,
+    skill_commands: Vec<Value>,
     model: Value,
     effort: String,
     usage: Value,
@@ -182,6 +183,7 @@ impl Client {
             queued: VecDeque::new(),
             models: vec![],
             raw_models: vec![],
+            skill_commands: vec![],
             model: Value::Null,
             effort: String::new(),
             usage: Value::Null,
@@ -299,6 +301,24 @@ impl Client {
             let error = format!(
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
+            if kind == "skills" {
+                let lower = error.to_ascii_lowercase();
+                if matches!(record["error"]["code"].as_i64(), Some(401 | 403))
+                    || [
+                        "authentication",
+                        "unauthorized",
+                        "unauthorised",
+                        "invalid api key",
+                        "not logged in",
+                    ]
+                    .iter()
+                    .any(|text| lower.contains(text))
+                {
+                    return Err(error);
+                }
+                self.reject(&json!({"type":"get_commands","id":request["id"]}), error);
+                return Ok(());
+            }
             if matches!(kind, "initialize" | "start" | "models" | "prompt") {
                 // Never retry an accepted turn, or attempt login after a denial.
                 return Err(error);
@@ -326,7 +346,23 @@ impl Client {
         match kind {
             "initialize" => {
                 self.wire.push(json!({"method":"initialized"}));
+                self.request(
+                    "skills/list",
+                    json!({"cwds":[self.start.workspace]}),
+                    json!({"type":"skills","id":"commands"}),
+                );
                 self.request("model/list", json!({"limit":100}), json!({"type":"models"}));
+            }
+            "skills" => {
+                self.skill_commands =
+                    crate::composer_skills::codex_commands(result, &self.start.workspace);
+                // Discovery may beat thread/start. Do not expose readiness before a session exists.
+                if self.ready {
+                    self.reply(
+                        &json!({"type":"get_commands","id":request["id"]}),
+                        json!({"commands":self.skill_commands}),
+                    );
+                }
             }
             "models" => {
                 let page = result["data"]
@@ -421,7 +457,7 @@ impl Client {
                 }
                 self.reply(
                     &json!({"type":"get_commands","id":"commands"}),
-                    json!({"commands":[]}),
+                    json!({"commands":self.skill_commands}),
                 );
                 self.events
                     .push(json!({"type":"harness_update","field":"awareness","value":true}));
@@ -524,7 +560,11 @@ impl Client {
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":self.levels()})),
             "get_session_stats" => self.reply(&record, json!({"contextUsage":self.usage})),
-            "get_commands" => self.reply(&record, json!({"commands":[]})),
+            "get_commands" => self.request(
+                "skills/list",
+                json!({"cwds":[self.start.workspace]}),
+                json!({"type":"skills","id":record["id"]}),
+            ),
             "set_session_name" => self.reply(&record, json!({})),
             "compact" => {
                 if self.running {

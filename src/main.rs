@@ -10,6 +10,7 @@ mod codex;
 mod composer;
 mod composer_paste;
 mod composer_rich;
+mod composer_skills;
 mod composer_sources;
 mod composer_tokens;
 mod context;

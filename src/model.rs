@@ -4859,6 +4859,32 @@ impl State {
         }
     }
 
+    /// Warm metadata on a command/skill trigger without sending a prompt. A failed startup
+    /// or denied login stays failed until the user takes an explicit recovery action.
+    pub fn ensure_composer_commands(&mut self) {
+        if self.demo || !self.runtime_enabled && self.client.is_none() {
+            return;
+        }
+        let t = self.current();
+        if !crate::composer::trigger(&t.draft).is_some_and(|t| matches!(t.marker, '/' | '$'))
+            || t.native.commands_loaded
+            || t.native.commands_requested
+            || t.native.commands_error.is_some()
+            || t.initializing
+            || t.error.is_some()
+            || t.status == Status::Failed
+            || t.archived()
+        {
+            return;
+        }
+        self.current_mut().native.commands_requested = true;
+        if self.client.is_some() || self.current().pi.is_some() {
+            self.current_mut().refresh_commands();
+        } else {
+            self.connect_thread(self.active);
+        }
+    }
+
     /// Changing a new thread's harness retires only its unused prewarmed process.
     pub fn choose_harness(&mut self, id: &str) {
         if self.forward(
@@ -4892,6 +4918,8 @@ impl State {
         thread.supports_images = None;
         thread.context.begin_model_change();
         thread.native.commands.clear();
+        thread.native.skills.clear();
+        thread.native.commands_requested = false;
         thread.native.commands_loaded = false;
         thread.error = None;
         thread.prewarm_attempted = false;
@@ -9235,6 +9263,16 @@ mod tests {
         assert_eq!(thread.status, Status::Completed);
         assert!(thread.error.is_none());
     }
+    #[test]
+    fn long_pastes_on_linked_threads_remain_inline_until_text_file_uploads_exist() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().machine = "linked-machine".into();
+        let text = "x".repeat(crate::composer_paste::THRESHOLD);
+        assert!(!state.fold_paste(&text));
+        assert!(state.current().draft_images.is_empty());
+        assert!(state.current().attachment_error.is_none());
+    }
+
     #[test]
     fn rich_draft_survives_ui_restore_and_sends_exact_markdown() {
         let mut state = State::new(".".into(), false);

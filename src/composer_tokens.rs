@@ -13,6 +13,10 @@ pub enum Token {
         id: usize,
         title: String,
     },
+    Skill {
+        name: String,
+        harness: String,
+    },
 }
 
 impl Token {
@@ -33,6 +37,8 @@ impl Token {
                 serde_json::to_string(title).unwrap(),
                 serde_json::json!({"thread_id":id})
             ),
+            // Codex and ACP advertise $name. Pi's bridge expands these exactly as KSG does.
+            Self::Skill { name, .. } => format!("${name}"),
         }
     }
 }

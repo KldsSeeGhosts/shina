@@ -136,7 +136,9 @@ pub struct PiSession {
     pub access: AccessMode,
     pub access_picker: bool,
     pub commands: Vec<SlashCommand>,
+    pub skills: Vec<crate::composer_skills::Skill>,
     pub commands_loaded: bool,
+    pub commands_requested: bool,
     pub commands_error: Option<String>,
     pub slash_index: usize,
     pub slash_dismissed: Option<String>,
@@ -268,6 +270,7 @@ impl Thread {
                 .iter()
                 .filter(|c| {
                     c.name != "model"
+                        && !c.name.starts_with('$')
                         && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
                             || c.name != "compact")
@@ -971,9 +974,11 @@ impl Thread {
                     }
                 }
                 if command == "get_commands" {
+                    self.native.commands_requested = false;
                     if record["success"] == false {
                         self.native.commands_error = Some(string(record, "error").into());
                     } else if let Some(commands) = record["data"]["commands"].as_array() {
+                        self.native.skills = crate::composer_skills::from_commands(commands);
                         let mut seen = std::collections::HashSet::new();
                         self.native.commands = commands
                             .iter()

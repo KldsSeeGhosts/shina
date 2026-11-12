@@ -114,6 +114,53 @@ fn handshake_stream_reasoning_command_plan_usage_and_approval_round_trip() {
 }
 
 #[test]
+fn a_skill_discovery_authentication_denial_stops_startup_without_a_fallback() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.request(
+        "skills/list",
+        json!({"cwds":[client.start.workspace]}),
+        json!({"type":"skills","id":"commands"}),
+    );
+    let id = client.wire.last().unwrap()["id"].clone();
+    client.wire.clear();
+    let error = client
+        .incoming(json!({"id":id,"error":{"code":401,"message":"Authentication required"}}))
+        .unwrap_err();
+    assert!(error.contains("Authentication required"));
+    assert!(client.wire.is_empty());
+}
+
+#[test]
+fn skills_list_is_project_scoped_and_skill_mentions_remain_native_text() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| !t.native.skills.is_empty());
+    assert_eq!(thread.native.skills.len(), 1);
+    assert_eq!(thread.native.skills[0].name, "fixture-skill");
+    thread.draft.insert_pill(
+        crate::composer_tokens::Token::Skill {
+            name: "fixture-skill".into(),
+            harness: "codex".into(),
+        }
+        .id(),
+        "fixture-skill",
+    );
+    thread.draft.insert(" respond");
+    thread.send();
+    pump(&mut thread, |t| t.status == Status::Completed);
+    let log = records(&log);
+    let request = log.iter().find(|r| r["method"] == "skills/list").unwrap();
+    assert_eq!(
+        request["params"]["cwds"][0],
+        crate::store::directory()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    let turn = log.iter().find(|r| r["method"] == "turn/start").unwrap();
+    assert_eq!(turn["params"]["input"][0]["text"], "$fixture-skill respond");
+}
+
+#[test]
 fn read_only_refuses_write_without_a_dialog_or_a_file() {
     let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
     pump(&mut thread, |t| t.native.commands_loaded);

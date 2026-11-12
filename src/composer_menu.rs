@@ -21,7 +21,7 @@ pub(super) fn trigger(s: &State) -> Option<Trigger> {
     if !t.draft.focused || t.native.slash_dismissed.as_ref() == Some(&t.draft.text) {
         return None;
     }
-    crate::composer::trigger(&t.draft).filter(|t| matches!(t.marker, '/' | '@'))
+    crate::composer::trigger(&t.draft)
 }
 
 fn linked(s: &State) -> bool {
@@ -30,8 +30,34 @@ fn linked(s: &State) -> bool {
 
 fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
     let t = s.current();
+    if trigger.marker == '$' {
+        let query = trigger.query.to_lowercase();
+        return (
+            t.native
+                .skills
+                .iter()
+                .filter(|skill| {
+                    skill.name.to_lowercase().contains(&query)
+                        || skill.description.to_lowercase().contains(&query)
+                })
+                .map(|skill| Item {
+                    label: format!("${}", skill.name),
+                    description: skill.description.clone(),
+                    source: t.harness.clone(),
+                    action: Action::Pill(
+                        Token::Skill {
+                            name: skill.name.clone(),
+                            harness: t.harness.clone(),
+                        },
+                        skill.name.clone(),
+                    ),
+                })
+                .collect(),
+            vec![],
+        );
+    }
     if trigger.marker == '/' {
-        let items = t
+        let mut items: Vec<_> = t
             .slash_matches()
             .into_iter()
             .map(|command| Item {
@@ -41,6 +67,36 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                 action: Action::Slash(command.name),
             })
             .collect();
+        for skill in &t.native.skills {
+            if t.native
+                .commands
+                .iter()
+                .any(|c| c.name == format!("skill:{}", skill.name))
+            {
+                continue;
+            }
+            if format!("skill:{}", skill.name)
+                .to_lowercase()
+                .contains(&trigger.query.to_lowercase())
+                || skill
+                    .description
+                    .to_lowercase()
+                    .contains(&trigger.query.to_lowercase())
+            {
+                items.push(Item {
+                    label: format!("/skill:{}", skill.name),
+                    description: skill.description.clone(),
+                    source: t.harness.clone(),
+                    action: Action::Pill(
+                        Token::Skill {
+                            name: skill.name.clone(),
+                            harness: t.harness.clone(),
+                        },
+                        skill.name.clone(),
+                    ),
+                });
+            }
+        }
         let notes = if t.native.commands_loaded {
             vec![]
         } else {
@@ -171,18 +227,14 @@ pub(super) fn overlay(s: &State, p: Palette, cx: &Cx<State>, width: f32) -> El {
 }
 
 fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<String>) -> El {
-    let prefix = if trigger.marker == '/' {
-        "slash"
-    } else {
-        "mention"
-    };
+    let prefix = menu_prefix(trigger.marker);
     let mut list = col()
         .key(format!("{prefix}-menu"))
         .role("listbox")
-        .label(if trigger.marker == '/' {
-            "Commands"
-        } else {
-            "Files, folders and threads"
+        .label(match trigger.marker {
+            '/' => "Commands",
+            '$' => "Skills",
+            _ => "Files, folders and threads",
         })
         .max_h(288.0)
         .padding(4.0)
@@ -199,14 +251,24 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
     if items.is_empty() {
         list = list.child(
             label(
-                if trigger.marker == '/' {
-                    "No matching command."
-                } else {
-                    "No matching files, folders or threads."
+                match trigger.marker {
+                    '/' => "No matching command.",
+                    '$' if !s.current().native.commands_loaded => s
+                        .current()
+                        .native
+                        .commands_error
+                        .as_deref()
+                        .unwrap_or("Loading skills..."),
+                    '$' if s.current().native.skills.is_empty() => {
+                        "No skills available for this harness."
+                    }
+                    '$' => "No matching skill.",
+                    _ => "No matching files, folders or threads.",
                 },
                 SMALL,
                 p.muted,
             )
+            .key(format!("{prefix}-empty"))
             .px(16.0)
             .py(10.0),
         );
@@ -291,17 +353,22 @@ pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
         } => pixel_icons::glyph("folder"),
         Token::File { .. } => pixel_icons::glyph("file"),
         Token::Thread { .. } => pixel_icons::glyph("thread"),
+        Token::Skill { .. } => pixel_icons::glyph("bolt"),
     })
 }
 
 pub(super) fn scroll_selected(s: &State, tx: &mut Tx) {
     if let Some(trigger) = trigger(s) {
-        let prefix = if trigger.marker == '/' {
-            "slash"
-        } else {
-            "mention"
-        };
+        let prefix = menu_prefix(trigger.marker);
         tx.scroll_into_view(format!("{prefix}-item-{}", s.current().native.slash_index));
+    }
+}
+
+fn menu_prefix(marker: char) -> &'static str {
+    match marker {
+        '/' => "slash",
+        '$' => "skill",
+        _ => "mention",
     }
 }
 
@@ -326,5 +393,31 @@ mod tests {
             Action::Pill(Token::Thread { id: 123, .. }, _)
         ));
         assert_eq!(notes, ["File search needs the machine's own Shina."]);
+    }
+
+    #[test]
+    fn an_empty_skill_inventory_has_one_muted_information_line() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("$");
+        state.current_mut().draft.focused = true;
+        state.current_mut().native.commands_loaded = true;
+        let active = trigger(&state).unwrap();
+        let (matches, notes) = items(&state, &active);
+        assert!(matches.is_empty());
+        assert!(notes.is_empty());
+        let mut rt = rune::Runtime::with_text(
+            state,
+            |s, _| {
+                let active = trigger(s).unwrap();
+                let (matches, notes) = items(s, &active);
+                menu(s, palette(false), &active, matches, notes).w(440.0)
+            },
+            (620.0, 720.0),
+            rune::Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        rt.frame(0.0);
+        assert!(rt.find("skill-empty").is_some());
+        assert!(rt.find("skill-item-0").is_none());
     }
 }

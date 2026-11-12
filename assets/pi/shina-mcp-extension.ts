@@ -2,9 +2,10 @@
 // Pi's own module resolution. It connects to the Shina MCP named by SHINA_MCP_URL and
 // SHINA_MCP_TOKEN, registers its tools as mcp__shina__<tool>, and tells the model it is
 // running inside Shina. Modeled on T3 Code's Pi MCP bridge.
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { request as httpRequest } from "node:http";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { Type } from "typebox";
 
 const PROTOCOL = "2025-06-18";
@@ -135,11 +136,37 @@ export default async function shinaExtension(pi: ExtensionAPI) {
       JSON.stringify(event.input, null, 2).slice(0, 4_000), { signal: ctx.signal });
     if (!approved) return { block: true, reason: `${event.toolName} was declined in Shina.` };
   });
-  pi.on("input", (_event, ctx) => {
+  pi.on("input", async (event, ctx) => {
     if (ctx.model && ctx.model.provider !== "cpa") {
       ctx.ui.notify("Shina uses CPA proxy models only. Choose a CPA model before starting work.", "error");
       return { action: "handled" };
     }
+    // KSG Code's provider-pi/mcpExtensionSource.ts. Pi natively expands only a leading
+    // /skill: command. Expand every selected $skill through Pi's own frontmatter loader.
+    if (!event.text.includes("$")) return;
+    const commands = pi.getCommands().filter((command) => command.source === "skill");
+    const nativeSkill = /^\/skill:([^ ]+)(?: |$)/.exec(event.text)?.[1];
+    const seen = new Set<string>(nativeSkill === undefined ? [] : [nativeSkill]);
+    const blocks: string[] = [];
+    for (const match of event.text.matchAll(/(^|\s)\$([^\s]+)(?=\s|$)/g)) {
+      const name = match[2];
+      if (name === undefined || seen.has(name)) continue;
+      const command = commands.find((candidate) => candidate.name === "skill:" + name);
+      if (command === undefined) continue;
+      seen.add(name);
+      const path = command.sourceInfo.path;
+      try {
+        const body = stripFrontmatter(await readFile(path, "utf8")).trim();
+        blocks.push(`<skill name="${name}" location="${path}">\nReferences are relative to ${dirname(path)}.\n\n${body}\n</skill>`);
+      } catch {
+        ctx.ui.notify(`Could not load skill ${name} from ${path}.`, "error");
+      }
+    }
+    if (blocks.length > 0) return {
+      action: "transform",
+      text: event.text + "\n\n" + blocks.join("\n\n"),
+      images: event.images,
+    };
   });
   const endpoint = process.env.SHINA_MCP_URL;
   const token = process.env.SHINA_MCP_TOKEN;

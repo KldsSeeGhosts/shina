@@ -110,6 +110,12 @@ for line in sys.stdin:
             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}],
             "inputModalities": ["text", "image"]
         }], "nextCursor": None}})
+    elif method == "skills/list":
+        assert len(params["cwds"]) == 1
+        send({"id": request_id, "result": {"data": [{"cwd": params["cwds"][0], "skills": [
+            {"name": "fixture-skill", "description": "Fixture skill", "path": "/fixture/SKILL.md", "enabled": True},
+            {"name": "disabled-skill", "path": "/fixture/disabled.md", "enabled": False}
+        ]}]}})
     elif method in ("thread/start", "thread/resume"):
         assert initialized
         assert "Shina" in params["developerInstructions"]
