@@ -2,7 +2,7 @@
 
 A native desktop chat workspace built with [Rune](https://github.com/anomalyco/rune) and the [Pi coding agent](https://github.com/earendil-works/pi). Shina is a working-name prototype, not a T3 Code or Capy client.
 
-The standalone app's interface is entirely Rune. Pi, Codex, or a selected ACP agent runs as a hidden background RPC process. There is no terminal emulator, webview, browser server, or Electron runtime in this app.
+The standalone app's interface is Rune. Pi, Codex, or a selected ACP agent runs as a hidden background RPC process. HTML artifacts render in platform webviews owned by helper processes: the chat shows a preview card and the live page opens in its own window, while Linux has no preview capture. There is no terminal emulator, browser server, or Electron runtime in this app.
 
 Threads default to Pi and its CPA-only provider. A new thread can instead select Codex or an installed ACP agent from the Harness group in the model picker. Settings has a Default harness item for new threads and captain homes. Workers inherit their parent's harness unless a delegation target selects another. Codex uses `codex app-server`, not ACP. Codex and ACP agents use their own configured providers and login. Shina never reads or copies their credentials, changes their configuration, installs agents, or changes their login state. See [thread harnesses](docs/harnesses.md) for discovery, MCP setup and protocol limits.
 
