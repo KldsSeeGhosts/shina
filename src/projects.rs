@@ -728,11 +728,6 @@ impl Projects {
 }
 
 impl State {
-    pub fn project_name(&self) -> String {
-        self.project(self.current().project)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "No project".into())
-    }
     pub fn open_clone_dialog(&mut self) {
         self.projects.clone_open = true;
         self.projects.clone_error = None;

@@ -342,7 +342,9 @@ These replace the earlier text where they differ.
   chat header and composer ("<Machine> is unreachable. Reconnecting.", send disabled). Demo mode
   never shows a disconnected machine.
 - **Fixed radii.** Rows, buttons and chips are 4 px, cards 6 px.
-- **Assistant label.** "Shina" above a turn is `ink` on the coral wash. A test covers the pair.
+- **Assistant label.** A plain Pi turn in a lone thread has no speaker label, as in KSG Code's
+  timeline. Only a captain's turns are signed. The "Shina" label on the coral wash is for a
+  message from Shina itself that is not a Pi reply, and a test covers its ink pair.
 - **Interim prose.** Assistant paragraphs between tool rows share the lane's one left margin
   with the captain's name. Only an expanded work log's tool rows are indented, as a group.
 - **Icons on 2 unit cells.** Clock, lightbulb, chip (a model with no vendor), settings, pencil,
@@ -353,9 +355,81 @@ These replace the earlier text where they differ.
 - **Brief.** Memory edit and delete icons show on hover and keyboard focus of the row. Section
   counts sit at the heading's end. Approval cards have a 2 px brass bar on the left, and crew
   tray chips a `card` fill with a 1 px `line` border.
-- **Captain home band.** It keeps the normal day or night sky. Only the lowest sky step takes
-  40% of the portrait's backdrop.
+- **Captain home band.** Superseded by section 12: the two lowest sky steps take the
+  portrait's backdrop.
 - **Dark text steps.** `muted` is `#b8c7e0` (6.3:1 on a hovered card) and `faint` `#98aac5`
   (4.6:1), so they read as two steps. The night hover wash is 6%.
 - **Art cache.** Pre-scaled portraits are cached for the current display scale and zoom only,
   up to 256 buffers.
+
+## 12. Round 4 fixes
+
+**Layout bugs**
+
+- **Wordmark.** It stays at 22 px in a normal 232 px docked sidebar with the attention badge, and
+  drops to 11 px only at 216 px or narrower.
+- **Undocked sidebar.** The header keeps the 24 px mark after the toggle, mounts the attention
+  badge, then leaves `HEADER_TAB_GAP` before the tabs.
+- **Shelved rows.** The age sits in a non-shrinking, right-aligned slot. The title truncates 8 px
+  before it.
+- **Attention popover.** 340 px wide, capped to the window less 16 px, with 80 px for the status
+  word. It hangs from the chat header's rule, so it never covers the header's away status.
+- **Work log.** Tool rows take one indent (`WORK_INDENT`, 14 px) while working and after. The
+  live status square sits on the prose lane's left edge with the label one indent in.
+- **Transcript top.** A 16 px fade under the header rule replaces the hard slice of a long
+  transcript that sticks to the bottom.
+- **Pickers.** The harness list shows an ACP agent that shares a built-in name with an ACP tag
+  and its own key. Popover rows (workspaces, harnesses, models) sit 4 px in from the frame
+  with a 4 px highlight.
+- **Shadows.** Cards with a hard shadow no longer clip themselves; clipping happens on an inner
+  layer.
+- **Speaker avatar.** A captain's turn shows its resting face, the same bust as the sidebar.
+
+**Consistency**
+
+- **Fleet rows.** A thread row names its machine when there is room. A captain row puts the
+  machine after the workspace on its status line. The fleet header uses the standard tab strip.
+- **Brief.** The chat header drops its Brief toggle while the drawer is docked open. Routine
+  switch thumbs are `card` with a 1 px frame. A memory row's edit and delete overlay its trailing
+  edge on hover or focus.
+- **Dialogs.** New captain, You and Clone share one field fill (`field_fill`: `panel` in
+  light, `bg` at night, focus shown only by `field_focus`), a close button at the top right,
+  Cancel as a secondary button right-aligned before the primary, 4 px field corners, and
+  Clone's "Choose..." as a secondary button.
+- **Thread menu.** "Auto-settle after" with its value ("3 days") in pixel type at the right edge.
+  "Delete thread..." and its icon use the danger colour. The menu is 232 px wide.
+- **Snooze.** An anchored popover on the thread's row, with no scrim and no Cancel row. Escape and
+  an outside press close it.
+- **Undo and recovery.** The undo notice reads "Undo settle": an outlined 32 px card (4 px radius,
+  8 px side margin) with the keycap at the right. The recovery banner reads "2 tasks stopped when
+  Shina closed. Review partial changes before resuming." with a live count. Review and the
+  dismiss control share one row, and the banner has a 1 px frame.
+- **Settings menu.** The "Y" tile has a 1 px frame and a pixel-type letter. The Keep awake track
+  has a 1 px `line` border and the chosen segment a 1 px frame.
+- **Status colour.** `status_ink` is the one function: Done and Working are `sea`, everything
+  else follows it.
+- **Type.** Tool output is system mono 12/18. ACP tags are Departure Mono 11 px, outlined, 4 px
+  radius.
+- **Composer.** "Default model" shows once when the model and effort are both default. A disabled
+  composer keeps its 2 px frame in `line` with no shadow.
+- **Light code.** Token colours darken until each reads at 4.5:1 on `code_bg`. Punctuation,
+  operators, variables, parameters and comments are no lighter than `#595f73`.
+- **User bubble.** One border in `frame` in both themes (1 px light, 2 px night).
+
+**Scenery**
+
+- **Captain band.** The two lowest sky steps take 60% and 30% of the portrait's backdrop. The
+  boat now sails here too, a quarter of the way along and clear of the portrait. Its flag is a
+  3 by 2 cell pennant in the backdrop colour.
+- **Fleet on the horizon.** The new-thread band and the captain band draw one distant sail per
+  working thread, up to four. A sail is 7 by 8 cells in the boat's colours, at fixed
+  positions (70%, 12%, 90% and 80% of the width). It is memoised on the count, with no timer.
+  Nothing shows when nothing works.
+- **Empty lists.** A search with no results, an empty sidebar and an empty Brief memory section
+  show the ship mark at 32 pt (two device pixels per cell at 2x) above the explanation.
+
+**Known limits**
+
+- 26 Pixelarticons glyphs use odd offsets (a 1 unit step inside the 24 unit grid), so some
+  edges fall on half device pixels at 2x. The `PI` and `AGENT` harness marks are smooth SVGs and
+  the OpenAI and Claude marks are vendor logos.

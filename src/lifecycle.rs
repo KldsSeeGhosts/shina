@@ -362,13 +362,14 @@ pub enum Action {
     Discard,
 }
 impl Action {
-    pub fn label(self) -> &'static str {
+    /// The undo notice's text: the verb to reverse, in the form a button would say it.
+    pub fn undo_label(self) -> &'static str {
         match self {
-            Self::Settle => "Settled",
-            Self::Snooze => "Snoozed",
-            Self::Unpin => "Unpinned",
-            Self::Archive => "Archived",
-            Self::Discard => "Draft discarded",
+            Self::Settle => "Undo settle",
+            Self::Snooze => "Undo snooze",
+            Self::Unpin => "Undo unpin",
+            Self::Archive => "Undo archive",
+            Self::Discard => "Undo discard",
         }
     }
 }

@@ -1,6 +1,7 @@
 //! KSG Code's ChatMarkdown lineBreaks and MarkdownCodeBlock headers in Rune.
 use super::*;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use rune_kit::syntax::{Syntax, SyntaxTheme};
 use std::borrow::Cow;
 
 const OPTIONS: Options = Options::ENABLE_STRIKETHROUGH
@@ -110,6 +111,7 @@ pub(super) fn render(
         p.coral_bg
     };
     let style = MarkdownStyle::neutral(dark)
+        .syntax_theme(syntax_theme(dark, p))
         .text(p.ink)
         .muted(p.muted)
         .body_font(if user {
@@ -210,6 +212,61 @@ pub(super) fn render(
     content
 }
 
+const SYNTAX_KINDS: [Syntax; 17] = [
+    Syntax::Keyword,
+    Syntax::String,
+    Syntax::Number,
+    Syntax::Comment,
+    Syntax::Type,
+    Syntax::Function,
+    Syntax::Property,
+    Syntax::Punctuation,
+    Syntax::Inserted,
+    Syntax::Deleted,
+    Syntax::Parameter,
+    Syntax::Heading,
+    Syntax::Link,
+    Syntax::Operator,
+    Syntax::Regex,
+    Syntax::Attribute,
+    Syntax::Variable,
+];
+
+/// The contrast ratio of two opaque colours.
+fn contrast(a: Color, b: Color) -> f32 {
+    let (a, b) = (a.luminance(), b.luminance());
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Rune's token colours, with the light ones darkened until each reads at 4.5:1 on the code
+/// fill. Identifiers, punctuation, operators and comments go no lighter than `#595f73`.
+/// The dark theme already passes and stays as Rune draws it.
+pub(super) fn syntax_theme(dark: bool, p: Palette) -> SyntaxTheme {
+    let mut theme = SyntaxTheme::neutral(dark);
+    if dark {
+        return theme;
+    }
+    let quiet = contrast(rgb_bytes([0x59, 0x5f, 0x73]), p.code_bg);
+    for kind in SYNTAX_KINDS {
+        let want = match kind {
+            Syntax::Punctuation
+            | Syntax::Operator
+            | Syntax::Variable
+            | Syntax::Parameter
+            | Syntax::Comment => quiet.max(4.5),
+            _ => 4.5,
+        };
+        let mut colour = theme.color(kind);
+        let mut step = 0.0;
+        while contrast(colour, p.code_bg) < want && step < 1.0 {
+            step += 0.02;
+            colour = mix_srgb(theme.color(kind), Color::BLACK, step);
+        }
+        theme = theme.with(kind, colour);
+    }
+    theme
+}
+
 /// `t` of the way from `a` to `b`, mixed in sRGB-encoded space.
 fn mix_srgb(a: Color, b: Color, t: f32) -> Color {
     use rune::color::{srgb_decode, srgb_encode};
@@ -228,6 +285,27 @@ fn mix_srgb(a: Color, b: Color, t: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_code_colours_read_at_4_5_to_1_on_the_code_fill() {
+        let p = palette(false);
+        let theme = syntax_theme(false, p);
+        let quiet = contrast(rgb_bytes([0x59, 0x5f, 0x73]), p.code_bg);
+        for kind in SYNTAX_KINDS {
+            let ratio = contrast(theme.color(kind), p.code_bg);
+            assert!(ratio >= 4.5, "{kind:?} is {ratio:.2}:1");
+            if matches!(
+                kind,
+                Syntax::Punctuation
+                    | Syntax::Operator
+                    | Syntax::Variable
+                    | Syntax::Parameter
+                    | Syntax::Comment
+            ) {
+                assert!(ratio >= quiet - 0.01, "{kind:?} is {ratio:.2}:1");
+            }
+        }
+    }
 
     #[test]
     fn the_dark_removed_line_is_a_quiet_red_not_a_loud_one() {

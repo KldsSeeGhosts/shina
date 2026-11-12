@@ -106,8 +106,9 @@ pub(super) fn switch(
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     let travel = rune::Curve::tween(0.15, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0));
-    // A square, framed switch: coral with a light thumb when on, a card with a muted thumb off.
-    let thumb = if on { p.on_coral } else { p.muted };
+    // A square, framed switch: coral with a card-coloured thumb and a 1 px frame when on, a card
+    // with a muted thumb off. Near-black on coral read as a hole.
+    let thumb = if on { p.card } else { p.muted };
     el().key(key)
         .role("switch")
         .checked(on)
@@ -126,6 +127,7 @@ pub(super) fn switch(
         .child(
             el().size(12.0, 12.0)
                 .fill(thumb)
+                .border(if on { 1.0 } else { 0.0 }, p.frame)
                 .offset(if on { 14.0 } else { 0.0 }, 0.0)
                 .offset_motion(travel),
         )
@@ -295,7 +297,6 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
                 .w(width)
                 .fill(p.panel)
                 .radius(6.0)
-                .clip_rounded(6.0)
                 .border(2.0, p.frame)
                 .box_shadow(hard_shadow(p))
                 .on_press(|_: &mut State| {})
@@ -623,6 +624,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             ))
     };
     let mut text = col()
+        .key(format!("memory-text-{id}"))
         .grow(1.0)
         .min_w(0.0)
         .gap(3.0)
@@ -651,6 +653,8 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
     }
     let edit_id = id.clone();
     let text_value = memory.text.clone();
+    let wash = hover_wash(s, p);
+    let backing = p.panel.mix(wash, wash.a);
     row()
         .key(format!("memory-{id}"))
         .px(4.0)
@@ -663,36 +667,42 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
         .hover_group_focus()
         .child(pin)
         .child(text)
+        // The controls lie over the row's trailing edge on hover and focus, on a backing the
+        // colour of the hovered row, so the text uses the row's full width at rest.
         .child(
-            icon_action(
-                s,
-                format!("memory-edit-{id}"),
-                "Edit memory",
-                icon("edit", p.muted),
-                p,
-                move |s| {
-                    s.brief.adding = false;
-                    s.brief.editing = Some(edit_id.clone());
-                    s.brief.edit = rune::TextEdit::default();
-                    s.brief.edit.replace_text(&text_value);
-                    s.brief.edit.focused = true;
-                },
-            )
-            .group_opacity(0.0, 1.0),
-        )
-        .child(
-            icon_action(
-                s,
-                format!("memory-delete-{id}"),
-                "Delete memory",
-                glyph_icon(&super::pixel_icons::TRASH, p.muted),
-                p,
-                move |s| {
-                    let result = s.delete_memory(captain, &id);
-                    report(s, result);
-                },
-            )
-            .group_opacity(0.0, 1.0),
+            row()
+                .key(format!("memory-actions-{id}"))
+                .pin(None, Some(4.0), Some(4.0), None)
+                .gap(2.0)
+                .px(2.0)
+                .radius(ROW_RADIUS)
+                .fill(backing)
+                .child(icon_action(
+                    s,
+                    format!("memory-edit-{id}"),
+                    "Edit memory",
+                    icon("edit", p.muted),
+                    p,
+                    move |s| {
+                        s.brief.adding = false;
+                        s.brief.editing = Some(edit_id.clone());
+                        s.brief.edit = rune::TextEdit::default();
+                        s.brief.edit.replace_text(&text_value);
+                        s.brief.edit.focused = true;
+                    },
+                ))
+                .child(icon_action(
+                    s,
+                    format!("memory-delete-{id}"),
+                    "Delete memory",
+                    glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                    p,
+                    move |s| {
+                        let result = s.delete_memory(captain, &id);
+                        report(s, result);
+                    },
+                ))
+                .group_opacity(0.0, 1.0),
         )
 }
 
@@ -726,9 +736,11 @@ fn memory_section(s: &State, p: Palette, captain: usize) -> El {
         section = section.child(memory_editor(s, p, captain, None));
     }
     if memories.is_empty() && !s.brief.adding {
-        section = section.child(quiet_note(
-            "Nothing yet. Add what this captain should remember, or let it remember as it works.",
+        section = section.child(super::empty_list(
+            s,
             p,
+            "brief-memory-empty",
+            "Nothing yet. Add what this captain should remember, or let it remember as it works.",
         ));
     }
     // Essential memories first, each group in stored order, as they enter the context.
@@ -848,13 +860,17 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
                         .gap(8.0)
                         .center_y()
                         .min_w(0.0)
+                        // The schedule is never cut; the state beside it gives way.
                         .child(
                             label(schedule, META.features(TABULAR), p.muted)
+                                .key(format!("routine-schedule-{id}")),
+                        )
+                        .child(
+                            label(state, TIMER, state_ink)
                                 .truncate()
                                 .shrink()
                                 .min_w(0.0),
-                        )
-                        .child(label(state, TIMER, state_ink)),
+                        ),
                 ),
         )
         .child(icon_action(
@@ -1009,7 +1025,6 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
         .padding(20.0)
         .gap(10.0)
         .radius(6.0)
-        .clip_rounded(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
@@ -1032,9 +1047,14 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
                 .pt(8.0)
                 .gap(8.0)
                 .child(spacer())
-                .child(ghost_button(s, "cancel-reset-conversation".into(), "Cancel", p, close))
-                .child(solid_button(
-                    "confirm-reset-conversation".into(),
+                .child(secondary_button(
+                    "cancel-reset-conversation",
+                    "Cancel",
+                    p,
+                    close,
+                ))
+                .child(primary_button(
+                    "confirm-reset-conversation",
                     "Reset conversation",
                     p,
                     move |s| {
@@ -1282,7 +1302,8 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
         .padding(2.0)
         .gap(2.0)
         .radius(4.0)
-        .fill(p.ink.alpha(if s.dark { 0.07 } else { 0.06 }));
+        .fill(p.ink.alpha(if s.dark { 0.07 } else { 0.06 }))
+        .border(1.0, p.line);
     for (key, title, choice) in [
         ("keep-awake-off", "Off", KeepAwake::Off),
         (
@@ -1307,6 +1328,9 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .center()
                 .radius(4.0)
                 .fill(if on { p.card } else { Color::TRANSPARENT })
+                // The chosen segment has a 1 px frame. Idle ones keep a clear border so no
+                // segment changes size when the choice moves.
+                .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
                 .hover(if on { p.card } else { hover_wash(s, p) })
                 .hover_motion(motion(), motion())
                 .on_press(move |s: &mut State| s.set_keep_awake(choice))
@@ -1362,7 +1386,8 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
                 .center()
                 .radius(4.0)
                 .fill(p.coral)
-                .child(label(
+                .border(1.0, p.frame)
+                .child(super::pixel_text(
                     profile
                         .name
                         .trim()
@@ -1370,7 +1395,6 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
                         .next()
                         .map(|c| c.to_uppercase().to_string())
                         .unwrap_or_else(|| "Y".into()),
-                    TextStyle::new(12.5, 600.0),
                     p.on_coral,
                 )),
         )
@@ -1453,7 +1477,7 @@ fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title:
         .px(10.0)
         .py(7.0)
         .radius(4.0)
-        .fill(if s.dark { p.bg } else { p.card })
+        .fill(field_fill(s, p))
         .field_focus(edit, p)
 }
 
@@ -1519,27 +1543,29 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
         .padding(20.0)
         .gap(16.0)
         .radius(6.0)
-        .clip_rounded(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
-            col()
-                .gap(4.0)
-                .child(label(
-                    "You",
-                    super::DIALOG_TITLE,
-                    p.ink,
-                ))
+            row()
+                .gap(8.0)
                 .child(
-                    label(
-                        "Every captain reads this with its memory. It is data about you, not instructions.",
-                        TextStyle::new(12.5, 420.0).lh(18.0),
-                        p.muted,
-                    )
-                    .wrap(),
-                ),
+                    col()
+                        .gap(4.0)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(label("You", super::DIALOG_TITLE, p.ink))
+                        .child(
+                            label(
+                                "Every captain reads this with its memory. It is data about you, not instructions.",
+                                TextStyle::new(12.5, 420.0).lh(18.0),
+                                p.muted,
+                            )
+                            .wrap(),
+                        ),
+                )
+                .child(icon_button("close-profile", "Close", "close", p, close_profile)),
         )
         .child(name)
         .child(zone)
@@ -1563,15 +1589,14 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
                     }),
             )
             .child(spacer())
-            .child(ghost_button(
-                s,
-                "cancel-profile".into(),
+            .child(secondary_button(
+                "cancel-profile",
                 "Cancel",
                 p,
                 close_profile,
             ))
             .child(
-                solid_button("save-profile".into(), "Save", p, save_profile)
+                primary_button("save-profile", "Save", p, save_profile)
                     .disabled(over)
                     .opacity(if over { 0.5 } else { 1.0 }),
             ),

@@ -524,10 +524,11 @@ fn settings_profile_demo(state: &mut State) {
     state.brief.profile_name.focused = true;
 }
 
+/// A captain's home with its crew: the needs-you card and the crew tray above the composer.
 fn captain_crews_demo(state: &mut State) {
     captain_workspace_demo(state);
-    let solo = state.threads.iter().position(|t| t.id == 11).unwrap();
-    state.select_thread(solo);
+    let home = state.threads.iter().position(|t| t.id == 7).unwrap();
+    state.select_thread(home);
 }
 
 fn main() {

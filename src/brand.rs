@@ -124,6 +124,31 @@ pub fn boat(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
     }
 }
 
+/// A distant sail, about a third of the boat's size, on a 7 by 8 grid: a mast, a mainsail, a
+/// jib and a hull in the boat's own colours. The keel is on row 7. Only the app draws it; the
+/// build script that shares this file does not.
+#[allow(dead_code)]
+pub fn distant_sail(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
+    let scene = if night { &NIGHT } else { &DAY };
+    for y in 0..=5 {
+        put(2, y, scene.mast);
+    }
+    for (y, width) in [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3)] {
+        for x in 3..3 + width {
+            put(x, y, if y == 5 { scene.sail_shade } else { scene.sail });
+        }
+    }
+    for (x, y) in [(1, 3), (1, 4), (0, 5), (1, 5)] {
+        put(x, y, scene.jib);
+    }
+    for x in 0..=6 {
+        put(x, 6, scene.hull);
+    }
+    for x in 1..=5 {
+        put(x, 7, scene.hull_shade);
+    }
+}
+
 /// RGBA pixels of the mark. `night` selects the dark-theme night sail.
 pub fn pixels(night: bool) -> Vec<u8> {
     let scene = if night { &NIGHT } else { &DAY };

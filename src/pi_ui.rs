@@ -91,7 +91,6 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 .padding(16.0)
                 .gap(8.0)
                 .radius(6.0)
-                .clip_rounded(6.0)
                 .fill(p.card)
                 .border(2.0, p.frame)
                 .box_shadow(hard_shadow(p))
@@ -227,7 +226,6 @@ pub(super) fn slash_menu(s: &State, p: Palette) -> El {
         .max_h(288.0)
         .padding(4.0)
         .radius(6.0)
-        .clip_rounded(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
@@ -604,7 +602,6 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
         .padding(16.0)
         .gap(12.0)
         .radius(6.0)
-        .clip_rounded(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));
@@ -685,7 +682,6 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .padding(8.0)
         .gap(4.0)
         .radius(6.0)
-        .clip_rounded(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));

@@ -319,14 +319,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             .w_full()
             .gap(8.0)
             .center_y()
-            .child(pixel_text(
-                status.label(),
-                if status == Status::Completed {
-                    p.sea
-                } else {
-                    status_ink(status, p)
-                },
-            ))
+            .child(pixel_text(status.label(), status_ink(status, p)))
             // The workspace keeps `WORKSPACE_FLOOR`, so the machine name gives way first, down
             // to its icon alone.
             .child(
@@ -342,6 +335,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                             + 24.0
                             + ICON
                             + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                        &detail.join(", "),
                     )),
             )
             .child(machine_tag(
@@ -420,48 +414,6 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         lifecycle::section(&entry.life, lifecycle::now()),
         Section::Settled | Section::Snoozed
     );
-    let mut meta = rune::row().h(18.0).gap(8.0).center_y();
-    if entry.draft || entry.life.pinned_at.is_some() {
-        meta = meta.child(
-            el().size(14.0, 16.0)
-                .center()
-                .child(icon(if entry.draft { "edit" } else { "pin" }, p.muted)),
-        );
-    }
-    meta = meta
-        .child(project_tile(s, p, project_tile_data.as_ref(), 16.0))
-        .child(
-            rune::row()
-                .grow(1.0)
-                .min_w(0.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    label(workspace, CARD_META, p.muted)
-                        .key(format!("machine-workspace-{}-{id}", entry.server))
-                        .truncate()
-                        .shrink()
-                        .min_w(workspace_floor(
-                            sidebar_row_width(s) - 2.0 * ROW_INSET,
-                            // The project tile, the machine icon, the status or age text and
-                            // the gaps between them.
-                            16.0 + ICON + 78.0 + 32.0,
-                        )),
-                )
-                .child(spacer())
-                .child(machine_tag(
-                    s,
-                    p,
-                    entry.server,
-                    format!("machine-tag-{}-{id}", entry.server),
-                    CARD_META,
-                    room_for_machine_name(
-                        sidebar_row_width(s) - 2.0 * ROW_INSET,
-                        16.0 + ICON + 78.0 + 32.0,
-                        workspace,
-                    ),
-                )),
-        );
     let at = lifecycle::now();
     let state_label = if view["request"]["method"] == "confirm" {
         "Approval"
@@ -490,6 +442,49 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     } else {
         relative_time(record["updated"].as_u64().unwrap_or(0))
     };
+    let mut meta = rune::row().h(18.0).gap(8.0).center_y();
+    if entry.draft || entry.life.pinned_at.is_some() {
+        meta = meta.child(
+            el().size(14.0, 16.0)
+                .center()
+                .child(icon(if entry.draft { "edit" } else { "pin" }, p.muted)),
+        );
+    }
+    meta = meta
+        .child(project_tile(s, p, project_tile_data.as_ref(), 16.0))
+        .child(
+            rune::row()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(workspace, CARD_META, p.muted)
+                        .key(format!("machine-workspace-{}-{id}", entry.server))
+                        .truncate()
+                        .shrink()
+                        .min_w(workspace_floor(
+                            sidebar_row_width(s) - 2.0 * ROW_INSET,
+                            // The project tile, the machine icon, the status or age text and
+                            // the gaps between them.
+                            16.0 + ICON + slot_width(age.as_deref()) + 32.0,
+                            workspace,
+                        )),
+                )
+                .child(spacer())
+                .child(machine_tag(
+                    s,
+                    p,
+                    entry.server,
+                    format!("machine-tag-{}-{id}", entry.server),
+                    CARD_META,
+                    room_for_machine_name(
+                        sidebar_row_width(s) - 2.0 * ROW_INSET,
+                        16.0 + ICON + slot_width(age.as_deref()) + 32.0,
+                        workspace,
+                    ),
+                )),
+        );
     if let Some(age) = age {
         let ink = if status == Status::Waiting {
             p.brass

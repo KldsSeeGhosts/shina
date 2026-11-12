@@ -942,12 +942,24 @@ pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
     Some(pill)
 }
 
+/// The attention popover's width and the room it keeps for each row's reason.
+const ATTENTION_MENU_WIDTH: f32 = 340.0;
+const ATTENTION_REASON_WIDTH: f32 = 80.0;
+
 /// The attention row's popover: each item names its thread and why, and opens it.
-pub(super) fn attention_menu(s: &State, p: Palette) -> El {
+/// It is 340 pt wide, or the window less 16 pt, and keeps 80 pt at the end of each row for the
+/// reason, so a title truncates before the reason does. With `below_header` it hangs from the
+/// chat header's rule instead of the badge, clear of the header's status text.
+pub(super) fn attention_menu(s: &State, p: Palette, below_header: bool) -> El {
+    let (anchor, gap) = if below_header {
+        ("chat-header-rule", 4.0)
+    } else {
+        ("attention-row", 6.0)
+    };
     let mut menu = popover("attention-menu", "Needs you", s, p)
         .role("menu")
-        .w(280.0)
-        .anchored_fit("attention-row", rune::Side::Bottom, rune::Align::Start, 6.0)
+        .w((s.viewport_width - 16.0).min(ATTENTION_MENU_WIDTH))
+        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, gap)
         .modal(true, |s: &mut State| s.attention_menu = false);
     let (_, tertiary) = quiet_inks(p);
     for item in s.attention() {
@@ -983,14 +995,20 @@ pub(super) fn attention_menu(s: &State, p: Palette) -> El {
                         .min_w(0.0),
                 )
                 .child(spacer())
-                .child(pixel_text(
-                    attention_word(item.kind),
-                    if status == Status::Failed {
-                        p.danger
-                    } else {
-                        tertiary
-                    },
-                )),
+                .child(
+                    pixel_text(
+                        attention_word(item.kind),
+                        if status == Status::Failed {
+                            p.danger
+                        } else {
+                            tertiary
+                        },
+                    )
+                    .key(format!("attention-reason-{id}"))
+                    .w(ATTENTION_REASON_WIDTH)
+                    .min_w(ATTENTION_REASON_WIDTH)
+                    .align(rune::Align::End),
+                ),
         );
     }
     menu
@@ -1006,7 +1024,21 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
         .into_iter()
         .find(|item| item.kind == AttentionKind::Interrupted)
         .map(|item| item.thread_id);
-    let mut actions = row().gap(6.0).pl(CARD_INDENT);
+    // The text follows the live count of stopped tasks. The stored notice covers an unclean
+    // shutdown, where nothing is marked as stopped yet.
+    let stopped = s
+        .attention()
+        .iter()
+        .filter(|item| item.kind == AttentionKind::Interrupted)
+        .count();
+    let text = match stopped {
+        0 => notice.clone(),
+        1 => "1 task stopped when Shina closed. Review partial changes before resuming.".into(),
+        n => {
+            format!("{n} tasks stopped when Shina closed. Review partial changes before resuming.")
+        }
+    };
+    let mut actions = row().key("recovery-actions").gap(6.0).center_y();
     if let Some(id) = interrupted {
         actions = actions.child(solid_button(
             "review-recovery".into(),
@@ -1018,35 +1050,35 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
             },
         ));
     }
+    actions = actions.child(spacer()).child(icon_button(
+        "dismiss-recovery",
+        "Dismiss notice",
+        "close",
+        p,
+        |s| s.recovery_notice = None,
+    ));
     Some(
         col()
             .key("recovery-notice")
             .role("status")
-            .label(notice.clone())
+            .label(text.clone())
             .mb(6.0)
             .padding(10.0)
             .gap(8.0)
-            .radius(ROW_RADIUS)
+            .radius(4.0)
             .fill(p.card)
-            .border(1.0, hairline(p))
+            .border(1.0, p.frame)
             .transition(Transition::offset(0.0, -6.0).combined(Transition::opacity()))
             .child(
                 row()
                     .gap(8.0)
                     .child(el().pt(1.0).child(icon("alert", p.brass)))
                     .child(
-                        label(notice, SMALL.lh(17.0), p.ink)
+                        label(text, SMALL.lh(17.0), p.ink)
                             .wrap()
                             .grow(1.0)
                             .min_w(0.0),
-                    )
-                    .child(icon_button(
-                        "dismiss-recovery",
-                        "Dismiss notice",
-                        "close",
-                        p,
-                        |s| s.recovery_notice = None,
-                    )),
+                    ),
             )
             .child(actions),
     )
