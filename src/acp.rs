@@ -97,10 +97,22 @@ struct Permission {
     reject: Option<String>,
 }
 
+/// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
+fn supports_active_steering(meta: &Value) -> bool {
+    let advertisement = &meta["t3code/steering"];
+    advertisement["version"] == 1
+        && advertisement["idempotent"] == true
+        && advertisement["holdsPrompt"] == true
+}
+
 /// Protocol state is separate from process supervision so negotiation and reduction are testable.
 struct Client {
     start: Start,
     capabilities: Value,
+    active_steering: bool,
+    restart_steering: bool,
+    restart_prompt: Option<Value>,
+    turn_id: Option<String>,
     session: Option<String>,
     pending: HashMap<String, Pending>,
     permissions: HashMap<String, Permission>,
@@ -125,9 +137,14 @@ struct Client {
 impl Client {
     fn new(start: Start) -> Self {
         let awareness_sent = start.context_sent;
+        let restart_steering = !matches!(start.id.as_str(), "github-copilot-cli" | "copilot");
         Self {
             start,
             capabilities: Value::Null,
+            active_steering: false,
+            restart_steering,
+            restart_prompt: None,
+            turn_id: None,
             session: None,
             pending: HashMap::new(),
             permissions: HashMap::new(),
@@ -192,7 +209,14 @@ impl Client {
     }
 
     fn state(&self) -> Value {
-        json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":""})
+        json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":"",
+            "turnCapabilities":self.turn_capabilities()})
+    }
+
+    fn turn_capabilities(&self) -> crate::model::TurnCapabilities {
+        let mut capabilities = crate::model::TurnCapabilities::new(self.active_steering, false);
+        capabilities.supports_steering_by_interrupt_restart = self.restart_steering;
+        capabilities
     }
 
     fn history_value(&self) -> Value {
@@ -268,6 +292,31 @@ impl Client {
         };
         let request = pending.request;
         let kind = request["type"].as_str().unwrap_or("");
+        if kind == "steer" {
+            let original = &request["original"];
+            match record["result"]["status"].as_str() {
+                Some("accepted") if record["error"].is_null() => {
+                    self.reply(original, json!({}));
+                }
+                Some("turn_settled") if record["error"].is_null() => {
+                    self.events.push(json!({"type":"response","id":original["id"],"command":"prompt",
+                        "success":false,"queueInstead":true,"error":"The ACP turn settled before steering admission."}));
+                }
+                Some("rejected")
+                    if record["error"].is_null() && record["result"]["reason"].is_string() =>
+                {
+                    self.reject(
+                        original,
+                        format!(
+                            "ACP steering rejected. {}",
+                            record["result"]["reason"].as_str().unwrap()
+                        ),
+                    );
+                }
+                _ => self.uncertain_steer(original),
+            }
+            return Ok(());
+        }
         if !record["error"].is_null() {
             let error = &record["error"];
             if kind == "start"
@@ -314,6 +363,10 @@ impl Client {
                     return Err("This ACP agent did not negotiate protocol version 1. ACP v2 is not supported.".into());
                 }
                 self.capabilities = result["agentCapabilities"].clone();
+                self.active_steering = supports_active_steering(&result["_meta"]);
+                self.events
+                    .push(json!({"type":"harness_update","field":"turnCapabilities",
+                    "value":self.turn_capabilities()}));
                 let mut params =
                     json!({"cwd":self.start.workspace,"mcpServers":self.mcp_servers()?});
                 let method = match &self.start.source {
@@ -487,7 +540,8 @@ impl Client {
                 self.reply(&record, json!({}));
             }
             "clear_queue" => {
-                let queued: Vec<_> = self.queued.drain(..).filter_map(|record| record["message"].as_str().map(str::to_owned)).collect();
+                let queued: Vec<_> = self.restart_prompt.take().into_iter().chain(self.queued.drain(..))
+                    .filter_map(|record| record["message"].as_str().map(str::to_owned)).collect();
                 self.reply(&record, json!({"steering":[],"followUp":queued}));
                 self.queue_update();
             }
@@ -501,8 +555,16 @@ impl Client {
                 if !self.running { self.events.push(json!({"type":"agent_settled","aborted":true})); }
             }
             "prompt" if self.running => {
-                // ACP v1 has no steer API. Keep follow-up input until the prompt settles.
-                if self.queued.len() >= 32 {
+                if record["streamingBehavior"] == "steer" && self.active_steering && !self.cancelling {
+                    self.steer(record)?;
+                } else if record["streamingBehavior"] == "steer" && self.restart_steering && !self.cancelling {
+                    // KSG's interrupt_restart waits for cancellation before the next attempt.
+                    self.restart_prompt = Some(record.clone());
+                    self.cancelling = true;
+                    self.wire.push(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.session}}));
+                    self.reply(&record, json!({"disposition":"queued"}));
+                    self.queue_update();
+                } else if self.queued.len() >= 32 {
                     self.reject(&record, "ACP follow-up queue is full.");
                 } else {
                     self.queued.push_back(record.clone());
@@ -583,18 +645,64 @@ impl Client {
             json!({"type":"message_start","message":{"role":"user","content":history_content}}),
         );
         self.events.push(json!({"type":"agent_start"}));
-        self.request(
-            "session/prompt",
-            json!({"sessionId":self.session,"prompt":content}),
-            record.clone(),
-        );
+        let turn = uuid::Uuid::new_v4().to_string();
+        self.turn_id = Some(turn.clone());
+        let mut params = json!({"sessionId":self.session,"prompt":content});
+        if self.active_steering {
+            params["_meta"] = json!({"t3code/turnId":turn});
+        }
+        self.request("session/prompt", params, record.clone());
         // Like Pi, acknowledge dispatch immediately, not when the full run finishes.
         self.reply(&record, json!({}));
         Ok(())
     }
 
+    fn steer(&mut self, record: Value) -> Result<(), String> {
+        let Some(turn) = self.turn_id.clone() else {
+            self.reject(&record, "The ACP turn is no longer active.");
+            return Ok(());
+        };
+        let images = record["images"].as_array().cloned().unwrap_or_default();
+        if !images.is_empty() && self.capabilities["promptCapabilities"]["image"] != true {
+            self.reject(&record, "This ACP agent did not negotiate image input.");
+            return Ok(());
+        }
+        let mut prompt = vec![json!({"type":"text","text":record["message"]})];
+        let files: Vec<_> = record["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                crate::attachments::Attachment::from_value(value)
+                    .ok_or("Invalid ACP attachment reference.")
+            })
+            .collect::<Result<_, _>>()?;
+        prompt.extend(crate::attachments::acp_parts(
+            &files,
+            &self.capabilities["promptCapabilities"],
+        )?);
+        prompt.extend(images);
+        self.request(
+            "_t3/steer",
+            json!({"sessionId":self.session,"turnId":turn,
+            "messageId":record["id"],"prompt":prompt}),
+            json!({"type":"steer","original":record}),
+        );
+        Ok(())
+    }
+
+    fn uncertain_steer(&mut self, record: &Value) {
+        // No refusal guarantee: never queue or restore a possibly admitted message.
+        self.reply(record, json!({"deliveryUnknown":true}));
+        self.events.push(
+            json!({"type":"steer_delivery_unknown","text":record["message"],
+            "message":{"content":record["images"]},"attachments":record["attachments"]}),
+        );
+    }
+
     fn settle(&mut self, aborted: bool) {
         self.running = false;
+        self.turn_id = None;
         let aborted = aborted || self.cancelling;
         if aborted
             && let Some(message) = self
@@ -606,6 +714,14 @@ impl Client {
             message["stopReason"] = json!("aborted");
         }
         self.cancelling = false;
+        if let Some(record) = self.restart_prompt.take() {
+            self.events.push(json!({"type":"steering_restart"}));
+            self.queue_update();
+            if let Err(error) = self.prompt(record.clone()) {
+                self.reject(&record, error);
+            }
+            return;
+        }
         self.events
             .push(json!({"type":"agent_settled","aborted":aborted}));
         // Dispatch on the worker after all settlement events, before accepting newer input.
@@ -619,8 +735,9 @@ impl Client {
 
     fn queue_update(&mut self) {
         let texts: Vec<_> = self
-            .queued
+            .restart_prompt
             .iter()
+            .chain(self.queued.iter())
             .map(|record| record["message"].clone())
             .collect();
         self.events
@@ -1040,6 +1157,15 @@ fn run(
         let _ = write_result.send(result);
     });
     let mut client = Client::new(start);
+    let executable = command.get_program().to_string_lossy();
+    if executable.rsplit(['/', '\\']).next().is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "copilot" | "copilot.exe" | "copilot.cmd"
+        )
+    }) {
+        client.restart_steering = false;
+    }
     client.claude_skills = claude_skills;
     client.initialize();
     let result = (|| {
@@ -1127,6 +1253,19 @@ fn run(
         if !backend::publish(output, wake, Event::Record(record)) {
             break;
         }
+    }
+    let uncertain: Vec<_> = client
+        .pending
+        .values()
+        .filter(|pending| pending.request["type"] == "steer")
+        .map(|pending| pending.request["original"].clone())
+        .collect();
+    for record in uncertain {
+        client.uncertain_steer(&record);
+    }
+    for mut record in std::mem::take(&mut client.events) {
+        crate::attachments::import_history(&mut record);
+        backend::publish(output, wake, Event::Record(record));
     }
     drop(writes);
     drop(records);

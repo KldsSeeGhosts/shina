@@ -131,6 +131,7 @@ impl Attachment {
 pub struct Prompt {
     pub text: String,
     pub images: Arc<[Attachment]>,
+    pub draft: Option<crate::composer_rich::Snapshot>,
 }
 
 impl Prompt {
@@ -138,6 +139,7 @@ impl Prompt {
         Self {
             text,
             images: images.into(),
+            draft: None,
         }
     }
 }

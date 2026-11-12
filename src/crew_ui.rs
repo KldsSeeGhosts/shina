@@ -1007,10 +1007,18 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     };
     if let Some(remote) = s.remote_task(t.id) {
         who = col().gap(4.0).min_w(0.0).shrink().child(who).child(
-            label(format!("Runs on {}", remote.label), SMALL, p.muted)
-                .truncate()
-                .min_w(0.0)
-                .key("remote-result-machine"),
+            label(
+                format!(
+                    "Runs on {} · {}",
+                    remote.label,
+                    remote.project["name"].as_str().unwrap_or("Unknown project")
+                ),
+                SMALL,
+                p.muted,
+            )
+            .truncate()
+            .min_w(0.0)
+            .key("remote-result-machine"),
         );
     }
     let mut bar = row()

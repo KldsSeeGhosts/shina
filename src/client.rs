@@ -100,6 +100,10 @@ impl Client {
     pub(crate) fn test_snapshot(&self, projection: Value) {
         *self.snapshot.lock().expect("client snapshot") = Some(projection);
     }
+    #[cfg(test)]
+    pub(crate) fn test_receipt(&self, command: Command, value: Value) {
+        self.output.send(Event::Receipt(command, value)).unwrap();
+    }
 
     #[cfg(test)]
     pub fn test_connected(directory: PathBuf) -> (Self, tokio::sync::mpsc::Receiver<Command>) {
@@ -554,7 +558,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"]});
+                        let metadata = json!({"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -634,6 +638,22 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if matches!(command.method.as_str(), "queue.update" | "queue.returnDraft")
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_TRANSACTIONS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::COMPOSER_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.method == "thread.resume"
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::RUN_CONTROL))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::RUN_CONTROL_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 let prepared = match uploaded_command(&command,remote.as_ref()).await {
                     Ok(command) => command,
                     Err(error) => {
@@ -1041,7 +1061,9 @@ async fn uploaded_command(
     remote: Option<&crate::peer::Link>,
 ) -> Result<Command, String> {
     let mut prepared = command.clone();
-    let Some(remote) = remote.filter(|_| command.method == "thread.send") else {
+    let Some(remote) =
+        remote.filter(|_| matches!(command.method.as_str(), "thread.send" | "queue.update"))
+    else {
         return Ok(prepared);
     };
     let Some(attachments) = prepared.params["attachments"].as_array_mut() else {
@@ -1051,6 +1073,13 @@ async fn uploaded_command(
     let address = remote.address()?;
     let base = format!("http://{address}");
     for attachment in attachments {
+        if command.method == "queue.update"
+            && command.params["existingAttachmentIds"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&attachment["id"]))
+        {
+            continue;
+        }
         if !attachment["path"].is_null() {
             return Err("Local file paths cannot be sent to another machine. Attach an image or reference a path on that server in your message.".into());
         }

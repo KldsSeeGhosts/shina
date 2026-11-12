@@ -19,6 +19,7 @@ pub const SECTIONS: [&str; 7] = [
 pub struct Preferences {
     pub confirm_archive: bool,
     pub confirm_delete: bool,
+    pub send_shortcut: crate::composer::SendShortcut,
     pub dismissed_updates: Vec<String>,
 }
 impl Default for Preferences {
@@ -26,6 +27,7 @@ impl Default for Preferences {
         Self {
             confirm_archive: false,
             confirm_delete: true,
+            send_shortcut: Default::default(),
             dismissed_updates: vec![],
         }
     }
@@ -579,6 +581,41 @@ fn default_access(p: Palette, current: &str) -> El {
     group
 }
 
+fn send_shortcut_picker(s: &State, p: Palette) -> El {
+    let current = s.preferences.send_shortcut;
+    let mut group = row().gap(4.0).flex_wrap();
+    for option in crate::composer::SendShortcut::ALL {
+        let on = option == current;
+        let label_text = option.label();
+        let key_suffix = match option {
+            crate::composer::SendShortcut::Enter => "enter",
+            crate::composer::SendShortcut::ModEnterMultiline => "mod-enter-multiline",
+            crate::composer::SendShortcut::ModEnter => "mod-enter",
+        };
+        group = group.child(
+            row()
+                .key(format!("settings-send-shortcut-{key_suffix}"))
+                .role("radio")
+                .checked(on)
+                .label(&label_text)
+                .focusable(true)
+                .focus_highlight(p.selected)
+                .h(28.0)
+                .px(8.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if on { p.selected } else { Color::TRANSPARENT })
+                .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
+                .on_press(move |s: &mut State| {
+                    s.preferences.send_shortcut = option;
+                    s.checkpoint();
+                })
+                .child(label(&label_text, TextStyle::new(12.0, 500.0), p.ink)),
+        );
+    }
+    group
+}
+
 /// Ported from KSG SettingsSidebarNav and SettingsPanels. The modal size follows Shina's brief.
 pub(super) fn dialog(s: &State, p: Palette) -> El {
     let compact = s.viewport_width <= 620.0;
@@ -741,6 +778,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             "Keep working in the background",
             "Keep awake",
             "Theme",
+            "Send shortcut",
             "Confirm before archiving a thread",
             "Confirm before deleting a thread",
         ],
@@ -806,6 +844,15 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                         s.checkpoint();
                     },
                 ),
+                p,
+            );
+            pane = add(
+                pane,
+                s,
+                "settings-send-shortcut",
+                "Send shortcut",
+                "Choose when Enter sends a prompt or inserts a new line",
+                send_shortcut_picker(s, p),
                 p,
             );
             pane = add(
@@ -1492,6 +1539,28 @@ mod tests {
                     assert_eq!((card[2], card[3]), (620.0, 720.0));
                 }
             }
+            for key in [
+                "settings-send-shortcut",
+                "settings-send-shortcut-enter",
+                "settings-send-shortcut-mod-enter-multiline",
+                "settings-send-shortcut-mod-enter",
+            ] {
+                rt.state.settings.section = 0;
+                rt.state.settings.search.replace_text("");
+                rt.invalidate();
+                rt.frame(0.0);
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width} {key}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width} {key}: {rect:?}"
+                );
+            }
             rt.state.settings.search.replace_text("Theme");
             rt.invalidate();
             rt.frame(0.0);
@@ -1591,6 +1660,10 @@ mod tests {
         let preferences: Preferences = serde_json::from_value(json!({})).unwrap();
         assert!(preferences.confirm_delete);
         assert!(!preferences.confirm_archive);
+        assert_eq!(
+            preferences.send_shortcut,
+            crate::composer::SendShortcut::Enter
+        );
         let mut invalid = defaults;
         invalid.snooze_minutes = vec![0];
         assert!(invalid.validate().is_err());

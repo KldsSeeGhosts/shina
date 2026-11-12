@@ -1250,7 +1250,12 @@ fn stop_interrupts_native_compaction_and_recovers_queued_input() {
     thread.send_during_run();
     thread.stop();
     pump(&mut thread, |t| !t.status.busy() && !t.native.operating());
-    assert!(thread.draft.text.contains("Keep this queued prompt"));
+    assert!(thread.draft.text.is_empty());
+    assert!(thread.native.queue_held);
+    assert_eq!(
+        thread.native.queue[0].prompt.text,
+        "Keep this queued prompt"
+    );
     assert_eq!(thread.native.compactions.len(), 1);
     assert_eq!(thread.native.compactions[0]["aborted"], true);
     assert!(

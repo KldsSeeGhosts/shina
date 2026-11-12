@@ -53,6 +53,12 @@ pub struct Call {
     pub reply: tokio::sync::oneshot::Sender<Result<Value, String>>,
 }
 
+struct PreparingCall {
+    call: Call,
+    receiver: crate::model::Preparation,
+    caller: Option<(usize, Option<u64>)>,
+}
+
 pub struct RuntimeState {
     pub state: State,
     pub seq: u64,
@@ -64,6 +70,7 @@ pub struct RuntimeState {
     failure: Option<String>,
     pending_effects: Vec<crate::outbox::Effect>,
     committed_history: Vec<Value>,
+    preparing_calls: Vec<PreparingCall>,
 }
 
 impl RuntimeState {
@@ -124,7 +131,87 @@ impl RuntimeState {
             failure: None,
             pending_effects: Vec::new(),
             committed_history: Vec::new(),
+            preparing_calls: Vec::new(),
         }
+    }
+
+    /// A cold Git lookup never holds the serialized runtime. Authorization and
+    /// receipts are checked again when the unchanged original call resumes.
+    pub fn accept_call(&mut self, call: Call) {
+        let preparation = (|| {
+            if let Some(db) = &self.database {
+                db.authorize(&call.device, &call.command.method, &call.command.params)?;
+                if db.receipt(&call.device, call.command.command_id)?.is_some() {
+                    return Ok(None);
+                }
+            }
+            if self.maintenance.fenced() || self.validation_hold {
+                return Ok(None);
+            }
+            Ok::<_, String>(
+                self.state
+                    .prepare_peer_call(&call.command.method, &call.command.params),
+            )
+        })();
+        match preparation {
+            Ok(Some(receiver)) => {
+                let caller = (call.command.method == "task.delegate")
+                    .then(|| {
+                        call.command.params["threadId"].as_u64().map(|id| {
+                            let id = id as usize;
+                            (id, self.state.delegation_generation(id))
+                        })
+                    })
+                    .flatten();
+                self.preparing_calls.push(PreparingCall {
+                    call,
+                    receiver,
+                    caller,
+                });
+            }
+            Ok(None) => {
+                let result = if call.command.method == "command.get" {
+                    self.lookup_command(&call.device, &call.command.params)
+                } else {
+                    self.command(&call.device, call.command)
+                };
+                let _ = call.reply.send(result);
+            }
+            Err(error) => {
+                let _ = call.reply.send(Err(error));
+            }
+        }
+    }
+
+    pub fn poll_prepared_calls(&mut self) -> bool {
+        let mut changed = false;
+        for pending in std::mem::take(&mut self.preparing_calls) {
+            let result = match pending.receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.preparing_calls.push(pending);
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("Repository identity worker stopped.".into())
+                }
+            };
+            let PreparingCall { call, caller, .. } = pending;
+            if caller
+                .is_some_and(|(id, generation)| self.state.delegation_generation(id) != generation)
+            {
+                let _ = call.reply.send(Err("Delegation cancelled because the calling thread stopped during repository lookup.".into()));
+                changed = true;
+                continue;
+            }
+            if let Err(error) = self.state.finish_peer_preparation(result) {
+                let _ = call.reply.send(Err(error));
+            } else {
+                self.accept_call(call);
+            }
+            changed = true;
+        }
+        changed
     }
 
     pub fn command(&mut self, device: &str, command: Command) -> Result<Value, String> {
@@ -319,11 +406,12 @@ impl RuntimeState {
         Ok(())
     }
     pub fn tick(&mut self) -> bool {
+        let prepared_changed = self.poll_prepared_calls();
         if self.failure.is_none() && !self.maintenance.fenced() && !self.validation_hold {
             // Only the previous committed state may cause a remote effect.
             self.state.dispatch_peer_work();
         }
-        let update_changed = self.updates.poll(&self.state.data_dir);
+        let update_changed = self.updates.poll(&self.state.data_dir) | prepared_changed;
         if update_changed && let Err(error) = self.record_update() {
             self.failure = Some(error);
         }
@@ -374,16 +462,18 @@ impl RuntimeState {
                 self.state.storage_error = Some(error.clone());
                 self.failure = Some(error);
             }
-            return self.seq != previous_seq || before != self.maintenance.status();
+            return prepared_changed
+                || self.seq != previous_seq
+                || before != self.maintenance.status();
         }
         let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
             | self.state.collect_recovered_inputs();
         if !changed {
-            return before != self.maintenance.status();
+            return prepared_changed || before != self.maintenance.status();
         }
         let projection = self.state.projection();
         if projection == self.last_projection {
-            return before != self.maintenance.status();
+            return prepared_changed || before != self.maintenance.status();
         }
         self.last_projection = projection;
         self.seq += 1;

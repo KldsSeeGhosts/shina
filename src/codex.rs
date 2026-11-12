@@ -301,6 +301,7 @@ impl Client {
 
     fn state(&self) -> Value {
         json!({"sessionFile":self.session,"isStreaming":self.running,
+            "turnCapabilities":TURN_CAPABILITIES,
             "isCompacting":self.compacting || self.compact_request.is_some(),
             "model":self.model,"thinkingLevel":self.effort,"serviceTier":self.service_tier})
     }
@@ -1104,7 +1105,6 @@ impl Client {
             "prompt" if self.running => {
                 // KSG uses turn/steer with expectedTurnId. Follow-ups retain FIFO ordering.
                 if record["streamingBehavior"] == "steer"
-                    && !self.compacting
                     && self.compact_request.is_none()
                     && let Some(turn) = &self.turn
                 {
@@ -2361,3 +2361,5 @@ fn tool_content(item: &Value) -> Value {
         .unwrap_or_else(|| item.to_string());
     json!([{"type":"text","text":output}])
 }
+pub const TURN_CAPABILITIES: crate::model::TurnCapabilities =
+    crate::model::TurnCapabilities::new(true, true);

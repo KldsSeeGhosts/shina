@@ -82,8 +82,11 @@ target.harness is present. Omit model to use that harness's configured default. 
 default when no choice is pinned. Fields you give override the inherited ones. Shina checks the exact model id and reasoning \
 level before starting the child, and rejects an unknown or unsupported choice. It never silently \
 substitutes a model or clamps a level.
-- Use target.machine only when the work must run on a linked server, and choose its id, host or label from orchestrator_capabilities.peers. \
-For remote work, workspace is a project id or path on that server; omit it only when the caller's git remote matches exactly one project there. \
+- Use target.environmentId for work on a linked server, from orchestrator_capabilities.peers[].serverId. \
+target.machine is an alias accepting its id, host or label. Read peers[].capabilities.projects before choosing \
+target.projectId, an id on that machine explicitly included in the captain's scope. \
+workspace remains an alias for a target-owned id or opaque path. Do not translate paths between machines. \
+Omit the explicit project only when the caller's Git origin matches exactly one project there. \
 Choose the peer's advertised harness and model, and reuse client_request_id with identical arguments when retrying an uncertain launch. \
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
 status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
@@ -239,7 +242,9 @@ pub fn tools() -> Value {
         "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
         "properties":{
             "harness":{"type":"string","description":"pi, codex, claude, or an installed ACP id. Defaults to the parent's harness."},
-            "machine":{"type":"string","description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work. A machine-only target runs there with the inherited model and harness."},
+            "machine":{"type":"string","minLength":1,"description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work. A machine-only target runs there with the inherited model and harness."},
+            "environmentId":{"type":"string","minLength":1,"description":"Owning linked server id from orchestrator_capabilities.peers. Alias of machine. Use capabilities.projects to list its projects."},
+            "projectId":{"type":"integer","minimum":1,"description":"Project id on the named machine. Must be explicitly in the captain's remote scope. Omit for automatic, unique Git origin matching. Paths are opaque target-owned strings."},
             "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{
@@ -252,7 +257,11 @@ pub fn tools() -> Value {
                 "additionalProperties":false
             }
         },
-        "anyOf":[{"required":["model"]},{"required":["harness"]},{"required":["machine"]}],
+        "anyOf":[{"required":["model"]},{"required":["harness"]},{"required":["machine"]},{"required":["environmentId"]}],
+        "allOf":[{"if":{"required":["projectId"]},"then":{"anyOf":[
+            {"required":["environmentId"],"properties":{"environmentId":{"not":{"const":"local"}}}},
+            {"required":["machine"],"properties":{"machine":{"not":{"const":"local"}}}}
+        ]}}],
         "additionalProperties":false
     });
     let mut tools = json!([
@@ -280,7 +289,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "orchestrator_capabilities",
-            "description": "Read Shina's delegation capabilities: harnesses, discovered model ids and reasoning levels, default and caller selections, and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
+            "description": "Read Shina's delegation capabilities: harnesses, discovered model ids and reasoning levels, default and caller selections, and host limits. peers[].capabilities.projects lists each linked machine's projects with target-owned ids and paths. Choose target.environmentId and target.projectId from that list and the caller's scope. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
             "inputSchema": {"type":"object","properties":{}},
             "annotations": {"readOnlyHint": true}
         },
@@ -324,16 +333,16 @@ pub fn tools() -> Value {
         },
         {
             "name": "delegate_task",
-            "description": "Delegate independent work to a new child with a complete brief and no parent history. Optionally pass target from orchestrator_capabilities; omit it to inherit the caller's selection. Unknown ids or levels are rejected before a child starts and are never silently substituted or clamped. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
+            "description": "Delegate independent work to a new child with a complete brief and no parent history. For a linked machine, discover projects in orchestrator_capabilities.peers[].capabilities.projects, then pass target.environmentId and target.projectId from the captain's scope. Omit projectId for a unique Git origin match. Optionally pass target from orchestrator_capabilities; omit it to inherit the caller's selection. Unknown ids or levels are rejected before a child starts and are never silently substituted or clamped. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
                 "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
-                "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Project id or path in the caller's scope. Required with several scoped workspaces; rejected outside scope."},
+                "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Local project id or path in the caller's scope. Required with several local scoped workspaces. For remote work this is a legacy alias for an explicitly scoped target-owned id or opaque path; prefer target.projectId."},
                 "target": target,
                 "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable retry key for remote delegation. Reuse it with the identical brief and target after an uncertain response."},
                 "wait_seconds": wait
-            },"required":["prompt"]}
+            },"required":["prompt"],"allOf":[{"not":{"required":["workspace","target"],"properties":{"target":{"required":["projectId"]}}}}]}
         },
         {
             "name": "task_status",
@@ -1031,7 +1040,7 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
         assert_eq!(target["additionalProperties"], false);
         assert_eq!(
             target["anyOf"],
-            json!([{"required":["model"]},{"required":["harness"]},{"required":["machine"]}])
+            json!([{"required":["model"]},{"required":["harness"]},{"required":["machine"]},{"required":["environmentId"]}])
         );
         assert!(target["properties"]["harness"].is_object());
         let options = &target["properties"]["options"];
@@ -1109,6 +1118,7 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
                 "options": {"thinking": "medium"}
             }),
             json!({"machine": "mac-studio"}),
+            json!({"environmentId": "mac-studio", "projectId": 9}),
             json!({
                 "machine": "mac-studio",
                 "harness": "pi",

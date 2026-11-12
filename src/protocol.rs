@@ -3,7 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 7;
+pub const MINOR: u32 = 9;
+pub const RUN_CONTROL: &str = "run-control";
+pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to stop or resume a specific run.";
+pub const COMPOSER_TRANSACTIONS: &str = "composer-transactions";
+pub const COMPOSER_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to edit queued messages.";
 pub const HISTORY_ITEMS: &str = "history-items";
 pub const HISTORY_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use scoped history and live items.";
@@ -13,6 +19,7 @@ pub const HISTORY_LEASE_GONE_CODE: i64 = -32010;
 pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
 pub const PEER_TASKS: &str = "peer-tasks-v2";
 pub const THREAD_READ: &str = "thread-read-v2";
+pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
 pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
@@ -70,6 +77,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         }
         "thread.send"
         | "thread.stop"
+        | "thread.resume"
         | "thread.configure"
         | "thread.retry"
         | "thread.visit"
@@ -90,6 +98,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "queue.remove"
         | "queue.sendNow"
         | "queue.edit"
+        | "queue.update"
+        | "queue.returnDraft"
         | "input.claim"
         | "project.put"
         | "project.remove"
@@ -120,7 +130,7 @@ pub const MAX_CONTROL: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
-pub const HISTORY_FIELDS: [&str; 13] = [
+pub const HISTORY_FIELDS: [&str; 14] = [
     "messages",
     "tools",
     "thoughts",
@@ -131,6 +141,7 @@ pub const HISTORY_FIELDS: [&str; 13] = [
     "commands",
     "models",
     "queue",
+    "queue_drafts",
     "steering",
     "follow_ups",
     "stats",
@@ -307,6 +318,8 @@ pub struct SendInput {
     pub mode: SendMode,
     #[serde(default)]
     pub editor_revision: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub draft: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -315,6 +328,8 @@ pub enum SendMode {
     Prompt,
     Steer,
     Queue,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]

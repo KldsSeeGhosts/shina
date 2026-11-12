@@ -916,10 +916,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 (Some(pane), Some(lane)) => pane - lane >= CAPTAIN_HERO_HEIGHT,
                 _ => true,
             };
-            main.child(empty_thread(s, p, narrow, wide, main_width, hero_fits))
+            main.child(empty_thread(
+                s,
+                p,
+                narrow,
+                wide,
+                main_width,
+                hero_fits,
+                composer_caret_edges(cx, zoom),
+            ))
         } else {
             main.child(conversation(s, p, wide, main_width))
-                .child(composer(s, p, narrow, wide, main_width))
+                .child(composer(
+                    s,
+                    p,
+                    narrow,
+                    wide,
+                    main_width,
+                    composer_caret_edges(cx, zoom),
+                ))
         };
         body = body.child(main);
         context_popover_shown = true;
@@ -5633,7 +5648,8 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
         .client
         .as_ref()
         .is_some_and(|client| !client.linked.is_empty());
-    let across = mode == ProjectPicker::Scope || mode == ProjectPicker::NewThread && multiple;
+    let across = matches!(mode, ProjectPicker::Scope | ProjectPicker::CaptainScope)
+        || mode == ProjectPicker::NewThread && multiple;
     if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
@@ -5643,11 +5659,33 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             choices.push((
                 PickerChoice::Project(id),
                 project.name.clone(),
-                (across && s.client.is_some()).then(|| s.machine_label(&s.machines.selected)),
+                (across && (s.client.is_some() || mode == ProjectPicker::CaptainScope))
+                    .then(|| s.machine_label(&s.machines.selected)),
             ));
         }
     }
-    if across && s.client.is_some() {
+    if mode == ProjectPicker::CaptainScope {
+        for peer in &s.peers {
+            for project in peer.capabilities["projects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if project["hidden"] == true {
+                    continue;
+                }
+                if let (Some(id), Some(name)) = (project["id"].as_u64(), project["name"].as_str()) {
+                    let choice = PickerChoice::MachineProject(peer.server_id.clone(), id as usize);
+                    if !choices.iter().any(|(existing, _, _)| *existing == choice) {
+                        choices.push((choice, name.into(), Some(peer.label.clone())));
+                    }
+                }
+            }
+        }
+    }
+    // Scope is authorized by the captain owner's peer links, not this desktop's
+    // device links. Their ids can differ, especially when its owner is remote.
+    if across && s.client.is_some() && mode != ProjectPicker::CaptainScope {
         for (server, view) in &s.machines.views {
             if server == &s.machines.selected {
                 continue;
@@ -5674,6 +5712,12 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
                 }
             }
         }
+    }
+    if mode == ProjectPicker::CaptainScope {
+        choices.sort_by_key(|(choice, _, _)| match choice {
+            PickerChoice::MachineProject(server, _) => (true, server.clone()),
+            _ => (false, String::new()),
+        });
     }
     if mode == ProjectPicker::NewThread && multiple {
         choices.retain(|(choice, _, _)| match choice {
@@ -5737,7 +5781,9 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         PickerChoice::NoProject => None,
         PickerChoice::Project(id) => Some(id),
         PickerChoice::MachineProject(server, id) => {
-            if mode == ProjectPicker::Scope {
+            if mode == ProjectPicker::CaptainScope {
+                captain_ui::toggle_remote_scope(s, server, id);
+            } else if mode == ProjectPicker::Scope {
                 s.set_machine_scope(server, Some(id), shift);
             } else if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
                 s.select_machine(&server);
@@ -5769,7 +5815,9 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
     }
 }
 
-/// Ported from KSG Code's CommandPalette: a centred modal that starts with a
+/// Ported from KSG Code's CommandPalette and CommandPaletteLookups project/environment
+/// grouping. Captain scope membership is Shina-specific.
+/// A centred modal that starts with a
 /// search field and moves with the arrow keys. Enter picks the highlighted row; Shift adds a
 /// workspace to the filter.
 fn project_picker(s: &State, p: Palette) -> El {
@@ -5868,7 +5916,9 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
-        if mode == ProjectPicker::NewThread && machine != &last_machine {
+        if matches!(mode, ProjectPicker::NewThread | ProjectPicker::CaptainScope)
+            && machine != &last_machine
+        {
             if let Some(machine) = machine {
                 list = list.child(
                     label(machine, SMALL, p.muted)
@@ -5888,6 +5938,13 @@ fn project_picker(s: &State, p: Palette) -> El {
                     projects
                         .iter()
                         .find(|project| project["id"].as_u64() == Some(*id as u64))
+                })
+                .or_else(|| {
+                    s.peers
+                        .iter()
+                        .find(|p| &p.server_id == server)
+                        .and_then(|p| p.capabilities["projects"].as_array())
+                        .and_then(|ps| ps.iter().find(|p| p["id"].as_u64() == Some(*id as u64)))
                 })
                 .and_then(|project| crate::projects::Project::from_record(project, false))
         } else {
@@ -5913,6 +5970,9 @@ fn project_picker(s: &State, p: Palette) -> El {
         let checked = match (mode, choice) {
             (ProjectPicker::CaptainScope, PickerChoice::Project(id)) => {
                 captain_ui::in_scope(s, *id)
+            }
+            (ProjectPicker::CaptainScope, PickerChoice::MachineProject(server, id)) => {
+                captain_ui::remote_in_scope(s, server, *id)
             }
             (ProjectPicker::Scope, PickerChoice::All) => s.project_scope == ProjectScope::All,
             (ProjectPicker::Scope, PickerChoice::NoProject) => {
@@ -7555,6 +7615,7 @@ fn empty_thread(
     wide: bool,
     pane_width: f32,
     hero_fits: bool,
+    caret_edges: Option<[bool; 2]>,
 ) -> El {
     // A captain's hero keeps its height above a tall crew tray and takes the room from the
     // space below the composer. In a window too short for both, the composer stays on screen
@@ -7581,7 +7642,7 @@ fn empty_thread(
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, narrow, wide, pane_width))
+        .child(composer(s, p, narrow, wide, pane_width, caret_edges))
         .child(below)
 }
 
@@ -8321,6 +8382,8 @@ fn context_popover(s: &State, p: Palette) -> El {
 /// the messages above it, with `pb-4` under the footer.
 /// The composer field's height with its 4 pt padding: one line at rest, so the body is 48 pt.
 const COMPOSER_FIELD_MIN: f32 = 36.0;
+/// The composer text field's own padding, inside `composer-input`.
+const COMPOSER_FIELD_PAD: f32 = 4.0;
 /// KSG's `max-h-52`: a 200 pt text window inside the 4 pt padding, then the field scrolls.
 const COMPOSER_FIELD_MAX: f32 = 208.0;
 /// A composer that cannot send: demo data, an archived thread or an unreachable machine.
@@ -8338,7 +8401,37 @@ fn composer_frame(s: &State, p: Palette) -> Color {
         p.frame
     }
 }
-fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
+/// Whether the composer's caret is on its first and last visual line, `[first, last]`, or
+/// `None` before the field has drawn a caret. Ported from KSG Code's `isCaretOnVisualEdge` in
+/// `ComposerPromptEditorTiptap.tsx`: the caret line is on an edge when it is within half its
+/// height of that edge of the text. Prompt history uses it, so Up and Down move through a
+/// wrapped line before they recall a prompt.
+fn composer_caret_edges(cx: &Cx<State>, zoom: f32) -> Option<[bool; 2]> {
+    // The caret is in window points and layout reads are in the zoomed view's points.
+    let caret = cx.caret("composer-input")?.map(|v| v / zoom);
+    // Only the field's top and height matter, so a sideways move does not re-run the view.
+    let [top, height] = cx.window_layout_with("composer-input", |r| [r[1], r[3]])?;
+    let half = caret[3] / 2.0;
+    let first = caret[1] - (top + COMPOSER_FIELD_PAD) < half;
+    // A field at its minimum height holds one line with spare room under it, so its bottom
+    // edge is not the text's. Taller than that, the field ends where its text does.
+    let last = if height <= COMPOSER_FIELD_MIN + 0.5 {
+        first
+    } else {
+        top + height - COMPOSER_FIELD_PAD - (caret[1] + caret[3]) < half
+    };
+    Some([first, last])
+}
+
+/// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
+fn composer(
+    s: &State,
+    p: Palette,
+    narrow: bool,
+    wide: bool,
+    pane_width: f32,
+    caret_edges: Option<[bool; 2]>,
+) -> El {
     let t = s.current();
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
@@ -8389,33 +8482,47 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 .selectable(true),
         );
     }
-    if t.native.questionnaire.is_some() && t.request.is_some() {
+    let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
+    if t.native.questionnaire.is_some() && request_visible {
         return area.child(pi_ui::questionnaire_drawer(s, p));
     }
-    if t.request.is_some() {
+    if request_visible {
         area = area.child(dialog(s, p));
     }
+    let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
-        && !t.initializing
+        && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
         && !t.configuring
-        && t.request.is_none()
-        && !t.native.operating()
-        && t.phase != "Stopping"
-        && t.has_draft_content();
+        && !request_visible
+        && (!t.native.operating() || t.queued_edit.is_some())
+        && (t.phase != "Stopping" || t.queued_edit.is_some())
+        && !t.queued_edit_saving()
+        && !t.resume_pending()
+        && (t.has_draft_content() || show_resume);
     let mut send = el()
         .key("send-message")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(if t.status.busy() {
-            if t.native.follow_up {
+        .label(if t.resume_pending() {
+            "Resuming thread"
+        } else if show_resume {
+            "Resume thread"
+        } else if t.queued_edit.is_some() {
+            if t.queued_edit_saving() {
+                "Updating queued message"
+            } else {
+                "Update queued message"
+            }
+        } else if t.status.busy() {
+            if t.follow_up_queues() {
                 "Queue message"
             } else {
                 "Steer message"
             }
         } else {
-            "Send message"
+            "Submit message"
         })
         .size(32.0, 32.0)
         .radius(4.0)
@@ -8423,12 +8530,25 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         // A framed key. Rune cannot move it on press, so a pressed key darkens instead.
         .press(if can_send { p.coral.alpha(0.8) } else { p.line })
         .fill(if can_send { p.coral } else { p.line })
-        .child(icon("send", if can_send { p.on_coral } else { p.muted }))
+        .child(icon(
+            if show_resume {
+                "play"
+            } else if t.queued_edit.is_some() {
+                "check"
+            } else {
+                "send"
+            },
+            if can_send { p.on_coral } else { p.muted },
+        ))
         .disabled(!can_send);
     if can_send {
         send = framed(send, p);
     }
-    if can_send {
+    if can_send && show_resume {
+        send = send
+            .focusable(true)
+            .on_press(|s: &mut State| s.resume_thread());
+    } else if can_send {
         send = send.focusable(true).on_press_tx(|s: &mut State, tx| {
             let previous = s.current().native.follow_up;
             if tx.mods().cmd || tx.mods().ctrl {
@@ -8438,13 +8558,22 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             s.current_mut().native.follow_up = previous;
         });
     }
-    let action = if t.status.busy() && !s.demo && !t.has_draft_content() {
-        framed(
+    let mut action = row().gap(8.0).center_y();
+    if !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+        action = action.child(send);
+    }
+    if !s.demo && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some()) {
+        action = action.child(framed(
             el().key("stop-agent")
                 .role("button")
                 .cursor(rune::Cursor::Pointer)
-                .label("Stop agent")
+                .label(t.stop_control.label())
                 .focusable(true)
+                .disabled(
+                    t.stop_control.disabled()
+                        || !t.turn_capabilities().supports_interrupt
+                        || s.client.is_some() && !s.machine_connected(&s.machines.selected),
+                )
                 .size(32.0, 32.0)
                 .radius(4.0)
                 .center()
@@ -8453,13 +8582,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 .on_press(|s: &mut State| s.current_mut().stop())
                 .child(icon("stop", p.on_coral)),
             p,
-        )
-    } else {
-        send
-    };
+        ));
+    }
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
-    let attach_locked =
-        s.demo || t.archived() || t.configuring || t.native.operating() || t.request.is_some();
+    let attach_locked = s.demo
+        || t.archived()
+        || t.configuring
+        || t.native.operating() && t.queued_edit.is_none()
+        || t.request.is_some();
     // Delegation context sits above the composer, nearest first: who sent this worker, then
     // what the crew needs from the user, then what it is doing.
     let lane = lane_width(pane_width, wide);
@@ -8554,13 +8684,13 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .caret(p.coral, p.coral_bg)
         .w_full()
         .min_h(COMPOSER_FIELD_MIN)
-        .padding(4.0)
+        .padding(COMPOSER_FIELD_PAD)
         .on_edit(|s: &mut State| {
             s.current_mut().native.slash_index = 0;
             &mut s.current_mut().draft
         })
-        .on_input_key(|s: &mut State, event, tx| {
-            if pi_ui::composer_pi_key(s, event) {
+        .on_input_key(move |s: &mut State, event, tx| {
+            if pi_ui::composer_pi_key(s, event, tx, caret_edges) {
                 composer_menu::scroll_selected(s, tx);
                 return true;
             }
@@ -8589,8 +8719,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             t.composer_rules.key(&mut t.draft, event)
         })
         .on_input_change(|s: &mut State, _| {
+            composer_menu::clear_dismissed_if_changed(s);
             let t = s.current_mut();
             t.composer_rules.changed(&mut t.draft);
+            t.typing_guard.on_type(std::time::Instant::now());
+            t.update_submission_error();
             s.ensure_composer_commands();
         })
         .on_input_paste(|s: &mut State, content, _| {
@@ -8650,23 +8783,35 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         )
         .child(spacer())
         .child(model_effort_trigger(s, p, narrow, locked));
-    if t.status.busy() && t.has_draft_content() {
-        actions = actions
-            .child(button(
+    if t.status.busy() && t.has_draft_content() && t.queued_edit.is_none() {
+        actions = actions.child(
+            button(
                 "dispatch-mode",
-                if t.native.follow_up { "Queue" } else { "Steer" },
+                if t.follow_up_queues() {
+                    "Queue"
+                } else {
+                    "Steer"
+                },
                 p,
                 |s| {
                     let n = &mut s.current_mut().native;
                     n.follow_up = !n.follow_up;
                 },
-            ))
-            .child(icon_button("stop-agent", "Stop agent", "stop", p, |s| {
-                s.current_mut().stop()
-            }));
+            )
+            .disabled(!t.can_steer()),
+        );
     }
     if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
+    }
+    if let Some(error) = &t.submission_error {
+        card = card.child(
+            col()
+                .key("composer-prompt-length-error")
+                .px(16.0)
+                .pb(8.0)
+                .child(label(error, SMALL, p.danger).wrap().selectable(true)),
+        );
     }
     area = area.child(card.child(actions.child(action.ml(4.0))));
     // KSG Code's context strip: a bare muted row under the card, machine on the left and the
@@ -9473,6 +9618,41 @@ pub(crate) mod tests {
                         "use the host path without joining on the client"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn captain_scope_picker_groups_remote_projects_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            connected_machines(&mut rt);
+            let server = uuid::Uuid::new_v4().to_string();
+            rt.state.peers.push(crate::peer::Peer {
+                server_id:server.clone(),host:"127.0.0.1:1".into(),label:"Studio".into(),
+                linked_at:0,last_reached_at:Some(0),last_error:None,
+                capabilities:json!({"projects":[{"id":1,"name":"Remote project","path":"C:\\project","machine":"local"}]}),
+            });
+            rt.state.open_picker(ProjectPicker::CaptainScope);
+            let choices = picker_choices(&rt.state, ProjectPicker::CaptainScope);
+            assert!(choices.iter().any(|(choice, _, _)|
+                matches!(choice, PickerChoice::MachineProject(owner, _) if owner == &server)));
+            assert!(!choices.iter().any(|(choice, _, _)|
+                matches!(choice, PickerChoice::MachineProject(owner, _) if owner == "studio")),
+                "desktop device links do not grant delegation on the captain owner's server");
+            rt.frame(0.0);
+            for key in [
+                "project-picker",
+                "picker-machine-0",
+                &format!("choose-project-{server}-1"),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {key} {rect:?}"
+                );
             }
         }
     }
@@ -11051,6 +11231,157 @@ pub(crate) mod tests {
                 assert!(
                     r[0] >= 0.0 && r[0] + r[2] <= width + 1.0,
                     "{width} {key} {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_send_rich_draft_and_later_edits_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.draft.replace_text("Submitted bold text");
+            t.draft.set_selection(0, 9);
+            t.draft.toggle_mark(rune::Mark::Bold);
+            t.send();
+            t.draft.replace_text("Later edits");
+            t.disconnect();
+            assert_eq!(
+                crate::composer_rich::markdown(&t.draft),
+                "**Submitted** bold text\n\nLater edits"
+            );
+            rt.frame(0.0);
+            let (rect, _) = rt.presented("composer").unwrap();
+            assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0);
+        }
+    }
+
+    #[test]
+    fn queued_edit_controls_save_cancel_and_shortcuts_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, _, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.status = Status::Running;
+            t.native.follow_up = true;
+            t.draft.replace_text("Queued original");
+            t.send_during_run();
+            let id = t.native.queue[0].id;
+            t.draft.replace_text("Ordinary draft");
+            t.draft.set_caret(0);
+            assert!(pi_ui::composer_pi_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Up,
+                    mods: rune::Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                },
+                &rune::Tx::default(),
+                None
+            ));
+            assert_eq!(rt.state.current().draft.text, "Queued original");
+            rt.frame(0.0);
+            for key in [
+                "composer",
+                "queued-messages",
+                "send-message",
+                &format!("queue-edit-{id}"),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0);
+            }
+            rt.state.current_mut().draft.replace_text("Edited queued");
+            rt.state.send();
+            assert_eq!(
+                rt.state.current().native.queue[0].prompt.text,
+                "Edited queued"
+            );
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
+            rt.state.current_mut().edit_queued(id);
+            rt.state.current_mut().draft.replace_text("Cancel me");
+            rt.state.current_mut().cancel_queued_edit();
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
+            assert!(pi_ui::composer_pi_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Enter,
+                    mods: rune::Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                },
+                &rune::Tx::default(),
+                None
+            ));
+            assert!(rt.state.current().native.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn capability_labels_stop_target_and_resume_fit_at_supported_widths() {
+        use std::time::{Duration, Instant};
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, _commands, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.harness = "fixture-acp".into();
+            t.status = Status::Running;
+            t.run_id = Some("run-a".into());
+            t.draft.replace_text("Follow-up");
+            rt.frame(0.0);
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Queue message")
+            );
+            rt.state.current_mut().stop();
+            rt.invalidate();
+            rt.frame(0.0);
+            let (stop_rect, _) = rt.presented("stop-agent").unwrap();
+            assert!(rt.accessibility_json().to_string().contains("Stopping"));
+            rt.state.current_mut().draft.replace_text("Still typing");
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(rt.presented("stop-agent").unwrap().0[0], stop_rect[0]);
+            rt.state.current_mut().draft.replace_text("");
+            rt.state
+                .current_mut()
+                .tick_stop(Instant::now() + Duration::from_secs(10));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Stop generation"),
+                "phase {:?}, status {:?}, error {:?}, tree {}",
+                rt.state.current().stop_control.phase(),
+                rt.state.current().status,
+                rt.state.current().error,
+                rt.accessibility_json()
+            );
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"agent_settled","aborted":true}));
+            rt.state.current_mut().tick_stop(Instant::now());
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json().to_string();
+            assert!(tree.contains("Resume thread"), "{width}: {tree}");
+            assert!(tree.contains("Stopped"));
+            for key in ["composer", "send-message", "stop-agent"] {
+                let (rect, _) = rt.presented(key).unwrap();
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{width} {key} {rect:?}"
                 );
             }
         }
@@ -15691,5 +16022,199 @@ pub(crate) mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submission_policy_and_prompt_limit_work_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+
+            // Under ModEnter, plain Enter inserts a newline instead of sending.
+            rt.state.preferences.send_shortcut = crate::composer::SendShortcut::ModEnter;
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "hello\n");
+            assert!(rt.state.current().messages.is_empty());
+
+            // Key-repeat Enter under Enter policy does not submit.
+            rt.state.preferences.send_shortcut = crate::composer::SendShortcut::Enter;
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.repeat_key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "hello");
+            assert!(rt.state.current().messages.is_empty());
+
+            // Oversized prompt blocks send and displays the limit error within the viewport.
+            let oversized = "x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1);
+            rt.state.current_mut().draft.replace_text(&oversized);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.current().messages.is_empty());
+            assert_eq!(
+                rt.state.current().submission_error.as_deref(),
+                Some(
+                    "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending."
+                )
+            );
+            let (rect, _) = rt
+                .presented("composer-prompt-length-error")
+                .unwrap_or_else(|| panic!("{width}: composer-prompt-length-error"));
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                "{width}: {rect:?}"
+            );
+            assert!(
+                rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                "{width}: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_history_follows_the_carets_visual_line_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // An older short prompt, then one that wraps over several lines with no newline.
+            let long = "wrapped ".repeat(60).trim_end().to_string();
+            rt.state.current_mut().messages = ["short", long.as_str()]
+                .into_iter()
+                .map(|text| crate::model::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "You",
+                    text: text.into(),
+                    images: Vec::new(),
+                })
+                .collect();
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            let mut time = 0.0;
+            let mut tap = |rt: &mut Runtime<State>, key: rune::Key| {
+                rt.key(rune::KeyEvent {
+                    key,
+                    mods: Default::default(),
+                });
+                // The caret's place reaches the view the frame after it is drawn.
+                for _ in 0..3 {
+                    time += 0.1;
+                    rt.frame(time);
+                }
+            };
+
+            tap(&mut rt, rune::Key::Up);
+            assert_eq!(rt.state.current().draft.text, long, "{width}: recall");
+            let (field, _) = rt.presented("composer-input").expect("composer input");
+            let lines = ((field[3] - 2.0 * COMPOSER_FIELD_PAD) / 23.0).round() as usize;
+            assert!(lines >= 2, "{width}: the prompt wraps, {field:?}");
+
+            // The caret starts on the last line. Up climbs the wrapped lines first, and only
+            // from the first line recalls the older prompt.
+            let mut presses = 0;
+            while rt.state.current().draft.text == long && presses < 40 {
+                tap(&mut rt, rune::Key::Up);
+                presses += 1;
+            }
+            assert_eq!(rt.state.current().draft.text, "short", "{width}: older");
+            assert_eq!(presses, lines, "{width}: one press a line, then the recall");
+
+            // Down from a one-line prompt goes forward, then leaves history from the last line.
+            tap(&mut rt, rune::Key::Down);
+            assert_eq!(rt.state.current().draft.text, long, "{width}: forward");
+            tap(&mut rt, rune::Key::Down);
+            assert_eq!(rt.state.current().draft.text, "", "{width}: leaves history");
+        }
+    }
+
+    #[test]
+    fn typing_guard_hides_arriving_request_while_typing_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("a".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+
+            rt.state.current_mut().apply(json!({
+                "type": "extension_ui_request",
+                "id": "guard-req",
+                "method": "confirm",
+                "title": "Allow?",
+                "message": "Run tool?"
+            }));
+            rt.frame(0.0);
+            assert!(rt.find("dialog-confirm").is_none());
+
+            // Blurring the composer immediately releases the held request.
+            rt.state.current_mut().draft.focused = false;
+            rt.state.current_mut().typing_guard.on_blur_or_send();
+            rt.invalidate();
+            rt.frame(0.0);
+            let (rect, _) = rt
+                .presented("dialog-confirm")
+                .unwrap_or_else(|| panic!("{width}: dialog-confirm"));
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                "{width}: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_menu_escape_dismissal_persists_until_trigger_changes_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("/mo".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            let (menu_rect, _) = rt
+                .presented("composer-menu")
+                .unwrap_or_else(|| panic!("{width}: composer-menu"));
+            assert!(
+                menu_rect[0] >= 0.0 && menu_rect[0] + menu_rect[2] <= width + 0.5,
+                "{width}: {menu_rect:?}"
+            );
+
+            // Escape dismisses the menu for this trigger identity.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.find("composer-menu").is_none());
+
+            // Typing further into the same trigger keeps it dismissed.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("d".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.find("composer-menu").is_none());
+
+            // A new trigger at a new range_start re-opens the menu.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text(" /mo".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.presented("composer-menu").is_some());
+        }
     }
 }

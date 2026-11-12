@@ -241,6 +241,277 @@ pub struct PeerOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_delegation_waits_for_a_cold_identity_without_blocking_the_reducer() {
+        let mut state = fixture();
+        let path = state.data_dir.join("cold");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/team/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        state.projects.entries[0] = Project::new(1, path);
+        let (reply, receive) = mpsc::channel();
+        let started = Instant::now();
+        state.mcp_request(crate::mcp::Request {
+            thread:1, tool:"delegate_task".into(),
+            args:json!({"prompt":"Cold automatic match","target":{"machine":"Target","model":"fixture"}}),
+            reply,
+        });
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            state.poll_remote_tasks();
+            if let Ok(result) = receive.try_recv() {
+                break result;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            state.tasks.last().unwrap().remote.as_ref().unwrap().project["id"],
+            9
+        );
+    }
+
+    #[test]
+    fn automatic_retry_keeps_the_already_selected_project_without_another_lookup() {
+        let mut state = fixture();
+        let args = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .launch_command
+            .params["request"]
+            .clone();
+        let path = state.data_dir.join("origin-no-longer-readable");
+        state.projects.entries[0].path = path.clone();
+        let (reply, receive) = mpsc::channel();
+        state.mcp_request(crate::mcp::Request {
+            thread: 1,
+            tool: "delegate_task".into(),
+            args,
+            reply,
+        });
+        let result = receive.try_recv().unwrap().unwrap();
+        assert_eq!(result["project"]["id"], 9);
+        assert_eq!(state.tasks.len(), 1);
+        assert!(!repository_cache().lock().unwrap().contains_key(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_identity_timeout_names_the_project_and_owning_machine() {
+        let mut state = fixture();
+        let path = state.data_dir.join("slow-project");
+        state.projects.entries[0] = Project::new(1, path.clone());
+        let lookup = Arc::new(RepositoryLookup::default());
+        repository_cache()
+            .lock()
+            .unwrap()
+            .insert(path, (lookup.clone(), Instant::now()));
+        std::thread::spawn(move || {
+            let result =
+                read_repository_command(std::process::Command::new("sh").args(["-c", "sleep 10"]));
+            lookup.finish(result);
+        });
+        let (reply, receive) = mpsc::channel();
+        state.mcp_request(crate::mcp::Request {
+            thread:1, tool:"delegate_task".into(),
+            args:json!({"prompt":"Bounded automatic match","target":{"machine":"Target","model":"fixture"}}),
+            reply,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            state.poll_remote_tasks();
+            if let Ok(result) = receive.try_recv() {
+                break result.unwrap_err();
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            error.contains("slow-project")
+                && error.contains(&crate::server::machine_label())
+                && error.contains("timed out")
+                && !error.contains("retry"),
+            "{error}"
+        );
+        assert_eq!(
+            state.tasks.len(),
+            1,
+            "no child was created for the failed lookup"
+        );
+    }
+
+    #[test]
+    fn cold_automatic_commands_and_peer_discovery_resume_the_original_call() {
+        for (method, cancel) in [
+            ("task.delegate", false),
+            ("peer.capabilities", false),
+            ("task.delegate", true),
+        ] {
+            let mut state = fixture();
+            state.demo = false;
+            state.load_global_for_test();
+            assert!(state.storage_error.is_none(), "{:?}", state.storage_error);
+            let path = state.data_dir.join("cold-command");
+            state.projects.entries[0] = Project::new(1, path.clone());
+            let lookup = Arc::new(RepositoryLookup::default());
+            repository_cache()
+                .lock()
+                .unwrap()
+                .insert(path, (lookup.clone(), Instant::now()));
+            let mut runtime = crate::runtime::RuntimeState::from_state(state);
+            let database = crate::database::Database::open(&runtime.state.data_dir).unwrap();
+            if method == "peer.capabilities" {
+                database
+                    .issue_scoped_device("fixture", "fixture-token", &["read", "peer-delegate"])
+                    .unwrap();
+            } else {
+                database.issue_device("fixture", "fixture-token").unwrap();
+            }
+            database.issue_device("observer", "observer-token").unwrap();
+            for peer in &runtime.state.peers {
+                database.put_peer(peer).unwrap();
+            }
+            runtime.database = Some(database);
+            let params = if method == "task.delegate" {
+                json!({"threadId":1,"args":{"prompt":"One cold automatic call",
+                    "target":{"machine":"Target","model":"fixture"}}})
+            } else {
+                json!({})
+            };
+            let (reply, mut response) = tokio::sync::oneshot::channel();
+            let started = Instant::now();
+            runtime.accept_call(crate::runtime::Call {
+                device: "fixture".into(),
+                command: Command::new(method, params),
+                reply,
+            });
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(response.try_recv().is_err(), "the cold call stays pending");
+            assert!(
+                runtime
+                    .command("observer", Command::new("server.status", json!({})))
+                    .is_ok(),
+                "other reducer commands remain available"
+            );
+            if cancel {
+                runtime.state.threads[0].stop_serial += 1;
+            }
+            lookup.finish(Ok(Some("example.com/team/repo".into())));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = loop {
+                let changed = runtime.tick();
+                if let Ok(result) = response.try_recv() {
+                    assert!(
+                        changed,
+                        "the resumed command must publish its committed snapshot"
+                    );
+                    break result;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if cancel {
+                assert!(result.unwrap_err().contains("cancelled"));
+                assert_eq!(runtime.state.tasks.len(), 1);
+                continue;
+            }
+            let result = result.unwrap();
+            assert_eq!(result["status"], "accepted", "{result}");
+            if method == "task.delegate" {
+                assert_eq!(result["result"]["project"]["id"], 9);
+            } else {
+                assert_eq!(result["result"]["repositoryIdentitiesReady"], true);
+                assert_eq!(
+                    result["result"]["projects"][0]["gitRemote"],
+                    "example.com/team/repo"
+                );
+            }
+        }
+    }
+    #[test]
+    fn an_explicit_project_cannot_use_git_identity_as_scope_authorization() {
+        let mut state = fixture();
+        let error = state.mcp_call(1, "delegate_task", &json!({
+            "prompt":"Do not bypass scope with a matching origin",
+            "target":{"environmentId":state.peers[0].server_id,"projectId":9,"model":"fixture"}
+        })).unwrap_err();
+        assert!(
+            error.contains("Project")
+                && error.contains("Target")
+                && error.contains("outside the caller's scope"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_remote_scope_does_not_require_a_local_repository() {
+        let mut state = fixture();
+        state.tasks.clear();
+        state.threads.truncate(1);
+        state.captains = Captain::presets();
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.threads[0].project = None;
+        state.set_captain_scope(0, vec![]).unwrap();
+        let server = state.peers[0].server_id.clone();
+        state
+            .set_remote_captain_scope(
+                0,
+                vec![RemoteProject {
+                    server: server.clone(),
+                    project_id: 9,
+                }],
+            )
+            .unwrap();
+        state.peers[0].capabilities["projects"][0]["gitRemote"] = Value::Null;
+        let result = state.mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Remote-only workspace",
+                "target":{"environmentId":server,"projectId":9,"model":"fixture"}
+            }),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let denied = state.mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Outside scope",
+                "target":{"environmentId":server,"projectId":99,"model":"fixture"}
+            }),
+        );
+        assert!(denied.is_err());
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        assert_eq!(
+            restored.remote_captain_scope(0),
+            state.remote_captain_scope(0)
+        );
+    }
     fn fixture() -> State {
         let directory =
             std::env::temp_dir().join(format!("shina-peer-model-{}", uuid::Uuid::new_v4()));
@@ -276,6 +547,11 @@ mod tests {
                 .success()
         );
         state.projects.entries.push(Project::new(1, workspace));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while repository(&state.projects.entries[0].path).is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         state.projects.next_id = 2;
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
@@ -284,7 +560,7 @@ mod tests {
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
         });
-        let args = json!({"prompt":"A bounded brief","workspace":9,"client_request_id":"stable",
+        let args = json!({"prompt":"A bounded brief","client_request_id":"stable",
             "target":{"machine":"Target","model":"fixture","options":{"reasoning":"off"}}});
         state.mcp_call(1, "delegate_task", &args).unwrap();
         assert_eq!(
@@ -548,7 +824,7 @@ mod tests {
     fn remote_tasks_share_the_existing_capacity_limits() {
         let mut state = fixture();
         for number in 1..8 {
-            state.mcp_call(1,"delegate_task",&json!({"prompt":"A bounded brief","workspace":9,
+            state.mcp_call(1,"delegate_task",&json!({"prompt":"A bounded brief",
                 "client_request_id":format!("task-{number}"),"target":{"machine":"Target","model":"fixture"}})).unwrap();
         }
         assert_eq!(
@@ -567,7 +843,7 @@ mod tests {
                 .count(),
             5
         );
-        assert!(state.mcp_call(1,"delegate_task",&json!({"prompt":"One too many","workspace":9,"target":{"machine":"Target","model":"fixture"}})).unwrap_err().contains("8 unfinished"));
+        assert!(state.mcp_call(1,"delegate_task",&json!({"prompt":"One too many","target":{"machine":"Target","model":"fixture"}})).unwrap_err().contains("8 unfinished"));
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -886,6 +1162,7 @@ pub struct RemoteTask {
 
 #[derive(Default)]
 pub(super) struct PeerRuntime {
+    preparing_mcp: Vec<(crate::mcp::Request, Preparation, Option<u64>)>,
     pending: HashMap<String, (String, mpsc::Receiver<Result<Value, String>>)>,
     probe: Option<mpsc::Receiver<Vec<crate::peer::Peer>>>,
     next_probe: u64,
@@ -893,29 +1170,149 @@ pub(super) struct PeerRuntime {
     followers: HashMap<String, tokio::sync::oneshot::Sender<()>>,
 }
 
+pub(crate) type Preparation = mpsc::Receiver<Result<Option<crate::peer::Peer>, String>>;
+type Identity = Result<Option<String>, String>;
+#[derive(Default)]
+struct RepositoryLookup {
+    result: std::sync::Mutex<Option<Identity>>,
+    ready: std::sync::Condvar,
+}
+impl RepositoryLookup {
+    fn finish(&self, result: Identity) {
+        *self.result.lock().expect("repository lookup") = Some(result);
+        self.ready.notify_all();
+    }
+    fn wait(&self) -> Identity {
+        self.wait_until(Instant::now() + Duration::from_secs(4))
+    }
+    fn wait_until(&self, deadline: Instant) -> Identity {
+        let (mut result, _) = self
+            .ready
+            .wait_timeout_while(
+                self.result.lock().expect("repository lookup"),
+                deadline.saturating_duration_since(Instant::now()),
+                |result| result.is_none(),
+            )
+            .expect("repository lookup");
+        let result = result
+            .get_or_insert_with(|| Err("Git identity lookup timed out.".into()))
+            .clone();
+        self.ready.notify_all();
+        result
+    }
+}
+type RepositoryCache = std::sync::Mutex<HashMap<PathBuf, (Arc<RepositoryLookup>, Instant)>>;
+fn repository_cache() -> &'static RepositoryCache {
+    static CACHE: std::sync::OnceLock<RepositoryCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+fn repository_lookup(path: &std::path::Path) -> Arc<RepositoryLookup> {
+    let mut cache = repository_cache().lock().expect("repository cache");
+    if let Some((lookup, at)) = cache.get(path)
+        && at.elapsed() < Duration::from_secs(60)
+    {
+        return lookup.clone();
+    }
+    // Refresh a known result in place. A TTL boundary must not turn a resolved
+    // identity back into a cold miss between preparation and command execution.
+    let lookup = cache
+        .get(path)
+        .map(|(lookup, _)| lookup.clone())
+        .unwrap_or_else(|| Arc::new(RepositoryLookup::default()));
+    cache.insert(path.to_owned(), (lookup.clone(), Instant::now()));
+    let worker = lookup.clone();
+    let path = path.to_owned();
+    std::thread::spawn(move || worker.finish(read_repository(&path)));
+    lookup
+}
+fn repository_result(path: &std::path::Path) -> Option<Identity> {
+    repository_lookup(path)
+        .result
+        .lock()
+        .expect("repository lookup")
+        .clone()
+}
+
+pub fn warm_repository_records(projects: &Value) {
+    for project in projects.as_array().into_iter().flatten() {
+        if project["machine"] == "local"
+            && let Some(path) = project["path"].as_str()
+        {
+            repository_lookup(std::path::Path::new(path));
+        }
+    }
+}
 pub fn retry_delay(attempt: u32) -> u64 {
     2_000u64.saturating_mul(1u64 << attempt.min(8)).min(300_000)
 }
 
-/// Canonical repository identity, never a path translation or checkout synchronization.
+/// KSG RepositoryIdentityResolver's one-minute cache. Reducers only read the cache;
+/// bounded git processes run on a worker, including cold and negative lookups.
 pub(super) fn repository(path: &std::path::Path) -> Option<String> {
-    let output = crate::process::output(
-        std::process::Command::new("git").arg("-C").arg(path).args([
-            "config",
-            "--get",
-            "remote.origin.url",
-        ]),
-        Duration::from_secs(2),
-        8192,
+    repository_entry(path).0
+}
+
+fn repository_entry(path: &std::path::Path) -> (Option<String>, bool) {
+    let result = repository_result(path);
+    (
+        result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .cloned()
+            .flatten(),
+        result.is_some(),
     )
-    .ok()?;
-    output
+}
+
+fn read_repository(path: &std::path::Path) -> Identity {
+    read_repository_command(std::process::Command::new("git").arg("-C").arg(path).args([
+        "config",
+        "--get",
+        "remote.origin.url",
+    ]))
+}
+
+fn read_repository_command(command: &mut std::process::Command) -> Identity {
+    let output =
+        crate::process::output(command, Duration::from_secs(2), 8192).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "Git identity lookup timed out.".into()
+            } else {
+                format!("Git identity lookup failed: {error}")
+            }
+        })?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(format!(
+            "Git identity lookup failed with exit status {}.",
+            output.status
+        ));
+    }
+    Ok(output
         .status
         .success()
         .then(|| canonical_remote(String::from_utf8_lossy(&output.stdout).trim()))
-        .flatten()
+        .flatten())
 }
 
+pub(super) fn target_machine(args: &Value) -> Result<Option<&str>, String> {
+    let target = &args["target"];
+    let read = |key: &str| {
+        target
+            .get(key)
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("target.{key} must name a linked machine."))
+            })
+            .transpose()
+    };
+    let environment = read("environmentId")?;
+    let machine = read("machine")?;
+    if environment.is_some() && machine.is_some() && environment != machine {
+        return Err("target.environmentId and target.machine disagree. Pass one.".into());
+    }
+    Ok(environment.or(machine))
+}
 fn canonical_remote(remote: &str) -> Option<String> {
     let remote = remote.trim();
     let (host, path) = if remote.contains("://") {
@@ -955,6 +1352,7 @@ pub(super) fn match_project(
         .ok_or("Peer projects are unavailable.")?;
     let matches: Vec<_> = projects
         .iter()
+        .filter(|p| p["hidden"] != true)
         .filter(|p| match workspace {
             Some(Value::Number(id)) => p["id"].as_number() == Some(id),
             Some(Value::String(name)) => {
@@ -969,14 +1367,243 @@ pub(super) fn match_project(
         .collect();
     if matches.len() != 1 {
         return Err(format!(
-            "No single target project matches. Pass workspace as an id or path on that machine. Projects: {}",
-            serde_json::to_string(projects).expect("projects")
+            "{} Pass target.projectId on the named machine. Projects: {}",
+            if matches.is_empty() {
+                "No target project matches this repository."
+            } else {
+                "Several projects there have this repository. Choose an explicit project."
+            },
+            serde_json::to_string(&if matches.is_empty() {
+                projects.clone()
+            } else {
+                matches.into_iter().cloned().collect()
+            })
+            .expect("projects")
         ));
     }
     Ok(matches[0].clone())
 }
 
 impl State {
+    /// KSG resolves a cold identity as part of the same call. Only immutable
+    /// inputs leave the reducer; the original request resumes after resolution.
+    pub(crate) fn prepare_peer_call(&self, method: &str, args: &Value) -> Option<Preparation> {
+        if method == "task.delegate" {
+            return self
+                .prepare_remote_delegation(args["threadId"].as_u64()? as usize, &args["args"]);
+        }
+        if method != "peer.capabilities" {
+            return None;
+        }
+        let lookups: Vec<_> = self
+            .projects
+            .entries
+            .iter()
+            .filter(|p| !p.hidden)
+            .map(|p| repository_lookup(&p.path))
+            .collect();
+        if lookups
+            .iter()
+            .all(|l| l.result.lock().expect("repository lookup").is_some())
+        {
+            return None;
+        }
+        let (send, receive) = mpsc::channel();
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            // Discovery lists projects whose Git probe failed. Automatic matching
+            // reports that project's contextual error; explicit ids still work.
+            let deadline = Instant::now() + Duration::from_secs(4);
+            for lookup in lookups {
+                let _ = lookup.wait_until(deadline);
+            }
+            let _ = send.send(Ok(None));
+            wake();
+        });
+        Some(receive)
+    }
+
+    pub(super) fn prepare_remote_delegation(
+        &self,
+        caller: usize,
+        args: &Value,
+    ) -> Option<Preparation> {
+        let thread = self.threads.iter().find(|t| t.id == caller)?;
+        if args["client_request_id"].as_str().is_some_and(|key| {
+            self.tasks.iter().any(|task| {
+                task.parent_thread_id == caller
+                    && task
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.client_request_id.as_deref() == Some(key))
+            })
+        }) {
+            // delegate_remote checks the original brief/target before replaying.
+            // Its recorded project must not depend on a later identity lookup.
+            return None;
+        }
+        if thread.delegated
+            || args.get("workspace").is_some()
+            || args["target"].get("projectId").is_some()
+            || parse_delegation_target(args).is_err()
+        {
+            return None;
+        }
+        let machine = target_machine(args).ok()??;
+        if machine == "local" {
+            return None;
+        }
+        let source = self.project(thread.project)?.clone();
+        let lookup = repository_lookup(&source.path);
+        if matches!(
+            &*lookup.result.lock().expect("repository lookup"),
+            Some(Ok(None) | Err(_))
+        ) {
+            return None;
+        }
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .and_then(|db| db.peers().ok())
+            .unwrap_or_else(|| self.peers.clone());
+        let matches: Vec<_> = peers
+            .into_iter()
+            .filter(|p| {
+                p.server_id == machine || p.host == machine || p.label.eq_ignore_ascii_case(machine)
+            })
+            .collect();
+        if matches.len() != 1 {
+            return None;
+        }
+        let mut peer = matches.into_iter().next().expect("one peer");
+        if peer
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("Authentication denied"))
+        {
+            return None;
+        }
+        if lookup.result.lock().expect("repository lookup").is_some()
+            && peer.capabilities["repositoryIdentitiesReady"] != false
+        {
+            return None;
+        }
+        let profile = self.data_dir.clone();
+        let wake = self.wake.clone();
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let identity = lookup.wait().map_err(|error| {
+                    format!(
+                        "Repository identity for project {} on {} failed: {error}",
+                        source.name,
+                        crate::server::machine_label()
+                    )
+                })?;
+                if identity.is_none() {
+                    return Ok(None);
+                }
+                if peer.capabilities["repositoryIdentitiesReady"] == false {
+                    let link = peer.credential(&profile)?;
+                    let deadline = Instant::now() + Duration::from_secs(6);
+                    loop {
+                        let response = peer_runtime().block_on(async {
+                            tokio::time::timeout(
+                                deadline.saturating_duration_since(Instant::now()),
+                                crate::client::remote_rpc(&link, "peer.capabilities", json!({})),
+                            )
+                            .await
+                            .map_err(|_| "Repository identity lookup timed out.".to_string())?
+                        });
+                        let receipt = match response {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                if error.starts_with("Authentication denied") {
+                                    peer.last_error = Some(error.clone());
+                                    if let Some(db) =
+                                        crate::database::for_path(&profile.join("index.json"))
+                                    {
+                                        let _ = db.update_peer_status(&peer);
+                                    }
+                                }
+                                return Err(format!(
+                                    "Repository matching for project {} on {} failed: {error}",
+                                    source.name, peer.label
+                                ));
+                            }
+                        };
+                        if receipt["status"] != "accepted" {
+                            return Err(format!(
+                                "Project discovery on {} failed: {}",
+                                peer.label, receipt["result"]
+                            ));
+                        }
+                        peer.capabilities = receipt["result"].clone();
+                        peer.last_reached_at = Some(lifecycle::now());
+                        peer.last_error = None;
+                        if peer.capabilities["repositoryIdentitiesReady"] != false {
+                            break;
+                        }
+                        // Prior builds return a cold cache immediately. Wait internally
+                        // within this bounded call, never asking the model to retry.
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "Repository identity lookup for project {} on {} timed out.",
+                                source.name, peer.label
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    if let Some(db) = crate::database::for_path(&profile.join("index.json")) {
+                        db.update_peer_status(&peer)?;
+                    }
+                    return Ok(Some(peer));
+                }
+                Ok(None)
+            })();
+            let _ = send.send(result);
+            wake();
+        });
+        Some(receive)
+    }
+
+    pub(crate) fn finish_peer_preparation(
+        &mut self,
+        result: Result<Option<crate::peer::Peer>, String>,
+    ) -> Result<(), String> {
+        if let Some(peer) = result?
+            && let Some(existing) = self
+                .peers
+                .iter_mut()
+                .find(|p| p.server_id == peer.server_id)
+        {
+            *existing = peer;
+        }
+        Ok(())
+    }
+
+    pub(super) fn defer_remote_mcp(
+        &mut self,
+        request: crate::mcp::Request,
+        preparation: Preparation,
+    ) {
+        let generation = self.delegation_generation(request.thread);
+        self.peer_runtime
+            .preparing_mcp
+            .push((request, preparation, generation));
+    }
+
+    pub(crate) fn delegation_generation(&self, caller: usize) -> Option<u64> {
+        self.threads
+            .iter()
+            .find(|t| t.id == caller)
+            .map(|t| t.stop_serial)
+    }
+    pub(crate) fn warm_repository_identities(&self) {
+        for project in &self.projects.entries {
+            if project.machine == "local" {
+                repository_lookup(&project.path);
+            }
+        }
+    }
     /// KSG OrchestratorMcpService.listThreads: project-scoped listing, title
     /// filtering and bounded numeric cursor paging, including linked reads.
     pub(super) fn readable_threads(
@@ -1244,10 +1871,7 @@ impl State {
         {
             return Err("Open the captain's primary home to delegate new work. This is an earlier conversation.".into());
         }
-        let machine = args["target"]["machine"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("target.machine must name a linked server.")?;
+        let machine = target_machine(args)?.ok_or("target.machine must name a linked server.")?;
         let request = args
             .get("client_request_id")
             .map(|v| {
@@ -1291,18 +1915,64 @@ impl State {
             );
         }
         let peer = matches[0];
+        if let Some(error) = peer
+            .last_error
+            .as_deref()
+            .filter(|e| e.starts_with("Authentication denied"))
+        {
+            return Err(format!(
+                "{}: {error} Link this machine again in Settings before delegating.",
+                peer.label
+            ));
+        }
         let prompt = args["prompt"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty() && s.len() <= 48 * 1024)
             .ok_or("prompt must contain a brief of at most 48 KiB.")?;
-        let source = self.project(self.threads[caller].project);
-        let remote = source.and_then(|p| repository(&p.path));
-        let project = match_project(
-            &peer.capabilities["projects"],
-            args.get("workspace"),
-            remote.as_deref(),
-        )?;
+        let explicit = args["target"]
+            .get("projectId")
+            .or_else(|| args.get("workspace"));
+        let remote = if explicit.is_none() {
+            let source = self.project(self.threads[caller].project).ok_or(
+                "Pass target.projectId: this thread has no project repository to match there.",
+            )?;
+            let identity = repository_result(&source.path)
+                .unwrap_or_else(|| {
+                    Err("Git identity lookup did not complete within its deadline.".into())
+                })
+                .map_err(|error| {
+                    format!(
+                        "Repository identity for project {} on {} failed: {error}",
+                        source.name,
+                        crate::server::machine_label()
+                    )
+                })?;
+            if identity.is_none() {
+                return Err(format!(
+                    "Project {} on {} has no Git origin to match. Pass target.projectId from the captain's scope.",
+                    source.name,
+                    crate::server::machine_label()
+                ));
+            }
+            if let Some(project) = peer.capabilities["projects"]
+                .as_array()
+                .and_then(|ps| ps.iter().find(|p| p["repositoryError"].is_string()))
+            {
+                return Err(format!(
+                    "Repository identity for project {} on {} failed: {}",
+                    project["name"].as_str().unwrap_or("Unknown"),
+                    peer.label,
+                    project["repositoryError"]
+                        .as_str()
+                        .unwrap_or("Unknown lookup error")
+                ));
+            }
+            identity
+        } else {
+            None
+        };
+        let project = match_project(&peer.capabilities["projects"], explicit, remote.as_deref())?;
         let scope = if self.threads[caller].captain_home {
             self.threads[caller]
                 .captain
@@ -1311,15 +1981,26 @@ impl State {
         } else {
             self.threads[caller].project.into_iter().collect()
         };
-        if !project["gitRemote"].as_str().is_some_and(|remote| {
-            scope
-                .into_iter()
-                .filter_map(|id| self.project(Some(id)))
-                .any(|project| repository(&project.path).as_deref() == Some(remote))
-        }) {
+        let explicitly_scoped = self.threads[caller]
+            .captain
+            .filter(|_| self.threads[caller].captain_home)
+            .is_some_and(|id| {
+                self.remote_captain_scope(id).iter().any(|entry| {
+                    entry.server == peer.server_id
+                        && project["id"].as_u64() == Some(entry.project_id as u64)
+                })
+            });
+        let automatic_scope = explicit.is_none()
+            && self.threads[caller]
+                .project
+                .is_some_and(|id| scope.contains(&id))
+            && project["gitRemote"].as_str() == remote.as_deref();
+        if !explicitly_scoped && !automatic_scope {
             return Err(format!(
-                "The remote workspace is outside the caller's scope. It must have the git remote of a scoped home workspace. Projects: {}",
-                peer.capabilities["projects"]
+                "Project {} ({}) on {} is outside the caller's scope. Add it to the captain's scope before delegating.",
+                project["name"].as_str().unwrap_or("Unknown"),
+                project["id"],
+                peer.label
             ));
         }
         let target = parse_delegation_target(args)?;
@@ -1490,9 +2171,19 @@ impl State {
                     .map(|p| {
                         let mut value = p.to_value();
                         value["gitRemote"] = json!(repository(&p.path));
+                        if let Some(Err(error)) = repository_result(&p.path) {
+                            value["repositoryError"] = json!(error);
+                        }
                         value
                     })
                     .collect::<Vec<_>>()
+            );
+            capabilities["repositoryIdentitiesReady"] = json!(
+                self.projects
+                    .entries
+                    .iter()
+                    .filter(|p| !p.hidden)
+                    .all(|p| repository_entry(&p.path).1)
             );
             return Ok(capabilities);
         }
@@ -1774,6 +2465,11 @@ impl State {
         if !self.headless {
             return;
         }
+        for project in &self.projects.entries {
+            if project.machine == "local" {
+                repository(&project.path);
+            }
+        }
         let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) else {
             return;
         };
@@ -1926,6 +2622,33 @@ impl State {
 
     pub(super) fn poll_remote_tasks(&mut self) -> bool {
         let mut changed = self.capture_peer_results();
+        let pending = std::mem::take(&mut self.peer_runtime.preparing_mcp);
+        for (request, receiver, generation) in pending {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.peer_runtime
+                        .preparing_mcp
+                        .push((request, receiver, generation));
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("Repository identity worker stopped.".into())
+                }
+            };
+            let result = if self.delegation_generation(request.thread) != generation {
+                Err("Delegation cancelled because the calling thread stopped during repository lookup.".into())
+            } else {
+                self.finish_peer_preparation(result)
+            };
+            match result {
+                Ok(()) => self.mcp_request(request),
+                Err(error) => {
+                    let _ = request.reply.send(Err(error));
+                }
+            }
+            changed = true;
+        }
         if self.headless && lifecycle::now() >= self.peer_runtime.next_metadata_at {
             self.peer_runtime.next_metadata_at = lifecycle::now() + 1_000;
             if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json"))

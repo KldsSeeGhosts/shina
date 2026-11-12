@@ -595,6 +595,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         history_items = minor >= 7;
                         if history_items { capabilities.push(protocol::HISTORY_ITEMS); }
                         if minor >= 7 { capabilities.extend([protocol::PEER_TASKS, protocol::THREAD_READ]); }
+                        if minor >= 8 { capabilities.push(protocol::REMOTE_PROJECT_SCOPE); }
+                        if minor >= 8 { capabilities.push(protocol::COMPOSER_TRANSACTIONS); }
+                        if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -651,6 +654,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     if shared.remote { Err("Create pairing codes on the host.".into()) }
                     else { shared.pairing.lock().expect("pairing").create_scoped(crate::lifecycle::now(), params.get("args").unwrap_or(params)["peer"] == true) }
                 } else if matches!(method, "peer.link" | "peer.list" | "peer.unlink") {
+                    if method == "peer.link" {
+                        crate::model::warm_repository_records(&snapshots.borrow()["state"]["index"]["projects"]);
+                    }
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
                     let dispatch=if method=="peer.list" {Ok(None)} else {
@@ -973,19 +979,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
             let Ok(call) = incoming.try_recv() else {
                 break;
             };
-            let result = if !runtime
-                .database
-                .as_ref()
-                .expect("durable runtime")
-                .device_active(&call.device)?
-            {
-                Err("Authentication denied. This device was revoked.".into())
-            } else if call.command.method == "command.get" {
-                runtime.lookup_command(&call.device, &call.command.params)
-            } else {
-                runtime.command(&call.device, call.command)
-            };
-            let _ = call.reply.send(result);
+            runtime.accept_call(call);
             changed = true;
             if runtime.state.runtime_stop_requested {
                 stop.send_replace(true);
@@ -1134,12 +1128,7 @@ mod tests {
                 crate::store::with_directory(profile, || {
                     while !stopping.load(Ordering::Acquire) {
                         if let Ok(call) = incoming.try_recv() {
-                            let result = if call.command.method == "command.get" {
-                                runtime.lookup_command(&call.device, &call.command.params)
-                            } else {
-                                runtime.command(&call.device, call.command)
-                            };
-                            let _ = call.reply.send(result);
+                            runtime.accept_call(call);
                             let snapshot = Arc::new(runtime.snapshot());
                             worker_streams
                                 .lock()
@@ -1149,6 +1138,15 @@ mod tests {
                             snapshots.send_replace(snapshot);
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
+                        }
+                        if runtime.poll_prepared_calls() {
+                            let snapshot = Arc::new(runtime.snapshot());
+                            worker_streams
+                                .lock()
+                                .expect("history streams")
+                                .ingest(runtime.take_committed_history())
+                                .unwrap();
+                            snapshots.send_replace(snapshot);
                         }
                     }
                     runtime.shutdown().unwrap();
@@ -1335,7 +1333,9 @@ mod tests {
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;
-            let mut target=Fixture::new("peer-target").await;
+            // The project scope lives on the current home. Launch remains compatible
+            // with the prior peer contract; no new permission is sent to the target.
+            let mut target=Fixture::with_minor("peer-target", 7).await;
             let user=target.link(&target.shared.directory.join("client")).await;
             let workspace=target.shared.directory.join("workspace");
             std::fs::create_dir_all(&workspace).unwrap();

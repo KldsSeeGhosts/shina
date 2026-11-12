@@ -162,7 +162,15 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         )
                         .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
                             s.current_mut().respond(json!({"cancelled":true}))
-                        })),
+                        }))
+                        .child(if t.status.busy() || t.stop_control.phase().is_some() {
+                            icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
+                                s.current_mut().stop();
+                            })
+                            .disabled(t.stop_control.disabled())
+                        } else {
+                            el()
+                        }),
                 ),
         )
 }
@@ -206,34 +214,120 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
     list
 }
 
-pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+/// `caret_edges` says whether the caret is on the field's first and last visual line, from
+/// `composer_caret_edges`; `None` falls back to the text's own line breaks.
+pub(super) fn composer_pi_key(
+    s: &mut State,
+    event: &rune::KeyEvent,
+    tx: &rune::Tx,
+    caret_edges: Option<[bool; 2]>,
+) -> bool {
+    if composer_queue_key(s, event) {
+        return true;
+    }
     if s.undo_key(event, true) {
         return true;
     }
     if composer_menu::key(s, event) {
         return true;
     }
-    if event.key == rune::Key::Enter && (event.mods.ctrl || event.mods.cmd) {
-        let previous = s.current().native.follow_up;
-        s.current_mut().native.follow_up = !previous;
-        s.send();
-        s.current_mut().native.follow_up = previous;
+    let is_running = s.current().status.busy();
+    let is_composing = s.current().draft.is_composing();
+    let send_shortcut = s.preferences.send_shortcut;
+    let prompt_text = s.current().draft.text.clone();
+    if let Some(intent) = crate::composer::submission_intent_for_key(
+        event,
+        tx.key_repeat(),
+        is_composing,
+        is_running,
+        send_shortcut,
+        &prompt_text,
+    ) {
+        if !s.demo && !s.current().archived() {
+            let previous = s.current().native.follow_up;
+            if intent == crate::composer::SubmissionIntent::Alternate {
+                s.current_mut().native.follow_up = !previous;
+            }
+            s.send();
+            s.current_mut().native.follow_up = previous;
+        }
+        return true;
+    }
+    if event.key == rune::Key::Enter && !is_composing && !event.mods.alt {
+        if tx.key_repeat() {
+            return true;
+        }
+        let newline_event = rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                shift: true,
+                ..Default::default()
+            },
+        };
+        let t = s.current_mut();
+        if !t.composer_rules.key(&mut t.draft, &newline_event) {
+            t.draft.key(&newline_event, None);
+            t.composer_rules.changed(&mut t.draft);
+            t.update_submission_error();
+        }
         return true;
     }
     let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();
-    let entries: Vec<_> = t
-        .messages
-        .iter()
-        .filter(|m| m.role == "You")
-        .map(|m| m.text.as_str())
-        .collect();
-    if t.prompt_history
-        .navigate(&mut t.draft, &entries, event, menu_open)
-    {
+    let entries = crate::composer::build_history_entries(&t.messages);
+    let has_attachments = !t.draft_images.is_empty();
+    let has_pending_request = t.request.is_some();
+    if t.prompt_history.navigate(
+        &mut t.draft,
+        &entries,
+        event,
+        menu_open,
+        has_attachments,
+        has_pending_request,
+        caret_edges.map(|[first, last]| {
+            if event.key == rune::Key::Up {
+                first
+            } else {
+                last
+            }
+        }),
+    ) {
         return true;
     }
     false
+}
+
+/// KSG Code's thread.editQueuedMessage and thread.steerQueuedMessage shortcuts.
+fn composer_queue_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+    if s.current().draft.is_composing() || s.current().request.is_some() {
+        return false;
+    }
+    let edit_latest = event.key == rune::Key::Up
+        && event.mods.alt
+        && !event.mods.ctrl
+        && !event.mods.cmd
+        && !event.mods.shift
+        && s.current().draft.focus == 0
+        && s.current().draft.anchor == 0;
+    let promote_next = event.key == rune::Key::Enter
+        && event.mods.shift
+        && (event.mods.cmd || event.mods.ctrl)
+        && !event.mods.alt;
+    let id = if edit_latest {
+        s.current().native.queue.back().map(|q| q.id)
+    } else if promote_next {
+        s.current().native.queue.front().map(|q| q.id)
+    } else {
+        return false;
+    };
+    let Some(id) = id else { return false };
+    if edit_latest {
+        s.current_mut().edit_queued(id);
+    } else {
+        s.current_mut().steer_queued(id);
+    }
+    s.checkpoint();
+    true
 }
 
 /// Ported from KSG Code's QueuedRunsControl: right-aligned unsent messages, per-message edit,
@@ -252,13 +346,54 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    let limit = if t.native.queue_expanded {
+    let limit = if t.native.queue_expanded || t.queued_edit.is_some() {
         usize::MAX
     } else {
         3
     };
     for queued in t.native.queue.iter().take(limit) {
         let id = queued.id;
+        let editing = t
+            .queued_edit
+            .as_ref()
+            .is_some_and(|edit| edit.input_id == id);
+        let mut actions = row().gap(2.0).flex_wrap();
+        if editing {
+            actions = actions
+                .child(label("Editing in the composer", SMALL, p.ink))
+                .child(
+                    button(&format!("queue-edit-{id}"), "Cancel", p, |s| {
+                        s.current_mut().cancel_queued_edit();
+                        s.checkpoint();
+                    })
+                    .label("Cancel editing queued message"),
+                );
+        } else {
+            actions = actions
+                .child(
+                    button(&format!("queue-steer-{id}"), "Send now", p, move |s| {
+                        s.current_mut().steer_queued(id);
+                        s.checkpoint();
+                    })
+                    .disabled(t.status.busy() && !t.can_steer()),
+                )
+                .child(
+                    button(&format!("queue-edit-{id}"), "Edit", p, move |s| {
+                        s.current_mut().edit_queued(id);
+                        s.checkpoint();
+                    })
+                    .disabled(t.request.is_some()),
+                );
+        }
+        actions = actions.child(button(
+            &format!("queue-remove-{id}"),
+            "Remove",
+            p,
+            move |s| {
+                s.current_mut().cancel_queued(id);
+                s.checkpoint();
+            },
+        ));
         let mut body = col()
             .gap(6.0)
             .px(12.0)
@@ -283,36 +418,7 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
                 .items_end()
                 .gap(4.0)
                 .child(body)
-                .child(
-                    row()
-                        .gap(2.0)
-                        .flex_wrap()
-                        .child(button(
-                            &format!("queue-steer-{id}"),
-                            "Send now",
-                            p,
-                            move |s| {
-                                s.current_mut().steer_queued(id);
-                                s.checkpoint();
-                            },
-                        ))
-                        .child(
-                            button(&format!("queue-edit-{id}"), "Edit", p, move |s| {
-                                s.current_mut().edit_queued(id);
-                                s.checkpoint();
-                            })
-                            .disabled(t.request.is_some()),
-                        )
-                        .child(button(
-                            &format!("queue-remove-{id}"),
-                            "Remove",
-                            p,
-                            move |s| {
-                                s.current_mut().cancel_queued(id);
-                                s.checkpoint();
-                            },
-                        )),
-                ),
+                .child(actions),
         );
     }
     if t.native.queue.len() > 3 {

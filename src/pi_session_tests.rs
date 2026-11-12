@@ -197,7 +197,8 @@ fn files_send_and_steer_without_vision_and_recover_from_persisted_queue_referenc
             .unwrap()
             .contains("Missing file")
     );
-    assert!(restored.native.queue.is_empty());
+    assert!(restored.native.queue_held);
+    assert_eq!(restored.native.queue.len(), 1);
 }
 
 fn thread(status: Status) -> (Thread, mpsc::Receiver<Value>) {
@@ -473,6 +474,12 @@ fn follow_up_stop_and_clear_queue_keep_original_text_and_images() {
     t.stop();
     let clear = command(&commands, "clear_queue");
     answer(&mut t, &clear, json!({"steering":[],"followUp":[]}));
+    assert!(t.draft.text.is_empty());
+    assert!(t.draft_images.is_empty());
+    assert!(t.native.queue_held);
+    assert_eq!(t.native.queue[0].prompt.text, "Do this later");
+    assert_eq!(t.native.queue[0].prompt.images[0].id, image.id);
+    t.clear_user_queue();
     assert_eq!(t.draft.text, "Do this later");
     assert_eq!(t.draft_images[0].id, image.id);
     assert!(t.native.queued_inputs.is_empty());
@@ -492,8 +499,8 @@ fn queued_messages_can_be_edited_cancelled_promoted_and_run_after_settlement() {
     assert_eq!(t.native.queue.len(), 1);
     t.edit_queued(b);
     assert_eq!(t.draft.text, "Queued B");
-    assert!(t.native.queue.is_empty());
-    t.send_during_run();
+    assert_eq!(t.native.queue.len(), 1);
+    t.save_queued_edit();
     let b = t.native.queue[0].id;
     t.steer_queued(b);
     let steer = command(&commands, "prompt");
