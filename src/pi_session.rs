@@ -229,22 +229,24 @@ impl Tool {
 }
 
 impl Thread {
-    pub fn slash_matches(&self) -> Vec<SlashCommand> {
-        let text = &self.draft.text;
-        if !self.draft.focused
-            || self.native.slash_dismissed.as_ref() == Some(text)
-            || !text.starts_with('/')
-            || text.chars().any(char::is_whitespace)
-        {
-            return vec![];
+    pub fn slash_trigger(&self) -> Option<crate::composer::Trigger> {
+        if !self.draft.focused || self.native.slash_dismissed.as_ref() == Some(&self.draft.text) {
+            return None;
         }
-        let query = text[1..].to_lowercase();
+        crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')
+    }
+
+    pub fn slash_matches(&self) -> Vec<SlashCommand> {
+        let Some(trigger) = self.slash_trigger() else {
+            return vec![];
+        };
+        let query = trigger.query.to_lowercase();
         let mut commands = vec![SlashCommand {
             name: "model".into(),
             description: "Switch response model for this thread".into(),
             source: "Shina".into(),
         }];
-        if crate::harness::supports_compaction(&self.harness) {
+        if trigger.range.start == 0 && crate::harness::supports_compaction(&self.harness) {
             commands.push(SlashCommand {
                 name: "compact".into(),
                 description: if self.harness == "codex" {
@@ -266,6 +268,7 @@ impl Thread {
                 .iter()
                 .filter(|c| {
                     c.name != "model"
+                        && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
                             || c.name != "compact")
                 })
@@ -1468,12 +1471,26 @@ impl State {
     }
 
     pub fn choose_slash(&mut self, name: String) {
-        if name == "model" {
-            self.current_mut().draft.replace_text("");
-            self.settings_picker = Some(SettingsPicker::Model);
+        let range = self.current().slash_trigger().map(|t| t.range).or_else(|| {
+            (name == "model" && self.current().draft.text.trim() == "/model")
+                .then(|| 0..self.current().draft.text.len())
+        });
+        let Some(range) = range else {
+            return;
+        };
+        let replacement = if name == "model" {
+            String::new()
         } else {
-            self.current_mut().draft.replace_text(format!("/{name} "));
-            self.current_mut().draft.focused = true;
+            format!("/{name} ")
+        };
+        let edit = &mut self.current_mut().draft;
+        edit.undo_group(|edit| {
+            edit.set_selection(range.start, range.end);
+            edit.insert(&replacement);
+        });
+        edit.focused = true;
+        if name == "model" {
+            self.settings_picker = Some(SettingsPicker::Model);
         }
     }
 

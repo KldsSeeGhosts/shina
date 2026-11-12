@@ -211,11 +211,7 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
 pub(super) fn slash_menu(s: &State, p: Palette) -> El {
     let t = s.current();
     let matches = t.slash_matches();
-    if !t.draft.text.starts_with('/')
-        || t.draft.text.chars().any(char::is_whitespace)
-        || !t.draft.focused
-        || t.native.slash_dismissed.as_ref() == Some(&t.draft.text)
-    {
+    if t.slash_trigger().is_none() {
         return el();
     }
     let mut list = col()
@@ -301,6 +297,10 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         return true;
     }
     let matches = s.current().slash_matches();
+    if s.current().slash_trigger().is_some() && event.key == rune::Key::Escape {
+        s.current_mut().native.slash_dismissed = Some(s.current().draft.text.clone());
+        return true;
+    }
     if !matches.is_empty() {
         let at = s.current().native.slash_index.min(matches.len() - 1);
         match event.key {
@@ -342,10 +342,7 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         return true;
     }
     let t = s.current_mut();
-    let menu_open = t.draft.focused
-        && t.draft.text.starts_with('/')
-        && !t.draft.text.chars().any(char::is_whitespace)
-        && t.native.slash_dismissed.as_ref() != Some(&t.draft.text);
+    let menu_open = t.slash_trigger().is_some();
     let entries: Vec<_> = t
         .messages
         .iter()

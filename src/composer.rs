@@ -1,6 +1,39 @@
 //! Composer editing rules, ported from KSG Code's chat/composerCommandKey.ts.
 use rune::{Key, KeyEvent, TextEdit};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trigger {
+    pub marker: char,
+    pub range: std::ops::Range<usize>,
+    pub query: String,
+}
+
+/// KSG Code's composer trigger grammar. Work in UTF-8 caret bytes, never character indices.
+pub fn trigger(edit: &TextEdit) -> Option<Trigger> {
+    if edit.anchor != edit.focus || edit.is_composing() || edit.active_block() == rune::Block::Code
+    {
+        return None;
+    }
+    let before = edit.text.get(..edit.focus)?;
+    let start = before
+        .rfind(char::is_whitespace)
+        .map_or(0, |i| i + before[i..].chars().next().unwrap().len_utf8());
+    let token = &before[start..];
+    let marker = token.chars().next()?;
+    if !matches!(marker, '/' | '@' | '$')
+        || edit
+            .pills()
+            .any(|(range, _)| range.start < edit.focus && range.end > start)
+    {
+        return None;
+    }
+    Some(Trigger {
+        marker,
+        range: start..edit.focus,
+        query: token[1..].to_owned(),
+    })
+}
+
 /// Per-thread browsing state. Keep the whole edit so recall also preserves the caret and marks.
 #[derive(Default)]
 pub struct History {
@@ -120,5 +153,20 @@ mod tests {
         modified.mods.shift = true;
         assert!(!history.navigate(&mut edit, &["sent"], &modified, false));
         assert!(!history.navigate(&mut edit, &[], &key(Key::Up), false));
+    }
+
+    #[test]
+    fn trigger_uses_the_caret_token_and_whitespace_boundary() {
+        for text in ["/", "please /rev", "猫\n/rev", "x\u{2003}/review"] {
+            let t = trigger(&TextEdit::new(text)).unwrap();
+            assert_eq!(t.marker, '/');
+            assert_eq!(&text[t.range.clone()], format!("/{}", t.query));
+        }
+        for text in ["https://example", "a/review", "/review ", "plain"] {
+            assert!(trigger(&TextEdit::new(text)).is_none(), "{text}");
+        }
+        let mut edit = TextEdit::new("before /rev after");
+        edit.set_caret(11);
+        assert_eq!(trigger(&edit).unwrap().range, 7..11);
     }
 }

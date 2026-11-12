@@ -10026,6 +10026,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn inline_slash_selection_preserves_the_rest_of_the_draft() {
+        let mut rt = runtime(960.0);
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        let t = rt.state.current_mut();
+        t.apply(
+            json!({"type":"response","command":"get_commands","success":true,
+            "data":{"commands":[{"name":"skill:review","source":"skill"}]}}),
+        );
+        t.draft.replace_text("please /skill:re after");
+        t.draft.set_caret(16);
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "please /skill:review  after");
+        rt.state
+            .current_mut()
+            .draft
+            .replace_text("please /does-not-exist");
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.find("slash-menu").is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert!(rt.find("slash-menu").is_none());
+    }
+
+    #[test]
     fn steering_and_rewind_controls_send_native_commands_without_overflow() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
