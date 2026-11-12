@@ -389,18 +389,19 @@ async fn snapshot(
     value: &Value,
     paged: bool,
     database: &crate::database::Database,
-) -> bool {
+) -> Option<u64> {
     let mut snapshot = value.clone();
     if snapshot["state"].is_null() {
         let database = database.clone();
         let Ok(Ok(committed)) =
             tokio::task::spawn_blocking(move || database.committed_snapshot()).await
         else {
-            return false;
+            return None;
         };
         snapshot["state"] = committed["state"].clone();
         snapshot["seq"] = committed["seq"].clone();
     }
+    let sequence = snapshot["seq"].as_u64()?;
     snapshot["subscriptionId"] = json!("workspace");
     if paged {
         snapshot["state"] = protocol::compact(&snapshot["state"]);
@@ -418,10 +419,10 @@ async fn snapshot(
                 )
                 .await
                 {
-                    return false;
+                    return None;
                 }
                 if cursor.is_null() {
-                    return true;
+                    return Some(sequence);
                 }
             }
         }
@@ -431,6 +432,7 @@ async fn snapshot(
         protocol::notification("subscription.snapshot", snapshot),
     )
     .await
+    .then_some(sequence)
 }
 
 async fn synchronize(
@@ -439,7 +441,7 @@ async fn synchronize(
     current: &Value,
     after: Option<u64>,
     paged: bool,
-) -> bool {
+) -> Option<u64> {
     if paged
         && let Some(after) = after
         && let Ok(Some(events)) = shared
@@ -457,10 +459,10 @@ async fn synchronize(
             )
             .await
             {
-                return false;
+                return None;
             }
         }
-        return true;
+        return current["seq"].as_u64();
     }
     snapshot(socket, current, paged, &shared.database).await
 }
@@ -635,9 +637,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     subscribed = true;
                     let current = snapshots.borrow_and_update().clone();
                     let after = params["lastSeq"].as_u64().filter(|_| params["epoch"] == current["epoch"]);
-                    if !synchronize(&mut socket, &shared, &current, after, paged).await { break; }
-                    cursor = current["seq"].as_u64();
-                    if !send(&mut socket, protocol::notification("subscription.ready", json!({"subscriptionId":"workspace","seq":current["seq"],"maintenance":current["maintenance"]}))).await { break; }
+                    let Some(sequence)=synchronize(&mut socket, &shared, &current, after, paged).await else { break; };
+                    cursor = Some(sequence);
+                    if !send(&mut socket, protocol::notification("subscription.ready", json!({"subscriptionId":"workspace","seq":sequence,"maintenance":current["maintenance"]}))).await { break; }
                     Ok(json!({"subscriptionId":"workspace"}))
                 } else if method == "subscription.cancel" {
                     subscribed = false;
@@ -764,9 +766,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     last_maintenance = current["maintenance"].clone();
                     if notify && !send(&mut socket, protocol::notification(method, last_maintenance.clone())).await { break; }
                 }
-                if subscribed {
-                    if !synchronize(&mut socket, &shared, &current, cursor, paged).await { break; }
-                    cursor = current["seq"].as_u64();
+                if subscribed && current["seq"].as_u64()>cursor {
+                    let Some(sequence)=synchronize(&mut socket, &shared, &current, cursor, paged).await else { break; };
+                    cursor = Some(sequence);
                 }
                 if let Some((thread, after)) = active_thread {
                     let Some(next) = replay_thread(&mut socket, &shared, thread, after).await else { break };
@@ -874,7 +876,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         .map_err(|e| e.to_string())?;
     let (calls, mut incoming) = mpsc::channel::<Call>(32);
     let (snapshots, receive) = watch::channel(Arc::new(runtime.snapshot()));
-    let mut published_sequence = runtime.seq;
+    runtime.take_committed_history();
     let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
         &snapshots.borrow(),
     )));
@@ -1006,14 +1008,10 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         }
         if changed {
             let snapshot = Arc::new(runtime.notification());
-            history_streams.lock().expect("history streams").ingest(
-                runtime
-                    .database
-                    .as_ref()
-                    .unwrap()
-                    .history_events_after(published_sequence)?,
-            )?;
-            published_sequence = runtime.seq;
+            history_streams
+                .lock()
+                .expect("history streams")
+                .ingest(runtime.take_committed_history())?;
             snapshots.send_replace(snapshot);
         }
         let _ = wake_receive.recv_timeout(runtime::TICK);
@@ -1146,7 +1144,8 @@ mod tests {
                             worker_streams
                                 .lock()
                                 .expect("history streams")
-                                .publish(&snapshot);
+                                .ingest(runtime.take_committed_history())
+                                .unwrap();
                             snapshots.send_replace(snapshot);
                         } else {
                             std::thread::sleep(Duration::from_millis(2));

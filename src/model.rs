@@ -7087,6 +7087,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         if remote_children.contains(&thread.id) {
             continue;
         }
+        let effects_before = crate::outbox::captured_count();
         let mut thread_changed = thread.poll_memory_command();
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
@@ -7172,6 +7173,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::from_secs(1));
             changed = true;
         }
+        // A quiet session can become dispatchable without another provider record.
+        // Its intent must join this batch even when a different thread streamed.
+        thread_changed |= crate::outbox::captured_count() != effects_before;
         if thread_changed {
             changed = true;
             if let Some(scope) = &mut state.persistence_scope {
@@ -7587,6 +7591,36 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_threads_new_effect_joins_another_threads_streaming_checkpoint() {
+        let mut state = State::headless(crate::store::directory().unwrap());
+        state.demo = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        let (_a_commands, a_events) = fake_pi(&mut state.threads[0], Status::Running);
+        let first = state.threads[0].id;
+        let mut other = Thread::new(2);
+        let (b_commands, _b_events) = fake_pi(&mut other, Status::Ready);
+        other.queued_prompt = Some((Prompt::new("quiet dispatch".into(), vec![]), 0));
+        state.threads.push(other);
+        a_events.send(Event::Record(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"stream"}}))).unwrap();
+        state.persistence_scope = Some(Default::default());
+        let capture = crate::outbox::Capture::begin();
+        assert!(poll(&mut state, 0.0, &mut Tx::default()));
+        let effects = capture.finish();
+        assert!(!effects.is_empty());
+        assert!(
+            b_commands.try_recv().is_err(),
+            "effects must remain captured until commit"
+        );
+        let scope = state
+            .persistence_scope
+            .as_ref()
+            .expect("only changed threads");
+        assert!(scope.contains(&first));
+        assert!(scope.contains(&2));
+        assert!(state.threads[1].pending_prompt.is_some());
+    }
 
     #[test]
     fn message_text_drops_terminal_escape_sequences() {

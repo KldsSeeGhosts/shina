@@ -63,6 +63,7 @@ pub struct RuntimeState {
     pub database: Option<crate::database::Database>,
     failure: Option<String>,
     pending_effects: Vec<crate::outbox::Effect>,
+    committed_history: Vec<Value>,
 }
 
 impl RuntimeState {
@@ -122,6 +123,7 @@ impl RuntimeState {
             database: None,
             failure: None,
             pending_effects: Vec::new(),
+            committed_history: Vec::new(),
         }
     }
 
@@ -495,6 +497,10 @@ impl RuntimeState {
             .or_else(|| self.database.as_ref().and_then(|db| db.failure()))
     }
 
+    pub fn take_committed_history(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.committed_history)
+    }
+
     fn persist(
         &mut self,
         receipt: Option<&Receipt>,
@@ -552,9 +558,11 @@ impl RuntimeState {
                 self.last_projection["threads"].clone()
             };
             let previous = json!({"seq":self.seq,"state":{"threads":previous_threads}});
-            let mut history = crate::history::Streams::new(&previous);
-            history.publish(&json!({"seq":next,"state":{"threads":projection["threads"]}}));
-            database.stage_history(history.committed_events(self.seq));
+            let history = crate::history::Streams::changes(
+                &previous,
+                &json!({"seq":next,"state":{"threads":projection["threads"]}}),
+            );
+            database.stage_history(history.clone());
             let patch = update_projection(&mut self.last_projection, &projection);
             if receipt.is_none()
                 && effects.is_empty()
@@ -574,6 +582,7 @@ impl RuntimeState {
                     .runtime_input_snapshot(self.state.persistence_scope.as_ref()),
             )?;
             database.commit(self.seq, &projection, &patch, receipt, &effects)?;
+            self.committed_history.extend(history);
             self.pending_effects.extend(effects);
             if self.maintenance.fenced() || self.validation_hold {
                 return Ok(());
@@ -600,6 +609,7 @@ impl RuntimeState {
     }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
+        self.committed_history.clear();
         self.state.persistence_scope = None;
         if let Some(error) = &self.failure {
             return Err(error.clone());
@@ -614,6 +624,7 @@ impl RuntimeState {
         self.state.begin_runtime_shutdown();
         if let Some(capture) = capture {
             self.persist(None, capture.finish())?;
+            self.committed_history.clear();
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
         loop {
@@ -627,6 +638,7 @@ impl RuntimeState {
             let running = self.state.drain_runtime_shutdown();
             if let Some(capture) = capture {
                 self.persist(None, capture.finish())?;
+                self.committed_history.clear();
             }
             if !running || std::time::Instant::now() >= deadline {
                 break;
@@ -647,6 +659,7 @@ impl RuntimeState {
             self.state.checkpoint_and_flush()
         };
         if result.is_ok() {
+            self.committed_history.clear();
             self.state.mark_clean_quit();
         }
         result

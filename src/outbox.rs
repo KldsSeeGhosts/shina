@@ -14,6 +14,9 @@ thread_local! {
 }
 
 pub struct Capture;
+pub fn captured_count() -> usize {
+    CAPTURE.with(|capture| capture.borrow().as_ref().map(Vec::len).unwrap_or(0))
+}
 impl Capture {
     pub fn begin() -> Self {
         CAPTURE.with(|capture| {

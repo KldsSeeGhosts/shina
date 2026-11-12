@@ -4,6 +4,7 @@ mod acp;
 mod attachments;
 mod backend;
 mod brand;
+mod cache_persistence;
 mod captains;
 mod claude;
 mod client;

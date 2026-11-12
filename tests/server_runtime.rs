@@ -249,6 +249,18 @@ impl Client {
         Self::with_token(discovery, auth["token"].as_str().unwrap().to_owned())
     }
     fn with_token(discovery: &Value, token: String) -> Self {
+        let mut client = Self::unsubscribed(discovery, token);
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}),
+            json!("hello"),
+        );
+        assert!(hello["error"].is_null(), "{hello}");
+        client.rpc("workspace.subscribe", json!({}), json!("subscribe"));
+        assert!(!client.snapshot.is_null());
+        client
+    }
+    fn unsubscribed(discovery: &Value, token: String) -> Self {
         let port = discovery["port"].as_u64().unwrap() as u16;
         let mut request = format!("ws://127.0.0.1:{port}/v1/ws")
             .into_client_request()
@@ -262,7 +274,7 @@ impl Client {
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
         }
-        let mut client = Self {
+        Self {
             socket,
             snapshot: Value::Null,
             seq: 0,
@@ -270,16 +282,7 @@ impl Client {
             notifications: Vec::new(),
             token,
             history_cache: None,
-        };
-        let hello = client.rpc(
-            "hello",
-            json!({"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}),
-            json!("hello"),
-        );
-        assert!(hello["error"].is_null(), "{hello}");
-        client.rpc("workspace.subscribe", json!({}), json!("subscribe"));
-        assert!(!client.snapshot.is_null());
-        client
+        }
     }
     fn rpc(&mut self, method: &str, params: Value, id: Value) -> Value {
         self.socket
@@ -316,6 +319,12 @@ impl Client {
                         self.snapshot = value["params"]["state"].clone();
                         self.seq = value["params"]["seq"].as_u64().unwrap();
                         self.epoch = value["params"]["epoch"].clone();
+                    }
+                    if value["method"] == "subscription.ready" {
+                        assert!(
+                            value["params"]["seq"].as_u64().unwrap() >= self.seq,
+                            "synchronization cursor precedes its installed snapshot"
+                        );
                     }
                     if value["method"] == "subscription.patch" {
                         for patch in value["params"]["patch"].as_array().unwrap() {
@@ -2063,8 +2072,13 @@ fn streaming_storage_scaling() {
         );
         assert_eq!(receipt["result"]["status"], "accepted", "{receipt}");
         std::thread::sleep(Duration::from_secs(3));
-        let samples: Vec<Value> = fs::read_to_string(profile.root.join("storage.jsonl"))
-            .unwrap()
+        let observed = fs::read_to_string(profile.root.join("storage.jsonl")).unwrap();
+        // A writer may be in the middle of its last JSONL record.
+        let complete = observed
+            .rsplit_once('\n')
+            .map(|(complete, _)| complete)
+            .unwrap_or("");
+        let samples: Vec<Value> = complete
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -2168,6 +2182,97 @@ fn streaming_history_resumes_after_disconnect() {
     streaming_history_case(200_000, true);
 }
 
+#[test]
+fn reconnect_attaches_the_retained_cache_before_any_workspace_subscription() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut actor = profile.client(uuid::Uuid::new_v4());
+    std::thread::sleep(Duration::from_secs(1));
+    actor.rpc("workspace.subscribe", json!({}), json!("base"));
+    let mut retained = client_history::ProjectionCache::default();
+    retained
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({
+                "state":protocol::compact(&actor.snapshot),"seq":actor.seq,"epoch":actor.epoch
+            }),
+        ))
+        .unwrap();
+    let retained_sequence = retained.seq.unwrap();
+    let missed = actor.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"missed base"}),
+        uuid::Uuid::new_v4(),
+    );
+    actor.until_sequence(missed["result"]["seq"].as_u64().unwrap(), |_| true);
+
+    // Reproduce the old fixture. Its convenience constructor consumes a newer
+    // snapshot without giving it to the retained cache.
+    let mut discarded = Client::with_token(&profile.discovery(), actor.token.clone());
+    let hello = discarded.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    let installed_sequence = discarded.seq;
+    assert!(installed_sequence > retained_sequence);
+    let receipt = actor.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"contiguous server patch"}),
+        uuid::Uuid::new_v4(),
+    );
+    actor.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |_| true);
+    let wire = loop {
+        let value = discarded.read();
+        if value["method"] == "subscription.patch" {
+            break value;
+        }
+    };
+    assert_eq!(
+        wire["params"]["seq"],
+        installed_sequence + 1,
+        "the server must send the next sequence for the snapshot actually consumed"
+    );
+    assert!(
+        retained
+            .receive(&wire)
+            .unwrap_err()
+            .contains("Projection replay gap")
+    );
+    drop(discarded);
+
+    // Native reconnect installs the retained base before its one subscription,
+    // and requests replay from that base rather than discarding another snapshot.
+    let mut resumed = Client::unsubscribed(&profile.discovery(), actor.token.clone());
+    resumed.snapshot = retained.state.clone();
+    resumed.seq = retained_sequence;
+    resumed.epoch = retained.epoch.clone();
+    retained.reconnect(&hello["result"]).unwrap();
+    let cursor = json!({"lastSeq":retained.seq,"epoch":retained.epoch});
+    resumed.history_cache = Some(retained);
+    resumed.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("native-hello"),
+    );
+    resumed.rpc("workspace.subscribe", cursor, json!("native-subscribe"));
+    assert!(
+        resumed.history_cache.as_ref().unwrap().seq.unwrap()
+            >= receipt["result"]["seq"].as_u64().unwrap()
+    );
+    assert_eq!(
+        resumed.history_cache.as_ref().unwrap().state["index"]["threads"][0]["title"],
+        "contiguous server patch"
+    );
+    assert!(
+        !resumed
+            .notifications
+            .iter()
+            .any(|value| value["method"] == "subscription.snapshot")
+    );
+    profile.stop();
+}
+
 fn streaming_history_case(bytes: usize, disconnect: bool) {
     let mut profile = Profile::new();
     profile.launch(&["serve"]);
@@ -2203,6 +2308,16 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
     client.until(|state| state["threads"][0]["status"] == "Running");
     let mut cache = client_history::ProjectionCache::default();
     cache.reconnect(&hello["result"]).unwrap();
+    // This fixture already subscribed before attaching its scoped-history cache.
+    // Seed that installed workspace so a queued live patch has a valid base.
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({
+                "state":protocol::compact(&client.snapshot),"seq":client.seq,"epoch":client.epoch
+            }),
+        ))
+        .unwrap();
     client.history_cache = Some(cache);
     client.rpc("workspace.subscribe", json!({}), json!("history-subscribe"));
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -2279,7 +2394,10 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             let cache = client.history_cache.take().unwrap();
             let token = client.token.clone();
             drop(client);
-            client = Client::with_token(&profile.discovery(), token);
+            client = Client::unsubscribed(&profile.discovery(), token);
+            client.snapshot = cache.state.clone();
+            client.seq = cache.seq.unwrap();
+            client.epoch = cache.epoch.clone();
             let hello = client.rpc(
                 "hello",
                 json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
@@ -2287,12 +2405,9 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             );
             let mut cache = cache;
             cache.reconnect(&hello["result"]).unwrap();
+            let cursor = json!({"lastSeq":cache.seq,"epoch":cache.epoch});
             client.history_cache = Some(cache);
-            client.rpc(
-                "workspace.subscribe",
-                json!({}),
-                json!("reconnect-subscribe"),
-            );
+            client.rpc("workspace.subscribe", cursor, json!("reconnect-subscribe"));
             reconnected = true;
             continue;
         }

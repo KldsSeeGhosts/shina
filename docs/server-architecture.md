@@ -30,6 +30,8 @@ The runtime stages one changed-thread checkpoint per reducer batch. `projection_
 
 Live elapsed values never enter the durable projection. Thread views carry stable start timestamps, and clients reconstruct their monotonic display clocks. Headless polling does not checkpoint for repaint timers or an unchanged minute sweep. Quiet ticks neither capture the workspace nor write the database. KSG admits an oversized item in one history response; Shina still fragments that response using the bounded lease above. See [storage performance](storage-performance.md) for the measurement fixture and reference mapping.
 
+The optional native remote-view cache has its own schema version and a latest-value writer outside the socket receive path. It ports KSG's 500 ms initial delay and ten-second save cadence, with a final native shutdown flush. Immutable blob downloads survive projection updates, and completion hydrates the newest view rather than replacing it with an older projection.
+
 Version skew follows KSG's forward-compatible contracts. New optional fields do not change the baseline capability. Unknown stream kinds and event types advance the replay position without changing known records. Unknown row fields are ignored, but malformed known records still fail validation. Missing `history-items` reports "Update required" and error `-32012`, not an indefinite loading state. The native client's history cache, individual history and stream reassembly, and pending snapshot-event buffer each retain a 64 MiB limit. Authenticated `GET /v1/blobs/{id}?offset=0&limit=65536` returns bounded image-file bytes with `x-blob-length` and `x-next-offset`; paths cannot escape the attachments directory.
 
 Reference mapping:

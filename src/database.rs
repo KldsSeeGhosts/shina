@@ -499,6 +499,14 @@ impl Database {
                 [seq.saturating_sub(1024) as i64],
             )
             .map_err(error)?;
+            tx.execute("DELETE FROM thread_events WHERE (thread_id,seq) IN (
+                SELECT thread_id,seq FROM (
+                    SELECT thread_id,seq,
+                        SUM(length(CAST(payload AS BLOB))) OVER (ORDER BY seq DESC,thread_id DESC) AS retained_bytes,
+                        ROW_NUMBER() OVER (ORDER BY seq DESC,thread_id DESC) AS retained_count
+                    FROM thread_events
+                ) WHERE retained_bytes > ?1 OR retained_count > 1024
+            )",[4_i64*1024*1024]).map_err(error)?;
             let mut projection = projection.clone();
             if let Some(index) = projection.as_object_mut().unwrap().remove("index") {
                 crate::projection_store::write(&tx, "workspace-index", &index)?;
@@ -1070,7 +1078,7 @@ impl Database {
 
     pub fn finish_if_unchanged(&self) -> Result<bool, String> {
         let mut inner = self.0.lock().expect("database");
-        if !inner.revocations.is_empty() {
+        if !inner.revocations.is_empty() || !inner.history_events.is_empty() {
             return Ok(false);
         }
         for (name, value) in &inner.staged {
@@ -1151,6 +1159,25 @@ fn put_receipt(connection: &Connection, receipt: &Receipt) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_thread_replay_has_a_hard_byte_budget() {
+        let directory = crate::store::directory().unwrap();
+        let database = Database::open(&directory).unwrap();
+        database.begin().unwrap();
+        database.stage_history(vec![
+            json!({"threadId":1,"sequence":1,"events":[{"text":"x".repeat(4*1024*1024+1024)}]}),
+        ]);
+        database
+            .commit(1, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        assert!(database.history_events().unwrap().is_empty());
+        database.begin().unwrap();
+        database.stage_history(vec![json!({"threadId":1,"sequence":2,"events":[]})]);
+        database
+            .commit(2, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        assert_eq!(database.history_events().unwrap().len(), 1);
+    }
     use crate::{
         outbox,
         protocol::{Command, ReceiptStatus},

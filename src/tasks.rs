@@ -1004,9 +1004,14 @@ impl State {
     pub(super) fn poll_tasks(&mut self, now: Instant) -> bool {
         let mut changed = self.poll_remote_tasks();
         let routes: std::collections::HashMap<_, _> = self
-            .threads
+            .tasks
             .iter()
-            .map(|t| (t.id, self.effective_home(t.id)))
+            .map(|task| {
+                (
+                    task.parent_thread_id,
+                    self.effective_home(task.parent_thread_id),
+                )
+            })
             .collect();
         for task in &mut self.tasks {
             if task.remote.is_some() {

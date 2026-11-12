@@ -17,6 +17,40 @@ fn timestamp_instant(unix: u64) -> Option<Instant> {
         crate::lifecycle::now().saturating_sub(unix),
     ))
 }
+fn thought_clock_key(thought: &Thought) -> String {
+    format!(
+        "{}:{}:{}",
+        thought.anchor.message, thought.anchor.offset, thought.block
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn scoped_thought_windows_keep_their_own_start_clock() {
+    let mut thread = Thread::new(1);
+    for (message, secs) in [(0, 30), (10, 3)] {
+        thread.thoughts.push(Thought {
+            anchor: ToolAnchor { message, offset: 0 },
+            block: 0,
+            order: message as u64,
+            text: String::new(),
+            expanded: false,
+            done: false,
+            started: Some(Instant::now() - Duration::from_secs(secs)),
+            duration_ms: None,
+        });
+    }
+    let mut window = ThreadView::capture(&thread);
+    window.thoughts.remove(0);
+    let mut client = Thread::new(1);
+    window.apply(&mut client).unwrap();
+    let elapsed = client.thoughts[0].started.unwrap().elapsed();
+    let expected = thread.thoughts[1].started.unwrap().elapsed();
+    assert!(
+        elapsed.as_millis().abs_diff(expected.as_millis()) < 100,
+        "scoped clock {elapsed:?}, expected {expected:?}"
+    );
+}
 
 #[cfg(test)]
 #[test]
@@ -94,8 +128,10 @@ struct ThreadView {
     started_at: Option<u64>,
     #[serde(default)]
     tool_started_at: std::collections::BTreeMap<String, u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     thought_started_at: Vec<Option<u64>>,
+    #[serde(default)]
+    thought_clocks: std::collections::BTreeMap<String, u64>,
     queue: Vec<(usize, String, Vec<Attachment>)>,
     steering: Vec<String>,
     follow_ups: Vec<String>,
@@ -181,10 +217,11 @@ impl ThreadView {
                 .iter()
                 .filter_map(|t| Some((t.id.clone(), stable_timestamp(t.started?))))
                 .collect(),
-            thought_started_at: thread
+            thought_started_at: Vec::new(),
+            thought_clocks: thread
                 .thoughts
                 .iter()
-                .map(|t| t.started.map(stable_timestamp))
+                .filter_map(|t| Some((thought_clock_key(t), stable_timestamp(t.started?))))
                 .collect(),
             queue: thread
                 .native
@@ -255,10 +292,10 @@ impl ThreadView {
         for (index, thought) in thoughts.iter_mut().enumerate() {
             if !thought.done {
                 thought.started = self
-                    .thought_started_at
-                    .get(index)
+                    .thought_clocks
+                    .get(&thought_clock_key(thought))
                     .copied()
-                    .flatten()
+                    .or_else(|| self.thought_started_at.get(index).copied().flatten())
                     .and_then(timestamp_instant)
                     .or_else(|| {
                         thought
