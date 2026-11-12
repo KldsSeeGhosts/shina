@@ -313,6 +313,7 @@ pub struct Thread {
     pub draft: TextEdit,
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
+    pub paste_history: crate::composer_paste::PasteHistory,
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
     pub pi: Option<Pi>,
@@ -526,6 +527,7 @@ impl Thread {
             work: vec![],
             draft: TextEdit::default(),
             prompt_history: crate::composer::History::default(),
+            paste_history: crate::composer_paste::PasteHistory::default(),
             draft_images: Vec::new(),
             attachment_error: None,
             pi: None,
@@ -4576,6 +4578,34 @@ impl State {
     /// Attach one or more picked or dropped files. A failure leaves the text draft untouched.
     pub fn attach_paths(&mut self, paths: &[PathBuf]) {
         self.attach_paths_to(self.current().id, paths);
+    }
+    pub fn fold_paste(&mut self, text: &str) -> bool {
+        if !crate::composer_paste::should_fold(text)
+            // Ordinary-file references are host-local. The linked upload API transfers images
+            // only, so keep text inline until it can stage a text file on the receiving host.
+            || self.current().machine != "local"
+            || self.client.is_some() && self.machines.selected != "local"
+            || self.attachment_guard(self.active).is_some()
+            || self.current().draft_images.len() >= attachments::MAX_ATTACHMENTS
+        {
+            return false;
+        }
+        match crate::composer_paste::stage(text, &self.current().draft_images) {
+            Ok(attachment) => {
+                if let Some(notice) = &mut self.undo {
+                    notice.owns_text_key = false;
+                }
+                let t = self.current_mut();
+                t.draft_images.push(attachment.clone());
+                t.paste_history.record(&mut t.draft, attachment);
+                self.checkpoint();
+                true
+            }
+            Err(error) => {
+                self.current_mut().attachment_error = Some(error);
+                false
+            }
+        }
     }
     pub fn attach_paths_to(&mut self, thread: usize, paths: &[PathBuf]) {
         if paths.is_empty() {

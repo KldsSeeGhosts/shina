@@ -7911,7 +7911,26 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             s.current_mut().native.slash_index = 0;
             &mut s.current_mut().draft
         })
-        .on_input_key(|s: &mut State, event, _| pi_ui::composer_pi_key(s, event))
+        .on_input_key(|s: &mut State, event, tx| {
+            if event.is_command('v') && event.mods.shift && !event.mods.alt {
+                let id = s.current().id;
+                tx.read_clipboard(move |s: &mut State, content, _| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.draft.insert(content.text());
+                    }
+                    s.checkpoint();
+                });
+                return true;
+            }
+            let t = s.current_mut();
+            if t.paste_history
+                .key(&mut t.draft, &mut t.draft_images, event)
+            {
+                s.checkpoint();
+                return true;
+            }
+            pi_ui::composer_pi_key(s, event)
+        })
         .on_input_paste(|s: &mut State, content, _| {
             let has_image = content.image().is_some();
             if let Some(image) = content.image() {
@@ -7919,6 +7938,9 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             }
             if !content.files().is_empty() {
                 s.attach_paths(content.files());
+            }
+            if !content.text().is_empty() && !has_image && content.files().is_empty() {
+                return s.fold_paste(content.text());
             }
             (has_image || !content.files().is_empty()) && content.text().is_empty()
         })
@@ -13628,6 +13650,35 @@ pub(crate) mod tests {
         assert!(rt.find("send-message").is_some());
         let id = rt.state.current().draft_images[0].id.clone();
         assert!(rt.find(&format!("attachment-{id}")).is_some());
+    }
+
+    #[test]
+    fn long_text_paste_uses_an_attachment_chip_and_undo_preserves_the_draft() {
+        let mut rt = runtime(960.0);
+        rt.frame(0.0);
+        rt.state.current_mut().draft.replace_text("unsent");
+        press(&mut rt, "composer-input");
+        let text = "猫".repeat(crate::composer_paste::THRESHOLD / 3 + 1);
+        rt.paste(text.clone());
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "unsent");
+        let attachment = &rt.state.current().draft_images[0];
+        assert_eq!(attachment.name, "pasted-text.txt");
+        assert_eq!(
+            std::fs::read_to_string(attachment.path.as_ref().unwrap()).unwrap(),
+            text
+        );
+        assert!(rt.find(&format!("attachment-{}", attachment.id)).is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('z'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.current().draft_images.is_empty());
+        assert_eq!(rt.state.current().draft.text, "unsent");
     }
 
     #[test]
