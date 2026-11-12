@@ -360,6 +360,7 @@ pub enum Action {
     Unpin,
     Archive,
     Discard,
+    Delete,
 }
 impl Action {
     /// The undo notice's text: the verb to reverse, in the form a button would say it.
@@ -370,6 +371,7 @@ impl Action {
             Self::Unpin => "Undo unpin",
             Self::Archive => "Undo archive",
             Self::Discard => "Undo discard",
+            Self::Delete => "Undo delete",
         }
     }
 }
@@ -382,12 +384,14 @@ pub enum UndoStep {
     Unarchive,
     RestoreDraft(String),
     RestoreImages(Vec<crate::attachments::Attachment>),
+    RestoreTab(usize, bool),
 }
 pub fn plan_undo(action: Action, old: &Lifecycle, draft: &str) -> Vec<UndoStep> {
     let mut steps = match action {
         Action::Snooze => return vec![UndoStep::Unsnooze],
         Action::Archive => return vec![UndoStep::Unarchive],
         Action::Discard => return vec![UndoStep::RestoreDraft(draft.into())],
+        Action::Delete => return vec![],
         Action::Settle => vec![UndoStep::Unsettle],
         Action::Unpin => vec![],
     };

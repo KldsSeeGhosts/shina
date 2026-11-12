@@ -89,6 +89,12 @@ pub struct Client {
 }
 
 impl Client {
+    #[cfg(test)]
+    pub(crate) fn test_commands(&mut self) -> tokio::sync::mpsc::Receiver<Command> {
+        self.commands.ready.store(true, Ordering::Release);
+        self.input.take().expect("unused test client")
+    }
+
     pub fn new(directory: PathBuf) -> Self {
         let (sender, input) = tokio::sync::mpsc::channel(32);
         let (output, events) = mpsc::sync_channel(64);
