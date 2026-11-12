@@ -17,6 +17,8 @@ pub const SECTIONS: [&str; 7] = [
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
+    /// KSG Code's panelAnimationDurationMs, 0 to 400 ms. Zero disables panel motion.
+    pub panel_animation_duration_ms: u32,
     pub confirm_archive: bool,
     pub confirm_delete: bool,
     pub send_shortcut: crate::composer::SendShortcut,
@@ -25,6 +27,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            panel_animation_duration_ms: 0,
             confirm_archive: false,
             confirm_delete: true,
             send_shortcut: Default::default(),
@@ -770,6 +773,61 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
+/// Ported from KSG Code's AppearanceSettingsPanel panel-animation-duration range,
+/// 0..400 ms in 25 ms steps. Uses Shina's existing pixel track and framed thumb.
+fn panel_animation_control(s: &State, p: Palette) -> El {
+    let value = s.preferences.panel_animation_duration_ms.min(400);
+    let fraction = value as f32 / 400.0;
+    let slider = el()
+        .key("panel-animation-duration")
+        .role("slider")
+        .label(format!("Panel animation duration, {value} milliseconds"))
+        .w(132.0)
+        .h(24.0)
+        .center_y()
+        .child(el().w_full().h(6.0).radius(2.0).fill(p.sea_bg))
+        .child(
+            el().w(8.0 + fraction * 116.0)
+                .h(6.0)
+                .radius(2.0)
+                .fill(p.coral),
+        )
+        .child(
+            el().absolute(fraction * 116.0, 4.0)
+                .size(16.0, 16.0)
+                .radius(4.0)
+                .fill(p.card)
+                .border(2.0, p.frame),
+        )
+        .on_step(|s: &mut State, step, _| {
+            s.preferences.panel_animation_duration_ms =
+                (s.preferences.panel_animation_duration_ms as i32 + step * 25).clamp(0, 400) as u32;
+            s.checkpoint();
+        })
+        .on_step_limit(|s: &mut State, maximum, _| {
+            s.preferences.panel_animation_duration_ms = if maximum { 400 } else { 0 };
+            s.checkpoint();
+        })
+        .on_drag(|s: &mut State, drag, _| {
+            if !drag.cancelled() {
+                let fraction = ((drag.x - 8.0) / (drag.w - 16.0).max(1.0)).clamp(0.0, 1.0);
+                s.preferences.panel_animation_duration_ms = (fraction * 16.0).round() as u32 * 25;
+                s.checkpoint();
+            }
+        });
+    row()
+        .gap(12.0)
+        .center_y()
+        .child(outlined(
+            pixel_text(format!("{value} ms"), p.ink)
+                .w(64.0)
+                .px(8.0)
+                .py(4.0),
+            p,
+        ))
+        .child(slider)
+}
+
 fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
     let mut pane = col().w_full().min_w(0.0);
     let titles: &[&str] = match section {
@@ -779,6 +837,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             "Keep awake",
             "Theme",
             "Send shortcut",
+            "Panel animations",
             "Confirm before archiving a thread",
             "Confirm before deleting a thread",
         ],
@@ -872,6 +931,15 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                         s.checkpoint();
                     },
                 ),
+                p,
+            );
+            pane = add(
+                pane,
+                s,
+                "settings-panel-animations",
+                "Panel animations",
+                "Set how fast panels open and close.",
+                panel_animation_control(s, p),
                 p,
             );
             pane = add(

@@ -141,10 +141,10 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     } else if event.is_command('n') {
         if event.mods.alt {
             state.new_thread_in(None);
-            state.current_mut().draft.focused = true;
+            state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         } else if event.mods.shift {
             state.new_thread();
-            state.current_mut().draft.focused = true;
+            state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         } else {
             state.new_thread_click(false);
         }
@@ -160,7 +160,7 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         }
         state.checkpoint();
     } else if event.is_command('l') {
-        state.current_mut().draft.focused = true;
+        state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
     } else if event.is_command('k') {
         state.search.focused = true;
     } else if event.is_command('=') || event.is_command('+') {
@@ -172,7 +172,7 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     } else if event.key == Key::Escape && state.current().status.busy() {
         state.current_mut().stop();
     } else {
-        return false;
+        return ui::composer_ui::key(state, event, tx);
     }
     true
 }

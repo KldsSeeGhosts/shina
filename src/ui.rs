@@ -14,6 +14,8 @@ use serde_json::json;
 mod captain_ui;
 #[path = "composer_menu.rs"]
 mod composer_menu;
+#[path = "composer_ui.rs"]
+pub(crate) mod composer_ui;
 #[path = "crew_ui.rs"]
 mod crew_ui;
 #[path = "markdown_ui.rs"]
@@ -751,6 +753,7 @@ const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
+    composer_ui::measure(s, cx);
     cx.foreground(p.ink);
     cx.focus_ring(2.0, 2.0, p.coral);
     // Every enabled button, tab, link and switch is a Tab stop in document order, as on the web,
@@ -893,14 +896,17 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         pane = pane.child(activity(s, p, true));
     } else {
         let mut body = row().grow(1.0).min_h(0.0);
-        let main = col()
-            .key("chat-main")
-            .grow(1.0)
-            .min_w(0.0)
-            .min_h(0.0)
-            .child(chat_header(s, p, narrow, compact))
-            // Scrolled messages are cut under the header, so give them a boundary.
-            .child(rule(p).key("chat-header-rule"));
+        let main = composer_ui::motion_host(
+            s,
+            col()
+                .key("chat-main")
+                .grow(1.0)
+                .min_w(0.0)
+                .min_h(0.0)
+                .child(chat_header(s, p, narrow, compact).animated_changes())
+                // Scrolled messages are cut under the header, so give them a boundary.
+                .child(rule(p).key("chat-header-rule")),
+        );
         let main = if captain_ui::is_earlier(s) {
             main.child(conversation(s, p, wide, main_width))
                 .child(captain_ui::earlier_bar(s, p, wide, main_width))
@@ -958,6 +964,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     );
     let mut root = col()
         .key("workspace-root")
+        .focusable(false)
+        .on_press(|s: &mut State| s.composer_ui.scope_focused.set(false))
         .on_layout(|s: &mut State, rect| {
             s.viewport_width = rect[2];
             s.viewport_height = rect[3];
@@ -1023,6 +1031,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.machines.picker {
         root = root.child(machine_picker(s, p));
     }
+    if s.composer_ui.overflow.get() {
+        root = root.child(composer_ui::overflow_menu(s, p));
+    }
     if s.machines.dialog {
         root = root.child(machine_dialog(s, p));
     }
@@ -1051,11 +1062,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         });
         root = root.child(crew_ui::attention_menu(s, p, pane));
     }
+    root = root.child(composer_ui::measurement_probes(s, p));
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
         _ => root.w_full().h_full(),
     };
     el().key("zoom-frame")
+        .on_paste_content(composer_ui::paste)
         .w_full()
         .h_full()
         .fill(p.bg)
@@ -1156,7 +1169,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             "Model {name}, reasoning {effort}. Change model or reasoning"
         ))
         .help(t.model.clone())
-        .focusable(!locked)
+        .preserve_focus_on_press(true)
         .center_y()
         .gap(7.0)
         .h(28.0)
@@ -1171,6 +1184,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         .press(p.selected);
     if !locked {
         trigger = trigger.on_press(|s: &mut State| {
+            s.begin_composer_menu();
             s.settings_picker = Some(SettingsPicker::Thinking);
             s.thinking_drag = None;
             s.refresh_catalog();
@@ -1193,7 +1207,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         .child(if both_default {
             el()
         } else {
-            pixel_text(effort, p.muted)
+            pixel_text(effort, p.muted).truncate().shrink().min_w(0.0)
         })
 }
 
@@ -1251,10 +1265,17 @@ fn settings_picker(s: &State, p: Palette) -> El {
         card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
             SMALL, p.muted).key("native-catalog-error").wrap_anywhere().px(16.0).py(8.0));
     }
+    card = card
+        .child(rule(p))
+        .child(composer_ui::permissions_section(s, p));
     // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
     // layer draws over the page and shifts the card to stay inside the window.
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
-        .modal(true, |s: &mut State| s.settings_picker = None)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.settings_picker = None;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
@@ -4026,7 +4047,7 @@ fn relative_time(updated: u64) -> Option<String> {
 /// `BranchToolbarEnvironmentSelector` (`ComposerControl` size `xs`) for the trigger and
 /// `ModelPickerContent` for the searchable popover with a trailing creation action.
 /// Captains are Shina-only (KSG Code has no captains).
-fn captain_selector_trigger(s: &State, p: Palette) -> El {
+fn captain_selector_trigger(s: &State, p: Palette, icon_only: bool) -> El {
     let t = s.current();
     let active = t.captain.and_then(|id| s.captains.get(id).map(|c| (id, c)));
     let locked = t.status.busy() || t.configuring || t.archived() || !t.is_draft();
@@ -4057,8 +4078,10 @@ fn captain_selector_trigger(s: &State, p: Palette) -> El {
         })
         .opacity(if locked { 0.65 } else { 1.0 })
         .disabled(locked);
+    trigger = trigger.preserve_focus_on_press(true);
     if !locked {
         trigger = trigger.on_press(|s: &mut State| {
+            s.begin_composer_menu();
             s.captain_picker = !s.captain_picker;
             if s.captain_picker {
                 s.captain_project = Some(s.current().project);
@@ -4074,13 +4097,15 @@ fn captain_selector_trigger(s: &State, p: Palette) -> El {
     };
     trigger
         .child(lead)
-        .child(
+        .child(if icon_only {
+            el()
+        } else {
             label(title, SMALL, if active.is_some() { p.ink } else { p.muted })
                 .key("captain-selector-label")
                 .truncate()
                 .shrink()
-                .min_w(0.0),
-        )
+                .min_w(0.0)
+        })
         .child(icon("chevron", p.muted).size(12.0, 12.0))
 }
 
@@ -4181,7 +4206,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                 let project = s.current().project;
                 s.new_thread_in(project);
             }
-            s.current_mut().draft.focused = true;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
         })
         .child(icon("user", p.muted).size(16.0, 16.0))
         .child(
@@ -4293,8 +4318,21 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .child(label("New captain", TextStyle::new(13.5, 450.0), p.ink));
     card = card.child(col().py(4.0).child(new_captain));
 
-    card.anchored_fit("captain-selector", rune::Side::Top, rune::Align::Start, 6.0)
-        .modal(true, |s: &mut State| s.cancel_captain_flow())
+    card.anchored_fit(
+        if s.composer_ui.visible_blocks.get() < 2 {
+            "composer-overflow"
+        } else {
+            "captain-selector"
+        },
+        rune::Side::Top,
+        rune::Align::Start,
+        6.0,
+    )
+    .focus_return("composer-input")
+    .modal(true, |s: &mut State| {
+        s.cancel_captain_flow();
+        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+    })
 }
 
 /// A portrait's cell in the captain editor's grid: the 40 pt face and 4 pt each side.
@@ -7443,6 +7481,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
     col()
         .key(format!("conversation-{}", t.id))
+        .animated_changes()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec {
@@ -8433,6 +8472,8 @@ fn composer(
     caret_edges: Option<[bool; 2]>,
 ) -> El {
     let t = s.current();
+    let lane = lane_width(pane_width, wide);
+    let collapsed = composer_ui::collapsed(s, s.composer_ui.viewport.get(), lane - 32.0);
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
         area = area.child(pi_ui::notifications(s, p));
@@ -8500,6 +8541,7 @@ fn composer(
         && (t.phase != "Stopping" || t.queued_edit.is_some())
         && !t.queued_edit_saving()
         && !t.resume_pending()
+        && (!collapsed || !t.status.busy())
         && (t.has_draft_content() || show_resume);
     let mut send = el()
         .key("send-message")
@@ -8558,11 +8600,26 @@ fn composer(
             s.current_mut().native.follow_up = previous;
         });
     }
-    let mut action = row().gap(8.0).center_y();
-    if !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+    let [action_x, mut action_y] = composer_ui::anchor_offset(s, 1, true);
+    if !collapsed {
+        action_y -= composer_ui::footer_offset(s);
+    }
+    let mut action = composer_ui::bind_anchor(
+        s,
+        1,
+        row()
+            .key("composer-transition-actions")
+            .offset(action_x, action_y)
+            .gap(8.0)
+            .center_y(),
+    );
+    if collapsed || !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
         action = action.child(send);
     }
-    if !s.demo && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some()) {
+    if !collapsed
+        && !s.demo
+        && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some())
+    {
         action = action.child(framed(
             el().key("stop-agent")
                 .role("button")
@@ -8592,7 +8649,6 @@ fn composer(
         || t.request.is_some();
     // Delegation context sits above the composer, nearest first: who sent this worker, then
     // what the crew needs from the user, then what it is doing.
-    let lane = lane_width(pane_width, wide);
     for part in [
         crew_ui::parent_bar(s, p, lane),
         crew_ui::needs_you(s, p),
@@ -8608,15 +8664,7 @@ fn composer(
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
     // A composer that cannot send has nothing to act on, so it drops the hard shadow. Its frame
     // keeps the same 2 px shape in the lighter `line` colour, so the box does not change size.
-    let composer_disabled = composer_disabled(s);
-    let mut card = col()
-        .key("composer")
-        .radius(6.0)
-        .fill(p.card)
-        .border(2.0, composer_frame(s, p));
-    if !composer_disabled {
-        card = card.box_shadow(hard_shadow(p));
-    }
+    let mut card = col().key("composer-natural").w_full();
     card = card
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
@@ -8624,9 +8672,12 @@ fn composer(
             s.checkpoint();
         })
         .on_drop_hover(|s: &mut State, over, _| s.attachment_drop_hover = over);
-    if !t.draft_images.is_empty() {
+    if !collapsed && !t.draft_images.is_empty() {
         let mut tray = row()
             .key("composer-attachments")
+            .keeps_text_selection()
+            .on_key(composer_ui::control_key)
+            .opacity(composer_ui::image_arrival(s, false))
             .gap(8.0)
             .flex_wrap()
             .px(12.0)
@@ -8644,106 +8695,187 @@ fn composer(
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
     let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
-    let field = text_input(&t.draft, composer_style)
-        .key("composer-input")
-        .label(format!(
-            "Message {}",
-            match t.harness.as_str() {
-                "pi" => "Pi",
-                "codex" => "Codex",
-                "claude" => "Claude",
-                id => s
-                    .harnesses
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == id)
-                    .map_or("agent", |agent| agent.name.as_str()),
-            }
-        ))
-        .placeholder(
-            if s.demo {
-                "Open a real workspace to send messages".to_string()
-            } else if let Some(machine) = s.unreachable_selected() {
-                format!("{machine} is unreachable. Reconnecting.")
-            } else {
-                "Ask anything. Shift Enter for a new line".to_string()
-            },
-            p.muted,
-        )
-        .color(p.ink)
-        .pill_colors(p.selected, Some(p.ink))
-        .pill_icon(composer_menu::pill_icon)
-        .rich_style(rune::RichStyle {
-            code_fg: Some(p.ink),
-            code_bg: p.code_bg,
-            code_block_bg: p.code_bg,
-            link: p.ink,
-            quote_bar: p.muted,
-            marker: Some(p.muted),
-        })
-        .caret(p.coral, p.coral_bg)
-        .w_full()
-        .min_h(COMPOSER_FIELD_MIN)
-        .padding(COMPOSER_FIELD_PAD)
-        .on_edit(|s: &mut State| {
-            s.current_mut().native.slash_index = 0;
-            &mut s.current_mut().draft
-        })
-        .on_input_key(move |s: &mut State, event, tx| {
-            if pi_ui::composer_pi_key(s, event, tx, caret_edges) {
-                composer_menu::scroll_selected(s, tx);
-                return true;
-            }
-            if event.is_command('v') && event.mods.shift && !event.mods.alt {
-                let id = s.current().id;
-                let machine = s.machines.selected.clone();
-                tx.read_clipboard(move |s: &mut State, content, _| {
-                    if s.machines.selected != machine {
-                        return;
-                    }
-                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
-                        t.draft.insert(content.text());
-                    }
-                    s.checkpoint();
-                });
-                return true;
-            }
-            let t = s.current_mut();
-            if t.paste_history
-                .key(&mut t.draft, &mut t.draft_images, event)
-            {
+    let blank_preview = rune::TextEdit::default();
+    let field = text_input(
+        if collapsed && t.draft.text.trim().is_empty() {
+            &blank_preview
+        } else {
+            &t.draft
+        },
+        composer_style,
+    )
+    .key("composer-input")
+    .label(format!(
+        "Message {}",
+        match t.harness.as_str() {
+            "pi" => "Pi",
+            "codex" => "Codex",
+            "claude" => "Claude",
+            id => s
+                .harnesses
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map_or("agent", |agent| agent.name.as_str()),
+        }
+    ))
+    .placeholder(
+        if s.demo {
+            "Open a real workspace to send messages".to_string()
+        } else if let Some(machine) = s.unreachable_selected() {
+            format!("{machine} is unreachable. Reconnecting.")
+        } else if collapsed {
+            "Ask anything...".to_string()
+        } else {
+            "Ask anything. Shift Enter for a new line".to_string()
+        },
+        p.muted,
+    )
+    .color(p.ink)
+    .pill_colors(p.selected, Some(p.ink))
+    .pill_icon(composer_menu::pill_icon)
+    .rich_style(rune::RichStyle {
+        code_fg: Some(p.ink),
+        code_bg: p.code_bg,
+        code_block_bg: p.code_bg,
+        link: p.ink,
+        quote_bar: p.muted,
+        marker: Some(p.muted),
+    })
+    .caret(p.coral, p.coral_bg)
+    .w_full()
+    .min_h(COMPOSER_FIELD_MIN)
+    .padding(COMPOSER_FIELD_PAD)
+    .on_edit(|s: &mut State| {
+        s.current_mut().native.slash_index = 0;
+        &mut s.current_mut().draft
+    })
+    .on_input_key(move |s: &mut State, event, tx| {
+        composer_ui::control_key(s, event, tx);
+        if pi_ui::composer_pi_key(s, event, tx, caret_edges) {
+            composer_menu::scroll_selected(s, tx);
+            return true;
+        }
+        if event.is_command('v') && event.mods.shift && !event.mods.alt {
+            let id = s.current().id;
+            let machine = s.machines.selected.clone();
+            tx.read_clipboard(move |s: &mut State, content, _| {
+                if s.machines.selected != machine {
+                    return;
+                }
+                if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                    t.draft.insert(content.text());
+                }
                 s.checkpoint();
-                return true;
-            }
-            let t = s.current_mut();
-            t.composer_rules.key(&mut t.draft, event)
-        })
-        .on_input_change(|s: &mut State, _| {
-            composer_menu::clear_dismissed_if_changed(s);
-            let t = s.current_mut();
-            t.composer_rules.changed(&mut t.draft);
-            t.typing_guard.on_type(std::time::Instant::now());
-            t.update_submission_error();
-            s.ensure_composer_commands();
-        })
-        .on_input_paste(|s: &mut State, content, _| {
-            let has_image = content.image().is_some();
-            if let Some(image) = content.image() {
-                s.attach_image("Pasted image.png", image.png());
-            }
-            if !content.files().is_empty() {
-                s.attach_paths(content.files());
-            }
-            if !content.text().is_empty() && !has_image && content.files().is_empty() {
-                return s.fold_paste(content.text());
-            }
-            (has_image || !content.files().is_empty()) && content.text().is_empty()
-        })
-        .on_submit(|s: &mut State, _| {
-            if !s.demo && !s.current().archived() {
-                s.send();
-            }
-        });
+            });
+            return true;
+        }
+        let t = s.current_mut();
+        if t.paste_history
+            .key(&mut t.draft, &mut t.draft_images, event)
+        {
+            s.checkpoint();
+            return true;
+        }
+        let t = s.current_mut();
+        t.composer_rules.key(&mut t.draft, event)
+    })
+    .on_input_change(|s: &mut State, _| {
+        composer_ui::changed(s);
+    })
+    .on_input_paste(|s: &mut State, content, _| {
+        let has_image = content.image().is_some();
+        if let Some(image) = content.image() {
+            s.attach_image("Pasted image.png", image.png());
+        }
+        if !content.files().is_empty() {
+            s.attach_paths(content.files());
+        }
+        if !content.text().is_empty() && !has_image && content.files().is_empty() {
+            return s.fold_paste(content.text());
+        }
+        (has_image || !content.files().is_empty()) && content.text().is_empty()
+    })
+    .on_submit(|s: &mut State, _| {
+        if !s.demo && !s.current().archived() {
+            s.send();
+        }
+    });
+    if collapsed {
+        // KSG's CollapsedComposerPromptPreview is inert. Reuse the real pill renderer without
+        // edit handlers or focus, so files, skills and thread chips have exactly the editor's ink.
+        let mut preview = row()
+            .key("composer-collapsed-row")
+            .center_y()
+            .gap(8.0)
+            .px(12.0)
+            .py(8.0)
+            .child(
+                el().key("composer-preview")
+                    .role("button")
+                    .label(if t.draft.text.trim().is_empty() {
+                        "Expand composer. Ask anything...".to_owned()
+                    } else {
+                        format!("Expand composer. {}", t.draft.display().0)
+                    })
+                    .cursor(rune::Cursor::Pointer)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .clip_rounded(0.0)
+                    .preserve_focus_on_press(true)
+                    .on_press(|s: &mut State| {
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                    })
+                    .child(composer_ui::prompt_surface(
+                        s,
+                        field.single_line().padding(0.0).h(28.0).min_h(0.0).inert(),
+                        true,
+                    )),
+            );
+        for image in t.draft_images.iter().take(3) {
+            preview = preview.child(
+                image_preview(
+                    s,
+                    p,
+                    image,
+                    24.0,
+                    24.0,
+                    format!("resting-attachment-{}", image.id),
+                )
+                .opacity(composer_ui::image_arrival(s, true))
+                .role("button")
+                .label(format!("Expand composer. {}", image.name))
+                .preserve_focus_on_press(true)
+                .on_press(|s: &mut State| {
+                    s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                }),
+            );
+        }
+        if t.draft_images.len() > 3 {
+            preview = preview.child(button(
+                "resting-attachments-more",
+                &format!("+{}", t.draft_images.len() - 3),
+                p,
+                |s| s.restore_composer_focus(composer_ui::FocusReason::Explicit),
+            ));
+        }
+        preview = preview.child(attach_control(attach_locked, p));
+        if context_ring_shown(t) {
+            preview = preview.child(context_ring(t, p));
+        }
+        preview = preview.child(action);
+        let controls = composer_ui::controls(s, p, lane - 32.0, true, locked);
+        return col()
+            .key("composer-lane")
+            .w_full()
+            .px(lane_gutter(pane_width))
+            .items_center()
+            .child(area.child(composer_ui::frame_card(
+                s,
+                p,
+                card.child(preview).child(controls),
+            )));
+    }
     card = card.child(
         col()
             .key("composer-body")
@@ -8752,10 +8884,11 @@ fn composer(
             .pt(10.0)
             .pb(2.0)
             // A press in the body's padding still lands in the field, as KSG's surface does.
-            .on_press_tx(|_: &mut State, tx| tx.focus("composer-input", false))
+            .on_press(|s: &mut State| s.restore_composer_focus(composer_ui::FocusReason::Explicit))
             // The field inside is the Tab stop, not this.
             .focusable(false)
-            .child(
+            .child(composer_ui::prompt_surface(
+                s,
                 col()
                     .key("composer-scroll")
                     .w_full()
@@ -8768,10 +8901,15 @@ fn composer(
                     // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
                     .scroll_margin(4.0)
                     .child(field),
-            ),
+                false,
+            )),
     );
+    let [model_x, model_y] = composer_ui::anchor_offset(s, 3, true);
     let mut actions = row()
         .key("composer-actions")
+        .offset(0.0, composer_ui::footer_offset(s))
+        .on_key(composer_ui::control_key)
+        .keeps_text_selection()
         .center_y()
         .gap(2.0)
         .px(8.0)
@@ -8782,7 +8920,12 @@ fn composer(
                 .radius(4.0),
         )
         .child(spacer())
-        .child(model_effort_trigger(s, p, narrow, locked));
+        .child(composer_ui::bind_anchor(
+            s,
+            3,
+            model_effort_trigger(s, p, narrow, locked)
+                .offset(model_x, model_y - composer_ui::footer_offset(s)),
+        ));
     if t.status.busy() && t.has_draft_content() && t.queued_edit.is_none() {
         actions = actions.child(
             button(
@@ -8813,7 +8956,11 @@ fn composer(
                 .child(label(error, SMALL, p.danger).wrap().selectable(true)),
         );
     }
-    area = area.child(card.child(actions.child(action.ml(4.0))));
+    area = area.child(composer_ui::frame_card(
+        s,
+        p,
+        card.child(actions.child(action.ml(4.0))),
+    ));
     // KSG Code's context strip: a bare muted row under the card, machine on the left and the
     // access mode on the right, inset to line up with the card's controls.
     let mut footer = row()
@@ -8845,16 +8992,7 @@ fn composer(
                     .child(pixel_text("Open a real workspace", p.sea)),
             )
     } else {
-        footer
-            .child(machine_selector(s, p))
-            .child(captain_selector_trigger(s, p))
-            .child(spacer())
-            .child(
-                pixel_button("access-mode", t.native.access.label(), p, |s| {
-                    s.current_mut().native.access_picker = true
-                })
-                .disabled(t.status.busy() || t.configuring || t.archived()),
-            )
+        composer_ui::controls(s, p, lane - 20.0, false, locked)
     };
     area = area.child(footer);
     col()
@@ -8866,7 +9004,7 @@ fn composer(
 }
 
 /// Ported from KSG Code's BranchToolbarEnvironmentSelector and ComposerControl size="xs".
-fn machine_selector(s: &State, p: Palette) -> El {
+fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
     let title = s.machine_label(&s.machines.selected);
     row()
         .key("machine-selector")
@@ -8884,10 +9022,13 @@ fn machine_selector(s: &State, p: Palette) -> El {
         .shrink()
         .radius(4.0)
         .hover(p.selected)
-        .focusable(true)
+        .preserve_focus_on_press(true)
         .cursor(rune::Cursor::Pointer)
         .disabled(s.client.is_none() || !s.can_retarget_draft())
-        .on_press(|s: &mut State| s.machines.picker = !s.machines.picker)
+        .on_press(|s: &mut State| {
+            s.begin_composer_menu();
+            s.machines.picker = !s.machines.picker;
+        })
         .child(
             icon(
                 if s.machines.selected == "local" {
@@ -8899,13 +9040,15 @@ fn machine_selector(s: &State, p: Palette) -> El {
             )
             .size(12.0, 12.0),
         )
-        .child(
+        .child(if icon_only {
+            el()
+        } else {
             label(title, SMALL, p.muted)
                 .key("machine-selector-label")
                 .truncate()
                 .shrink()
-                .min_w(0.0),
-        )
+                .min_w(0.0)
+        })
         .child(icon("chevron", p.muted).size(12.0, 12.0))
 }
 
@@ -8965,6 +9108,7 @@ fn machine_picker(s: &State, p: Palette) -> El {
             machine_option(&key, &title, &server, s.machine_connected(&server), p).on_press(
                 move |s: &mut State| {
                     s.retarget_draft(&server);
+                    s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
                 },
             ),
         );
@@ -8975,8 +9119,21 @@ fn machine_picker(s: &State, p: Palette) -> El {
             s.machines.dialog = true;
         }),
     );
-    menu.anchored_fit("machine-selector", rune::Side::Top, rune::Align::Start, 6.0)
-        .modal(true, |s: &mut State| s.machines.picker = false)
+    menu.anchored_fit(
+        if s.composer_ui.visible_blocks.get() == 0 {
+            "composer-overflow"
+        } else {
+            "machine-selector"
+        },
+        rune::Side::Top,
+        rune::Align::Start,
+        6.0,
+    )
+    .focus_return("composer-input")
+    .modal(true, |s: &mut State| {
+        s.machines.picker = false;
+        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+    })
 }
 
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
@@ -9512,6 +9669,408 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn resting_composer_collapses_only_below_sm_and_expands_on_press() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("A single line");
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(
+                rt.presented("composer-preview").is_some(),
+                width < 640.0,
+                "{width}"
+            );
+            if width < 640.0 {
+                press(&mut rt, "composer-preview");
+                rt.frame(1.0);
+                assert!(rt.state.current().draft.focused);
+                assert!(rt.presented("composer-preview").is_none());
+            }
+            assert!(rt.presented("composer-input").is_some());
+        }
+    }
+
+    #[test]
+    fn opening_a_thread_restores_the_composer_caret() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("Existing draft");
+            rt.state.new_thread();
+            rt.state.current_mut().draft.focused = false;
+            rt.state.select_thread(0);
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(rt.state.current().draft.focused, "{width}");
+        }
+    }
+
+    #[test]
+    fn timeline_typing_and_paste_redirect_but_controls_and_open_layers_keep_input() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.frame(0.0);
+            rt.frame(1.0);
+            tap(&mut rt, rune::Key::Text("x".into()));
+            assert_eq!(rt.state.current().draft.text, "x", "{width}");
+            assert!(rt.state.current().draft.focused);
+            rt.state.current_mut().draft.focused = false;
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.paste(" pasted");
+            rt.frame(1.0);
+            assert_eq!(rt.state.current().draft.text, "x pasted", "{width}");
+
+            for key in [
+                "sidebar-search",
+                "model-search",
+                "captain-search",
+                "secret",
+                "reply-input",
+                "settings-search",
+                "access-mode",
+                "model-effort",
+                "send-message",
+            ] {
+                assert!(
+                    !composer_ui::redirect_allowed(&rt.state, Some(key)),
+                    "{key}"
+                );
+            }
+            let layers: &[fn(&mut State)] = &[
+                |s| s.settings_menu = true,
+                |s| s.settings_picker = Some(SettingsPicker::Thinking),
+                |s| s.captain_picker = true,
+                |s| s.project_picker = Some(ProjectPicker::NewThread),
+                |s| s.rename_thread = Some(s.current().id),
+                |s| s.delete_thread = Some(s.current().id),
+                |s| s.thread_menu = true,
+                |s| s.attention_menu = true,
+                |s| s.machines.picker = true,
+                |s| s.machines.dialog = true,
+                |s| s.projects.clone_open = true,
+                |s| s.fleet.open = true,
+                |s| s.brief.profile_open = true,
+                |s| s.brief.confirm_reset = true,
+                |s| s.composer_ui.overflow.set(true),
+                |s| s.current_mut().native.access_picker = true,
+                |s| s.current_mut().request = Some(json!({"id":"secret", "type":"input"})),
+            ];
+            for (index, open) in layers.iter().enumerate() {
+                let mut state = State::new(".".into(), false);
+                open(&mut state);
+                assert!(
+                    !composer_ui::redirect_allowed(&state, None),
+                    "{width}, layer {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_composer_never_collapses_and_restoration_keeps_model_picker_focus() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("First line\nSecond line");
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(rt.presented("composer-preview").is_none());
+            assert!(rt.presented("composer-input").is_some());
+            for reason in [
+                composer_ui::FocusReason::ThreadOpened,
+                composer_ui::FocusReason::AttachmentInserted,
+                composer_ui::FocusReason::MenuClosed,
+                composer_ui::FocusReason::Inserted,
+            ] {
+                rt.state.settings_picker = Some(SettingsPicker::Thinking);
+                rt.state.current_mut().draft.focused = false;
+                rt.state.restore_composer_focus(reason);
+                assert!(!rt.state.current().draft.focused, "{width}, {reason:?}");
+                rt.state.settings_picker = None;
+                rt.state.restore_composer_focus(reason);
+                rt.invalidate();
+                rt.frame(1.0);
+                assert!(rt.state.current().draft.focused, "{width}, {reason:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resting_width_resolver_and_every_reachable_overflow_layout_fit_at_all_widths() {
+        use composer_ui::ControlsLayout;
+        for viewport in [620.0, 960.0, 1280.0, 1920.0] {
+            for resting in [false, true] {
+                let mut rt = Runtime::with_text(
+                    State::new(".".into(), false),
+                    |s, cx| {
+                        composer_ui::measure(s, cx);
+                        let mut root = col()
+                            .w(s.viewport_width + if s.show_archive { 32.0 } else { 20.0 })
+                            .child(composer_ui::controls(
+                                s,
+                                palette(false),
+                                s.viewport_width,
+                                s.show_archive,
+                                false,
+                            ))
+                            .child(composer_ui::measurement_probes(s, palette(false)));
+                        if s.composer_ui.overflow.get() {
+                            root = root.child(composer_ui::overflow_menu(s, palette(false)));
+                        }
+                        root
+                    },
+                    (viewport, 720.0),
+                    Env::new(false, 1.0),
+                    rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+                );
+                rt.state.show_archive = resting;
+                rt.state.current_mut().native.access = crate::model::AccessMode::Supervised;
+                rt.state.viewport_width = 580.0;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let m = rt.state.composer_ui.measurement.get().unwrap_or_else(|| {
+                    panic!(
+                        "measured controls: {:?}",
+                        rt.elements()
+                            .into_iter()
+                            .filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("measure-")))
+                            .map(|e| (e.key, e.rect))
+                            .collect::<Vec<_>>()
+                    )
+                });
+                let fixed = if resting { m[0] } else { 0.0 };
+                let blocks = [m[1], m[2], if resting { m[6] } else { m[3] }];
+                let icons = [m[4], m[5], m[6]];
+                let width_at = |step: usize| {
+                    let hidden = step.saturating_sub(3);
+                    let compact = step.min(3);
+                    fixed
+                        + (0..3 - hidden)
+                            .map(|i| {
+                                if i >= 3 - compact {
+                                    icons[i]
+                                } else {
+                                    blocks[i]
+                                }
+                            })
+                            .sum::<f32>()
+                        + if hidden > 0 { 28.0 } else { 0.0 }
+                        + 4.0 * (3 - hidden + usize::from(hidden > 0)) as f32
+                };
+                for step in 0..=6 {
+                    // Equal-width steps have no distinct arrangement. In particular, replacing
+                    // a 28 px access icon with a 28 px overflow trigger saves no width.
+                    if step > 0 && width_at(step - 1) - width_at(step) < 0.5 {
+                        continue;
+                    }
+                    let host = width_at(step) + 0.1;
+                    rt.state.viewport_width = host;
+                    rt.state.composer_ui.layout.set(ControlsLayout {
+                        visible: true,
+                        ..Default::default()
+                    });
+                    rt.invalidate();
+                    rt.frame(1.0);
+                    let layout = rt.state.composer_ui.layout.get();
+                    assert_eq!(
+                        layout.hidden,
+                        step.saturating_sub(3),
+                        "{viewport}/{resting}/{step}"
+                    );
+                    assert_eq!(layout.icons, step.min(3), "{viewport}/{resting}/{step}");
+                    assert_eq!(
+                        rt.presented("machine-selector").is_some(),
+                        layout.hidden < 3
+                    );
+                    assert_eq!(
+                        rt.presented("captain-selector").is_some(),
+                        layout.hidden < 2
+                    );
+                    assert_eq!(rt.presented("access-mode").is_some(), layout.hidden == 0);
+                    let (footer, _) = rt.presented("composer-footer").unwrap();
+                    let mut right = footer[0];
+                    for key in [
+                        "model-effort",
+                        "machine-selector",
+                        "captain-selector",
+                        "access-mode",
+                        "composer-overflow",
+                    ] {
+                        if let Some((rect, _)) = rt.presented(key) {
+                            assert!(
+                                rect[0] >= right - 0.5
+                                    && rect[0] + rect[2] <= footer[0] + footer[2] + 0.5,
+                                "{viewport}/{resting}/{step}: {key} {rect:?} in {footer:?}"
+                            );
+                            right = rect[0] + rect[2];
+                        }
+                    }
+                    if layout.hidden > 0 {
+                        assert!(rt.presented("composer-overflow").is_some());
+                        rt.state.composer_ui.overflow.set(true);
+                        rt.invalidate();
+                        rt.frame(1.0);
+                        assert!(rt.presented("overflow-access-read-only").is_some());
+                        assert_eq!(
+                            rt.presented("overflow-machine").is_some(),
+                            layout.hidden == 3
+                        );
+                        assert_eq!(
+                            rt.presented("overflow-captain").is_some(),
+                            layout.hidden >= 2
+                        );
+                        rt.state.composer_ui.overflow.set(false);
+                    }
+                }
+            }
+        }
+        // KSG demotes immediately, but requires one spare pixel to promote.
+        let previous = ControlsLayout {
+            hidden: 0,
+            icons: 1,
+            visible: true,
+        };
+        assert_eq!(
+            composer_ui::resolve(124.0, 80.0, 52.0, &[40.0], &[20.0], 28.0, 4.0, previous).icons,
+            1
+        );
+        assert_eq!(
+            composer_ui::resolve(125.0, 80.0, 52.0, &[40.0], &[20.0], 28.0, 4.0, previous).icons,
+            0
+        );
+    }
+
+    #[test]
+    fn resting_transition_retargets_its_displayed_height_and_never_changes_the_caret() {
+        let mut transition = composer_ui::RestingTransition::default();
+        transition.retarget(0.0, 80.0, true, 200);
+        assert_eq!(transition.duration, 0.0, "initial layout does not animate");
+        transition.retarget(1.0, 120.0, false, 200);
+        assert_eq!(transition.height(1.0), 80.0);
+        let halfway = transition.height(1.1);
+        assert!(halfway > 100.0 && halfway < 120.0);
+        transition.retarget(1.1, 80.0, true, 200);
+        assert!((transition.height(1.1) - halfway).abs() < 0.001);
+        assert!((transition.height(1.3) - 80.0).abs() < 0.001);
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.poll = Some(|s, now, tx| composer_ui::tick(s, now, tx));
+            rt.state.preferences.panel_animation_duration_ms = 200;
+            rt.state.current_mut().draft.replace_text("A draft");
+            rt.frame(0.0);
+            rt.frame(0.1);
+            let old_action = rt.presented("send-message").unwrap().0;
+            rt.state
+                .restore_composer_focus(composer_ui::FocusReason::Explicit);
+            rt.invalidate();
+            rt.frame(0.01);
+            if width < 640.0 {
+                let action = rt.presented("send-message").unwrap().0;
+                assert!(
+                    (action[0] - old_action[0]).abs() < 1.0
+                        && (action[1] - old_action[1]).abs() < 1.0,
+                    "the action starts at its displayed position: {old_action:?} {action:?}, {}, {:?}",
+                    composer_ui::motion_debug(&rt.state),
+                    rt.elements()
+                        .into_iter()
+                        .filter(|e| e.key.as_deref().is_some_and(|k| [
+                            "composer-lane",
+                            "composer-transition-slot",
+                            "composer",
+                            "composer-natural",
+                            "composer-actions",
+                            "composer-transition-actions"
+                        ]
+                        .contains(&k)))
+                        .map(|e| (e.key, e.rect, e.target, e.moving))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let lane_height = rt.presented("composer-lane").unwrap().0[3];
+            rt.frame(0.05);
+            assert!(
+                (rt.presented("composer-lane").unwrap().0[3] - lane_height).abs() < 0.5,
+                "{width}: the overlay publishes only its destination height"
+            );
+            assert!(rt.state.current().draft.focused, "{width}");
+            let interrupted_action = rt.presented("send-message").unwrap().0;
+            rt.state.current_mut().draft.focused = false;
+            rt.invalidate();
+            rt.frame(0.0);
+            let action = rt.presented("send-message").unwrap().0;
+            assert!(
+                (action[0] - interrupted_action[0]).abs() < 1.0
+                    && (action[1] - interrupted_action[1]).abs() < 1.0,
+                "{width}: an interrupted transition preserves the displayed action"
+            );
+            rt.state
+                .restore_composer_focus(composer_ui::FocusReason::Explicit);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.3);
+            assert!(rt.state.current().draft.focused, "{width}");
+            assert!(rt.presented("composer-input").is_some());
+        }
+    }
+
+    #[test]
+    fn attachments_and_menu_dismissals_restore_focus_but_picker_search_keeps_its_input() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.state.current_mut().draft.replace_text("Original draft");
+            rt.state.attach_image("focus.png", &ui_png(2));
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(rt.state.current().draft.focused, "{width}: attachment");
+            press(&mut rt, "model-effort");
+            rt.state.settings_picker = Some(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(1.0);
+            tap(&mut rt, rune::Key::Text("query".into()));
+            rt.paste(" paste");
+            rt.frame(1.0);
+            assert_eq!(rt.state.model_search.text, "query paste", "{width}");
+            assert_eq!(rt.state.current().draft.text, "Original draft");
+            tap(&mut rt, rune::Key::Escape);
+            assert!(rt.state.current().draft.focused, "{width}: model menu");
+            rt.state.open_captain_selector();
+            rt.invalidate();
+            rt.frame(1.0);
+            tap(&mut rt, rune::Key::Text("captain".into()));
+            assert_eq!(rt.state.captain_picker_query.text, "captain", "{width}");
+            assert_eq!(rt.state.current().draft.text, "Original draft");
+            tap(&mut rt, rune::Key::Escape);
+            assert!(rt.state.current().draft.focused, "{width}: captain menu");
+        }
+    }
+
+    #[test]
+    fn tab_inside_the_expanded_composer_keeps_its_controls_mounted() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            tap(&mut rt, rune::Key::Tab);
+            assert_eq!(focused_key(&rt).as_deref(), Some("attach-image"), "{width}");
+            assert!(rt.presented("composer-preview").is_none(), "{width}");
+            for _ in 0..20 {
+                if focused_key(&rt).as_deref() == Some("access-mode") {
+                    break;
+                }
+                tap(&mut rt, rune::Key::Tab);
+            }
+            assert_eq!(focused_key(&rt).as_deref(), Some("access-mode"), "{width}");
+            tap(&mut rt, rune::Key::Tab);
+            assert!(focused_key(&rt).is_some(), "{width}: leaving the footer");
+        }
+    }
+
     fn finish_folder_listing(rt: &mut Runtime<State>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
@@ -10004,12 +10563,18 @@ pub(crate) mod tests {
                 rt.state.populate_demo();
                 rt.state.demo = false;
                 rt.state.dark = dark;
+                rt.state.composer_ui.force_expanded = true;
                 rt.frame(0.0);
                 rt.frame(1.0);
                 let p = palette(dark);
                 assert!(!rt.state.current().draft.focused);
                 assert_eq!(composer_frame(&rt.state, p), p.frame, "{width}");
-                tab_to(&mut rt, "composer-input");
+                if rt.presented("composer-preview").is_some() {
+                    tab_to(&mut rt, "composer-preview");
+                    tap(&mut rt, rune::Key::Enter);
+                } else {
+                    tab_to(&mut rt, "composer-input");
+                }
                 assert!(rt.state.current().draft.focused, "{width}: Tab focus");
                 assert_eq!(composer_frame(&rt.state, p), p.coral, "{width}");
                 tab(&mut rt);
@@ -10025,15 +10590,19 @@ pub(crate) mod tests {
                 let mut rt = runtime(width);
                 rt.state.populate_demo();
                 rt.state.demo = false;
+                rt.state.composer_ui.force_expanded = true;
                 if empty {
                     rt.state.new_thread_in(None);
                 }
+                // Thread-open restoration starts at the editor. This test walks visual order
+                // from the window's first control, independently of that restoration policy.
+                rt.state.current_mut().draft.focused = false;
                 rt.frame(0.0);
                 rt.frame(1.0);
                 let stops: Vec<String> = rt
                     .elements()
                     .into_iter()
-                    .filter(|e| e.focusable && e.visible[2] > 0.0 && e.visible[3] > 0.0)
+                    .filter(|e| !e.inert && e.focusable && e.visible[2] > 0.0 && e.visible[3] > 0.0)
                     .filter_map(|e| e.key)
                     .collect();
                 let mut seen: Vec<rune::ElementInfo> = Vec::new();
@@ -10057,7 +10626,12 @@ pub(crate) mod tests {
                 for key in ["send-message", "composer-body", "machine-selector"] {
                     assert!(!keys.contains(&key), "{width}/{empty}: Tab stops on {key}");
                 }
-                for key in ["composer-input", "attach-image", "model-effort"] {
+                let prompt = if rt.presented("composer-preview").is_some() {
+                    "composer-preview"
+                } else {
+                    "composer-input"
+                };
+                for key in [prompt, "attach-image", "model-effort"] {
                     assert!(keys.contains(&key), "{width}/{empty}: Tab misses {key}");
                 }
                 // Visual order: the title strip, then the sidebar, then the pane, each top to
@@ -10818,6 +11392,12 @@ pub(crate) mod tests {
     }
     pub(super) fn press(rt: &mut Runtime<State>, key: &str) {
         rt.frame(0.25);
+        if key == "composer-input" && rt.presented("composer-preview").is_some() {
+            let (x, y) = rt.find("composer-preview").expect("collapsed composer");
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.0);
+        }
         let (x, y) = rt
             .find(key)
             .unwrap_or_else(|| panic!("{key} is not on screen"));
@@ -11334,6 +11914,7 @@ pub(crate) mod tests {
             t.status = Status::Running;
             t.run_id = Some("run-a".into());
             t.draft.replace_text("Follow-up");
+            t.draft.focused = true;
             rt.frame(0.0);
             assert!(
                 rt.accessibility_json()
@@ -11392,6 +11973,7 @@ pub(crate) mod tests {
             let t = rt.state.current_mut();
             t.pi = Some(pi);
             t.session = Some("fixture.jsonl".into());
+            t.draft.focused = true;
             t.model_provider = "cpa".into();
             t.context_window = Some(200000);
             t.context.details_open = true;
@@ -11654,6 +12236,7 @@ pub(crate) mod tests {
             t.model_provider = "cpa".into();
             t.status = Status::Running;
             t.draft.replace_text("Steer now");
+            t.draft.focused = true;
             rt.frame(0.0);
             for key in ["dispatch-mode", "send-message", "stop-agent"] {
                 let (r, _) = rt.presented(key).unwrap();
@@ -11744,6 +12327,7 @@ pub(crate) mod tests {
                 percent: Some(30.0),
             };
             t.draft.replace_text("A short draft");
+            t.draft.focused = true;
             rt.frame(0.0);
             rt.frame(1.0);
             let (card, _) = rt.presented("composer").unwrap();
