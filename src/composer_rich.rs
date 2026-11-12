@@ -12,6 +12,53 @@ pub fn draft(text: impl Into<String>) -> TextEdit {
     ])
 }
 
+/// The editor document, not its expanded Markdown transport. Ported from KSG Code's
+/// snapshotComposerSend/restoreComposerDraft. Attachments exclude files derived from pills.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Snapshot {
+    pub text: String,
+    pub html: String,
+    pub attachments: Vec<crate::attachments::Attachment>,
+}
+
+impl Snapshot {
+    pub fn capture(edit: &TextEdit, attachments: &[crate::attachments::Attachment]) -> Self {
+        Self {
+            text: edit.text.clone(),
+            html: edit.to_html(),
+            attachments: attachments.to_vec(),
+        }
+    }
+
+    pub fn editor(&self) -> TextEdit {
+        restore(&self.text, Some(&self.html))
+    }
+}
+
+/// Preserve both documents, including marks, blocks, soft breaks and self-contained pills.
+/// Shina's existing failure recovery prepends the submission to edits made after Send.
+pub fn prepend(submitted: &TextEdit, later: &TextEdit) -> TextEdit {
+    let focused = later.focused;
+    let mut edit = if submitted.text.is_empty() {
+        later.clone()
+    } else if later.text.is_empty() {
+        submitted.clone()
+    } else {
+        let text = format!("{}\n\n{}", submitted.text, later.text);
+        restore(
+            &text,
+            Some(&format!(
+                "{}<p></p>{}",
+                submitted.to_html(),
+                later.to_html()
+            )),
+        )
+    };
+    edit.focused = focused;
+    edit.set_caret(edit.text.len());
+    edit
+}
+
 #[derive(Default)]
 pub struct Rules {
     converted: Option<TextEdit>,

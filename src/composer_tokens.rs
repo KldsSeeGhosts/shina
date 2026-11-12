@@ -107,6 +107,7 @@ pub fn prompt_for(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> Result<Prompt, String> {
+    validate_pill_kinds(edit)?;
     let mut attachments = images.to_vec();
     for (_, id) in edit.pills() {
         // Ported from KSG Code's `threadContextsOutsideEnvironment` and its use in
@@ -133,10 +134,55 @@ pub fn prompt_for(
         }
     }
     attachments::validate_prompt_images(&attachments)?;
-    Ok(Prompt::new(
+    let mut prompt = Prompt::new(
         crate::composer_rich::markdown_for(edit, target_machine, machine_name),
         attachments,
-    ))
+    );
+    prompt.draft = Some(crate::composer_rich::Snapshot::capture(edit, images));
+    Ok(prompt)
+}
+
+fn validate_pill_kinds(edit: &TextEdit) -> Result<(), String> {
+    if edit
+        .pills()
+        .any(|(_, id)| id.starts_with("shina:") && Token::decode(id).is_none())
+    {
+        return Err("Update required. This draft contains a mention this version of Shina cannot send. Update Shina or remove that mention.".into());
+    }
+    Ok(())
+}
+
+/// Validate the additive editor snapshot against the provider text and admitted attachments.
+/// Missing snapshots remain valid for older peers. Unknown snapshot fields are ignored.
+pub fn received_prompt(
+    text: String,
+    images: Vec<Attachment>,
+    snapshot: Option<serde_json::Value>,
+) -> Result<Prompt, String> {
+    let mut prompt = Prompt::new(text, images);
+    if let Some(value) = snapshot.filter(|value| !value.is_null()) {
+        let mut snapshot: crate::composer_rich::Snapshot =
+            serde_json::from_value(value).map_err(|_| "Invalid composer document.")?;
+        let editor = snapshot.editor();
+        validate_pill_kinds(&editor)?;
+        if crate::composer_rich::markdown(&editor) != prompt.text {
+            return Err("The composer document does not match the submitted message.".into());
+        }
+        snapshot.attachments = snapshot
+            .attachments
+            .iter()
+            .map(|attachment| {
+                prompt
+                    .images
+                    .iter()
+                    .find(|image| image.id == attachment.id)
+                    .cloned()
+                    .ok_or("Composer attachment is not in the submitted message.")
+            })
+            .collect::<Result<_, _>>()?;
+        prompt.draft = Some(snapshot);
+    }
+    Ok(prompt)
 }
 
 /// A server receives serialized text, not the client's pill marks. Do not interpret a leading
@@ -154,6 +200,23 @@ pub fn starts_with_file_path(text: &str, attachments: &[Attachment]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_pill_kinds_require_an_update_without_discarding_the_document() {
+        let mut edit = crate::composer_rich::draft("Future context");
+        edit.replace_with_pill(
+            0..14,
+            r#"shina:{"kind":"futureContext","id":7}"#,
+            "Future context",
+        );
+        assert!(prompt(&edit, &[]).unwrap_err().contains("Update required"));
+        let snapshot = crate::composer_rich::Snapshot::capture(&edit, &[]);
+        assert!(
+            received_prompt(edit.text.clone(), vec![], Some(serde_json::json!(snapshot)))
+                .unwrap_err()
+                .contains("Update required")
+        );
+        assert_eq!(edit.pills().count(), 1);
+    }
     #[test]
     fn leading_file_pills_remain_paths_after_server_serialization() {
         let root = crate::store::directory().unwrap();

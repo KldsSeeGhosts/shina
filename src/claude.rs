@@ -348,6 +348,7 @@ impl Client {
 
     fn state(&self) -> Value {
         json!({"sessionFile":self.session,"isStreaming":self.running,
+            "turnCapabilities":crate::model::TurnCapabilities::new(self.capabilities.contains("interrupt_cancel_queued_v1"), false),
             "isCompacting":self.compacting,"model":self.model,"thinkingLevel":self.effort})
     }
 
@@ -701,6 +702,13 @@ impl Client {
                         self.capabilities
                             .extend(caps.iter().filter_map(Value::as_str).map(str::to_owned));
                         self.update("capabilities", record["capabilities"].clone());
+                        self.update(
+                            "turnCapabilities",
+                            json!(crate::model::TurnCapabilities::new(
+                                self.capabilities.contains("interrupt_cancel_queued_v1"),
+                                false,
+                            )),
+                        );
                     }
                     if let Some(id) = record["model"].as_str() {
                         if let Some(model) = self.models.iter().find(|m| m["id"] == id) {

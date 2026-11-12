@@ -1297,6 +1297,245 @@ fn pi_and_acp_survive_disconnect_and_a_second_client_sees_the_same_state() {
 }
 
 #[test]
+fn queued_edit_commits_in_place_and_rejects_stale_removed_and_started_items() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut first = profile.client(uuid::Uuid::new_v4());
+    first.command(
+        "thread.send",
+        json!({"threadId":1,"text":"queue-wait-fixture","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    first.until(|state| {
+        state["threads"][0]["initializing"] == false && state["threads"][0]["status"] == "Running"
+    });
+    first.command(
+        "thread.send",
+        json!({"threadId":1,"text":"Queued original","attachments":[],"mode":"queue"}),
+        uuid::Uuid::new_v4(),
+    );
+    first.until(|state| {
+        state["threads"][0]["queue"]
+            .as_array()
+            .is_some_and(|queue| queue.len() == 1)
+    });
+    let thread = &first.snapshot["threads"][0];
+    let id = thread["queue"][0][0].clone();
+    let generation = thread["generation"].clone();
+    let draft = thread["queue_drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry[0] == id)
+        .unwrap()[1]
+        .clone();
+    let revision =
+        protocol::revision(&json!({"text":"Queued original","attachments":[],"draft":draft}));
+    let edit = json!({"threadId":1,"inputId":id,"generation":generation,"expectedRevision":revision,
+        "text":"Queued edited","attachments":[]});
+    let command = uuid::Uuid::new_v4();
+    assert_eq!(
+        first.command("queue.update", edit.clone(), command)["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        first.command("queue.update", edit.clone(), command)["result"]["status"],
+        "accepted",
+        "a lost acknowledgement repeats the same receipt, not the mutation"
+    );
+    first.until(|state| state["threads"][0]["queue"][0][1] == "Queued edited");
+    assert_eq!(first.snapshot["threads"][0]["queue"][0][0], id);
+    assert_eq!(
+        first.command("queue.update", edit.clone(), uuid::Uuid::new_v4())["result"]["status"],
+        "rejected"
+    );
+    let mut second = profile.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        second.command(
+            "queue.remove",
+            json!({"threadId":1,"inputId":id,"generation":generation}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        first.command("queue.update", edit, uuid::Uuid::new_v4())["result"]["status"],
+        "rejected"
+    );
+    first.command(
+        "thread.send",
+        json!({"threadId":1,"text":"Next queued","attachments":[],"mode":"queue"}),
+        uuid::Uuid::new_v4(),
+    );
+    first.until(|state| {
+        state["threads"][0]["queue"]
+            .as_array()
+            .is_some_and(|queue| queue.len() == 1)
+    });
+    let thread = &first.snapshot["threads"][0];
+    let id = thread["queue"][0][0].clone();
+    let draft = thread["queue_drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry[0] == id)
+        .unwrap()[1]
+        .clone();
+    let revision =
+        protocol::revision(&json!({"text":"Next queued","attachments":[],"draft":draft}));
+    first.command(
+        "thread.send",
+        json!({"threadId":1,"text":"queue-release-fixture","attachments":[],"mode":"steer"}),
+        uuid::Uuid::new_v4(),
+    );
+    first.until(|state| {
+        state["threads"][0]["messages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["text"] == "Next queued")
+            })
+    });
+    assert_eq!(
+        first.command(
+            "queue.update",
+            json!({"threadId":1,"inputId":id,"generation":generation,
+        "expectedRevision":revision,"text":"Too late","attachments":[]}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "rejected"
+    );
+    profile.stop();
+}
+
+#[test]
+fn stop_holds_the_server_queue_and_resume_continues_only_the_selected_interrupted_run() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"queue-wait-fixture","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until(|state| {
+        state["threads"][0]["initializing"] == false && state["threads"][0]["status"] == "Running"
+    });
+    let run = client.snapshot["threads"][0]["run_id"].clone();
+    let generation = client.snapshot["threads"][0]["generation"].clone();
+    assert!(run.is_string());
+    for text in ["Queued A", "Queued B"] {
+        assert_eq!(
+            client.command(
+                "thread.send",
+                json!({"threadId":1,"text":text,"attachments":[],"mode":"queue"}),
+                uuid::Uuid::new_v4()
+            )["result"]["status"],
+            "accepted"
+        );
+    }
+    client.until(|state| {
+        state["threads"][0]["queue"]
+            .as_array()
+            .is_some_and(|queue| queue.len() == 2)
+    });
+    assert_eq!(
+        client.command(
+            "thread.stop",
+            json!({"threadId":1,"runId":run}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Ready");
+    assert_eq!(client.snapshot["threads"][0]["queue_held"], true);
+    assert_eq!(
+        client.snapshot["threads"][0]["queue"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    assert_eq!(client.snapshot["threads"][0]["queue_held"], true);
+    assert_eq!(client.snapshot["threads"][0]["resumable_run_id"], run);
+    assert_eq!(
+        client.snapshot["threads"][0]["queue"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        client.command(
+            "thread.resume",
+            json!({"threadId":1,"generation":generation,
+        "continuationOfRunId":run,"releaseQueue":true}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "rejected"
+    );
+    let generation = client.snapshot["threads"][0]["generation"].clone();
+    assert_eq!(
+        client.command(
+            "thread.resume",
+            json!({"threadId":1,"generation":generation,
+        "continuationOfRunId":"wrong-run","releaseQueue":true}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "rejected"
+    );
+    let resume = uuid::Uuid::new_v4();
+    let args =
+        json!({"threadId":1,"generation":generation,"continuationOfRunId":run,"releaseQueue":true});
+    assert_eq!(
+        client.command("thread.resume", args.clone(), resume)["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.stop",
+            json!({"threadId":1,"runId":run}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "rejected",
+        "a stop captured before resume must not interrupt its new run"
+    );
+    client.until(|state| {
+        state["threads"][0]["status"] == "Completed"
+            && state["threads"][0]["messages"]
+                .as_array()
+                .is_some_and(|messages| {
+                    messages.iter().any(|message| message["text"] == "Queued B")
+                })
+    });
+    assert_eq!(
+        client.command("thread.resume", args, resume)["result"]["status"],
+        "accepted"
+    );
+    let workspace = profile.root.join("Shina/chats/1");
+    let prompts: Vec<String> = fs::read_to_string(workspace.join("fixture-prompts.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        prompts,
+        [
+            "queue-wait-fixture",
+            "Continue where you left off.",
+            "Queued A",
+            "Queued B"
+        ]
+    );
+    profile.stop();
+}
+
+#[test]
 fn two_serve_processes_converge_and_mcp_delivers_without_a_client() {
     let mut profile = Profile::new();
     profile.launch(&["serve"]);

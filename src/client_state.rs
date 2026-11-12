@@ -40,6 +40,22 @@ struct ThreadView {
     questionnaire: Value,
     elapsed: Option<u64>,
     queue: Vec<(usize, String, Vec<Attachment>)>,
+    #[serde(default)]
+    queue_drafts: Vec<(usize, crate::composer_rich::Snapshot)>,
+    #[serde(default)]
+    queue_edit_supported: bool,
+    #[serde(default)]
+    queue_held: bool,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    resumable_run_id: Option<String>,
+    #[serde(default)]
+    continuation_of_run_id: Option<String>,
+    #[serde(default)]
+    run_control_supported: bool,
+    #[serde(default)]
+    turn_capabilities: Option<TurnCapabilities>,
     steering: Vec<String>,
     follow_ups: Vec<String>,
     commands: Vec<Value>,
@@ -136,6 +152,19 @@ impl ThreadView {
                 .iter()
                 .map(|q| (q.id, q.prompt.text.clone(), q.prompt.images.to_vec()))
                 .collect(),
+            queue_drafts: thread
+                .native
+                .queue
+                .iter()
+                .filter_map(|q| q.prompt.draft.clone().map(|draft| (q.id, draft)))
+                .collect(),
+            queue_edit_supported: true,
+            queue_held: thread.native.queue_held,
+            run_id: thread.run_id.clone(),
+            resumable_run_id: thread.resumable_run_id.clone(),
+            continuation_of_run_id: thread.continuation_of_run_id.clone(),
+            run_control_supported: true,
+            turn_capabilities: Some(thread.turn_capabilities()),
             steering: thread.native.steering.clone(),
             follow_ups: thread.native.follow_ups.clone(),
             commands: thread.native.commands.iter().map(|c| json!(c)).collect(),
@@ -158,6 +187,10 @@ impl ThreadView {
             thread.request_generation = self.generation;
         }
         thread.status = self.status;
+        thread.run_id = self.run_id;
+        thread.resumable_run_id = self.resumable_run_id;
+        thread.continuation_of_run_id = self.continuation_of_run_id;
+        thread.run_control_supported = self.run_control_supported;
         thread.messages = self
             .messages
             .into_iter()
@@ -212,6 +245,9 @@ impl ThreadView {
         }
         thread.work = work;
         thread.harness_state = self.harness_state;
+        if let Some(capabilities) = self.turn_capabilities {
+            thread.harness_state["turnCapabilities"] = json!(capabilities);
+        }
         thread.model = self.model;
         thread.model_provider = self.model_provider;
         thread.model_id = self.model_id;
@@ -257,11 +293,20 @@ impl ThreadView {
         thread.native.queue = self
             .queue
             .into_iter()
-            .map(|(id, text, images)| pi_session::QueuedMessage {
-                id,
-                prompt: Prompt::new(text, images),
+            .map(|(id, text, images)| {
+                let mut prompt = Prompt::new(text, images);
+                prompt.draft = self
+                    .queue_drafts
+                    .iter()
+                    .find(|(key, _)| *key == id)
+                    .map(|(_, draft)| draft.clone());
+                pi_session::QueuedMessage { id, prompt }
             })
             .collect();
+        thread.queue_edit_supported = self.queue_edit_supported;
+        thread.native.queue_held = self.queue_held;
+        thread.reconcile_queued_edit();
+        thread.tick_stop(Instant::now());
         thread.native.steering = self.steering;
         thread.native.follow_ups = self.follow_ups;
         thread.native.commands = self
@@ -504,12 +549,22 @@ impl State {
                 thread.history_loaded = true;
                 thread.native.projected_operating = false;
                 thread.native.projected_queued = false;
-                // Lost process queues are recovered against history, never dispatched here.
-                thread.native.queue.clear();
+                // Application-owned queue records survive restart, held until a person resumes.
+                // Legacy process-only queues still recover against history, never auto-dispatch.
+                if thread.run_control_supported && !thread.native.queue.is_empty() {
+                    thread.native.queue_held = true;
+                    thread.serial = thread
+                        .serial
+                        .max(thread.native.queue.iter().map(|q| q.id).max().unwrap_or(0));
+                } else {
+                    thread.native.queue.clear();
+                }
                 thread.native.steering.clear();
                 thread.native.follow_ups.clear();
                 thread.native.questionnaire = None;
                 if thread.status.busy() || thread.configuring || thread.request.is_some() {
+                    thread.resumable_run_id = thread.run_id.clone();
+                    thread.native.queue_held = true;
                     thread.status = Status::Failed;
                     thread.configuring = false;
                     thread.request = None;
@@ -588,15 +643,19 @@ impl State {
                 continue;
             }
             if let Some(previous) = self.recovered_inputs.get(&thread.id) {
-                let newer = Prompt::new(thread.draft.text.clone(), thread.draft_images.clone());
-                thread
-                    .draft
-                    .replace_text(previous["text"].as_str().unwrap_or(""));
-                thread.draft_images =
+                let images: Vec<Attachment> =
                     serde_json::from_value(previous["attachments"].clone()).unwrap_or_default();
-                thread.restore_prompt(&newer);
+                let editor = serde_json::from_value::<crate::composer_rich::Snapshot>(
+                    previous["draft"].clone(),
+                )
+                .map(|snapshot| snapshot.editor())
+                .unwrap_or_else(|_| {
+                    crate::composer_rich::draft(previous["text"].as_str().unwrap_or(""))
+                });
+                thread.restore_editor(&editor, &images);
             }
-            self.recovered_inputs.insert(thread.id,json!({"text":thread.draft.text,"attachments":thread.draft_images,"commandId":thread.recovery_command}));
+            self.recovered_inputs.insert(thread.id,json!({"text":thread.draft.text,"attachments":thread.draft_images,
+                "draft":crate::composer_rich::Snapshot::capture(&thread.draft,&thread.draft_images),"commandId":thread.recovery_command}));
             thread.draft.replace_text("");
             thread.draft_images.clear();
             changed = true;
@@ -820,6 +879,55 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
+                && command.method == "thread.send"
+            {
+                let threads = if server == self.machines.selected {
+                    Some(&mut self.threads)
+                } else {
+                    self.machines.threads.get_mut(&server)
+                };
+                if let Some(thread) = threads.and_then(|threads| {
+                    threads.iter_mut().find(|thread| {
+                        thread
+                            .remote_send
+                            .as_ref()
+                            .is_some_and(|(id, _, _)| *id == command.command_id)
+                    })
+                }) {
+                    thread.finish_remote_send(
+                        command.command_id,
+                        value["result"]["status"] == "accepted",
+                    );
+                }
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
+                && command.method == "thread.resume"
+            {
+                let threads = if server == self.machines.selected {
+                    Some(&mut self.threads)
+                } else {
+                    self.machines.threads.get_mut(&server)
+                };
+                if let Some(thread) = threads.and_then(|threads| {
+                    threads
+                        .iter_mut()
+                        .find(|thread| thread.resume_command == Some(command.command_id))
+                }) {
+                    thread.resume_command = None;
+                    if value["result"]["status"] != "accepted" {
+                        thread.error = Some("Could not resume thread.".into());
+                    }
+                }
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
+                && matches!(
+                    command.method.as_str(),
+                    "queue.update" | "queue.returnDraft"
+                )
+            {
+                self.apply_queue_receipt(&server, command, value);
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
                 && (command.method.starts_with("settings.")
                     || matches!(
                         command.method.as_str(),
@@ -849,29 +957,6 @@ impl State {
             if server != self.machines.selected
                 && matches!(event, crate::client::Event::Receipt(..))
             {
-                if let crate::client::Event::Receipt(command, value) = &event
-                    && let Some(thread) =
-                        self.machines.threads.get_mut(&server).and_then(|threads| {
-                            threads.iter_mut().find(|thread| {
-                                thread
-                                    .remote_send
-                                    .as_ref()
-                                    .is_some_and(|(id, _, _)| *id == command.command_id)
-                            })
-                        })
-                    && thread
-                        .remote_send
-                        .as_ref()
-                        .is_some_and(|(id, _, _)| *id == command.command_id)
-                    && let Some((_, edit, attachments)) = thread.remote_send.take()
-                    && value["result"]["status"] == "accepted"
-                    && thread.draft == edit
-                    && thread.draft_images == attachments
-                {
-                    thread.draft.replace_text("");
-                    thread.draft_images.clear();
-                    self.machines.ui[&server]["drafts"][thread.id.to_string()] = json!("");
-                }
                 self.machines
                     .receipts
                     .entry(server)
@@ -921,25 +1006,6 @@ impl State {
                 }
                 crate::client::Event::Receipt(command, value) => {
                     self.apply_tab_receipt(&server, &command, &value);
-                    if let Some(thread) = self.threads.iter_mut().find(|thread| {
-                        thread
-                            .remote_send
-                            .as_ref()
-                            .is_some_and(|(id, _, _)| *id == command.command_id)
-                    }) && let Some((id, edit, attachments)) = thread.remote_send.take()
-                    {
-                        if id == command.command_id {
-                            if value["result"]["status"] == "accepted"
-                                && thread.draft == edit
-                                && thread.draft_images == attachments
-                            {
-                                thread.draft.replace_text("");
-                                thread.draft_images.clear();
-                            }
-                        } else {
-                            thread.remote_send = Some((id, edit, attachments));
-                        }
-                    }
                     if command.method.starts_with("server.") {
                         if let Some(error) = value["error"]["message"].as_str() {
                             self.restart_notice = Some(error.into());
@@ -960,28 +1026,38 @@ impl State {
                                 ),
                             );
                         }
-                        if matches!(command.method.as_str(), "thread.stop" | "thread.rewind")
-                            && let Some(id) = command.params["threadId"].as_u64()
+                        if matches!(
+                            command.method.as_str(),
+                            "thread.stop" | "thread.rewind" | "queue.returnDraft"
+                        ) && let Some(id) = command.params["threadId"].as_u64()
                         {
                             self.client_recover.insert(id as usize, command.command_id);
                         }
-                        if matches!(command.method.as_str(), "queue.edit" | "input.claim")
+                        if command.method == "input.claim"
                             && let Some(thread) = self
                                 .threads
                                 .iter_mut()
                                 .find(|t| json!(t.id) == command.params["threadId"])
                         {
-                            let images = serde_json::from_value(
+                            let images: Vec<Attachment> = serde_json::from_value(
                                 value["result"]["result"]["attachments"].clone(),
                             )
                             .unwrap_or_default();
-                            thread.restore_prompt(&Prompt::new(
-                                value["result"]["result"]["text"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .into(),
-                                images,
-                            ));
+                            if let Ok(snapshot) =
+                                serde_json::from_value::<crate::composer_rich::Snapshot>(
+                                    value["result"]["result"]["draft"].clone(),
+                                )
+                            {
+                                thread.restore_editor(&snapshot.editor(), &images);
+                            } else {
+                                thread.restore_prompt(&Prompt::new(
+                                    value["result"]["result"]["text"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .into(),
+                                    images,
+                                ));
+                            }
                             thread.native.follow_up = true;
                         }
                     } else {
@@ -1020,7 +1096,8 @@ impl State {
                         };
                         if let Some(threads) = threads {
                             for thread in threads {
-                                if thread.remote_send.take().is_some() {
+                                if let Some((id, _, _)) = &thread.remote_send {
+                                    thread.finish_remote_send(*id, false);
                                     thread.error=Some("This device was paired again. Review the previous send before retrying. Your draft was kept.".into());
                                 }
                             }
@@ -1132,6 +1209,7 @@ impl State {
     }
 
     fn apply_projection(&mut self, projection: Value) -> Result<(), String> {
+        let preserve_cached_editors = self.client_views["cachedEditors"] == true;
         let active = self.current().id;
         let tabs = self.tabs.clone();
         let first = self.client_views["index"].is_null();
@@ -1273,7 +1351,31 @@ impl State {
         self.client_views = projection;
         self.apply_native_catalogs();
         if first && !local.is_null() {
+            // Live cached editors also own pending sends and isolated queue edits. Restoring the
+            // disk UI over them would lose receipts or replace an edit with its ordinary draft.
+            let editors: Vec<_> = if preserve_cached_editors {
+                self.threads
+                    .iter()
+                    .map(|thread| {
+                        (
+                            thread.id,
+                            thread.draft.clone(),
+                            thread.draft_images.clone(),
+                            thread.attachment_error.clone(),
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
             self.restore_ui(&local)?;
+            for (id, draft, images, error) in editors {
+                if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+                    thread.draft = draft;
+                    thread.draft_images = images;
+                    thread.attachment_error = error;
+                }
+            }
             if restore_navigation && let Some(tabs) = local["tabs"].as_array() {
                 self.tabs = tabs
                     .iter()
@@ -1448,11 +1550,9 @@ impl State {
         self.requested_tab = None;
         self.requested_tab_restore = None;
         self.machines.selected = server.into();
-        self.threads = self
-            .machines
-            .threads
-            .remove(server)
-            .unwrap_or_else(|| vec![Thread::new(1)]);
+        let cached = self.machines.threads.remove(server);
+        let cached_editors = cached.is_some();
+        self.threads = cached.unwrap_or_else(|| vec![Thread::new(1)]);
         self.active = 0;
         self.tabs.clear();
         self.client_recover = self.machines.recover.remove(server).unwrap_or_default();
@@ -1476,7 +1576,8 @@ impl State {
             self.background.settings.clone(),
             self.preferences.clone(),
         );
-        self.client_views = json!({"localUi":self.machines.ui[server]});
+        self.client_views =
+            json!({"localUi":self.machines.ui[server],"cachedEditors":cached_editors});
         if let Some(projection) = projection {
             if let Err(error) = self.apply_projection(projection) {
                 self.storage_error = Some(error);
@@ -1663,6 +1764,8 @@ impl State {
                 thread.client_creating = Some(command);
                 thread.remote_send =
                     Some((command, thread.draft.clone(), thread.draft_images.clone()));
+                thread.draft.replace_text("");
+                thread.draft_images.clear();
             }
             Err(error) => self.storage_error = Some(error),
         }
@@ -1693,6 +1796,9 @@ impl State {
         draft.client_creating = None;
         let submitted = draft.remote_send.take();
         if value["result"]["status"] != "accepted" {
+            if let Some((_, edit, images)) = submitted {
+                draft.restore_editor(&edit, &images);
+            }
             let error = value["error"]["message"]
                 .as_str()
                 .or(value["result"]["result"]["error"].as_str())
@@ -1731,19 +1837,21 @@ impl State {
         {
             Ok(prompt) => prompt,
             Err(error) => {
+                draft.restore_editor(&edit, &images);
                 draft.attachment_error = Some(error.clone());
                 self.machines.notice = Some(error);
                 return;
             }
         };
         let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-            "editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+            "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
         let result = commands
             .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
             .and_then(|commands| commands.send("thread.send", params));
         match result {
             Ok(id) => draft.remote_send = Some((id, edit, images)),
             Err(error) => {
+                draft.restore_editor(&edit, &images);
                 draft.error = Some(error.clone());
                 self.machines.notice = Some(error);
             }
@@ -2207,15 +2315,17 @@ impl State {
             if args["generation"] != json!(self.current().request_generation) {
                 return Err("The queue belongs to an earlier runtime generation.".into());
             }
-            let id = number("inputId")?;
-            if !self
-                .current()
-                .native
-                .queue
-                .iter()
-                .any(|input| input.id == id)
-            {
-                return Err("This queued input was already changed or removed.".into());
+            if command.method != "queue.returnDraft" {
+                let id = number("inputId")?;
+                if !self
+                    .current()
+                    .native
+                    .queue
+                    .iter()
+                    .any(|input| input.id == id)
+                {
+                    return Err("This queued input was already changed or removed.".into());
+                }
             }
         }
         match command.method.as_str() {
@@ -2226,6 +2336,9 @@ impl State {
                 }
                 let input: crate::protocol::SendInput =
                     serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+                if matches!(input.mode, crate::protocol::SendMode::Unknown) {
+                    return Err(crate::protocol::RUN_CONTROL_UPDATE_REQUIRED.into());
+                }
                 let text = input.text;
                 let attachments = input
                     .attachments
@@ -2233,8 +2346,16 @@ impl State {
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
                 attachments::validate_prompt_images(&attachments)?;
-                self.current_mut().draft.replace_text(text);
-                self.current_mut().draft_images = attachments;
+                let prompt =
+                    crate::composer_tokens::received_prompt(text, attachments, input.draft)?;
+                self.current_mut().draft = prompt.draft.as_ref().map_or_else(
+                    || crate::composer_rich::draft(&prompt.text),
+                    crate::composer_rich::Snapshot::editor,
+                );
+                self.current_mut().draft_images = prompt
+                    .draft
+                    .as_ref()
+                    .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
                 self.send();
@@ -2251,14 +2372,46 @@ impl State {
                 }
             }
             "thread.stop" => {
+                if args
+                    .get("runId")
+                    .is_some_and(|id| !id.is_null() && !id.is_string())
+                {
+                    return Err("runId must be a run identity.".into());
+                }
+                if let Some(target) = args.get("runId")
+                    && *target != json!(self.current().run_id)
+                {
+                    return Err(
+                        "This run is no longer active. The newer run was not stopped.".into(),
+                    );
+                }
                 self.current_mut().recovery_command = Some(command.command_id);
                 self.current_mut().stop();
                 self.owe_remote_stops_for(self.current().id);
                 if self.current().has_draft_content() {
-                    let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images,"commandId":command.command_id});
+                    let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images,
+                        "draft":crate::composer_rich::Snapshot::capture(&self.current().draft,&self.current().draft_images),"commandId":command.command_id});
                     self.recovered_inputs.insert(self.current().id, input);
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                }
+            }
+            "thread.resume" => {
+                if args
+                    .get("continuationOfRunId")
+                    .is_some_and(|id| !id.is_null() && !id.is_string())
+                {
+                    return Err("continuationOfRunId must be a run identity.".into());
+                }
+                if args["generation"] != json!(self.current().request_generation) {
+                    return Err("This resume belongs to an earlier runtime generation.".into());
+                }
+                self.current_mut().resume_run(
+                    args["continuationOfRunId"].as_str(),
+                    args["releaseQueue"] == true,
+                )?;
+                if self.current().pi.is_none() {
+                    self.connect_thread(self.active);
                 }
             }
             "thread.configure" => {
@@ -2459,11 +2612,37 @@ impl State {
             "queue.remove" => self.current_mut().cancel_queued(number("inputId")?),
             "queue.sendNow" => self.current_mut().steer_queued(number("inputId")?),
             "queue.edit" => {
-                self.current_mut().edit_queued(number("inputId")?);
-                let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images});
-                self.current_mut().draft.replace_text("");
-                self.current_mut().draft_images.clear();
-                return Ok(input);
+                return Err(crate::protocol::COMPOSER_UPDATE_REQUIRED.into());
+            }
+            "queue.update" => {
+                let images = args["attachments"]
+                    .as_array()
+                    .ok_or("attachments must be an array.")?
+                    .iter()
+                    .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let prompt = crate::composer_tokens::received_prompt(
+                    text("text")?,
+                    images,
+                    args.get("draft").cloned(),
+                )?;
+                self.current_mut().update_queued(
+                    number("inputId")?,
+                    &text("generation")?,
+                    &text("expectedRevision")?,
+                    prompt,
+                )?;
+            }
+            "queue.returnDraft" => {
+                self.current_mut().recovery_command = Some(command.command_id);
+                self.current_mut().native.queue_held = false;
+                if self.current().pi.is_some() {
+                    self.current_mut().command("clear_queue", json!({}));
+                }
+                let prompts: Vec<_> = self.current_mut().native.queue.drain(..).map(|q| {
+                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"draft":q.prompt.draft})
+                }).collect();
+                return Ok(json!({"prompts":prompts}));
             }
             "input.claim" => {
                 let id = self.current().id;
@@ -3048,11 +3227,11 @@ mod tests {
         assert_eq!(send.params["attachments"][0]["id"], image.id);
         assert_eq!(state.current().id, 1);
         assert!(!state.current().client_draft);
-        assert_eq!(
-            state.current().draft.text,
-            "Keep the exact draft",
-            "clear only on send receipt"
+        assert!(
+            state.current().draft.text.is_empty(),
+            "the submitted snapshot owns the draft until its receipt"
         );
+        assert!(state.current().remote_send.is_some());
         state.select_machine("local");
         assert!(
             state.current().draft.text.is_empty(),
@@ -3659,6 +3838,103 @@ mod tests {
     }
 
     #[test]
+    fn failed_remote_send_restores_rich_snapshot_after_later_edits_and_navigation() {
+        for navigate in [false, true] {
+            let (mut state, _, mut remote, _) = paired_client_fixture();
+            state.retarget_draft("studio");
+            state.current_mut().draft.replace_text("Submitted");
+            state.current_mut().draft.set_selection(0, 9);
+            state.current_mut().draft.toggle_mark(rune::Mark::Bold);
+            state.send();
+            let create = remote.try_recv().unwrap();
+            assert!(state.current().draft.text.is_empty());
+            state.current_mut().draft.replace_text("Later");
+            state.current_mut().draft.set_selection(0, 5);
+            state.current_mut().draft.toggle_mark(rune::Mark::Italic);
+            state.complete_client_creation(
+                "studio",
+                &create,
+                &json!({"result":{"status":"accepted","result":{"threadId":1}}}),
+            );
+            let sent = remote.try_recv().unwrap();
+            state.finish_client_promotions();
+            if navigate {
+                state.select_machine("local");
+            }
+            state.client.as_ref().unwrap().linked["studio"].test_receipt(
+                sent,
+                json!({"result":{"status":"rejected","result":{"error":"Fixture refusal"}}}),
+            );
+            state.poll_client(&mut Tx::default());
+            if navigate {
+                state.select_machine("studio");
+                state.poll_client(&mut Tx::default());
+            }
+            assert_eq!(
+                crate::composer_rich::markdown(&state.current().draft),
+                "**Submitted**\n\n*Later*",
+                "navigate={navigate}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_edits_survive_machine_switches_and_recover_queue_departures_on_return() {
+        for leaves_queue in [false, true] {
+            for ordinary_empty in [false, true] {
+                let (mut state, _, _, mut projection) = paired_client_fixture();
+                state.select_thread(0);
+                let id = state.current().id;
+                let view = projection["threads"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|view| view["id"] == json!(id))
+                    .unwrap();
+                view["queue"] = json!([[9, "Queued original", []]]);
+                state.apply_projection(projection.clone()).unwrap();
+                state
+                    .machines
+                    .views
+                    .insert("local".into(), projection.clone());
+                state.current_mut().draft.replace_text(if ordinary_empty {
+                    ""
+                } else {
+                    "Ordinary"
+                });
+                state.current_mut().edit_queued(9);
+                state.current_mut().draft.replace_text("Edited");
+                state.select_machine("studio");
+                if leaves_queue {
+                    projection["threads"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|view| view["id"] == json!(id))
+                        .unwrap()["queue"] = json!([]);
+                    state.machines.views.insert("local".into(), projection);
+                }
+                state.select_machine("local");
+                if leaves_queue {
+                    assert!(state.current().queued_edit.is_none());
+                    assert_eq!(
+                        state.current().draft.text,
+                        if ordinary_empty { "Edited" } else { "Ordinary" }
+                    );
+                } else {
+                    assert!(state.current().queued_edit.is_some());
+                    assert_eq!(state.current().draft.text, "Edited");
+                    state.current_mut().cancel_queued_edit();
+                    assert_eq!(
+                        state.current().draft.text,
+                        if ordinary_empty { "" } else { "Ordinary" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn started_and_offline_threads_cannot_be_retargeted() {
         let (mut state, _, mut remote, _) = paired_client_fixture();
         state.current_mut().draft.replace_text("Stay here");
@@ -4105,11 +4381,11 @@ mod tests {
             "accepted"
         );
         assert!(runtime.state.current().draft.text.is_empty());
-        assert!(
-            runtime.state.recovered_inputs[&1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("queued text")
+        assert!(!runtime.state.recovered_inputs.contains_key(&1));
+        assert!(runtime.state.current().native.queue_held);
+        assert_eq!(
+            runtime.state.current().native.queue[0].prompt.text,
+            "queued text"
         );
         let mut client = State::new(PathBuf::new(), false);
         client.client = Some(crate::client::Client::new(client.data_dir.clone()));

@@ -38,11 +38,27 @@ mod background;
 pub use background::{BackgroundSettings, BackgroundStatus};
 #[path = "client_state.rs"]
 mod client_state;
+#[path = "queued_edit.rs"]
+mod queued_edit;
+#[path = "run_control.rs"]
+mod run_control;
+pub use queued_edit::QueuedEdit;
+#[cfg(test)]
+use queued_edit::queue_revision;
+#[cfg(test)]
+pub use run_control::StopPhase;
+pub use run_control::{StopControl, TurnCapabilities};
 #[path = "honcho.rs"]
 mod honcho;
 #[path = "memory.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod memory;
+#[cfg(test)]
+#[path = "queued_edit_tests.rs"]
+mod queued_edit_tests;
+#[cfg(test)]
+#[path = "run_control_tests.rs"]
+mod run_control_tests;
 #[path = "scope.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod scope;
@@ -316,6 +332,12 @@ pub struct BriefUi {
 pub struct Thread {
     pub peer_origin: Option<PeerOrigin>,
     pub stop_serial: u64,
+    pub run_id: Option<String>,
+    pub resumable_run_id: Option<String>,
+    pub continuation_of_run_id: Option<String>,
+    pub stop_control: StopControl,
+    run_control_supported: bool,
+    resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
     client_creating: Option<uuid::Uuid>,
@@ -344,6 +366,9 @@ pub struct Thread {
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
     pub draft: TextEdit,
+    pub queued_edit: Option<QueuedEdit>,
+    queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
+    queue_edit_supported: bool,
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
     pub typing_guard: crate::composer::TypingGuard,
@@ -484,6 +509,8 @@ impl Thread {
             && self.unused_session()
             && self.messages.is_empty()
             && !self.has_draft_content()
+            && self.remote_send.is_none()
+            && self.client_creating.is_none()
             && !self.configuring
             && !self.queued()
             && !self.renamed
@@ -552,6 +579,15 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            queued_edit: None,
+            queued_save: None,
+            queue_edit_supported: true,
+            run_id: None,
+            resumable_run_id: None,
+            continuation_of_run_id: None,
+            stop_control: StopControl::default(),
+            run_control_supported: true,
+            resume_command: None,
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
             client_draft: false,
@@ -939,6 +975,7 @@ impl Thread {
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
+        self.native.queue_held = false;
         self.begin_prompt(prompt);
     }
 
@@ -960,6 +997,10 @@ impl Thread {
     }
 
     fn begin_prompt(&mut self, prompt: Prompt) {
+        self.run_id = Some(uuid::Uuid::new_v4().to_string());
+        self.resumable_run_id = None;
+        self.continuation_of_run_id = None;
+        self.stop_control = StopControl::default();
         self.native.initial_user = true;
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
         self.retry_prompt = Some(prompt.clone());
@@ -1004,8 +1045,16 @@ impl Thread {
     }
 
     pub fn stop(&mut self) {
+        if self.remote.is_some() && !self.run_control_supported {
+            self.error = Some(crate::protocol::RUN_CONTROL_UPDATE_REQUIRED.into());
+            return;
+        }
+        if self.stop_control.disabled() && self.stop_control.target() == self.run_id.as_deref() {
+            return;
+        }
+        self.begin_stop();
         self.stop_serial = self.stop_serial.saturating_add(1);
-        if self.forward("thread.stop", json!({})) {
+        if self.forward("thread.stop", json!({"runId":self.run_id})) {
             return;
         }
         let _ = self.stop_task();
@@ -1023,7 +1072,7 @@ impl Thread {
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
-        self.return_local_queue();
+        self.native.queue_held = true;
         self.pending_injections.clear();
         self.injection_id = None;
         self.injection_retry_at = None;
@@ -1243,11 +1292,8 @@ impl Thread {
             return false;
         }
         if operation == "abort" {
-            self.disconnect();
-            self.pending_injections.clear();
-            self.complete_task("cancelled");
-            self.error =
-                Some("Pi did not stop within ten seconds. Its process was terminated.".into());
+            self.operation_deadline = None;
+            self.tick_stop(now);
         } else {
             self.fail_session(format!(
                 "Pi did not answer the {operation} operation before its deadline. Retry to resume."
@@ -1281,6 +1327,7 @@ impl Thread {
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
+        self.native.queue_held = true;
         self.disconnect();
         self.error = Some(error);
         self.status = Status::Failed;
@@ -1564,6 +1611,28 @@ impl Thread {
             return;
         }
         match string(&record, "type") {
+            "steering_restart" => {
+                let held = self.native.queue_held;
+                self.mark_stopped();
+                self.native.queue_held = held;
+                self.resumable_run_id = None;
+            }
+            "steer_delivery_unknown" => {
+                let mut images = content_images(&record["message"]["content"]);
+                images.extend(
+                    record["attachments"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Attachment::from_value),
+                );
+                self.messages.push(Message {
+                    role: "You",
+                    text: string(&record, "text").into(),
+                    images,
+                });
+                self.error = Some("ACP steering delivery could not be confirmed. The provider may have accepted this message, so Shina did not resend it.".into());
+            }
             "harness_update" => {
                 if record["field"] == "awareness" {
                     self.harness_context_sent = record["value"] == true;
@@ -1636,6 +1705,7 @@ impl Thread {
                         self.remove_optimistic_prompt(&prompt, index);
                     }
                     if matches!(command, "prompt" | "get_state" | "get_messages") {
+                        self.native.queue_held = true;
                         self.status = Status::Failed;
                         self.started = None;
                         self.complete_task("failed");
@@ -1645,6 +1715,10 @@ impl Thread {
                 match command {
                     "get_state" => {
                         let data = &record["data"];
+                        if data["turnCapabilities"].is_object() {
+                            self.harness_state["turnCapabilities"] =
+                                data["turnCapabilities"].clone();
+                        }
                         if self
                             .startup_selection_check
                             .as_ref()
@@ -1916,6 +1990,9 @@ impl Thread {
                 }
             }
             "agent_start" => {
+                if self.run_id.is_none() {
+                    self.run_id = Some(uuid::Uuid::new_v4().to_string());
+                }
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
                 self.assistant = None;
@@ -1936,6 +2013,8 @@ impl Thread {
                 let aborted = record["aborted"] == true;
                 if aborted {
                     self.mark_stopped();
+                } else {
+                    self.resumable_run_id = None;
                 }
                 self.finish_run();
                 // A stopped run is idle, not a finished task.
@@ -2123,6 +2202,8 @@ impl Thread {
     }
 
     fn mark_stopped(&mut self) {
+        self.resumable_run_id = self.run_id.clone();
+        self.native.queue_held = true;
         let elapsed = self
             .started
             .map(|at| at.elapsed().as_secs())
@@ -2254,17 +2335,17 @@ impl Thread {
     }
 
     fn restore_prompt(&mut self, prompt: &Prompt) {
-        let text = if prompt.text.is_empty() {
-            self.draft.text.clone()
-        } else if self.draft.text.is_empty() {
-            prompt.text.clone()
-        } else {
-            format!("{}\n\n{}", prompt.text, self.draft.text)
-        };
-        self.draft.replace_text(&text);
+        let submitted = prompt.draft.as_ref().map_or_else(
+            || crate::composer_rich::draft(&prompt.text),
+            crate::composer_rich::Snapshot::editor,
+        );
+        self.draft = crate::composer_rich::prepend(&submitted, &self.draft);
         // Keep submitted images first. A newer draft may have added images while the process was
         // starting, so merge those after the snapshot without duplicating either set.
-        let mut images = prompt.images.to_vec();
+        let mut images = prompt
+            .draft
+            .as_ref()
+            .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
         for image in &self.draft_images {
             if !images.iter().any(|current| current.id == image.id) {
                 images.push(image.clone());
@@ -2276,6 +2357,40 @@ impl Thread {
         self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
+    fn restore_editor(&mut self, submitted: &TextEdit, attachments: &[Attachment]) {
+        if let Some(edit) = &mut self.queued_edit {
+            edit.ordinary = crate::composer_rich::prepend(submitted, &edit.ordinary);
+            let mut images = attachments.to_vec();
+            for image in &edit.ordinary_images {
+                if !images.iter().any(|existing| existing.id == image.id) {
+                    images.push(image.clone());
+                }
+            }
+            edit.ordinary_images = images;
+        } else {
+            let mut prompt = Prompt::new(String::new(), attachments.to_vec());
+            prompt.draft = Some(crate::composer_rich::Snapshot::capture(
+                submitted,
+                attachments,
+            ));
+            self.restore_prompt(&prompt);
+        }
+    }
+
+    fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) {
+        if !self
+            .remote_send
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == command)
+        {
+            return;
+        }
+        let (_, edit, images) = self.remote_send.take().unwrap();
+        if !accepted {
+            self.restore_editor(&edit, &images);
+        }
+    }
+
     fn finish_run(&mut self) {
         self.finish_retry(self.error.clone().as_deref());
         self.status = if self.error.is_some() {
@@ -2284,6 +2399,7 @@ impl Thread {
             Status::Completed
         };
         if self.status == Status::Failed {
+            self.native.queue_held = true;
             self.life.failed_at = Some(lifecycle::now());
         }
         self.elapsed = self
@@ -5508,6 +5624,14 @@ impl State {
         if self.ownership_denied {
             return;
         }
+        if self.current().resume_pending() {
+            return;
+        }
+        if self.current().queued_edit.is_some() {
+            self.current_mut().save_queued_edit();
+            self.checkpoint();
+            return;
+        }
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -5520,7 +5644,7 @@ impl State {
             if self.current().remote_send.is_some() || !self.current().has_draft_content() {
                 return;
             }
-            // Do not clear until its receipt arrives and this exact editor content still matches.
+            // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
             let target_machine = self.current().machine.clone();
             let prompt = match crate::composer_tokens::prompt_for(
@@ -5543,14 +5667,16 @@ impl State {
             }
             self.current_mut().submission_error = None;
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
                     self.current_mut().remote_send = Some((
                         id,
                         self.current().draft.clone(),
                         self.current().draft_images.clone(),
-                    ))
+                    ));
+                    self.current_mut().draft.replace_text("");
+                    self.current_mut().draft_images.clear();
                 }
                 Some(Err(error)) => self.storage_error = Some(error),
                 None => {}
@@ -6273,6 +6399,10 @@ impl State {
                     thread.title = record["title"].as_str()?.into();
                     thread.renamed = record["renamed"] == true;
                     thread.session = record["session"].as_str().map(str::to_owned);
+                    thread.run_id = record["runId"].as_str().map(str::to_owned);
+                    thread.resumable_run_id = record["resumableRunId"].as_str().map(str::to_owned);
+                    thread.continuation_of_run_id =
+                        record["continuationOfRunId"].as_str().map(str::to_owned);
                     if let Some(model) = record["model"].as_str() {
                         // Pi restores only CPA choices. ACP selections belong to its agent id.
                         let provider = if thread.harness == "pi" {
@@ -6457,13 +6587,15 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let value = if t.draft_images.is_empty() && !crate::composer_rich::has_format(&t.draft) {
-                    json!(t.draft.text)
+                let (draft, images) = t.queued_edit.as_ref().map_or(
+                    (&t.draft, &t.draft_images), |edit| (&edit.ordinary, &edit.ordinary_images));
+                let value = if images.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
+                    json!(draft.text)
                 } else {
                     json!({
-                        "text": t.draft.text,
-                        "richHtml": t.draft.to_html(),
-                        "images": t.draft_images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                        "text": draft.text,
+                        "richHtml": draft.to_html(),
+                        "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                     })
                 };
                 (t.id.to_string(), value)
@@ -6770,6 +6902,7 @@ impl State {
                 let mut record = json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
+                "runId":thread.run_id,"resumableRunId":thread.resumable_run_id,"continuationOfRunId":thread.continuation_of_run_id,
                 "memoryContext":thread.memory_context,
                 "scopeContextPending":thread.scope_context_pending,
                 "neverSent":thread.never_sent && thread.life.latest_user_message_at.is_none(),
@@ -7703,8 +7836,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_configuration_deadlines_disconnect_unresponsive_sessions() {
-        for operation in ["abort", "set_model", "set_thinking_level"] {
+    fn configuration_deadlines_disconnect_unresponsive_sessions() {
+        for operation in ["set_model", "set_thinking_level"] {
             let mut thread = Thread::new(1);
             let (_commands, _events) = fake_pi(&mut thread, Status::Running);
             thread.configuring = operation != "abort";
@@ -8791,6 +8924,7 @@ mod tests {
         state.threads[0].queued_prompt = Some((
             Prompt {
                 text: "queued".into(),
+                draft: None,
                 images: Default::default(),
             },
             0,
@@ -8912,6 +9046,7 @@ mod tests {
         state.threads[0].draft.replace_text("work");
         state.threads[0].queued_prompt = Some((
             Prompt {
+                draft: None,
                 text: "work".into(),
                 images: Default::default(),
             },
@@ -10725,6 +10860,37 @@ mod tests {
         state.restore_ui(&legacy).unwrap();
         assert!(state.current().draft.is_rich());
         assert_eq!(state.current().draft.text, "plain old draft");
+    }
+
+    #[test]
+    fn failed_send_restores_rich_document_pills_and_later_rich_edits() {
+        let mut thread = Thread::new(1);
+        let original_image = test_attachment("original.png", 1);
+        let later_image = test_attachment("later.png", 2);
+        thread.draft_images.push(original_image.clone());
+        thread.draft = crate::composer_rich::draft("Bold reference");
+        thread.draft.set_selection(0, 4);
+        thread.draft.toggle_mark(rune::Mark::Bold);
+        let token = crate::composer_tokens::Token::Skill {
+            name: "review".into(),
+            harness: "pi".into(),
+        };
+        thread.draft.replace_with_pill(5..14, token.id(), "review");
+        let original = crate::composer_rich::markdown(&thread.draft);
+        thread.send();
+        thread.draft.replace_text("Later");
+        thread.draft.set_selection(0, 5);
+        thread.draft.toggle_mark(rune::Mark::Italic);
+        thread.draft_images.push(later_image.clone());
+        thread.disconnect();
+        assert_eq!(
+            crate::composer_rich::markdown(&thread.draft),
+            format!("{original}\n\n*Later*")
+        );
+        assert_eq!(thread.draft.pills().count(), 1);
+        assert_eq!(thread.draft.text, "Bold review\n\nLater");
+        assert!(thread.messages.is_empty());
+        assert_eq!(thread.draft_images, vec![original_image, later_image]);
     }
 
     #[test]

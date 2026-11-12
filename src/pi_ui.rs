@@ -162,7 +162,15 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         )
                         .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
                             s.current_mut().respond(json!({"cancelled":true}))
-                        })),
+                        }))
+                        .child(if t.status.busy() || t.stop_control.phase().is_some() {
+                            icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
+                                s.current_mut().stop();
+                            })
+                            .disabled(t.stop_control.disabled())
+                        } else {
+                            el()
+                        }),
                 ),
         )
 }
@@ -214,6 +222,9 @@ pub(super) fn composer_pi_key(
     tx: &rune::Tx,
     caret_edges: Option<[bool; 2]>,
 ) -> bool {
+    if composer_queue_key(s, event) {
+        return true;
+    }
     if s.undo_key(event, true) {
         return true;
     }
@@ -286,6 +297,39 @@ pub(super) fn composer_pi_key(
     false
 }
 
+/// KSG Code's thread.editQueuedMessage and thread.steerQueuedMessage shortcuts.
+fn composer_queue_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+    if s.current().draft.is_composing() || s.current().request.is_some() {
+        return false;
+    }
+    let edit_latest = event.key == rune::Key::Up
+        && event.mods.alt
+        && !event.mods.ctrl
+        && !event.mods.cmd
+        && !event.mods.shift
+        && s.current().draft.focus == 0
+        && s.current().draft.anchor == 0;
+    let promote_next = event.key == rune::Key::Enter
+        && event.mods.shift
+        && (event.mods.cmd || event.mods.ctrl)
+        && !event.mods.alt;
+    let id = if edit_latest {
+        s.current().native.queue.back().map(|q| q.id)
+    } else if promote_next {
+        s.current().native.queue.front().map(|q| q.id)
+    } else {
+        return false;
+    };
+    let Some(id) = id else { return false };
+    if edit_latest {
+        s.current_mut().edit_queued(id);
+    } else {
+        s.current_mut().steer_queued(id);
+    }
+    s.checkpoint();
+    true
+}
+
 /// Ported from KSG Code's QueuedRunsControl: right-aligned unsent messages, per-message edit,
 /// remove and Send now actions, three initial rows and an explicit expansion control.
 pub(super) fn queued_messages(s: &State, p: Palette) -> El {
@@ -302,13 +346,54 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    let limit = if t.native.queue_expanded {
+    let limit = if t.native.queue_expanded || t.queued_edit.is_some() {
         usize::MAX
     } else {
         3
     };
     for queued in t.native.queue.iter().take(limit) {
         let id = queued.id;
+        let editing = t
+            .queued_edit
+            .as_ref()
+            .is_some_and(|edit| edit.input_id == id);
+        let mut actions = row().gap(2.0).flex_wrap();
+        if editing {
+            actions = actions
+                .child(label("Editing in the composer", SMALL, p.ink))
+                .child(
+                    button(&format!("queue-edit-{id}"), "Cancel", p, |s| {
+                        s.current_mut().cancel_queued_edit();
+                        s.checkpoint();
+                    })
+                    .label("Cancel editing queued message"),
+                );
+        } else {
+            actions = actions
+                .child(
+                    button(&format!("queue-steer-{id}"), "Send now", p, move |s| {
+                        s.current_mut().steer_queued(id);
+                        s.checkpoint();
+                    })
+                    .disabled(t.status.busy() && !t.can_steer()),
+                )
+                .child(
+                    button(&format!("queue-edit-{id}"), "Edit", p, move |s| {
+                        s.current_mut().edit_queued(id);
+                        s.checkpoint();
+                    })
+                    .disabled(t.request.is_some()),
+                );
+        }
+        actions = actions.child(button(
+            &format!("queue-remove-{id}"),
+            "Remove",
+            p,
+            move |s| {
+                s.current_mut().cancel_queued(id);
+                s.checkpoint();
+            },
+        ));
         let mut body = col()
             .gap(6.0)
             .px(12.0)
@@ -333,36 +418,7 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
                 .items_end()
                 .gap(4.0)
                 .child(body)
-                .child(
-                    row()
-                        .gap(2.0)
-                        .flex_wrap()
-                        .child(button(
-                            &format!("queue-steer-{id}"),
-                            "Send now",
-                            p,
-                            move |s| {
-                                s.current_mut().steer_queued(id);
-                                s.checkpoint();
-                            },
-                        ))
-                        .child(
-                            button(&format!("queue-edit-{id}"), "Edit", p, move |s| {
-                                s.current_mut().edit_queued(id);
-                                s.checkpoint();
-                            })
-                            .disabled(t.request.is_some()),
-                        )
-                        .child(button(
-                            &format!("queue-remove-{id}"),
-                            "Remove",
-                            p,
-                            move |s| {
-                                s.current_mut().cancel_queued(id);
-                                s.checkpoint();
-                            },
-                        )),
-                ),
+                .child(actions),
         );
     }
     if t.native.queue.len() > 3 {

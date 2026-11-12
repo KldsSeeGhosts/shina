@@ -61,6 +61,11 @@ glyph!(
     SEND,
     r#"<path d="M11 20h2V4h-2zm2-12h2V6h-2zm2 2h2V8h-2zm2 2h2v-2h-2zm-6-4H9V6h2z"/><path d="M15 10H7V8h8zm2 2H5v-2h12z"/>"#
 );
+// Pixelarticons play.svg, used for KSG Code's Resume thread action.
+glyph!(
+    PLAY,
+    r#"<path d="M15 11h-2V9h2zm0 4h-2v-2h2zm-2 2h-2v-2h2zm0-8h-2V7h2zm-2-2H9V5h2zM9 21H7V3h2zm6-8h2v-2h-2zm-6 4h2v2H9z"/>"#
+);
 glyph!(
     BUBBLE,
     r#"<path d="M20 2H4v2h16zm0 14H6v2h14zm2-12h-2v12h2zM4 4H2v18h2zm2 14H4v2h2zm0-6h4v2H6zm0-4h8v2H6z"/>"#
@@ -233,6 +238,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "compose" => &COMPOSE,
         "edit" => &PENCIL,
         "send" => &SEND,
+        "play" => &PLAY,
         "thread" => &BUBBLE,
         "cloud" => &CLOUD,
         "panel" => &PANEL,

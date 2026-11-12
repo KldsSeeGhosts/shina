@@ -5,6 +5,7 @@
 mod tests;
 use super::*;
 use std::collections::{HashMap, HashSet};
+pub const TURN_CAPABILITIES: TurnCapabilities = TurnCapabilities::new(true, false);
 #[path = "questionnaire.rs"]
 pub mod questionnaire;
 
@@ -142,6 +143,7 @@ pub struct PiSession {
     questionnaire_advance: Option<Instant>,
     pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
+    pub queue_held: bool,
     pub queue_expanded: bool,
     pub access: AccessMode,
     pub access_picker: bool,
@@ -378,7 +380,8 @@ impl Thread {
         };
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex" | "claude") {
+        if self.follow_up_queues() {
+            self.native.queue_held = false;
             self.serial += 1;
             self.native.queue.push_back(QueuedMessage {
                 id: self.serial,
@@ -401,21 +404,6 @@ impl Thread {
         self.drive_native();
     }
 
-    pub fn edit_queued(&mut self, id: usize) {
-        if self.forward(
-            "queue.edit",
-            json!({"inputId":id,"generation":self.request_generation}),
-        ) {
-            return;
-        }
-        if let Some(i) = self.native.queue.iter().position(|q| q.id == id)
-            && let Some(queued) = self.native.queue.remove(i)
-        {
-            self.restore_prompt(&queued.prompt);
-            self.native.follow_up = true;
-        }
-    }
-
     pub fn cancel_queued(&mut self, id: usize) {
         if self.forward(
             "queue.remove",
@@ -424,6 +412,7 @@ impl Thread {
             return;
         }
         self.native.queue.retain(|q| q.id != id);
+        self.reconcile_queued_edit();
     }
 
     pub fn steer_queued(&mut self, id: usize) {
@@ -436,9 +425,16 @@ impl Thread {
         if self.request.is_some() || self.configuring {
             return;
         }
+        if self.status.busy() && !self.can_steer() {
+            self.error = Some(
+                "This provider cannot steer the active turn. The message stays queued.".into(),
+            );
+            return;
+        }
         if let Some(i) = self.native.queue.iter().position(|q| q.id == id)
             && let Some(queued) = self.native.queue.remove(i)
         {
+            self.reconcile_queued_edit();
             if self.status.busy() {
                 self.native.sends.push_back(PendingSend {
                     id: None,
@@ -448,6 +444,7 @@ impl Thread {
                     delivered: false,
                 });
             } else {
+                self.native.queue_held = false;
                 self.native.queue.push_front(queued);
             }
             self.drive_native();
@@ -455,13 +452,34 @@ impl Thread {
     }
 
     pub(super) fn return_local_queue(&mut self) {
+        self.cancel_queued_edit();
         let queue = std::mem::take(&mut self.native.queue);
+        self.native.queue_held = false;
         for queued in queue.into_iter().rev() {
             self.restore_prompt(&queued.prompt);
         }
     }
 
+    /// Stop keeps admitted input in the server queue. Return to draft still restores it.
+    fn recover_queued_prompt(&mut self, prompt: &Prompt) {
+        if self.native.queue_held {
+            self.serial += 1;
+            self.native.queue.push_front(QueuedMessage {
+                id: self.serial,
+                prompt: prompt.clone(),
+            });
+        } else {
+            self.restore_prompt(prompt);
+        }
+    }
+
     pub fn clear_user_queue(&mut self) {
+        if self.forward(
+            "queue.returnDraft",
+            json!({"generation":self.request_generation}),
+        ) {
+            return;
+        }
         self.return_local_queue();
         if self.pi.is_some() {
             self.command("clear_queue", json!({}));
@@ -553,7 +571,7 @@ impl Thread {
             return true;
         }
         if self.native.compact_id.is_some()
-            || self.context.phase == crate::context::ContextPhase::Compacting
+            || self.context.phase == crate::context::ContextPhase::Compacting && !self.can_steer()
         {
             return true;
         }
@@ -564,11 +582,13 @@ impl Thread {
             }
         }
         if !self.status.busy()
+            && !self.native.queue_held
             && self.native.sends.is_empty()
             && self.queued_prompt.is_none()
             && self.pending_prompt.is_none()
             && let Some(queued) = self.native.queue.pop_front()
         {
+            self.reconcile_queued_edit();
             self.begin_prompt(queued.prompt);
             return true;
         }
@@ -852,6 +872,7 @@ impl Thread {
             .chain(self.native.dialog_deadline)
             .chain(self.native.questionnaire_advance)
             .chain(self.typing_guard.deadline())
+            .chain(self.stop_deadline())
             .min()
     }
 
@@ -869,9 +890,10 @@ impl Thread {
 
     pub(super) fn pending_inputs_value(&self) -> Value {
         let mut values: Vec<_> = self.native.sends.iter().chain(&self.native.queued_inputs).chain(&self.native.recovery).map(|s| json!({
-            "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after
+            "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft
         })).collect();
-        values.extend(self.native.queue.iter().map(|q| json!({"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len()})));
+        values.extend(self.native.queue.iter().map(|q| json!({"kind":"queued","inputId":q.id,
+            "held":self.native.queue_held,"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft})));
         json!(values)
     }
 
@@ -880,6 +902,9 @@ impl Thread {
             return Ok(());
         }
         for item in value.as_array().ok_or("Invalid queued messages.")? {
+            if item.get("kind").is_some_and(|kind| kind != "queued") {
+                continue;
+            }
             let text = item["text"]
                 .as_str()
                 .ok_or("Invalid queued message text.")?;
@@ -893,9 +918,26 @@ impl Thread {
             if images.len() != saved_images.len() {
                 self.attachment_error = Some("Some queued images are missing. Reattach them before sending the recovered draft.".into());
             }
+            let prompt = crate::composer_tokens::received_prompt(
+                text.into(),
+                images,
+                item.get("draft").cloned(),
+            )?;
+            if item["kind"] == "queued" {
+                let id = item["inputId"]
+                    .as_u64()
+                    .and_then(|id| usize::try_from(id).ok())
+                    .ok_or("Invalid queued input identity.")?;
+                self.serial = self.serial.max(id);
+                self.native.queue_held = true;
+                if !self.native.queue.iter().any(|q| q.id == id) {
+                    self.native.queue.push_back(QueuedMessage { id, prompt });
+                }
+                continue;
+            }
             self.native.recovery.push(PendingSend {
                 id: None,
-                prompt: Prompt::new(text.into(), images),
+                prompt,
                 mode: "steer",
                 after: item["after"]
                     .as_u64()
@@ -940,10 +982,12 @@ impl Thread {
         self.native.questionnaires.clear();
         self.native.questionnaire_replies.clear();
         self.native.notifications.clear();
-        self.return_local_queue();
+        if !self.native.queue_held {
+            self.return_local_queue();
+        }
         let queued = std::mem::take(&mut self.native.queued_inputs);
         for send in queued.into_iter().rev() {
-            self.restore_prompt(&send.prompt);
+            self.recover_queued_prompt(&send.prompt);
         }
         self.native.steering.clear();
         self.native.follow_ups.clear();
@@ -979,7 +1023,7 @@ impl Thread {
         self.native
             .notifications
             .retain(|(_, deadline)| *deadline > now);
-        let mut changed = before != self.native.notifications.len();
+        let mut changed = (before != self.native.notifications.len()) | self.tick_stop(now);
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
             self.cancel_questionnaire();
             self.native.dialog_deadline = None;
@@ -1124,7 +1168,13 @@ impl Thread {
                 {
                     let mut send = self.native.sends.pop_front().unwrap();
                     if record["success"] == false {
-                        if string(record, "error").contains("compaction") {
+                        if record["queueInstead"] == true {
+                            self.serial += 1;
+                            self.native.queue.push_back(QueuedMessage {
+                                id: self.serial,
+                                prompt: send.prompt,
+                            });
+                        } else if string(record, "error").contains("compaction") {
                             send.id = None;
                             self.native.sends.push_front(send);
                             self.context.begin_compaction();
@@ -1336,7 +1386,7 @@ impl Thread {
                         if let Some(i) = texts.iter().position(|text| *text == send.prompt.text) {
                             texts.remove(i);
                         }
-                        self.restore_prompt(&send.prompt);
+                        self.recover_queued_prompt(&send.prompt);
                     }
                     // Claude's interrupt receipt can prove an already-streamed
                     // input was cancelled. Preserve its images and path references.
@@ -1362,11 +1412,13 @@ impl Thread {
                                     .flatten()
                                     .filter_map(Attachment::from_value),
                             );
-                            self.restore_prompt(&Prompt::new(text, images));
+                            self.recover_queued_prompt(&Prompt::new(text, images));
                         }
                     }
                     if !texts.is_empty() {
-                        self.restore_prompt(&Prompt::new(texts.join("\n\n"), vec![]));
+                        for text in texts.into_iter().rev() {
+                            self.recover_queued_prompt(&Prompt::new(text, vec![]));
+                        }
                     }
                     self.native.steering.clear();
                     self.native.follow_ups.clear();
