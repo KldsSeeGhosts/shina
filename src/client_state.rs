@@ -4232,7 +4232,7 @@ mod tests {
     }
 
     #[test]
-    fn retargeted_thread_pill_keeps_owner_and_drops_read_thread_hint() {
+    fn retargeted_thread_pill_keeps_owner_and_blocks_the_send() {
         let mut state = State::new(PathBuf::new(), false);
         let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
         let (remote_client, _rx2) = crate::client::Client::test_connected(state.data_dir.clone());
@@ -4292,17 +4292,17 @@ mod tests {
 
         state.retarget_draft("server-b");
         assert_eq!(state.machines.selected, "server-b");
-        let retargeted_prompt = crate::composer_tokens::prompt_for(
+        let blocked = crate::composer_tokens::prompt_for(
             &state.current().draft,
             &[],
             Some(&state.current().machine),
             &|machine| state.machine_label(machine),
         )
-        .unwrap();
+        .err()
+        .expect("a thread on another machine blocks the send");
         assert_eq!(
-            retargeted_prompt.text,
-            "check Shina thread \"Local seven\" on Local (not readable from this machine)"
+            blocked,
+            "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
         );
-        assert!(!retargeted_prompt.text.contains("read_thread"));
     }
 }

@@ -109,6 +109,22 @@ pub fn prompt_for(
 ) -> Result<Prompt, String> {
     let mut attachments = images.to_vec();
     for (_, id) in edit.pills() {
+        // Ported from KSG Code's `threadContextsOutsideEnvironment` and its use in
+        // `useComposerSend.ts`: a thread the target machine's agent cannot read blocks the send.
+        // Shina has no read path to a linked machine's threads yet, so any other owner blocks.
+        if let Some(Token::Thread {
+            title,
+            machine: Some(owner),
+            ..
+        }) = Token::decode(id)
+            && let Some(target) = target_machine
+            && owner != target
+        {
+            return Err(format!(
+                "Attached thread is on another machine. This machine's agent can't read \"{title}\". Remove it, or switch back to {} to send.",
+                machine_name(&owner)
+            ));
+        }
         if let Some(Token::File { path, .. }) = Token::decode(id) {
             let attachment = attachments::reference_file(&path)?;
             if !attachments.iter().any(|a| a.id == attachment.id) {
