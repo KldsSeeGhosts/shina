@@ -1049,6 +1049,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(pill) = crew_ui::attention_row(s, p) {
         root = root.child(pill);
     }
+    if !s.toasts.is_empty() {
+        root = root.child(toast_stack(s, p, chrome.height.max(40.0 * zoom) / zoom));
+    }
     if s.attention_menu && !s.attention().is_empty() {
         // The pane's top left corner, worked out rather than read from the last layout, so the
         // popover is in place on its first frame: the workspace's 8 pt inset, the sidebar and
@@ -3427,10 +3430,80 @@ fn row_status(s: &State, thread: &Thread) -> (Status, bool) {
         Status::Waiting
     } else if s.is_captain_home(thread) {
         s.home_status(id)
+    } else if thread.status == Status::Ready
+        && (thread.client_creating.is_some()
+            || thread.remote_send.is_some()
+            || thread.client_promoted.is_some())
+    {
+        Status::Running
     } else {
         thread.status
     };
     (status, approval)
+}
+
+/// Ported from KSG Code's `Toasts` (`components/ui/toast.tsx`) and `stackedThreadToast`,
+/// styled with Shina's Pixel Voyage framed card.
+fn toast_stack(s: &State, p: Palette, top: f32) -> El {
+    let mut stack = col()
+        .key("toast-stack")
+        .pin(Some(top + 8.0), Some(16.0), None, None)
+        .w((s.viewport_width - 32.0).clamp(240.0, 360.0))
+        .gap(8.0);
+    for toast in s.toasts.iter().rev() {
+        let id = toast.id;
+        let (glyph_name, ink) = match toast.kind {
+            crate::model::ToastKind::Success => ("check", p.sea),
+            crate::model::ToastKind::Warning => ("alert", p.brass),
+            crate::model::ToastKind::Error => ("alert", p.danger),
+        };
+        let mut card = col()
+            .key(format!("toast-{id}"))
+            .role("status")
+            .label(toast.title.clone())
+            .w_full()
+            .padding(12.0)
+            .gap(6.0)
+            .radius(6.0)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .box_shadow(hard_shadow(p))
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(icon(glyph_name, ink))
+                    .child(
+                        label(&toast.title, TextStyle::new(13.0, 600.0), p.ink)
+                            .wrap()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(icon_button(
+                        &format!("toast-close-{id}"),
+                        "Dismiss",
+                        "close",
+                        p,
+                        move |s| {
+                            s.dismiss_toast(id);
+                        },
+                    )),
+            );
+        if let Some(description) = &toast.description {
+            card = card.child(label(description, SMALL, p.muted).wrap().selectable(true));
+        }
+        if let Some(action_label) = &toast.action_label {
+            card = card.child(row().w_full().justify_end().child(button(
+                &format!("toast-action-{id}"),
+                action_label,
+                p,
+                move |s| s.activate_toast(id),
+            )));
+        }
+        stack = stack.child(card);
+    }
+    stack
 }
 
 /// The portrait a captain wears; threads without a profile wear the first.
@@ -17230,12 +17303,13 @@ pub(crate) mod tests {
         assert!(rt.state.current().native.queue.is_empty());
 
         // Under SendShortcut::ModEnter on a draft thread, Mod+Enter routes through
-        // composer.sendBackground and submits.
+        // composer.sendBackground, starts the thread in background, and opens a fresh composer.
         let mut draft_rt = runtime(1280.0);
         draft_rt.on_key = Some(crate::key);
         draft_rt.state.preferences.send_shortcut = crate::composer::SendShortcut::ModEnter;
         draft_rt.frame(0.0);
         press(&mut draft_rt, "composer-input");
+        let first_id = draft_rt.state.current().id;
         draft_rt.state.current_mut().draft.replace_text("Ship it");
         draft_rt.key(rune::KeyEvent {
             key: rune::Key::Enter,
@@ -17245,8 +17319,10 @@ pub(crate) mod tests {
             },
         });
         draft_rt.frame(0.0);
+        assert_ne!(draft_rt.state.current().id, first_id);
+        assert!(draft_rt.state.current().is_draft());
         assert!(draft_rt.state.current().draft.text.is_empty());
-        assert_eq!(draft_rt.state.current().messages.len(), 1);
+        assert_eq!(draft_rt.state.threads[0].messages.len(), 1);
     }
 
     #[test]
@@ -17512,6 +17588,232 @@ pub(crate) mod tests {
             rt.frame(0.0);
             assert!(rt.state.current().draft.has_mark(&rune::Mark::Bold));
             assert!(!rt.state.show_activity);
+        }
+    }
+
+    #[test]
+    fn background_send_and_new_thread_chords_work_and_render_toasts_at_all_widths() {
+        let enter_chord = |alt: bool| rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                cmd: true,
+                alt,
+                ..Default::default()
+            },
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            // 1. Draft thread: Mod+Enter and Mod+Alt+Enter start in background and open a fresh focused composer.
+            for alt in [false, true] {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                rt.state.current_mut().pi = Some(pi);
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("Draft background");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let first_id = rt.state.current().id;
+
+                rt.key(enter_chord(alt));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, first_id, "{width} alt={alt}");
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert!(rt.state.current().draft.text.is_empty());
+                assert_eq!(rt.state.threads[0].messages.len(), 1);
+                assert_eq!(rt.state.threads[0].status, Status::Running);
+
+                let (stack, _) = rt.presented("toast-stack").expect("toast stack");
+                assert!(
+                    stack[0] >= 0.0 && stack[0] + stack[2] <= width + 1.0,
+                    "{width}: {stack:?}"
+                );
+                let toast_action = format!("toast-action-{}", rt.state.toasts[0].id);
+                let (btn, _) = rt.presented(&toast_action).expect("Open action");
+                assert!(btn[0] >= 0.0 && btn[0] + btn[2] <= width + 1.0);
+                press(&mut rt, &toast_action);
+                assert_eq!(rt.state.current().id, first_id);
+                assert!(rt.state.toasts.is_empty());
+            }
+
+            // 2. Existing idle thread: Mod+Alt+Enter sends and opens a fresh focused draft composer.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                {
+                    let t = rt.state.current_mut();
+                    t.pi = Some(pi);
+                    t.model_provider = "cpa".into();
+                    t.messages.push(crate::model::Message {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role: "You",
+                        text: "Prior turn".into(),
+                        images: vec![],
+                    });
+                    t.draft.replace_text("Follow-up idle");
+                }
+                let existing_id = rt.state.current().id;
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, existing_id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert!(rt.state.current().draft.text.is_empty());
+                assert!(rt.state.toasts.is_empty());
+                assert_eq!(rt.state.threads[0].messages.len(), 2);
+            }
+
+            // 3. Existing running thread: Mod+Alt+Enter queues/steers and opens a fresh focused draft composer.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                {
+                    let t = rt.state.current_mut();
+                    t.pi = Some(pi);
+                    t.model_provider = "cpa".into();
+                    t.status = Status::Running;
+                    t.native.follow_up = true;
+                    t.draft.replace_text("Follow-up while running");
+                }
+                let running_id = rt.state.current().id;
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, running_id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert_eq!(rt.state.threads[0].native.queue.len(), 1);
+            }
+
+            // 4. Failing background send: shows "Background task failed" toast with "Open draft" and recovers draft.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                rt.state.runtime_enabled = true;
+                let failed_id = rt.state.current().id;
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.state.current_mut().machine = "missing-host".into();
+                rt.state.current_mut().draft.replace_text("Recover me");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, failed_id);
+                let (stack, _) = rt.presented("toast-stack").expect("failure toast");
+                assert!(stack[0] >= 0.0 && stack[0] + stack[2] <= width + 1.0);
+                let toast_action = format!("toast-action-{}", rt.state.toasts[0].id);
+                press(&mut rt, &toast_action);
+                assert_eq!(rt.state.current().id, failed_id);
+                assert_eq!(rt.state.current().draft.text, "Recover me");
+                assert!(rt.state.current().error.is_some());
+            }
+
+            // 5. Guards: empty prompt, submission_error, pending request, archived, unfocused, repeat, IME composition.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                rt.state.current_mut().pi = Some(pi);
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let id = rt.state.current().id;
+
+                // Empty prompt
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert!(rt.state.toasts.is_empty());
+
+                // Unfocused composer does not trigger sendBackground
+                rt.state.current_mut().draft.replace_text("Unfocused");
+                rt.state.current_mut().draft.focused = false;
+                rt.invalidate();
+                rt.frame(0.0);
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+
+                // Archived thread does not send
+                press(&mut rt, "composer-input");
+                rt.state.current_mut().life.archived_at = Some(1);
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+                rt.state.current_mut().life.archived_at = None;
+
+                // Pending request blocks sendAndNewThread
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "You",
+                    text: "Turn 1".into(),
+                    images: vec![],
+                });
+                rt.state.current_mut().request = Some(json!({"id":"r1","method":"confirm"}));
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+                rt.state.current_mut().request = None;
+
+                // Over-limit prompt sets submission_error and does not open a new thread
+                rt.state.current_mut().draft.replace_text(
+                    &"x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1),
+                );
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert!(rt.state.current().submission_error.is_some());
+
+                // Key repeat and IME composition never submit
+                rt.state.current_mut().submission_error = None;
+                rt.state.current_mut().draft.replace_text("Repeat/IME");
+                rt.frame(0.0);
+                rt.repeat_key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Repeat/IME");
+                rt.ime(rune::Ime::Preedit("あ".into(), None));
+                rt.frame(0.0);
+                assert!(rt.state.current().draft.is_composing());
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Repeat/IME");
+                rt.state.current_mut().draft.cancel_composition();
+                rt.frame(0.0);
+
+                // Open slash menu does not intercept Mod+Alt+Enter (sendAndNewThread)
+                rt.state.current_mut().draft.replace_text("/review");
+                rt.state.current_mut().native.commands.push(
+                    crate::model::pi_session::SlashCommand {
+                        name: "review".into(),
+                        description: "Review".into(),
+                        source: "ACP".into(),
+                    },
+                );
+                rt.frame(0.0);
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_ne!(rt.state.current().id, id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+            }
         }
     }
 }

@@ -106,6 +106,29 @@ impl Selection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToastAction {
+    OpenThread { server: String, thread_id: usize },
+}
+
+#[derive(Clone, Debug)]
+pub struct ToastNotice {
+    pub id: u64,
+    pub kind: ToastKind,
+    pub title: String,
+    pub description: Option<String>,
+    pub action_label: Option<String>,
+    pub action: Option<ToastAction>,
+    pub expires_at: Option<u64>,
+}
+
 /// The validated fields of a `delegate_task.target` request.
 pub(crate) struct DelegationTarget {
     harness: Option<String>,
@@ -341,10 +364,13 @@ pub struct Thread {
     resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
-    client_creating: Option<uuid::Uuid>,
-    client_promoted: Option<usize>,
+    pub(crate) client_creating: Option<uuid::Uuid>,
+    pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
-    remote_send: Option<(uuid::Uuid, TextEdit, Vec<Attachment>)>,
+    pub(crate) remote_send: Option<(uuid::Uuid, TextEdit, Vec<Attachment>)>,
+    pub(crate) background_start_pending: bool,
+    pub(crate) background_send: Option<String>,
+    pub(crate) pending_send_and_new_thread: Option<(uuid::Uuid, String)>,
     request_generation: String,
     server_owned: bool,
     recovery_command: Option<uuid::Uuid>,
@@ -489,6 +515,9 @@ impl Thread {
             && self.messages.is_empty()
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
+            && self.client_creating.is_none()
+            && self.remote_send.is_none()
+            && self.client_promoted.is_none()
     }
     /// No session, or one that was only warmed for a thread nothing has been sent in.
     fn unused_session(&self) -> bool {
@@ -580,6 +609,9 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            background_start_pending: false,
+            background_send: None,
+            pending_send_and_new_thread: None,
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
@@ -2415,18 +2447,19 @@ impl Thread {
         }
     }
 
-    fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) {
+    pub(crate) fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) -> bool {
         if !self
             .remote_send
             .as_ref()
             .is_some_and(|(id, _, _)| *id == command)
         {
-            return;
+            return false;
         }
         let (_, edit, images) = self.remote_send.take().unwrap();
         if !accepted {
             self.restore_editor(&edit, &images);
         }
+        true
     }
 
     fn finish_run(&mut self) {
@@ -2571,6 +2604,8 @@ pub struct State {
     pub shelves: [bool; 2],
     pub settled_visible: usize,
     pub undo: Option<UndoNotice>,
+    pub toasts: Vec<ToastNotice>,
+    next_toast_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
@@ -2646,7 +2681,7 @@ pub struct State {
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
-    runtime_enabled: bool,
+    pub(crate) runtime_enabled: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
     // Drop the owner only after every store has flushed and stopped its writer.
@@ -2764,6 +2799,8 @@ impl State {
             shelves: [false; 2],
             settled_visible: 10,
             undo: None,
+            toasts: Vec::new(),
+            next_toast_id: 1,
             opened_draft: None,
             composer_sources: crate::composer_sources::Sources::default(),
             snooze_menu: None,
@@ -2903,8 +2940,12 @@ impl State {
     fn focus_thread(&mut self, index: usize) {
         self.focus_tab(index, true);
     }
-    fn focus_tab(&mut self, index: usize, visit: bool) {
+    pub(crate) fn focus_tab(&mut self, index: usize, visit: bool) {
         debug_assert!(self.tabs.contains(&self.threads[index].id));
+        let previous = self.active;
+        if previous != index && previous < self.threads.len() {
+            self.threads[previous].draft.focused = false;
+        }
         self.active = index;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
@@ -4453,13 +4494,14 @@ impl State {
         self.create_thread_in(project, &[], &seed);
     }
     // Ported from KSG Code's useHandleNewThread composer model override.
-    fn composer_seed(&self) -> Value {
+    pub(crate) fn composer_seed(&self) -> Value {
         self.threads.get(self.active).map_or(Value::Null, |thread| {
             json!({"harness":thread.harness,"model":thread.selected_or_effective_model(),
-                "thinking":thread.selected_or_effective_reasoning(),"access":thread.native.access.id()})
+                "thinking":thread.selected_or_effective_reasoning(),"access":thread.native.access.id(),
+                "serviceTier":thread.harness_state["serviceTier"]})
         })
     }
-    fn inherit_composer(&mut self, index: usize, seed: &Value) {
+    pub(crate) fn inherit_composer(&mut self, index: usize, seed: &Value) {
         if seed.is_null() {
             let harness = self.default_harness.clone();
             self.threads[index].harness = harness.clone();
@@ -4524,6 +4566,16 @@ impl State {
         } else if !thread.thinking_levels.contains(&thread.thinking) {
             thread.selected_thinking = None;
             thread.thinking.clear();
+        }
+        if harness == "codex"
+            && let Some(tier) = seed["serviceTier"].as_str().filter(|tier| {
+                model
+                    .service_tiers
+                    .iter()
+                    .any(|option| option["id"] == *tier)
+            })
+        {
+            thread.harness_state["serviceTier"] = json!(tier);
         }
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
@@ -5699,29 +5751,249 @@ impl State {
         self.current_mut().remove_attachment(id);
         self.checkpoint();
     }
+    pub(crate) fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        description: Option<String>,
+        action: Option<(String, ToastAction)>,
+        timeout_ms: Option<u64>,
+    ) {
+        let title = title.into();
+        if title == "Not connected: message not sent" {
+            self.toasts.retain(|t| t.title != title);
+        }
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        let (action_label, action) = match action {
+            Some((label, action)) => (Some(label), Some(action)),
+            None => (None, None),
+        };
+        let expires_at = timeout_ms.map(|ms| lifecycle::now().saturating_add(ms));
+        self.toasts.push(ToastNotice {
+            id,
+            kind,
+            title,
+            description,
+            action_label,
+            action,
+            expires_at,
+        });
+        while self.toasts.len() > 5 {
+            self.toasts.remove(0);
+        }
+    }
+
+    pub fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.retain(|t| t.id != id);
+    }
+
+    pub fn activate_toast(&mut self, id: u64) {
+        let Some(pos) = self.toasts.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let toast = self.toasts.remove(pos);
+        let Some(action) = toast.action else {
+            return;
+        };
+        match action {
+            ToastAction::OpenThread { server, thread_id } => {
+                if self.client.is_some() {
+                    if server != self.machines.selected {
+                        self.select_machine(&server);
+                    }
+                    if self.machines.selected == server
+                        && let Some(index) = self.threads.iter().position(|t| t.id == thread_id)
+                    {
+                        self.select_thread(index);
+                    }
+                } else if let Some(index) = self.threads.iter().position(|t| t.id == thread_id) {
+                    self.select_thread(index);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn expire_toasts(&mut self) -> bool {
+        let at = lifecycle::now();
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|toast| toast.expires_at.is_none_or(|exp| exp > at));
+        self.toasts.len() != before
+    }
+
+    pub(crate) fn notify_background_started(&mut self, server: &str, thread_id: usize) {
+        self.push_toast(
+            ToastKind::Success,
+            "Started in background",
+            None,
+            Some((
+                "Open".into(),
+                ToastAction::OpenThread {
+                    server: server.to_owned(),
+                    thread_id,
+                },
+            )),
+            Some(5_000),
+        );
+    }
+
+    pub(crate) fn notify_background_failure(
+        &mut self,
+        server: &str,
+        thread_id: usize,
+        error: String,
+    ) {
+        self.toasts.retain(|toast| {
+            !(toast.title == "Started in background"
+                && toast.action.as_ref().is_some_and(|action| {
+                    matches!(
+                        action,
+                        ToastAction::OpenThread {
+                            server: s,
+                            thread_id: tid
+                        } if s == server && *tid == thread_id
+                    )
+                }))
+        });
+        self.push_toast(
+            ToastKind::Error,
+            "Background task failed",
+            Some(error),
+            Some((
+                "Open draft".into(),
+                ToastAction::OpenThread {
+                    server: server.to_owned(),
+                    thread_id,
+                },
+            )),
+            Some(5_000),
+        );
+    }
+
     pub fn send(&mut self) {
-        if self.ownership_denied {
+        let _ = self.dispatch_send();
+    }
+
+    /// Ported from KSG Code's `useComposerSend` (`onSend` with `submissionIntent: "background"`):
+    /// on a draft thread, starts in the background and opens a fresh composer; on an existing
+    /// thread, dispatches the turn and opens a new draft once accepted.
+    pub fn send_background(&mut self) {
+        let source_index = self.active;
+        let source_id = self.current().id;
+        let was_draft = self.current().is_draft();
+        let project = self.current().project;
+        let seed = self.composer_seed();
+        let server = self.machines.selected.clone();
+
+        if !self.dispatch_send() {
             return;
         }
-        if self.current().resume_pending() {
+
+        if self.client.is_some() {
+            if was_draft {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.background_send = Some(server);
+                }
+                self.new_client_draft_with_seed(project, &seed);
+                if !self.headless {
+                    self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+                }
+                self.checkpoint();
+            } else if let Some((command_id, _, _)) = self
+                .threads
+                .iter()
+                .find(|t| t.id == source_id)
+                .and_then(|t| t.remote_send.as_ref())
+            {
+                let command_id = *command_id;
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.pending_send_and_new_thread = Some((command_id, server));
+                }
+            }
             return;
+        }
+
+        if was_draft {
+            self.create_thread_in(project, &[source_id], &seed);
+            if !self.headless {
+                self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+            }
+            let failed = self
+                .threads
+                .iter()
+                .find(|t| t.id == source_id)
+                .is_some_and(|t| t.status == Status::Failed);
+            if failed {
+                let error = self
+                    .threads
+                    .iter()
+                    .find(|t| t.id == source_id)
+                    .and_then(|t| t.error.clone())
+                    .unwrap_or_else(|| "Failed to send message.".into());
+                self.notify_background_failure("local", source_id, error);
+            } else {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.background_start_pending =
+                        thread.pending_prompt.is_some() || thread.queued_prompt.is_some();
+                }
+                self.notify_background_started("local", source_id);
+            }
+            self.checkpoint();
+        } else {
+            let failed = self
+                .threads
+                .get(source_index)
+                .is_some_and(|t| t.id == source_id && t.status == Status::Failed);
+            if !failed {
+                self.create_thread_in(project, &[source_id], &seed);
+                if !self.headless {
+                    self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+                }
+            }
+            self.checkpoint();
+        }
+    }
+
+    fn dispatch_send(&mut self) -> bool {
+        if self.demo || self.ownership_denied || self.current().archived() {
+            return false;
+        }
+        if self.current().resume_pending() {
+            return false;
         }
         if self.current().queued_edit.is_some() {
             self.current_mut().save_queued_edit();
             self.checkpoint();
-            return;
+            return false;
+        }
+        if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
+            return false;
         }
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
-                return;
+                return false;
+            }
+            if !self.current().has_draft_content() {
+                return false;
+            }
+            if !self.machine_connected(&self.machines.selected) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Not connected: message not sent",
+                    Some("Reconnecting to the environment. Try again once it is connected.".into()),
+                    None,
+                    Some(5_000),
+                );
+                return false;
             }
             if self.current().client_draft {
                 self.promote_client_draft();
-                return;
+                return self.current().client_creating.is_some();
             }
-            if self.current().remote_send.is_some() || !self.current().has_draft_content() {
-                return;
+            if self.current().remote_send.is_some() {
+                return false;
             }
             // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
@@ -5735,19 +6007,19 @@ impl State {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     self.current_mut().attachment_error = Some(error);
-                    return;
+                    return false;
                 }
             };
             if !self.headless
                 && let Some(error) = self.current().validate_prompt_length(&prompt)
             {
                 self.current_mut().submission_error = Some(error);
-                return;
+                return false;
             }
             self.current_mut().submission_error = None;
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
                 "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
-            match result {
+            return match result {
                 Some(Ok(id)) => {
                     self.current_mut().remote_send = Some((
                         id,
@@ -5756,27 +6028,30 @@ impl State {
                     ));
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                    true
                 }
-                Some(Err(error)) => self.storage_error = Some(error),
-                None => {}
-            }
-            return;
+                Some(Err(error)) => {
+                    self.storage_error = Some(error);
+                    false
+                }
+                None => false,
+            };
         }
         if self.network_blocked() {
             self.current_mut().error =
                 Some("Waiting for the network after resume. Your draft has not been sent.".into());
-            return;
+            return false;
         }
         if self.current().status == Status::Paused {
             self.current_mut().status = Status::Ready;
             self.current_mut().error = None;
         }
-        if self.demo
-            || self.current().archived()
-            || self.current().configuring
+        if self.current().configuring
+            || self.current().native.operating()
+            || self.current().phase == "Stopping"
             || !self.current().has_draft_content()
         {
-            return;
+            return false;
         }
         let text = crate::composer_rich::markdown(&self.current().draft)
             .trim()
@@ -5795,13 +6070,13 @@ impl State {
         }) {
             Some("/model") => {
                 self.choose_slash("model".into());
-                return;
+                return false;
             }
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
                         Some("Compaction does not accept attachments. Your draft was kept.".into());
-                    return;
+                    return false;
                 }
                 if self.current().can_compact() {
                     let instructions = words
@@ -5812,12 +6087,12 @@ impl State {
                     self.current_mut().draft.replace_text("");
                     self.compact_context(instructions);
                 }
-                return;
+                return false;
             }
             Some(command @ ("/goal" | "/feedback")) if self.current().harness == "codex" => {
                 if self.current().harness_state["codexNativeExtensions"] != true {
                     self.current_mut().error = Some("This Codex version has no verified native command protocol. Update Codex outside Shina.".into());
-                    return;
+                    return false;
                 }
                 let arguments = words.next().unwrap_or("").trim().to_owned();
                 if self.current().status.busy()
@@ -5825,13 +6100,13 @@ impl State {
                     && !matches!(arguments.as_str(), "" | "pause" | "clear")
                 {
                     self.current_mut().error = Some("Wait for Codex to finish before running this command. Your draft was kept.".into());
-                    return;
+                    return false;
                 }
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error = Some(
                         "Native commands do not accept attachments. Your draft was kept.".into(),
                     );
-                    return;
+                    return false;
                 }
                 self.current_mut().native.pending_command =
                     Some(json!({"name":command.trim_start_matches('/'),"arguments":arguments}));
@@ -5841,7 +6116,7 @@ impl State {
                 } else {
                     self.current_mut().drive_session();
                 }
-                return;
+                return false;
             }
             Some(command) if command.starts_with('/') => {
                 let name = command.trim_start_matches('/');
@@ -5860,7 +6135,7 @@ impl State {
                             "ACP"
                         }
                     ));
-                    return;
+                    return false;
                 }
             }
             _ => {}
@@ -5874,13 +6149,16 @@ impl State {
                 ) && let Some(error) = self.current().validate_prompt_length(&prompt)
                 {
                     self.current_mut().submission_error = Some(error);
-                    return;
+                    return false;
                 }
                 self.current_mut().submission_error = None;
             }
             self.current_mut().send_during_run();
-            self.checkpoint();
-            return;
+            let dispatched = !self.current().has_draft_content();
+            if dispatched {
+                self.checkpoint();
+            }
+            return dispatched;
         }
         if !self.headless {
             if let Ok(prompt) =
@@ -5888,17 +6166,21 @@ impl State {
                 && let Some(error) = self.current().validate_prompt_length(&prompt)
             {
                 self.current_mut().submission_error = Some(error);
-                return;
+                return false;
             }
             self.current_mut().submission_error = None;
         }
         self.current_mut().send();
+        if self.current().has_draft_content() || self.current().status != Status::Running {
+            return false;
+        }
         let id = self.current().id;
         self.invalidate_undo(id);
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
         self.checkpoint();
+        true
     }
 
     pub fn retry(&mut self) {
@@ -7406,6 +7688,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut run_ended = false;
     let mut crew_questions = Vec::new();
+    let mut background_failures = Vec::new();
     let mut event_budget_exhausted = false;
     if changed {
         state.persistence_scope = None;
@@ -7422,6 +7705,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
         let effects_before = crate::outbox::captured_count();
         let mut thread_changed = thread.poll_memory_command();
+        let was_bg_pending = thread.background_start_pending;
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
             let event = thread.pi.as_ref().and_then(|pi| pi.events.try_recv().ok());
@@ -7438,6 +7722,15 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 Event::Record(record) => {
                     state.background.observe_record(&record);
                     let settled = record["type"] == "agent_settled";
+                    if matches!(
+                        record["type"].as_str(),
+                        Some("agent_start" | "message_start" | "agent_settled")
+                    ) || (record["type"] == "response"
+                        && record["command"] == "prompt"
+                        && record["success"] != false)
+                    {
+                        thread.background_start_pending = false;
+                    }
                     if record["type"] == "extension_ui_request"
                         && !thread.recovering_task
                         && matches!(
@@ -7500,6 +7793,19 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             );
             thread_changed = true;
         }
+        if was_bg_pending && thread.status == Status::Failed {
+            thread.background_start_pending = false;
+            thread_changed = true;
+            if index != state.active {
+                background_failures.push((
+                    thread.id,
+                    thread
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Failed to send message.".into()),
+                ));
+            }
+        }
         thread_changed |= thread.reclaim_idle(Instant::now());
         // A quiet RPC stream must not freeze the visible work/thinking clocks.
         if !state.headless && index == state.active && thread.status.busy() {
@@ -7546,7 +7852,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    let global_changed = state.pause_offline_errors()
+    let mut global_changed = false;
+    for (thread_id, error) in background_failures {
+        state.notify_background_failure("local", thread_id, error);
+        global_changed = true;
+    }
+    global_changed |= state.pause_offline_errors()
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
     if global_changed {
@@ -7638,6 +7949,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             changed = true;
         } else {
             tx.wake_after(Duration::from_millis(notice.expires - at));
+        }
+    }
+    changed |= state.expire_toasts();
+    for toast in &state.toasts {
+        if let Some(expires) = toast.expires_at
+            && expires > at
+        {
+            tx.wake_after(Duration::from_millis(expires - at));
         }
     }
     if let Some(error) = state
@@ -13116,5 +13435,282 @@ mod tests {
 
         thread.history_loaded = true;
         assert!(!thread.restoring_history());
+    }
+
+    #[test]
+    fn send_background_starts_draft_in_background_inherits_composer_and_notifies() {
+        let mut state = State::new(".".into(), false);
+        let dir_b = std::env::temp_dir().join(format!("shina-bg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir_b);
+        let p2 = state.add_project(dir_b.clone()).unwrap().unwrap();
+        let model = AgentModel {
+            provider: "codex".into(),
+            id: "codex-fast".into(),
+            name: "Codex Fast".into(),
+            thinking_levels: vec!["low".into(), "high".into()],
+            context_window: Some(100_000),
+            supports_images: Some(true),
+            service_tiers: vec![
+                json!({"id":"default","name":"Standard"}),
+                json!({"id":"fast","name":"Fast"}),
+            ],
+        };
+        state.codex_catalog.models = vec![model.clone()];
+        let (pi, _cmds, _events) = Pi::test_connection();
+        {
+            let t = state.current_mut();
+            t.harness = "codex".into();
+            t.models = vec![model];
+            t.set_model("codex".into(), "codex-fast".into());
+            t.set_thinking("high".into());
+            t.set_service_tier("fast".into());
+            state.set_access_mode(AccessMode::ReadOnly);
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.draft.replace_text("Background task");
+            t.add_attachment(test_attachment("shot.png", 1)).unwrap();
+        }
+        let bg_id = state.current().id;
+
+        state.send_background();
+
+        // Fresh draft composer is active, focused, empty, and inherits selections.
+        assert_ne!(state.current().id, bg_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+        assert!(state.current().draft.text.is_empty());
+        assert!(state.current().draft_images.is_empty());
+        assert!(state.current().messages.is_empty());
+        assert!(state.current().error.is_none());
+        assert_eq!(state.current().project, Some(p2));
+        assert_eq!(state.current().machine, "local");
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(
+            state.current().selected_model,
+            Some(("codex".into(), "codex-fast".into()))
+        );
+        assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+        assert_eq!(state.current().harness_state["serviceTier"], "fast");
+        assert_eq!(state.current().native.access, AccessMode::ReadOnly);
+        assert!(state.current().captain.is_none());
+
+        // Background thread is running and visible in sidebar Active section.
+        let bg = state.threads.iter().find(|t| t.id == bg_id).unwrap();
+        assert_eq!(bg.status, Status::Running);
+        assert_eq!(bg.messages.len(), 1);
+        assert_eq!(bg.messages[0].text, "Background task");
+        assert!(!bg.is_draft());
+        assert!(
+            state
+                .sidebar_threads()
+                .iter()
+                .any(|&i| state.threads[i].id == bg_id)
+        );
+
+        // 5-second "Started in background" toast with "Open" action.
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Started in background");
+        assert_eq!(toast.action_label.as_deref(), Some("Open"));
+        assert!(toast.expires_at.is_some());
+
+        // Completing in background marks the thread unread; clicking Open navigates to it and clears unread.
+        let bg_idx = state.threads.iter().position(|t| t.id == bg_id).unwrap();
+        state.threads[bg_idx].apply(json!({"type":"agent_settled"}));
+        let completed_at = state.threads[bg_idx].life.last_completed_at.unwrap();
+        state.threads[bg_idx].life.last_visited_at = Some(completed_at.saturating_sub(100));
+        assert!(state.threads[bg_idx].unread());
+
+        let toast_id = toast.id;
+        state.activate_toast(toast_id);
+        assert_eq!(state.current().id, bg_id);
+        assert!(state.toasts.is_empty());
+        assert!(!state.current().unread());
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn send_and_new_thread_works_on_idle_and_running_threads_and_respects_guards() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, _events) = Pi::test_connection();
+        let original_id = state.current().id;
+        {
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: "You",
+                text: "Prior message".into(),
+                images: vec![],
+            });
+            t.draft.replace_text("First message");
+        }
+        state.send_background();
+        let fresh_id = state.current().id;
+        assert_ne!(fresh_id, original_id);
+        // Existing idle thread -> sendAndNewThread opens a fresh draft without "Started in background" toast.
+        assert!(state.toasts.is_empty());
+
+        // Switch back to original_id (which is now running!) and test sendAndNewThread while running.
+        let orig_idx = state
+            .threads
+            .iter()
+            .position(|t| t.id == original_id)
+            .unwrap();
+        state.select_thread(orig_idx);
+        state.current_mut().native.follow_up = true;
+        state.current_mut().draft.replace_text("Queued follow up");
+        state.send_background();
+        let after_running_id = state.current().id;
+        assert_ne!(after_running_id, original_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+        assert!(state.toasts.is_empty());
+        let orig = state.threads.iter().find(|t| t.id == original_id).unwrap();
+        assert_eq!(orig.native.queue.len(), 1);
+        assert_eq!(orig.native.queue[0].prompt.text, "Queued follow up");
+        let _ = commands;
+    }
+
+    #[test]
+    fn send_background_guards_block_empty_validation_pending_archived_and_queued_edit() {
+        // 1. Empty prompt
+        let mut state = State::new(".".into(), false);
+        let id = state.current().id;
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().id, id);
+        assert!(state.toasts.is_empty());
+
+        // 2. Prompt length validation error (> 120,000 chars)
+        state
+            .current_mut()
+            .draft
+            .replace_text(&"x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1));
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.current().submission_error.is_some());
+        assert!(state.toasts.is_empty());
+        state.current_mut().submission_error = None;
+
+        // 3. Pending request / question blocks send_background
+        state.current_mut().draft.replace_text("Blocked by request");
+        state.current_mut().request = Some(json!({"id":"req-1","method":"confirm"}));
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().draft.text, "Blocked by request");
+        state.current_mut().request = None;
+
+        // 4. Archived thread blocks send_background
+        state.current_mut().life.archived_at = Some(1);
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().draft.text, "Blocked by request");
+        state.current_mut().life.archived_at = None;
+
+        // 5. Queued edit mode saves in place without opening a new thread
+        let (pi, _cmds, _evs) = Pi::test_connection();
+        let t = state.current_mut();
+        t.pi = Some(pi);
+        t.model_provider = "cpa".into();
+        t.status = Status::Running;
+        t.native.follow_up = true;
+        t.draft.replace_text("Queued original");
+        t.send_during_run();
+        let qid = t.native.queue[0].id;
+        t.edit_queued(qid);
+        t.draft.replace_text("Queued edited");
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().native.queue[0].prompt.text, "Queued edited");
+        assert!(state.current().queued_edit.is_none());
+    }
+
+    #[test]
+    fn failed_background_send_recovers_draft_sets_error_and_offers_open_draft_toast() {
+        let mut state = State::new(".".into(), false);
+        state.runtime_enabled = true;
+        let bg_id = state.current().id;
+        let img = test_attachment("fail.png", 1);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().supports_images = Some(true);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Will fail on connect");
+        state.current_mut().add_attachment(img.clone()).unwrap();
+        // Force synchronous connect_thread failure via missing directory on unknown machine.
+        state.current_mut().machine = "missing-host".into();
+
+        state.send_background();
+
+        // User landed on a fresh composer.
+        assert_ne!(state.current().id, bg_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+
+        // Background task failed toast with "Open draft" action is shown.
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.title, "Background task failed");
+        assert!(toast.description.is_some());
+        assert_eq!(toast.action_label.as_deref(), Some("Open draft"));
+
+        // Clicking "Open draft" opens the failed draft with restored text, attachments, and error.
+        let toast_id = toast.id;
+        state.activate_toast(toast_id);
+        assert_eq!(state.current().id, bg_id);
+        assert_eq!(state.current().draft.text, "Will fail on connect");
+        assert_eq!(state.current().draft_images, vec![img]);
+        assert!(state.current().error.is_some());
+
+        // Async failure during startup in poll() replaces "Started in background" with "Background task failed".
+        let mut async_state = State::new(".".into(), false);
+        let (pi, _cmds, events) = Pi::test_connection();
+        let async_bg_id = async_state.current().id;
+        async_state.current_mut().pi = Some(pi);
+        async_state.current_mut().initializing = true;
+        async_state.current_mut().model_provider = "cpa".into();
+        async_state
+            .current_mut()
+            .draft
+            .replace_text("Async failure");
+        async_state.send_background();
+        assert_eq!(async_state.toasts[0].title, "Started in background");
+
+        events.send(Event::Error("Process crashed".into())).unwrap();
+        poll(&mut async_state, 0.0, &mut Tx::default());
+
+        assert_eq!(async_state.toasts.len(), 1);
+        assert_eq!(async_state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(async_state.toasts[0].title, "Background task failed");
+        assert_eq!(
+            async_state.toasts[0].description.as_deref(),
+            Some("Process crashed")
+        );
+        assert_eq!(
+            async_state.toasts[0].action_label.as_deref(),
+            Some("Open draft")
+        );
+        let bg_after = async_state
+            .threads
+            .iter()
+            .find(|t| t.id == async_bg_id)
+            .unwrap();
+        assert_eq!(bg_after.draft.text, "Async failure");
+        assert_eq!(bg_after.error.as_deref(), Some("Process crashed"));
+
+        // Dismiss and 5s timeout expiration remove toasts cleanly.
+        async_state.toasts[0].expires_at = Some(1);
+        poll(&mut async_state, 0.0, &mut Tx::default());
+        assert!(async_state.toasts.is_empty());
+        async_state.notify_background_started("local", async_bg_id);
+        assert_eq!(async_state.toasts.len(), 1);
+        let dismiss_id = async_state.toasts[0].id;
+        async_state.dismiss_toast(dismiss_id);
+        assert!(async_state.toasts.is_empty());
     }
 }

@@ -41,6 +41,7 @@ pub fn requires_modifier(send_shortcut: SendShortcut, prompt: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmissionIntent {
     Foreground,
+    Background,
     Alternate,
 }
 
@@ -50,11 +51,13 @@ pub fn submission_intent_for_key(
     key_repeat: bool,
     is_composing: bool,
     is_running: bool,
+    is_draft_thread: bool,
     send_shortcut: SendShortcut,
     prompt: &str,
 ) -> Option<SubmissionIntent> {
     let mut ctx = crate::keybindings::ShortcutContext::desktop();
     ctx.composer_focus = true;
+    ctx.draft_thread_route = is_draft_thread;
     ctx.turn_running = is_running;
     ctx.composer_requires_modifier = requires_modifier(send_shortcut, prompt);
     let defaults = crate::keybindings::default_resolved_keybindings();
@@ -71,17 +74,20 @@ pub fn submission_intent_for_key(
         key_repeat,
         is_composing,
         is_running,
+        is_draft_thread,
         send_shortcut,
         prompt,
         command,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn submission_intent_for_command(
     event: &KeyEvent,
     key_repeat: bool,
     is_composing: bool,
     is_running: bool,
+    is_draft_thread: bool,
     send_shortcut: SendShortcut,
     prompt: &str,
     command: Option<&str>,
@@ -92,10 +98,13 @@ pub fn submission_intent_for_command(
     if command == Some("composer.sendAlternate") && is_running {
         return Some(SubmissionIntent::Alternate);
     }
-    if command == Some("composer.sendBackground") {
-        return Some(SubmissionIntent::Foreground);
+    if command == Some("composer.sendBackground") && is_draft_thread {
+        return Some(SubmissionIntent::Background);
     }
-    if command == Some("composer.sendAndNewThread") || command.is_some() {
+    if command == Some("composer.sendAndNewThread") && !is_draft_thread {
+        return Some(SubmissionIntent::Background);
+    }
+    if command.is_some() {
         return None;
     }
     if event.key != Key::Enter || event.mods.shift || event.mods.alt {
@@ -858,16 +867,33 @@ mod tests {
         alt_enter.mods.alt = true;
 
         assert_eq!(
-            submission_intent_for_key(&enter, false, false, false, SendShortcut::Enter, "hi"),
-            Some(SubmissionIntent::Foreground)
-        );
-        assert_eq!(
-            submission_intent_for_key(&enter, false, false, false, SendShortcut::Enter, "a\nb"),
+            submission_intent_for_key(
+                &enter,
+                false,
+                false,
+                false,
+                false,
+                SendShortcut::Enter,
+                "hi"
+            ),
             Some(SubmissionIntent::Foreground)
         );
         assert_eq!(
             submission_intent_for_key(
                 &enter,
+                false,
+                false,
+                false,
+                false,
+                SendShortcut::Enter,
+                "a\nb"
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
+        assert_eq!(
+            submission_intent_for_key(
+                &enter,
+                false,
                 false,
                 false,
                 false,
@@ -882,6 +908,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 SendShortcut::ModEnterMultiline,
                 "a\nb"
             ),
@@ -890,6 +917,7 @@ mod tests {
         assert_eq!(
             submission_intent_for_key(
                 &mod_enter,
+                false,
                 false,
                 false,
                 false,
@@ -899,12 +927,21 @@ mod tests {
             Some(SubmissionIntent::Foreground)
         );
         assert_eq!(
-            submission_intent_for_key(&enter, false, false, false, SendShortcut::ModEnter, "hi"),
+            submission_intent_for_key(
+                &enter,
+                false,
+                false,
+                false,
+                false,
+                SendShortcut::ModEnter,
+                "hi"
+            ),
             None
         );
         assert_eq!(
             submission_intent_for_key(
                 &mod_enter,
+                false,
                 false,
                 false,
                 false,
@@ -914,29 +951,61 @@ mod tests {
             Some(SubmissionIntent::Foreground)
         );
         assert_eq!(
-            submission_intent_for_key(&shift_enter, false, false, false, SendShortcut::Enter, "hi"),
+            submission_intent_for_key(
+                &shift_enter,
+                false,
+                false,
+                false,
+                false,
+                SendShortcut::Enter,
+                "hi"
+            ),
             None
         );
         assert_eq!(
-            submission_intent_for_key(&alt_enter, false, false, false, SendShortcut::Enter, "hi"),
+            submission_intent_for_key(
+                &alt_enter,
+                false,
+                false,
+                false,
+                false,
+                SendShortcut::Enter,
+                "hi"
+            ),
             None
         );
         // Key repeat and composition never submit.
         assert_eq!(
-            submission_intent_for_key(&enter, true, false, false, SendShortcut::Enter, "hi"),
+            submission_intent_for_key(&enter, true, false, false, false, SendShortcut::Enter, "hi"),
             None
         );
         assert_eq!(
-            submission_intent_for_key(&enter, false, true, false, SendShortcut::Enter, "hi"),
+            submission_intent_for_key(&enter, false, true, false, false, SendShortcut::Enter, "hi"),
             None
         );
         // Running thread alternate send shortcuts.
         assert_eq!(
-            submission_intent_for_key(&mod_enter, false, false, true, SendShortcut::Enter, "hi"),
+            submission_intent_for_key(
+                &mod_enter,
+                false,
+                false,
+                true,
+                false,
+                SendShortcut::Enter,
+                "hi"
+            ),
             Some(SubmissionIntent::Alternate)
         );
         assert_eq!(
-            submission_intent_for_key(&mod_enter, false, false, true, SendShortcut::ModEnter, "hi"),
+            submission_intent_for_key(
+                &mod_enter,
+                false,
+                false,
+                true,
+                false,
+                SendShortcut::ModEnter,
+                "hi"
+            ),
             Some(SubmissionIntent::Foreground)
         );
         assert_eq!(
@@ -945,6 +1014,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 SendShortcut::ModEnter,
                 "hi"
             ),
@@ -1096,5 +1166,218 @@ mod tests {
         edit.replace_text("@mod");
         let t4 = trigger(&edit).unwrap();
         assert!(!dismissed.matches(&t4));
+    }
+
+    #[test]
+    fn background_and_new_thread_submission_intents_match_ksg_rules() {
+        let enter = KeyEvent {
+            key: Key::Enter,
+            mods: Default::default(),
+        };
+        let mut mod_enter = enter.clone();
+        mod_enter.mods.cmd = true;
+        let mut mod_alt_enter = mod_enter.clone();
+        mod_alt_enter.mods.alt = true;
+
+        let defaults = crate::keybindings::default_resolved_keybindings();
+        let resolve = |event: &KeyEvent,
+                       rules: &[crate::keybindings::ResolvedKeybindingRule],
+                       is_draft_thread: bool,
+                       is_running: bool,
+                       send_shortcut: SendShortcut,
+                       key_repeat: bool,
+                       is_composing: bool| {
+            let mut ctx = crate::keybindings::ShortcutContext::desktop();
+            ctx.composer_focus = true;
+            ctx.draft_thread_route = is_draft_thread;
+            ctx.turn_running = is_running;
+            ctx.composer_requires_modifier = requires_modifier(send_shortcut, "hi");
+            let command = crate::keybindings::resolve_shortcut_command(
+                event,
+                rules,
+                &ctx,
+                crate::keybindings::Platform::current(),
+                None,
+                None,
+            );
+            submission_intent_for_command(
+                event,
+                key_repeat,
+                is_composing,
+                is_running,
+                is_draft_thread,
+                send_shortcut,
+                "hi",
+                command,
+            )
+        };
+
+        // Draft thread: mod+enter and mod+alt+enter both yield Background regardless of send_shortcut.
+        for shortcut in SendShortcut::ALL {
+            assert_eq!(
+                resolve(&mod_enter, &defaults, true, false, shortcut, false, false),
+                Some(SubmissionIntent::Background),
+                "{shortcut:?}"
+            );
+            assert_eq!(
+                resolve(
+                    &mod_alt_enter,
+                    &defaults,
+                    true,
+                    false,
+                    shortcut,
+                    false,
+                    false
+                ),
+                Some(SubmissionIntent::Background),
+                "{shortcut:?}"
+            );
+        }
+
+        // Existing thread (idle or running): mod+alt+enter yields Background; mod+enter does not.
+        assert_eq!(
+            resolve(
+                &mod_alt_enter,
+                &defaults,
+                false,
+                false,
+                SendShortcut::Enter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Background)
+        );
+        assert_eq!(
+            resolve(
+                &mod_alt_enter,
+                &defaults,
+                false,
+                true,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Background)
+        );
+        assert_eq!(
+            resolve(
+                &mod_enter,
+                &defaults,
+                false,
+                false,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
+
+        // Key repeat and IME composition never submit.
+        assert_eq!(
+            resolve(
+                &mod_enter,
+                &defaults,
+                true,
+                false,
+                SendShortcut::Enter,
+                true,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            resolve(
+                &mod_alt_enter,
+                &defaults,
+                false,
+                false,
+                SendShortcut::Enter,
+                false,
+                true
+            ),
+            None
+        );
+
+        // Custom rebinding overrides defaults for sendBackground and sendAndNewThread.
+        let mut custom = Vec::new();
+        crate::keybindings::upsert_custom_rule(
+            &mut custom,
+            "composer.sendBackground",
+            "alt+b",
+            Some("composerFocus && draftThreadRoute"),
+            None,
+        )
+        .unwrap();
+        crate::keybindings::upsert_custom_rule(
+            &mut custom,
+            "composer.sendAndNewThread",
+            "alt+n",
+            Some("composerFocus && !draftThreadRoute"),
+            None,
+        )
+        .unwrap();
+        let merged = crate::keybindings::merge_with_default_keybindings(&custom);
+        let alt_b = KeyEvent {
+            key: Key::Text("b".into()),
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        };
+        let alt_n = KeyEvent {
+            key: Key::Text("n".into()),
+            mods: rune::Mods {
+                alt: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            resolve(
+                &alt_b,
+                &merged,
+                true,
+                false,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Background)
+        );
+        assert_eq!(
+            resolve(
+                &alt_b,
+                &merged,
+                false,
+                false,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            resolve(
+                &alt_n,
+                &merged,
+                false,
+                false,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Background)
+        );
+        assert_eq!(
+            resolve(
+                &mod_enter,
+                &merged,
+                true,
+                false,
+                SendShortcut::ModEnter,
+                false,
+                false
+            ),
+            Some(SubmissionIntent::Foreground)
+        );
     }
 }
