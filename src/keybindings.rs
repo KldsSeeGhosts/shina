@@ -1202,6 +1202,92 @@ pub fn shortcut_to_keybinding_input(shortcut: &KeybindingShortcut) -> String {
     parts.join("+")
 }
 
+pub const CORE_WHEN_VARIABLES: &[&str] = &[
+    "terminalFocus",
+    "terminalOpen",
+    "previewOpen",
+    "isWeb",
+    "isDesktop",
+    "true",
+    "false",
+];
+
+fn collect_when_identifiers(node: Option<&WhenNode>, out: &mut HashSet<String>) {
+    let Some(node) = node else { return };
+    match node {
+        WhenNode::Identifier { name } => {
+            out.insert(name.clone());
+        }
+        WhenNode::Not { node } => collect_when_identifiers(Some(node), out),
+        WhenNode::And { left, right } | WhenNode::Or { left, right } => {
+            collect_when_identifiers(Some(left), out);
+            collect_when_identifiers(Some(right), out);
+        }
+    }
+}
+
+pub fn build_when_variable_options() -> Vec<String> {
+    let mut vars: HashSet<String> = CORE_WHEN_VARIABLES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for rule in default_resolved_keybindings() {
+        collect_when_identifiers(rule.when_ast.as_ref(), &mut vars);
+    }
+    let mut list: Vec<String> = vars.into_iter().collect();
+    list.sort_by(|left, right| {
+        let l_idx = CORE_WHEN_VARIABLES.iter().position(|&c| c == left);
+        let r_idx = CORE_WHEN_VARIABLES.iter().position(|&c| c == right);
+        match (l_idx, r_idx) {
+            (Some(l), Some(r)) => l.cmp(&r),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+    list
+}
+
+pub fn default_when_variable() -> String {
+    build_when_variable_options()
+        .into_iter()
+        .find(|v| v != "true" && v != "false")
+        .unwrap_or_else(|| "terminalFocus".into())
+}
+
+pub fn is_known_when_variable(identifier: &str) -> bool {
+    build_when_variable_options()
+        .iter()
+        .any(|known| known == identifier)
+}
+
+pub fn unknown_when_variables(node: Option<&WhenNode>) -> Vec<String> {
+    let mut identifiers = HashSet::new();
+    collect_when_identifiers(node, &mut identifiers);
+    let known: HashSet<String> = build_when_variable_options().into_iter().collect();
+    let mut unknown: Vec<String> = identifiers
+        .into_iter()
+        .filter(|id| !known.contains(id))
+        .collect();
+    unknown.sort();
+    unknown
+}
+
+pub fn parse_when_expression_draft(expression: &str) -> Result<Option<WhenNode>, String> {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_KEYBINDING_WHEN_LENGTH {
+        return Err(format!(
+            "When expression must be {MAX_KEYBINDING_WHEN_LENGTH} characters or fewer."
+        ));
+    }
+    parse_keybinding_when_expression(trimmed)
+        .map(Some)
+        .ok_or_else(|| "Use variables with !, &&, ||, and parentheses.".into())
+}
+
 pub fn when_ast_to_expression(node: Option<&WhenNode>) -> String {
     let Some(node) = node else {
         return String::new();

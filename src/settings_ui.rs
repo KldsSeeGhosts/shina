@@ -187,6 +187,67 @@ impl ThreadDefaults {
         self.validate()
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WhenTarget {
+    NewKeybinding,
+    Row {
+        command: String,
+        key: String,
+        original_when: String,
+    },
+}
+
+pub struct WhenEditorState {
+    pub target: WhenTarget,
+    pub anchor_key: String,
+    pub text: rune::TextEdit,
+    pub ast: Option<crate::keybindings::WhenNode>,
+    pub valid: bool,
+    pub error: Option<String>,
+    pub var_menu: Option<String>,
+}
+
+impl WhenEditorState {
+    pub fn open(target: WhenTarget, anchor_key: String, initial_when: &str) -> Self {
+        let parsed = crate::keybindings::parse_when_expression_draft(initial_when);
+        let (ast, valid, error) = match parsed {
+            Ok(ast) => (ast, true, None),
+            Err(err) => (None, false, Some(err)),
+        };
+        Self {
+            target,
+            anchor_key,
+            text: rune::TextEdit::new(initial_when),
+            ast,
+            valid,
+            error,
+            var_menu: None,
+        }
+    }
+
+    pub fn sync_from_text(&mut self) {
+        match crate::keybindings::parse_when_expression_draft(&self.text.text) {
+            Ok(ast) => {
+                self.ast = ast;
+                self.valid = true;
+                self.error = None;
+            }
+            Err(err) => {
+                self.valid = false;
+                self.error = Some(err);
+            }
+        }
+    }
+
+    pub fn set_ast(&mut self, next: Option<crate::keybindings::WhenNode>) {
+        let expr = crate::keybindings::when_ast_to_expression(next.as_ref());
+        self.ast = next;
+        self.text.replace_text(&expr);
+        self.valid = true;
+        self.error = None;
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NewKeybindingDraft {
     pub command: String,
@@ -204,6 +265,7 @@ pub struct Dialog {
     pub shortcut_capture: Option<String>,
     pub shortcut_notice: Option<String>,
     pub new_keybinding: Option<NewKeybindingDraft>,
+    pub when_editor: Option<WhenEditorState>,
     pub machine: String,
     pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
@@ -228,6 +290,7 @@ impl Default for Dialog {
             shortcut_capture: None,
             shortcut_notice: None,
             new_keybinding: None,
+            when_editor: None,
             machine: "local".into(),
             profile_target: None,
             snooze: Default::default(),
@@ -379,7 +442,12 @@ impl State {
                 .settings
                 .new_keybinding
                 .as_ref()
-                .is_some_and(|d| d.recording);
+                .is_some_and(|d| d.recording)
+            || self
+                .settings
+                .when_editor
+                .as_ref()
+                .is_some_and(|w| w.text.focused);
         let mut ctx = crate::keybindings::ShortcutContext::desktop();
         ctx.editable_focus = editable_focus;
         ctx.composer_focus = composer_focus;
@@ -400,6 +468,7 @@ impl State {
         self.settings.shortcut_capture = None;
         self.settings.shortcut_notice = None;
         self.settings.new_keybinding = None;
+        self.settings.when_editor = None;
         self.settings.notice = None;
         if !self.demo && !cfg!(test) && self.settings.version_probe.is_none() {
             let (send, receive) = std::sync::mpsc::channel();
@@ -826,6 +895,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                     s.settings.shortcut_capture = None;
                     s.settings.shortcut_notice = None;
                     s.settings.new_keybinding = None;
+                    s.settings.when_editor = None;
                     if index == 3 && s.client.is_some() && !s.demo {
                         s.machine_action("devices", "");
                     }
@@ -843,6 +913,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                     s.settings.shortcut_capture = None;
                     s.settings.shortcut_notice = None;
                     s.settings.new_keybinding = None;
+                    s.settings.when_editor = None;
                     false
                 }),
         );
@@ -927,6 +998,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                         s.settings_menu = false;
                         s.settings.shortcut_capture = None;
                         s.settings.new_keybinding = None;
+                        s.settings.when_editor = None;
                     },
                 ))
                 .child(search),
@@ -951,6 +1023,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
             s.settings_menu = false;
             s.settings.shortcut_capture = None;
             s.settings.new_keybinding = None;
+            s.settings.when_editor = None;
         })
         .child(card);
     if s.settings
@@ -960,7 +1033,666 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
     {
         backdrop = backdrop.child(new_keybinding_command_menu(s, p));
     }
+    if s.settings.when_editor.is_some() {
+        backdrop = backdrop.child(when_editor_popover(s, p));
+    }
     backdrop
+}
+
+fn when_clause_trigger(
+    key: &str,
+    label_name: &str,
+    expression: &str,
+    p: Palette,
+    on_open: impl Fn(&mut State) + 'static,
+) -> El {
+    let shown = if expression.trim().is_empty() {
+        "Always"
+    } else {
+        expression.trim()
+    };
+    row()
+        .gap(6.0)
+        .center_y()
+        .flex_wrap()
+        .child(label("When", TextStyle::new(12.0, 400.0), p.muted))
+        .child(
+            row()
+                .key(key)
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Edit when clause for {label_name}"))
+                .focusable(true)
+                .focus_highlight(p.selected)
+                .h(24.0)
+                .px(6.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .hover(p.selected)
+                .border(1.0, p.line)
+                .on_press(on_open)
+                .child(
+                    label(
+                        shown,
+                        SMALL,
+                        if expression.trim().is_empty() {
+                            p.muted
+                        } else {
+                            p.ink
+                        },
+                    )
+                    .truncate()
+                    .max_w(240.0),
+                )
+                .child(icon("chevron", p.muted).size(12.0, 12.0)),
+        )
+}
+
+fn when_default_condition() -> crate::keybindings::WhenNode {
+    crate::keybindings::WhenNode::Identifier {
+        name: crate::keybindings::default_when_variable(),
+    }
+}
+
+fn when_default_group(is_or: bool) -> crate::keybindings::WhenNode {
+    let cond = when_default_condition();
+    let neg = crate::keybindings::WhenNode::Not {
+        node: Box::new(cond.clone()),
+    };
+    if is_or {
+        crate::keybindings::WhenNode::Or {
+            left: Box::new(cond),
+            right: Box::new(neg),
+        }
+    } else {
+        crate::keybindings::WhenNode::And {
+            left: Box::new(cond),
+            right: Box::new(neg),
+        }
+    }
+}
+
+fn flatten_when_children(
+    node: &crate::keybindings::WhenNode,
+    is_or: bool,
+) -> Vec<crate::keybindings::WhenNode> {
+    match (node, is_or) {
+        (crate::keybindings::WhenNode::Or { left, right }, true)
+        | (crate::keybindings::WhenNode::And { left, right }, false) => {
+            let mut out = flatten_when_children(left, is_or);
+            out.extend(flatten_when_children(right, is_or));
+            out
+        }
+        _ => vec![node.clone()],
+    }
+}
+
+fn build_when_group(
+    children: Vec<crate::keybindings::WhenNode>,
+    is_or: bool,
+) -> Option<crate::keybindings::WhenNode> {
+    let mut iter = children.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |left, right| {
+        if is_or {
+            crate::keybindings::WhenNode::Or {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        } else {
+            crate::keybindings::WhenNode::And {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        }
+    }))
+}
+
+fn when_node_remove_label(node: &crate::keybindings::WhenNode, depth: usize) -> &'static str {
+    if depth == 0 {
+        return "Clear all conditions";
+    }
+    match node {
+        crate::keybindings::WhenNode::Identifier { .. } => "Remove condition",
+        crate::keybindings::WhenNode::Not { node }
+            if matches!(**node, crate::keybindings::WhenNode::Identifier { .. }) =>
+        {
+            "Remove condition"
+        }
+        _ => "Remove group and its conditions",
+    }
+}
+
+fn render_when_node_editor(
+    node: &crate::keybindings::WhenNode,
+    variables: &[String],
+    var_menu: Option<&str>,
+    path_prefix: &str,
+    depth: usize,
+    p: Palette,
+    on_change: std::rc::Rc<dyn Fn(&mut State, Option<crate::keybindings::WhenNode>)>,
+) -> El {
+    use crate::keybindings::WhenNode;
+
+    // Leaf condition: Identifier or Not(Identifier).
+    let leaf = match node {
+        WhenNode::Identifier { name } => Some((name.clone(), false)),
+        WhenNode::Not { node: inner } => match inner.as_ref() {
+            WhenNode::Identifier { name } => Some((name.clone(), true)),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some((ident, negated)) = leaf {
+        let on_not = on_change.clone();
+        let ident_not = ident.clone();
+        let on_var = on_change.clone();
+        let vars_cycle = variables.to_vec();
+        let ident_cycle = ident.clone();
+        let on_rm = on_change.clone();
+        let menu_id = path_prefix.to_owned();
+        let menu_open = var_menu == Some(menu_id.as_str());
+        let unknown = !crate::keybindings::is_known_when_variable(&ident);
+
+        let mut row_el = row()
+            .key(format!("when-node-{path_prefix}"))
+            .padding(6.0)
+            .gap(6.0)
+            .center_y()
+            .flex_wrap()
+            .radius(4.0)
+            .fill(p.panel)
+            .border(1.0, p.line)
+            .child(
+                settings_button(
+                    &format!("when-not-{path_prefix}"),
+                    if negated { "! Not" } else { "Not" },
+                    p,
+                    move |s| {
+                        let next_inner = WhenNode::Identifier {
+                            name: ident_not.clone(),
+                        };
+                        let next = if negated {
+                            next_inner
+                        } else {
+                            WhenNode::Not {
+                                node: Box::new(next_inner),
+                            }
+                        };
+                        on_not(s, Some(next));
+                    },
+                )
+                .label(format!("Negate {ident}"))
+                .border(1.0, if negated { p.coral } else { p.frame }),
+            )
+            .child(
+                settings_button(&format!("when-var-{path_prefix}"), &ident, p, move |s| {
+                    if let Some(editor) = &mut s.settings.when_editor {
+                        editor.var_menu = if editor.var_menu.as_deref() == Some(menu_id.as_str()) {
+                            None
+                        } else {
+                            Some(menu_id.clone())
+                        };
+                    }
+                })
+                .label(format!("Condition {ident}")),
+            );
+        if unknown {
+            row_el =
+                row_el.child(label(format!("Unknown condition: {ident}"), SMALL, p.brass).wrap());
+        }
+        row_el = row_el.child(
+            settings_button(&format!("when-remove-{path_prefix}"), "-", p, move |s| {
+                on_rm(s, None);
+            })
+            .label(when_node_remove_label(node, depth)),
+        );
+        let mut container = col().w_full().gap(4.0).child(row_el);
+        if menu_open {
+            let mut list = col()
+                .key(format!("when-var-menu-{path_prefix}"))
+                .w_full()
+                .max_h(160.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .padding(4.0)
+                .gap(1.0)
+                .radius(4.0)
+                .fill(p.card)
+                .border(1.0, p.frame);
+            for (v_idx, option) in vars_cycle.iter().enumerate() {
+                let opt = option.clone();
+                let on_pick = on_var.clone();
+                let is_curr = option == &ident_cycle;
+                list = list.child(
+                    row()
+                        .key(format!("when-var-opt-{path_prefix}-{v_idx}"))
+                        .role("option")
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .h(24.0)
+                        .px(8.0)
+                        .center_y()
+                        .radius(4.0)
+                        .fill(if is_curr {
+                            p.selected
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .hover(p.selected)
+                        .on_press(move |s: &mut State| {
+                            let next_inner = WhenNode::Identifier { name: opt.clone() };
+                            let next = if negated {
+                                WhenNode::Not {
+                                    node: Box::new(next_inner),
+                                }
+                            } else {
+                                next_inner
+                            };
+                            on_pick(s, Some(next));
+                            if let Some(editor) = &mut s.settings.when_editor {
+                                editor.var_menu = None;
+                            }
+                        })
+                        .child(label(option, SMALL, p.ink)),
+                );
+            }
+            container = container.child(list);
+        }
+        return container;
+    }
+
+    if let WhenNode::Not { node: inner } = node {
+        let inner_clone = inner.as_ref().clone();
+        let on_unnegate = on_change.clone();
+        let on_rm = on_change.clone();
+        let on_child = on_change.clone();
+        let child_cb: std::rc::Rc<dyn Fn(&mut State, Option<WhenNode>)> =
+            std::rc::Rc::new(move |s, next| {
+                on_child(s, next.map(|n| WhenNode::Not { node: Box::new(n) }));
+            });
+        return col()
+            .key(format!("when-node-{path_prefix}"))
+            .w_full()
+            .padding(8.0)
+            .gap(6.0)
+            .radius(4.0)
+            .fill(p.panel)
+            .border(1.0, p.line)
+            .child(
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        settings_button(&format!("when-not-{path_prefix}"), "! Not", p, move |s| {
+                            on_unnegate(s, Some(inner_clone.clone()));
+                        })
+                        .label("Negate group")
+                        .border(1.0, p.coral),
+                    )
+                    .child(spacer())
+                    .child(
+                        settings_button(&format!("when-remove-{path_prefix}"), "-", p, move |s| {
+                            on_rm(s, None);
+                        })
+                        .label(when_node_remove_label(node, depth)),
+                    ),
+            )
+            .child(col().pl(12.0).child(render_when_node_editor(
+                inner,
+                variables,
+                var_menu,
+                &format!("{path_prefix}.0"),
+                depth + 1,
+                p,
+                child_cb,
+            )));
+    }
+
+    let is_or = matches!(node, WhenNode::Or { .. });
+    let children = flatten_when_children(node, is_or);
+    let children_op = children.clone();
+    let on_op = on_change.clone();
+    let children_add_cond = children.clone();
+    let on_add_cond = on_change.clone();
+    let children_add_grp = children.clone();
+    let on_add_grp = on_change.clone();
+    let on_rm = on_change.clone();
+
+    let mut group_box = col()
+        .key(format!("when-node-{path_prefix}"))
+        .w_full()
+        .padding(8.0)
+        .gap(6.0)
+        .radius(4.0)
+        .fill(p.panel)
+        .border(1.0, p.line)
+        .child(
+            row()
+                .gap(6.0)
+                .flex_wrap()
+                .center_y()
+                .child(settings_button(
+                    &format!("when-op-{path_prefix}"),
+                    if is_or { "or" } else { "and" },
+                    p,
+                    move |s| {
+                        let next = build_when_group(children_op.clone(), !is_or);
+                        on_op(s, next);
+                    },
+                ))
+                .child(settings_button(
+                    &format!("when-add-cond-{path_prefix}"),
+                    "+ Condition",
+                    p,
+                    move |s| {
+                        let mut next_children = children_add_cond.clone();
+                        next_children.push(when_default_condition());
+                        on_add_cond(s, build_when_group(next_children, is_or));
+                    },
+                ))
+                .child(settings_button(
+                    &format!("when-add-group-{path_prefix}"),
+                    "+ Group",
+                    p,
+                    move |s| {
+                        let mut next_children = children_add_grp.clone();
+                        next_children.push(when_default_group(!is_or));
+                        on_add_grp(s, build_when_group(next_children, is_or));
+                    },
+                ))
+                .child(spacer())
+                .child(
+                    settings_button(&format!("when-remove-{path_prefix}"), "-", p, move |s| {
+                        on_rm(s, None);
+                    })
+                    .label(when_node_remove_label(node, depth)),
+                ),
+        );
+
+    let mut children_col = col().w_full().pl(12.0).gap(6.0);
+    for (idx, child) in children.iter().enumerate() {
+        let children_snapshot = children.clone();
+        let on_child_parent = on_change.clone();
+        let child_cb: std::rc::Rc<dyn Fn(&mut State, Option<WhenNode>)> =
+            std::rc::Rc::new(move |s, next| {
+                let mut updated = children_snapshot.clone();
+                if let Some(new_node) = next {
+                    updated[idx] = new_node;
+                    on_child_parent(s, build_when_group(updated, is_or));
+                } else {
+                    updated.remove(idx);
+                    if updated.is_empty() {
+                        on_child_parent(s, Some(when_default_condition()));
+                    } else {
+                        on_child_parent(s, build_when_group(updated, is_or));
+                    }
+                }
+            });
+        children_col = children_col.child(render_when_node_editor(
+            child,
+            variables,
+            var_menu,
+            &format!("{path_prefix}.{idx}"),
+            depth + 1,
+            p,
+            child_cb,
+        ));
+    }
+    group_box = group_box.child(children_col);
+    group_box
+}
+
+fn when_editor_popover(s: &State, p: Palette) -> El {
+    let editor = s.settings.when_editor.as_ref().expect("when editor");
+    let variables = crate::keybindings::build_when_variable_options();
+    let unknown = if editor.valid {
+        crate::keybindings::unknown_when_variables(editor.ast.as_ref())
+    } else {
+        Vec::new()
+    };
+
+    let header = row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .child(label("When", TextStyle::new(14.0, 500.0), p.ink))
+        .child(spacer())
+        .child(settings_button(
+            "when-add-condition",
+            "+ Condition",
+            p,
+            |s| {
+                if let Some(ed) = &mut s.settings.when_editor {
+                    let next = match &ed.ast {
+                        None => when_default_condition(),
+                        Some(existing) => crate::keybindings::WhenNode::And {
+                            left: Box::new(existing.clone()),
+                            right: Box::new(when_default_condition()),
+                        },
+                    };
+                    ed.set_ast(Some(next));
+                }
+            },
+        ))
+        .child(settings_button("when-add-group", "+ Group", p, |s| {
+            if let Some(ed) = &mut s.settings.when_editor {
+                let group = when_default_group(true);
+                let next = match &ed.ast {
+                    None => group,
+                    Some(existing) => crate::keybindings::WhenNode::And {
+                        left: Box::new(existing.clone()),
+                        right: Box::new(group),
+                    },
+                };
+                ed.set_ast(Some(next));
+            }
+        }));
+
+    let expr_field = text_input(&editor.text, TextStyle::new(13.0, 400.0))
+        .key("when-expression-input")
+        .label("When expression")
+        .placeholder("Always", p.muted)
+        .single_line()
+        .w_full()
+        .h(30.0)
+        .padding(7.0)
+        .radius(4.0)
+        .color(p.ink)
+        .fill(field_fill(s, p))
+        .border(
+            if editor.error.is_some() { 2.0 } else { 1.0 },
+            if editor.error.is_some() {
+                p.danger
+            } else if editor.text.focused {
+                p.coral
+            } else {
+                p.field_line
+            },
+        )
+        .on_edit(|s: &mut State| &mut s.settings.when_editor.as_mut().expect("when editor").text)
+        .on_input_change(|s: &mut State, _| {
+            if let Some(ed) = &mut s.settings.when_editor {
+                ed.sync_from_text();
+            }
+        })
+        .on_input_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Escape {
+                s.settings.when_editor = None;
+                return true;
+            }
+            s.undo_key(event, true)
+        });
+
+    let mut body = col()
+        .key("when-editor-popover")
+        .role("dialog")
+        .label("When")
+        .w((s.viewport_width - 32.0).clamp(260.0, 500.0))
+        .max_h(440.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .padding(12.0)
+        .gap(10.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(header)
+        .child(expr_field);
+
+    if let Some(err) = &editor.error {
+        body = body.child(
+            label(err, SMALL, p.danger)
+                .key("when-expression-error")
+                .wrap(),
+        );
+    } else if !unknown.is_empty() {
+        let warn = if unknown.len() == 1 {
+            format!(
+                "Unknown condition: {}. Shina does not recognize this condition yet. It can still be saved, but it may not match unless the runtime provides it.",
+                unknown[0]
+            )
+        } else {
+            format!(
+                "Unknown conditions: {}. Shina does not recognize these conditions yet. They can still be saved, but they may not match unless the runtime provides them.",
+                unknown.join(", ")
+            )
+        };
+        body = body.child(
+            label(warn, SMALL, p.brass)
+                .key("when-expression-unknown")
+                .wrap(),
+        );
+    }
+
+    if editor.error.is_some() {
+        body = body.child(
+            col()
+                .key("when-visual-blocked")
+                .w_full()
+                .padding(12.0)
+                .radius(4.0)
+                .fill(p.panel)
+                .border(1.0, p.danger)
+                .child(
+                    label(
+                        "Fix the expression above to continue editing visually.",
+                        SMALL,
+                        p.danger,
+                    )
+                    .wrap(),
+                ),
+        );
+    } else if let Some(ast) = &editor.ast {
+        let on_root: std::rc::Rc<dyn Fn(&mut State, Option<crate::keybindings::WhenNode>)> =
+            std::rc::Rc::new(|s, next| {
+                if let Some(ed) = &mut s.settings.when_editor {
+                    ed.set_ast(next);
+                }
+            });
+        body = body.child(render_when_node_editor(
+            ast,
+            &variables,
+            editor.var_menu.as_deref(),
+            "root",
+            0,
+            p,
+            on_root,
+        ));
+    } else {
+        body = body.child(
+            row()
+                .key("when-empty-actions")
+                .w_full()
+                .padding(10.0)
+                .gap(8.0)
+                .flex_wrap()
+                .radius(4.0)
+                .fill(p.panel)
+                .border(1.0, p.line)
+                .child(settings_button(
+                    "when-empty-add-condition",
+                    "+ Condition",
+                    p,
+                    |s| {
+                        if let Some(ed) = &mut s.settings.when_editor {
+                            ed.set_ast(Some(when_default_condition()));
+                        }
+                    },
+                ))
+                .child(settings_button("when-empty-add-group", "+ Group", p, |s| {
+                    if let Some(ed) = &mut s.settings.when_editor {
+                        ed.set_ast(Some(when_default_group(false)));
+                    }
+                })),
+        );
+    }
+
+    let can_save = editor.valid;
+    let footer = row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(spacer())
+        .child(settings_button("when-editor-cancel", "Cancel", p, |s| {
+            s.settings.when_editor = None;
+        }))
+        .child(
+            primary_button("when-editor-save", "Save", p, |s| {
+                let Some(ed) = s.settings.when_editor.take() else {
+                    return;
+                };
+                if !ed.valid {
+                    return;
+                }
+                let next_expr = crate::keybindings::when_ast_to_expression(ed.ast.as_ref());
+                match ed.target {
+                    WhenTarget::NewKeybinding => {
+                        if let Some(draft) = &mut s.settings.new_keybinding {
+                            draft.when_draft = next_expr;
+                            draft.validation = None;
+                        }
+                    }
+                    WhenTarget::Row {
+                        command,
+                        key,
+                        original_when,
+                    } => {
+                        let next_when = (!next_expr.is_empty()).then_some(next_expr.as_str());
+                        let orig_when =
+                            (!original_when.is_empty()).then_some(original_when.as_str());
+                        if let Err(err) = crate::keybindings::upsert_custom_rule(
+                            &mut s.preferences.keybindings,
+                            &command,
+                            &key,
+                            next_when,
+                            Some((&command, &key, orig_when)),
+                        ) {
+                            s.settings.shortcut_notice = Some(err);
+                        } else {
+                            s.settings.shortcut_notice = None;
+                            s.checkpoint();
+                        }
+                    }
+                }
+            })
+            .disabled(!can_save),
+        );
+    body = body.child(footer);
+
+    body.anchored_fit(
+        &editor.anchor_key,
+        rune::Side::Bottom,
+        rune::Align::Start,
+        6.0,
+    )
+    .modal(true, |s: &mut State| s.settings.when_editor = None)
 }
 
 fn new_keybinding_command_menu(s: &State, p: Palette) -> El {
@@ -1832,19 +2564,30 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
         let conflicts =
             keybinding_conflict_labels(&rows, "new", &draft.key_draft, &draft.when_draft, platform);
 
-        let when_desc = if draft.when_draft.trim().is_empty() {
-            "When Always".to_owned()
-        } else {
-            format!("When {}", draft.when_draft.trim())
-        };
+        let when_for_new = draft.when_draft.clone();
+        let when_trigger = when_clause_trigger(
+            "new-keybinding-when",
+            if draft.command.is_empty() {
+                "new keybinding"
+            } else {
+                &cmd_text
+            },
+            &draft.when_draft,
+            p,
+            move |s| {
+                s.settings.when_editor = Some(WhenEditorState::open(
+                    WhenTarget::NewKeybinding,
+                    "new-keybinding-when".into(),
+                    &when_for_new,
+                ));
+            },
+        );
         let mut info_col = col()
             .grow(1.0)
             .min_w(140.0)
             .gap(4.0)
             .child(label("New keybinding", TextStyle::new(14.0, 500.0), p.ink))
-            .child(
-                label(&when_desc, TextStyle::new(12.5, 400.0).lh(17.0), p.muted).wrap_anywhere(),
-            );
+            .child(when_trigger);
         if let Some(conflict_msg) = conflict_warning_description(&conflicts) {
             info_col = info_col.child(
                 label(conflict_msg, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
@@ -1922,11 +2665,6 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
             *occurrence += 1;
 
             let title_text = command_label(&row_item.command);
-            let when_text = if row_item.when.is_empty() {
-                "When Always".to_owned()
-            } else {
-                format!("When {}", row_item.when)
-            };
             let is_custom = row_item.source == KeybindingSource::Custom;
             let is_capturing = s.settings.shortcut_capture.as_deref() == Some(row_item.id.as_str());
 
@@ -1946,9 +2684,30 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 ));
             }
 
-            let mut info_col = col().grow(1.0).min_w(0.0).gap(4.0).child(title_row).child(
-                label(&when_text, TextStyle::new(12.5, 400.0).lh(17.0), p.muted).wrap_anywhere(),
-            );
+            let when_key = format!("keybinding-when-{slug}");
+            let row_cmd = row_item.command.clone();
+            let row_key_str = row_item.key.clone();
+            let row_when_str = row_item.when.clone();
+            let when_anchor = when_key.clone();
+            let when_trigger =
+                when_clause_trigger(&when_key, &title_text, &row_item.when, p, move |s| {
+                    s.settings.when_editor = Some(WhenEditorState::open(
+                        WhenTarget::Row {
+                            command: row_cmd.clone(),
+                            key: row_key_str.clone(),
+                            original_when: row_when_str.clone(),
+                        },
+                        when_anchor.clone(),
+                        &row_when_str,
+                    ));
+                });
+
+            let mut info_col = col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(title_row)
+                .child(when_trigger);
             if let Some(conflict_msg) = conflict_warning_description(&row_item.conflicts) {
                 info_col = info_col.child(
                     label(conflict_msg, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
@@ -2736,5 +3495,111 @@ mod tests {
             .unwrap();
         }
         assert_eq!(custom.len(), crate::keybindings::MAX_KEYBINDINGS_COUNT);
+    }
+
+    #[test]
+    fn when_editor_validates_updates_visually_and_fits_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.state.open_settings();
+            rt.frame(0.0);
+            crate::ui::tests::press(&mut rt, "settings-section-7");
+
+            let (trig_rect, _) = rt
+                .presented("keybinding-when-commandPalette.toggle")
+                .unwrap_or_else(|| panic!("{width}: keybinding-when-commandPalette.toggle"));
+            assert!(trig_rect[0] >= 0.0 && trig_rect[0] + trig_rect[2] <= width + 0.5);
+
+            // Open When popover for commandPalette.toggle (default "!terminalFocus").
+            crate::ui::tests::press(&mut rt, "keybinding-when-commandPalette.toggle");
+            for key in [
+                "when-editor-popover",
+                "when-expression-input",
+                "when-not-root",
+                "when-var-root",
+                "when-editor-save",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width} {key}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width} {key}: {rect:?}"
+                );
+            }
+
+            // Invalid expression shows KSG's error + visual overlay and blocks Save.
+            {
+                let ed = rt.state.settings.when_editor.as_mut().unwrap();
+                ed.text.replace_text("terminalFocus &&");
+                ed.sync_from_text();
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            let err_el = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("when-expression-error"))
+                .unwrap();
+            assert_eq!(
+                err_el.text.as_deref(),
+                Some("Use variables with !, &&, ||, and parentheses.")
+            );
+            assert!(rt.presented("when-visual-blocked").is_some());
+            assert!(!rt.state.settings.when_editor.as_ref().unwrap().valid);
+
+            // Escape closes When popover without closing Settings and discards unparsed draft.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.settings_menu);
+            assert!(rt.state.settings.when_editor.is_none());
+
+            // Re-open, toggle Not, add a Condition, and Save.
+            crate::ui::tests::press(&mut rt, "keybinding-when-commandPalette.toggle");
+            assert_eq!(
+                rt.state.settings.when_editor.as_ref().unwrap().text.text,
+                "!terminalFocus"
+            );
+            crate::ui::tests::press(&mut rt, "when-not-root");
+            assert_eq!(
+                rt.state.settings.when_editor.as_ref().unwrap().text.text,
+                "terminalFocus"
+            );
+
+            // Unknown identifier shows warning but still allows saving.
+            {
+                let ed = rt.state.settings.when_editor.as_mut().unwrap();
+                ed.text.replace_text("customFlag");
+                ed.sync_from_text();
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("when-expression-unknown").is_some());
+
+            // Visual "+ Condition" builds an `and` group, then Save persists the override.
+            crate::ui::tests::press(&mut rt, "when-add-condition");
+            assert_eq!(
+                rt.state.settings.when_editor.as_ref().unwrap().text.text,
+                "customFlag && terminalFocus"
+            );
+            crate::ui::tests::press(&mut rt, "when-editor-save");
+            assert!(rt.state.settings.when_editor.is_none());
+            assert_eq!(
+                rt.state.preferences.keybindings,
+                vec![crate::keybindings::KeybindingRule {
+                    key: "mod+k".into(),
+                    command: "commandPalette.toggle".into(),
+                    when: Some("customFlag && terminalFocus".into()),
+                }]
+            );
+        }
     }
 }
