@@ -1223,13 +1223,14 @@ fn settings_picker(s: &State, p: Palette) -> El {
     if t.harness == "pi"
         && let Some(error) = &s.catalog.error
     {
-        card = card
-            .child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0))
-            .child(
-                button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
-                    .ml(10.0)
-                    .mb(8.0),
-            );
+        if !is_model {
+            card = card.child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0));
+        }
+        card = card.child(
+            button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
+                .ml(10.0)
+                .mb(8.0),
+        );
     }
     if let (_, Some(error)) = s.native_catalog_status(&t.harness) {
         card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
@@ -1864,6 +1865,9 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         list = list.child(item);
     }
     if count == 0 {
+        let pi_error = (t.harness == "pi" && t.models.is_empty())
+            .then_some(s.catalog.error.as_deref())
+            .flatten();
         // The harnesses end here and the models begin: a rule and a heading, so the note is
         // plainly about models and not about the last harness.
         list = list
@@ -1885,6 +1889,8 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                         }
                     } else if t.harness != "pi" && t.models.is_empty() {
                         "This harness uses its configured model until it reports available models."
+                    } else if let Some(error) = pi_error {
+                        error
                     } else if t.models.is_empty() && s.catalog.remaining().is_some() {
                         "Reading the CPA catalog..."
                     } else if t.models.is_empty() {
@@ -1893,8 +1899,13 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                         "No matching models."
                     },
                     SMALL,
-                    p.muted,
+                    if pi_error.is_some() {
+                        p.danger
+                    } else {
+                        p.muted
+                    },
                 )
+                .key("models-empty-note")
                 .wrap()
                 .px(16.0)
                 .py(10.0),
@@ -2174,7 +2185,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .child(
                 icon_button("new-thread", "New thread", "compose", p, |_| {})
                     .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-                    .help("New thread. Shift-click: in the current workspace"),
+                    .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                        "New thread"
+                    } else {
+                        "New thread. Shift-click: in the current workspace"
+                    }),
             ),
     );
     // A workspace filter names itself and clears in one click.
@@ -2250,19 +2265,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         if !s.show_archive {
             heading = heading.child(icon_button(
                 "assign-captain",
-                "Add a captain",
+                "New captain thread",
                 "plus",
                 p,
-                // With no captains yet, this goes straight to the create form, which also
-                // picks the workspace. Otherwise it picks a workspace, then a captain.
-                |s| {
-                    if s.captains.is_empty() {
-                        s.captain_project = None;
-                        s.begin_new_captain();
-                    } else {
-                        s.open_picker(ProjectPicker::AssignCaptain);
-                    }
-                },
+                // Uses the same new-thread draft route, with the in-place captain selector open.
+                |s| s.open_captain_selector(),
             ));
         }
         content = content.child(heading);
@@ -3361,13 +3368,6 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
     }
     portrait
 }
-fn captain_status_chip(status: Status, p: Palette) -> El {
-    row()
-        .center_y()
-        .gap(5.0)
-        .child(status_mark(status, p, 6.0))
-        .child(pixel_text(status.label(), status_ink(status, p)))
-}
 /// A sidebar row's status, and whether it waits on an approval: a pending request, or a
 /// worker's approval, outranks the run. A captain's home stands for its whole crew.
 fn row_status(s: &State, thread: &Thread) -> (Status, bool) {
@@ -4007,145 +4007,279 @@ fn relative_time(updated: u64) -> Option<String> {
     })
 }
 
-/// The Captain screen: a centred modal that introduces each captain by portrait, role, state,
-/// where they already work and how they are briefed, then offers a new one.
-fn captain_picker(s: &State, p: Palette) -> El {
-    let target = s.project(s.projects.captain_target);
-    let workspace = target
-        .map(|project| project.name.clone())
-        .unwrap_or_else(|| "No workspace".into());
-    let mut card = popover("captain-picker", "Choose a captain", s, p)
-        .role("dialog")
-        .w(560.0)
-        .max_h((s.viewport_height * 0.72).max(360.0))
-        .padding(6.0)
-        .radius(6.0)
-        .on_press(|_: &mut State| {})
+/// In-place captain selector in the composer footer, ported from KSG Code's
+/// `BranchToolbarEnvironmentSelector` (`ComposerControl` size `xs`) for the trigger and
+/// `ModelPickerContent` for the searchable popover with a trailing creation action.
+/// Captains are Shina-only (KSG Code has no captains).
+fn captain_selector_trigger(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let active = t.captain.and_then(|id| s.captains.get(id).map(|c| (id, c)));
+    let locked = t.status.busy() || t.configuring || t.archived() || !t.is_draft();
+    let title = active
+        .map(|(_, c)| c.name.clone())
+        .unwrap_or_else(|| "No captain".into());
+    let mut trigger = row()
+        .key("captain-selector")
+        .role("button")
+        .label(format!("Captain: {title}"))
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .radius(4.0)
+        .hover(p.selected)
+        .focusable(!locked)
+        .cursor(if locked {
+            rune::Cursor::Default
+        } else {
+            rune::Cursor::Pointer
+        })
+        .opacity(if locked { 0.65 } else { 1.0 })
+        .disabled(locked);
+    if !locked {
+        trigger = trigger.on_press(|s: &mut State| {
+            s.captain_picker = !s.captain_picker;
+            if s.captain_picker {
+                s.captain_project = Some(s.current().project);
+                s.captain_picker_query = rune::TextEdit::default();
+                s.captain_picker_query.focused = true;
+                s.captain_picker_highlight = 0;
+            }
+        });
+    }
+    let lead = match active {
+        Some((id, _)) => avatar(s, p, id, 14.0, s.captain_status(id)),
+        None => icon("user", p.muted).size(12.0, 12.0),
+    };
+    trigger
+        .child(lead)
         .child(
-            col()
-                .px(10.0)
-                .pt(12.0)
-                .pb(10.0)
-                .gap(4.0)
-                .child(label("Choose a captain", DIALOG_TITLE, p.ink))
-                .child(
-                    row()
-                        .gap(6.0)
-                        .center_y()
-                        .child(label("They will coordinate work in", SMALL, p.muted))
-                        .child(project_tile(s, p, target, 14.0))
-                        .child(label(workspace, TextStyle::new(12.0, 560.0), p.ink)),
-                ),
-        );
-    // Up, Down, Home and End move through the captains; Return opens one.
+            label(title, SMALL, if active.is_some() { p.ink } else { p.muted })
+                .key("captain-selector-label")
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Ported from KSG Code's `ModelPickerContent` (searchable list in a bordered popover card)
+/// and `BranchToolbarEnvironmentSelector` (anchored above the composer footer control).
+/// Captains, portraits, and the "No captain" / "New captain" rows are Shina-specific.
+fn captain_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let selected_captain = t.captain;
+    let query = s.captain_picker_query.text.trim().to_lowercase();
+    let filtered: Vec<usize> = (0..s.captains.len())
+        .filter(|&id| {
+            if query.is_empty() {
+                return true;
+            }
+            let c = &s.captains[id];
+            c.name.to_lowercase().contains(&query) || c.role.to_lowercase().contains(&query)
+        })
+        .collect();
+
+    let header = row().center_y().gap(6.0).px(10.0).py(8.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.captain_picker_query, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(
+                text_input(&s.captain_picker_query, TextStyle::new(13.0, 420.0))
+                    .key("captain-search")
+                    .label("Search captains")
+                    .placeholder("Search captains", p.muted)
+                    .color(p.ink)
+                    .caret(p.coral, p.coral_bg)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .on_edit(|s: &mut State| &mut s.captain_picker_query)
+                    .on_input_key(|s: &mut State, event, tx| {
+                        if matches!(event.key, rune::Key::Down) {
+                            s.captain_picker_query.focused = false;
+                            tx.focus("captain-list", true);
+                            return true;
+                        }
+                        false
+                    }),
+            ),
+    );
+
     let mut list = col()
-        .role("list")
+        .key("captain-list")
+        .role("listbox")
         .label("Captains")
         .focus_group()
-        .gap(2.0)
-        .min_h(0.0)
-        .shrink()
+        .w_full()
+        .max_h(260.0)
+        .pb(4.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    for captain in 0..s.captains.len() {
-        let state = s.captain_status(captain);
-        let open = s.current().captain == Some(captain) && s.is_captain_home(s.current());
-        let hovered = s.hovered_captain == Some(captain);
-        let profile = &s.captains[captain];
-        // The workspaces this captain already has a home in.
-        let mut homes: Vec<String> = s
-            .threads
-            .iter()
-            .filter(|t| t.captain == Some(captain) && s.is_captain_home(t) && !t.archived())
-            .map(|t| {
-                s.project(t.project)
-                    .map(|project| project.name.clone())
-                    .unwrap_or_else(|| "No workspace".into())
-            })
-            .collect();
-        homes.sort();
-        homes.dedup();
-        let brief = profile.instructions.lines().find(|l| !l.trim().is_empty());
-        let mut text = col().gap(2.0).grow(1.0).min_w(0.0).child(
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(label(&profile.name, CAPTAIN_SERIF, p.ink))
-                .child(label(&profile.role, SMALL, p.muted))
-                .child(spacer())
-                .child(captain_status_chip(state, p)),
+
+    let no_captain_selected = selected_captain.is_none();
+    let mut no_captain = row()
+        .key("choose-no-captain")
+        .role("option")
+        .label("No captain (plain thread)")
+        .checked(no_captain_selected)
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .center_y()
+        .gap(10.0)
+        .h(34.0)
+        .mx(4.0)
+        .pl(12.0)
+        .pr(8.0)
+        .radius(4.0)
+        .fill(if no_captain_selected {
+            p.coral_bg
+        } else {
+            Color::TRANSPARENT
+        })
+        .hover(if no_captain_selected {
+            p.coral_bg
+        } else {
+            p.selected
+        })
+        .focus_fill(p.selected)
+        .focus_selected(no_captain_selected)
+        .on_press(|s: &mut State| {
+            s.captain_picker = false;
+            s.captain_project = None;
+            s.projects.captain_target = None;
+            if s.current().captain.is_some() {
+                let project = s.current().project;
+                s.new_thread_in(project);
+            }
+            s.current_mut().draft.focused = true;
+        })
+        .child(icon("user", p.muted).size(16.0, 16.0))
+        .child(
+            label("No captain", TextStyle::new(13.5, 450.0), p.ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
         );
-        if let Some(brief) = brief {
-            text = text.child(label(brief.trim(), SMALL, p.muted).truncate());
-        }
-        if !homes.is_empty() {
-            text = text
-                .child(label(format!("Works in {}", homes.join(", ")), SMALL, p.faint).truncate());
-        }
+    if no_captain_selected {
+        no_captain = no_captain.child(icon("check", p.sea));
+    }
+    list = list.child(no_captain);
+
+    if !filtered.is_empty() {
+        list = list.child(pixel_label("Captains", p.muted).px(16.0).pt(6.0).pb(4.0));
+    }
+
+    let filtered_empty = filtered.is_empty() && !query.is_empty();
+    for captain in filtered {
+        let profile = &s.captains[captain];
+        let state = s.captain_status(captain);
+        let selected = selected_captain == Some(captain);
         let mut item = row()
             .key(format!("choose-captain-{captain}"))
-            .role("button")
-            .cursor(rune::Cursor::Pointer)
+            .role("option")
             .label(format!("Open Captain {}, {}", profile.name, state.label()))
+            .checked(selected)
             .focusable(true)
-            .autofocus()
-            .focus_fill(p.selected)
-            .px(10.0)
-            .py(10.0)
-            .gap(14.0)
-            .radius(4.0)
-            .fill(if open { p.selected } else { Color::TRANSPARENT })
-            .hover(p.selected)
+            .cursor(rune::Cursor::Pointer)
             .center_y()
-            .on_hover_change(move |s: &mut State, on, _| {
-                if on {
-                    s.hovered_captain = Some(captain);
-                } else if s.hovered_captain == Some(captain) {
-                    s.hovered_captain = None;
-                }
+            .gap(10.0)
+            .h(36.0)
+            .mx(4.0)
+            .pl(12.0)
+            .pr(8.0)
+            .radius(4.0)
+            .fill(if selected {
+                p.coral_bg
+            } else {
+                Color::TRANSPARENT
             })
-            .on_press(move |s: &mut State| s.open_captain(captain))
-            .child(avatar(s, p, captain, PICKER_PORTRAIT, state))
-            .child(text);
-        item = item.child(
-            icon_button(
-                &format!("edit-captain-{captain}"),
-                &format!("Rename or edit {}", profile.name),
-                "edit",
-                p,
-                move |s| {
-                    s.captain_picker = false;
-                    s.edit_captain(captain);
-                },
-            )
-            .opacity(if hovered || open { 1.0 } else { 0.0 }),
-        );
+            .hover(if selected { p.coral_bg } else { p.selected })
+            .focus_fill(p.selected)
+            .focus_selected(selected)
+            .on_press(move |s: &mut State| {
+                s.captain_picker = false;
+                s.open_captain(captain);
+            })
+            .child(avatar(s, p, captain, 18.0, state))
+            .child(
+                col()
+                    .gap(1.0)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(
+                        label(&profile.name, TextStyle::new(13.5, 500.0), p.ink)
+                            .truncate()
+                            .min_w(0.0),
+                    )
+                    .child(if profile.role.is_empty() {
+                        el()
+                    } else {
+                        label(&profile.role, SMALL, p.muted).truncate().min_w(0.0)
+                    }),
+            );
+        if selected {
+            item = item.child(icon("check", p.sea));
+        }
         list = list.child(item);
     }
-    card = card
-        .child(list)
-        .child(el().h(0.5).w_full().my(4.0).fill(p.line))
-        .child(
-            row()
-                .h(40.0)
-                .pl(2.0)
-                .pr(8.0)
-                .gap(16.0)
-                .center_y()
-                .child(
-                    menu_item("picker-new-captain", "New captain", "plus", p)
-                        .on_press(|s: &mut State| s.begin_new_captain()),
-                )
-                .child(spacer())
-                .child(keycap("Esc", "Close", p)),
+    if filtered_empty {
+        list = list.child(
+            label("No matching captains", SMALL, p.muted)
+                .px(16.0)
+                .py(8.0),
         );
-    modal_frame(
-        "captain-picker-backdrop",
-        s,
-        |s| s.cancel_captain_flow(),
-        card,
-    )
+    }
+
+    let mut card = col()
+        .key("captain-picker")
+        .role("dialog")
+        .label("Choose a captain")
+        .w(PICKER_WIDTH)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .on_press(|_: &mut State| {})
+        .child(header)
+        .child(list)
+        .child(rule(p));
+    let new_captain = row()
+        .key("picker-new-captain")
+        .role("button")
+        .label("New captain")
+        .cursor(rune::Cursor::Pointer)
+        .focusable(true)
+        .center_y()
+        .gap(10.0)
+        .h(34.0)
+        .mx(4.0)
+        .pl(12.0)
+        .pr(8.0)
+        .radius(4.0)
+        .hover(p.selected)
+        .focus_fill(p.selected)
+        .on_press(|s: &mut State| s.begin_new_captain())
+        .child(icon("plus", p.muted))
+        .child(label("New captain", TextStyle::new(13.5, 450.0), p.ink));
+    card = card.child(col().py(4.0).child(new_captain));
+
+    card.anchored_fit("captain-selector", rune::Side::Top, rune::Align::Start, 6.0)
+        .modal(true, |s: &mut State| s.cancel_captain_flow())
 }
 
 /// A portrait's cell in the captain editor's grid: the 40 pt face and 4 pt each side.
@@ -4295,7 +4429,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .as_ref()
                                 .is_some_and(|e| e.editing.is_none())
                             {
-                                s.open_picker(ProjectPicker::AssignCaptain);
+                                s.open_picker(ProjectPicker::NewThread);
                             }
                         })
                         .child(project_tile(s, p, s.project(captain_project), 16.0))
@@ -5632,16 +5766,6 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 captain_ui::toggle_scope(s, project);
             }
         }
-        ProjectPicker::AssignCaptain => {
-            s.project_picker = None;
-            s.projects.captain_target = project;
-            s.captain_project = Some(project);
-            if s.captains.is_empty() && s.captain_editor.is_none() {
-                s.begin_new_captain();
-            } else {
-                s.captain_picker = s.captain_editor.is_none();
-            }
-        }
     }
 }
 
@@ -5655,7 +5779,6 @@ fn project_picker(s: &State, p: Palette) -> El {
     let placeholder = match mode {
         ProjectPicker::Scope => "Filter by workspace...",
         ProjectPicker::NewThread => "New thread in...",
-        ProjectPicker::AssignCaptain => "Assign a captain to...",
         ProjectPicker::AddProject => "Add workspace",
         ProjectPicker::CaptainScope => "Add to this captain's scope...",
     };
@@ -6008,7 +6131,8 @@ fn edits_text(event: &rune::KeyEvent) -> bool {
         rune::Key::Text(_) | rune::Key::Backspace | rune::Key::Delete
     ) || matches!(event.key, rune::Key::Command('v' | 'x' | 'z'))
 }
-/// Move the browse field into a listed folder.
+/// Move the browse field into a listed folder with a trailing separator, matching KSG Code's
+/// `appendBrowsePathSegment` / `browseTo`.
 fn browse_into(s: &mut State, name: &str) {
     if let Some(path) = s
         .projects
@@ -6018,9 +6142,67 @@ fn browse_into(s: &mut State, name: &str) {
         .and_then(|listing| listing.entries.iter().find(|entry| entry.name == name))
         .map(|entry| entry.path.clone())
     {
-        s.picker_query.replace_text(path);
+        let sep = if path.contains('\\') && !path.contains('/') {
+            '\\'
+        } else {
+            '/'
+        };
+        let next = if path.ends_with(['/', '\\']) {
+            path
+        } else {
+            format!("{path}{sep}")
+        };
+        s.picker_query.replace_text(next);
     }
     s.picker_highlight = 0;
+}
+
+/// Shell-style Tab completion for folder browsing, ported from KSG Code's
+/// `getFilesystemBrowseTabCompletion`: a single match enters the directory, several extend
+/// to their common case-insensitive prefix.
+fn browse_tab_complete(s: &mut State, folders: &[String]) {
+    let Some(first) = folders.first() else {
+        return;
+    };
+    if folders.len() == 1 {
+        browse_into(s, first);
+        return;
+    }
+    let query = &s.picker_query.text;
+    let leaf = if query.ends_with(['/', '\\']) {
+        ""
+    } else {
+        query.rsplit(['/', '\\']).next().unwrap_or("")
+    };
+    let mut prefix: Vec<char> = first.chars().collect();
+    for name in &folders[1..] {
+        let chars: Vec<char> = name.chars().collect();
+        let mut len = 0;
+        while len < prefix.len()
+            && len < chars.len()
+            && prefix[len].to_lowercase().eq(chars[len].to_lowercase())
+        {
+            len += 1;
+        }
+        prefix.truncate(len);
+    }
+    let common: String = prefix.into_iter().collect();
+    let lower_common = common.to_lowercase();
+    if common.chars().count() > leaf.chars().count()
+        && folders
+            .iter()
+            .all(|name| name.to_lowercase().starts_with(&lower_common))
+    {
+        let dir_prefix = if query.ends_with(['/', '\\']) {
+            query.as_str()
+        } else if let Some(idx) = query.rfind(['/', '\\']) {
+            &query[..=idx]
+        } else {
+            ""
+        };
+        s.picker_query.replace_text(format!("{dir_prefix}{common}"));
+        s.picker_highlight = 0;
+    }
 }
 
 /// A palette row with a title and a quieter description, as T3 Code lists its sources.
@@ -6161,9 +6343,11 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                         true
                     }
                     rune::Key::Tab if browsing => {
-                        if let Some(name) = folders.get(at) {
-                            browse_into(s, &name.clone());
-                        }
+                        browse_tab_complete(s, &folders);
+                        true
+                    }
+                    rune::Key::Backspace if browsing && s.picker_query.text.is_empty() => {
+                        s.open_picker(ProjectPicker::AddProject);
                         true
                     }
                     rune::Key::Enter if browsing => {
@@ -6282,13 +6466,30 @@ fn add_project_palette(s: &State, p: Palette) -> El {
             .as_ref()
             .and_then(|listing| listing.parent.clone())
         {
+            let sep = if parent.contains('\\') && !parent.contains('/') {
+                '\\'
+            } else {
+                '/'
+            };
+            let parent_dir = if parent.ends_with(['/', '\\']) {
+                parent
+            } else {
+                format!("{parent}{sep}")
+            };
             list = list.child(
-                palette_row("browse-parent".into(), "folder", "..", &parent, false, p)
-                    .min_h(34.0)
-                    .on_press(move |s: &mut State| {
-                        s.picker_query.replace_text(&parent);
-                        s.picker_highlight = 0;
-                    }),
+                palette_row(
+                    "browse-parent".into(),
+                    "folder",
+                    "..",
+                    &parent_dir,
+                    false,
+                    p,
+                )
+                .min_h(34.0)
+                .on_press(move |s: &mut State| {
+                    s.picker_query.replace_text(&parent_dir);
+                    s.picker_highlight = 0;
+                }),
             );
         }
         for (index, name) in folders.iter().enumerate() {
@@ -7444,6 +7645,56 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
         }
         picker
     };
+    let has_any_project = s.projects.entries.iter().any(|project| !project.hidden);
+    if !has_workspace && !has_any_project && !s.demo {
+        // Ported from KSG Code's `NoProjectsHero`: when no workspaces exist yet, show the
+        // empty-workspace headline and primary "Add workspace" action instead of an empty
+        // project picker.
+        return col()
+            .key("empty-heading")
+            .w_full()
+            .items_center()
+            .gap(12.0)
+            .child(
+                label("What should we build?", HEADING_NARROW, p.ink)
+                    .align(rune::Align::Center)
+                    .wrap()
+                    .w_full(),
+            )
+            .child(
+                label(
+                    "Add a workspace to start a thread, or start without one.",
+                    SMALL,
+                    p.muted,
+                )
+                .align(rune::Align::Center)
+                .wrap()
+                .w_full(),
+            )
+            .child(framed(
+                row()
+                    .key("no-projects-add-workspace")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Add workspace")
+                    .focusable(true)
+                    .h(30.0)
+                    .px(10.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(p.coral)
+                    .hover(p.coral)
+                    .on_press(|s: &mut State| s.open_picker(ProjectPicker::AddProject))
+                    .child(icon("plus", p.on_coral))
+                    .child(label(
+                        "Add workspace",
+                        TextStyle::new(13.0, 560.0),
+                        p.on_coral,
+                    )),
+                p,
+            ));
+    }
     if inline {
         row()
             .key("empty-heading")
@@ -8449,12 +8700,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                     .child(pixel_text("Open a real workspace", p.sea)),
             )
     } else {
-        footer.child(machine_selector(s, p)).child(spacer()).child(
-            pixel_button("access-mode", t.native.access.label(), p, |s| {
-                s.current_mut().native.access_picker = true
-            })
-            .disabled(t.status.busy() || t.configuring || t.archived()),
-        )
+        footer
+            .child(machine_selector(s, p))
+            .child(captain_selector_trigger(s, p))
+            .child(spacer())
+            .child(
+                pixel_button("access-mode", t.native.access.label(), p, |s| {
+                    s.current_mut().native.access_picker = true
+                })
+                .disabled(t.status.busy() || t.configuring || t.archived()),
+            )
     };
     area = area.child(footer);
     col()
@@ -9172,7 +9427,7 @@ pub(crate) mod tests {
                 if state == "listing" {
                     press(&mut rt, "browse-0");
                     assert_eq!(
-                        rt.state.picker_query.text, "/srv/projects/shina",
+                        rt.state.picker_query.text, "/srv/projects/shina/",
                         "use the host path without joining on the client"
                     );
                 }
@@ -9410,11 +9665,13 @@ pub(crate) mod tests {
             walk_menu(&mut rt, "row-context-menu", true, &at("row menu"));
 
             let mut rt = fresh();
-            rt.state.captain_picker = true;
+            rt.state.open_captain_selector();
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
-            walk_menu(&mut rt, "captain-picker", false, &at("captain picker"));
+            assert_eq!(focused(&rt).key.as_deref(), Some("captain-search"));
+            tap(&mut rt, rune::Key::Down);
+            walk_menu(&mut rt, "captain-list", true, &at("captain picker"));
 
             let mut rt = fresh();
             rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -13161,19 +13418,14 @@ pub(crate) mod tests {
             assert!(rt.find(&format!("choose-project-captain-{id}")).is_none());
         }
         press(&mut rt, "assign-captain");
-        assert_eq!(rt.state.project_picker, Some(ProjectPicker::AssignCaptain));
-        assert!(rt.find("choose-no-project").is_some());
-        press(&mut rt, "choose-project-3");
+        assert!(rt.state.project_picker.is_none());
+        assert!(rt.state.captain_picker);
+        assert_eq!(rt.state.current().project, Some(1));
+        assert!(rt.find("choose-no-captain").is_some());
         press(&mut rt, "choose-captain-0");
-        assert_eq!(rt.state.project(Some(3)).unwrap().captain, Some(0));
-        assert_eq!(rt.state.current().project, Some(3));
+        assert_eq!(rt.state.current().captain, Some(0));
+        assert_eq!(rt.state.current().project, Some(1));
         assert!(rt.find("thread-2").is_some());
-        press(&mut rt, "assign-captain");
-        assert!(
-            rt.find("choose-project-3").is_some(),
-            "several captains can share a project"
-        );
-        assert!(rt.find("choose-project-1").is_some());
     }
 
     #[test]
@@ -13253,18 +13505,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_new_roster_is_empty_and_adding_a_captain_opens_the_create_form() {
+    fn a_new_roster_is_empty_and_adding_a_captain_opens_the_selector_then_editor() {
         let mut rt = runtime(1280.0);
         rt.frame(0.0);
         assert!(rt.state.captains.is_empty());
         press(&mut rt, "assign-captain");
-        assert!(
-            rt.state.captain_editor.is_some(),
-            "no preset list to choose from"
-        );
+        assert!(rt.state.captain_picker);
         assert!(rt.state.project_picker.is_none());
+        assert!(rt.find("choose-no-captain").is_some());
+        press(&mut rt, "picker-new-captain");
+        assert!(rt.state.captain_editor.is_some());
+        assert!(!rt.state.captain_picker);
         let editor = rt.state.captain_editor.as_mut().unwrap();
         assert!(editor.role.text.is_empty(), "no default role");
+        assert!(
+            !editor.name.text.trim().is_empty(),
+            "suggested name is pre-filled"
+        );
         editor.name.replace_text("Riku");
         rt.invalidate();
         rt.frame(0.5);
@@ -13309,7 +13566,7 @@ pub(crate) mod tests {
         };
         rt.key(key(rune::Key::Enter, false));
         rt.frame(1.5);
-        assert!(rt.state.picker_query.text.ends_with("alpha"));
+        assert!(rt.state.picker_query.text.ends_with(&format!("alpha{sep}")));
         finish_folder_listing(&mut rt);
         rt.key(key(rune::Key::Enter, true));
         rt.frame(2.0);
@@ -13383,7 +13640,6 @@ pub(crate) mod tests {
         rt.state.captains = crate::captains::Captain::presets();
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
-        press(&mut rt, "choose-project-1");
         assert!(rt.state.captain_picker);
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-captain-2");
@@ -13404,7 +13660,6 @@ pub(crate) mod tests {
         rt.state.captains = crate::captains::Captain::presets();
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
-        press(&mut rt, "choose-project-1");
         rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-captain-3");
         assert_eq!(rt.state.current().captain, Some(3));
@@ -13419,7 +13674,6 @@ pub(crate) mod tests {
         rt.state.current_mut().draft.replace_text("Keep this draft");
         rt.frame(0.0);
         press(&mut rt, "assign-captain");
-        press(&mut rt, "choose-project-1");
         rt.frame(1.0);
         press(&mut rt, "picker-new-captain");
         assert!(rt.state.captain_editor.is_some());
@@ -13701,9 +13955,15 @@ pub(crate) mod tests {
         press(&mut rt, "menu-remove-project");
         assert!(rt.state.projects.entries[0].hidden);
         assert_eq!(rt.state.threads[0].project, Some(1));
-        // With no workspace in view, New thread asks where.
+        // With no workspace in view, New thread starts a projectless thread at once (KSG's
+        // projectGroupCount === 0 rule), and the picker still allows choosing No workspace.
         press(&mut rt, "new-thread");
-        assert_eq!(rt.state.project_picker, Some(ProjectPicker::NewThread));
+        assert!(rt.state.project_picker.is_none());
+        assert!(rt.state.current().project.is_none());
+        assert!(rt.state.current().captain.is_none());
+        rt.state.open_picker(ProjectPicker::NewThread);
+        rt.invalidate();
+        rt.frame(0.5);
         press(&mut rt, "choose-no-project");
         assert!(rt.state.current().project.is_none());
         assert!(rt.state.current().captain.is_none());
@@ -14669,6 +14929,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pi_model_list_shows_catalog_error_and_retry() {
+        let mut rt = runtime(1280.0);
+        rt.state.catalog.error = Some("Pi was not found on PATH.".into());
+        rt.state.current_mut().harness = "pi".into();
+        rt.state.current_mut().models.clear();
+        rt.frame(0.0);
+        press(&mut rt, "model-effort");
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "open-model-list");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("models-group").is_some());
+        assert!(rt.find("models-empty-note").is_some());
+        let tree = rt.accessibility_json().to_string();
+        assert!(
+            tree.contains("Pi was not found on PATH."),
+            "catalog error missing from picker: {tree}"
+        );
+        assert!(
+            !tree.contains("No CPA models are available."),
+            "generic fallback should not appear when catalog.error is set: {tree}"
+        );
+        assert!(rt.find("retry-catalog").is_some());
+    }
+
+    #[test]
     fn effort_slider_moves_by_keyboard_click_and_drag() {
         let mut rt = runtime(1280.0);
         with_levels(&mut rt);
@@ -15190,5 +15475,140 @@ pub(crate) mod tests {
                 "{width}: thread with saved session must show Restoring conversation"
             );
         }
+    }
+
+    #[test]
+    fn in_draft_captain_selector_fits_and_opens_on_the_new_thread_route_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.frame(0.0);
+
+            let (trigger, _) = rt
+                .presented("captain-selector")
+                .expect("captain selector trigger in composer footer");
+            assert!(
+                trigger[0] >= 0.0 && trigger[0] + trigger[2] <= width + 1.0,
+                "{width}: trigger fits {trigger:?}"
+            );
+
+            // Clicking the footer trigger opens the in-place selector popover inside the window.
+            press(&mut rt, "captain-selector");
+            assert!(rt.state.captain_picker);
+            rt.frame(0.1);
+            let (picker, _) = rt
+                .presented("captain-picker")
+                .expect("captain picker popover presented");
+            assert!(
+                picker[0] >= 0.0
+                    && picker[0] + picker[2] <= width + 1.0
+                    && picker[1] >= 0.0
+                    && picker[1] + picker[3] <= 840.0 + 1.0,
+                "{width}: picker fits {picker:?}"
+            );
+            assert!(rt.presented("choose-no-captain").is_some());
+            assert!(rt.presented("choose-captain-0").is_some());
+            assert!(rt.presented("picker-new-captain").is_some());
+
+            // Sidebar "+" uses the same route: starts/keeps a draft in the workspace with the
+            // selector open and search focused (closing it returns focus to the composer).
+            press(&mut rt, "captain-selector");
+            assert!(!rt.state.captain_picker);
+            if width >= 1050.0 {
+                press(&mut rt, "assign-captain");
+                assert!(rt.state.captain_picker);
+                assert!(rt.state.captain_picker_query.focused);
+                assert_eq!(rt.state.current().captain, None);
+            } else {
+                rt.state.open_captain_selector();
+                rt.frame(0.1);
+                assert!(rt.state.captain_picker);
+                assert!(rt.state.captain_picker_query.focused);
+                assert_eq!(rt.state.current().captain, None);
+            }
+
+            // Filtering by name narrows the list while keeping No captain + New captain.
+            rt.state.captain_picker_query.replace_text("Pip");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(rt.find("choose-no-captain").is_some());
+            assert!(rt.find("choose-captain-0").is_none());
+            assert!(rt.find("choose-captain-3").is_some());
+            assert!(rt.find("picker-new-captain").is_some());
+        }
+    }
+
+    #[test]
+    fn no_projects_hero_and_add_project_browse_parity_fit_at_all_widths() {
+        let root = std::env::temp_dir().join(format!("shina-browse-parity-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("alpha-one")).unwrap();
+        std::fs::create_dir_all(root.join("alpha-two")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden-dir")).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // Remove all workspaces so NoProjectsHero renders on the empty new-thread screen.
+            rt.state.projects.entries.clear();
+            rt.state.new_thread_in(None);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            let (hero_btn, _) = rt
+                .presented("no-projects-add-workspace")
+                .expect("NoProjectsHero Add workspace button");
+            assert!(
+                hero_btn[0] >= 0.0 && hero_btn[0] + hero_btn[2] <= width + 1.0,
+                "{width}: hero button fits {hero_btn:?}"
+            );
+
+            // Configured "Add project starts in" directory seeds the folder browser.
+            rt.state.thread_defaults.add_project_base_directory =
+                root.to_string_lossy().into_owned();
+            press(&mut rt, "no-projects-add-workspace");
+            assert_eq!(rt.state.project_picker, Some(ProjectPicker::AddProject));
+            press(&mut rt, "add-local-folder");
+            assert!(rt.state.picker_browsing);
+            assert_eq!(
+                rt.state.picker_query.text,
+                format!("{}{sep}", root.display())
+            );
+            finish_folder_listing(&mut rt);
+            rt.invalidate();
+            rt.frame(0.5);
+
+            // Hidden dotfiles are filtered out unless the query leaf starts with '.'.
+            assert!(rt.find("browse-0").is_some());
+            assert!(rt.find("browse-1").is_some());
+            assert!(rt.find("browse-2").is_none());
+
+            // Tab extends to the common prefix ("alpha-") when multiple matches share a prefix.
+            rt.state
+                .picker_query
+                .replace_text(format!("{}{sep}al", root.display()));
+            finish_folder_listing(&mut rt);
+            rt.invalidate();
+            rt.frame(0.6);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: rune::Mods::default(),
+            });
+            rt.frame(0.65);
+            assert_eq!(
+                rt.state.picker_query.text,
+                format!("{}{sep}alpha-", root.display())
+            );
+
+            // Typing '.' reveals hidden directories.
+            rt.state
+                .picker_query
+                .replace_text(format!("{}{sep}.", root.display()));
+            finish_folder_listing(&mut rt);
+            rt.invalidate();
+            rt.frame(0.7);
+            assert!(rt.find("browse-0").is_some());
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

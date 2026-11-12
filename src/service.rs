@@ -518,6 +518,17 @@ fn launch_server(service: &Service, log: &fs::File) -> Result<(), String> {
         .env("SHINA_BOOT_SERVICE", "1")
         .env_remove("SHINA_DESKTOP_OWNER_PID")
         .stdin(Stdio::null());
+    // On macOS/Linux, `main()` reconciles PATH from the login shell before spawning;
+    // keep the reconciled PATH rather than overwriting it with a stale minimal PATH
+    // from an older service.json.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(reconciled_path) = std::env::var_os("PATH") {
+        let stale = service.environment.get("PATH").map(String::as_str);
+        if let Some(merged) = crate::shell_env::merge_path_entries(reconciled_path.to_str(), stale)
+        {
+            command.env("PATH", merged);
+        }
+    }
     if service
         .environment
         .get("SHINA_SERVICE_TAILNET")

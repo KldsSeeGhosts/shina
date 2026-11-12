@@ -1043,6 +1043,7 @@ pub fn browse_folder(input: &str, partial: bool) -> Result<crate::protocol::Fold
     } else {
         (path, String::new())
     };
+    let show_hidden = filter.starts_with('.');
     let path = path.canonicalize().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "That folder does not exist."
@@ -1067,6 +1068,9 @@ pub fn browse_folder(input: &str, partial: bool) -> Result<crate::protocol::Fold
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
+        if partial && !show_hidden && name.starts_with('.') {
+            continue;
+        }
         if !filter.is_empty() && !name.to_lowercase().starts_with(&filter) {
             continue;
         }

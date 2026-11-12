@@ -44,6 +44,7 @@ mod server_auth;
 mod server_lock;
 mod service;
 mod session;
+mod shell_env;
 mod store;
 mod tray;
 mod ui;
@@ -138,13 +139,15 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     } else if event.is_command('n') {
         if event.mods.alt {
             state.new_thread_in(None);
-        } else {
+            state.current_mut().draft.focused = true;
+        } else if event.mods.shift {
             state.new_thread();
+            state.current_mut().draft.focused = true;
+        } else {
+            state.new_thread_click(false);
         }
-        state.current_mut().draft.focused = true;
     } else if event.mods.shift && event.is_command('o') {
-        state.new_thread();
-        state.current_mut().draft.focused = true;
+        state.new_thread_click(false);
     } else if event.is_command('o') {
         projects::pick_folder(state, tx);
     } else if event.is_command('b') {
@@ -623,6 +626,7 @@ fn captain_crews_demo(state: &mut State) {
 }
 
 fn main() {
+    shell_env::reconcile_path();
     if std::env::args().nth(1).as_deref() == Some("--html-native") {
         if let Err(error) = html_window::helper() {
             println!("{}", serde_json::json!({"error":error}));

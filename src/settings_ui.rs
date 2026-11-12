@@ -87,6 +87,9 @@ pub struct ThreadDefaults {
     pub snooze_minutes: Vec<u32>,
     pub snooze_calendar: Vec<CalendarDefault>,
     pub models: BTreeMap<String, ModelDefault>,
+    /// Starting directory when the Add workspace folder browser opens (KSG Code's `addProjectBaseDirectory`).
+    /// Empty defaults to `"~/"`.
+    pub add_project_base_directory: String,
 }
 impl Default for ThreadDefaults {
     fn default() -> Self {
@@ -105,6 +108,7 @@ impl Default for ThreadDefaults {
                 },
             ],
             models: BTreeMap::new(),
+            add_project_base_directory: String::new(),
         }
     }
 }
@@ -122,6 +126,11 @@ impl ThreadDefaults {
                         .iter()
                         .any(|s| s.len() > 256 || s.chars().any(char::is_control))
             })
+            || self.add_project_base_directory.len() > 1024
+            || self
+                .add_project_base_directory
+                .chars()
+                .any(char::is_control)
         {
             return Err("Invalid thread defaults.".into());
         }
@@ -179,6 +188,7 @@ pub struct Dialog {
     pub machine: String,
     pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
+    pub add_project_base: rune::TextEdit,
     pub model: rune::TextEdit,
     pub provider: rune::TextEdit,
     pub effort: rune::TextEdit,
@@ -198,6 +208,7 @@ impl Default for Dialog {
             machine: "local".into(),
             profile_target: None,
             snooze: Default::default(),
+            add_project_base: Default::default(),
             model: Default::default(),
             provider: Default::default(),
             effort: Default::default(),
@@ -255,11 +266,12 @@ impl State {
                 wake();
             });
         }
+        let defaults = self.settings_defaults();
+        self.settings.snooze.replace_text(&defaults.snooze_text());
         self.settings
-            .snooze
-            .replace_text(&self.settings_defaults().snooze_text());
-        let value = self
-            .settings_defaults()
+            .add_project_base
+            .replace_text(&defaults.add_project_base_directory);
+        let value = defaults
             .models
             .get(&self.settings.model_harness)
             .cloned()
@@ -348,11 +360,12 @@ impl State {
     }
     fn set_settings_machine(&mut self, machine: &str) {
         self.settings.machine = machine.into();
+        let defaults = self.settings_defaults();
+        self.settings.snooze.replace_text(&defaults.snooze_text());
         self.settings
-            .snooze
-            .replace_text(&self.settings_defaults().snooze_text());
-        let value = self
-            .settings_defaults()
+            .add_project_base
+            .replace_text(&defaults.add_project_base_directory);
+        let value = defaults
             .models
             .get(&self.settings.model_harness)
             .cloned()
@@ -984,6 +997,36 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         })));
             }
+            pane = add(
+                pane,
+                s,
+                "settings-add-project-base",
+                "Add project starts in",
+                "Leave empty to use \"~/\" when the Add Project browser opens.",
+                row()
+                    .gap(4.0)
+                    .child(
+                        field(
+                            &s.settings.add_project_base,
+                            "settings-add-project-base-input",
+                            "~/",
+                            p,
+                        )
+                        .on_edit(|s: &mut State| &mut s.settings.add_project_base),
+                    )
+                    .child(settings_button(
+                        "settings-add-project-base-save",
+                        "Save",
+                        p,
+                        |s| {
+                            let mut defaults = s.settings_defaults();
+                            defaults.add_project_base_directory =
+                                s.settings.add_project_base.text.trim().into();
+                            s.save_defaults(defaults);
+                        },
+                    )),
+                p,
+            );
         }
         2 => {
             let processes = [

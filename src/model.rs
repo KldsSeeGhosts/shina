@@ -280,7 +280,6 @@ pub enum ProjectScope {
 pub enum ProjectPicker {
     NewThread,
     Scope,
-    AssignCaptain,
     /// Add a workspace, as T3 Code's Add project palette: pick a source, then browse.
     AddProject,
     /// Add or remove a workspace in the open captain's scope, from its Brief panel.
@@ -2410,7 +2409,6 @@ pub struct State {
     pub picker_highlight: usize,
     /// The Add workspace palette is browsing folders; the query holds the path.
     pub picker_browsing: bool,
-    pub hovered_captain: Option<usize>,
     pub activity_full: bool,
     pub show_archive: bool,
     pub sidebar: bool,
@@ -2431,6 +2429,8 @@ pub struct State {
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub captain_picker: bool,
+    pub captain_picker_query: TextEdit,
+    pub captain_picker_highlight: usize,
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
@@ -2590,7 +2590,6 @@ impl State {
             picker_query: TextEdit::default(),
             picker_highlight: 0,
             picker_browsing: false,
-            hovered_captain: None,
             activity_full: false,
             show_archive: false,
             sidebar: true,
@@ -2611,6 +2610,8 @@ impl State {
             attachment_cache,
             attachment_drop_hover: false,
             captain_picker: false,
+            captain_picker_query: TextEdit::default(),
+            captain_picker_highlight: 0,
             captain_project: None,
             captains: Vec::new(),
             captain_scopes: Default::default(),
@@ -3063,14 +3064,44 @@ impl State {
         self.picker_query.focused = true;
         self.picker_highlight = 0;
     }
-    /// Switch the Add workspace palette to browsing the selected server user's home.
+    /// Initial query for the Add workspace folder browser, ported from KSG Code's
+    /// `getAddProjectInitialQueryForEnvironment`: uses `addProjectBaseDirectory` from the
+    /// target machine's thread defaults (ensuring a trailing separator), or `"~/"` when empty.
+    pub fn add_project_initial_query(&self) -> String {
+        let base = if self.client.is_none() || self.machines.selected == "local" {
+            self.thread_defaults.add_project_base_directory.trim()
+        } else {
+            self.machines
+                .views
+                .get(&self.machines.selected)
+                .and_then(|v| v["index"]["threadDefaults"]["add_project_base_directory"].as_str())
+                .map(str::trim)
+                .unwrap_or("")
+        };
+        if base.is_empty() {
+            return "~/".into();
+        }
+        let mut out = base.to_string();
+        if !out.ends_with(['/', '\\']) {
+            out.push(if out.contains('\\') && !out.contains('/') {
+                '\\'
+            } else {
+                '/'
+            });
+        }
+        out
+    }
+    /// Switch the Add workspace palette to browsing the selected server user's home or
+    /// configured "Add project starts in" directory.
+    /// Ported from KSG Code's `startAddProjectBrowse`.
     pub fn browse_for_project(&mut self) {
         self.project_picker = Some(ProjectPicker::AddProject);
         self.picker_browsing = true;
         self.projects.browser = Default::default();
         self.picker_query = TextEdit::default();
-        // The answering host resolves home. Do not derive remote parents on this machine.
-        self.picker_query.replace_text("~");
+        // The answering host resolves home/base. Do not derive remote parents on this machine.
+        let initial = self.add_project_initial_query();
+        self.picker_query.replace_text(&initial);
         self.picker_query.focused = true;
         self.picker_highlight = 0;
     }
@@ -3132,8 +3163,9 @@ impl State {
             Err(error) => self.projects.menu_error = Some(error),
         }
     }
-    /// The sidebar's New thread, by T3 Code's rule: with one workspace in view, or with Shift
-    /// in a workspace that is in view, start at once; otherwise ask which workspace.
+    /// The sidebar's New thread, ported from KSG Code's `shouldCreateNewThreadInCurrentProject`
+    /// and `startNewThreadFromContext`: with one workspace in view, no workspaces at all, or
+    /// Shift-click in a visible workspace, start at once; otherwise open the New thread picker.
     pub fn new_thread_click(&mut self, shift: bool) {
         let shown = |s: &Self, project: Option<ProjectId>| {
             s.scope_includes(project)
@@ -3146,11 +3178,14 @@ impl State {
             .filter(|p| shown(self, Some(p.id)))
             .map(|p| p.id)
             .collect();
+        let all_visible_empty = self.projects.entries.iter().all(|p| p.hidden);
         let current = self.current().project;
         let target = if shift && current.is_some() && shown(self, current) {
             Some(current)
         } else if in_view.len() == 1 {
             Some(Some(in_view[0]))
+        } else if all_visible_empty && in_view.is_empty() {
+            Some(None)
         } else {
             None
         };
@@ -4127,17 +4162,35 @@ impl State {
         }
         !eligible.is_empty()
     }
+    /// Open the in-draft captain selector (from the composer footer or sidebar Captains "+").
+    /// Ported from KSG Code's new-thread / composer picker flow: starts a ready draft in the
+    /// current workspace if needed, focuses the composer, and opens the in-place captain selector.
+    pub fn open_captain_selector(&mut self) {
+        if self.current().captain.is_some() || !self.current().is_draft() {
+            let project = self.current().project;
+            self.new_thread_in(project);
+        }
+        self.captain_project = Some(self.current().project);
+        self.captain_picker = true;
+        self.captain_picker_query = TextEdit::default();
+        self.captain_picker_query.focused = true;
+        self.captain_picker_highlight = 0;
+        self.current_mut().draft.focused = true;
+    }
+
     pub fn choose_project_captain(&mut self, id: ProjectId) {
         if let Some(captain) = self.project(Some(id)).and_then(|p| p.captain) {
             self.projects.captain_target = Some(id);
             self.open_captain(captain);
-        } else if self.captains.is_empty() {
+        } else {
+            self.new_thread_in(Some(id));
             self.projects.captain_target = Some(id);
             self.captain_project = Some(Some(id));
-            self.begin_new_captain();
-        } else {
-            self.projects.captain_target = Some(id);
             self.captain_picker = true;
+            self.captain_picker_query = TextEdit::default();
+            self.captain_picker_query.focused = true;
+            self.captain_picker_highlight = 0;
+            self.current_mut().draft.focused = true;
         }
     }
     pub fn toggle_thread_auto_settle(&mut self, id: usize) {
@@ -4396,11 +4449,38 @@ impl State {
             })
             .map(|p| p.id);
         if self.captain_project.is_none() {
-            self.captain_project = Some(suggested.or(self.current().project));
+            self.captain_project = Some(self.current().project.or(suggested));
         }
         self.captain_picker = false;
-        self.captain_editor = Some(CaptainEditor::new());
-        self.captain_editor.as_mut().unwrap().server = self.machines.selected.clone();
+        let used_names: std::collections::HashSet<String> = self
+            .captains
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect();
+        let used_portraits: std::collections::HashSet<usize> =
+            self.captains.iter().map(|c| c.portrait).collect();
+        let (portrait, suggested_name) = (0..crate::visuals::PORTRAITS)
+            .find(|i| {
+                !used_portraits.contains(i)
+                    && !used_names.contains(&crate::visuals::CAPTAIN_NAMES[*i].to_lowercase())
+            })
+            .map(|i| (i, crate::visuals::CAPTAIN_NAMES[i].to_string()))
+            .unwrap_or_else(|| {
+                let mut idx = self.captains.len() + 1;
+                let candidate = loop {
+                    let c = format!("Captain {idx}");
+                    if !used_names.contains(&c.to_lowercase()) {
+                        break c;
+                    }
+                    idx += 1;
+                };
+                (self.captains.len() % crate::visuals::PORTRAITS, candidate)
+            });
+        let mut editor = CaptainEditor::new();
+        editor.server = self.machines.selected.clone();
+        editor.portrait = portrait;
+        editor.name.replace_text(&suggested_name);
+        self.captain_editor = Some(editor);
     }
 
     pub fn edit_captain(&mut self, captain: usize) {

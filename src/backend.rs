@@ -824,6 +824,7 @@ mod tests {
     #[test]
     #[ignore = "Starts the installed Pi, but sends no model prompt"]
     fn installed_pi_answers_state_and_history_without_a_prompt() {
+        crate::shell_env::reconcile_path();
         for ephemeral in [false, true] {
             let pi = if ephemeral {
                 Pi::discover(std::env::temp_dir(), Arc::new(|| {}))
