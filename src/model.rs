@@ -2511,6 +2511,7 @@ pub struct State {
     pub settings_menu: bool,
     pub settings: crate::ui::settings_ui::Dialog,
     pub preferences: crate::ui::settings_ui::Preferences,
+    pub keybindings_watcher: crate::keybindings::KeybindingsWatcher,
     pub thread_defaults: crate::ui::settings_ui::ThreadDefaults,
     pub fleet: crate::fleet_update::Fleet,
     /// The sidebar's "N need you" popover is open.
@@ -2625,6 +2626,14 @@ impl State {
             if let Some(ui) = crate::store::load(&self.data_dir.join("ui-state.json"))? {
                 self.restore_ui(&ui)?;
             }
+            if self.keybindings_path().exists() {
+                let file_state =
+                    crate::keybindings::load_runtime_keybindings_file(&self.keybindings_path());
+                self.preferences.keybindings = file_state.rules;
+                self.settings.keybindings_issues = file_state.issues;
+                self.keybindings_watcher
+                    .record_stamp(&self.keybindings_path());
+            }
             Ok::<_, String>(())
         })();
         if let Err(error) = result {
@@ -2696,6 +2705,7 @@ impl State {
             settings_menu: false,
             settings: Default::default(),
             preferences: Default::default(),
+            keybindings_watcher: Default::default(),
             thread_defaults: Default::default(),
             fleet: Default::default(),
             attention_menu: false,
@@ -6107,6 +6117,7 @@ impl State {
         if self.ownership_denied {
             return;
         }
+        self.init_keybindings_file(wake.clone());
         self.setup_background();
         self.runtime_enabled = true;
         self.start_task_recovery();
@@ -6588,10 +6599,90 @@ impl State {
         }
         Ok(())
     }
+    pub fn keybindings_path(&self) -> PathBuf {
+        self.data_dir.join("keybindings.json")
+    }
+    pub fn ensure_keybindings_file(&mut self) {
+        let path = self.keybindings_path();
+        match crate::keybindings::sync_default_keybindings_on_startup(
+            &path,
+            &self.preferences.keybindings,
+        ) {
+            Ok(file_state) => {
+                self.preferences.keybindings = file_state.rules;
+                self.settings.keybindings_issues = file_state.issues;
+                self.keybindings_watcher.record_stamp(&path);
+            }
+            Err(error) => {
+                self.settings.keybindings_issues =
+                    vec![crate::keybindings::KeybindingsIssue::MalformedConfig { message: error }];
+            }
+        }
+    }
+    pub fn init_keybindings_file(&mut self, wake: Waker) {
+        self.ensure_keybindings_file();
+        if !self.demo && !self.headless {
+            self.keybindings_watcher
+                .start(self.keybindings_path(), wake);
+        }
+    }
+    pub fn poll_keybindings(&mut self) -> bool {
+        if self.demo {
+            return false;
+        }
+        let Some(file_state) = self.keybindings_watcher.poll(&self.keybindings_path()) else {
+            return false;
+        };
+        self.preferences.keybindings = file_state.rules;
+        self.settings.keybindings_issues = file_state.issues;
+        true
+    }
+    pub fn save_keybinding_override(
+        &mut self,
+        command: &str,
+        key: &str,
+        when: Option<&str>,
+        replace: Option<(&str, &str, Option<&str>)>,
+    ) -> Result<(), String> {
+        let path = self.keybindings_path();
+        let file_state =
+            crate::keybindings::upsert_keybinding_in_file(&path, command, key, when, replace)?;
+        self.preferences.keybindings = file_state.rules;
+        self.settings.keybindings_issues = file_state.issues;
+        self.keybindings_watcher.record_stamp(&path);
+        Ok(())
+    }
+    pub fn reset_keybinding_override(
+        &mut self,
+        command: &str,
+        key: &str,
+        when: Option<&str>,
+        default_key: Option<&str>,
+        default_when: &str,
+    ) -> Result<(), String> {
+        let path = self.keybindings_path();
+        let file_state = crate::keybindings::reset_keybinding_in_file(
+            &path,
+            command,
+            key,
+            when,
+            default_key,
+            default_when,
+        )?;
+        self.preferences.keybindings = file_state.rules;
+        self.settings.keybindings_issues = file_state.issues;
+        self.keybindings_watcher.record_stamp(&path);
+        Ok(())
+    }
+
     fn ui_snapshot(&self) -> Value {
+        let mut prefs_value = serde_json::to_value(&self.preferences).unwrap_or_else(|_| json!({}));
+        if let Some(map) = prefs_value.as_object_mut() {
+            map.remove("keybindings");
+        }
         json!({
             "background": self.background.settings,
-            "preferences": self.preferences,
+            "preferences": prefs_value,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -7149,7 +7240,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
-    let browsing = state.poll_folder_browser() | state.poll_settings() | html_changed;
+    let keybindings_changed = state.poll_keybindings();
+    let browsing =
+        state.poll_folder_browser() | state.poll_settings() | html_changed | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {

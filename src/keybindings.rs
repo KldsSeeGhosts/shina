@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, SystemTime};
 
 pub const MAX_KEYBINDING_VALUE_LENGTH: usize = 64;
 pub const MAX_KEYBINDING_WHEN_LENGTH: usize = 256;
@@ -1831,6 +1837,7 @@ pub fn validate_keybinding_draft(command: &str, key: &str, when: &str) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 pub fn upsert_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1894,6 +1901,7 @@ pub fn upsert_custom_rule(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn remove_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1923,6 +1931,7 @@ pub fn remove_custom_rule(
     });
 }
 
+#[cfg(test)]
 pub fn reset_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1938,6 +1947,459 @@ pub fn reset_custom_rule(
         upsert_custom_rule(custom, command, default_key, default_when_opt, None)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeybindingsIssue {
+    MalformedConfig { message: String },
+    InvalidEntry { index: usize, message: String },
+}
+
+impl KeybindingsIssue {
+    pub fn display_message(&self) -> String {
+        match self {
+            Self::MalformedConfig { message } => {
+                format!("Malformed keybindings.json: {message}")
+            }
+            Self::InvalidEntry { index, message } => {
+                format!("Ignored keybindings.json entry #{}: {message}", index + 1)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeybindingsFileState {
+    pub rules: Vec<KeybindingRule>,
+    pub issues: Vec<KeybindingsIssue>,
+}
+
+fn keybinding_shortcut_context(rule: &KeybindingRule) -> Option<String> {
+    let shortcut = parse_keybinding_shortcut(&rule.key)?;
+    let encoded = shortcut_to_keybinding_input(&shortcut);
+    Some(format!("{encoded}\0{}", rule.when.as_deref().unwrap_or("")))
+}
+
+fn has_same_shortcut_context(left: &KeybindingRule, right: &KeybindingRule) -> bool {
+    match (
+        keybinding_shortcut_context(left),
+        keybinding_shortcut_context(right),
+    ) {
+        (Some(l), Some(r)) => l == r,
+        _ => false,
+    }
+}
+
+fn rule_identity(rule: &KeybindingRule) -> (String, String, Option<String>) {
+    let key = parse_keybinding_shortcut(&rule.key)
+        .map(|s| shortcut_to_keybinding_input(&s))
+        .unwrap_or_else(|| rule.key.trim().to_owned());
+    let when = rule
+        .when
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .and_then(parse_keybinding_when_expression)
+        .map(|ast| when_ast_to_expression(Some(&ast)));
+    (rule.command.clone(), key, when)
+}
+
+fn is_same_keybinding_rule(left: &KeybindingRule, right: &KeybindingRule) -> bool {
+    rule_identity(left) == rule_identity(right)
+}
+
+fn decode_keybinding_entry(entry: &serde_json::Value) -> Result<KeybindingRule, String> {
+    let obj = entry
+        .as_object()
+        .ok_or_else(|| "Expected an object with key and command.".to_owned())?;
+    let key = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing key.".to_owned())?;
+    let command = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing command.".to_owned())?;
+    let when = match obj.get("when") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(w)) => {
+            let trimmed = w.trim();
+            if trimmed.is_empty() {
+                return Err("When expression cannot be empty.".into());
+            }
+            Some(trimmed.to_owned())
+        }
+        Some(_) => return Err("When expression must be a string.".into()),
+    };
+    validate_keybinding_draft(command, key, when.as_deref().unwrap_or(""))?;
+    let rule = KeybindingRule {
+        key: key.to_owned(),
+        command: command.to_owned(),
+        when,
+    };
+    if compile_resolved_keybinding_rule(&rule).is_none() {
+        return Err("Invalid keybinding rule.".into());
+    }
+    Ok(rule)
+}
+
+fn parse_lenient_entries(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    let value: serde_json::Value =
+        serde_json_lenient::from_str(raw).map_err(|err| format!("expected JSON array ({err})"))?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "expected JSON array".to_owned())
+}
+
+fn write_keybindings_entries_atomically(
+    path: &Path,
+    entries: &[serde_json::Value],
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create keybindings config directory: {err}"))?;
+    }
+    let mut encoded = serde_json::to_string_pretty(entries)
+        .map_err(|err| format!("failed to encode keybindings config: {err}"))?;
+    encoded.push('\n');
+    crate::store::write_atomic(path, encoded.as_bytes())
+        .map_err(|err| format!("failed to write keybindings config: {err}"))
+}
+
+pub fn load_runtime_keybindings_file(path: &Path) -> KeybindingsFileState {
+    if !path.exists() {
+        return KeybindingsFileState::default();
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return KeybindingsFileState {
+                rules: Vec::new(),
+                issues: vec![KeybindingsIssue::MalformedConfig {
+                    message: format!("failed to read keybindings config ({err})"),
+                }],
+            };
+        }
+    };
+    let entries = match parse_lenient_entries(&raw) {
+        Ok(entries) => entries,
+        Err(detail) => {
+            return KeybindingsFileState {
+                rules: Vec::new(),
+                issues: vec![KeybindingsIssue::MalformedConfig { message: detail }],
+            };
+        }
+    };
+    let mut rules = Vec::new();
+    let mut issues = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match decode_keybinding_entry(entry) {
+            Ok(rule) => rules.push(rule),
+            Err(message) => issues.push(KeybindingsIssue::InvalidEntry { index, message }),
+        }
+    }
+    if rules.len() > MAX_KEYBINDINGS_COUNT {
+        let start = rules.len() - MAX_KEYBINDINGS_COUNT;
+        rules.drain(..start);
+    }
+    KeybindingsFileState { rules, issues }
+}
+
+fn load_writable_keybindings_entries(
+    path: &Path,
+) -> Result<Vec<(serde_json::Value, Option<KeybindingRule>)>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "Unable to parse keybindings config at {}: {err}",
+            path.display()
+        )
+    })?;
+    let entries = parse_lenient_entries(&raw).map_err(|detail| {
+        format!(
+            "Unable to parse keybindings config at {}: {detail}",
+            path.display()
+        )
+    })?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let decoded = decode_keybinding_entry(&entry).ok();
+            (entry, decoded)
+        })
+        .collect())
+}
+
+pub fn sync_default_keybindings_on_startup(
+    path: &Path,
+    legacy_overrides: &[KeybindingRule],
+) -> Result<KeybindingsFileState, String> {
+    if !path.exists() {
+        let defaults = default_keybinding_rules();
+        let mut initial: Vec<KeybindingRule> = Vec::new();
+        if legacy_overrides.is_empty() {
+            initial = defaults;
+        } else {
+            let existing_cmds: HashSet<&str> = legacy_overrides
+                .iter()
+                .map(|r| r.command.as_str())
+                .collect();
+            for default_rule in defaults {
+                if existing_cmds.contains(default_rule.command.as_str()) {
+                    continue;
+                }
+                if legacy_overrides
+                    .iter()
+                    .any(|entry| has_same_shortcut_context(entry, &default_rule))
+                {
+                    continue;
+                }
+                initial.push(default_rule);
+            }
+            initial.extend(legacy_overrides.iter().cloned());
+        }
+        if initial.len() > MAX_KEYBINDINGS_COUNT {
+            let start = initial.len() - MAX_KEYBINDINGS_COUNT;
+            initial.drain(..start);
+        }
+        let values: Vec<serde_json::Value> = initial
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        write_keybindings_entries_atomically(path, &values)?;
+        return Ok(load_runtime_keybindings_file(path));
+    }
+
+    let state = load_runtime_keybindings_file(path);
+    if !state.issues.is_empty() {
+        return Ok(state);
+    }
+
+    let existing_cmds: HashSet<&str> = state.rules.iter().map(|r| r.command.as_str()).collect();
+    let mut missing_defaults = Vec::new();
+    for default_rule in default_keybinding_rules() {
+        if existing_cmds.contains(default_rule.command.as_str()) {
+            continue;
+        }
+        if state
+            .rules
+            .iter()
+            .any(|entry| has_same_shortcut_context(entry, &default_rule))
+        {
+            continue;
+        }
+        missing_defaults.push(default_rule);
+    }
+    let available = MAX_KEYBINDINGS_COUNT.saturating_sub(state.rules.len());
+    let to_prepend: Vec<KeybindingRule> = missing_defaults.into_iter().take(available).collect();
+    if !to_prepend.is_empty() {
+        let mut combined = to_prepend;
+        combined.extend(state.rules);
+        let values: Vec<serde_json::Value> = combined
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        write_keybindings_entries_atomically(path, &values)?;
+        return Ok(load_runtime_keybindings_file(path));
+    }
+    Ok(state)
+}
+
+pub fn upsert_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+    replace: Option<(&str, &str, Option<&str>)>,
+) -> Result<KeybindingsFileState, String> {
+    validate_keybinding_draft(command, key, when.unwrap_or(""))?;
+    let parsed = parse_keybinding_shortcut(key).ok_or("Invalid keybinding.")?;
+    let normalized_key = shortcut_to_keybinding_input(&parsed);
+    let normalized_when = when
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let ast = parse_keybinding_when_expression(w)
+                .ok_or("Use variables with !, &&, ||, and parentheses.")?;
+            Ok::<_, String>(when_ast_to_expression(Some(&ast)))
+        })
+        .transpose()?;
+    let new_rule = KeybindingRule {
+        key: normalized_key,
+        command: command.to_owned(),
+        when: normalized_when,
+    };
+    let replace_rule = replace.map(|(rc, rk, rw)| KeybindingRule {
+        key: rk.trim().to_owned(),
+        command: rc.to_owned(),
+        when: rw
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned),
+    });
+
+    let existing = load_writable_keybindings_entries(path)?;
+    let mut next_values: Vec<serde_json::Value> = existing
+        .into_iter()
+        .filter_map(|(value, decoded)| match decoded {
+            None => Some(value),
+            Some(entry) => {
+                let drop_new = is_same_keybinding_rule(&entry, &new_rule);
+                let drop_replace = replace_rule
+                    .as_ref()
+                    .is_some_and(|target| is_same_keybinding_rule(&entry, target));
+                if drop_new || drop_replace {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+        })
+        .collect();
+    next_values.push(
+        serde_json::to_value(&new_rule)
+            .map_err(|err| format!("failed to serialize keybinding: {err}"))?,
+    );
+    if next_values.len() > MAX_KEYBINDINGS_COUNT {
+        let start = next_values.len() - MAX_KEYBINDINGS_COUNT;
+        next_values.drain(..start);
+    }
+    write_keybindings_entries_atomically(path, &next_values)?;
+    Ok(load_runtime_keybindings_file(path))
+}
+
+pub fn remove_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+) -> Result<KeybindingsFileState, String> {
+    let target = KeybindingRule {
+        key: key.trim().to_owned(),
+        command: command.to_owned(),
+        when: when
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned),
+    };
+    let existing = load_writable_keybindings_entries(path)?;
+    let next_values: Vec<serde_json::Value> = existing
+        .into_iter()
+        .filter_map(|(value, decoded)| match decoded {
+            None => Some(value),
+            Some(entry) if is_same_keybinding_rule(&entry, &target) => None,
+            Some(_) => Some(value),
+        })
+        .collect();
+    write_keybindings_entries_atomically(path, &next_values)?;
+    Ok(load_runtime_keybindings_file(path))
+}
+
+pub fn reset_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+    default_key: Option<&str>,
+    default_when: &str,
+) -> Result<KeybindingsFileState, String> {
+    if let Some(default_key) = default_key {
+        let default_when_opt = (!default_when.trim().is_empty()).then_some(default_when);
+        upsert_keybinding_in_file(
+            path,
+            command,
+            default_key,
+            default_when_opt,
+            Some((command, key, when)),
+        )
+    } else {
+        remove_keybinding_in_file(path, command, key, when)
+    }
+}
+
+pub type FileStamp = (Option<SystemTime>, u64);
+
+pub fn read_file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+#[derive(Default)]
+pub struct KeybindingsWatcher {
+    stamp: Option<FileStamp>,
+    dirty: Arc<AtomicBool>,
+    stop: Option<Arc<AtomicBool>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeybindingsWatcher {
+    pub fn record_stamp(&mut self, path: &Path) {
+        self.stamp = read_file_stamp(path);
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    pub fn start(&mut self, path: std::path::PathBuf, wake: rune::Waker) {
+        self.stop_worker();
+        let initial = read_file_stamp(&path);
+        self.stamp = initial;
+        let dirty = self.dirty.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        self.stop = Some(stop);
+        self.worker = Some(std::thread::spawn(move || {
+            let mut seen = initial;
+            let mut pending_since: Option<std::time::Instant> = None;
+            while !stop_flag.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(200));
+                if stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                let current = read_file_stamp(&path);
+                if current != seen {
+                    seen = current;
+                    pending_since = Some(std::time::Instant::now());
+                } else if let Some(since) = pending_since
+                    && since.elapsed() >= Duration::from_millis(100)
+                {
+                    pending_since = None;
+                    dirty.store(true, Ordering::Release);
+                    wake();
+                }
+            }
+        }));
+    }
+
+    pub fn poll(&mut self, path: &Path) -> Option<KeybindingsFileState> {
+        let signaled = self.dirty.swap(false, Ordering::AcqRel);
+        let current = read_file_stamp(path);
+        if !signaled && current == self.stamp {
+            return None;
+        }
+        self.stamp = current;
+        Some(load_runtime_keybindings_file(path))
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for KeybindingsWatcher {
+    fn drop(&mut self) {
+        self.stop_worker();
+    }
 }
 
 #[cfg(test)]

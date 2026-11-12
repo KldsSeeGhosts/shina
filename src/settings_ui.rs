@@ -266,6 +266,7 @@ pub struct Dialog {
     pub shortcut_notice: Option<String>,
     pub new_keybinding: Option<NewKeybindingDraft>,
     pub when_editor: Option<WhenEditorState>,
+    pub keybindings_issues: Vec<crate::keybindings::KeybindingsIssue>,
     pub machine: String,
     pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
@@ -291,6 +292,7 @@ impl Default for Dialog {
             shortcut_notice: None,
             new_keybinding: None,
             when_editor: None,
+            keybindings_issues: Vec::new(),
             machine: "local".into(),
             profile_target: None,
             snooze: Default::default(),
@@ -347,8 +349,7 @@ pub(crate) fn handle_shortcut_capture(
         return true;
     };
     let when_opt = (!row.when.is_empty()).then_some(row.when.as_str());
-    match crate::keybindings::upsert_custom_rule(
-        &mut s.preferences.keybindings,
+    match s.save_keybinding_override(
         &row.command,
         &next_key,
         when_opt,
@@ -657,6 +658,28 @@ impl State {
             if let Err(e) = command.spawn() {
                 self.settings.notice = Some(e.to_string());
             }
+        }
+    }
+    pub(crate) fn open_settings_file(&mut self, name: &str) {
+        let path = self.data_dir.join(name);
+        if self.demo || cfg!(test) {
+            return;
+        }
+        let mut command = if cfg!(target_os = "macos") {
+            let mut cmd = std::process::Command::new("open");
+            cmd.arg(&path);
+            cmd
+        } else if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "start", ""]).arg(&path);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("xdg-open");
+            cmd.arg(&path);
+            cmd
+        };
+        if let Err(e) = command.spawn() {
+            self.settings.shortcut_notice = Some(format!("Unable to open {name}: {e}"));
         }
     }
 }
@@ -1667,8 +1690,7 @@ fn when_editor_popover(s: &State, p: Palette) -> El {
                         let next_when = (!next_expr.is_empty()).then_some(next_expr.as_str());
                         let orig_when =
                             (!original_when.is_empty()).then_some(original_when.as_str());
-                        if let Err(err) = crate::keybindings::upsert_custom_rule(
-                            &mut s.preferences.keybindings,
+                        if let Err(err) = s.save_keybinding_override(
                             &command,
                             &key,
                             next_when,
@@ -2374,7 +2396,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
         KeybindingSource, Platform, build_keybinding_rows, command_label,
         conflict_warning_description, filter_keybinding_rows, format_shortcut_label,
         group_keybinding_rows, keybinding_conflict_labels, keycap_parts, parse_keybinding_shortcut,
-        reset_custom_rule, upsert_custom_rule, validate_keybinding_draft,
+        validate_keybinding_draft,
     };
 
     let platform = Platform::current();
@@ -2419,6 +2441,13 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
             s.settings.new_keybinding = Some(NewKeybindingDraft::default());
         })
         .disabled(s.settings.new_keybinding.is_some());
+        let open_file_button =
+            settings_button("keybindings-open-file", "Open keybindings.json", p, |s| {
+                if !s.demo {
+                    s.ensure_keybindings_file();
+                    s.open_settings_file("keybindings.json");
+                }
+            });
         pane = pane.child(
             row()
                 .key("keybindings-toolbar")
@@ -2427,8 +2456,28 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 .flex_wrap()
                 .center_y()
                 .child(search_field)
-                .child(add_button),
+                .child(add_button)
+                .child(open_file_button),
         );
+    }
+
+    if !s.settings.keybindings_issues.is_empty() {
+        let mut issues_col = col()
+            .key("keybindings-file-issues")
+            .w_full()
+            .padding(8.0)
+            .gap(4.0)
+            .radius(4.0)
+            .fill(p.panel)
+            .border(1.0, p.danger);
+        for (idx, issue) in s.settings.keybindings_issues.iter().enumerate() {
+            issues_col = issues_col.child(
+                label(issue.display_message(), SMALL, p.danger)
+                    .key(format!("keybinding-file-issue-{idx}"))
+                    .wrap(),
+            );
+        }
+        pane = pane.child(issues_col);
     }
 
     if let Some(notice) = &s.settings.shortcut_notice {
@@ -2536,13 +2585,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
         let save_when = draft.when_draft.clone();
         let save_button = primary_button("new-keybinding-save", "Save", p, move |s| {
             let when_opt = (!save_when.trim().is_empty()).then_some(save_when.as_str());
-            match upsert_custom_rule(
-                &mut s.preferences.keybindings,
-                &save_cmd,
-                &save_key,
-                when_opt,
-                None,
-            ) {
+            match s.save_keybinding_override(&save_cmd, &save_key, when_opt, None) {
                 Ok(()) => {
                     s.settings.new_keybinding = None;
                     s.settings.shortcut_notice = None;
@@ -2734,8 +2777,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                         p,
                         move |s| {
                             let when_opt = (!reset_when.is_empty()).then_some(reset_when.as_str());
-                            if let Err(error) = reset_custom_rule(
-                                &mut s.preferences.keybindings,
+                            if let Err(error) = s.reset_keybinding_override(
                                 &reset_cmd,
                                 &reset_key,
                                 when_opt,
@@ -3196,6 +3238,7 @@ mod tests {
     fn keybindings_section_groups_rebinds_resets_and_reports_conflicts_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
             rt.on_key = Some(crate::key);
             rt.state.open_settings();
             rt.frame(0.0);
@@ -3312,14 +3355,22 @@ mod tests {
                 )
             );
 
-            // Reset to default removes the override and clears the conflict.
+            // Reset to default restores the default chord and clears the conflict.
             crate::ui::tests::press(&mut rt, "keybinding-reset-commandPalette.toggle");
-            assert!(rt.state.preferences.keybindings.is_empty());
+            assert_eq!(
+                rt.state.preferences.keybindings,
+                vec![crate::keybindings::KeybindingRule {
+                    key: "mod+k".into(),
+                    command: "commandPalette.toggle".into(),
+                    when: Some("!terminalFocus".into()),
+                }]
+            );
             assert!(
                 rt.find("keybinding-conflict-commandPalette.toggle")
                     .is_none()
             );
             assert!(rt.find("keybinding-reset-commandPalette.toggle").is_none());
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
 
             // Search filters the list and shows KSG's empty message on no match.
             rt.state
@@ -3345,15 +3396,19 @@ mod tests {
     fn add_keybinding_flow_validates_captures_and_fits_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
             rt.on_key = Some(crate::key);
             rt.state.open_settings();
             rt.frame(0.0);
             crate::ui::tests::press(&mut rt, "settings-section-7");
 
-            let (add_rect, _) = rt
-                .presented("keybindings-add")
-                .unwrap_or_else(|| panic!("{width}: keybindings-add"));
-            assert!(add_rect[0] >= 0.0 && add_rect[0] + add_rect[2] <= width + 0.5);
+            for key in ["keybindings-add", "keybindings-open-file"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5);
+                assert!(rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5);
+            }
 
             // Open "Add keybinding" row.
             crate::ui::tests::press(&mut rt, "keybindings-add");
@@ -3480,6 +3535,7 @@ mod tests {
                     .iter()
                     .any(|r| r.command == chosen_cmd && r.key == "mod+k")
             );
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
         }
 
         // Enforces MAX_KEYBINDINGS_COUNT (256) limit when adding rules.
@@ -3501,6 +3557,7 @@ mod tests {
     fn when_editor_validates_updates_visually_and_fits_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
             rt.on_key = Some(crate::key);
             rt.state.open_settings();
             rt.frame(0.0);
@@ -3600,6 +3657,174 @@ mod tests {
                     when: Some("customFlag && terminalFocus".into()),
                 }]
             );
+            let _ = std::fs::remove_file(rt.state.keybindings_path());
         }
+    }
+
+    #[test]
+    fn keybindings_json_file_syncs_reloads_handles_malformed_and_fits_open_button() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "shina-kb-file-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        crate::store::with_directory(temp_dir.clone(), || {
+            for width in [620.0, 960.0, 1280.0, 1920.0] {
+                let mut rt = runtime(width);
+                let _ = std::fs::remove_file(rt.state.keybindings_path());
+                rt.state.open_settings();
+                rt.frame(0.0);
+                crate::ui::tests::press(&mut rt, "settings-section-7");
+
+                let (btn, _) = rt
+                    .presented("keybindings-open-file")
+                    .unwrap_or_else(|| panic!("{width}: keybindings-open-file"));
+                assert!(btn[0] >= 0.0 && btn[0] + btn[2] <= width + 0.5);
+                assert!(btn[1] >= 0.0 && btn[1] + btn[3] <= 720.5);
+
+                // Clicking "Open keybindings.json" bootstraps keybindings.json if missing.
+                crate::ui::tests::press(&mut rt, "keybindings-open-file");
+                assert!(rt.state.keybindings_path().exists());
+            }
+
+            // 1. Startup initializes keybindings.json and ui_snapshot omits keybindings copy.
+            let mut state = State::new(std::path::PathBuf::new(), false);
+            let _ = std::fs::remove_file(state.keybindings_path());
+            state.ensure_keybindings_file();
+            let raw = std::fs::read_to_string(state.keybindings_path()).unwrap();
+            assert!(raw.contains("sidebar.toggle"));
+            assert!(state.settings.keybindings_issues.is_empty());
+
+            // 2. UI override writes to keybindings.json (single source of truth).
+            state
+                .save_keybinding_override("sidebar.toggle", "mod+alt+k", None, None)
+                .unwrap();
+            let on_disk =
+                crate::keybindings::load_runtime_keybindings_file(&state.keybindings_path());
+            assert!(
+                on_disk
+                    .rules
+                    .iter()
+                    .any(|r| r.command == "sidebar.toggle" && r.key == "mod+alt+k")
+            );
+
+            // 3. External edit with lenient JSON (comments + trailing comma) reloads via poll_keybindings.
+            std::fs::write(
+                state.keybindings_path(),
+                r#"[
+  // User comment
+  { "key": "mod+shift+y", "command": "sidebar.toggle", },
+]"#,
+            )
+            .unwrap();
+            assert!(state.poll_keybindings());
+            assert!(state.settings.keybindings_issues.is_empty());
+            let resolved = state.resolved_keybindings();
+            let ctx = crate::keybindings::ShortcutContext::desktop();
+            let ev_y = rune::KeyEvent {
+                key: rune::Key::Command('y'),
+                mods: rune::Mods {
+                    cmd: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                crate::keybindings::resolve_shortcut_command(
+                    &ev_y,
+                    &resolved,
+                    &ctx,
+                    crate::keybindings::Platform::current(),
+                    None,
+                    None
+                ),
+                Some("sidebar.toggle")
+            );
+
+            // 4. Malformed JSON leaves file untouched on disk, falls back to defaults, and surfaces issue in UI.
+            std::fs::write(state.keybindings_path(), "{ not-json").unwrap();
+            assert!(state.poll_keybindings());
+            assert_eq!(
+                std::fs::read_to_string(state.keybindings_path()).unwrap(),
+                "{ not-json"
+            );
+            assert!(matches!(
+                state.settings.keybindings_issues.as_slice(),
+                [crate::keybindings::KeybindingsIssue::MalformedConfig { .. }]
+            ));
+            let resolved_default = state.resolved_keybindings();
+            let ev_b = rune::KeyEvent {
+                key: rune::Key::Command('b'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                crate::keybindings::resolve_shortcut_command(
+                    &ev_b,
+                    &resolved_default,
+                    &ctx,
+                    crate::keybindings::Platform::current(),
+                    None,
+                    None
+                ),
+                Some("sidebar.toggle")
+            );
+            // Saving while completely malformed refuses to clobber the user's file.
+            assert!(
+                state
+                    .save_keybinding_override("sidebar.toggle", "mod+j", None, None)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(state.keybindings_path()).unwrap(),
+                "{ not-json"
+            );
+
+            // 5. Invalid entries in an array are ignored, valid entries stay active, and
+            // undecodable entries are preserved when another rule is saved via UI.
+            std::fs::write(
+                state.keybindings_path(),
+                serde_json::json!([
+                    { "key": "mod+alt+m", "command": "sidebar.toggle" },
+                    { "key": "mod+shift+d+o", "command": "chat.new" },
+                    { "key": "mod+x", "command": "future.command" }
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            assert!(state.poll_keybindings());
+            assert_eq!(state.settings.keybindings_issues.len(), 2);
+            assert_eq!(state.preferences.keybindings.len(), 1);
+            assert_eq!(state.preferences.keybindings[0].key, "mod+alt+m");
+
+            state
+                .save_keybinding_override("chat.new", "mod+alt+n", None, None)
+                .unwrap();
+            let raw_after = std::fs::read_to_string(state.keybindings_path()).unwrap();
+            assert!(
+                raw_after.contains("future.command"),
+                "undecodable entry preserved: {raw_after}"
+            );
+            assert!(raw_after.contains("mod+alt+n"));
+
+            // Issue banner renders cleanly in the Settings UI.
+            let mut rt = runtime(960.0);
+            rt.state.open_settings();
+            rt.state.settings.section = 7;
+            assert!(rt.state.poll_keybindings());
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("keybindings-file-issues").is_some());
+            assert!(rt.presented("keybinding-file-issue-0").is_some());
+        });
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
