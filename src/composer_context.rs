@@ -1579,12 +1579,28 @@ pub fn build_message_context(
 ) -> Option<MessageContext> {
     let mut records = Vec::new();
     let mut seen = HashSet::new();
+    let mut bound_attachment_ids = HashSet::new();
     for record in draft_context {
         if referenced_ids.contains(&record.context_id) && seen.insert(record.context_id.clone()) {
+            match &record.data {
+                ComposerContextData::Image { attachment_id, .. }
+                | ComposerContextData::File { attachment_id, .. } => {
+                    bound_attachment_ids.insert((record.kind().to_owned(), attachment_id.clone()));
+                }
+                _ => {}
+            }
             records.push(record.clone());
         }
     }
     for attachment in attachments {
+        let kind = if attachment.is_image() {
+            "image"
+        } else {
+            "file"
+        };
+        if bound_attachment_ids.contains(&(kind.to_owned(), attachment.id.clone())) {
+            continue;
+        }
         let rec = attachment_context_record(attachment);
         if seen.insert(rec.context_id.clone()) {
             records.push(rec);
@@ -1609,19 +1625,31 @@ pub fn reconcile_context_references(
     retained: &mut RetainedContextPayloads,
 ) {
     let mut retained_records = Vec::new();
+    let mut removed_file_bindings: Vec<(String, String)> = Vec::new();
     for record in std::mem::take(draft_context) {
         if referenced_ids.contains(&record.context_id) {
             retained_records.push(record);
         } else {
-            if let ComposerContextData::File { attachment_id, .. } = &record.data
-                && let Some(pos) = draft_images
-                    .iter()
-                    .position(|a| !a.is_image() && a.id == *attachment_id)
-            {
-                let file = draft_images.remove(pos);
-                retained.files.insert(record.context_id.clone(), file);
+            if let ComposerContextData::File { attachment_id, .. } = &record.data {
+                removed_file_bindings.push((record.context_id.clone(), attachment_id.clone()));
             }
             retained.records.insert(record.context_id.clone(), record);
+        }
+    }
+    for (context_id, attachment_id) in removed_file_bindings {
+        let still_referenced = retained_records.iter().any(|r| {
+            matches!(
+                &r.data,
+                ComposerContextData::File { attachment_id: id, .. } if *id == attachment_id
+            )
+        });
+        if !still_referenced
+            && let Some(pos) = draft_images
+                .iter()
+                .position(|a| !a.is_image() && a.id == attachment_id)
+        {
+            let file = draft_images.remove(pos);
+            retained.files.insert(context_id, file);
         }
     }
     let live_ids: HashSet<String> = retained_records
@@ -1767,6 +1795,483 @@ fn parse_legacy_terminal_block(
         });
     }
     Some(out)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardSource {
+    pub environment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerContextClipboardFragment {
+    pub version: u8,
+    pub source: ClipboardSource,
+    pub records: Vec<ComposerContextRecord>,
+}
+
+impl<'de> Deserialize<'de> for ComposerContextClipboardFragment {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        decode_clipboard_fragment_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_clipboard_fragment_value(
+    value: &Value,
+) -> Result<ComposerContextClipboardFragment, String> {
+    let obj = value.as_object().ok_or("Fragment must be an object.")?;
+    if obj.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("Unsupported fragment version.".into());
+    }
+    let source: ClipboardSource = serde_json::from_value(
+        obj.get("source")
+            .cloned()
+            .ok_or("Missing fragment source.")?,
+    )
+    .map_err(|_| "Invalid fragment source.")?;
+    if source.environment_id.trim().is_empty() {
+        return Err("Fragment source.environmentId must be nonempty.".into());
+    }
+    let raw_records = obj
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or("Fragment records must be an array.")?;
+    if raw_records.len() > COMPOSER_CONTEXT_MAX_RECORDS {
+        return Err("Fragment exceeds max records.".into());
+    }
+    let records = raw_records
+        .iter()
+        .filter_map(|raw| decode_record(raw).ok())
+        .collect();
+    Ok(ComposerContextClipboardFragment {
+        version: 1,
+        source,
+        records,
+    })
+}
+
+pub fn encode_composer_context_fragment(
+    fragment: &ComposerContextClipboardFragment,
+) -> Option<String> {
+    let encoded = serde_json::to_string(fragment).ok()?;
+    (encoded.encode_utf16().count() <= COMPOSER_CONTEXT_MAX_SERIALIZED_CHARS).then_some(encoded)
+}
+
+pub fn decode_composer_context_fragment(
+    raw: Option<&str>,
+) -> Option<ComposerContextClipboardFragment> {
+    let raw = raw?;
+    if raw.is_empty() || raw.encode_utf16().count() > COMPOSER_CONTEXT_MAX_SERIALIZED_CHARS {
+        return None;
+    }
+    let value: Value = serde_json::from_str(raw).ok()?;
+    decode_clipboard_fragment_value(&value).ok()
+}
+
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_uri_component(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = input.get(i + 1..i + 3)?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+const HTML_WRAPPER_SLACK_CHARS: usize = 4096;
+
+pub fn encode_composer_context_clipboard_html(
+    text: &str,
+    fragment: &str,
+    html: Option<&str>,
+) -> String {
+    let encoded = encode_uri_component(fragment);
+    if let Some(html) = html {
+        format!("<div data-t3-context-fragment=\"{encoded}\">{html}</div>")
+    } else {
+        let escaped = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        format!("<pre data-t3-context-fragment=\"{encoded}\">{escaped}</pre>")
+    }
+}
+
+pub fn decode_composer_context_clipboard_html(
+    html: Option<&str>,
+) -> Option<ComposerContextClipboardFragment> {
+    let html = html?;
+    if html.is_empty()
+        || html.len() > COMPOSER_CONTEXT_MAX_SERIALIZED_CHARS * 9 + HTML_WRAPPER_SLACK_CHARS
+    {
+        return None;
+    }
+    static ATTR_DOUBLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"data-t3-context-fragment="([^"]+)""#).unwrap());
+    static ATTR_SINGLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"data-t3-context-fragment='([^']+)'"#).unwrap());
+    let raw = ATTR_DOUBLE
+        .captures(html)
+        .or_else(|| ATTR_SINGLE.captures(html))?
+        .get(1)?
+        .as_str();
+    let decoded = decode_uri_component(raw)?;
+    decode_composer_context_fragment(Some(&decoded))
+}
+
+static COPIED_ATTACHMENTS: LazyLock<
+    std::sync::Mutex<Option<(String, HashMap<String, Attachment>)>>,
+> = LazyLock::new(Default::default);
+
+pub fn remember_copied_composer_attachments(
+    environment_id: &str,
+    files: HashMap<String, Attachment>,
+) {
+    let mut guard = COPIED_ATTACHMENTS.lock().expect("copied attachments");
+    *guard = if files.is_empty() {
+        None
+    } else {
+        Some((environment_id.to_owned(), files))
+    };
+}
+
+pub fn copied_composer_attachment(environment_id: &str, attachment_id: &str) -> Option<Attachment> {
+    let guard = COPIED_ATTACHMENTS.lock().expect("copied attachments");
+    let (env, map) = guard.as_ref()?;
+    (env == environment_id)
+        .then(|| map.get(attachment_id).cloned())
+        .flatten()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAttachmentImport {
+    pub record: ComposerContextRecord,
+    pub local_id: String,
+    pub new_context_id: String,
+    pub source_environment_id: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ContextImportOutcome {
+    pub rewritten_ids: HashMap<String, String>,
+    pub imported_records: Vec<ComposerContextRecord>,
+    pub pending_attachments: Vec<PendingAttachmentImport>,
+}
+
+pub fn composer_context_import_lookup_ids(record: &ComposerContextRecord) -> Vec<String> {
+    let kind = record.kind();
+    let destination_id = to_kind_scoped_composer_context_id(
+        kind,
+        &producer_id_from_composer_context_id(kind, &record.context_id),
+    );
+    if destination_id == record.context_id {
+        vec![record.context_id.clone()]
+    } else {
+        vec![destination_id, record.context_id.clone()]
+    }
+}
+
+fn find_existing_record<'a>(
+    record: &ComposerContextRecord,
+    existing_records: &'a [ComposerContextRecord],
+    existing_attachments: &'a [Attachment],
+) -> Option<(
+    String,
+    Option<ComposerContextRecord>,
+    Option<&'a Attachment>,
+)> {
+    let lookup_ids = composer_context_import_lookup_ids(record);
+    for id in &lookup_ids {
+        if let Some(found) = existing_records.iter().find(|r| r.context_id == *id) {
+            let att = match &found.data {
+                ComposerContextData::Image { attachment_id, .. }
+                | ComposerContextData::File { attachment_id, .. } => {
+                    existing_attachments.iter().find(|a| a.id == *attachment_id)
+                }
+                _ => None,
+            };
+            return Some((id.clone(), Some(found.clone()), att));
+        }
+        if matches!(
+            record.data,
+            ComposerContextData::Image { .. } | ComposerContextData::File { .. }
+        ) {
+            let kind = record.kind();
+            if let Some(att) = existing_attachments
+                .iter()
+                .find(|a| to_kind_scoped_composer_context_id(kind, &a.id) == *id)
+            {
+                return Some((id.clone(), Some(attachment_context_record(att)), Some(att)));
+            }
+        }
+    }
+    None
+}
+
+pub fn import_context_records(
+    records: &[ComposerContextRecord],
+    source_environment_id: Option<&str>,
+    target_environment_id: &str,
+    linked_environments: &HashSet<String>,
+    existing_records: &[ComposerContextRecord],
+    existing_attachments: &[Attachment],
+) -> ContextImportOutcome {
+    let mut outcome = ContextImportOutcome::default();
+    let mut dependent_attachment_local_ids: HashMap<String, String> = HashMap::new();
+    let mut skipped_dependent_attachment_ids: HashSet<String> = HashSet::new();
+
+    // Resolve preview-annotation before its dependent screenshot record regardless of order.
+    let mut ordered: Vec<&ComposerContextRecord> = records.iter().collect();
+    ordered.sort_by_key(|r| {
+        if r.kind() == "preview-annotation" {
+            0u8
+        } else {
+            1u8
+        }
+    });
+
+    let mut working_records = existing_records.to_vec();
+
+    for record in ordered {
+        if !record.is_known() {
+            continue;
+        }
+        let existing = if dependent_attachment_local_ids.contains_key(&record.context_id) {
+            None
+        } else {
+            find_existing_record(record, &working_records, existing_attachments)
+        };
+
+        if let Some(source_env) = source_environment_id
+            && let ComposerContextData::Image { attachment_id, .. }
+            | ComposerContextData::File { attachment_id, .. } = &record.data
+            && let Some((existing_id, _, Some(existing_att))) = &existing
+            && let Some(copied_att) = copied_composer_attachment(source_env, attachment_id)
+            && copied_att.id == existing_att.id
+        {
+            if existing_id != &record.context_id {
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), existing_id.clone());
+            }
+            continue;
+        }
+
+        if let Some((existing_id, Some(existing_rec), _)) = &existing
+            && is_same_composer_context_payload(existing_rec, record)
+        {
+            if let ComposerContextData::PreviewAnnotation {
+                screenshot_context_id: Some(shot_id),
+                ..
+            } = &record.data
+            {
+                skipped_dependent_attachment_ids.insert(shot_id.clone());
+            }
+            if existing_id != &record.context_id {
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), existing_id.clone());
+            }
+            continue;
+        }
+
+        let conflicts = existing.is_some();
+        match &record.data {
+            ComposerContextData::Thread { environment_id, .. } => {
+                if environment_id != target_environment_id
+                    && !linked_environments.contains(environment_id)
+                {
+                    continue;
+                }
+                let mut imported = record.clone();
+                if conflicts {
+                    let new_id = to_kind_scoped_composer_context_id(
+                        "thread",
+                        &uuid::Uuid::new_v4().to_string(),
+                    );
+                    imported.context_id = new_id.clone();
+                }
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), imported.context_id.clone());
+                working_records.push(imported.clone());
+                outcome.imported_records.push(imported);
+            }
+            ComposerContextData::Image { .. } | ComposerContextData::File { .. } => {
+                if skipped_dependent_attachment_ids.contains(&record.context_id) {
+                    continue;
+                }
+                let Some(source_env) = source_environment_id else {
+                    if !conflicts {
+                        outcome
+                            .rewritten_ids
+                            .insert(record.context_id.clone(), record.context_id.clone());
+                    }
+                    continue;
+                };
+                let local_id = dependent_attachment_local_ids
+                    .get(&record.context_id)
+                    .cloned()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let new_context_id = to_kind_scoped_composer_context_id(record.kind(), &local_id);
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), new_context_id.clone());
+                outcome.pending_attachments.push(PendingAttachmentImport {
+                    record: record.clone(),
+                    local_id,
+                    new_context_id,
+                    source_environment_id: source_env.to_owned(),
+                });
+            }
+            ComposerContextData::PreviewAnnotation {
+                screenshot_context_id,
+                ..
+            } => {
+                let mut imported = record.clone();
+                if conflicts {
+                    let new_raw = uuid::Uuid::new_v4().to_string();
+                    imported.context_id =
+                        to_kind_scoped_composer_context_id("preview-annotation", &new_raw);
+                    if let Some(shot_id) = screenshot_context_id {
+                        dependent_attachment_local_ids.insert(shot_id.clone(), new_raw);
+                        if let ComposerContextData::PreviewAnnotation {
+                            screenshot_context_id: shot_field,
+                            ..
+                        } = &mut imported.data
+                        {
+                            *shot_field = Some(to_kind_scoped_composer_context_id(
+                                "image",
+                                dependent_attachment_local_ids.get(shot_id).unwrap(),
+                            ));
+                        }
+                    }
+                } else if let Some(shot_id) = screenshot_context_id {
+                    dependent_attachment_local_ids.insert(
+                        shot_id.clone(),
+                        producer_id_from_composer_context_id(
+                            "preview-annotation",
+                            &imported.context_id,
+                        ),
+                    );
+                }
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), imported.context_id.clone());
+                working_records.push(imported.clone());
+                outcome.imported_records.push(imported);
+            }
+            _ => {
+                let mut imported = record.clone();
+                if conflicts {
+                    let new_raw = uuid::Uuid::new_v4().to_string();
+                    imported.context_id =
+                        to_kind_scoped_composer_context_id(record.kind(), &new_raw);
+                }
+                outcome
+                    .rewritten_ids
+                    .insert(record.context_id.clone(), imported.context_id.clone());
+                working_records.push(imported.clone());
+                outcome.imported_records.push(imported);
+            }
+        }
+    }
+    outcome
+}
+
+pub fn import_pasted_composer_text(
+    plain_text: &str,
+    html: Option<&str>,
+    target_environment_id: &str,
+    linked_environments: &HashSet<String>,
+    existing_records: &[ComposerContextRecord],
+    existing_attachments: &[Attachment],
+) -> (String, ContextImportOutcome) {
+    let normalized = plain_text.replace("\r\n", "\n").replace('\r', "\n");
+    let fragment = decode_composer_context_clipboard_html(html)
+        .or_else(|| decode_composer_context_fragment(html));
+    let Some(fragment) = fragment else {
+        return (normalized, ContextImportOutcome::default());
+    };
+    let pasted_ids: HashSet<String> = collect_composer_context_references(&normalized)
+        .into_iter()
+        .map(|o| o.context_id)
+        .collect();
+    let mut wanted_ids = pasted_ids;
+    for rec in &fragment.records {
+        if let ComposerContextData::PreviewAnnotation {
+            screenshot_context_id: Some(shot_id),
+            ..
+        } = &rec.data
+            && wanted_ids.contains(&rec.context_id)
+        {
+            wanted_ids.insert(shot_id.clone());
+        }
+    }
+    let filtered: Vec<ComposerContextRecord> = fragment
+        .records
+        .iter()
+        .filter(|r| wanted_ids.contains(&r.context_id))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        return (normalized, ContextImportOutcome::default());
+    }
+    let outcome = import_context_records(
+        &filtered,
+        Some(&fragment.source.environment_id),
+        target_environment_id,
+        linked_environments,
+        existing_records,
+        existing_attachments,
+    );
+    if outcome.rewritten_ids.is_empty() {
+        return (normalized, outcome);
+    }
+    let rewritten = replace_composer_context_references(&normalized, |occ| {
+        if let Some(next_id) = outcome.rewritten_ids.get(&occ.context_id) {
+            let next_kind = if occ.kind == "element" {
+                "preview-annotation"
+            } else {
+                occ.kind.as_str()
+            };
+            format_composer_context_reference(next_kind, next_id, &occ.label)
+        } else {
+            occ.source.clone()
+        }
+    });
+    (rewritten, outcome)
 }
 
 #[cfg(test)]
@@ -2266,6 +2771,231 @@ mod tests {
         assert_eq!(
             restore_attachment_only_bootstrap_prompt("ultrathink:\n", true),
             format!("Ultrathink:\n{ATTACHMENT_ONLY_BOOTSTRAP_PROMPT}")
+        );
+    }
+
+    #[test]
+    fn clipboard_fragment_html_round_trips_and_handles_quotes_and_bad_records() {
+        let rec = thread_context_record("env-1", 42, "Copied thread");
+        let fragment = ComposerContextClipboardFragment {
+            version: 1,
+            source: ClipboardSource {
+                environment_id: "env-1".into(),
+                thread_id: Some("1".into()),
+                message_id: None,
+            },
+            records: vec![rec.clone()],
+        };
+        let encoded = encode_composer_context_fragment(&fragment).unwrap();
+        assert_eq!(
+            decode_composer_context_fragment(Some(&encoded)),
+            Some(fragment.clone())
+        );
+
+        let html = encode_composer_context_clipboard_html(
+            "See [Copied thread](t3-context://v1/thread/thread_42)",
+            &encoded,
+            Some(
+                "<p>See <span data-pill=\"t3-context://v1/thread/thread_42\">Copied thread</span></p>",
+            ),
+        );
+        assert!(html.contains("data-t3-context-fragment="));
+        assert_eq!(
+            decode_composer_context_clipboard_html(Some(&html)),
+            Some(fragment.clone())
+        );
+
+        // Single-quoted attribute with escaped single quote inside URL encoding works too.
+        let single_quoted = html
+            .replace("data-t3-context-fragment=\"", "data-t3-context-fragment='")
+            .replace("\"><p>", "'><p>");
+        assert_eq!(
+            decode_composer_context_clipboard_html(Some(&single_quoted)),
+            Some(fragment)
+        );
+    }
+
+    #[test]
+    fn context_import_deduplicates_rewrites_collisions_and_filters_unlinked_threads() {
+        let term_a = ComposerContextRecord {
+            version: 1,
+            context_id: "terminal_t1".into(),
+            label: "T1".into(),
+            data: ComposerContextData::Terminal {
+                terminal_id: "default".into(),
+                terminal_label: "Terminal 1".into(),
+                line_start: 1,
+                line_end: 2,
+                text: "output A".into(),
+            },
+        };
+        let term_a_dup_legacy = ComposerContextRecord {
+            context_id: "legacy_terminal_1".into(),
+            label: "Old label".into(),
+            ..term_a.clone()
+        };
+        let term_b_colliding = ComposerContextRecord {
+            version: 1,
+            context_id: "terminal_t1".into(),
+            label: "T1 other".into(),
+            data: ComposerContextData::Terminal {
+                terminal_id: "default".into(),
+                terminal_label: "Terminal 1".into(),
+                line_start: 1,
+                line_end: 2,
+                text: "output B".into(),
+            },
+        };
+        let linked_thread = thread_context_record("env-linked", 10, "Linked");
+        let unlinked_thread = thread_context_record("env-unlinked", 11, "Unlinked");
+        let unknown = ComposerContextRecord {
+            version: 1,
+            context_id: "future_1".into(),
+            label: "Future".into(),
+            data: ComposerContextData::Unknown {
+                kind: "future".into(),
+                payload: json!({"x": 1}),
+            },
+        };
+
+        // 1. Identical payload under colliding/legacy id deduplicates without adding a second record.
+        let existing_legacy = ComposerContextRecord {
+            context_id: "terminal_legacy_terminal_1".into(),
+            ..term_a.clone()
+        };
+        let dup_outcome = import_context_records(
+            &[term_a_dup_legacy],
+            Some("env-a"),
+            "env-b",
+            &HashSet::new(),
+            &[existing_legacy],
+            &[],
+        );
+        assert!(dup_outcome.imported_records.is_empty());
+        assert_eq!(
+            dup_outcome
+                .rewritten_ids
+                .get("legacy_terminal_1")
+                .map(String::as_str),
+            Some("terminal_legacy_terminal_1")
+        );
+
+        // 2. Colliding id with DIFFERENT payload rewrites id so both survive.
+        let linked = HashSet::from(["env-linked".to_owned()]);
+        let outcome = import_context_records(
+            &[
+                term_b_colliding.clone(),
+                linked_thread.clone(),
+                unlinked_thread.clone(),
+                unknown,
+            ],
+            Some("env-linked"),
+            "env-local",
+            &linked,
+            &[term_a],
+            &[],
+        );
+        let rewritten_id = outcome.rewritten_ids.get("terminal_t1").unwrap();
+        assert_ne!(rewritten_id, "terminal_t1");
+        assert!(rewritten_id.starts_with("terminal_"));
+        assert!(
+            outcome
+                .imported_records
+                .iter()
+                .any(|r| r.context_id == *rewritten_id)
+        );
+        // Linked thread imported; unlinked thread and unknown record dropped.
+        assert!(
+            outcome
+                .imported_records
+                .iter()
+                .any(|r| r.context_id == linked_thread.context_id)
+        );
+        assert!(
+            !outcome
+                .imported_records
+                .iter()
+                .any(|r| r.context_id == unlinked_thread.context_id)
+        );
+        assert!(
+            !outcome
+                .imported_records
+                .iter()
+                .any(|r| r.context_id == "future_1")
+        );
+
+        // 3. Preview annotation collision rewrites both the annotation and its dependent screenshot.
+        let ann = ComposerContextRecord {
+            version: 1,
+            context_id: "preview-annotation_ann-1".into(),
+            label: "Checkout".into(),
+            data: ComposerContextData::PreviewAnnotation {
+                annotation_id: "ann-1".into(),
+                page_url: "http://localhost:3000".into(),
+                page_title: Some("Checkout".into()),
+                comment: "Fix button".into(),
+                target_summary: "1 element".into(),
+                style_changes: vec![],
+                elements: None,
+                element_ids: None,
+                region_count: None,
+                stroke_count: None,
+                style_change_details: None,
+                screenshot_context_id: Some("image_ann-1".into()),
+            },
+        };
+        let shot = ComposerContextRecord {
+            version: 1,
+            context_id: "image_ann-1".into(),
+            label: "shot.png".into(),
+            data: ComposerContextData::Image {
+                attachment_id: "att_shot".into(),
+                name: "shot.png".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 12,
+            },
+        };
+        let existing_ann = ComposerContextRecord {
+            data: ComposerContextData::PreviewAnnotation {
+                annotation_id: "ann-1".into(),
+                page_url: "http://localhost:3000".into(),
+                page_title: Some("Different".into()),
+                comment: "Other comment".into(),
+                target_summary: "".into(),
+                style_changes: vec![],
+                elements: None,
+                element_ids: None,
+                region_count: None,
+                stroke_count: None,
+                style_change_details: None,
+                screenshot_context_id: None,
+            },
+            ..ann.clone()
+        };
+        // Send screenshot before annotation to verify ordering rule.
+        let ann_outcome = import_context_records(
+            &[shot, ann],
+            Some("env-a"),
+            "env-b",
+            &HashSet::new(),
+            &[existing_ann],
+            &[],
+        );
+        let new_ann_id = ann_outcome
+            .rewritten_ids
+            .get("preview-annotation_ann-1")
+            .unwrap();
+        let new_shot_id = ann_outcome.rewritten_ids.get("image_ann-1").unwrap();
+        assert_ne!(new_ann_id, "preview-annotation_ann-1");
+        assert_ne!(new_shot_id, "image_ann-1");
+        assert_eq!(
+            producer_id_from_composer_context_id("preview-annotation", new_ann_id),
+            producer_id_from_composer_context_id("image", new_shot_id)
+        );
+        assert_eq!(ann_outcome.pending_attachments.len(), 1);
+        assert_eq!(
+            ann_outcome.pending_attachments[0].new_context_id,
+            *new_shot_id
         );
     }
 }

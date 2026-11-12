@@ -672,9 +672,7 @@ pub(super) fn changed(s: &mut State) {
 
 pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx) {
     if !redirect_allowed(s, tx.focused())
-        || content.text().is_empty()
-        || !content.files().is_empty()
-        || content.image().is_some()
+        || content.text().is_empty() && content.files().is_empty() && content.image().is_none()
     {
         return;
     }
@@ -687,10 +685,8 @@ pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx
         .paste_as_text_until
         .take()
         .is_some_and(|until| std::time::Instant::now() <= until);
-    if bypass || !s.fold_paste(content.text()) {
-        s.current_mut().draft.insert(content.text());
-        changed(s);
-    }
+    s.paste_composer_content(content, bypass);
+    changed(s);
     s.checkpoint();
 }
 

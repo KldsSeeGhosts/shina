@@ -7925,13 +7925,25 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
 
 pub(crate) fn tray_attachments(t: &Thread) -> Vec<&Attachment> {
     let inline_ids = crate::composer_tokens::collect_inline_context_ids_from_edit(&t.draft);
+    let inline_file_attachment_ids: std::collections::HashSet<&str> = t
+        .draft_context
+        .iter()
+        .filter(|r| inline_ids.contains(&r.context_id))
+        .filter_map(|r| match &r.data {
+            crate::composer_context::ComposerContextData::File { attachment_id, .. } => {
+                Some(attachment_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
     t.draft_images
         .iter()
         .filter(|a| {
             a.is_image()
-                || !inline_ids.contains(
-                    &crate::composer_context::to_kind_scoped_composer_context_id("file", &a.id),
-                )
+                || (!inline_file_attachment_ids.contains(a.id.as_str())
+                    && !inline_ids.contains(
+                        &crate::composer_context::to_kind_scoped_composer_context_id("file", &a.id),
+                    ))
         })
         .collect()
 }
@@ -8846,6 +8858,15 @@ fn composer(
             composer_menu::scroll_selected(s, tx);
             return true;
         }
+        if (event.is_command('c') || event.is_command('x'))
+            && !event.mods.shift
+            && !event.mods.alt
+            && s.current().draft.anchor != s.current().draft.focus
+            && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+        {
+            tx.copy_rich(content);
+            return true;
+        }
         if event.is_command('v') && event.mods.shift && !event.mods.alt {
             let id = s.current().id;
             let machine = s.machines.selected.clone();
@@ -8885,21 +8906,8 @@ fn composer(
         composer_ui::changed(s);
     })
     .on_input_paste(|s: &mut State, content, _| {
-        let has_image = content.image().is_some();
         let bypass = s.composer_ui.consume_paste_as_text();
-        if let Some(image) = content.image() {
-            s.attach_image_with_options("Pasted image.png", image.png(), bypass);
-        }
-        if !content.files().is_empty() {
-            s.attach_paths(content.files());
-        }
-        if !content.text().is_empty() && !has_image && content.files().is_empty() {
-            if bypass || !s.fold_paste(content.text()) {
-                crate::composer_paste::insert(s, content.text());
-            }
-            return true;
-        }
-        (has_image || !content.files().is_empty()) && content.text().is_empty()
+        s.paste_composer_content(content, bypass)
     })
     .on_submit(|s: &mut State, _| {
         if !s.demo && !s.current().archived() {
@@ -17756,6 +17764,150 @@ pub(crate) mod tests {
             assert!(rt.find("remove-attachment-dialog").is_none());
             assert_eq!(rt.state.current().draft_images.len(), 1);
             assert_eq!(rt.state.current().draft.pills().count(), 1);
+        }
+    }
+
+    #[test]
+    fn copy_and_paste_structured_context_across_threads_and_machines_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.poll = Some(|s, now, tx| composer_ui::tick(s, now, tx));
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            connected_machines(&mut rt);
+
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().draft.replace_text("See ");
+            rt.state.current_mut().draft.set_caret(4);
+            rt.state.attach_image("shot.png", &ui_png(20));
+            let rec = crate::composer_context::ComposerContextRecord {
+                version: 1,
+                context_id: "terminal_t1".into(),
+                label: "Terminal 1".into(),
+                data: crate::composer_context::ComposerContextData::Terminal {
+                    terminal_id: "term-1".into(),
+                    terminal_label: "Terminal 1".into(),
+                    line_start: 1,
+                    line_end: 2,
+                    text: "line 1\nline 2".into(),
+                },
+            };
+            rt.state.current_mut().draft_context.push(rec.clone());
+            let pos = rt.state.current().draft.text.len();
+            rt.state.current_mut().draft.set_caret(pos);
+            rt.state
+                .current_mut()
+                .draft
+                .insert_pill("t3-context://v1/terminal/terminal_t1", "Terminal 1");
+            rt.invalidate();
+            rt.frame(0.5);
+            rt.frame(1.0);
+
+            // Select all & copy.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('a'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('c'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            let clip_content = clipboard.content().unwrap();
+            assert!(clip_content.text().contains("t3-context://v1/image/"));
+            assert!(
+                clip_content
+                    .text()
+                    .contains("t3-context://v1/terminal/terminal_t1")
+            );
+            assert!(
+                clip_content
+                    .html()
+                    .unwrap()
+                    .contains("data-t3-context-fragment=")
+            );
+
+            // Switch to linked machine "studio" and paste.
+            rt.state.select_machine("studio");
+            rt.invalidate();
+            rt.frame(0.5);
+            press(&mut rt, "composer-input");
+            rt.paste_content(clip_content.clone());
+            rt.frame(0.5);
+            rt.frame(1.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 2);
+            assert_eq!(rt.state.current().draft_images.len(), 1);
+            assert!(
+                rt.state
+                    .current()
+                    .draft_context
+                    .iter()
+                    .any(|r| r.context_id == "terminal_t1")
+            );
+
+            // Pasting again deduplicates without adding a second terminal record.
+            let count_before = rt.state.current().draft_context.len();
+            rt.paste_content(clip_content);
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft_context.len(), count_before);
+
+            // Pasting a fragment from an unlinked/disconnected machine leaves an unresolved chip
+            // and reports KSG's error message while staying inside composer bounds.
+            let missing_fragment = crate::composer_context::ComposerContextClipboardFragment {
+                version: 1,
+                source: crate::composer_context::ClipboardSource {
+                    environment_id: "unlinked-machine".into(),
+                    thread_id: None,
+                    message_id: None,
+                },
+                records: vec![crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "image_gone".into(),
+                    label: "gone.png".into(),
+                    data: crate::composer_context::ComposerContextData::Image {
+                        attachment_id: "missing-blob.png".into(),
+                        name: "gone.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: 42,
+                    },
+                }],
+            };
+            let encoded =
+                crate::composer_context::encode_composer_context_fragment(&missing_fragment)
+                    .unwrap();
+            let gone_md = "![gone.png](t3-context://v1/image/image_gone)";
+            let gone_html = crate::composer_context::encode_composer_context_clipboard_html(
+                gone_md, &encoded, None,
+            );
+            rt.paste_content(rune::ClipboardContent::new(gone_md).with_html(gone_html));
+            rt.frame(0.5);
+            assert!(
+                rt.state
+                    .current()
+                    .attachment_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Couldn't bring gone.png into this message")
+            );
+            let (_, gone_pill_id) = rt.state.current().draft.pills().last().unwrap();
+            assert_eq!(
+                composer_menu::chip_status(&rt.state, gone_pill_id),
+                composer_menu::ChipStatus::Unresolved
+            );
+            let (composer_rect, _) = rt.presented("composer").unwrap();
+            let (input_rect, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input_rect[0] >= composer_rect[0] - 0.5
+                    && input_rect[0] + input_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5,
+                "{width}: {input_rect:?} in {composer_rect:?}"
+            );
         }
     }
 }

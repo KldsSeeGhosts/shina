@@ -449,9 +449,23 @@ pub(super) fn chip_status(s: &State, id: &str) -> ChipStatus {
     let t = s.current();
     if let Some((kind, context_id)) = crate::composer_context::parse_composer_context_href(id) {
         if kind == "image" || kind == "file" {
+            let bound_id = t
+                .draft_context
+                .iter()
+                .find(|r| r.context_id == context_id)
+                .and_then(|r| match &r.data {
+                    crate::composer_context::ComposerContextData::Image {
+                        attachment_id, ..
+                    }
+                    | crate::composer_context::ComposerContextData::File {
+                        attachment_id, ..
+                    } => Some(attachment_id.as_str()),
+                    _ => None,
+                });
             let attachment = t.draft_images.iter().find(|a| {
-                crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)
-                    == context_id
+                bound_id.is_some_and(|id| a.id == id)
+                    || crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)
+                        == context_id
             });
             let Some(attachment) = attachment else {
                 return ChipStatus::Unresolved;
@@ -523,12 +537,14 @@ pub(super) fn pill_appearance(
                 let directory = records
                     .iter()
                     .find(|r| r.context_id == context_id)
-                    .is_some_and(|r| {
-                        matches!(
-                            &r.data,
-                            crate::composer_context::ComposerContextData::Mention { path }
-                                if path.ends_with('/')
-                        )
+                    .is_some_and(|r| match &r.data {
+                        crate::composer_context::ComposerContextData::Mention { path } => {
+                            path.ends_with('/')
+                        }
+                        crate::composer_context::ComposerContextData::File {
+                            mime_type, ..
+                        } => mime_type == "inode/directory",
+                        _ => false,
                     })
                     || images.iter().any(|a| {
                         crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)

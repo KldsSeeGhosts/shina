@@ -1020,7 +1020,7 @@ impl State {
             .as_ref()
             .map(|client| client.snapshots())
             .unwrap_or_default();
-        let mut changed = changed || !projections.is_empty();
+        let mut changed = changed || !projections.is_empty() || self.poll_context_imports();
         for (server, projection) in projections {
             self.machines
                 .views
@@ -4859,5 +4859,136 @@ mod tests {
         let kept = crate::client::downgrade_composer_context_command(command, true);
         assert!(kept.params.get("context").is_some());
         assert!(kept.params.get("draft").is_some());
+    }
+
+    #[test]
+    fn clipboard_paste_fetches_image_asset_from_linked_server_and_shows_unresolved_when_missing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let mut png_cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(&mut png_cursor, image::ImageFormat::Png)
+        .unwrap();
+        let png_bytes = png_cursor.into_inner();
+        let ok_blob_id = "remote-shot.png";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served_bytes = png_bytes.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(4) {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains(&format!("/v1/blobs/{ok_blob_id}")) {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served_bytes.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&served_bytes);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        let mut state = State::new(PathBuf::new(), false);
+        let source_server_id = uuid::Uuid::new_v4().to_string();
+        let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (mut source_client, _rx2) =
+            crate::client::Client::test_connected(state.data_dir.clone());
+        source_client.remote = Some(crate::peer::Link {
+            server_id: source_server_id.clone(),
+            host: format!("127.0.0.1:{port}"),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+        });
+        client
+            .linked
+            .insert(source_server_id.clone(), source_client);
+        state.client = Some(client);
+
+        let fragment = crate::composer_context::ComposerContextClipboardFragment {
+            version: 1,
+            source: crate::composer_context::ClipboardSource {
+                environment_id: source_server_id,
+                thread_id: Some("1".into()),
+                message_id: None,
+            },
+            records: vec![
+                crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "image_ok".into(),
+                    label: "remote.png".into(),
+                    data: crate::composer_context::ComposerContextData::Image {
+                        attachment_id: ok_blob_id.into(),
+                        name: "remote.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: png_bytes.len() as u64,
+                    },
+                },
+                crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "image_missing".into(),
+                    label: "missing.png".into(),
+                    data: crate::composer_context::ComposerContextData::Image {
+                        attachment_id: "missing-blob.png".into(),
+                        name: "missing.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: 10,
+                    },
+                },
+            ],
+        };
+        let encoded = crate::composer_context::encode_composer_context_fragment(&fragment).unwrap();
+        let md = "![remote.png](t3-context://v1/image/image_ok) ![missing.png](t3-context://v1/image/image_missing)";
+        let html =
+            crate::composer_context::encode_composer_context_clipboard_html(md, &encoded, None);
+        assert!(
+            state.paste_composer_content(&rune::ClipboardContent::new(md).with_html(html), false)
+        );
+
+        // While downloads are pending, send is blocked cleanly.
+        assert!(state.has_pending_context_imports("local", state.current().id));
+        state.send();
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Still bringing attached context into this message")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.has_pending_context_imports("local", state.current().id) {
+            state.poll_context_imports();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Valid image resolved with rewritten contextId; missing image stays unresolved with error.
+        assert_eq!(state.current().draft_images.len(), 1);
+        assert_eq!(state.current().draft_images[0].name, "remote.png");
+        assert_eq!(state.current().draft.pills().count(), 2);
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Couldn't bring missing.png into this message")
+        );
+        assert_eq!(state.current().draft_context.len(), 1);
+        assert_ne!(state.current().draft_context[0].context_id, "image_ok");
     }
 }

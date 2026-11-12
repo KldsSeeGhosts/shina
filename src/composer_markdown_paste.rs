@@ -21,6 +21,9 @@ pub fn tokens(text: &str) -> Vec<Range<usize>> {
     static DECORATOR: LazyLock<regex::Regex> =
         LazyLock::new(|| regex(r"^[\p{XID_Start}_$][\p{XID_Continue}.$\u{200c}\u{200d}]*\("));
     let mut ranges = Vec::new();
+    for occ in crate::composer_context::collect_composer_context_references(text) {
+        ranges.push(occ.start..occ.end);
+    }
     static LINKS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex(r"(^|\s)(\[(?:\\.|[^\]\\]){0,512}\]\([^\s)]+\))"));
     for capture in LINKS.captures_iter(text) {
@@ -30,6 +33,9 @@ pub fn tokens(text: &str) -> Vec<Range<usize>> {
         let token = capture.get(2).unwrap();
         if text[token.end()..].chars().next().is_none_or(source::space)
             && mention_path(token.as_str()).is_some()
+            && !ranges
+                .iter()
+                .any(|r| r.start < token.end() && token.start() < r.end)
         {
             ranges.push(token.range());
         }
@@ -399,16 +405,18 @@ pub fn paste_with_path_query(
         return;
     }
     let found = tokens(&text);
-    if found
-        .last()
-        .is_some_and(|r| r.end == text.len() && resolve(&text[r.clone()]).is_some())
-    {
+    if found.last().is_some_and(|r| {
+        r.end == text.len()
+            && !text[r.clone()].contains("](t3-context:")
+            && resolve(&text[r.clone()]).is_some()
+    }) {
         text.push(' ');
     }
-    if found
-        .first()
-        .is_some_and(|r| r.start == 0 && resolve(&text[r.clone()]).is_some())
-        && edit.range().0 > 0
+    if found.first().is_some_and(|r| {
+        r.start == 0
+            && !text[r.clone()].contains("](t3-context:")
+            && resolve(&text[r.clone()]).is_some()
+    }) && edit.range().0 > 0
         && edit.text[..edit.range().0]
             .chars()
             .next_back()

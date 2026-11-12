@@ -25,6 +25,16 @@ pub fn insert(state: &mut crate::model::State, text: &str) {
     });
     let thread = state.current_mut();
     crate::composer_rich::paste_with_path_query(&mut thread.draft, text, path_query, &|source| {
+        if let Some(occ) = crate::composer_context::collect_composer_context_references(source)
+            .into_iter()
+            .next()
+            && occ.source == source
+        {
+            return Some((
+                crate::composer_context::format_composer_context_href(&occ.kind, &occ.context_id),
+                occ.label,
+            ));
+        }
         if let Some(path) = crate::composer_rich::pasted_mention_path(source) {
             let path = std::path::PathBuf::from(path);
             let path = if path.is_absolute() {

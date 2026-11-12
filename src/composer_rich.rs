@@ -740,6 +740,95 @@ pub fn markdown_for(
     out.join("\n")
 }
 
+pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
+    let start = range.start.min(edit.text.len());
+    let end = range.end.min(edit.text.len()).max(start);
+    if start == end {
+        return String::new();
+    }
+    let paragraphs = edit.paragraphs();
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut numbers = [0usize; 4];
+    while at < paragraphs.len() {
+        let p = &paragraphs[at];
+        if p.range.end < start || p.range.start > end {
+            at += 1;
+            continue;
+        }
+        // Only treat a single-line partial selection inside a paragraph as plain inline markdown.
+        if p.range.start <= start && end <= p.range.end && !p.soft_break {
+            if p.block == Block::Code {
+                return edit.text[start..end].to_owned();
+            }
+            return inline(edit, start..end, None, &|machine| machine.to_owned());
+        }
+        let sub_start = p.range.start.max(start);
+        let sub_end = p.range.end.min(end);
+        if sub_start > sub_end {
+            at += 1;
+            continue;
+        }
+        if p.block == Block::Code {
+            let mut code_end = sub_end;
+            at += 1;
+            while at < paragraphs.len()
+                && paragraphs[at].block == Block::Code
+                && paragraphs[at].range.start <= end
+            {
+                code_end = paragraphs[at].range.end.min(end);
+                at += 1;
+            }
+            let content = &edit.text[sub_start..code_end];
+            let ticks = fence(content, 3);
+            let newline = if content.is_empty() { "" } else { "\n" };
+            out.push(format!("{ticks}{newline}{content}\n{ticks}"));
+            numbers.fill(0);
+            continue;
+        }
+        let prefix = if sub_start == p.range.start {
+            match p.block {
+                Block::Bullet(level) => {
+                    numbers[level as usize..].fill(0);
+                    format!("{}- ", "    ".repeat(level as usize))
+                }
+                Block::Numbered(level) => {
+                    if !p.soft_break {
+                        numbers[level as usize] += 1;
+                        numbers[level as usize + 1..].fill(0);
+                    }
+                    if p.soft_break {
+                        "    ".repeat(level as usize + 1)
+                    } else {
+                        format!(
+                            "{}{}. ",
+                            "    ".repeat(level as usize),
+                            numbers[level as usize]
+                        )
+                    }
+                }
+                Block::Quote => {
+                    numbers.fill(0);
+                    "> ".into()
+                }
+                _ => {
+                    numbers.fill(0);
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "{prefix}{}",
+            inline(edit, sub_start..sub_end, None, &|machine| machine
+                .to_owned())
+        ));
+        at += 1;
+    }
+    out.join("\n")
+}
+
 pub fn has_format(edit: &TextEdit) -> bool {
     !edit.marks().is_empty()
         || edit.blocks().iter().any(|b| *b != Block::Paragraph)
