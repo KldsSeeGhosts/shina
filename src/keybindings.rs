@@ -912,20 +912,24 @@ pub fn resolve_event_keys(
     key_base: Option<char>,
 ) -> HashSet<String> {
     let mut keys = HashSet::new();
+    let mut layout_is_ascii_letter = false;
     match &event.key {
         rune::Key::Text(t) => {
             let lower = t.to_lowercase();
-            keys.insert(lower.clone());
             let mut chars = lower.chars();
-            if let (Some(ch), None) = (chars.next(), chars.next())
-                && event.mods.shift
-                && let Some(unshifted) = us_shifted_to_unshifted(ch)
-            {
-                keys.insert(unshifted.to_string());
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                layout_is_ascii_letter = ch.is_ascii_lowercase();
+                if event.mods.shift
+                    && let Some(unshifted) = us_shifted_to_unshifted(ch)
+                {
+                    keys.insert(unshifted.to_string());
+                }
             }
+            keys.insert(lower);
         }
         rune::Key::Command(ch) => {
             let lower = ch.to_ascii_lowercase();
+            layout_is_ascii_letter = lower.is_ascii_lowercase();
             keys.insert(lower.to_string());
             if event.mods.shift
                 && let Some(unshifted) = us_shifted_to_unshifted(lower)
@@ -981,7 +985,7 @@ pub fn resolve_event_keys(
         keys.insert(base.to_ascii_lowercase().to_string());
     }
     if let Some(code) = physical {
-        if let Some(letter) = physical_letter_token(code) {
+        if !layout_is_ascii_letter && let Some(letter) = physical_letter_token(code) {
             keys.insert(letter.to_string());
         }
         if let Some(token) = us_physical_key_token(code) {
@@ -989,6 +993,21 @@ pub fn resolve_event_keys(
         }
     }
     keys
+}
+
+/// Ported from KSG Code's `isRichTextBoldShortcut` (`apps/web/src/keybindings.ts`):
+/// Mod+B without extra modifiers, with non-empty text selection.
+pub fn is_rich_text_bold_shortcut(
+    event: &rune::KeyEvent,
+    physical: Option<rune::PhysicalKeyCode>,
+    key_base: Option<char>,
+    has_selection: bool,
+) -> bool {
+    has_selection
+        && (event.mods.cmd || event.mods.ctrl)
+        && !event.mods.alt
+        && !event.mods.shift
+        && resolve_event_keys(event, physical, key_base).contains("b")
 }
 
 pub fn matches_keybinding_shortcut(
@@ -2142,5 +2161,81 @@ mod tests {
         )
         .unwrap();
         assert!(custom.is_empty());
+    }
+
+    #[test]
+    fn rich_text_bold_shortcut_follows_layout_and_selection_rules() {
+        // Non-Latin layout ('и' at physical KeyB) matches when selected.
+        let cyrillic_b = ev(
+            Key::Text("и".into()),
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert!(is_rich_text_bold_shortcut(
+            &cyrillic_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
+        assert!(!is_rich_text_bold_shortcut(
+            &cyrillic_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            false
+        ));
+
+        // Latin layout letter 'x' at physical KeyB does NOT match 'b'.
+        let x_on_b = ev(
+            Key::Command('x'),
+            Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        );
+        assert!(!is_rich_text_bold_shortcut(
+            &x_on_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
+
+        // Latin layout letter 'b' at physical KeyN DOES match 'b'.
+        let b_on_n = ev(
+            Key::Command('b'),
+            Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        );
+        assert!(is_rich_text_bold_shortcut(
+            &b_on_n,
+            Some(PhysicalKeyCode::KeyN),
+            None,
+            true
+        ));
+        assert!(!is_rich_text_bold_shortcut(
+            &b_on_n,
+            Some(PhysicalKeyCode::KeyN),
+            None,
+            false
+        ));
+
+        // Extra shift or alt prevents bold shortcut.
+        let mod_shift_b = ev(
+            Key::Command('b'),
+            Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(!is_rich_text_bold_shortcut(
+            &mod_shift_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
     }
 }

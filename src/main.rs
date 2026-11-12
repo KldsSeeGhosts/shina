@@ -238,6 +238,25 @@ fn dispatch_global_command(
             }
             state.checkpoint();
         }
+        "threadPanel.toggle" => {
+            if key_repeat {
+                return true;
+            }
+            if state.settings_menu
+                || state.project_picker.is_some()
+                || state.captain_editor.is_some()
+                || state.machines.dialog
+                || state.fleet.open
+                || state.settings.archive.is_some()
+            {
+                return false;
+            }
+            state.show_activity = !state.show_activity;
+            if !state.show_activity {
+                state.activity_full = false;
+            }
+            state.checkpoint();
+        }
         "composer.focus" => {
             state.current_mut().draft.focused = true;
         }

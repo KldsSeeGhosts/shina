@@ -288,13 +288,32 @@ pub(super) fn composer_pi_key(
         }
         return true;
     }
-    if matches!(
-        event.key,
-        rune::Key::Up | rune::Key::Down | rune::Key::Left | rune::Key::Right
-    ) && (event.mods.cmd || event.mods.ctrl || event.mods.alt)
-        && crate::dispatch_key_no_tx(s, event, tx.physical_key(), tx.key_base(), tx.key_repeat())
+    if (event.mods.cmd || event.mods.ctrl || event.mods.alt)
+        && let Some(command) = shortcut_command
     {
-        return true;
+        let has_selection = s.current().draft.anchor != s.current().draft.focus;
+        let yield_bold = command == "sidebar.toggle"
+            && crate::keybindings::is_rich_text_bold_shortcut(
+                event,
+                tx.physical_key(),
+                tx.key_base(),
+                has_selection,
+            );
+        if !yield_bold
+            && !matches!(
+                command,
+                "composer.sendAlternate" | "composer.sendBackground" | "composer.sendAndNewThread"
+            )
+            && crate::dispatch_key_no_tx(
+                s,
+                event,
+                tx.physical_key(),
+                tx.key_base(),
+                tx.key_repeat(),
+            )
+        {
+            return true;
+        }
     }
     let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();

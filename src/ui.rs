@@ -16657,4 +16657,270 @@ pub(crate) mod tests {
         assert!(draft_rt.state.current().draft.text.is_empty());
         assert_eq!(draft_rt.state.current().messages.len(), 1);
     }
+
+    #[test]
+    fn colliding_rich_text_and_registry_chords_match_ksg_for_all_focus_and_selection_states() {
+        let cmd_ev = |ch: char, shift: bool| rune::KeyEvent {
+            key: rune::Key::Command(ch),
+            mods: rune::Mods {
+                cmd: true,
+                shift,
+                ..Default::default()
+            },
+        };
+
+        // 1. Composer focused, WITHOUT selection:
+        // Mod+B -> sidebar.toggle (no Bold); Mod+Shift+B -> threadPanel.toggle (no Bold);
+        // Mod+I -> Italic; Mod+Shift+I -> Italic; Mod+E -> Code;
+        // Mod+Shift+S -> thread.settle (no Strike); Mod+Shift+E -> composer.effort (no Code).
+        {
+            let mut rt = runtime(1280.0);
+            rt.on_key = Some(crate::key);
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().draft.set_caret(5);
+            assert_eq!(
+                rt.state.current().draft.anchor,
+                rt.state.current().draft.focus
+            );
+
+            let sidebar_before = rt.state.sidebar;
+            rt.key(cmd_ev('b', false));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.sidebar, !sidebar_before,
+                "Mod+B toggles sidebar without selection"
+            );
+            assert!(rt.state.current().draft.marks().is_empty());
+
+            let panel_before = rt.state.show_activity;
+            rt.key(cmd_ev('b', true));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.show_activity, !panel_before,
+                "Mod+Shift+B toggles threadPanel"
+            );
+            assert!(rt.state.current().draft.marks().is_empty());
+
+            // Mod+I and Mod+Shift+I toggle Italic active mark (verified by inserting a char).
+            rt.key(cmd_ev('i', false));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("a".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Italic));
+            rt.key(cmd_ev('i', true));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("b".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "hello*a*b"
+            );
+
+            // Mod+E toggles Code active mark.
+            rt.key(cmd_ev('e', false));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("c".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Code));
+            rt.key(cmd_ev('e', false));
+            rt.frame(0.0);
+
+            // Mod+Shift+S settles thread rather than toggling Strike.
+            let settled_id = rt.state.current().id;
+            let settled_before = rt.state.current().life.settled();
+            rt.key(cmd_ev('s', true));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == settled_id)
+                    .unwrap()
+                    .life
+                    .settled(),
+                !settled_before
+            );
+            assert!(
+                !rt.state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == settled_id)
+                    .unwrap()
+                    .draft
+                    .has_mark(&rune::Mark::Strike)
+            );
+
+            // Mod+Shift+E opens effort picker rather than toggling Code.
+            rt.key(cmd_ev('e', true));
+            rt.frame(0.0);
+            assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+        }
+
+        // 2. Composer focused, WITH selection:
+        // Mod+B -> Bold (sidebar unchanged); Mod+Shift+B -> threadPanel.toggle (no Bold);
+        // Mod+I -> Italic; Mod+Shift+I -> Italic; Mod+E -> Code;
+        // Mod+Shift+S -> thread.settle (no Strike); Mod+Shift+E -> composer.effort (no Code).
+        {
+            let mut rt = runtime(1280.0);
+            rt.on_key = Some(crate::key);
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+
+            rt.state.current_mut().draft.set_selection(0, 5);
+            let sidebar_before = rt.state.sidebar;
+            rt.key(cmd_ev('b', false));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.sidebar, sidebar_before,
+                "Mod+B yields to Bold with selection"
+            );
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Bold));
+
+            // Clear bold, keep selection, test Mod+Shift+B.
+            rt.state.current_mut().draft.toggle_mark(rune::Mark::Bold);
+            let panel_before = rt.state.show_activity;
+            rt.key(cmd_ev('b', true));
+            rt.frame(0.0);
+            assert_eq!(rt.state.show_activity, !panel_before);
+            assert!(!rt.state.current().draft.has_mark(&rune::Mark::Bold));
+
+            // Mod+I and Mod+Shift+I toggle Italic on selection.
+            rt.key(cmd_ev('i', false));
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Italic));
+            rt.key(cmd_ev('i', true));
+            rt.frame(0.0);
+            assert!(!rt.state.current().draft.has_mark(&rune::Mark::Italic));
+
+            // Mod+E toggles Code on selection.
+            rt.key(cmd_ev('e', false));
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Code));
+            rt.key(cmd_ev('e', false));
+            rt.frame(0.0);
+            assert!(!rt.state.current().draft.has_mark(&rune::Mark::Code));
+
+            // Mod+Shift+S settles thread (no Strike).
+            let settled_id = rt.state.current().id;
+            let settled_before = rt.state.current().life.settled();
+            rt.key(cmd_ev('s', true));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == settled_id)
+                    .unwrap()
+                    .life
+                    .settled(),
+                !settled_before
+            );
+            assert!(
+                !rt.state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == settled_id)
+                    .unwrap()
+                    .draft
+                    .has_mark(&rune::Mark::Strike)
+            );
+
+            // Mod+Shift+E opens effort picker (no Code).
+            rt.key(cmd_ev('e', true));
+            rt.frame(0.0);
+            assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+            assert!(!rt.state.current().draft.has_mark(&rune::Mark::Code));
+        }
+
+        // 3. Composer UNFOCUSED:
+        // Registry shortcuts execute; Mod+I, Mod+Shift+I, Mod+E do not mutate draft marks.
+        {
+            let mut rt = runtime(1280.0);
+            rt.on_key = Some(crate::key);
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.state.current_mut().draft.set_selection(0, 5);
+            rt.frame(0.0);
+            assert!(!rt.state.current().draft.focused);
+
+            let sidebar_before = rt.state.sidebar;
+            rt.key(cmd_ev('b', false));
+            rt.frame(0.0);
+            assert_eq!(rt.state.sidebar, !sidebar_before);
+            assert!(rt.state.current().draft.marks().is_empty());
+
+            let panel_before = rt.state.show_activity;
+            rt.key(cmd_ev('b', true));
+            rt.frame(0.0);
+            assert_eq!(rt.state.show_activity, !panel_before);
+            assert!(rt.state.current().draft.marks().is_empty());
+
+            for (ch, shift) in [('i', false), ('i', true), ('e', false)] {
+                rt.key(cmd_ev(ch, shift));
+                rt.frame(0.0);
+                assert!(rt.state.current().draft.marks().is_empty());
+            }
+
+            let settled_id = rt.state.current().id;
+            let settled_before = rt.state.current().life.settled();
+            rt.key(cmd_ev('s', true));
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == settled_id)
+                    .unwrap()
+                    .life
+                    .settled(),
+                !settled_before
+            );
+
+            rt.key(cmd_ev('e', true));
+            rt.frame(0.0);
+            assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+        }
+
+        // 4. Rebinding overriding shortcuts away lets rich-text marks work in focused composer.
+        {
+            let mut rt = runtime(1280.0);
+            rt.on_key = Some(crate::key);
+            for (cmd, new_key) in [
+                ("sidebar.toggle", "mod+alt+1"),
+                ("threadPanel.toggle", "mod+alt+2"),
+                ("thread.settle", "mod+alt+3"),
+            ] {
+                crate::keybindings::upsert_custom_rule(
+                    &mut rt.state.preferences.keybindings,
+                    cmd,
+                    new_key,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            rt.state.current_mut().draft.replace_text("hello");
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().draft.set_selection(0, 5);
+
+            rt.key(cmd_ev('s', true));
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Strike));
+            assert!(!rt.state.current().life.settled());
+
+            rt.key(cmd_ev('b', true));
+            rt.frame(0.0);
+            assert!(rt.state.current().draft.has_mark(&rune::Mark::Bold));
+            assert!(!rt.state.show_activity);
+        }
+    }
 }
