@@ -492,8 +492,8 @@ fn queued_messages_can_be_edited_cancelled_promoted_and_run_after_settlement() {
     assert_eq!(t.native.queue.len(), 1);
     t.edit_queued(b);
     assert_eq!(t.draft.text, "Queued B");
-    assert!(t.native.queue.is_empty());
-    t.send_during_run();
+    assert_eq!(t.native.queue.len(), 1);
+    t.save_queued_edit();
     let b = t.native.queue[0].id;
     t.steer_queued(b);
     let steer = command(&commands, "prompt");

@@ -40,6 +40,10 @@ struct ThreadView {
     questionnaire: Value,
     elapsed: Option<u64>,
     queue: Vec<(usize, String, Vec<Attachment>)>,
+    #[serde(default)]
+    queue_drafts: Vec<(usize, crate::composer_rich::Snapshot)>,
+    #[serde(default)]
+    queue_edit_supported: bool,
     steering: Vec<String>,
     follow_ups: Vec<String>,
     commands: Vec<Value>,
@@ -136,6 +140,13 @@ impl ThreadView {
                 .iter()
                 .map(|q| (q.id, q.prompt.text.clone(), q.prompt.images.to_vec()))
                 .collect(),
+            queue_drafts: thread
+                .native
+                .queue
+                .iter()
+                .filter_map(|q| q.prompt.draft.clone().map(|draft| (q.id, draft)))
+                .collect(),
+            queue_edit_supported: true,
             steering: thread.native.steering.clone(),
             follow_ups: thread.native.follow_ups.clone(),
             commands: thread.native.commands.iter().map(|c| json!(c)).collect(),
@@ -257,11 +268,18 @@ impl ThreadView {
         thread.native.queue = self
             .queue
             .into_iter()
-            .map(|(id, text, images)| pi_session::QueuedMessage {
-                id,
-                prompt: Prompt::new(text, images),
+            .map(|(id, text, images)| {
+                let mut prompt = Prompt::new(text, images);
+                prompt.draft = self
+                    .queue_drafts
+                    .iter()
+                    .find(|(key, _)| *key == id)
+                    .map(|(_, draft)| draft.clone());
+                pi_session::QueuedMessage { id, prompt }
             })
             .collect();
+        thread.queue_edit_supported = self.queue_edit_supported;
+        thread.reconcile_queued_edit();
         thread.native.steering = self.steering;
         thread.native.follow_ups = self.follow_ups;
         thread.native.commands = self
@@ -819,6 +837,14 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
+                && matches!(
+                    command.method.as_str(),
+                    "queue.update" | "queue.returnDraft"
+                )
+            {
+                self.apply_queue_receipt(&server, command, value);
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
                 && (command.method.starts_with("settings.")
                     || matches!(
                         command.method.as_str(),
@@ -964,7 +990,7 @@ impl State {
                         {
                             self.client_recover.insert(id as usize, command.command_id);
                         }
-                        if matches!(command.method.as_str(), "queue.edit" | "input.claim")
+                        if command.method == "input.claim"
                             && let Some(thread) = self
                                 .threads
                                 .iter_mut()
@@ -1735,7 +1761,7 @@ impl State {
             }
         };
         let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-            "editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+            "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
         let result = commands
             .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
             .and_then(|commands| commands.send("thread.send", params));
@@ -2201,7 +2227,7 @@ impl State {
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| format!("{key} must be an id."))
         };
-        if command.method.starts_with("queue.") {
+        if command.method.starts_with("queue.") && command.method != "queue.returnDraft" {
             if args["generation"] != json!(self.current().request_generation) {
                 return Err("The queue belongs to an earlier runtime generation.".into());
             }
@@ -2231,8 +2257,16 @@ impl State {
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
                 attachments::validate_prompt_images(&attachments)?;
-                self.current_mut().draft.replace_text(text);
-                self.current_mut().draft_images = attachments;
+                let prompt =
+                    crate::composer_tokens::received_prompt(text, attachments, input.draft)?;
+                self.current_mut().draft = prompt.draft.as_ref().map_or_else(
+                    || crate::composer_rich::draft(&prompt.text),
+                    crate::composer_rich::Snapshot::editor,
+                );
+                self.current_mut().draft_images = prompt
+                    .draft
+                    .as_ref()
+                    .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
                 self.send();
@@ -2457,11 +2491,32 @@ impl State {
             "queue.remove" => self.current_mut().cancel_queued(number("inputId")?),
             "queue.sendNow" => self.current_mut().steer_queued(number("inputId")?),
             "queue.edit" => {
-                self.current_mut().edit_queued(number("inputId")?);
-                let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images});
-                self.current_mut().draft.replace_text("");
-                self.current_mut().draft_images.clear();
-                return Ok(input);
+                return Err(crate::protocol::COMPOSER_UPDATE_REQUIRED.into());
+            }
+            "queue.update" => {
+                let images = args["attachments"]
+                    .as_array()
+                    .ok_or("attachments must be an array.")?
+                    .iter()
+                    .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let prompt = crate::composer_tokens::received_prompt(
+                    text("text")?,
+                    images,
+                    args.get("draft").cloned(),
+                )?;
+                self.current_mut().update_queued(
+                    number("inputId")?,
+                    &text("generation")?,
+                    &text("expectedRevision")?,
+                    prompt,
+                )?;
+            }
+            "queue.returnDraft" => {
+                let prompts: Vec<_> = self.current_mut().native.queue.drain(..).map(|q| {
+                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"draft":q.prompt.draft})
+                }).collect();
+                return Ok(json!({"prompts":prompts}));
             }
             "input.claim" => {
                 let id = self.current().id;

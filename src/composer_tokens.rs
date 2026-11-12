@@ -141,6 +141,37 @@ pub fn prompt_for(
     Ok(prompt)
 }
 
+/// Validate the additive editor snapshot against the provider text and admitted attachments.
+/// Missing snapshots remain valid for older peers. Unknown snapshot fields are ignored.
+pub fn received_prompt(
+    text: String,
+    images: Vec<Attachment>,
+    snapshot: Option<serde_json::Value>,
+) -> Result<Prompt, String> {
+    let mut prompt = Prompt::new(text, images);
+    if let Some(value) = snapshot.filter(|value| !value.is_null()) {
+        let mut snapshot: crate::composer_rich::Snapshot =
+            serde_json::from_value(value).map_err(|_| "Invalid composer document.")?;
+        if crate::composer_rich::markdown(&snapshot.editor()) != prompt.text {
+            return Err("The composer document does not match the submitted message.".into());
+        }
+        snapshot.attachments = snapshot
+            .attachments
+            .iter()
+            .map(|attachment| {
+                prompt
+                    .images
+                    .iter()
+                    .find(|image| image.id == attachment.id)
+                    .cloned()
+                    .ok_or("Composer attachment is not in the submitted message.")
+            })
+            .collect::<Result<_, _>>()?;
+        prompt.draft = Some(snapshot);
+    }
+    Ok(prompt)
+}
+
 /// A server receives serialized text, not the client's pill marks. Do not interpret a leading
 /// attached path as a slash command. Require the full path and its token boundary.
 pub fn starts_with_file_path(text: &str, attachments: &[Attachment]) -> bool {

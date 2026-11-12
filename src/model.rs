@@ -38,11 +38,19 @@ mod background;
 pub use background::{BackgroundSettings, BackgroundStatus};
 #[path = "client_state.rs"]
 mod client_state;
+#[path = "queued_edit.rs"]
+mod queued_edit;
+pub use queued_edit::QueuedEdit;
+#[cfg(test)]
+use queued_edit::queue_revision;
 #[path = "honcho.rs"]
 mod honcho;
 #[path = "memory.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod memory;
+#[cfg(test)]
+#[path = "queued_edit_tests.rs"]
+mod queued_edit_tests;
 #[path = "scope.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod scope;
@@ -340,6 +348,9 @@ pub struct Thread {
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
     pub draft: TextEdit,
+    pub queued_edit: Option<QueuedEdit>,
+    queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
+    queue_edit_supported: bool,
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
     pub paste_history: crate::composer_paste::PasteHistory,
@@ -546,6 +557,9 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            queued_edit: None,
+            queued_save: None,
+            queue_edit_supported: true,
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
             client_draft: false,
@@ -5468,6 +5482,11 @@ impl State {
         if self.ownership_denied {
             return;
         }
+        if self.current().queued_edit.is_some() {
+            self.current_mut().save_queued_edit();
+            self.checkpoint();
+            return;
+        }
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -5496,7 +5515,7 @@ impl State {
                 }
             };
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
                     self.current_mut().remote_send = Some((
@@ -6386,13 +6405,15 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let value = if t.draft_images.is_empty() && !crate::composer_rich::has_format(&t.draft) {
-                    json!(t.draft.text)
+                let (draft, images) = t.queued_edit.as_ref().map_or(
+                    (&t.draft, &t.draft_images), |edit| (&edit.ordinary, &edit.ordinary_images));
+                let value = if images.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
+                    json!(draft.text)
                 } else {
                     json!({
-                        "text": t.draft.text,
-                        "richHtml": t.draft.to_html(),
-                        "images": t.draft_images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                        "text": draft.text,
+                        "richHtml": draft.to_html(),
+                        "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                     })
                 };
                 (t.id.to_string(), value)

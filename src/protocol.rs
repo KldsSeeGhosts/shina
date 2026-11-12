@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 7;
+pub const MINOR: u32 = 8;
+pub const COMPOSER_TRANSACTIONS: &str = "composer-transactions";
+pub const COMPOSER_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to edit queued messages.";
 pub const HISTORY_ITEMS: &str = "history-items";
 pub const HISTORY_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use scoped history and live items.";
@@ -90,6 +93,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "queue.remove"
         | "queue.sendNow"
         | "queue.edit"
+        | "queue.update"
+        | "queue.returnDraft"
         | "input.claim"
         | "project.put"
         | "project.remove"
@@ -120,7 +125,7 @@ pub const MAX_CONTROL: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
-pub const HISTORY_FIELDS: [&str; 13] = [
+pub const HISTORY_FIELDS: [&str; 14] = [
     "messages",
     "tools",
     "thoughts",
@@ -131,6 +136,7 @@ pub const HISTORY_FIELDS: [&str; 13] = [
     "commands",
     "models",
     "queue",
+    "queue_drafts",
     "steering",
     "follow_ups",
     "stats",
@@ -303,6 +309,8 @@ pub struct SendInput {
     pub mode: SendMode,
     #[serde(default)]
     pub editor_revision: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub draft: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

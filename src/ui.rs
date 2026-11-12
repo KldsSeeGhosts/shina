@@ -8397,18 +8397,25 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     }
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
-        && !t.initializing
+        && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
         && !t.configuring
         && t.request.is_none()
-        && !t.native.operating()
-        && t.phase != "Stopping"
+        && (!t.native.operating() || t.queued_edit.is_some())
+        && (t.phase != "Stopping" || t.queued_edit.is_some())
+        && !t.queued_edit_saving()
         && t.has_draft_content();
     let mut send = el()
         .key("send-message")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(if t.status.busy() {
+        .label(if t.queued_edit.is_some() {
+            if t.queued_edit_saving() {
+                "Updating queued message"
+            } else {
+                "Update queued message"
+            }
+        } else if t.status.busy() {
             if t.native.follow_up {
                 "Queue message"
             } else {
@@ -8423,7 +8430,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         // A framed key. Rune cannot move it on press, so a pressed key darkens instead.
         .press(if can_send { p.coral.alpha(0.8) } else { p.line })
         .fill(if can_send { p.coral } else { p.line })
-        .child(icon("send", if can_send { p.on_coral } else { p.muted }))
+        .child(icon(
+            if t.queued_edit.is_some() {
+                "check"
+            } else {
+                "send"
+            },
+            if can_send { p.on_coral } else { p.muted },
+        ))
         .disabled(!can_send);
     if can_send {
         send = framed(send, p);
@@ -8438,7 +8452,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             s.current_mut().native.follow_up = previous;
         });
     }
-    let action = if t.status.busy() && !s.demo && !t.has_draft_content() {
+    let action = if t.status.busy() && !s.demo && !t.has_draft_content() && t.queued_edit.is_none()
+    {
         framed(
             el().key("stop-agent")
                 .role("button")
@@ -8458,8 +8473,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         send
     };
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
-    let attach_locked =
-        s.demo || t.archived() || t.configuring || t.native.operating() || t.request.is_some();
+    let attach_locked = s.demo
+        || t.archived()
+        || t.configuring
+        || t.native.operating() && t.queued_edit.is_none()
+        || t.request.is_some();
     // Delegation context sits above the composer, nearest first: who sent this worker, then
     // what the crew needs from the user, then what it is doing.
     let lane = lane_width(pane_width, wide);
@@ -11071,6 +11089,70 @@ pub(crate) mod tests {
             rt.frame(0.0);
             let (rect, _) = rt.presented("composer").unwrap();
             assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0);
+        }
+    }
+
+    #[test]
+    fn queued_edit_controls_save_cancel_and_shortcuts_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, _, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.status = Status::Running;
+            t.native.follow_up = true;
+            t.draft.replace_text("Queued original");
+            t.send_during_run();
+            let id = t.native.queue[0].id;
+            t.draft.replace_text("Ordinary draft");
+            t.draft.set_caret(0);
+            assert!(pi_ui::composer_pi_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Up,
+                    mods: rune::Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                }
+            ));
+            assert_eq!(rt.state.current().draft.text, "Queued original");
+            rt.frame(0.0);
+            for key in [
+                "composer",
+                "queued-messages",
+                "send-message",
+                &format!("queue-edit-{id}"),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0);
+            }
+            rt.state.current_mut().draft.replace_text("Edited queued");
+            rt.state.send();
+            assert_eq!(
+                rt.state.current().native.queue[0].prompt.text,
+                "Edited queued"
+            );
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
+            rt.state.current_mut().edit_queued(id);
+            rt.state.current_mut().draft.replace_text("Cancel me");
+            rt.state.current_mut().cancel_queued_edit();
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
+            assert!(pi_ui::composer_pi_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Enter,
+                    mods: rune::Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                }
+            ));
+            assert!(rt.state.current().native.queue.is_empty());
         }
     }
 
