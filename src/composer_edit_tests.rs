@@ -29,8 +29,18 @@ fn ksg_input_mark_rules_and_literal_exclusions() {
         ("__bold__", "bold", "**bold**", Some(Mark::Bold)),
         ("*italic*", "italic", "*italic*", Some(Mark::Italic)),
         ("~~strike~~", "strike", "~~strike~~", Some(Mark::Strike)),
-        ("`**not bold**`", "**not bold**", "`**not bold**`", Some(Mark::Code)),
-        ("_build node_modules", "_build node_modules", "_build node_modules", None),
+        (
+            "`**not bold**`",
+            "**not bold**",
+            "`**not bold**`",
+            Some(Mark::Code),
+        ),
+        (
+            "_build node_modules",
+            "_build node_modules",
+            "_build node_modules",
+            None,
+        ),
         ("a*word*", "a*word*", "a*word*", None),
         ("** spaced **", " spaced ", " **spaced** ", Some(Mark::Bold)),
         ("** **", "** **", "** **", None),
@@ -63,7 +73,11 @@ fn ksg_formatting_chords() {
         let mut rules = Rules::default();
         let event = KeyEvent {
             key: Key::Command(ch),
-            mods: rune::Mods { cmd: true, shift, ..Default::default() },
+            mods: rune::Mods {
+                cmd: true,
+                shift,
+                ..Default::default()
+            },
         };
         assert!(rules.key(&mut edit, &event));
         assert!(edit.has_mark(&mark));
@@ -128,7 +142,11 @@ fn ksg_code_tab_and_newline() {
 
 #[test]
 fn ksg_code_closing_fence_and_two_trailing_blank_lines() {
-    for (text, code) in [("code\n```", "code"), ("code\n\n", "code"), ("code\n \n  ", "code")] {
+    for (text, code) in [
+        ("code\n```", "code"),
+        ("code\n\n", "code"),
+        ("code\n \n  ", "code"),
+    ] {
         let mut edit = draft(text);
         edit.set_blocks(vec![Block::Code; text.lines().count() + 1]);
         edit.set_caret(text.len());
@@ -143,4 +161,18 @@ fn ksg_code_closing_fence_and_two_trailing_blank_lines() {
     press(&mut edit, &mut Rules::default(), Key::Enter, false);
     assert_eq!(edit.active_block(), Block::Code);
     assert_eq!(edit.text, "code\n\n");
+}
+
+#[test]
+fn ksg_formats_code_when_opening_tick_is_typed_last() {
+    for prefix in ["", "this is a "] {
+        let mut edit = draft(format!("{prefix}test` after"));
+        edit.set_caret(prefix.len());
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, "`");
+        assert_eq!(markdown(&edit), format!("{prefix}`test` after"));
+        assert_eq!(edit.focus, prefix.len());
+        type_text(&mut edit, &mut rules, "new ");
+        assert_eq!(markdown(&edit), format!("{prefix}`new test` after"));
+    }
 }

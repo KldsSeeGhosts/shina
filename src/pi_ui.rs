@@ -222,6 +222,11 @@ pub(super) fn composer_pi_key(
     tx: &rune::Tx,
     caret_edges: Option<[bool; 2]>,
 ) -> bool {
+    // KSG's editor handles code Enter/Tab and opening-fence Enter before the
+    // composer command handler, including before the send shortcut.
+    if crate::composer_rich::editor_key_before_commands(s.current_mut(), event) {
+        return true;
+    }
     if composer_queue_key(s, event) {
         return true;
     }
