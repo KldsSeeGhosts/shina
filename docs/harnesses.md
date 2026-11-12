@@ -81,6 +81,19 @@ ACP and Codex use the same bounded connection queues, shutdown registry and per-
 
 ## Validation
 
+### Typed transcript tools
+
+`Tool.kind` and `Tool.changes` default to absent and empty for saved transcripts and
+older server projections. Only an absent kind uses the legacy Pi name classifier.
+Each change keeps `path`, optional `old_path`, `operation`, unified `diff`, `additions`
+and `deletions`. ACP old/new text becomes a whole-file unified hunk before flattening.
+
+`Tool.input` retains named input fields. `Tool.structured` retains the native
+`structuredContent`, `details` and `nestedCalls`, plus `input`. Normalized search
+results live at `fileSearchResults` as `{fileName, line?, column?, preview?}` and
+`webResults` as `{url, title?, snippet?}`. Providers that supply no structured
+results keep their text output. No result entries are inferred from prose.
+
 `cargo test acp::tests` runs a Python ACP fixture from an owned temporary Shina profile. Python must be installed as `python` on Windows or `python3` on Unix. No third-party agents or external inference run in automated tests. Tests cover initialization, authenticated MCP registration and relay, stream reduction, permission responses and policy, cancellation, load/resume, images, queues, model switching, authentication denial and unsupported capabilities. Layout tests cover the harness picker at 620, 960, 1280 and 1920 pixels.
 
 `cargo test codex` runs a temporary Python app-server fixture and harness integration tests. They cover initialization, streaming text and reasoning, command output, plans, approval responses, read-only write refusal, interrupt, resume, current usage, attachment input, model efforts, awareness and harness delegation. Compaction tests cover manual success, request rejection, failed turns, automatic and deprecated notifications, prompt races, cancellation, usage invalidation and refresh, and resume history. The ignored `real_codex_pong_smoke` test sends one paid prompt followed by native compaction in an isolated temporary workspace and passes a temporary `LOCALAPPDATA` to Codex. It never uses the real Shina profile.

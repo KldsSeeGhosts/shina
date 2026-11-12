@@ -157,6 +157,12 @@ impl Message {
 pub struct Tool {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: Option<crate::work::ToolKind>,
+    #[serde(default)]
+    pub changes: Vec<crate::work::FileChange>,
+    #[serde(default)]
+    pub input: Value,
     pub detail: String,
     pub done: bool,
     pub failed: bool,
@@ -192,6 +198,9 @@ impl Tool {
         Self {
             id: id.into(),
             name: name.into(),
+            kind: Some(crate::work::pi_kind(name)),
+            changes: vec![],
+            input: args.clone(),
             detail: tool_detail(args),
             done: false,
             failed: false,
@@ -1404,6 +1413,7 @@ impl Thread {
                 } else {
                     let mut tool =
                         Tool::new(id, string(block, "name"), &block["arguments"], anchor);
+                    tool.accept_metadata(block);
                     tool.block = block_index;
                     if restored {
                         tool.done = true;
@@ -1842,6 +1852,7 @@ impl Thread {
                     };
                     let mut tool =
                         Tool::new(id, string(&record, "toolName"), &record["args"], anchor);
+                    tool.accept_metadata(&record);
                     tool.started = Some(Instant::now());
                     tool.parent_call = record["parentToolCallId"].as_str().map(str::to_owned);
                     self.tools.push(tool);
@@ -5773,6 +5784,7 @@ impl State {
         thread.tools = vec![
             Tool {
                 id: "example-1".into(),
+                kind: None, changes: vec![], input: Value::Null,
                 name: "read".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5789,6 +5801,7 @@ impl State {
             },
             Tool {
                 id: "example-2".into(),
+                kind: None, changes: vec![], input: Value::Null,
                 name: "read".into(),
                 detail: "tests/reconnect.test.ts".into(),
                 done: true,
@@ -5805,6 +5818,7 @@ impl State {
             },
             Tool {
                 id: "example-3".into(),
+                kind: None, changes: vec![], input: Value::Null,
                 name: "edit".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5821,6 +5835,7 @@ impl State {
             },
             Tool {
                 id: "example-4".into(),
+                kind: None, changes: vec![], input: Value::Null,
                 name: "powershell".into(),
                 detail: "npm test -- reconnect.test.ts".into(),
                 done: true,

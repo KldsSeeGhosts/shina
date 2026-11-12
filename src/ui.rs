@@ -6045,13 +6045,14 @@ enum ToolKind {
     Other,
 }
 
-fn tool_kind(name: &str) -> ToolKind {
-    match name.to_ascii_lowercase().as_str() {
-        "read" | "read_file" => ToolKind::Read,
-        "edit" | "write" | "edit_file" | "write_file" | "apply_patch" => ToolKind::Edit,
-        "bash" | "powershell" | "shell" | "exec" | "exec_command" => ToolKind::Run,
-        "grep" | "rg" | "search" | "find" => ToolKind::Search,
-        "ls" | "list" | "list_directory" => ToolKind::List,
+fn tool_kind(tool: &Tool) -> ToolKind {
+    use crate::work::ToolKind as Kind;
+    match tool.resolved_kind() {
+        Kind::Read => ToolKind::Read,
+        Kind::FileChange => ToolKind::Edit,
+        Kind::Command => ToolKind::Run,
+        Kind::FileSearch | Kind::WebSearch => ToolKind::Search,
+        Kind::List => ToolKind::List,
         _ => ToolKind::Other,
     }
 }
@@ -6059,7 +6060,7 @@ fn tool_kind(name: &str) -> ToolKind {
 /// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
 fn tool_verb(tool: &Tool) -> String {
     let done = tool.done || tool.failed;
-    match (tool_kind(&tool.name), done) {
+    match (tool_kind(tool), done) {
         (ToolKind::Read, true) => "Read".into(),
         (ToolKind::Read, false) => "Reading".into(),
         (ToolKind::List, true) => "Listed".into(),
@@ -6090,7 +6091,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 /// One line for a batch: "Explored 3 files, 2 searches", "Edited 1 file", "Ran 2 commands".
 fn tool_summary(tools: &[&Tool]) -> String {
-    let count = |kind: ToolKind| tools.iter().filter(|t| tool_kind(&t.name) == kind).count();
+    let count = |kind: ToolKind| tools.iter().filter(|t| tool_kind(t) == kind).count();
     let (read, list, search) = (
         count(ToolKind::Read),
         count(ToolKind::List),
@@ -6294,7 +6295,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             &tool.detail,
             tool.failed,
             tool.expanded,
-            match tool_kind(&tool.name) {
+            match tool_kind(tool) {
                 ToolKind::Read => "eye",
                 ToolKind::List => "folder",
                 ToolKind::Search => "search",

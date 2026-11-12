@@ -730,26 +730,31 @@ impl Client {
                     .as_str()
                     .or_else(|| tool["kind"].as_str())
                     .unwrap_or("ACP tool");
+                let metadata = tool_metadata(&tool);
                 if new {
                     self.history_chunk(
                         "assistant",
-                        json!({"type":"toolCall","id":id,"name":name,"arguments":tool["rawInput"]}),
+                        json!({"type":"toolCall","id":id,"name":name,"arguments":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}),
                     );
                     if emit {
-                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"]}));
+                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
                 let done = matches!(tool["status"].as_str(), Some("completed" | "failed"));
                 let result = tool_result(&tool);
                 if done {
+                    let mut saved = result.clone();
+                    saved["role"] = json!("toolResult");
+                    saved["toolCallId"] = json!(id);
+                    saved["isError"] = json!(tool["status"] == "failed");
                     if let Some(previous) = self
                         .history
                         .iter_mut()
                         .find(|m| m["role"] == "toolResult" && m["toolCallId"] == id)
                     {
-                        *previous = json!({"role":"toolResult","toolCallId":id,"content":result["content"],"isError":tool["status"]=="failed"});
+                        *previous = saved;
                     } else {
-                        self.history.push(json!({"role":"toolResult","toolCallId":id,"content":result["content"],"isError":tool["status"]=="failed"}));
+                        self.history.push(saved);
                     }
                 }
                 if emit {
@@ -799,7 +804,65 @@ fn tool_result(tool: &Value) -> Value {
     if content.is_empty() && !tool["rawOutput"].is_null() {
         content.push(json!({"type":"text","text":tool["rawOutput"].as_str().map(str::to_owned).unwrap_or_else(||tool["rawOutput"].to_string())}));
     }
-    json!({"content":content,"details":{"acp":tool}})
+    let mut result = tool_metadata(tool);
+    result["content"] = json!(content);
+    result["details"] = json!({"acp":tool,"exitCode":tool["rawOutput"]["exitCode"]});
+    result
+}
+
+/// Ported from KSG Code's provider-acp adapter's kind switch and diff parts.
+fn tool_metadata(tool: &Value) -> Value {
+    use crate::work::{FileChange, ToolKind, result_metadata, text_diff};
+    let kind = match tool["kind"].as_str().unwrap_or("") {
+        "execute" => ToolKind::Command,
+        "edit" | "delete" | "move" => ToolKind::FileChange,
+        "search"
+            if tool["rawInput"]["url"].is_string()
+                || tool["rawOutput"]["results"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|r| r["url"].is_string())) =>
+        {
+            ToolKind::WebSearch
+        }
+        "search" => ToolKind::FileSearch,
+        "fetch" => ToolKind::WebSearch,
+        "read" => ToolKind::Read,
+        "list" => ToolKind::List,
+        "subagent" => ToolKind::Subagent,
+        "plan" => ToolKind::Plan,
+        _ => ToolKind::Other,
+    };
+    let mut changes: Vec<_> = tool["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["type"] == "diff")
+        .filter_map(|part| {
+            let path = part["path"].as_str()?;
+            let mut change = FileChange::new(
+                path,
+                tool["kind"].as_str().unwrap_or("edit"),
+                &text_diff(
+                    part["oldText"].as_str().unwrap_or(""),
+                    part["newText"].as_str().unwrap_or(""),
+                ),
+            );
+            change.old_path = part["oldPath"].as_str().map(str::to_owned);
+            Some(change)
+        })
+        .collect();
+    if kind == ToolKind::FileChange && changes.is_empty() {
+        for location in tool["locations"].as_array().into_iter().flatten() {
+            if let Some(path) = location["path"].as_str() {
+                changes.push(FileChange::new(
+                    path,
+                    tool["kind"].as_str().unwrap_or("edit"),
+                    "",
+                ));
+            }
+        }
+    }
+    result_metadata(kind, changes, &tool["rawOutput"])
 }
 
 fn run(

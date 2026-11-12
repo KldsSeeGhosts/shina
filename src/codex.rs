@@ -1039,10 +1039,11 @@ impl Client {
                     }
                     _ => kind,
                 };
+                let metadata = tool_metadata(item);
                 if new {
-                    self.history.push(json!({"role":"assistant","content":[{"type":"toolCall","id":id,"name":name,"arguments":item}]}));
+                    self.history.push(json!({"role":"assistant","content":[{"type":"toolCall","id":id,"name":name,"arguments":item,"toolKind":metadata["toolKind"],"changes":metadata["changes"]}]}));
                     if emit {
-                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":item}));
+                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":item,"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
                 if done {
@@ -1053,11 +1054,18 @@ impl Client {
                     let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
                         || item["exitCode"].as_i64().is_some_and(|code| code != 0);
                     let content = json!([{"type":"text","text":output}]);
-                    self.history.push(json!({"role":"toolResult","toolCallId":id,"content":content,"isError":failed}));
+                    let mut result = metadata;
+                    result["content"] = content;
+                    result["details"] = json!({"codex":item,"exitCode":item["exitCode"]});
+                    let mut saved = result.clone();
+                    saved["role"] = json!("toolResult");
+                    saved["toolCallId"] = json!(id);
+                    saved["isError"] = json!(failed);
+                    self.history.push(saved);
                     if emit {
                         self.events
                             .push(json!({"type":"tool_execution_end","toolCallId":id,
-                        "result":{"content":content},"isError":failed}));
+                        "result":result,"isError":failed}));
                     }
                 }
             }
@@ -1442,3 +1450,42 @@ fn run(
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+/// Ported from KSG Code's CodexAdapterV2 item contracts, before output is flattened.
+fn tool_metadata(item: &Value) -> Value {
+    use crate::work::{FileChange, ToolKind, result_metadata};
+    let kind = match item["type"].as_str().unwrap_or("") {
+        "commandExecution" => ToolKind::Command,
+        "fileChange" => ToolKind::FileChange,
+        "fileSearch" => ToolKind::FileSearch,
+        "webSearch" | "webFetch" => ToolKind::WebSearch,
+        "readFile" | "imageView" => ToolKind::Read,
+        "listDirectory" => ToolKind::List,
+        "collabAgentToolCall" | "collabAgentSpawn" | "collabAgentInteraction" => ToolKind::Subagent,
+        "todoList" | "plan" => ToolKind::Plan,
+        _ => ToolKind::Other,
+    };
+    let changes = item["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            let path = change["path"].as_str()?;
+            let operation = change["kind"]["type"]
+                .as_str()
+                .or_else(|| change["kind"].as_str())
+                .unwrap_or("update");
+            let mut file = FileChange::new(path, operation, change["diff"].as_str().unwrap_or(""));
+            if let Some(moved) = change["kind"]["move_path"]
+                .as_str()
+                .or_else(|| change["kind"]["movePath"].as_str())
+            {
+                file.old_path = Some(file.path);
+                file.path = moved.into();
+                file.operation = "move".into();
+            }
+            Some(file)
+        })
+        .collect();
+    result_metadata(kind, changes, item)
+}

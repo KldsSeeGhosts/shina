@@ -3,6 +3,41 @@ use crate::model::{Status, Thread};
 use std::sync::Arc;
 
 #[test]
+fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
+    use crate::work::ToolKind::*;
+    for (native, expected) in [
+        ("execute", Command),
+        ("edit", FileChange),
+        ("search", FileSearch),
+        ("fetch", WebSearch),
+        ("read", Read),
+        ("list", List),
+        ("subagent", Subagent),
+        ("plan", Plan),
+        ("other", Other),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.ready = true;
+        client.running = true;
+        client.update(&json!({"sessionUpdate":"tool_call","toolCallId":"typed","title":"A provider title","kind":native,
+            "rawInput":{"command":"pwd","pattern":"foo"},"status":"completed",
+            "rawOutput":{"results":[{"fileName":"a.rs","line":3,"preview":"foo"}]},
+            "content":[{"type":"diff","path":"a.rs","oldText":"old\n","newText":"new\n"}]}));
+        let mut live = Thread::new(1);
+        for event in client.events {
+            live.apply(event);
+        }
+        let mut restored = Thread::new(2);
+        restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+        for thread in [&live, &restored] {
+            let tool = &thread.tools[0];
+            assert_eq!(tool.kind, Some(expected), "{native}");
+            assert_eq!(tool.changes[0].diff, "@@ -1,1 +1,1 @@\n-old\n+new\n");
+        }
+    }
+}
+
+#[test]
 fn file_prompts_use_negotiated_resources_or_path_text() {
     let directory = crate::store::directory().unwrap();
     let path = directory.join("resource.txt");

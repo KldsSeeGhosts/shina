@@ -1,6 +1,53 @@
 use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
+#[test]
+fn typed_items_survive_live_and_history_reduction() {
+    use crate::work::ToolKind::*;
+    for (native, expected) in [
+        ("commandExecution", Command),
+        ("fileChange", FileChange),
+        ("fileSearch", FileSearch),
+        ("webSearch", WebSearch),
+        ("readFile", Read),
+        ("listDirectory", List),
+        ("collabAgentToolCall", Subagent),
+        ("todoList", Plan),
+        ("unknown", Other),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "read-only"));
+        let item = json!({"id":"typed","type":native,"status":"completed","command":"pwd",
+            "changes":[{"path":"old.rs","kind":{"type":"update","move_path":"new.rs"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}],
+            "results":[{"fileName":"new.rs","line":2,"preview":"new","url":"https://example.com","title":"Example","snippet":"Text"}]});
+        client.item(&item, false, true);
+        client.item(&item, true, true);
+        let mut live = Thread::new(1);
+        for event in client.events {
+            live.apply(event);
+        }
+        let mut restored = Thread::new(2);
+        restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+        for thread in [&live, &restored] {
+            let tool = &thread.tools[0];
+            assert_eq!(tool.kind, Some(expected), "{native}");
+            if expected == FileChange {
+                assert_eq!(tool.changes[0].path, "new.rs");
+                assert_eq!(tool.changes[0].old_path.as_deref(), Some("old.rs"));
+                assert_eq!(
+                    (tool.changes[0].additions, tool.changes[0].deletions),
+                    (1, 1)
+                );
+            }
+            if expected == FileSearch {
+                assert_eq!(tool.structured["fileSearchResults"][0]["line"], 2);
+            }
+            if expected == WebSearch {
+                assert_eq!(tool.structured["webResults"][0]["title"], "Example");
+            }
+        }
+    }
+}
+
 fn spec(source: SessionSource, access: &str) -> Start {
     Start {
         id: "codex".into(),

@@ -36,6 +36,7 @@ mod tray;
 mod ui;
 mod update;
 mod visuals;
+mod work;
 
 use model::State;
 use rune::{AppSpec, Key, KeyEvent, Tx};
@@ -405,6 +406,9 @@ Error: none".into(),
         .into_iter()
         .enumerate()
         .map(|(block, child)| model::Tool {
+            kind: None,
+            changes: vec![],
+            input: serde_json::Value::Null,
             id: format!("delegate-{child}"),
             name: "mcp__shina__delegate_task".into(),
             detail: String::new(),

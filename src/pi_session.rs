@@ -225,6 +225,7 @@ impl Tool {
         self.exit_code = result["structuredContent"]["exit_code"]
             .as_i64()
             .or_else(|| result["details"]["exitCode"].as_i64());
+        self.accept_work_result(result);
     }
 }
 
