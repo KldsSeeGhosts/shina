@@ -44,6 +44,7 @@ pub enum SubmissionIntent {
     Alternate,
 }
 
+#[cfg(test)]
 pub fn submission_intent_for_key(
     event: &KeyEvent,
     key_repeat: bool,
@@ -91,10 +92,10 @@ pub fn submission_intent_for_command(
     if command == Some("composer.sendAlternate") && is_running {
         return Some(SubmissionIntent::Alternate);
     }
-    if command == Some("composer.sendBackground")
-        || command == Some("composer.sendAndNewThread")
-        || command.is_some()
-    {
+    if command == Some("composer.sendBackground") {
+        return Some(SubmissionIntent::Foreground);
+    }
+    if command == Some("composer.sendAndNewThread") || command.is_some() {
         return None;
     }
     if event.key != Key::Enter || event.mods.shift || event.mods.alt {

@@ -95,12 +95,10 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if ui::questionnaire_key(state, event) {
         return true;
     }
-    if state.undo_key(event, false) {
-        return true;
-    }
     if state.settings_menu && state.settings.shortcut_capture.is_some() {
         return false;
     }
+    let undo_active = state.expire_undo();
     let resolved = state.resolved_keybindings();
     let ctx = state.shortcut_context(state.current().draft.focused);
     let command = crate::keybindings::resolve_shortcut_command(
@@ -111,6 +109,13 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         tx.physical_key(),
         tx.key_base(),
     );
+    if command != Some("thread.undo")
+        && undo_active
+        && !matches!(event.key, rune::Key::Modifier { .. })
+        && let Some(notice) = &mut state.undo
+    {
+        notice.owns_text_key = false;
+    }
     let Some(command) = command else {
         return false;
     };
@@ -198,11 +203,24 @@ fn dispatch_global_command(
             }
         }
         "thread.undo" => {
-            if state.undo.is_some() {
+            if state.expire_undo() {
                 state.undo_thread_action();
             } else {
                 return false;
             }
+        }
+        "thread.steerQueuedMessage" => {
+            if tx.key_repeat() {
+                return true;
+            }
+            if state.current().request.is_some() {
+                return false;
+            }
+            let Some(id) = state.current().native.queue.front().map(|q| q.id) else {
+                return false;
+            };
+            state.current_mut().steer_queued(id);
+            state.checkpoint();
         }
         _ => return false,
     }

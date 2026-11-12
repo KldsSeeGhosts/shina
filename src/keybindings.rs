@@ -269,6 +269,24 @@ pub const STATIC_COMMANDS: &[&str] = &[
     "view.resetZoom",
 ];
 
+pub fn is_valid_command(command: &str) -> bool {
+    if STATIC_COMMANDS.contains(&command) {
+        return true;
+    }
+    let Some(id) = command
+        .strip_prefix("script.")
+        .and_then(|rest| rest.strip_suffix(".run"))
+    else {
+        return false;
+    };
+    !id.is_empty()
+        && id.len() <= 24
+        && (id.as_bytes()[0].is_ascii_lowercase() || id.as_bytes()[0].is_ascii_digit())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 pub fn default_keybinding_rules() -> Vec<KeybindingRule> {
     let mut rules = vec![
         rule("mod+b", "sidebar.toggle", None),
@@ -433,13 +451,14 @@ pub fn default_keybinding_rules() -> Vec<KeybindingRule> {
         rule("mod+l", "composer.focus", Some("!previewFocus")),
         rule("mod+=", "view.zoomIn", Some("!previewFocus")),
         rule("mod++", "view.zoomIn", Some("!previewFocus")),
+        rule("mod+shift+=", "view.zoomIn", Some("!previewFocus")),
         rule("mod+-", "view.zoomOut", Some("!previewFocus")),
         rule("mod+shift+-", "view.zoomOut", Some("!previewFocus")),
         rule("mod+0", "view.resetZoom", Some("!previewFocus")),
         rule(
             "escape",
             "thread.stop",
-            Some("turnRunning && !editableFocus"),
+            Some("turnRunning && (!editableFocus || composerFocus)"),
         ),
     ]);
     rules
@@ -793,30 +812,10 @@ pub fn matches_shortcut_modifiers(
     let expected_meta = shortcut.meta_key || (shortcut.mod_key && use_meta_for_mod);
     let expected_ctrl = shortcut.ctrl_key || (shortcut.mod_key && !use_meta_for_mod);
     let (meta_key, ctrl_key, shift_key, alt_key) = event_modifiers(event, platform);
-    if meta_key == expected_meta
+    meta_key == expected_meta
         && ctrl_key == expected_ctrl
         && shift_key == shortcut.shift_key
         && alt_key == shortcut.alt_key
-    {
-        return true;
-    }
-    // Cross-platform callers and tests on macOS may pass `ctrl: true, cmd: false` for a `mod+`
-    // binding (KSG's `mod` is Cmd on macOS and Ctrl elsewhere, and existing Shina tests send
-    // `ctrl: true, shift: true` on Enter for `thread.steerQueuedMessage`). Accept `ctrl` as `mod`
-    // when `mod_key` is set and `meta_key`/`logo` are not held, if the shortcut itself doesn't
-    // require `ctrl` separately.
-    if use_meta_for_mod
-        && shortcut.mod_key
-        && !shortcut.meta_key
-        && !shortcut.ctrl_key
-        && !meta_key
-        && ctrl_key
-        && shift_key == shortcut.shift_key
-        && alt_key == shortcut.alt_key
-    {
-        return true;
-    }
-    false
 }
 
 fn us_shifted_to_unshifted(c: char) -> Option<char> {
@@ -1589,6 +1588,9 @@ pub fn upsert_custom_rule(
     when: Option<&str>,
     replace: Option<(&str, &str, Option<&str>)>,
 ) -> Result<(), String> {
+    if !is_valid_command(command) {
+        return Err("Unknown keybinding command.".into());
+    }
     let parsed = parse_keybinding_shortcut(key).ok_or("Invalid keybinding.")?;
     let normalized_key = shortcut_to_keybinding_input(&parsed);
     let normalized_when = when
@@ -1825,5 +1827,167 @@ mod tests {
             ),
             Some("thread.previous")
         );
+    }
+
+    #[test]
+    fn validates_static_and_script_commands() {
+        assert!(is_valid_command("modelPicker.toggle"));
+        assert!(is_valid_command("script.build-app.run"));
+        assert!(!is_valid_command("script..run"));
+        assert!(!is_valid_command("script.Build.run"));
+        assert!(!is_valid_command("unknown.command"));
+    }
+
+    #[test]
+    fn global_shortcuts_preserve_existing_behavior_and_honour_overrides() {
+        let mut state = crate::model::State::new(std::path::PathBuf::new(), false);
+        state.populate_demo();
+        let initial_sidebar = state.sidebar;
+        let mut tx = rune::Tx::default();
+
+        // Mod+B toggles sidebar.
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('b'),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert_eq!(state.sidebar, !initial_sidebar);
+
+        // Mod+L focuses composer, Mod+K focuses search, Mod+Shift+P pins thread.
+        state.current_mut().draft.focused = false;
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('l'),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!(state.current().draft.focused);
+
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('k'),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!(state.search.focused);
+        state.search.focused = false;
+
+        let was_pinned = state.current().pinned();
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('p'),
+                Mods {
+                    cmd: true,
+                    shift: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert_eq!(state.current().pinned(), !was_pinned);
+
+        // Mod+= and Mod++ zoom in, Mod+- zooms out, Mod+0 resets zoom.
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('='),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!(state.zoom > 1.0);
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('+'),
+                Mods {
+                    cmd: true,
+                    shift: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('0'),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!((state.zoom - 1.0).abs() < 0.001);
+
+        // Escape while running stops even when composer is focused.
+        let (pi, _cmds, _) = crate::backend::Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().status = crate::model::Status::Running;
+        state.current_mut().draft.focused = true;
+        assert!(crate::key(
+            &mut state,
+            &ev(Key::Escape, Mods::default()),
+            &mut tx
+        ));
+
+        // Rebinding thread.undo works through the registry.
+        let id = state.current().id;
+        state.pin_thread(id);
+        let pinned_after_action = state.current().pinned();
+        upsert_custom_rule(
+            &mut state.preferences.keybindings,
+            "thread.undo",
+            "mod+shift+u",
+            Some("!terminalFocus && !editableFocus"),
+            None,
+        )
+        .unwrap();
+        state.current_mut().draft.focused = false;
+        assert!(!crate::key(
+            &mut state,
+            &ev(
+                Key::Command('z'),
+                Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert!(crate::key(
+            &mut state,
+            &ev(
+                Key::Command('u'),
+                Mods {
+                    cmd: true,
+                    shift: true,
+                    ..Default::default()
+                }
+            ),
+            &mut tx
+        ));
+        assert_eq!(state.current().pinned(), !pinned_after_action);
     }
 }

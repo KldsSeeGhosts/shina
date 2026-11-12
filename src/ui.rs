@@ -11310,7 +11310,8 @@ pub(crate) mod tests {
                 &rune::KeyEvent {
                     key: rune::Key::Enter,
                     mods: rune::Mods {
-                        ctrl: true,
+                        cmd: true,
+                        ctrl: cfg!(not(target_os = "macos")),
                         shift: true,
                         ..Default::default()
                     },

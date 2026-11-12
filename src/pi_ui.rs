@@ -324,6 +324,7 @@ fn composer_queue_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> b
         tx.key_base(),
     );
     let edit_latest = command == Some("thread.editQueuedMessage")
+        && s.current().queued_edit.is_none()
         && s.current().draft.focus == 0
         && s.current().draft.anchor == 0;
     let promote_next = command == Some("thread.steerQueuedMessage");
@@ -335,6 +336,9 @@ fn composer_queue_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> b
         return false;
     };
     let Some(id) = id else { return false };
+    if tx.key_repeat() {
+        return true;
+    }
     if edit_latest {
         s.current_mut().edit_queued(id);
     } else {
