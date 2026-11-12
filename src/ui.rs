@@ -14904,13 +14904,6 @@ pub(crate) mod tests {
 
             rt.state.current_mut().draft.replace_text("First draft");
             rt.state.current_mut().session = Some("warmed.jsonl".into());
-            rt.invalidate();
-            rt.frame(0.0);
-            assert!(
-                rt.presented("thread-1").is_some(),
-                "{width}: active warmed draft with text must be listed"
-            );
-
             rt.state.new_thread();
             let token = crate::composer_tokens::Token::File {
                 path: std::path::PathBuf::from("src/main.rs"),
@@ -14925,6 +14918,13 @@ pub(crate) mod tests {
             assert!(
                 rt.presented("thread-1").is_some(),
                 "{width}: inactive draft stays listed"
+            );
+            rt.state.select_thread(0);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-1").is_some(),
+                "{width}: the reopened draft keeps its row"
             );
             assert!(
                 rt.presented("thread-2").is_some(),
@@ -14953,6 +14953,7 @@ pub(crate) mod tests {
             );
 
             rt.state.current_mut().session = Some("saved.jsonl".into());
+            rt.state.current_mut().never_sent = false;
             rt.invalidate();
             rt.frame(0.0);
             let tree = rt.accessibility_json().to_string();

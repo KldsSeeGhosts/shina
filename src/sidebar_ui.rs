@@ -139,6 +139,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 continue;
             }
             let draft = !captain
+                && (record["session"].is_null() || record["neverSent"] == true)
                 && life.pinned_at.is_none()
                 && !life.settled()
                 && life.snoozed_at.is_none()
@@ -147,10 +148,8 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 && life.last_completed_at.is_none()
                 && view["messages"].as_array().is_none_or(Vec::is_empty)
                 && status_of_view(view) == Status::Ready;
-            // Match local draft-listing rules. Blank remote landing slots are not chats, unless
-            // the thread already has a session (e.g., an existing remote thread).
+            // Match local draft-listing rules. Blank remote landing slots are not chats.
             if draft
-                && record["session"].is_null()
                 && draft_text.trim().is_empty()
                 && !saved["richHtml"]
                     .as_str()

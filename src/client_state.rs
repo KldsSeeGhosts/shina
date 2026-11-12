@@ -1139,6 +1139,7 @@ impl State {
                 local.renamed = thread.renamed;
                 local.life = thread.life;
                 local.session = thread.session;
+                local.never_sent = thread.never_sent;
                 local.harness = thread.harness;
                 local.harness_context_sent = thread.harness_context_sent;
                 local.project = thread.project;

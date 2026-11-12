@@ -1678,6 +1678,7 @@ impl State {
             return;
         };
         let mut thread = Thread::new(self.next_id);
+        thread.never_sent = false;
         thread.harness = source.harness.clone();
         thread.models = source.models.clone();
         thread.harness_state["codexNativeExtensions"] =
