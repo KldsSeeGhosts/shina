@@ -100,6 +100,10 @@ impl Client {
     pub(crate) fn test_snapshot(&self, projection: Value) {
         *self.snapshot.lock().expect("client snapshot") = Some(projection);
     }
+    #[cfg(test)]
+    pub(crate) fn test_receipt(&self, command: Command, value: Value) {
+        self.output.send(Event::Receipt(command, value)).unwrap();
+    }
 
     #[cfg(test)]
     pub fn test_connected(directory: PathBuf) -> (Self, tokio::sync::mpsc::Receiver<Command>) {
@@ -615,6 +619,14 @@ async fn supervise(
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_TRANSACTIONS))
                 {
                     let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::COMPOSER_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.method == "thread.resume"
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::RUN_CONTROL))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::RUN_CONTROL_UPDATE_REQUIRED}})));
                     wake();
                     continue;
                 }

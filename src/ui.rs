@@ -8338,6 +8338,7 @@ fn composer_frame(s: &State, p: Palette) -> Color {
         p.frame
     }
 }
+/// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
@@ -8395,6 +8396,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     if t.request.is_some() {
         area = area.child(dialog(s, p));
     }
+    let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
@@ -8404,25 +8406,30 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         && (!t.native.operating() || t.queued_edit.is_some())
         && (t.phase != "Stopping" || t.queued_edit.is_some())
         && !t.queued_edit_saving()
-        && t.has_draft_content();
+        && !t.resume_pending()
+        && (t.has_draft_content() || show_resume);
     let mut send = el()
         .key("send-message")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(if t.queued_edit.is_some() {
+        .label(if t.resume_pending() {
+            "Resuming thread"
+        } else if show_resume {
+            "Resume thread"
+        } else if t.queued_edit.is_some() {
             if t.queued_edit_saving() {
                 "Updating queued message"
             } else {
                 "Update queued message"
             }
         } else if t.status.busy() {
-            if t.native.follow_up {
+            if t.follow_up_queues() {
                 "Queue message"
             } else {
                 "Steer message"
             }
         } else {
-            "Send message"
+            "Submit message"
         })
         .size(32.0, 32.0)
         .radius(4.0)
@@ -8431,7 +8438,9 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .press(if can_send { p.coral.alpha(0.8) } else { p.line })
         .fill(if can_send { p.coral } else { p.line })
         .child(icon(
-            if t.queued_edit.is_some() {
+            if show_resume {
+                "play"
+            } else if t.queued_edit.is_some() {
                 "check"
             } else {
                 "send"
@@ -8442,7 +8451,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     if can_send {
         send = framed(send, p);
     }
-    if can_send {
+    if can_send && show_resume {
+        send = send
+            .focusable(true)
+            .on_press(|s: &mut State| s.resume_thread());
+    } else if can_send {
         send = send.focusable(true).on_press_tx(|s: &mut State, tx| {
             let previous = s.current().native.follow_up;
             if tx.mods().cmd || tx.mods().ctrl {
@@ -8452,14 +8465,22 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             s.current_mut().native.follow_up = previous;
         });
     }
-    let action = if t.status.busy() && !s.demo && !t.has_draft_content() && t.queued_edit.is_none()
-    {
-        framed(
+    let mut action = row().gap(8.0).center_y();
+    if !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+        action = action.child(send);
+    }
+    if !s.demo && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some()) {
+        action = action.child(framed(
             el().key("stop-agent")
                 .role("button")
                 .cursor(rune::Cursor::Pointer)
-                .label("Stop agent")
+                .label(t.stop_control.label())
                 .focusable(true)
+                .disabled(
+                    t.stop_control.disabled()
+                        || !t.turn_capabilities().supports_interrupt
+                        || s.client.is_some() && !s.machine_connected(&s.machines.selected),
+                )
                 .size(32.0, 32.0)
                 .radius(4.0)
                 .center()
@@ -8468,10 +8489,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 .on_press(|s: &mut State| s.current_mut().stop())
                 .child(icon("stop", p.on_coral)),
             p,
-        )
-    } else {
-        send
-    };
+        ));
+    }
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
     let attach_locked = s.demo
         || t.archived()
@@ -8668,20 +8687,23 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         )
         .child(spacer())
         .child(model_effort_trigger(s, p, narrow, locked));
-    if t.status.busy() && t.has_draft_content() {
-        actions = actions
-            .child(button(
+    if t.status.busy() && t.has_draft_content() && t.queued_edit.is_none() {
+        actions = actions.child(
+            button(
                 "dispatch-mode",
-                if t.native.follow_up { "Queue" } else { "Steer" },
+                if t.follow_up_queues() {
+                    "Queue"
+                } else {
+                    "Steer"
+                },
                 p,
                 |s| {
                     let n = &mut s.current_mut().native;
                     n.follow_up = !n.follow_up;
                 },
-            ))
-            .child(icon_button("stop-agent", "Stop agent", "stop", p, |s| {
-                s.current_mut().stop()
-            }));
+            )
+            .disabled(!t.can_steer()),
+        );
     }
     if context_ring_shown(t) {
         actions = actions.child(context_ring(t, p));
@@ -11153,6 +11175,68 @@ pub(crate) mod tests {
                 }
             ));
             assert!(rt.state.current().native.queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn capability_labels_stop_target_and_resume_fit_at_supported_widths() {
+        use std::time::{Duration, Instant};
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (pi, _commands, _) = crate::backend::Pi::test_connection();
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.harness = "fixture-acp".into();
+            t.status = Status::Running;
+            t.run_id = Some("run-a".into());
+            t.draft.replace_text("Follow-up");
+            rt.frame(0.0);
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Queue message")
+            );
+            rt.state.current_mut().stop();
+            rt.invalidate();
+            rt.frame(0.0);
+            let (stop_rect, _) = rt.presented("stop-agent").unwrap();
+            assert!(rt.accessibility_json().to_string().contains("Stopping"));
+            rt.state.current_mut().draft.replace_text("Still typing");
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(rt.presented("stop-agent").unwrap().0[0], stop_rect[0]);
+            rt.state.current_mut().draft.replace_text("");
+            rt.state
+                .current_mut()
+                .tick_stop(Instant::now() + Duration::from_secs(10));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Stop generation"),
+                "phase {:?}, status {:?}, error {:?}, tree {}",
+                rt.state.current().stop_control.phase(),
+                rt.state.current().status,
+                rt.state.current().error,
+                rt.accessibility_json()
+            );
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"agent_settled","aborted":true}));
+            rt.state.current_mut().tick_stop(Instant::now());
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json().to_string();
+            assert!(tree.contains("Resume thread"), "{width}: {tree}");
+            assert!(tree.contains("Stopped"));
+            for key in ["composer", "send-message", "stop-agent"] {
+                let (rect, _) = rt.presented(key).unwrap();
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{width} {key} {rect:?}"
+                );
+            }
         }
     }
 

@@ -109,6 +109,7 @@ impl Thread {
         self.draft.set_caret(self.draft.text.len());
         self.prompt_history.reset();
         self.paste_history = Default::default();
+        self.composer_rules = Default::default();
     }
 
     pub fn cancel_queued_edit(&mut self) {
@@ -117,6 +118,9 @@ impl Thread {
             self.draft_images = edit.ordinary_images;
             self.attachment_error = edit.ordinary_error;
             self.draft.focused = true;
+            self.prompt_history.reset();
+            self.paste_history = Default::default();
+            self.composer_rules = Default::default();
         }
     }
 

@@ -579,6 +579,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if history_items { capabilities.push(protocol::HISTORY_ITEMS); }
                         if minor >= 7 { capabilities.extend([protocol::PEER_TASKS, protocol::THREAD_READ]); }
                         if minor >= 8 { capabilities.push(protocol::COMPOSER_TRANSACTIONS); }
+                        if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),

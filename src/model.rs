@@ -40,9 +40,14 @@ pub use background::{BackgroundSettings, BackgroundStatus};
 mod client_state;
 #[path = "queued_edit.rs"]
 mod queued_edit;
+#[path = "run_control.rs"]
+mod run_control;
 pub use queued_edit::QueuedEdit;
 #[cfg(test)]
 use queued_edit::queue_revision;
+#[cfg(test)]
+pub use run_control::StopPhase;
+pub use run_control::{StopControl, TurnCapabilities};
 #[path = "honcho.rs"]
 mod honcho;
 #[path = "memory.rs"]
@@ -51,6 +56,9 @@ mod memory;
 #[cfg(test)]
 #[path = "queued_edit_tests.rs"]
 mod queued_edit_tests;
+#[cfg(test)]
+#[path = "run_control_tests.rs"]
+mod run_control_tests;
 #[path = "scope.rs"]
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod scope;
@@ -320,6 +328,12 @@ pub struct BriefUi {
 pub struct Thread {
     pub peer_origin: Option<PeerOrigin>,
     pub stop_serial: u64,
+    pub run_id: Option<String>,
+    pub resumable_run_id: Option<String>,
+    pub continuation_of_run_id: Option<String>,
+    pub stop_control: StopControl,
+    run_control_supported: bool,
+    resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
     client_creating: Option<uuid::Uuid>,
@@ -489,6 +503,8 @@ impl Thread {
             && self.unused_session()
             && self.messages.is_empty()
             && !self.has_draft_content()
+            && self.remote_send.is_none()
+            && self.client_creating.is_none()
             && !self.configuring
             && !self.queued()
             && !self.renamed
@@ -560,6 +576,12 @@ impl Thread {
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
+            run_id: None,
+            resumable_run_id: None,
+            continuation_of_run_id: None,
+            stop_control: StopControl::default(),
+            run_control_supported: true,
+            resume_command: None,
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
             client_draft: false,
@@ -944,10 +966,15 @@ impl Thread {
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
+        self.native.queue_held = false;
         self.begin_prompt(prompt);
     }
 
     fn begin_prompt(&mut self, prompt: Prompt) {
+        self.run_id = Some(uuid::Uuid::new_v4().to_string());
+        self.resumable_run_id = None;
+        self.continuation_of_run_id = None;
+        self.stop_control = StopControl::default();
         self.native.initial_user = true;
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
         self.retry_prompt = Some(prompt.clone());
@@ -992,8 +1019,16 @@ impl Thread {
     }
 
     pub fn stop(&mut self) {
+        if self.remote.is_some() && !self.run_control_supported {
+            self.error = Some(crate::protocol::RUN_CONTROL_UPDATE_REQUIRED.into());
+            return;
+        }
+        if self.stop_control.disabled() && self.stop_control.target() == self.run_id.as_deref() {
+            return;
+        }
+        self.begin_stop();
         self.stop_serial = self.stop_serial.saturating_add(1);
-        if self.forward("thread.stop", json!({})) {
+        if self.forward("thread.stop", json!({"runId":self.run_id})) {
             return;
         }
         let _ = self.stop_task();
@@ -1011,7 +1046,7 @@ impl Thread {
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
-        self.return_local_queue();
+        self.native.queue_held = true;
         self.pending_injections.clear();
         self.injection_id = None;
         self.injection_retry_at = None;
@@ -1231,11 +1266,8 @@ impl Thread {
             return false;
         }
         if operation == "abort" {
-            self.disconnect();
-            self.pending_injections.clear();
-            self.complete_task("cancelled");
-            self.error =
-                Some("Pi did not stop within ten seconds. Its process was terminated.".into());
+            self.operation_deadline = None;
+            self.tick_stop(now);
         } else {
             self.fail_session(format!(
                 "Pi did not answer the {operation} operation before its deadline. Retry to resume."
@@ -1269,6 +1301,7 @@ impl Thread {
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
+        self.native.queue_held = true;
         self.disconnect();
         self.error = Some(error);
         self.status = Status::Failed;
@@ -1552,6 +1585,28 @@ impl Thread {
             return;
         }
         match string(&record, "type") {
+            "steering_restart" => {
+                let held = self.native.queue_held;
+                self.mark_stopped();
+                self.native.queue_held = held;
+                self.resumable_run_id = None;
+            }
+            "steer_delivery_unknown" => {
+                let mut images = content_images(&record["message"]["content"]);
+                images.extend(
+                    record["attachments"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Attachment::from_value),
+                );
+                self.messages.push(Message {
+                    role: "You",
+                    text: string(&record, "text").into(),
+                    images,
+                });
+                self.error = Some("ACP steering delivery could not be confirmed. The provider may have accepted this message, so Shina did not resend it.".into());
+            }
             "harness_update" => {
                 if record["field"] == "awareness" {
                     self.harness_context_sent = record["value"] == true;
@@ -1624,6 +1679,7 @@ impl Thread {
                         self.remove_optimistic_prompt(&prompt, index);
                     }
                     if matches!(command, "prompt" | "get_state" | "get_messages") {
+                        self.native.queue_held = true;
                         self.status = Status::Failed;
                         self.started = None;
                         self.complete_task("failed");
@@ -1633,6 +1689,10 @@ impl Thread {
                 match command {
                     "get_state" => {
                         let data = &record["data"];
+                        if data["turnCapabilities"].is_object() {
+                            self.harness_state["turnCapabilities"] =
+                                data["turnCapabilities"].clone();
+                        }
                         if self
                             .startup_selection_check
                             .as_ref()
@@ -1904,6 +1964,9 @@ impl Thread {
                 }
             }
             "agent_start" => {
+                if self.run_id.is_none() {
+                    self.run_id = Some(uuid::Uuid::new_v4().to_string());
+                }
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
                 self.assistant = None;
@@ -1924,6 +1987,8 @@ impl Thread {
                 let aborted = record["aborted"] == true;
                 if aborted {
                     self.mark_stopped();
+                } else {
+                    self.resumable_run_id = None;
                 }
                 self.finish_run();
                 // A stopped run is idle, not a finished task.
@@ -2110,6 +2175,8 @@ impl Thread {
     }
 
     fn mark_stopped(&mut self) {
+        self.resumable_run_id = self.run_id.clone();
+        self.native.queue_held = true;
         let elapsed = self
             .started
             .map(|at| at.elapsed().as_secs())
@@ -2263,6 +2330,40 @@ impl Thread {
         self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
+    fn restore_editor(&mut self, submitted: &TextEdit, attachments: &[Attachment]) {
+        if let Some(edit) = &mut self.queued_edit {
+            edit.ordinary = crate::composer_rich::prepend(submitted, &edit.ordinary);
+            let mut images = attachments.to_vec();
+            for image in &edit.ordinary_images {
+                if !images.iter().any(|existing| existing.id == image.id) {
+                    images.push(image.clone());
+                }
+            }
+            edit.ordinary_images = images;
+        } else {
+            let mut prompt = Prompt::new(String::new(), attachments.to_vec());
+            prompt.draft = Some(crate::composer_rich::Snapshot::capture(
+                submitted,
+                attachments,
+            ));
+            self.restore_prompt(&prompt);
+        }
+    }
+
+    fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) {
+        if !self
+            .remote_send
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == command)
+        {
+            return;
+        }
+        let (_, edit, images) = self.remote_send.take().unwrap();
+        if !accepted {
+            self.restore_editor(&edit, &images);
+        }
+    }
+
     fn finish_run(&mut self) {
         self.finish_retry(self.error.clone().as_deref());
         self.status = if self.error.is_some() {
@@ -2271,6 +2372,7 @@ impl Thread {
             Status::Completed
         };
         if self.status == Status::Failed {
+            self.native.queue_held = true;
             self.life.failed_at = Some(lifecycle::now());
         }
         self.elapsed = self
@@ -5482,6 +5584,9 @@ impl State {
         if self.ownership_denied {
             return;
         }
+        if self.current().resume_pending() {
+            return;
+        }
         if self.current().queued_edit.is_some() {
             self.current_mut().save_queued_edit();
             self.checkpoint();
@@ -5499,7 +5604,7 @@ impl State {
             if self.current().remote_send.is_some() || !self.current().has_draft_content() {
                 return;
             }
-            // Do not clear until its receipt arrives and this exact editor content still matches.
+            // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
             let target_machine = self.current().machine.clone();
             let prompt = match crate::composer_tokens::prompt_for(
@@ -5515,14 +5620,16 @@ impl State {
                 }
             };
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
                     self.current_mut().remote_send = Some((
                         id,
                         self.current().draft.clone(),
                         self.current().draft_images.clone(),
-                    ))
+                    ));
+                    self.current_mut().draft.replace_text("");
+                    self.current_mut().draft_images.clear();
                 }
                 Some(Err(error)) => self.storage_error = Some(error),
                 None => {}
@@ -6221,6 +6328,10 @@ impl State {
                     thread.title = record["title"].as_str()?.into();
                     thread.renamed = record["renamed"] == true;
                     thread.session = record["session"].as_str().map(str::to_owned);
+                    thread.run_id = record["runId"].as_str().map(str::to_owned);
+                    thread.resumable_run_id = record["resumableRunId"].as_str().map(str::to_owned);
+                    thread.continuation_of_run_id =
+                        record["continuationOfRunId"].as_str().map(str::to_owned);
                     if let Some(model) = record["model"].as_str() {
                         // Pi restores only CPA choices. ACP selections belong to its agent id.
                         let provider = if thread.harness == "pi" {
@@ -6719,6 +6830,7 @@ impl State {
                 let mut record = json!({
                 "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
                 "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
+                "runId":thread.run_id,"resumableRunId":thread.resumable_run_id,"continuationOfRunId":thread.continuation_of_run_id,
                 "memoryContext":thread.memory_context,
                 "scopeContextPending":thread.scope_context_pending,
                 "neverSent":thread.never_sent && thread.life.latest_user_message_at.is_none(),
@@ -7621,8 +7733,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_configuration_deadlines_disconnect_unresponsive_sessions() {
-        for operation in ["abort", "set_model", "set_thinking_level"] {
+    fn configuration_deadlines_disconnect_unresponsive_sessions() {
+        for operation in ["set_model", "set_thinking_level"] {
             let mut thread = Thread::new(1);
             let (_commands, _events) = fake_pi(&mut thread, Status::Running);
             thread.configuring = operation != "abort";

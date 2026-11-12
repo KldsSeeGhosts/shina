@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 8;
+pub const MINOR: u32 = 9;
+pub const RUN_CONTROL: &str = "run-control";
+pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to stop or resume a specific run.";
 pub const COMPOSER_TRANSACTIONS: &str = "composer-transactions";
 pub const COMPOSER_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to edit queued messages.";
@@ -73,6 +76,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         }
         "thread.send"
         | "thread.stop"
+        | "thread.resume"
         | "thread.configure"
         | "thread.retry"
         | "thread.visit"
@@ -319,6 +323,8 @@ pub enum SendMode {
     Prompt,
     Steer,
     Queue,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]

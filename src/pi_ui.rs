@@ -162,7 +162,15 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         )
                         .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
                             s.current_mut().respond(json!({"cancelled":true}))
-                        })),
+                        }))
+                        .child(if t.status.busy() || t.stop_control.phase().is_some() {
+                            icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
+                                s.current_mut().stop();
+                            })
+                            .disabled(t.stop_control.disabled())
+                        } else {
+                            el()
+                        }),
                 ),
         )
 }
@@ -312,15 +320,13 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
                 );
         } else {
             actions = actions
-                .child(button(
-                    &format!("queue-steer-{id}"),
-                    "Send now",
-                    p,
-                    move |s| {
+                .child(
+                    button(&format!("queue-steer-{id}"), "Send now", p, move |s| {
                         s.current_mut().steer_queued(id);
                         s.checkpoint();
-                    },
-                ))
+                    })
+                    .disabled(t.status.busy() && !t.can_steer()),
+                )
                 .child(
                     button(&format!("queue-edit-{id}"), "Edit", p, move |s| {
                         s.current_mut().edit_queued(id);

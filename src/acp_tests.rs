@@ -3,6 +3,111 @@ use crate::model::{Status, Thread};
 use std::sync::Arc;
 
 #[test]
+fn steering_requires_the_exact_identity_and_ownership_advertisement() {
+    for advertisement in [
+        Value::Null,
+        json!(true),
+        json!({"version":1}),
+        json!({"version":2,"idempotent":true,"holdsPrompt":true}),
+        json!({"version":1,"idempotent":false,"holdsPrompt":true}),
+        json!({"version":1,"idempotent":true,"holdsPrompt":false}),
+    ] {
+        assert!(!supports_active_steering(
+            &json!({"t3code/steering":advertisement})
+        ));
+    }
+    assert!(supports_active_steering(&json!({"t3code/steering":{
+        "version":1,"idempotent":true,"holdsPrompt":true,"futureField":true
+    }})));
+    let mut start = spec(SessionSource::New);
+    start.id = "github-copilot-cli".into();
+    let client = Client::new(start);
+    assert!(!client.turn_capabilities().supports_active_steering);
+    assert!(
+        !client
+            .turn_capabilities()
+            .supports_steering_by_interrupt_restart
+    );
+}
+
+#[test]
+fn native_steering_uses_the_prompt_turn_id_and_never_replays_an_uncertain_delivery() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client.active_steering = true;
+    client
+        .prompt(json!({"type":"prompt","id":"first","message":"Start"}))
+        .unwrap();
+    let prompt = client
+        .wire
+        .iter()
+        .find(|request| request["method"] == "session/prompt")
+        .unwrap();
+    let turn = prompt["params"]["_meta"]["t3code/turnId"].clone();
+    assert!(turn.is_string());
+    client
+        .command(
+            json!({"type":"prompt","id":"steer-a","message":"Steer","streamingBehavior":"steer"}),
+        )
+        .unwrap();
+    let steer = client
+        .wire
+        .iter()
+        .find(|request| request["method"] == "_t3/steer")
+        .unwrap()
+        .clone();
+    assert_eq!(steer["params"]["turnId"], turn);
+    assert_eq!(steer["params"]["messageId"], "steer-a");
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","id":steer["id"],"result":{"status":"unknown-future-status"}}),
+        )
+        .unwrap();
+    assert!(client.queued.is_empty());
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|event| event["type"] == "steer_delivery_unknown")
+    );
+}
+
+#[test]
+fn standard_acp_steering_restarts_after_cancellation_but_stop_wins_the_race() {
+    for stop in [false, true] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.ready = true;
+        client.session = Some("fixture-session".into());
+        client
+            .prompt(json!({"type":"prompt","id":"first","message":"Start"}))
+            .unwrap();
+        client.command(json!({"type":"prompt","id":"steer","message":"Redirect","streamingBehavior":"steer"})).unwrap();
+        assert!(client.wire.iter().any(|r| r["method"] == "session/cancel"));
+        if stop {
+            client
+                .command(json!({"type":"clear_queue","id":"clear"}))
+                .unwrap();
+            client.command(json!({"type":"abort","id":"stop"})).unwrap();
+        }
+        client.settle(true);
+        let prompts = client
+            .wire
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .count();
+        assert_eq!(prompts, if stop { 1 } else { 2 });
+        assert_eq!(
+            client
+                .events
+                .iter()
+                .any(|event| event["type"] == "steering_restart"),
+            !stop
+        );
+    }
+}
+
+#[test]
 fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
     use crate::work::ToolKind::*;
     for (native, expected) in [
@@ -420,7 +525,7 @@ fn capabilities_images_model_selection_queue_and_unknown_requests() {
     assert_eq!(prompt["params"]["prompt"][2]["mimeType"], "image/png");
     client
         .command(
-            json!({"type":"prompt","id":"queued","message":"next","streamingBehavior":"steer"}),
+            json!({"type":"prompt","id":"queued","message":"next","streamingBehavior":"followUp"}),
         )
         .unwrap();
     assert_eq!(client.queued.len(), 1);
