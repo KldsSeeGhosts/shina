@@ -115,6 +115,16 @@ impl RuntimeState {
                 "Server is draining for an update. Retry after restart or cancellation.".into(),
             );
         }
+        if matches!(
+            command.method.as_str(),
+            "peer.capabilities" | "peer.thread.status"
+        ) {
+            // Read polls do not grow the durable mutation-receipt history.
+            return self
+                .state
+                .execute_peer_command(device, &command)
+                .map(|result| json!({"status":"accepted","result":result}));
+        }
         if let Some(database) = &self.database {
             if let Some(receipt) = database.receipt(device, command.command_id)? {
                 if receipt.hash != command.hash() {
@@ -132,7 +142,9 @@ impl RuntimeState {
                 result: Value::Null,
                 seq: self.seq + 1,
             };
-            let result = if command.method == "devices.revoke" {
+            let result = if command.method.starts_with("peer.") {
+                self.state.execute_peer_command(device, &command)
+            } else if command.method == "devices.revoke" {
                 command.params["deviceId"]
                     .as_str()
                     .filter(|id| uuid::Uuid::parse_str(id).is_ok())
@@ -194,6 +206,10 @@ impl RuntimeState {
     }
 
     pub fn tick(&mut self) -> bool {
+        if self.failure.is_none() && !self.maintenance.fenced() && !self.validation_hold {
+            // Only the previous committed state may cause a remote effect.
+            self.state.dispatch_peer_work();
+        }
         let before = self.maintenance.status();
         if self.maintenance.advance(std::time::Instant::now()) {
             self.state.runtime_stop_requested = true;

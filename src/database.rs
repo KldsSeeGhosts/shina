@@ -96,7 +96,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 2 {
+        if version > 3 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         connection
@@ -125,6 +125,13 @@ impl Database {
             crate::maintenance::backup_state(directory)?;
             let tx = connection.transaction().map_err(error)?;
             tx.execute_batch(include_str!("migrations/002.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
+        if version < 3 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/003.sql"))
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -499,7 +506,7 @@ impl Database {
                 |r| r.get(0),
             )
             .map_err(error)?;
-        if scopes.contains(&"paired")
+        if (scopes.contains(&"paired") || scopes.contains(&"peer-delegate"))
             && inner
                 .connection
                 .query_row(
@@ -551,6 +558,26 @@ impl Database {
         let scopes: Vec<String> =
             serde_json::from_str(&text.ok_or("Authentication denied. Device unknown or revoked.")?)
                 .map_err(error)?;
+        // A peer's read grant is not a client subscription or host-filesystem grant.
+        // Its only thread access goes through the runtime's same-device origin fence.
+        if scopes.iter().any(|scope| scope == "peer-delegate")
+            && !matches!(
+                method,
+                "hello"
+                    | "command.get"
+                    | "peer.capabilities"
+                    | "peer.thread.launch"
+                    | "peer.thread.status"
+                    | "peer.thread.read"
+                    | "peer.thread.send"
+                    | "peer.thread.stop"
+            )
+            && !(method == "devices.revoke" && args["deviceId"] == id)
+        {
+            return Err(
+                "Permission denied. A peer may access only its own delegated threads.".into(),
+            );
+        }
         let scope = if method == "devices.revoke" && args["deviceId"] == id {
             "read"
         } else {
@@ -577,7 +604,72 @@ impl Database {
             )
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "paired"))
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| scope == "paired" || scope == "peer-delegate")
+            })
+    }
+
+    pub fn peers(&self) -> Result<Vec<crate::peer::Peer>, String> {
+        let inner = self.0.lock().expect("database");
+        let mut stmt = inner.connection.prepare(
+            "SELECT server_id,host,label,linked_at,capabilities,last_reached_at,last_error FROM peers ORDER BY label,server_id"
+        ).map_err(error)?;
+        stmt.query_map([], |row| {
+            Ok(crate::peer::Peer {
+                server_id: row.get(0)?,
+                host: row.get(1)?,
+                label: row.get(2)?,
+                linked_at: row.get::<_, i64>(3)? as u64,
+                capabilities: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                last_reached_at: row.get::<_, Option<i64>>(5)?.map(|n| n as u64),
+                last_error: row.get(6)?,
+            })
+        })
+        .map_err(error)?
+        .collect::<Result<_, _>>()
+        .map_err(error)
+    }
+
+    pub fn put_peer(&self, peer: &crate::peer::Peer) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        inner.connection.execute(
+            "INSERT INTO peers(server_id,host,label,linked_at,capabilities,last_reached_at,last_error)
+             VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(server_id) DO UPDATE SET
+             host=excluded.host,label=excluded.label,capabilities=excluded.capabilities,
+             last_reached_at=excluded.last_reached_at,last_error=excluded.last_error",
+            params![peer.server_id,peer.host,peer.label,peer.linked_at as i64,peer.capabilities.to_string(),peer.last_reached_at.map(|n|n as i64),peer.last_error]
+        ).map_err(error)?;
+        Ok(())
+    }
+
+    pub fn remove_peer(&self, id: &str) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        inner
+            .connection
+            .execute("DELETE FROM peers WHERE server_id=?1", [id])
+            .map_err(error)?;
+        Ok(())
+    }
+
+    pub fn update_peer_status(&self, peer: &crate::peer::Peer) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        // A probe must never recreate a link concurrently removed by acknowledged unlink.
+        inner.connection.execute(
+            "UPDATE peers SET capabilities=?2,last_reached_at=?3,last_error=?4 WHERE server_id=?1",
+            params![peer.server_id,peer.capabilities.to_string(),peer.last_reached_at.map(|n|n as i64),peer.last_error]
+        ).map_err(error)?;
+        Ok(())
     }
 
     pub fn device(&self, token: &str) -> Result<Option<String>, String> {

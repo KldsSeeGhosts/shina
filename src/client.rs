@@ -1136,7 +1136,32 @@ pub async fn remote_rpc(
     method: &str,
     args: Value,
 ) -> Result<Value, String> {
+    remote_request(
+        link,
+        Command::new(method, args),
+        method.starts_with("peer."),
+    )
+    .await
+}
+
+pub async fn remote_command(link: &crate::peer::Link, command: Command) -> Result<Value, String> {
+    remote_request(link, command, true).await
+}
+
+async fn remote_request(
+    link: &crate::peer::Link,
+    command: Command,
+    peer: bool,
+) -> Result<Value, String> {
     tokio::time::timeout(Duration::from_secs(8), async {
+        // Protocol 1.5 peers require a pre-credential identity check. Ordinary client
+        // connections retain compatibility with older additive protocol minors.
+        let pinned = if peer {
+            Some(crate::peer::pin(link).await?)
+        } else {
+            None
+        };
+        let link = pinned.as_ref().unwrap_or(link);
         let (mut socket, hello) = connect(
             &remote_discovery(link),
             &link.device_id,
@@ -1146,12 +1171,11 @@ pub async fn remote_rpc(
             Some(link),
         )
         .await?;
-        if method == "filesystem.browse" && !supports_browse(&hello) {
+        if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),
             );
         }
-        let command = Command::new(method, args);
         socket
             .send(wire_command(&command))
             .await

@@ -117,6 +117,26 @@ shina unlink <server-id-or-host>
 
 `devices` lists inbound grants on that host; `links` lists this client's outbound server links without tokens. `unlink` first asks the remote server to revoke this client's credential, then removes the local credential file. If the server is offline, it keeps the link and reports that revocation was not acknowledged. Revoke on the host instead when necessary. After a host revocation, automatic reconnect stops. Run `pair` on the host and explicitly `link` again to replace the denied credential.
 
+Server-to-server delegation uses a separate, outbound peer link. Run these commands on the target and home servers respectively, using the installed binary's full path where needed:
+
+```text
+# On the target server, through its local maintenance device
+shina pair --peer
+
+# On the captain's home server
+shina peer link <host> <peer-code>
+shina peer list
+shina peer unlink <server-id-or-host>
+```
+
+Peer codes have the same five-minute lifetime, single-use consumption and host-wide throttling as client codes. A peer has only `read` and `peer-delegate`. It can launch workers and read, send to or stop only threads that its credential created. It cannot subscribe to the workspace, browse arbitrary host folders, approve requests, maintain the host or link onward. Peer credentials live in the protected profile under `Shina/peers/<server-id>/credential.json`; the `peers` SQLite table and projections contain metadata only. Shina checks the answering server's identity before sending a credential, and refuses proxies and redirects.
+
+To replace a revoked peer credential, mint a fresh peer code and repeat `peer link` with the same host. Shina confirms that the old credential is revoked before replacing its protected file. It does not silently move an existing link to another address.
+
+`orchestrator_capabilities` and `list_captains` report peers and their cached reachability, projects, harnesses and models. In `delegate_task`, `target.machine` selects a peer by server id, host or label. `workspace` then names a project id or path on that server. The target repository must belong to the caller's workspace scope, matched by git remote. An explicit selector chooses a target checkout without expanding that scope. Without it, the caller's git remote must match exactly one target project. A stable `client_request_id` retries an uncertain launch without creating another worker. Sleeping machines leave the task pending, with retries between two seconds and five minutes. Cancellation commits at home immediately and remains owed until the target acknowledges it. Recovered results wait for review before delivery. Questions and approvals stay on the target; memory suggestions require the home captain's explicit `remember`.
+
+The Linked machines dialog's Peers section manages the local server's outbound links. On a linked remote view it lists that server's peers without maintenance controls. A remote task opens on its owning server if the desktop also has a client link to it; otherwise it opens the cached result excerpt.
+
 Codes have 48 bits of OS randomness, expire after five minutes, allow five exchange attempts per minute per host, and work once. Durable tokens have 256 bits of OS randomness. Servers store hashes and scopes in SQLite; clients store secrets outside repositories in `Shina/linked/<server-id>/credential.json`. Windows uses a protected current-user-only DACL. Unix uses a private directory and mode 0600 credential file. Tokens never enter argv or logs. Only the one-time code enters `link` argv. HTTP/WebSocket traffic uses Tailscale's encrypted transport; proxies, redirects and non-tailnet destinations are refused. MCP agents receive only their existing thread-bound MCP token, never a paired user credential, so they cannot answer approvals or mint credentials.
 
 Each desktop draft slot stores per-server UI state and last-known projections separately. Sleeping servers appear offline and reconnect with their own cursor and backoff. Cached threads remain readable. New commands and approvals are not queued offline, and work never falls back to Local. Projects use the selected server's absolute paths; remote workspace dialogs do not browse this client's filesystem. Image attachments upload in bounded, offset-checked chunks and validate their hash and image content before submission. Ordinary local file/folder references cannot be sent to another server.
@@ -388,7 +408,7 @@ The earlier layout's release build reported forced at-rest CPU times below 0.15 
 
 The full T3 thread-management port is on hold for a separate spec. Snooze and auto-wake, settle/unsettle rules, collapsible and paged settled shelves, drag between sections and undo notices are not implemented in this release. `Status::Settled` still means the Pi run finished, not that the user settled the thread. Future thread-list lifecycle fields must remain separate from process status.
 
-This is an initial desktop prototype. Login UI, git diffs, worktrees and cross-server captain delegation remain unfinished. Paired remote user clients are available as described in "Linking machines". Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
+This is an initial desktop prototype. Login UI, git diffs and worktrees remain unfinished. Paired remote clients and cross-server captain delegation are available as described in "Linking machines". Crash recovery resumes persisted Pi history, but cannot recover unsaved provider output or guarantee that retrying a tool action is safe. The transcript currently displays the latest 100 messages and the activity panel displays the latest 50 calls. Older transcript messages remain in Pi's session. Pi RPC records have a 64 MiB limit, so exceptionally image-heavy saved history can require inspection in Pi or a new Shina thread.
 
 The mark is a 32-cell pixel sailboat drawn by [`src/brand.rs`](src/brand.rs). The light theme shows a day sail with a sun, clouds and the three status dots as foam; the dark theme shows a night sail under a moon and stars. The window icon follows the saved theme at launch. The executable icon, favicons and Mac iconset use the night sail because they cannot follow the theme. Exports keep sharp pixels at every size. Regenerate them after changing the mark:
 

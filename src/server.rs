@@ -312,16 +312,22 @@ async fn pair(
     if headers.contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let result = shared.pairing.lock().expect("pairing").exchange(
+    let mut pairing = shared.pairing.lock().expect("pairing");
+    if pairing.is_peer() != (body["peer"] == true) {
+        let _ = pairing.exchange(&shared.database, "", "", crate::lifecycle::now());
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let result = pairing.exchange(
         &shared.database,
         body["code"].as_str().unwrap_or(""),
         body["deviceId"].as_str().unwrap_or(""),
         crate::lifecycle::now(),
     );
     match result {
-        Ok(token) => {
-            Json(json!({"serverId":shared.discovery.server_id,"token":token})).into_response()
-        }
+        Ok(token) => Json(
+            json!({"serverId":shared.discovery.server_id,"token":token,"peer":body["peer"]==true}),
+        )
+        .into_response(),
         Err(_) => StatusCode::FORBIDDEN.into_response(),
     }
 }
@@ -493,6 +499,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 2 { capabilities.push("coordinated-restart"); }
                         if minor >= 3 { capabilities.extend(["scoped-pairing","multi-server-clients","image-uploads"]); }
                         if minor >= 4 { capabilities.push(protocol::FILESYSTEM_BROWSE); }
+                        if minor >= 5 { capabilities.push(protocol::PEER_DELEGATION); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -515,7 +522,22 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     shared.database.devices()
                 } else if method == "devices.pair" {
                     if shared.remote { Err("Create pairing codes on the host.".into()) }
-                    else { shared.pairing.lock().expect("pairing").create(crate::lifecycle::now()) }
+                    else { shared.pairing.lock().expect("pairing").create_scoped(crate::lifecycle::now(), params.get("args").unwrap_or(params)["peer"] == true) }
+                } else if matches!(method, "peer.link" | "peer.list" | "peer.unlink") {
+                    // Host maintenance only. A peer-delegate credential can never link onward.
+                    let args = params.get("args").unwrap_or(params);
+                    let dispatch=if method=="peer.list" {Ok(None)} else {
+                        shared.database.claim_dispatch().and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
+                    };
+                    match dispatch {
+                        Err(error)=>Err(error),
+                        Ok(_dispatch)=>match method {
+                        "peer.link" => crate::peer::link_peer(&shared.directory,&shared.database,
+                            args["host"].as_str().unwrap_or(""),args["code"].as_str().unwrap_or("")).await.and_then(|peer|serde_json::to_value(peer).map_err(|e|e.to_string())),
+                        "peer.unlink" => crate::peer::unlink_peer(&shared.directory,&shared.database,
+                            args["server"].as_str().unwrap_or("")).await.map(|_| json!({})),
+                        _ => shared.database.peers().map(|peers|json!(peers.iter().map(crate::peer::Peer::summary).collect::<Vec<_>>())),
+                    }}
                 } else if method == "filesystem.browse" {
                     let args = params.get("args").unwrap_or(params);
                     let path = args["path"].as_str().unwrap_or("").to_string();
@@ -866,6 +888,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
 
 fn router(shared: Shared) -> Router {
     Router::new()
+        .route("/v1/identity", get(identity))
         .route("/v1/auth", post(authenticate))
         .route("/v1/pair", post(pair))
         .route("/v1/ws", get(upgrade))
@@ -875,6 +898,31 @@ fn router(shared: Shared) -> Router {
         .route("/v1/uploads/{id}/commit", post(upload_commit))
         .layer(axum::extract::DefaultBodyLimit::max(protocol::MAX_CONTROL))
         .with_state(shared)
+}
+
+async fn identity(State(shared): State<Shared>, headers: HeaderMap) -> Response {
+    if headers.contains_key("origin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(
+        json!({"serverId":shared.discovery.server_id,"label":machine_label(),
+        "peerDelegation":shared.discovery.protocol_minor >= 5}),
+    )
+    .into_response()
+}
+
+pub fn machine_label() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_else(|| "Shina".into())
+        })
 }
 
 #[cfg(test)]
@@ -901,6 +949,9 @@ mod tests {
             let database = crate::database::Database::open(&directory).unwrap();
             let mut state = crate::model::State::headless(directory.clone());
             state.load_global_for_test();
+            state.catalog.models.push(crate::session::AgentModel::from_value(
+                &json!({"provider":"cpa","id":"fixture","name":"Fixture","thinkingLevels":["off"]})
+            ).unwrap());
             let mut runtime = RuntimeState::from_state(state);
             runtime.database = Some(database.clone());
             let (calls, mut incoming) = mpsc::channel::<Call>(32);
@@ -1037,6 +1088,62 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let home=Fixture::new("peer-home").await;
+            let mut target=Fixture::new("peer-target").await;
+            let user=target.link(&target.shared.directory.join("client")).await;
+            let workspace=target.shared.directory.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            assert_eq!(crate::client::remote_rpc(&user,"project.put",json!({"path":workspace})).await.unwrap()["status"],"accepted");
+            let code=target.shared.pairing.lock().unwrap().create_scoped(crate::lifecycle::now(),true).unwrap()["code"].as_str().unwrap().to_owned();
+            let peer=crate::peer::link_peer(&home.shared.directory,&home.shared.database,&target.address.to_string(),&code).await.unwrap();
+            let link=peer.credential(&home.shared.directory).unwrap();
+            assert_eq!(home.shared.database.peers().unwrap().len(),1);
+            assert!(!serde_json::to_string(&peer).unwrap().contains(&link.token));
+            let scopes=target.shared.database.devices().unwrap();
+            let device=scopes.as_array().unwrap().iter().find(|d|d["deviceId"]==link.device_id).unwrap();
+            assert_eq!(device["scopes"],json!(["read","peer-delegate"]));
+            for method in ["server.stop","devices.pair","request.respond","peer.link","workspace.subscribe","thread.history","filesystem.browse","uploads.write"] {
+                assert!(target.shared.database.authorize(&link.device_id,method,&json!({})).is_err(),"{method}");
+            }
+            let command=Command::new("peer.thread.launch",json!({"projectId":1,"harness":"pi","provider":"cpa","model":"fixture",
+                "brief":"A bounded task","origin":{"deviceId":"forged","serverId":home.shared.discovery.server_id,"serverLabel":"Home",
+                "parentThreadId":1,"taskId":"task-1","captain":"Captain","memories":[]}}));
+            // Ignore the first reply, then retry the exact command and assert one creation.
+            let first=crate::client::remote_command(&link,command.clone()).await.unwrap();
+            assert_eq!(first["status"],"accepted","{first}");
+            let replay=crate::client::remote_command(&link,command.clone()).await.unwrap();
+            assert_eq!(first,replay);
+            let id=first["result"]["threadId"].as_u64().unwrap();
+            let snapshot=target.shared.snapshots.borrow().clone();
+            assert_eq!(snapshot["state"]["index"]["threads"].as_array().unwrap().iter().filter(|t|t["peerOrigin"]["taskId"]=="task-1").count(),1);
+            assert_eq!(snapshot["state"]["index"]["threads"].as_array().unwrap().iter().find(|t|t["id"]==id).unwrap()["peerOrigin"]["deviceId"],link.device_id);
+            let foreign=crate::client::remote_rpc(&link,"peer.thread.stop",json!({"threadId":1})).await.unwrap();
+            assert_eq!(foreign["status"],"rejected");
+            assert!(foreign["result"]["error"].as_str().unwrap().contains("did not create"));
+            let mut changed=command; changed.params["brief"]=json!("Different");
+            assert!(crate::client::remote_command(&link,changed).await.unwrap_err().contains("different payload"));
+            let mut wrong=link.clone(); wrong.server_id=home.shared.discovery.server_id.clone();
+            assert!(crate::client::remote_rpc(&wrong,"peer.capabilities",json!({})).await.unwrap_err().contains("No credential was sent"));
+            let delayed=Command::new("peer.thread.send",json!({"threadId":id,"message":"A delayed follow-up"}));
+            let stop=Command::new("peer.thread.stop",json!({"threadId":id,"sendCommandId":delayed.command_id}));
+            let stopped=crate::client::remote_command(&link,stop.clone()).await.unwrap();
+            assert_eq!(stopped,crate::client::remote_command(&link,stop).await.unwrap());
+            let cancelled=crate::client::remote_command(&link,delayed).await.unwrap();
+            assert_eq!(cancelled["result"]["cancelled"],true);
+            target.listener.abort();target.disconnect.send_replace(true);
+            tokio::task::yield_now().await;
+            assert!(crate::peer::unlink_peer(&home.shared.directory,&home.shared.database,&peer.server_id).await.is_err());
+            assert_eq!(home.shared.database.peers().unwrap().len(),1);
+            assert!(peer.credential(&home.shared.directory).is_ok());
+            target.listen().await;
+            target.shared.database.revoke(&link.device_id).unwrap();
+            assert!(crate::client::remote_rpc(&link,"peer.thread.status",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
+        });
     }
 
     #[test]
