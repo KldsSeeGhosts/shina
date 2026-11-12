@@ -3474,7 +3474,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let quiet = !selected && !thread.unread() && !thread.actionable();
     let shelved = matches!(section, Section::Snoozed | Section::Settled) && !captain_home;
     let title = label(
-        if draft && !thread.draft.text.is_empty() {
+        if draft && !thread.draft.text.trim().is_empty() {
             thread.draft.text.lines().next().unwrap_or(&thread.title)
         } else {
             &thread.title
@@ -14759,5 +14759,74 @@ pub(crate) mod tests {
             tick_portraits(&mut rt.state, now).is_none(),
             "reduced motion"
         );
+    }
+
+    #[test]
+    fn drafts_render_in_sidebar_when_active_inactive_pill_only_or_warmed_and_blank_does_not() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.frame(0.0);
+            assert!(rt.presented("thread-1").is_none(), "{width}: blank thread");
+
+            rt.state.current_mut().draft.replace_text("First draft");
+            rt.state.current_mut().session = Some("warmed.jsonl".into());
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-1").is_some(),
+                "{width}: active warmed draft with text must be listed"
+            );
+
+            rt.state.new_thread();
+            let token = crate::composer_tokens::Token::File {
+                path: std::path::PathBuf::from("src/main.rs"),
+                directory: false,
+            };
+            rt.state
+                .current_mut()
+                .draft
+                .insert_pill(token.id(), "main.rs");
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-1").is_some(),
+                "{width}: inactive draft stays listed"
+            );
+            assert!(
+                rt.presented("thread-2").is_some(),
+                "{width}: pill-only draft is listed"
+            );
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                tree.contains("Drafts") || tree.contains("DRAFTS"),
+                "{width}: Drafts heading shown"
+            );
+            assert!(tree.contains("First draft"), "{width}: draft title shown");
+        }
+    }
+
+    #[test]
+    fn restoring_conversation_line_is_absent_on_new_thread_and_present_for_saved_session() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().initializing = true;
+            rt.frame(0.0);
+            assert!(rt.presented("empty-state").is_some());
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                !tree.contains("Restoring conversation..."),
+                "{width}: new thread must not show Restoring conversation"
+            );
+
+            rt.state.current_mut().session = Some("saved.jsonl".into());
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                tree.contains("Restoring conversation..."),
+                "{width}: thread with saved session must show Restoring conversation"
+            );
+        }
     }
 }

@@ -445,7 +445,6 @@ impl Thread {
             && self.life.snoozed_at.is_none()
             && self.life.failed_at.is_none()
             && self.status == Status::Ready
-            && self.session.is_none()
             && self.messages.is_empty()
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
@@ -463,7 +462,6 @@ impl Thread {
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
             && self.status == Status::Ready
-            && self.session.is_none()
             && self.messages.is_empty()
             && !self.has_draft_content()
             && !self.configuring
@@ -490,7 +488,9 @@ impl Thread {
             || self.native_pending_turns()
     }
     pub fn has_draft_content(&self) -> bool {
-        !self.draft.text.trim().is_empty() || !self.draft_images.is_empty()
+        !self.draft.text.trim().is_empty()
+            || self.draft.pills().next().is_some()
+            || !self.draft_images.is_empty()
     }
     /// Add a validated attachment while preserving the text draft and its undo history.
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
@@ -1357,7 +1357,9 @@ impl Thread {
     }
 
     pub fn restoring_history(&self) -> bool {
-        self.initializing && !self.history_loaded
+        self.initializing
+            && !self.history_loaded
+            && (self.session.is_some() || self.native.fork_source.is_some())
     }
 
     fn reclaim_idle(&mut self, now: Instant) -> bool {
@@ -2894,16 +2896,17 @@ impl State {
         rows.extend(self.visible_sidebar_threads());
         rows
     }
-    /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
-    /// whatever it had when it was opened.
+    /// Whether an unsent draft has a "Drafts" row. Any unsent draft with content or a custom
+    /// title is listed, whether active or inactive. A blank draft is not listed unless it was
+    /// already listed when opened.
     pub fn draft_listed(&self, t: &Thread) -> bool {
         if !t.is_draft() {
             return false;
         }
-        match self.opened_draft {
-            Some((id, listed)) if id == t.id && id == self.current().id => listed,
-            _ => t.has_draft_content() || t.renamed,
+        if t.has_draft_content() || t.renamed {
+            return true;
         }
+        matches!(self.opened_draft, Some((id, true)) if id == t.id && id == self.current().id)
     }
     /// Records whether the open thread is a listed draft as it is opened or restored.
     fn capture_opened_draft(&mut self) {
@@ -3826,7 +3829,8 @@ impl State {
         // Keep an empty draft only in the short undo window, never as an archive row.
         if self.threads[i].blank_draft()
             && self.threads[i].messages.is_empty()
-            && self.threads[i].session.is_none()
+            && self.threads[i].life.latest_user_message_at.is_none()
+            && self.threads[i].life.last_completed_at.is_none()
         {
             self.delete_with_undo(std::collections::HashSet::from([id]), Action::Discard);
             return;
@@ -3835,7 +3839,10 @@ impl State {
         self.threads[i].draft.replace_text("");
         self.threads[i].draft_images.clear();
         self.threads[i].attachment_error = None;
-        if self.threads[i].messages.is_empty() && self.threads[i].session.is_none() {
+        if self.threads[i].messages.is_empty()
+            && self.threads[i].life.latest_user_message_at.is_none()
+            && self.threads[i].life.last_completed_at.is_none()
+        {
             self.threads[i].life.archived_at = Some(lifecycle::now());
         }
         self.remove_tab(id, false);
@@ -7843,9 +7850,10 @@ mod tests {
         assert!(state.sidebar_threads().is_empty(), "no empty Drafts rows");
         state.current_mut().draft.replace_text("A first prompt");
         let active = state.active;
-        assert!(
-            state.sidebar_threads().is_empty(),
-            "the open draft's row does not pop in while typing"
+        assert_eq!(
+            state.sidebar_threads(),
+            vec![active],
+            "a draft with content is listed in the sidebar even while active"
         );
         state.select_thread((active + 1) % state.threads.len());
         assert_eq!(state.sidebar_threads(), vec![active]);
@@ -7910,9 +7918,10 @@ mod tests {
             .current_mut()
             .draft
             .replace_text("Typing after launch");
-        assert!(
-            restored.sidebar_threads().is_empty(),
-            "a restored blank draft's row does not pop in while typing"
+        assert_eq!(
+            restored.sidebar_threads(),
+            vec![0],
+            "a restored draft with content is listed in the sidebar while active"
         );
 
         let mut state = State::new(".".into(), false);
@@ -12168,5 +12177,67 @@ mod tests {
             crate::attachments::read(&image).unwrap()
         );
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn drafts_stay_listed_with_text_pills_or_warmed_session_and_sent_threads_do_not() {
+        let mut state = State::new(".".into(), false);
+        assert!(
+            state.sidebar_threads().is_empty(),
+            "blank thread is not listed"
+        );
+
+        // Typing text in the active draft lists it immediately.
+        state.current_mut().draft.replace_text("First draft");
+        assert!(state.current().is_draft());
+        assert_eq!(state.sidebar_threads(), vec![0]);
+
+        // Warming a session on an unsent draft keeps it listed as a draft.
+        state.current_mut().session = Some("warmed-session.jsonl".into());
+        assert!(state.current().is_draft());
+        assert_eq!(state.sidebar_threads(), vec![0]);
+
+        // Switching to a second blank tab keeps the first draft listed and hides the blank tab.
+        state.new_thread();
+        assert_eq!(state.active, 1);
+        assert!(state.current().blank_draft());
+        assert_eq!(state.sidebar_threads(), vec![0]);
+
+        // A draft whose only content is a pill is also listed.
+        let token = crate::composer_tokens::Token::File {
+            path: PathBuf::from("src/main.rs"),
+            directory: false,
+        };
+        state.current_mut().draft.insert_pill(token.id(), "main.rs");
+        assert!(state.current().has_draft_content());
+        let listed = state.sidebar_threads();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&0) && listed.contains(&1));
+
+        // Sending a prompt turns the thread into a non-draft immediately.
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().send();
+        assert!(!state.threads[1].is_draft());
+        assert!(!state.draft_listed(&state.threads[1]));
+        let listed = state.sidebar_threads();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&0) && listed.contains(&1));
+    }
+
+    #[test]
+    fn restoring_history_only_triggers_for_threads_with_a_saved_session() {
+        let mut thread = Thread::new(1);
+        thread.initializing = true;
+        thread.history_loaded = false;
+        assert!(
+            !thread.restoring_history(),
+            "new thread without a session has no conversation to restore"
+        );
+
+        thread.session = Some("saved.jsonl".into());
+        assert!(thread.restoring_history());
+
+        thread.history_loaded = true;
+        assert!(!thread.restoring_history());
     }
 }
