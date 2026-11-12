@@ -33,8 +33,8 @@ Shina shows the user every thread, its status, and its transcript.
 
 Ordinary coding tasks need no Shina tools.
 
-Use html_preview with exactly one of html or path to check a self-contained page and receive a PNG, contentHeight and consoleMessages. \
-Use html_render with the same source, title and height to show a finished chart, mockup or status board in this conversation. \
+Use html_preview with exactly one of html or path to check a self-contained page and receive a PNG, contentHeight and consoleMessages when host screenshot capture is available (Windows and macOS). \
+Use html_render with the same source, title and height to publish a finished chart, mockup or status board as a card in this conversation; the card shows a preview image when the host can capture one, and the live page opens in its own window. \
 Only full-access threads may pass a path or inline local images, and pages cannot access Shina or private networks.
 
 - Captain homes are read-only coordinators. Read and plan there, and delegate code changes to \
@@ -257,7 +257,7 @@ pub fn tools() -> Value {
     let mut tools = json!([
         {
             "name":"html_render",
-            "description":"Show a finished HTML page inline in this thread. Pass exactly one of html or path. Use inline styles and scripts and theme CSS variables --background, --foreground, --card, --muted-foreground, --chart-1 to --chart-6, --radius, --font-sans and --font-mono. Let content set the height; viewport-height units are rejected. Local absolute image paths are inlined only in full access. Use html_preview to check height first.",
+            "description":"Publish a finished HTML page as a card in this conversation. The card shows a preview image when the host can capture one (Windows and macOS), and the live page opens in its own window. Pass exactly one of html or path. Use inline styles and scripts and theme CSS variables --background, --foreground, --card, --muted-foreground, --chart-1 to --chart-6, --radius, --font-sans and --font-mono. Let content set the height; viewport-height units are rejected. Local absolute image paths are inlined only in full access. Use html_preview to check height first when capture is available.",
             "inputSchema":{"type":"object","properties":{
                 "html":{"type":"string","minLength":1,"maxLength":512000},
                 "path":{"type":"string","description":"Absolute .html file path, full access only."},
