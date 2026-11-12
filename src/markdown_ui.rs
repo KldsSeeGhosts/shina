@@ -32,9 +32,9 @@ fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palet
     col()
         .key(format!("code-{identity}"))
         .min_w(0.0)
-        .radius(8.0)
-        .clip_rounded(8.0)
-        .border(0.5, p.line)
+        .radius(6.0)
+        .clip_rounded(6.0)
+        .border(1.0, p.line)
         .fill(p.code_bg)
         .child(
             row()
@@ -43,11 +43,7 @@ fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palet
                 .pr(6.0)
                 .gap(6.0)
                 .center_y()
-                .child(label(
-                    language,
-                    TextStyle::new(11.0, 400.0).family(rune::Family::SystemMono),
-                    p.muted,
-                ))
+                .child(pixel_label(language, p.muted))
                 .child(spacer())
                 .child(
                     icon_button(
@@ -61,6 +57,7 @@ fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palet
                     .on_press_tx(move |_: &mut State, tx| tx.copy(source.clone())),
                 ),
         )
+        .child(rule(p))
         .child(code)
 }
 
@@ -104,6 +101,13 @@ pub(super) fn render(
     } else {
         Cow::Borrowed(source)
     };
+    // The dark coral wash is too faint on the code fill to read as a removed line, so dark
+    // mode mixes in more of the danger colour.
+    let removed = if dark {
+        p.code_bg.mix(p.coral, 0.28)
+    } else {
+        p.coral_bg
+    };
     let style = MarkdownStyle::neutral(dark)
         .text(p.ink)
         .muted(p.muted)
@@ -112,15 +116,12 @@ pub(super) fn render(
         } else {
             prose_style(wide)
         })
-        .inline_code_bg(if dark {
-            Color::WHITE.alpha(0.07)
-        } else {
-            Color::BLACK.alpha(0.055)
-        })
-        .selection(p.teal_bg)
+        // Rune's inline code chip has a fixed corner radius; only its fill is ours.
+        .inline_code_bg(p.code_bg)
+        .selection(p.coral_bg)
         // The header frame owns the visible border. Rune's inner card has none.
         .code_block(p.code_bg, Color::TRANSPARENT)
-        .diff(p.teal.alpha(0.12), p.danger.alpha(0.10))
+        .diff(p.sea_bg, removed)
         .code_block_font(
             TextStyle::new(12.0, 400.0)
                 .family(rune::Family::SystemMono)
@@ -164,6 +165,7 @@ pub(super) fn render(
     if diffs.is_empty() {
         return ordinary(&source, &style, streaming, user, identity.into(), p);
     }
+    let diff_style = style.clone().code_block_padding(12.0, 4.0);
     let mut content = col().w_full().min_w(0.0).gap(12.0).selection_group(true);
     let mut from = 0;
     for (range, language, code) in diffs {
@@ -177,12 +179,14 @@ pub(super) fn render(
                 p,
             ));
         }
+        // Tinted rows run edge to edge, so the block keeps only a thin pad above the first row
+        // instead of the 12 px that would leave an empty line under the header.
         let diff = Markdown::new(&source[range.clone()])
             .streaming(streaming)
             .selectable(true)
             .copy_source(!user)
             .scroll_wide(true)
-            .render(&style);
+            .render(&diff_style);
         content = content.child(code_frame(
             diff,
             &language,

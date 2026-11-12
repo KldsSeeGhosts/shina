@@ -2,6 +2,18 @@
 
 Shina is a native Rust app built on [Rune](https://github.com/anomalyco/rune). Almost all UI lives in `src/ui.rs`.
 
+## Visual skin: Pixel Voyage
+
+The visual skin follows `docs/ui/pixel-voyage.md`: the palette, Departure Mono labels, Pixelarticons icons, 4 px and 6 px corners, 2 px pixel frames with hard shadows, and the horizon band and sea strip. Structure and behaviour are still ported from KSG Code, as described below. Where this section and the KSG Code section disagree about colour, type, radius or icons, the design document wins. Where they disagree about what goes where or what a click does, KSG Code wins.
+
+Notes for the skin in code:
+
+- `Palette` in `src/ui.rs` holds the colours. `pixel(size)`, `PIXEL` and `PIXEL_LABEL` are the Departure Mono styles. Use the face at 11 px or 22 px only, and only for labels, counts, timers, status words, badges and keycaps. Prose, titles, composer text and code stay Inter, Source Serif 4 and the system mono.
+- `framed`, `hard_shadow` and `pixel_portrait` draw the pixel frame. Rune has no blur in this skin and cannot move a button on press, so a pressed framed button darkens. Use `framed` (frame and shadow) only for things you act on. `outlined` (frame only) is for keycaps, counts and badges that only inform. Text colours are `ink`, `muted` and `faint`, all opaque; do not put an alpha on text.
+- `fn icon` takes names from `src/pixel_icons.rs`. The glyphs sit on a 24 unit grid and draw at `ICON` (18 pt), because 2 unit squares then land on whole device pixels at 2x. Pixelarticons is MIT; its licence is `assets/icons-LICENSE.txt`. Departure Mono is SIL OFL; its licence is next to the font.
+- `src/crisp.rs` scales pixel art to whole device pixels, because Rune samples images with a filter. Never hand Rune a portrait or the mark at a size that is not a whole multiple of its cells. Ask `Artwork::face_pixels` or `Artwork::mark_pixels` (and `Portraits::pixels` for animated stages) for the size in points, and keep slot sizes at multiples of the art where you can (40 pt for the 40 cell busts). The view tells `Artwork` the device scale each frame.
+- `src/horizon.rs` builds the scenery from the app mark's palette. Tests there and in `src/ui.rs` pin its geometry.
+
 ## Port UI from KSG Code. Do not invent it.
 
 KSG Code, the user's T3 Code fork, already has the interface the user wants. Its source is at `D:\AiStack\ksgcode` (web UI in `apps/web/src/components`). For any UI work, read the matching KSG Code component first and port its layout, spacing, typography, and behaviour into Rune. Design something new only when KSG Code has no equivalent, and say so when you do.

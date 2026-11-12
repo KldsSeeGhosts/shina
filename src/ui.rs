@@ -18,6 +18,8 @@ mod crew_ui;
 mod markdown_ui;
 #[path = "pi_ui.rs"]
 mod pi_ui;
+#[path = "pixel_icons.rs"]
+mod pixel_icons;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
 pub(crate) use pi_ui::questionnaire_key;
@@ -58,7 +60,9 @@ pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
     rows
 }
 
-// Sailcloth, chart paper and the night sky from brand.rs, with teal actions.
+// The two scenes of the icon (night sky, day sail) with a coral hull for the accent, set out
+// in docs/ui/pixel-voyage.md. Coral is the primary accent, brass marks anything waiting on the
+// user and sea marks running work and links.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color,
@@ -67,14 +71,27 @@ struct Palette {
     line: Color,
     ink: Color,
     muted: Color,
+    /// A quieter text colour for tool details, paths and machine names. Opaque, and 4.5:1 or
+    /// better on every surface text sits on, so it is never `muted` with an alpha.
+    faint: Color,
+    /// Hover tint over any surface.
     selected: Color,
-    teal: Color,
-    teal_bg: Color,
-    gold: Color,
+    /// Fill of the selected sidebar row.
+    row: Color,
+    coral: Color,
+    coral_bg: Color,
+    on_coral: Color,
+    brass: Color,
+    on_brass: Color,
+    sea: Color,
+    sea_bg: Color,
     danger: Color,
-    on_teal: Color,
-    badge_ring: Color,
-    teal_text: Color,
+    /// The 2 px pixel border, and the hard shadow it casts down and to the right.
+    frame: Color,
+    /// The outline of portraits and project tiles. In the dark theme it stays the darker navy,
+    /// so a face reads apart from the lighter frames of buttons, tabs and the composer.
+    portrait_frame: Color,
+    shadow: Color,
     field_line: Color,
     message_bg: Color,
     code_bg: Color,
@@ -85,52 +102,84 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#12161f"),
-            panel: color("#171c26"),
-            card: color("#202733"),
-            line: color("#e3dfd5").alpha(0.12),
-            ink: color("#efede6"),
-            muted: color("#b2b9c4"),
+            bg: color("#101727"),
+            panel: color("#162036"),
+            card: color("#1d2a45"),
+            line: color("#f4efe3").alpha(0.12),
+            ink: color("#f4efe3"),
+            muted: color("#9fb0cc"),
+            faint: color("#9dafca"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
-            selected: color("#a0bdcf").alpha(0.065),
-            teal: color("#70b9ad"),
-            teal_bg: color("#263f39"),
-            gold: color("#d3ba6b"),
+            selected: color("#9fb0cc").alpha(0.07),
+            row: color("#1d2a45").alpha(0.85),
+            coral: color("#e07a54"),
+            coral_bg: color("#e07a54").alpha(0.16),
+            on_coral: color("#1a0f0a"),
+            brass: color("#d3ba6b"),
+            on_brass: color("#1a0f0a"),
+            sea: color("#7ab4d2"),
+            sea_bg: color("#24406a"),
             danger: color("#f0a39c"),
-            on_teal: color("#0d1f1e"),
-            badge_ring: color("#12161f"),
-            teal_text: color("#89c8bc"),
-            field_line: color("#526173"),
-            message_bg: color("#263940"),
-            code_bg: color("#111720"),
+            // The document's #0a0f1c frame vanishes on these surfaces, so night frames are a
+            // lighter blue-grey and only the hard shadows stay near-black.
+            frame: color("#52688e"),
+            portrait_frame: color("#3a4a6c"),
+            shadow: color("#060a13"),
+            field_line: color("#3d507a"),
+            message_bg: color("#24406a"),
+            code_bg: color("#0c1220"),
         }
     } else {
         Palette {
-            bg: color("#ebe6da"),
+            // The day sky of the icon, between its #b9e0ee and white: the window and sidebar
+            // are sky, the sea strip is the horizon, and the chat pane is sailcloth.
+            bg: color("#d5e8ef"),
             panel: color("#f8f4ea"),
             card: color("#fffdf7"),
-            line: color("#34332d").alpha(0.12),
-            ink: color("#292923"),
-            muted: color("#605e55"),
-            selected: color("#34332d").alpha(0.075),
-            teal: color("#23776b"),
-            teal_bg: color("#e0ede7"),
-            gold: color("#8a6a2f"),
+            line: color("#1f2538").alpha(0.14),
+            ink: color("#1f2538"),
+            // The document's #5d6478 is 4.25:1 on a hovered sidebar row; this is 4.7:1.
+            muted: color("#565d71"),
+            faint: color("#595f73"),
+            selected: color("#1f2538").alpha(0.075),
+            row: color("#fffdf7").alpha(0.7),
+            coral: color("#d2643c"),
+            coral_bg: color("#d2643c").alpha(0.12),
+            // Cream on #d2643c is 3.7:1. Near-black reaches 5.2:1, so coral fills keep it.
+            on_coral: color("#1a0f0a"),
+            brass: color("#8a6a2f"),
+            on_brass: color("#fffdf7"),
+            sea: color("#1f6d62"),
+            sea_bg: color("#d6ebe4"),
             danger: color("#a33e38"),
-            on_teal: Color::WHITE,
-            badge_ring: color("#ebe6da"),
-            teal_text: color("#23776b"),
-            field_line: color("#bcb9ae"),
-            message_bg: color("#eae3d3"),
-            code_bg: color("#eeeadd"),
+            frame: color("#1f2538"),
+            portrait_frame: color("#1f2538"),
+            shadow: color("#1f2538").alpha(0.30),
+            field_line: color("#b5ac94"),
+            message_bg: color("#e0d6ba"),
+            code_bg: color("#ebe6d3"),
         }
     }
 }
 pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
+/// The pixel face: section labels, counts, timers, status words, badges and the wordmark. It is
+/// drawn for 11 px and its multiples, so use it at 11 or 22 only.
+pub const PIXEL_FAMILY: &str = "Departure Mono";
 pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/InterVariable.ttf"),
     include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
+    include_bytes!("../assets/fonts/DepartureMono-Regular.otf"),
 ];
+/// A Departure Mono style at 11 px (the grid it is drawn on) or 22 px.
+const fn pixel(size: f32) -> TextStyle {
+    TextStyle::new(size, 400.0)
+        .lh(size + 3.0)
+        .family(rune::Family::Named(PIXEL_FAMILY))
+}
+/// Section labels, counts and status words.
+const PIXEL: TextStyle = pixel(11.0);
+/// Section labels are uppercase with a little air between the letters.
+const PIXEL_LABEL: TextStyle = pixel(11.0).tracking(0.6);
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
 /// Assistant answers use Cursor's agent-window text: 15/24 sans with slightly tight tracking.
 const PROSE: TextStyle = TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.20);
@@ -141,6 +190,16 @@ const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10)
 const HEADING: TextStyle = TextStyle::new(30.0, 400.0)
     .lh(36.0)
     .tracking(-0.45)
+    .family(rune::Family::Named("Source Serif 4"));
+/// Dialog titles: Source Serif 4 at 20/600, tight.
+const DIALOG_TITLE: TextStyle = TextStyle::new(20.0, 600.0)
+    .lh(26.0)
+    .tracking(-0.2)
+    .family(rune::Family::Named("Source Serif 4"));
+/// A captain's name in the picker, the hero and the editor: Source Serif 4, tight.
+const CAPTAIN_SERIF: TextStyle = TextStyle::new(16.0, 600.0)
+    .lh(22.0)
+    .tracking(-0.2)
     .family(rune::Family::Named("Source Serif 4"));
 const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0)
     .lh(32.0)
@@ -182,7 +241,7 @@ fn lane_width(pane_width: f32, wide: bool) -> f32 {
 }
 /// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
 const TABULAR: &str = "'tnum' 1";
-const TIMER: TextStyle = ACTIVITY.features(TABULAR);
+const TIMER: TextStyle = PIXEL.features(TABULAR);
 const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
 /// The project line of a sidebar card.
@@ -208,7 +267,130 @@ fn spacer() -> El {
 fn rule(p: Palette) -> El {
     el().h(1.0).w_full().fill(p.line)
 }
+/// A hard 2 px shadow below and to the right, with no blur anywhere in the app.
+fn hard_shadow(p: Palette) -> rune::Shadow {
+    rune::Shadow {
+        x: 2.0,
+        y: 2.0,
+        blur: 0.0,
+        spread: 0.0,
+        color: p.shadow,
+        inset: false,
+    }
+}
+/// The pixel frame: a 2 px `frame` border and the hard shadow.
+fn framed(el: El, p: Palette) -> El {
+    el.border(2.0, p.frame).box_shadow(hard_shadow(p))
+}
+/// The pixel frame for something that only informs (a keycap, a count, the Demo badge): the
+/// outline without the hard shadow. Shadows belong to portraits, buttons you can press, the
+/// composer, menus and dialogs.
+fn outlined(el: El, p: Palette) -> El {
+    el.border(1.0, p.frame)
+}
+/// A scene from `horizon` as one shape of flat rectangles.
+fn scenery(rects: &[crate::horizon::Rect]) -> Shape {
+    rects.iter().fold(Shape::new(), |shape, r| {
+        let [red, green, blue] = r.color;
+        shape.fill(
+            vec![
+                [r.x, r.y],
+                [r.x + r.w, r.y],
+                [r.x + r.w, r.y + r.h],
+                [r.x, r.y + r.h],
+            ],
+            color(&format!("#{red:02x}{green:02x}{blue:02x}")),
+        )
+    })
+}
+/// The horizon band over the new-thread screen: `width` by `HORIZON_HEIGHT`, 6 px corners and
+/// a pixel frame. The frame is an overlay, so the scenery cannot paint over it.
+///
+/// The scenery is rebuilt only when the width, the theme or a captain's backdrop changes. Its
+/// polygons and colour strings are the costly part, and nothing else in the view moves them.
+fn horizon_band(width: f32, dark: bool, subject: crate::horizon::Subject, p: Palette) -> El {
+    let backdrop = match subject {
+        crate::horizon::Subject::Boat => (false, [0u8; 3]),
+        crate::horizon::Subject::Sky(rgb) => (true, rgb),
+    };
+    rune::memo(
+        "horizon-band",
+        (width.to_bits(), dark, backdrop),
+        move || {
+            let shape = scenery(&crate::horizon::band(width, HORIZON_HEIGHT, dark, subject));
+            // The scenery is clipped in its own layer, because a clipped element also clips its
+            // hard shadow.
+            el().key("horizon-band")
+                .w(width)
+                .h(HORIZON_HEIGHT)
+                .radius(6.0)
+                .box_shadow(hard_shadow(p))
+                .child(
+                    el().size(width, HORIZON_HEIGHT)
+                        .radius(6.0)
+                        .clip_rounded(6.0)
+                        .shape(shape),
+                )
+                .child(
+                    el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .radius(6.0)
+                        .border(2.0, p.frame)
+                        .a11y_hidden(),
+                )
+                .a11y_hidden()
+        },
+    )
+}
+/// Height of the horizon band, 36 cells of 3 pt.
+const HORIZON_HEIGHT: f32 = 108.0;
+/// Height of the sea strip at the foot of the sidebar, 9 cells of 3 pt.
+const SEA_HEIGHT: f32 = 27.0;
+/// A portrait in a pixel frame. The image sits under a border overlay, because Rune paints a
+/// clipped image over its own border. Below 30 px the frame is 1 px so the face keeps its room.
+fn pixel_portrait(pixels: &rune::Pixels, size: f32, p: Palette) -> El {
+    pixel_portrait_framed(pixels, size, p, p.portrait_frame)
+}
+/// `pixel_portrait` with its frame in another colour, for a selected portrait. The frame keeps
+/// its width, so the outer bounds do not change.
+fn pixel_portrait_framed(pixels: &rune::Pixels, size: f32, p: Palette, edge: Color) -> El {
+    let (radius, frame) = if size >= 30.0 { (4.0, 2.0) } else { (2.0, 1.0) };
+    el().size(size, size)
+        .radius(radius)
+        .box_shadow(hard_shadow(p))
+        .child(
+            el().size(size, size)
+                .radius(radius)
+                .clip_rounded(radius)
+                .pixels(pixels),
+        )
+        .child(
+            el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(radius)
+                .border(frame, edge),
+        )
+}
+/// Uppercase Departure Mono, for section labels and status words.
+fn pixel_label(value: &str, ink: Color) -> El {
+    label(value.to_uppercase(), PIXEL_LABEL, ink)
+}
+/// Departure Mono at 11 px as written, for counts, ages and timers.
+fn pixel_text(value: impl Into<String>, ink: Color) -> El {
+    label(value, PIXEL, ink)
+}
 fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    button_in(key, title, TextStyle::new(12.0, 450.0), p, action)
+}
+/// A quiet button whose label is Departure Mono, for the rows of state under the composer.
+fn pixel_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    button_in(key, title, PIXEL, p, action)
+}
+fn button_in(
+    key: &str,
+    title: &str,
+    style: TextStyle,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
     row()
         .key(key)
         .role("button")
@@ -219,239 +401,52 @@ fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'sta
         .gap(7.0)
         .px(10.0)
         .h(24.0)
-        .radius(5.0)
+        .radius(4.0)
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
-        .child(
-            label(title, TextStyle::new(12.0, 450.0), p.ink)
-                .truncate()
-                .shrink(),
-        )
+        .child(label(title, style, p.ink).truncate().shrink())
 }
+/// Icon size in points. The glyphs sit on a 24 unit grid of 2 unit squares, so 18 pt puts each
+/// square on 3 device pixels at 2x and keeps the edges hard. 16 pt lands on 2.67 and blurs.
+const ICON: f32 = 18.0;
+/// A Pixelarticons glyph (24 grid, 2 px squares).
 fn icon(kind: &str, ink: Color) -> El {
-    macro_rules! glyph {
-        ($name:ident,$body:expr) => {
-            static $name: Icon = Icon {
-                name: stringify!($name),
-                view: 16.0,
-                body: concat!(r#"<g stroke-width="1.5">"#, $body, "</g>"),
-            };
-        };
-    }
-    glyph!(
-        PLUS,
-        r#"<path d="M8 3v10M3 8h10" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        SIDEBAR,
-        r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor"/><path d="M6 2.5v11" stroke="currentColor"/>"#
-    );
-    glyph!(
-        COMPOSE,
-        r#"<path d="M8.5 3H4a1.5 1.5 0 0 0-1.5 1.5V12A1.5 1.5 0 0 0 4 13.5h7.5A1.5 1.5 0 0 0 13 12V7.5M8 8l5-5a1.1 1.1 0 0 0-1.5-1.5L6.5 6.5 6 9z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        CHEVRON_RIGHT,
-        r#"<path d="m6.5 4.5 3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        SEND,
-        r#"<path d="m4 7 4-4 4 4M8 3v10" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        CLOUD,
-        r#"<path d="M4.5 12.5a3 3 0 0 1-.6-5.95 4.2 4.2 0 0 1 8-.6 3.35 3.35 0 0 1 .1 6.55z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        PIN,
-        r#"<path d="m6 2 7 7-2.5.5L8 12 4 8l2.5-2.5zM6 10l-4 4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        CLOCK,
-        r#"<circle cx="8" cy="8.5" r="5" stroke="currentColor" fill="none"/><path d="M8 5.5v3.3l2 1.2M2 3l2-1M12 2l2 1" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        MORE,
-        r#"<circle cx="3" cy="8" r=".75" fill="currentColor"/><circle cx="8" cy="8" r=".75" fill="currentColor"/><circle cx="13" cy="8" r=".75" fill="currentColor"/>"#
-    );
-    glyph!(
-        LIST,
-        r#"<path d="M6 4h8M6 8h8M6 12h8M2 4h.5M2 8h.5M2 12h.5" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        BRANCH,
-        r#"<circle cx="4" cy="3" r="1.5" stroke="currentColor"/><circle cx="12" cy="3" r="1.5" stroke="currentColor"/><circle cx="4" cy="13" r="1.5" stroke="currentColor"/><path d="M4 4.5v7M12 4.5V6a3 3 0 0 1-3 3H4" stroke="currentColor" fill="none"/>"#
-    );
-    glyph!(
-        STOP,
-        r#"<rect x="4.5" y="4.5" width="7" height="7" rx=".5" fill="currentColor"/>"#
-    );
-    glyph!(
-        GRID,
-        r#"<rect x="2.5" y="3" width="11" height="10" rx="1" stroke="currentColor"/><path d="M2.5 6h11M7 3v10" stroke="currentColor"/>"#
-    );
-    glyph!(
-        ARCHIVE,
-        r#"<rect x="2.5" y="3" width="11" height="3" rx=".5" stroke="currentColor"/><path d="M3.5 6v7h9V6M6.5 9h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        BUBBLE,
-        r#"<path d="M3 3.5h10a1 1 0 0 1 1 1V10a1 1 0 0 1-1 1H7l-3 2.5V11H3a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        PANEL,
-        r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" fill="none"/><path d="M10 2.5v11" stroke="currentColor"/>"#
-    );
-    glyph!(
-        ISSUE,
-        r#"<circle cx="8" cy="8" r="5.5" stroke="currentColor" fill="none"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/>"#
-    );
-    glyph!(
-        BOLT,
-        r#"<path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
-    );
-    glyph!(DOT, r#"<circle cx="8" cy="8" r="3" fill="currentColor"/>"#);
-    glyph!(
-        THEME,
-        r#"<circle cx="8" cy="8" r="5.5" stroke="currentColor" fill="none"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/>"#
-    );
-    glyph!(
-        PENCIL,
-        r#"<path d="M10.5 2.5 13.5 5.5 6 13H3v-3z" fill="none" stroke="currentColor" stroke-linejoin="round"/><path d="m9 4 3 3" stroke="currentColor"/>"#
-    );
-    glyph!(
-        FILTER,
-        r#"<path d="M2.5 4.5h11M4.5 8h7M6.5 11.5h3" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        FOLDER_PLUS,
-        r#"<path d="M2 4.5c0-.83.67-1.5 1.5-1.5h2.6l1.4 1.5h5c.83 0 1.5.67 1.5 1.5v5.5c0 .83-.67 1.5-1.5 1.5h-9c-.83 0-1.5-.67-1.5-1.5z" stroke="currentColor" stroke-linejoin="round" fill="none"/><path d="M8 7v3.5M6.25 8.75h3.5" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        SETTINGS,
-        r#"<circle cx="8" cy="8" r="2" stroke="currentColor" fill="none"/><path d="M6.9 1.75h2.2l.35 1.6 1.2.7 1.55-.5 1.1 1.9-1.2 1.1v1.4l1.2 1.1-1.1 1.9-1.55-.5-1.2.7-.35 1.6H6.9l-.35-1.6-1.2-.7-1.55.5-1.1-1.9 1.2-1.1v-1.4L2.7 5.45l1.1-1.9 1.55.5 1.2-.7z" stroke="currentColor" stroke-linejoin="round" fill="none"/>"#
-    );
-    glyph!(
-        SUN,
-        r#"<circle cx="8" cy="8" r="2.75" stroke="currentColor" fill="none"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        MOON,
-        r#"<path d="M13 9.5A5.5 5.5 0 0 1 6.5 3a5.5 5.5 0 1 0 6.5 6.5z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        ALERT,
-        r#"<circle cx="8" cy="8" r="5.75" stroke="currentColor" fill="none"/><path d="M8 5v3.5" stroke="currentColor" stroke-linecap="round"/><circle cx="8" cy="11" r=".8" fill="currentColor"/>"#
-    );
-    glyph!(
-        FILE,
-        r#"<path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5zM9 1.5V5h4M5.5 8h5M5.5 10.5h3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        TERMINAL,
-        r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><path d="m4 6 2 2-2 2M8.5 10H12" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        EXPAND,
-        r#"<path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        IMAGE,
-        r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5" fill="none" stroke="currentColor"/><circle cx="5.5" cy="6" r="1.3" fill="currentColor"/><path d="m2.5 11 3-3 2.5 2.5 2-2 3 3" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        MONITOR,
-        r#"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1.25" fill="none" stroke="currentColor"/><path d="M5.5 13.5h5M8 11v2.5" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        PAPERCLIP,
-        r#"<path d="M13.5 7.5 8 13a3.5 3.5 0 0 1-5-5l5.75-5.75a2.25 2.25 0 0 1 3.2 3.2L6.2 11.2a1 1 0 0 1-1.4-1.4L10 4.6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        CHEVRON_LEFT,
-        r#"<path d="m9.5 4.5-3.5 3.5 3.5 3.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    // Lucide's `Minimize2`, the icon on KSG Code's Compact button.
-    glyph!(
-        MINIMIZE,
-        r#"<path d="M9.33 2.67v4h4M2.67 9.33h4v4M9.33 6.67 14 2M2 14l4.67-4.67" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        EYE,
-        r#"<path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8Z" fill="none" stroke="currentColor"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor"/>"#
-    );
-    glyph!(
-        BRAIN,
-        r#"<path d="M8 3a2 2 0 0 0-3.8-.8A2.5 2.5 0 0 0 2.5 6 3 3 0 0 0 3 11a2.5 2.5 0 0 0 5 1V3Zm0 0a2 2 0 0 1 3.8-.8A2.5 2.5 0 0 1 13.5 6 3 3 0 0 1 13 11a2.5 2.5 0 0 1-5 1M5 6l-2-1M11 6l2-1M5 10l-2 1M11 10l2 1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        WRENCH,
-        r#"<path d="M10 2a4 4 0 0 0-4.8 4.8l-3.5 3.5a2.1 2.1 0 0 0 3 3l3.5-3.5A4 4 0 0 0 13 5l-2.5 2.5L8.5 5.5 11 3Z" fill="none" stroke="currentColor" stroke-linejoin="round"/>"#
-    );
-    glyph!(
-        CREW,
-        r#"<circle cx="8" cy="5" r="2.5" fill="none" stroke="currentColor"/><path d="M3 14v-1a5 5 0 0 1 10 0v1" fill="none" stroke="currentColor" stroke-linecap="round"/>"#
-    );
-    glyph!(
-        COPY,
-        r#"<rect x="5" y="5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor"/><path d="M10 5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" fill="none" stroke="currentColor"/>"#
-    );
-    let glyph = match kind {
-        "plus" => &PLUS,
-        "minimize" => &MINIMIZE,
-        "paperclip" => &PAPERCLIP,
-        "back" => &CHEVRON_LEFT,
-        "monitor" => &MONITOR,
-        "sidebar" => &SIDEBAR,
-        "compose" => &COMPOSE,
-        "edit" => &PENCIL,
-        "send" => &SEND,
-        "thread" => &BUBBLE,
-        "cloud" => &CLOUD,
-        "panel" => &PANEL,
-        "issue" => &ISSUE,
-        "bolt" => &BOLT,
-        "dot" => &DOT,
-        "theme" => &THEME,
-        "settings" => &SETTINGS,
-        "filter" => &FILTER,
-        "folder-plus" => &FOLDER_PLUS,
-        "sun" => &SUN,
-        "moon" => &MOON,
-        "alert" => &ALERT,
-        "pin" => &PIN,
-        "clock" => &CLOCK,
-        "more" => &MORE,
-        "list" => &LIST,
-        "branch" => &BRANCH,
-        "stop" => &STOP,
-        "grid" => &GRID,
-        "archive" => &ARCHIVE,
-        "folder" => &rune_kit::glyphs::FOLDER,
-        "search" => &rune_kit::glyphs::SEARCH,
-        "chevron" => &rune_kit::glyphs::CHEVRON_DOWN,
-        "open" => &CHEVRON_RIGHT,
-        "lock" => &rune_kit::glyphs::LOCK,
-        "close" => &rune_kit::glyphs::CLOSE,
-        "file" => &FILE,
-        "terminal" => &TERMINAL,
-        "expand" => &EXPAND,
-        "image" => &IMAGE,
-        "eye" => &EYE,
-        "brain" => &BRAIN,
-        "wrench" => &WRENCH,
-        "crew" => &CREW,
-        "copy" => &COPY,
-        _ => &rune_kit::glyphs::CHECK_SMALL,
-    };
-    // A 1.5 px stroke on our 16 px grid matches Lucide's 2 px at 24 px.
-    rune::icon(glyph, 14.0).color(ink).a11y_hidden()
+    rune::icon(pixel_icons::glyph(kind), ICON)
+        .color(ink)
+        .a11y_hidden()
 }
 fn tool_icon(kind: &str, ink: Color) -> El {
-    icon(kind, ink).size(16.0, 16.0)
+    icon(kind, ink).size(ICON, ICON)
 }
 fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    framed(
+        row()
+            .key(key)
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(title)
+            .focusable(true)
+            .center_y()
+            .h(32.0)
+            .px(14.0)
+            .radius(4.0)
+            .fill(p.coral)
+            // Rune cannot move a button on press, so a pressed key darkens instead.
+            .press(p.coral.alpha(0.8))
+            .on_press(action)
+            .child(label(title, TextStyle::new(13.0, 600.0), p.on_coral)),
+        p,
+    )
+}
+/// The secondary action beside a primary one, such as Cancel: the same size and the 2 px frame,
+/// with no shadow and no fill, so the pair reads as one set.
+fn secondary_button(
+    key: &str,
+    title: &str,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
     row()
         .key(key)
         .role("button")
@@ -461,10 +456,13 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
         .center_y()
         .h(32.0)
         .px(14.0)
-        .radius(6.0)
-        .fill(p.teal)
+        .radius(4.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .hover(p.selected)
+        .press(p.selected)
         .on_press(action)
-        .child(label(title, TextStyle::new(13.0, 560.0), p.on_teal))
+        .child(label(title, TextStyle::new(13.0, 600.0), p.ink))
 }
 fn icon_button(
     key: &str,
@@ -480,7 +478,7 @@ fn icon_button(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(7.0)
+        .radius(4.0)
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
@@ -502,7 +500,7 @@ fn toggle_button(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(5.0)
+        .radius(4.0)
         .fill(if on { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(action)
@@ -520,27 +518,22 @@ fn shown_status(s: &State) -> Status {
 fn status_ink(status: Status, p: Palette) -> Color {
     match status {
         Status::Failed => p.danger,
-        Status::Waiting => p.gold,
-        Status::Running => p.teal_text,
+        Status::Waiting => p.brass,
+        Status::Running => p.sea,
         _ => p.muted,
     }
 }
-/// One status vocabulary everywhere: a dot for working, a ring for needs you, a square for
-/// failed, and a check for settled. Ready and offline have no mark.
+/// One status vocabulary everywhere, in squares: a filled one for working, a hollow one for
+/// needs you, a smaller filled one for failed, and a check for settled. Ready and offline get
+/// a faint square.
 fn status_mark(status: Status, p: Palette, size: f32) -> El {
     let ink = status_ink(status, p);
     match status {
-        Status::Running => el().size(size, size).radius(size / 2.0).fill(ink),
-        Status::Waiting => el()
-            .size(size, size)
-            .radius(size / 2.0)
-            .border((size / 3.5).max(1.5), ink),
-        Status::Failed => el().size(size - 1.0, size - 1.0).radius(1.5).fill(ink),
-        Status::Completed => icon("check", ink).size(size + 5.0, size + 5.0),
-        _ => el()
-            .size(size, size)
-            .radius(size / 2.0)
-            .fill(ink.alpha(0.6)),
+        Status::Running => el().size(size, size).fill(ink),
+        Status::Waiting => el().size(size, size).border(2.0, ink),
+        Status::Failed => el().size(size - 2.0, size - 2.0).fill(ink),
+        Status::Completed => icon("check", ink).size(size + 7.0, size + 7.0),
+        _ => el().size(size, size).fill(ink.alpha(0.6)),
     }
     .a11y_hidden()
 }
@@ -554,11 +547,11 @@ fn status(status: Status, p: Palette) -> El {
         .center_y()
         .gap(6.0)
         .child(status_mark(status, p, 6.0))
-        .child(label(status.label(), SMALL, status_ink(status, p)))
+        .child(pixel_text(status.label(), status_ink(status, p)))
 }
 /// Room for "Working for 59m 59s" in the chat header, so live status never reflows the row
 /// around it.
-const HEADER_STATUS_SLOT: f32 = 132.0;
+const HEADER_STATUS_SLOT: f32 = 156.0;
 /// A live status in a slot of fixed width. The text sits at the slot's end in tabular
 /// figures, never shrinks or truncates, and fades between values on Shina's motion curve, so
 /// "Ready" becoming "Working for 12m 05s" moves nothing beside it. Ready and Done show only
@@ -584,7 +577,7 @@ fn status_slot(key: &str, status: Status, text: Option<String>, width: f32, p: P
             .opacity_motion(slider_curve(false))
             .child(status_mark(status, p, 6.0))
             .child(
-                label(text, SMALL.features(TABULAR), status_ink(status, p))
+                label(text, PIXEL.features(TABULAR), status_ink(status, p))
                     .key(format!("{key}-text")),
             ),
     );
@@ -603,7 +596,7 @@ fn timer_label(seconds: u64) -> String {
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
     cx.foreground(p.ink);
-    cx.focus_ring(2.0, 2.0, p.teal);
+    cx.focus_ring(2.0, 2.0, p.coral);
     cx.caption_color(p.muted);
     // The sidebar portraits' animation clock lives outside the view and needs this setting.
     s.portraits.set_reduced_motion(cx.is_reduced_motion());
@@ -633,6 +626,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
     let zoom = s.zoom.clamp(0.5, 2.0);
+    // Pixel art is scaled to whole device pixels for this scale, so tell it what that is.
+    s.artwork.set_scale(cx.env().scale * zoom);
     let leading = if chrome.leading > 0.0 {
         (chrome.leading + 8.0) / zoom
     } else {
@@ -655,18 +650,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // Keep tabs aligned with the pane while reserving native controls inside
         // the sidebar header. At small zoom levels, keep actions and omit the logo.
         let padding = (leading - 8.0).max(8.0);
-        let show_logo = sidebar_width - padding - 16.0 >= 72.0;
+        // The header runs to the sidebar's edge, so the attention badge, which sits at its end,
+        // has room beside the 22 px wordmark in a 232 px sidebar, with 8 px between the mark and the name.
+        let line = sidebar_width - padding - 2.0;
         top = top.child(
-            sidebar_header(s, p, compact, show_logo)
+            sidebar_header(s, p, compact, line)
                 .w(sidebar_width)
                 .pl(padding)
-                .pr(16.0),
+                .pr(2.0),
         );
     } else {
         top = top.pl(leading.max(8.0));
         top = top.child(sidebar_toggle(p, compact));
     }
-    top = top.child(header(s, p, narrow, compact).grow(1.0).min_w(0.0));
+    // The tab strip's width from the last layout, for sharing it out among the tabs. The first
+    // frame guesses from the window.
+    let tabs_width = cx
+        .layout_with("thread-tabs", |r| r[2])
+        .unwrap_or((s.viewport_width - 400.0).max(200.0));
+    top = top.child(header(s, p, narrow, tabs_width).grow(1.0).min_w(0.0));
     let mut workspace = row().grow(1.0).min_h(0.0).px(8.0).pb(8.0);
     if docked {
         workspace = workspace.child(sidebar(s, p, sidebar_width));
@@ -717,8 +719,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .min_h(0.0)
         .fill(p.panel)
-        .radius(10.0)
-        .clip_rounded(10.0);
+        .radius(6.0)
+        .clip_rounded(6.0);
     // A captain home shows its Brief instead of session details: beside the chat, or as a
     // sheet over it on a narrow window.
     let brief = s.show_activity && captain_ui::brief_captain(s).is_some();
@@ -731,7 +733,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .grow(1.0)
             .min_w(0.0)
             .min_h(0.0)
-            .child(chat_header(s, p, narrow, compact));
+            .child(chat_header(s, p, narrow, compact))
+            // Scrolled messages are cut under the header, so give them a boundary.
+            .child(rule(p).key("chat-header-rule"));
         let main = if captain_ui::is_earlier(s) {
             main.child(conversation(s, p, wide, main_width))
                 .child(captain_ui::earlier_bar(s, p, wide, main_width))
@@ -757,6 +761,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         pane = pane.child(body);
     }
+    // The pane's 1 px `line` border sits over its content, which would otherwise paint across it.
+    pane = pane.child(
+        el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .radius(6.0)
+            .border(1.0, p.line)
+            .a11y_hidden(),
+    );
     let mut root = col()
         .key("workspace-root")
         .on_layout(|s: &mut State, rect| {
@@ -827,7 +838,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
     }
-    if docked && let Some(pill) = crew_ui::attention_row(s, p, sidebar_width < 240.0) {
+    if docked && let Some(pill) = crew_ui::attention_row(s, p) {
         root = root.child(pill);
     }
     if s.attention_menu && docked && !s.attention().is_empty() {
@@ -945,7 +956,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         .gap(7.0)
         .h(28.0)
         .px(8.0)
-        .radius(8.0)
+        .radius(4.0)
         .shrink()
         .min_w(0.0)
         .max_w(if narrow { 200.0 } else { 340.0 })
@@ -968,12 +979,12 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             14.0,
         ))
         .child(
-            label(name, TextStyle::new(13.0, 500.0), p.ink)
+            label(name, TextStyle::new(13.0, 600.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         )
-        .child(label(effort, TextStyle::new(13.0, 500.0), p.muted))
+        .child(pixel_text(effort, p.muted))
 }
 
 const PICKER_WIDTH: f32 = 320.0;
@@ -993,15 +1004,11 @@ fn settings_picker(s: &State, p: Palette) -> El {
             "Model and reasoning"
         })
         .w(PICKER_WIDTH)
-        .radius(14.0)
-        .clip_rounded(14.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(1.0, p.line)
-        .shadow(
-            12.0,
-            32.0,
-            Color::BLACK.alpha(if s.dark { 0.45 } else { 0.18 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {});
     card = if is_model {
         model_list(s, p, can_choose, 320.0, card)
@@ -1074,7 +1081,7 @@ fn sparkles(p: Palette) -> El {
                     el().absolute(0.0, y - size / 2.0)
                         .size(size, size)
                         .radius(size / 2.0)
-                        .fill(p.on_teal)
+                        .fill(p.brass)
                         .looping(rune::LoopSpec::opacity(period / 2.0, delay, 0.15, 0.95)),
                 ),
         );
@@ -1123,7 +1130,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                         title
                     },
                     TextStyle::new(15.0, 600.0),
-                    if count == 0 { p.muted } else { p.teal_text },
+                    if count == 0 { p.muted } else { p.sea },
                 )
                 .key("effort-title")
                 .align(rune::Align::Center)
@@ -1161,8 +1168,8 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .pin(Some(0.0), Some(2.0), Some(0.0), Some(2.0))
         .radius(12.0)
         .clip_rounded(12.0)
-        .fill(p.selected)
-        .border(0.5, p.line);
+        .fill(p.sea_bg)
+        .border(1.0, p.line);
     if count == 0 {
         return section.child(slider.child(track).opacity(0.5)).child(label(
             "This model has no reasoning levels.",
@@ -1170,7 +1177,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
             p.muted,
         ));
     }
-    let fill = |on: bool| if on { p.teal } else { Color::TRANSPARENT };
+    let fill = |on: bool| if on { p.coral } else { Color::TRANSPARENT };
     // One fill, ending at cap + frac * (width - cap): under the thumb at the lowest level and
     // at the track's far end at the top. The thumb covers the part past its centre.
     track = track.child(
@@ -1210,7 +1217,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 .fill(if Some(index) == shown {
                     Color::TRANSPARENT
                 } else if lit {
-                    p.on_teal.alpha(0.7)
+                    p.on_coral.alpha(0.7)
                 } else {
                     p.muted.alpha(0.55)
                 }),
@@ -1226,14 +1233,13 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 .child(el().key("effort-thumb-before").w(0.0).grow(frac))
                 .child(
                     el().key("effort-thumb").w(0.0).h(SLIDER_H).child(
-                        // Codex's thumb: white, a hairline edge, and a soft 2 px shadow.
+                        // Codex's thumb in the pixel skin: a `card` disc in a 2 px frame.
                         el().key("effort-thumb-knob")
                             .absolute(-cap, 0.0)
                             .size(SLIDER_H, SLIDER_H)
                             .radius(cap)
-                            .fill(Color::WHITE)
-                            .border(0.5, p.field_line)
-                            .shadow(0.0, 2.0, Color::BLACK.alpha(0.12)),
+                            .fill(p.card)
+                            .border(2.0, p.frame),
                     ),
                 )
                 .child(el().key("effort-thumb-after").w(0.0).grow(1.0 - frac)),
@@ -1366,7 +1372,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 .gap(6.0)
                 .h(30.0)
                 .px(10.0)
-                .radius(8.0)
+                .radius(4.0)
                 .fill(p.selected)
                 .grow(1.0)
                 .min_w(0.0)
@@ -1377,7 +1383,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                         .label("Search models")
                         .placeholder("Search models", p.muted)
                         .color(p.ink)
-                        .caret(p.teal, p.teal_bg)
+                        .caret(p.coral, p.coral_bg)
                         .grow(1.0)
                         .min_w(0.0)
                         .on_edit(|s: &mut State| &mut s.model_search),
@@ -1395,7 +1401,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
     let mut group: Option<String> = None;
     let mut count = 0;
     list = list.child(
-        label("Harness", TextStyle::new(11.5, 600.0), p.muted)
+        pixel_label("Harness", p.muted)
             .key("harness-group")
             .px(16.0)
             .pt(8.0)
@@ -1407,12 +1413,22 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .iter()
             .map(|agent| (agent.id.as_str(), agent.name.as_str())),
     );
+    let mut seen: Vec<&str> = Vec::new();
     for (id, name) in harnesses {
         let selected = t.harness == id;
         let enabled = t.can_choose_harness();
         let chosen = id.to_owned();
+        // An ACP agent can share an id with a built-in harness. The first entry keeps the
+        // plain key; a later one gets a suffix so keys stay unique.
+        let repeats = seen.iter().filter(|&&earlier| earlier == id).count();
+        seen.push(id);
+        let key = if repeats == 0 {
+            format!("choose-harness-{id}")
+        } else {
+            format!("choose-harness-{id}-{}", repeats + 1)
+        };
         let mut item = row()
-            .key(format!("choose-harness-{id}"))
+            .key(key)
             .role("option")
             .label(name)
             .checked(selected)
@@ -1423,11 +1439,11 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .pl(16.0)
             .pr(12.0)
             .fill(if selected {
-                p.teal_bg
+                p.coral_bg
             } else {
                 Color::TRANSPARENT
             })
-            .hover(if selected { p.teal_bg } else { p.selected })
+            .hover(if selected { p.coral_bg } else { p.selected })
             .disabled(!enabled)
             .child(harness_icon(s, p, id, name))
             .child(
@@ -1449,7 +1465,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         }
         item = item.child(spacer());
         if selected {
-            item = item.child(icon("check", p.teal_text));
+            item = item.child(icon("check", p.sea));
         }
         if enabled {
             item = item
@@ -1495,11 +1511,11 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .pl(16.0)
             .pr(12.0)
             .fill(if selected {
-                p.teal_bg
+                p.coral_bg
             } else {
                 Color::TRANSPARENT
             })
-            .hover(if selected { p.teal_bg } else { p.selected })
+            .hover(if selected { p.coral_bg } else { p.selected })
             .disabled(!can_choose)
             .child(provider_icon(
                 s,
@@ -1514,7 +1530,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                     .min_w(0.0),
             );
         if selected {
-            item = item.child(icon("check", p.teal_text));
+            item = item.child(icon("check", p.sea));
         }
         if can_choose {
             item = item
@@ -1584,39 +1600,59 @@ fn sidebar_toggle(p: Palette, compact: bool) -> El {
 
 /// The sidebar's half of the title strip, left-aligned as T3 Code lays it out: the sidebar
 /// toggle, then Shina's mark and name. Search and actions sit in the sidebar below.
-fn sidebar_header(s: &State, p: Palette, compact: bool, show_logo: bool) -> El {
-    let mut header = row()
-        .h(36.0)
-        .center_y()
-        .gap(8.0)
-        .child(sidebar_toggle(p, compact));
-    if show_logo {
-        header = header
-            .child(
-                // The 32-cell sail stays crisp at 24 px, an exact three-quarter scale on 2x displays.
-                el().key("shina-logo")
-                    .size(24.0, 24.0)
-                    .radius(5.0)
-                    .clip_rounded(5.0)
-                    .pixels(
-                        if s.dark {
-                            &s.artwork.mark_dark
-                        } else {
-                            &s.artwork.mark
-                        }
-                        .pixels(),
-                    ),
-            )
-            .child(label(
-                "Shina",
-                TextStyle::new(15.0, 650.0).tracking(-0.25),
-                p.ink,
-            ));
+fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32) -> El {
+    let mut header = row().h(36.0).center_y().child(sidebar_toggle(p, compact));
+    if line >= HEADER_TOGGLE + HEADER_MARK {
+        header = header.child(
+            el().key("shina-logo")
+                .size(HEADER_MARK, HEADER_MARK)
+                .radius(4.0)
+                .clip_rounded(4.0)
+                .pixels(&s.artwork.mark_pixels(s.dark, HEADER_MARK))
+                // The day mark's sky is the chrome's sky, so a 1 px frame keeps its edge. The
+                // frame is an overlay because Rune paints a clipped image over its border.
+                .child(
+                    el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .radius(4.0)
+                        .border(1.0, p.frame)
+                        .a11y_hidden(),
+                ),
+        );
+        // The name is Departure Mono at 22 px whenever the header has room for it beside the
+        // attention badge. Only a narrow sidebar sets it at 11 px, the face's other native size,
+        // and only a truly narrow one leaves the mark alone.
+        let badge = if s.attention().is_empty() {
+            0.0
+        } else {
+            8.0 + HEADER_BADGE
+        };
+        let before = HEADER_TOGGLE + HEADER_MARK + WORDMARK_GAP;
+        if line >= before + WORDMARK_WIDTH + badge {
+            header = header.child(
+                label("Shina", pixel(22.0), p.ink)
+                    .key("shina-wordmark")
+                    .ml(WORDMARK_GAP),
+            );
+        } else if line >= before + WORDMARK_WIDTH / 2.0 + badge {
+            header = header.child(
+                label("Shina", pixel(11.0), p.ink)
+                    .key("shina-wordmark")
+                    .ml(WORDMARK_GAP),
+            );
+        }
     }
     header
         .child(spacer())
         .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
 }
+/// The space between the mark and the wordmark. The toggle and the mark touch their boxes.
+const WORDMARK_GAP: f32 = 8.0;
+const HEADER_TOGGLE: f32 = 24.0;
+const HEADER_MARK: f32 = 24.0;
+/// The attention badge's width.
+const HEADER_BADGE: f32 = 20.0;
+/// "Shina" at 22 px: five cells of 14 px.
+const WORDMARK_WIDTH: f32 = 70.0;
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let mut side = col()
@@ -1629,6 +1665,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     // One row holds search and the sidebar's actions, as in T3 Code: filter by workspace,
     // add a workspace, and start a thread.
     let scoped = !s.scope_additional.is_empty() || s.project_scope != ProjectScope::All;
+    let mut scope_machine: Option<String> = None;
     let scope = if !s.scope_additional.is_empty()
         || !s.machines.scope_remote.is_empty() && s.project_scope != ProjectScope::All
     {
@@ -1662,12 +1699,17 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 }
                 .unwrap_or("Workspace");
                 if s.client.is_some() {
-                    format!("{name} · {}", s.machine_label(owner))
-                } else {
-                    name.into()
+                    scope_machine = Some(s.machine_label(owner));
                 }
+                name.into()
             }
         }
+    };
+    // The accessibility label and tooltip join the machine with a comma; the chip shows it as
+    // its own label.
+    let scope_words = match &scope_machine {
+        Some(machine) => format!("{scope}, {machine}"),
+        None => scope.clone(),
     };
     if let Some(notice) = crew_ui::recovery_banner(s, p) {
         side = side.child(notice);
@@ -1687,14 +1729,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .px(ROW_INSET)
                     .gap(8.0)
                     .center_y()
-                    .radius(8.0)
+                    .radius(4.0)
                     .grow(1.0)
                     .min_w(0.0)
-                    .fill(if s.search.focused || !s.search.text.is_empty() {
-                        p.selected
-                    } else {
-                        Color::TRANSPARENT
-                    })
+                    // A field: a 1 px `line` border, and a 2 px coral border while focused.
+                    .border(
+                        if s.search.focused { 2.0 } else { 1.0 },
+                        if s.search.focused { p.coral } else { p.line },
+                    )
                     .hover(p.selected)
                     .child(icon("search", p.muted))
                     .child(
@@ -1712,13 +1754,13 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .child(
                 toggle_button(
                     "project-scope",
-                    &format!("Workspace: {scope}"),
+                    &format!("Workspace: {scope_words}"),
                     "filter",
                     scoped,
                     p,
                     |s| s.open_picker(ProjectPicker::Scope),
                 )
-                .help(format!("Workspace: {scope}")),
+                .help(format!("Workspace: {scope_words}")),
             )
             .child(project_switcher(s, p).help("Add workspace"))
             .child(
@@ -1739,6 +1781,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .center_y()
                 .child(icon("folder", p.muted))
                 .child(label(&scope, SMALL, p.ink).truncate().shrink().min_w(0.0))
+                .child(match &scope_machine {
+                    Some(machine) => label(machine, SMALL, p.faint).truncate().max_w(MACHINE_CAP),
+                    None => el(),
+                })
                 .child(spacer())
                 .child(icon_button(
                     "clear-project-scope",
@@ -1784,7 +1830,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         let mut heading = section_title("Captains", p);
         if !captains.is_empty() {
             heading = heading.child(
-                label(captains.len().to_string(), SMALL, p.muted)
+                pixel_text(captains.len().to_string(), p.muted)
                     .key("captain-count")
                     .mr(6.0),
             );
@@ -1865,11 +1911,13 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         .filter(|entry| entry.draft)
         .collect();
     if !drafts.is_empty() {
+        if !captains.is_empty() {
+            content = content.child(dotted_rule(p));
+        }
         content = content.child(section_title("Drafts", p));
         for entry in drafts {
             content = content.child(sidebar_ui::row(s, p, entry));
         }
-        content = content.child(rule(p));
     }
     let mut first_shelf = true;
     for section in [
@@ -1905,6 +1953,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             let title = format!("{section:?}");
             let marker = format!("drop-{section:?}");
             let open = s.shelves[shelf];
+            content = content.child(dotted_rule(p));
             content = content.child(
                 row()
                     .key(&key)
@@ -1917,7 +1966,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .pr(8.0)
                     .gap(6.0)
                     .center_y()
-                    .radius(6.0)
+                    .radius(4.0)
                     .hover(p.selected)
                     .on_drawn_layout(move |s: &mut State, rect| {
                         s.drop_rects.insert(marker.clone(), rect);
@@ -1926,9 +1975,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         s.shelves[shelf] = !s.shelves[shelf];
                         s.checkpoint();
                     })
-                    .child(label(title, TextStyle::new(13.0, 460.0), p.muted))
+                    .child(pixel_label(&title, p.muted))
                     .child(spacer())
-                    .child(label(rows.len().to_string(), SMALL, p.muted))
+                    .child(pixel_text(rows.len().to_string(), p.muted))
                     .child(icon(if open { "chevron" } else { "open" }, p.muted)),
             );
         } else if dragging {
@@ -1940,11 +1989,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .h(28.0)
                     .px(8.0)
                     .center_y()
-                    .fill(if selected { p.teal_bg } else { p.selected })
+                    .fill(if selected { p.coral_bg } else { p.selected })
                     .on_drawn_layout(move |s: &mut State, rect| {
                         s.drop_rects.insert(marker.clone(), rect);
                     })
-                    .child(label(format!("{section:?}"), SMALL, p.muted)),
+                    .child(pixel_label(&format!("{section:?}"), p.muted)),
             );
         }
         let limit = if section == Section::Settled && s.search.text.is_empty() {
@@ -2004,7 +2053,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(notice) = &s.undo {
         let count = notice.entries.len();
         let title = format!(
-            "{}{} · Ctrl+Z",
+            "{}{}",
             notice.action.label(),
             if count > 1 {
                 format!(" {count}")
@@ -2012,7 +2061,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 String::new()
             }
         );
-        side = side.child(button("thread-undo", &title, p, |s| s.undo_thread_action()).h(32.0));
+        // The shortcut is a keycap beside the action, not text joined to it.
+        side = side.child(
+            button("thread-undo", &title, p, |s| s.undo_thread_action())
+                .label(format!("{title}, Ctrl+Z"))
+                .h(32.0)
+                .child(spacer())
+                .child(keycap_chip("Ctrl+Z", p)),
+        );
     }
     // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark. Settings
     // holds preferences such as the theme.
@@ -2051,6 +2107,24 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             )
             .child(spacer()),
     );
+    // The waterline of the app: a sea strip the footer icons sit above. It bleeds to the
+    // window's left and bottom edges (the workspace inset is 8 px) and runs the sidebar's full
+    // width, with square corners.
+    let bleed = width + 8.0;
+    let dark = s.dark;
+    side = side.child(rune::memo(
+        "sidebar-sea",
+        (bleed.to_bits(), dark),
+        move || {
+            el().key("sidebar-sea")
+                .w(bleed)
+                .h(SEA_HEIGHT)
+                .ml(-8.0)
+                .mb(-8.0)
+                .shape(scenery(&crate::horizon::strip(bleed, SEA_HEIGHT, dark)))
+                .a11y_hidden()
+        },
+    ));
     side
 }
 
@@ -2069,14 +2143,11 @@ fn settings_menu(s: &State, p: Palette) -> El {
         })
         .padding(4.0)
         .gap(1.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .child(
             menu_item(
                 "default-harness",
@@ -2133,13 +2204,13 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
         .cursor(rune::Cursor::Pointer)
         .label(title)
         .focusable(true)
-        .h(32.0)
+        .h(28.0)
         .px(8.0)
         .gap(10.0)
         .center_y()
-        .radius(6.0)
+        .radius(4.0)
         .hover(p.selected)
-        .child(el().size(16.0, 16.0).center().child(icon(glyph, p.muted)))
+        .child(el().size(ICON, ICON).center().child(icon(glyph, p.muted)))
         .child(
             label(title, TextStyle::new(13.0, 450.0), p.ink)
                 .grow(1.0)
@@ -2160,10 +2231,11 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .w(460.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(8.0, 24.0, Color::BLACK.alpha(0.15))
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -2171,11 +2243,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                 .child(
                     col()
                         .gap(2.0)
-                        .child(label(
-                            "Clone repository",
-                            TextStyle::new(14.0, 560.0),
-                            p.ink,
-                        ))
+                        .child(label("Clone repository", DIALOG_TITLE, p.ink))
                         .child(label(
                             "Uses your existing git and GitHub CLI login.",
                             SMALL,
@@ -2194,7 +2262,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(label("Repository", SMALL, p.muted))
+                .child(pixel_label("Repository", p.muted))
                 .child(
                     text_input(&projects.clone_source, BODY)
                         .key("clone-source")
@@ -2202,12 +2270,23 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                         .placeholder("owner/repo or https://github.com/owner/repo", p.muted)
                         .single_line()
                         .color(p.ink)
-                        .caret(p.teal, p.teal_bg)
+                        .caret(p.coral, p.coral_bg)
                         .w_full()
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(1.0, p.field_line)
+                        .border(
+                            if projects.clone_source.focused {
+                                2.0
+                            } else {
+                                1.0
+                            },
+                            if projects.clone_source.focused {
+                                p.coral
+                            } else {
+                                p.field_line
+                            },
+                        )
                         .disabled(cloning)
                         .on_edit(|s: &mut State| &mut s.projects.clone_source)
                         .on_submit(|s: &mut State, _| s.start_clone()),
@@ -2216,7 +2295,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(label("Clone into", SMALL, p.muted))
+                .child(pixel_label("Clone into", p.muted))
                 .child(
                     row()
                         .gap(8.0)
@@ -2248,7 +2327,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         );
     if s.machines.selected != "local" {
         card = card
-            .child(label("Destination path on this server", SMALL, p.muted))
+            .child(pixel_label("Destination path on this server", p.muted))
             .child(
                 text_input(&s.machines.project_path, BODY)
                     .key("remote-clone-path")
@@ -2256,7 +2335,18 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                     .single_line()
                     .w_full()
                     .padding(8.0)
-                    .border(1.0, p.field_line)
+                    .border(
+                        if s.machines.project_path.focused {
+                            2.0
+                        } else {
+                            1.0
+                        },
+                        if s.machines.project_path.focused {
+                            p.coral
+                        } else {
+                            p.field_line
+                        },
+                    )
                     .color(p.ink)
                     .on_edit(|s: &mut State| &mut s.machines.project_path),
             );
@@ -2292,16 +2382,12 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         );
     }
     let mut actions = row().gap(8.0).center_y().child(spacer());
-    actions = actions.child(
-        button(
-            "clone-cancel",
-            if cloning { "Stop" } else { "Cancel" },
-            p,
-            |s| s.close_clone_dialog(),
-        )
-        .h(32.0)
-        .border(0.5, p.line),
-    );
+    actions = actions.child(secondary_button(
+        "clone-cancel",
+        if cloning { "Stop" } else { "Cancel" },
+        p,
+        |s| s.close_clone_dialog(),
+    ));
     actions = actions.child(if cloning {
         primary_button("clone-start", "Cloning...", p, |_| {}).disabled(true)
     } else {
@@ -2358,9 +2444,9 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                     .gap(8.0)
                     .center_y()
                     .radius(6.0)
-                    .fill(p.teal_bg)
-                    .child(icon("send", p.teal_text))
-                    .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text)),
+                    .fill(p.sea_bg)
+                    .child(icon("send", p.sea))
+                    .child(label(title, TextStyle::new(12.5, 520.0), p.sea)),
             )
         }
         Status::Ready { update } => {
@@ -2380,11 +2466,11 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                 .gap(8.0)
                 .center_y()
                 .radius(6.0)
-                .fill(p.teal_bg)
+                .fill(p.sea_bg)
                 .disabled(blocker.is_some())
                 .a11y_value(description.unwrap_or_default())
-                .child(icon("send", p.teal_text))
-                .child(label(title, TextStyle::new(12.5, 520.0), p.teal_text));
+                .child(icon("send", p.sea))
+                .child(label(title, TextStyle::new(12.5, 520.0), p.sea));
             if blocker.is_none() {
                 button = button
                     .focusable(true)
@@ -2396,14 +2482,37 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
     }
 }
 
+/// A sidebar section label: Departure Mono, uppercase, muted. Counts and buttons follow it.
 fn section_title(title: &str, p: Palette) -> El {
     row()
         .h(30.0)
         .pl(ROW_INSET)
         .pr(4.0)
         .center_y()
-        .child(label(title, TextStyle::new(12.5, 500.0), p.muted))
+        .child(pixel_label(title, p.muted))
         .child(spacer())
+}
+/// The dotted divider (2 px on, 2 px off) between sidebar sections.
+fn dotted_rule(p: Palette) -> El {
+    el().h(1.0)
+        .mx(ROW_INSET)
+        .my(4.0)
+        .border(1.0, p.line)
+        .border_dash(2.0, 2.0)
+        .a11y_hidden()
+}
+/// A selected sidebar row: the `row` fill and a 3 px coral bar on the left edge, the full
+/// height of the row, with square ends. Hover is a fill only.
+fn select_bar(item: El, selected: bool, p: Palette) -> El {
+    if !selected {
+        return item;
+    }
+    item.fill(p.row).corners([0.0, 4.0, 4.0, 0.0]).child(
+        el().w(3.0)
+            .fill(p.coral)
+            .pin(Some(0.0), Some(0.0), None, Some(0.0))
+            .a11y_hidden(),
+    )
 }
 fn face_for(status: Status) -> crate::visuals::Face {
     use crate::visuals::Face;
@@ -2420,37 +2529,42 @@ fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> E
     portrait_avatar(s, p, portrait, size, status)
 }
 fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
+    portrait_face(s, p, captain, size, status, p.portrait_frame)
+}
+fn portrait_face(
+    s: &State,
+    p: Palette,
+    captain: usize,
+    size: f32,
+    status: Status,
+    edge: Color,
+) -> El {
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
-    let radius = if size >= 30.0 { 9.0 } else { 4.0 };
-    let portrait = el()
+    let pixels = s.artwork.face_pixels(captain, face_for(status), size);
+    let portrait = pixel_portrait_framed(&pixels, size, p, edge)
         .key(format!("avatar-{captain}-{}", size as u32))
-        .size(size, size)
-        .radius(radius)
-        .clip_rounded(radius)
-        .border(0.5, p.line)
-        .pixels(
-            if size < 30.0 {
-                s.artwork.small_face(captain, face_for(status))
-            } else {
-                s.artwork.face(captain, face_for(status))
-            }
-            .pixels(),
-        )
         .a11y_hidden();
     status_badge(p, portrait, size, status)
 }
 
+/// The portrait in the captain picker and the editor's grid. The head art is 40 cells, so 40
+/// points is a whole number of device pixels per cell at every integer window scale.
+const PICKER_PORTRAIT: f32 = 40.0;
 /// Every machine uses the same portrait size, including before a captain is selected.
 const CAPTAIN_SLOT: f32 = 44.0;
+/// A sidebar portrait is 40 px inside its 44 px slot, so the pixel frame's shadow fits in it.
+const CAPTAIN_FACE: f32 = 40.0;
 /// Room for one badge at the end of the name line, kept even when there is none, so a
 /// badge arriving never moves the name.
+/// The widest a machine name and its connection note grow beside a workspace or a detail.
+const MACHINE_CAP: f32 = 110.0;
+/// The least a machine name keeps when a row is tight: about seven characters and the ellipsis.
+const MACHINE_FLOOR: f32 = 48.0;
 const BADGE_SLOT: f32 = 28.0;
 /// Room for "59m 59s" at the end of the status line.
 const TIMER_SLOT: f32 = 48.0;
 const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
 const CAPTAIN_STATUS: TextStyle = TextStyle::new(12.5, 460.0);
-/// Running clocks use tabular digits so a ticking timer keeps its width.
-const SIDEBAR_TIMER: TextStyle = TextStyle::new(12.0, 520.0).features("'tnum' 1");
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -2467,15 +2581,10 @@ fn sidebar_portrait(
     let face = face_for(status);
     let pixels = s
         .portraits
-        .pixels(portrait, face)
-        .unwrap_or_else(|| s.artwork.face(portrait, face).pixels());
-    let radius = (size * 0.27).round();
-    el().key(format!("portrait-{row}"))
-        .size(size, size)
-        .radius(radius)
-        .clip_rounded(radius)
-        .border(0.5, p.gold.alpha(0.4))
-        .pixels(pixels)
+        .pixels(portrait, face, size)
+        .unwrap_or_else(|| s.artwork.face_pixels(portrait, face, size));
+    pixel_portrait(&pixels, size, p)
+        .key(format!("portrait-{row}"))
         .a11y_hidden()
         .on_visible(move |s: &mut State, on, tx| {
             s.portraits.set_visible(row, on);
@@ -2485,30 +2594,42 @@ fn sidebar_portrait(
         })
 }
 
-fn count_pill(count: usize, fill: Color, ink: Color) -> El {
+/// What a count badge counts. Brass is for what needs you, coral for what is unread, and sea
+/// for work in progress.
+#[derive(Clone, Copy)]
+pub(crate) enum CountKind {
+    NeedsYou,
+    Unread,
+    Working,
+}
+
+fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
     let text = if count > 9 {
         "9+".into()
     } else {
         count.to_string()
     };
+    let (fill, ink, frame) = match kind {
+        CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
+        CountKind::Unread => (p.coral, p.on_coral, p.frame),
+        CountKind::Working => (p.sea_bg, p.sea, p.sea),
+    };
+    // A square with Departure Mono digits and a 1 px frame, no shadow.
     row()
-        .h(16.0)
-        .min_w(16.0)
-        .px(5.0)
-        .radius(8.0)
+        .h(18.0)
+        .min_w(18.0)
+        .px(3.0)
+        .radius(2.0)
         .fill(fill)
+        .border(1.0, frame)
         .center()
-        .child(label(text, TextStyle::new(10.5, 650.0), ink))
+        .child(label(text, PIXEL, ink))
 }
 
 /// A row's hover and selection washes, after Grok Bot's bot list: ink at about 6% on hover
 /// and 8% when selected. Rune blends in linear light, so dark mode needs far less alpha.
-fn row_washes(s: &State, p: Palette) -> (Color, Color) {
-    if s.dark {
-        (p.ink.alpha(0.014), p.selected)
-    } else {
-        (p.ink.alpha(0.055), p.selected)
-    }
+fn row_washes(_: &State, p: Palette) -> (Color, Color) {
+    (p.selected, p.row)
 }
 
 /// A captain in the sidebar, laid out like Grok Bot's bot rows: a larger portrait, the name,
@@ -2559,14 +2680,14 @@ fn captain_row(
             if count > 0 {
                 parts.push(format!("{count} crew"));
             }
-            parts.join(" · ")
+            parts.join(", ")
         }
     };
     if let Some(workspace) = row_workspace(s, thread) {
         detail = if detail.is_empty() {
             workspace
         } else {
-            format!("{detail} · {workspace}")
+            format!("{detail}, {workspace}")
         };
     }
     if s.client.is_some() {
@@ -2574,7 +2695,7 @@ fn captain_row(
         detail = if detail.is_empty() {
             machine
         } else {
-            format!("{detail} · {machine}")
+            format!("{detail}, {machine}")
         };
     }
     let timer = (status == Status::Running)
@@ -2582,25 +2703,18 @@ fn captain_row(
         .flatten();
     let status_ink = match status {
         Status::Ready => p.muted,
-        Status::Completed => p.teal_text,
+        Status::Completed => p.sea,
         other => status_ink(other, p),
     };
     let mut status_line = row()
         .key(format!("captain-status-{id}"))
         .h(18.0)
-        .gap(4.0)
+        .gap(8.0)
         .center_y()
-        .child(
-            el().size(10.0, 10.0)
-                .center()
-                .child(status_mark(status, p, 6.0)),
-        )
-        .child(
-            label(status.label(), CAPTAIN_STATUS, status_ink).key(format!("captain-state-{id}")),
-        );
+        .child(pixel_text(status.label(), status_ink).key(format!("captain-state-{id}")));
     if !detail.is_empty() {
         status_line = status_line.child(
-            label(format!("· {detail}"), CAPTAIN_STATUS, p.muted)
+            label(detail.clone(), CAPTAIN_STATUS, p.muted)
                 .truncate()
                 .shrink()
                 .grow(1.0)
@@ -2613,7 +2727,7 @@ fn captain_row(
         status_line = status_line.child(
             label(
                 elapsed_label(start.elapsed().as_secs()),
-                SIDEBAR_TIMER,
+                PIXEL.features(TABULAR),
                 p.muted,
             )
             .key(format!("captain-timer-{id}"))
@@ -2622,9 +2736,12 @@ fn captain_row(
         );
     }
     let badge = if requests > 0 || status == Status::Waiting {
-        Some(count_pill(requests.max(1), p.gold, p.on_teal).key(format!("captain-attention-{id}")))
+        Some(
+            count_pill(requests.max(1), CountKind::NeedsYou, p)
+                .key(format!("captain-attention-{id}")),
+        )
     } else if unread > 0 {
-        Some(count_pill(unread, p.teal, p.on_teal).key(format!("captain-unread-{id}")))
+        Some(count_pill(unread, CountKind::Unread, p).key(format!("captain-unread-{id}")))
     } else {
         None
     };
@@ -2649,7 +2766,7 @@ fn captain_row(
                 .min_w(0.0),
         )
         .child(badges);
-    let size = CAPTAIN_SLOT;
+    let size = CAPTAIN_FACE;
     let portrait = captain_portrait(s, thread.captain);
     let (hover, active) = row_washes(s, p);
     let curve = |seconds| rune::Curve::tween(seconds, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
@@ -2660,42 +2777,47 @@ fn captain_row(
     if unread > 0 {
         description.push_str(&format!(", {unread} unread"));
     }
-    item.label(description)
-        .radius(10.0)
-        .fill(if selected { active } else { Color::TRANSPARENT })
-        .hover(hover)
-        .press(active)
-        .hover_motion(curve(0.15), curve(0.2))
-        .child(
-            row()
-                .grow(1.0)
-                .min_w(0.0)
-                .h(CAPTAIN_SLOT + 12.0)
-                .pl(6.0)
-                .pr(8.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    el().key(format!("portrait-slot-{id}"))
-                        .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
-                        .center()
-                        .child(sidebar_portrait(s, p, id, portrait, size, status)),
-                )
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(1.0)
-                        .child(name_line)
-                        .child(status_line),
-                ),
-        )
+    select_bar(
+        item.label(description)
+            .radius(4.0)
+            .fill(Color::TRANSPARENT)
+            .hover(hover)
+            .press(active)
+            .hover_motion(curve(0.15), curve(0.2)),
+        selected,
+        p,
+    )
+    .child(
+        row()
+            .grow(1.0)
+            .min_w(0.0)
+            .h(CAPTAIN_SLOT + 12.0)
+            .pl(6.0)
+            .pr(8.0)
+            .gap(10.0)
+            .center_y()
+            .child(
+                el().key(format!("portrait-slot-{id}"))
+                    .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
+                    .center()
+                    .child(sidebar_portrait(s, p, id, portrait, size, status)),
+            )
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(1.0)
+                    .child(name_line)
+                    .child(status_line),
+            ),
+    )
 }
 
 /// The corner mark that shows a portrait's status in pickers and headers.
 fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
     if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
-        // A backing disc in the surface color keeps the mark readable over the artwork.
+        // A small square in the panel color, with a 1 px frame, keeps the mark readable over
+        // the artwork. Every live avatar sits on the panel (chat turns, the hero, the brief).
         let (backing, mark) = if size <= 16.0 {
             (8.0, 5.0)
         } else if size >= 30.0 {
@@ -2707,8 +2829,9 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
         return el().size(size, size).child(portrait).child(
             el().absolute(offset, offset)
                 .size(backing, backing)
-                .radius(backing / 2.0)
-                .fill(p.badge_ring)
+                .radius(2.0)
+                .fill(p.panel)
+                .border(1.0, p.frame)
                 .center()
                 .child(status_mark(status, p, mark))
                 .a11y_hidden(),
@@ -2721,7 +2844,7 @@ fn captain_status_chip(status: Status, p: Palette) -> El {
         .center_y()
         .gap(5.0)
         .child(status_mark(status, p, 6.0))
-        .child(label(status.label(), SMALL, status_ink(status, p)))
+        .child(pixel_text(status.label(), status_ink(status, p)))
 }
 /// A sidebar row's status, and whether it waits on an approval: a pending request, or a
 /// worker's approval, outranks the run. A captain's home stands for its whole crew.
@@ -2852,12 +2975,8 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         ))
         .focusable(true)
         .w_full()
-        .radius(8.0)
-        .fill(if selected {
-            p.selected
-        } else {
-            Color::TRANSPARENT
-        })
+        .radius(4.0)
+        .fill(Color::TRANSPARENT)
         .hover(p.selected)
         .on_press_tx(move |s: &mut State, tx| {
             s.click_thread(index, tx.mods());
@@ -2891,16 +3010,17 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     if captain_home && !nested {
         return captain_row(s, p, thread, item, row_status, approval, selected);
     }
+    let item = select_bar(item, selected, p);
 
     // The mark only shows what deserves a glance: work in progress, something that needs the
     // user, a failure, an unread result, a draft or a pin. Quiet rows leave it out.
-    let dot = |ink: Color| el().size(7.0, 7.0).radius(3.5).fill(ink);
+    let dot = |ink: Color| el().size(6.0, 6.0).fill(ink);
     let mark = if approval || thread.request.is_some() || row_status == Status::Waiting {
-        Some(dot(p.gold))
+        Some(dot(p.brass))
     } else if row_status == Status::Running || row_status == Status::Failed {
         Some(status_mark(row_status, p, 7.0))
     } else if thread.unread() || thread.life.woke(at) {
-        Some(dot(p.teal_text))
+        Some(dot(p.sea))
     } else if draft {
         Some(icon("edit", p.muted))
     } else if thread.pinned() && !nested {
@@ -2938,10 +3058,17 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     )
     .truncate()
     .grow(1.0)
+    .shrink()
     .min_w(0.0);
 
     if nested {
-        let mut line = row().h(CREW_ROW).px(10.0).gap(8.0).center_y();
+        let mut line = row()
+            .h(CREW_ROW)
+            .w_full()
+            .pl(10.0)
+            .pr(8.0)
+            .gap(8.0)
+            .center_y();
         if let Some(mark) = mark {
             line = line.child(mark);
         }
@@ -2973,7 +3100,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .px(6.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(6.0)
+                    .radius(4.0)
                     .hover(p.line)
                     .child(tool_icon(glyph, p.muted))
                     .child(label(title, SMALL, p.muted))
@@ -3014,7 +3141,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         }
     } else if thread.life.woke(at) {
         slot = slot.child(
-            label("Woke", SMALL, p.teal_text)
+            pixel_text("Woke", p.sea)
                 .key(format!("thread-woke-{id}"))
                 .role("button")
                 .cursor(rune::Cursor::Pointer)
@@ -3026,11 +3153,11 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         );
     } else if !state_label.is_empty() {
         let ink = if approval || row_status == Status::Waiting {
-            p.gold
+            p.brass
         } else if thread.status == Status::Failed {
             p.danger
         } else {
-            p.teal_text
+            p.sea
         };
         // A working row counts up, as T3 Code's status slot does.
         let text = match (state_label, thread.started) {
@@ -3039,7 +3166,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             }
             _ => state_label.to_string(),
         };
-        slot = slot.child(label(text, SIDEBAR_TIMER, ink));
+        slot = slot.child(label(text, PIXEL.features(TABULAR), ink));
     } else {
         let time = match section {
             Section::Snoozed => Some(lifecycle::wake_label(
@@ -3050,7 +3177,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             _ => relative_time(thread.updated),
         };
         if let Some(time) = time {
-            slot = slot.child(label(time, SMALL, p.muted).key(format!("thread-age-{id}")));
+            slot = slot.child(pixel_text(time, p.muted).key(format!("thread-age-{id}")));
         }
     }
     if thread.machine != "local" {
@@ -3078,24 +3205,32 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let top = lead(row().h(18.0).gap(8.0).center_y())
         .child(project_tile(s, p, project, 16.0))
         .child(
-            label(
-                format!(
-                    "{}{}",
-                    project
-                        .map(|project| project.name.clone())
-                        .unwrap_or_else(|| "No workspace".into()),
-                    if s.client.is_some() {
-                        format!(" · {}", machine_caption(s, &s.machines.selected))
-                    } else {
-                        String::new()
-                    }
-                ),
-                CARD_META,
-                p.muted,
-            )
-            .truncate()
-            .grow(1.0)
-            .min_w(0.0),
+            // The workspace and, on a linked machine, the machine: two labels, not one joined.
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(
+                        project
+                            .map(|project| project.name.clone())
+                            .unwrap_or_else(|| "No workspace".into()),
+                        CARD_META,
+                        p.muted,
+                    )
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+                )
+                .child(if s.client.is_some() {
+                    label(machine_caption(s, &s.machines.selected), CARD_META, p.faint)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0)
+                } else {
+                    el()
+                }),
         )
         .child(slot);
     item.child(
@@ -3124,10 +3259,12 @@ fn project_tile(
     project: Option<&crate::projects::Project>,
     size: f32,
 ) -> El {
+    // A pixel-framed square. At 16 px the frame is 1 px, so the initial still has room.
     let tile = el()
         .size(size, size)
-        .radius(4.0)
-        .clip_rounded(4.0)
+        .radius(2.0)
+        .clip_rounded(2.0)
+        .border(1.0, p.frame)
         .a11y_hidden();
     let Some(project) = project else {
         return tile.center().child(icon("thread", p.muted));
@@ -3150,8 +3287,8 @@ fn project_tile(
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default();
     tile.center()
-        .fill(hue.alpha(if s.dark { 0.24 } else { 0.18 }))
-        .child(label(initial, TextStyle::new(size * 0.62, 650.0), hue))
+        .fill(hue.alpha(if s.dark { 0.45 } else { 0.35 }))
+        .child(label(initial, PIXEL, p.ink))
 }
 
 /// A row's workspace name, unless the Workspace filter already names that one workspace.
@@ -3186,7 +3323,7 @@ fn machine_caption(s: &State, server: &str) -> String {
         if s.machine_connected(server) {
             ""
         } else {
-            " · Offline"
+            ", offline"
         }
     )
 }
@@ -3216,7 +3353,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .w(560.0)
         .max_h((s.viewport_height * 0.72).max(360.0))
         .padding(6.0)
-        .radius(14.0)
+        .radius(6.0)
         .on_press(|_: &mut State| {})
         .child(
             col()
@@ -3224,11 +3361,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                 .pt(12.0)
                 .pb(10.0)
                 .gap(4.0)
-                .child(label(
-                    "Choose a captain",
-                    TextStyle::new(16.0, 620.0).tracking(-0.2),
-                    p.ink,
-                ))
+                .child(label("Choose a captain", DIALOG_TITLE, p.ink))
                 .child(
                     row()
                         .gap(6.0)
@@ -3264,7 +3397,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(label(&profile.name, TextStyle::new(14.0, 600.0), p.ink))
+                .child(label(&profile.name, CAPTAIN_SERIF, p.ink))
                 .child(label(&profile.role, SMALL, p.muted))
                 .child(spacer())
                 .child(captain_status_chip(state, p)),
@@ -3273,14 +3406,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
             text = text.child(label(brief.trim(), SMALL, p.muted).truncate());
         }
         if !homes.is_empty() {
-            text = text.child(
-                label(
-                    format!("Works in {}", homes.join(", ")),
-                    SMALL,
-                    p.muted.alpha(0.8),
-                )
-                .truncate(),
-            );
+            text = text
+                .child(label(format!("Works in {}", homes.join(", ")), SMALL, p.faint).truncate());
         }
         let mut item = row()
             .key(format!("choose-captain-{captain}"))
@@ -3291,7 +3418,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .px(10.0)
             .py(10.0)
             .gap(14.0)
-            .radius(10.0)
+            .radius(4.0)
             .fill(if open { p.selected } else { Color::TRANSPARENT })
             .hover(p.selected)
             .center_y()
@@ -3303,7 +3430,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                 }
             })
             .on_press(move |s: &mut State| s.open_captain(captain))
-            .child(avatar(s, p, captain, 48.0, state))
+            .child(avatar(s, p, captain, PICKER_PORTRAIT, state))
             .child(text);
         item = item.child(
             icon_button(
@@ -3377,21 +3504,25 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .min_w(0.0)
                     .h(64.0)
                     .center()
-                    .radius(8.0)
-                    .border(
-                        if selected { 2.0 } else { 1.0 },
-                        if selected { p.teal } else { Color::TRANSPARENT },
-                    )
-                    .fill(if selected {
-                        p.teal_bg
-                    } else {
-                        Color::TRANSPARENT
-                    })
+                    .radius(4.0)
                     .hover(p.selected)
                     .on_press(move |s: &mut State| {
                         s.captain_editor.as_mut().unwrap().portrait = portrait;
                     })
-                    .child(portrait_avatar(s, p, portrait, 48.0, Status::Ready)),
+                    // The selected portrait's own 2 px frame turns coral. There is no ring or
+                    // wash around it, so all twelve keep the same outer bounds.
+                    .child(
+                        portrait_face(
+                            s,
+                            p,
+                            portrait,
+                            PICKER_PORTRAIT,
+                            Status::Ready,
+                            if selected { p.coral } else { p.portrait_frame },
+                        )
+                        // The editor's header shows the chosen portrait at the same size.
+                        .key(format!("captain-portrait-face-{portrait}")),
+                    ),
             );
         }
         portraits = portraits.child(line);
@@ -3408,7 +3539,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(label("Workspace", SMALL, p.muted))
+                .child(pixel_label("Workspace", p.muted))
                 .child(
                     row()
                         .key("captain-project-choice")
@@ -3459,32 +3590,39 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(
                     row()
                         .gap(6.0)
-                        .child(label("Portrait", SMALL, p.muted))
+                        .child(pixel_label("Portrait", p.muted))
                         .child(label(crate::visuals::PORTRAIT_NAMES[chosen], SMALL, p.ink)),
                 )
                 .child(portraits),
         )
         .child(
-            col().gap(5.0).child(label("Name", SMALL, p.muted)).child(
+            col().gap(5.0).child(pixel_label("Name", p.muted)).child(
                 text_input(&editor.name, BODY)
                     .key("captain-name")
                     .label("Captain name")
                     .placeholder("e.g. Atlas", p.muted)
                     .single_line()
                     .color(p.ink)
-                    .caret(p.teal, p.teal_bg)
+                    .caret(p.coral, p.coral_bg)
                     .w_full()
                     .padding(8.0)
                     .radius(6.0)
                     .fill(field)
-                    .border(1.0, p.field_line)
+                    .border(
+                        if editor.name.focused { 2.0 } else { 1.0 },
+                        if editor.name.focused {
+                            p.coral
+                        } else {
+                            p.field_line
+                        },
+                    )
                     .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name),
             ),
         )
         .child(
             col()
                 .gap(5.0)
-                .child(label("Role (optional)", SMALL, p.muted))
+                .child(pixel_label("Role (optional)", p.muted))
                 .child(
                     text_input(&editor.role, BODY)
                         .key("captain-role")
@@ -3492,33 +3630,51 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .placeholder("e.g. Code review", p.muted)
                         .single_line()
                         .color(p.ink)
-                        .caret(p.teal, p.teal_bg)
+                        .caret(p.coral, p.coral_bg)
                         .w_full()
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(1.0, p.field_line)
+                        .border(
+                            if editor.role.focused { 2.0 } else { 1.0 },
+                            if editor.role.focused {
+                                p.coral
+                            } else {
+                                p.field_line
+                            },
+                        )
                         .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
                 ),
         )
         .child(
             col()
                 .gap(5.0)
-                .child(label("Instructions for Pi", SMALL, p.muted))
+                .child(pixel_label("Instructions for Pi", p.muted))
                 .child(
                     text_input(&editor.instructions, BODY)
                         .key("captain-instructions")
                         .label("Captain instructions")
                         .placeholder("What should this captain focus on? Optional.", p.muted)
                         .color(p.ink)
-                        .caret(p.teal, p.teal_bg)
+                        .caret(p.coral, p.coral_bg)
                         .w_full()
                         .min_h(76.0)
                         .max_h(140.0)
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(1.0, p.field_line)
+                        .border(
+                            if editor.instructions.focused {
+                                2.0
+                            } else {
+                                1.0
+                            },
+                            if editor.instructions.focused {
+                                p.coral
+                            } else {
+                                p.field_line
+                            },
+                        )
                         .on_edit(|s: &mut State| {
                             &mut s.captain_editor.as_mut().unwrap().instructions
                         }),
@@ -3548,14 +3704,11 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .max_h((height - 32.0).max(240.0))
         .padding(18.0)
         .gap(14.0)
-        .radius(14.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -3565,7 +3718,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(
                     col()
                         .gap(3.0)
-                        .child(label(title, TextStyle::new(16.0, 560.0), p.ink))
+                        .child(label(title, DIALOG_TITLE, p.ink))
                         .child(label(
                             "Name it, pick a portrait, and say what it should focus on.",
                             SMALL,
@@ -3587,12 +3740,9 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(
-                    button("cancel-captain", "Cancel", p, |s| s.cancel_captain_flow())
-                        .h(32.0)
-                        .px(14.0)
-                        .border(0.5, p.line),
-                )
+                .child(secondary_button("cancel-captain", "Cancel", p, |s| {
+                    s.cancel_captain_flow()
+                }))
                 .child(spacer())
                 .child(if profile.validate().is_ok() {
                     primary_button(
@@ -3635,7 +3785,39 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(card)
 }
 
-fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
+const TAB_GAP: f32 = 4.0;
+/// Below this a tab drops its workspace prefix and keeps the title.
+const TAB_PREFIX_WIDTH: f32 = 170.0;
+/// The narrowest a tab gets before the strip scrolls.
+const TAB_MIN_WIDTH: f32 = 120.0;
+/// Inter 13/520, the title in a tab.
+const TAB_TITLE: TextStyle = TextStyle::new(13.0, 520.0);
+/// A tab's look. The active tab is a `card` with a pixel frame (no shadow) and a 2 px coral bar
+/// along the bottom inside it. Others have no fill.
+fn tab_frame(tab: El, active: bool, p: Palette) -> El {
+    if !active {
+        return tab.hover(p.selected);
+    }
+    tab.fill(p.card).border(2.0, p.frame).child(
+        el().h(2.0)
+            .fill(p.coral)
+            .pin(Some(2.0), None, Some(2.0), Some(2.0))
+            .a11y_hidden(),
+    )
+}
+
+/// The new-tab plus: a framed 24 px square.
+fn new_tab_button(p: Palette) -> El {
+    framed(
+        icon_button("new-tab", "New thread", "plus", p, |_| {})
+            .fill(p.card)
+            .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift)),
+        p,
+    )
+    .mr(2.0)
+}
+
+fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
     // Ported from KSG Code's ChatHeader workspace/thread breadcrumb. Linked
     // environments share one navigation header, not a new set of tabs per server.
     if s.client.is_some() {
@@ -3654,36 +3836,37 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
                     .h(36.0)
                     .center_y()
                     .child(
-                        row()
-                            .key("active-tab")
-                            .h(28.0)
-                            .gap(6.0)
-                            .px(8.0)
-                            .min_w(0.0)
-                            .child(project_tile(s, p, project, 14.0))
-                            .child(
-                                label(
-                                    project.map(|p| p.name.as_str()).unwrap_or("No workspace"),
-                                    SMALL,
-                                    p.muted,
-                                )
-                                .max_w(if narrow { 90.0 } else { 160.0 })
-                                .truncate()
-                                .shrink(),
+                        tab_frame(
+                            row()
+                                .key("active-tab")
+                                .h(28.0)
+                                .gap(8.0)
+                                .px(8.0)
+                                .min_w(0.0)
+                                .radius(4.0)
+                                .center_y(),
+                            true,
+                            p,
+                        )
+                        .child(project_tile(s, p, project, 16.0))
+                        .child(
+                            pixel_text(
+                                project.map(|p| p.name.as_str()).unwrap_or("No workspace"),
+                                p.muted,
                             )
-                            .child(label("/", SMALL, p.muted))
-                            .child(
-                                label(&thread.title, TextStyle::new(13.0, 520.0), p.ink)
-                                    .truncate()
-                                    .min_w(0.0)
-                                    .shrink(),
-                            ),
+                            .max_w(if narrow { 90.0 } else { 160.0 })
+                            .truncate()
+                            .shrink(),
+                        )
+                        .child(
+                            label(&thread.title, TAB_TITLE, p.ink)
+                                .truncate()
+                                .min_w(0.0)
+                                .shrink(),
+                        ),
                     ),
             )
-            .child(
-                icon_button("new-tab", "New thread", "plus", p, |_| {})
-                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift)),
-            );
+            .child(new_tab_button(p));
     }
     let mut tabs = row()
         .key("thread-tabs")
@@ -3691,8 +3874,20 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         .grow(1.0)
         .h(36.0)
         .center_y()
-        .gap(4.0)
-        .scroll_x();
+        .gap(TAB_GAP)
+        .scroll_x()
+        // Tabs hidden past an edge fade out, so a clipped strip reads as scrollable.
+        .scroll_edge_fade(12.0);
+    // Tabs share the strip evenly, down to a minimum. Only once every tab is at the minimum
+    // does the strip scroll.
+    let count = s
+        .tabs
+        .iter()
+        .filter(|&&id| s.threads.iter().any(|t| t.id == id))
+        .count()
+        .max(1) as f32;
+    let tab_width = ((tabs_width + TAB_GAP) / count - TAB_GAP)
+        .clamp(TAB_MIN_WIDTH, if narrow { 210.0 } else { 285.0 });
     for &id in &s.tabs {
         let Some(index) = s.threads.iter().position(|t| t.id == id) else {
             continue;
@@ -3703,41 +3898,60 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
             .project(thread.project)
             .map(|p| p.name.as_str())
             .unwrap_or("No workspace");
-        let mut tab = row()
-            .key(if active {
-                "active-tab".into()
-            } else {
-                format!("tab-{id}")
-            })
-            .role("tab")
-            .cursor(rune::Cursor::Pointer)
-            .label(format!("{project} / {}", thread.title))
-            .focusable(true)
-            .center_y()
-            .gap(6.0)
-            .px(8.0)
-            .h(28.0)
-            .radius(6.0)
-            .w(if narrow { 210.0 } else { 285.0 })
-            .min_w(120.0)
-            .fill(if active { p.card } else { Color::TRANSPARENT })
-            .hover(p.selected)
-            .on_press(move |s: &mut State| s.select_thread(index))
-            .child(label(project, SMALL, p.muted).max_w(85.0).truncate())
-            .child(label("/", SMALL, p.muted))
-            .child(
-                label(&thread.title, TextStyle::new(12.0, 520.0), p.ink)
-                    .truncate()
-                    .grow(1.0),
-            );
+        let mut tab = tab_frame(
+            row()
+                .key(if active {
+                    "active-tab".into()
+                } else {
+                    format!("tab-{id}")
+                })
+                .role("tab")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("{project} / {}", thread.title))
+                .focusable(true)
+                .center_y()
+                .gap(8.0)
+                .pl(8.0)
+                .pr(if s.tabs.len() > 1 { 2.0 } else { 8.0 })
+                .h(28.0)
+                .radius(4.0)
+                .w(tab_width)
+                .min_w(tab_width)
+                .hover_group()
+                .on_press_tx(move |s: &mut State, tx| {
+                    s.select_thread(index);
+                    tx.scroll_into_view("active-tab");
+                }),
+            active,
+            p,
+        )
+        .child(if tab_width >= TAB_PREFIX_WIDTH {
+            pixel_text(project, p.muted).max_w(85.0).truncate()
+        } else {
+            // A tab at its minimum gives the width to the title.
+            el()
+        })
+        .child(label(&thread.title, TAB_TITLE, p.ink).truncate().grow(1.0));
         if s.tabs.len() > 1 {
-            tab = tab.child(icon_button(
-                &format!("close-tab-{id}"),
-                "Close tab, keep thread running",
-                "close",
-                p,
-                move |s| s.close_tab(id),
-            ));
+            // The close button shows on the active tab and on hover.
+            let close = el()
+                .key(format!("close-tab-{id}"))
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label("Close tab, keep thread running")
+                .focusable(true)
+                .size(22.0, 22.0)
+                .center()
+                .radius(4.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press(move |s: &mut State| s.close_tab(id))
+                .child(tool_icon("close", p.muted));
+            tab = tab.child(if active {
+                close
+            } else {
+                close.group_opacity(0.0, 1.0)
+            });
         }
         tabs = tabs.child(tab);
     }
@@ -3747,10 +3961,31 @@ fn header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         .center_y()
         .gap(6.0)
         .child(tabs)
-        .child(
-            icon_button("new-tab", "New thread", "plus", p, |_| {})
-                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift)),
-        )
+        .child(new_tab_button(p))
+        .child(reveal_active_tab(s, tab_width))
+}
+
+/// Scrolls the strip so the active tab shows whole, each time the selection, the tab list or
+/// the tab width changes. This is a 1 pt marker outside the strip whose key names that state.
+/// A new key is a new element, and it reports once when it first shows, which runs the scroll.
+/// (`on_visible` on the tab itself only fires once half the tab shows, too late for a tab
+/// that starts off screen.)
+fn reveal_active_tab(s: &State, tab_width: f32) -> El {
+    use std::hash::{Hash, Hasher};
+    let mut signature = std::collections::hash_map::DefaultHasher::new();
+    s.tabs.hash(&mut signature);
+    s.threads.get(s.active).map(|t| t.id).hash(&mut signature);
+    (tab_width.round() as i32).hash(&mut signature);
+    el().key(format!("tab-reveal-{:x}", signature.finish()))
+        .absolute(0.0, 0.0)
+        .size(1.0, 1.0)
+        .a11y_hidden()
+        .on_visible(|_: &mut State, visible, tx| {
+            if visible {
+                tx.instant();
+                tx.scroll_into_view("active-tab");
+            }
+        })
 }
 
 fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
@@ -3780,7 +4015,7 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
                             if s.machine_connected(server) {
                                 ""
                             } else {
-                                " · Offline"
+                                ", offline"
                             }
                         ),
                         SMALL,
@@ -3811,16 +4046,19 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         header = header.child(line);
     }
     header = header.child(spacer()).child(if s.demo {
-        row()
-            .key("demo-badge")
-            .h(20.0)
-            .px(8.0)
-            .mr(4.0)
-            .radius(10.0)
-            .center_y()
-            .fill(p.gold.alpha(0.12))
-            .label("Demo data, read-only")
-            .child(label("Demo", TextStyle::new(11.0, 560.0), p.gold))
+        outlined(
+            row()
+                .key("demo-badge")
+                .h(20.0)
+                .px(6.0)
+                .mr(6.0)
+                .radius(4.0)
+                .center_y()
+                .fill(p.card)
+                .label("Demo data, read-only")
+                .child(pixel_label("Demo", p.brass)),
+            p,
+        )
     } else {
         let t = s.current();
         let text = match (t.status, t.started) {
@@ -3866,14 +4104,11 @@ fn thread_menu(s: &State, p: Palette) -> El {
         .w(200.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.thread_menu = false)
         .child(thread_actions(s, s.current().id, p))
@@ -4147,7 +4382,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
         );
     }
     actions.child(rule(p)).child(
-        menu_item("menu-delete-thread", "Delete thread...", "close", p)
+        menu_item("menu-delete-thread", "Delete thread...", "trash", p)
             .on_press(move |s: &mut State| s.request_delete(id)),
     )
 }
@@ -4159,9 +4394,11 @@ fn snooze_menu(s: &State, p: Palette) -> El {
         .w(280.0)
         .padding(12.0)
         .gap(4.0)
-        .radius(8.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label("Snooze thread", LABEL, p.ink));
     if s.custom_snooze_open {
@@ -4174,6 +4411,18 @@ fn snooze_menu(s: &State, p: Palette) -> El {
                     .placeholder("2026-11-12 09:00 or 90m, 3h, 2d", p.muted)
                     .single_line()
                     .color(p.ink)
+                    .w_full()
+                    .padding(8.0)
+                    .radius(6.0)
+                    .fill(if s.dark { p.bg } else { p.panel })
+                    .border(
+                        if s.snooze_edit.focused { 2.0 } else { 1.0 },
+                        if s.snooze_edit.focused {
+                            p.coral
+                        } else {
+                            p.field_line
+                        },
+                    )
                     .on_edit(|s: &mut State| &mut s.snooze_edit),
             )
             .child(button("snooze-custom-save", "Snooze", p, move |s| {
@@ -4193,8 +4442,13 @@ fn snooze_menu(s: &State, p: Palette) -> El {
         for (i, choice) in choices.iter().enumerate() {
             card = card.child(
                 menu_item(&format!("snooze-preset-{i}"), &choice.label, "clock", p)
-                    .child(spacer())
-                    .child(label(&choice.time, SMALL, p.muted))
+                    // The label already grows, so the time sits against the right edge on its
+                    // own. A spacer here would split the row and clip the label.
+                    .child(
+                        label(&choice.time, TIMER, p.muted)
+                            .w(72.0)
+                            .align(rune::Align::End),
+                    )
                     .on_press(move |s: &mut State| {
                         let until = s
                             .snooze_menu
@@ -4248,38 +4502,42 @@ fn bulk_thread_actions(s: &State, p: Palette) -> El {
         ("bulk-delete", "Delete...", 4),
     ] {
         actions = actions.child(
-            menu_item(key, &format!("{title} ({count})"), "thread", p).on_press(
-                move |s: &mut State| {
-                    let ids = s.selected_threads.clone();
-                    s.row_menu = None;
-                    if action == 2 {
-                        if let Some(id) = ids.first() {
-                            s.open_snooze(*id);
-                        }
-                        return;
+            menu_item(
+                key,
+                &format!("{title} ({count})"),
+                ["pin", "check", "clock", "dot", "trash"][action],
+                p,
+            )
+            .on_press(move |s: &mut State| {
+                let ids = s.selected_threads.clone();
+                s.row_menu = None;
+                if action == 2 {
+                    if let Some(id) = ids.first() {
+                        s.open_snooze(*id);
                     }
-                    if action == 4 {
-                        if let Some(id) = ids.first() {
-                            s.request_delete(*id);
-                        }
-                        return;
+                    return;
+                }
+                if action == 4 {
+                    if let Some(id) = ids.first() {
+                        s.request_delete(*id);
                     }
-                    for id in ids {
-                        if action == 0 {
-                            if s.threads.iter().any(|t| t.id == id && t.pinned()) {
-                                s.pin_thread(id);
-                            }
-                        } else if action == 1 {
-                            if s.threads.iter().any(|t| t.id == id && !t.life.settled()) {
-                                s.settle_thread(id);
-                            }
-                        } else if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
-                            t.life.mark_unread();
+                    return;
+                }
+                for id in ids {
+                    if action == 0 {
+                        if s.threads.iter().any(|t| t.id == id && t.pinned()) {
+                            s.pin_thread(id);
                         }
+                    } else if action == 1 {
+                        if s.threads.iter().any(|t| t.id == id && !t.life.settled()) {
+                            s.settle_thread(id);
+                        }
+                    } else if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.life.mark_unread();
                     }
-                    s.checkpoint();
-                },
-            ),
+                }
+                s.checkpoint();
+            }),
         );
     }
     actions
@@ -4339,14 +4597,11 @@ fn row_menu(s: &State, p: Palette) -> El {
         .w(222.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .anchored_fit(
             if s.row_menu_at.is_some() {
                 "row-menu-point".into()
@@ -4389,11 +4644,13 @@ fn thread_dialog(s: &State, p: Palette) -> El {
         .max_w(540.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
-        .child(label(title, TextStyle::new(15.0, 560.0), p.ink));
+        .child(label(title, DIALOG_TITLE, p.ink));
     if renaming {
         if captain {
             card = card.child(
@@ -4412,6 +4669,17 @@ fn thread_dialog(s: &State, p: Palette) -> El {
                 .single_line()
                 .color(p.ink)
                 .w_full()
+                .padding(8.0)
+                .radius(6.0)
+                .fill(if s.dark { p.bg } else { p.panel })
+                .border(
+                    if s.rename_edit.focused { 2.0 } else { 1.0 },
+                    if s.rename_edit.focused {
+                        p.coral
+                    } else {
+                        p.field_line
+                    },
+                )
                 .on_edit(|s: &mut State| &mut s.rename_edit)
                 .on_submit(|s: &mut State, _| s.save_thread_name()),
         );
@@ -4438,7 +4706,7 @@ fn thread_dialog(s: &State, p: Palette) -> El {
         row()
             .gap(8.0)
             .child(spacer())
-            .child(button("cancel-thread-dialog", "Cancel", p, |s| {
+            .child(secondary_button("cancel-thread-dialog", "Cancel", p, |s| {
                 s.rename_thread = None;
                 s.delete_thread = None;
             }))
@@ -4487,39 +4755,40 @@ fn modal_frame(key: &str, s: &State, close: fn(&mut State), card: El) -> El {
 }
 
 /// A keyboard hint for a modal's footer: the key in a small cap, then what it does.
+/// A key name in an outlined Departure Mono chip.
+fn keycap_chip(keys: &str, p: Palette) -> El {
+    outlined(
+        row()
+            .h(20.0)
+            .px(6.0)
+            .center_y()
+            .radius(4.0)
+            .fill(p.card)
+            .child(pixel_text(keys, p.muted)),
+        p,
+    )
+}
 fn keycap(keys: &str, action: &str, p: Palette) -> El {
     row()
-        .gap(6.0)
+        .gap(8.0)
         .center_y()
-        .child(
-            row()
-                .h(18.0)
-                .px(5.0)
-                .center_y()
-                .radius(4.0)
-                .border(0.5, p.line)
-                .fill(p.selected)
-                .child(label(keys, TextStyle::new(11.0, 520.0), p.muted)),
-        )
+        .child(keycap_chip(keys, p))
         .child(label(action, SMALL, p.muted))
 }
 
 /// A floating surface for menus and pickers, styled as T3 Code's popovers: one radius, a
 /// hairline edge and a soft shadow that reads in both themes.
-fn popover(key: &str, name: &str, s: &State, p: Palette) -> El {
+fn popover(key: &str, name: &str, _: &State, p: Palette) -> El {
     col()
         .key(key)
         .label(name)
         .padding(4.0)
         .gap(1.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4531,29 +4800,24 @@ enum PickerChoice {
 }
 
 /// The picker's rows that match its search, in display order.
-fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String)> {
+/// Each choice with its name and, for a linked machine, the machine's name.
+fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, Option<String>)> {
     let query = s.picker_query.text.trim().to_lowercase();
     let mut choices = vec![];
     if mode == ProjectPicker::Scope {
-        choices.push((PickerChoice::All, "All workspaces".to_string()));
+        choices.push((PickerChoice::All, "All workspaces".to_string(), None));
     }
     if mode != ProjectPicker::CaptainScope {
-        choices.push((PickerChoice::NoProject, "No workspace".to_string()));
+        choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
     for id in s.sorted_projects() {
         let project = s.project(Some(id)).expect("sorted project");
         if !project.hidden {
             choices.push((
                 PickerChoice::Project(id),
-                if mode == ProjectPicker::Scope && s.client.is_some() {
-                    format!(
-                        "{} · {}",
-                        project.name,
-                        s.machine_label(&s.machines.selected)
-                    )
-                } else {
-                    project.name.clone()
-                },
+                project.name.clone(),
+                (mode == ProjectPicker::Scope && s.client.is_some())
+                    .then(|| s.machine_label(&s.machines.selected)),
             ));
         }
     }
@@ -4569,13 +4833,19 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String)>
                 if let (Some(id), Some(name)) = (project["id"].as_u64(), project["name"].as_str()) {
                     choices.push((
                         PickerChoice::MachineProject(server.clone(), id as usize),
-                        format!("{name} · {}", s.machine_label(server)),
+                        name.to_string(),
+                        Some(s.machine_label(server)),
                     ));
                 }
             }
         }
     }
-    choices.retain(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query));
+    choices.retain(|(_, name, machine)| {
+        query.is_empty()
+            || format!("{name} {}", machine.as_deref().unwrap_or(""))
+                .to_lowercase()
+                .contains(&query)
+    });
     choices
 }
 
@@ -4640,7 +4910,7 @@ fn project_picker(s: &State, p: Palette) -> El {
         .w(520.0)
         .max_h(460.0)
         .padding(6.0)
-        .radius(14.0)
+        .radius(6.0)
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -4683,7 +4953,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                                     if let Some(mode) = s.project_picker
                                         && let Some(choice) = picker_choices(s, mode)
                                             .get(s.picker_highlight.min(count.saturating_sub(1)))
-                                            .map(|(choice, _)| choice.clone())
+                                            .map(|(choice, _, _)| choice.clone())
                                     {
                                         choose_picker(s, mode, choice, event.mods.shift);
                                     }
@@ -4702,7 +4972,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
-    for (index, (choice, name)) in choices.iter().enumerate() {
+    for (index, (choice, name, machine)) in choices.iter().enumerate() {
         let remote_project = if let PickerChoice::MachineProject(server, id) = choice {
             s.machines
                 .views
@@ -4749,15 +5019,18 @@ fn project_picker(s: &State, p: Palette) -> El {
             .key(key)
             .role("menuitem")
             .cursor(rune::Cursor::Pointer)
-            .label(name.as_str())
+            .label(match machine {
+                Some(machine) => format!("{name}, {machine}"),
+                None => name.clone(),
+            })
             .focusable(true)
             .h(38.0)
             .px(8.0)
             .gap(10.0)
             .center_y()
-            .radius(8.0)
+            .radius(4.0)
             .fill(if index == highlight {
-                p.selected
+                p.coral_bg
             } else {
                 Color::TRANSPARENT
             })
@@ -4775,6 +5048,10 @@ fn project_picker(s: &State, p: Palette) -> El {
                     .shrink()
                     .min_w(0.0),
             )
+            .child(match machine {
+                Some(machine) => label(machine, SMALL, p.muted).truncate().max_w(MACHINE_CAP),
+                None => el(),
+            })
             // Where the workspace lives, so two folders with one name stay distinct.
             .child(
                 label(
@@ -4782,14 +5059,14 @@ fn project_picker(s: &State, p: Palette) -> El {
                         .map(|project| project.path.display().to_string())
                         .unwrap_or_default(),
                     SMALL,
-                    p.muted.alpha(0.8),
+                    p.faint,
                 )
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),
             );
         if checked {
-            item = item.child(icon("check", p.teal));
+            item = item.child(icon("check", p.coral));
         }
         if let PickerChoice::Project(id) = choice {
             let target = RowTarget::Project(id);
@@ -4939,8 +5216,8 @@ fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p
         .py(6.0)
         .gap(10.0)
         .center_y()
-        .radius(8.0)
-        .fill(if lit { p.selected } else { Color::TRANSPARENT })
+        .radius(4.0)
+        .fill(if lit { p.coral_bg } else { Color::TRANSPARENT })
         .hover(p.selected)
         .child(el().size(16.0, 16.0).center().child(icon(glyph, p.muted)))
         .child({
@@ -5109,7 +5386,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .w(560.0)
         .max_h(480.0)
         .padding(6.0)
-        .radius(14.0)
+        .radius(6.0)
         .on_press(|_: &mut State| {})
         .child(field)
         .child(el().h(0.5).w_full().mb(4.0).fill(p.line));
@@ -5217,9 +5494,11 @@ fn remote_project_dialog(s: &State, p: Palette) -> El {
         .w((s.viewport_width - 32.0).clamp(280.0, 480.0))
         .padding(16.0)
         .gap(12.0)
-        .radius(10.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .child(
             label(
                 format!("Workspace on {}", s.machine_label(&s.machines.selected)),
@@ -5243,7 +5522,18 @@ fn remote_project_dialog(s: &State, p: Palette) -> El {
                 .single_line()
                 .w_full()
                 .padding(8.0)
-                .border(1.0, p.field_line)
+                .border(
+                    if s.machines.project_path.focused {
+                        2.0
+                    } else {
+                        1.0
+                    },
+                    if s.machines.project_path.focused {
+                        p.coral
+                    } else {
+                        p.field_line
+                    },
+                )
                 .color(p.ink)
                 .on_edit(|s: &mut State| &mut s.machines.project_path),
         )
@@ -5472,7 +5762,7 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
 
 /// Secondary and tertiary transcript inks: a tool's verb, and what it acted on.
 fn quiet_inks(p: Palette) -> (Color, Color) {
-    (p.muted, p.muted.alpha(0.62))
+    (p.muted, p.faint)
 }
 
 /// Ported from KSG Code's WorkLogLine: a 24 px icon slot, a label and adjacent disclosure.
@@ -5498,18 +5788,15 @@ fn activity_line(
         .min_h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(6.0)
+        .radius(4.0)
         .hover(p.selected)
         .child(
             el().size(24.0, 24.0)
                 .center()
                 .child(tool_icon(glyph, secondary)),
         )
-        .child(label(
-            verb,
-            ACTIVITY,
-            if failed { p.danger } else { secondary },
-        ));
+        // The verb is Departure Mono in sentence case; what it acted on stays Inter.
+        .child(pixel_text(verb, if failed { p.danger } else { secondary }));
     if !detail.is_empty() {
         line = line.child(
             label(detail, ACTIVITY, tertiary)
@@ -5519,7 +5806,7 @@ fn activity_line(
         );
     }
     if failed {
-        line = line.child(label("failed", ACTIVITY, p.danger));
+        line = line.child(pixel_text("failed", p.danger));
     }
     line.child(icon(if open { "chevron" } else { "open" }, tertiary).opacity(0.8))
         .child(spacer())
@@ -5566,9 +5853,9 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                 .label(format!("Output for {title}"))
                 .mb(4.0)
                 .ml(28.0)
-                .radius(8.0)
+                .radius(6.0)
                 .fill(p.code_bg)
-                .border(0.5, p.line)
+                .border(1.0, p.line)
                 .child(
                     label(&tool.detail, SMALL, p.muted)
                         .wrap_anywhere()
@@ -5756,7 +6043,7 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
                             &thought.text
                         },
                         TextStyle::new(13.0, 400.0).lh(20.0),
-                        p.muted.alpha(0.8),
+                        p.faint,
                     )
                     .wrap_anywhere()
                     .selectable(true),
@@ -5837,11 +6124,11 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         response = response.child(
             row()
                 .center_y()
-                .gap(7.0)
-                .child(avatar(s, p, captain, 18.0, t.status))
+                .gap(8.0)
+                .child(avatar(s, p, captain, 20.0, t.status))
                 .child(label(
                     format!("Captain {}", s.captains[captain].name),
-                    TextStyle::new(13.0, 600.0),
+                    TextStyle::new(14.0, 600.0),
                     p.ink,
                 )),
         );
@@ -5895,7 +6182,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         .min_w(0.0)
                         .shrink()
                         .child(
-                            label(live_status(t), ACTIVITY, p.muted)
+                            pixel_text(live_status(t), p.muted)
                                 .key(format!("live-status-text-{}", t.id))
                                 .truncate()
                                 .shrink()
@@ -5904,7 +6191,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         // The phase gives way before the timer, whose tabular figures and
                         // padded seconds keep each tick the same width.
                         .child(match seconds {
-                            Some(seconds) => label(timer_label(seconds), TIMER, quiet_inks(p).1)
+                            Some(seconds) => label(timer_label(seconds), TIMER, p.sea)
                                 .key(format!("live-timer-{}", t.id)),
                             None => el(),
                         }),
@@ -5949,6 +6236,8 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 }),
             );
         if expanded {
+            // The indent is deliberate: an expanded turn nests its interim prose and tool rows
+            // under the "Worked for" line, while the final reply sits on the lane.
             section = section.child(work_rows(
                 col()
                     .key(format!("work-rows-{}-{start}", t.id))
@@ -5997,13 +6286,19 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             introduction = introduction
                 .items_center()
                 .pb(16.0)
-                .child(captain_hero(s, p, captain, pane_width));
+                .child(captain_hero(s, p, captain, wide, pane_width));
         } else {
             introduction = introduction
                 .items_center()
                 .px(0.0)
                 .pb(16.0)
-                .gap(8.0)
+                .gap(24.0)
+                .child(horizon_band(
+                    lane_width(pane_width, wide),
+                    s.dark,
+                    crate::horizon::Subject::Boat,
+                    p,
+                ))
                 .child(draft_headline(s, p, pane_width));
         }
         if t.restoring_history() {
@@ -6080,8 +6375,13 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         .max_w(max_width)
                         .min_w(0.0)
                         .padding(12.0)
-                        .radius(16.0)
-                        .fill(p.message_bg),
+                        .radius(6.0)
+                        .fill(p.message_bg)
+                        // Night bubbles take the 2 px frame; day bubbles a 1 px line. No shadow.
+                        .border(
+                            if s.dark { 2.0 } else { 1.0 },
+                            if s.dark { p.frame } else { p.line },
+                        ),
                     );
                 }
                 row().justify_end().child(user)
@@ -6102,8 +6402,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     .px(12.0)
                     .py(8.0)
                     .radius(6.0)
-                    .fill(p.teal_bg)
-                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.teal))
+                    .fill(p.coral_bg)
+                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.coral))
                     .child(
                         label(message.display_text(), body_style(wide), p.ink)
                             .wrap_anywhere()
@@ -6144,7 +6444,7 @@ const HERO_PORTRAIT: f32 = 72.0;
 /// `text-3xl font-normal tracking-tight`, `text-2xl` on a narrow pane), with the captain's
 /// animated portrait above it. A home with a goal shows the goal; otherwise the captain asks
 /// what to look after. The live status keeps one 20 px line, so it never moves the composer.
-fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
+fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let profile = &s.captains[captain];
     let status = shown_status(s);
@@ -6152,15 +6452,10 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
     let portrait_index = captain_portrait(s, Some(captain));
     let pixels = s
         .portraits
-        .pixels(portrait_index, face)
-        .unwrap_or_else(|| s.artwork.face(portrait_index, face).pixels());
-    let portrait = el()
+        .pixels(portrait_index, face, HERO_PORTRAIT)
+        .unwrap_or_else(|| s.artwork.face_pixels(portrait_index, face, HERO_PORTRAIT));
+    let portrait = pixel_portrait(&pixels, HERO_PORTRAIT, p)
         .key("captain-hero-portrait")
-        .size(HERO_PORTRAIT, HERO_PORTRAIT)
-        .radius(20.0)
-        .clip_rounded(20.0)
-        .border(0.5, p.line)
-        .pixels(pixels)
         .a11y_hidden()
         .on_visible(|s: &mut State, on, tx| {
             s.portraits.set_visible(HERO_PORTRAIT_ROW, on);
@@ -6206,7 +6501,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
                 .child(status_mark(line_status, p, 6.0))
                 .child(label(
                     text,
-                    SMALL.features(TABULAR),
+                    PIXEL.features(TABULAR),
                     status_ink(line_status, p),
                 )),
         );
@@ -6216,16 +6511,26 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
         .lines()
         .next()
         .filter(|line| !line.trim().is_empty())
-        .map_or_else(
-            || format!("Captain {} · {}", profile.name, profile.role),
-            |line| format!("Captain {} · {line}", profile.name),
-        );
+        .map_or_else(|| profile.role.clone(), str::to_owned);
+    // A profile banner: the portrait overlaps the band's bottom edge, and the band's sky takes
+    // the portrait's backdrop colour.
+    let band = horizon_band(
+        lane_width(pane_width, wide),
+        s.dark,
+        crate::horizon::Subject::Sky(crate::visuals::portrait_backdrop(portrait_index)),
+        p,
+    );
     col()
         .key("captain-hero")
         .w_full()
         .items_center()
         .gap(10.0)
-        .child(status_badge(p, portrait, HERO_PORTRAIT, status).mb(6.0))
+        .child(band)
+        .child(
+            status_badge(p, portrait, HERO_PORTRAIT, status)
+                .mt(-(HERO_PORTRAIT / 2.0) - 10.0)
+                .mb(6.0),
+        )
         .child(
             label(
                 heading,
@@ -6239,11 +6544,25 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
             .max_w(measure(true)),
         )
         .child(
-            label(role, SMALL.lh(18.0), p.muted)
-                .align(rune::Align::Center)
-                .wrap()
-                .w_full()
-                .max_w(520.0),
+            // Who and what they look after, as two labels with a gap between them.
+            row()
+                .key("captain-role")
+                .label(format!("Captain {}, {role}", profile.name))
+                .max_w(520.0)
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(format!("Captain {}", profile.name), SMALL.lh(18.0), p.ink)
+                        .shrink()
+                        .min_w(0.0),
+                )
+                .child(
+                    label(role, SMALL.lh(18.0), p.muted)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                ),
         )
         .child(status_line)
 }
@@ -6326,7 +6645,7 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
             .w_full()
             .justify_center()
             .center_y()
-            .child(label("What should we build in", HEADING, p.ink).pr(4.0))
+            .child(label("What should we build in", HEADING, p.ink))
             .child(picker(HEADING))
             .child(label("?", HEADING, p.ink))
     } else {
@@ -6415,8 +6734,8 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 ATTACHMENT_THUMB,
                 format!("attachment-thumb-{id}"),
             )
-            .radius(8.0)
-            .clip_rounded(8.0)
+            .radius(4.0)
+            .clip_rounded(4.0)
             .a11y_hidden(),
         )
         .child(
@@ -6428,7 +6747,7 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 .pin(None, Some(4.0), Some(4.0), None)
                 .size(18.0, 18.0)
                 .center()
-                .radius(9.0)
+                .radius(4.0)
                 .fill(Color::BLACK.alpha(0.6))
                 .hover(Color::BLACK.alpha(0.8))
                 .on_press(move |s: &mut State| s.remove_attachment(&id))
@@ -6467,7 +6786,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
         .help("Attach files. Shift-click for a folder.")
         .size(24.0, 24.0)
         .center()
-        .radius(5.0)
+        .radius(4.0)
         .opacity(if locked { 0.65 } else { 1.0 })
         .hover(p.selected)
         .disabled(locked)
@@ -6534,9 +6853,9 @@ fn context_ink(percent: f64, p: Palette) -> Color {
     if percent >= 90.0 {
         p.danger
     } else if percent >= 70.0 {
-        p.gold
+        p.brass
     } else {
-        p.teal_text
+        p.sea
     }
 }
 
@@ -6575,7 +6894,7 @@ fn context_ring_shape(context: &ContextMeter, p: Palette) -> Shape {
     let radius = 7.5;
     let width = 2.0;
     let track = if context.phase == ContextPhase::Compacting {
-        p.gold.alpha(0.65)
+        p.brass.alpha(0.65)
     } else {
         p.field_line.alpha(0.55)
     };
@@ -6723,16 +7042,14 @@ fn context_popover(s: &State, p: Palette) -> El {
     let t = s.current();
     let limit = context_limit(t);
     let usage = &t.context.usage;
-    let secondary = TextStyle::new(11.0, 400.0).lh(16.0).features(TABULAR);
-    let strong = TextStyle::new(11.0, 500.0).lh(16.0).features(TABULAR);
-    let mut figures = row().center_y().gap(4.0);
+    // Figures are Departure Mono with tabular digits; their names stay Inter.
+    let secondary = TIMER;
+    let strong = TIMER;
+    let mut figures = row().center_y().gap(8.0);
     if let Some(percent) = usage.percent {
-        figures = figures
-            .child(
-                label(context_percent_text(percent), secondary, p.muted)
-                    .key("context-details-percent"),
-            )
-            .child(label("·", secondary, p.muted));
+        figures = figures.child(
+            label(context_percent_text(percent), secondary, p.muted).key("context-details-percent"),
+        );
     }
     let used = match (usage.tokens, limit) {
         (Some(tokens), Some(limit)) => {
@@ -6754,14 +7071,11 @@ fn context_popover(s: &State, p: Palette) -> El {
         .w(256.0)
         .padding(12.0)
         .gap(8.0)
-        .radius(8.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            8.0,
-            24.0,
-            Color::BLACK.alpha(if s.dark { 0.36 } else { 0.10 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .anchored("context-usage-ring", rune::Side::Top, rune::Align::End, 4.0)
         .on_key(|s: &mut State, event, _| context_escape(s, event))
         .on_hover_change(|s: &mut State, inside, _| s.current_mut().context.hover(false, inside))
@@ -6770,11 +7084,7 @@ fn context_popover(s: &State, p: Palette) -> El {
             row()
                 .center_y()
                 .gap(12.0)
-                .child(label(
-                    "Context Window",
-                    TextStyle::new(12.0, 500.0).lh(16.0),
-                    p.muted,
-                ))
+                .child(pixel_label("Context window", p.muted))
                 .child(spacer())
                 .child(figures),
         );
@@ -6782,22 +7092,18 @@ fn context_popover(s: &State, p: Palette) -> El {
         && limit > 0
     {
         let fraction = usage.percent.unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0;
-        let ink = if fraction > 0.9 {
-            p.danger
-        } else {
-            p.muted.alpha(0.72)
-        };
+        let ink = if fraction > 0.9 { p.danger } else { p.faint };
         let mut bar = row()
             .key("context-details-bar")
             .role("progressbar")
             .label("Context window usage")
             .w_full()
             .h(6.0)
-            .radius(3.0)
-            .clip_rounded(3.0)
+            .radius(2.0)
+            .clip_rounded(2.0)
             .fill(p.line);
         if usage.percent.is_some() {
-            bar = bar.child(el().w_frac(fraction).h_full().radius(3.0).fill(ink));
+            bar = bar.child(el().w_frac(fraction).h_full().radius(2.0).fill(ink));
         }
         card = card.child(bar);
     }
@@ -6805,9 +7111,9 @@ fn context_popover(s: &State, p: Palette) -> El {
         row()
             .center_y()
             .gap(12.0)
-            .child(label(name, secondary, p.muted))
+            .child(label(name, SMALL, p.muted))
             .child(spacer())
-            .child(label(value, strong, p.muted))
+            .child(label(value, strong, p.ink))
     };
     if let Some(tokens) = t.native.stats["tokens"]["total"]
         .as_u64()
@@ -6845,8 +7151,8 @@ fn context_popover(s: &State, p: Palette) -> El {
         .gap(6.0)
         .justify_center()
         .center_y()
-        .radius(6.0)
-        .border(1.0, p.line)
+        .radius(4.0)
+        .border(2.0, p.frame)
         .hover(p.selected)
         .press(p.selected)
         .opacity(if can_compact { 1.0 } else { 0.55 })
@@ -6943,22 +7249,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             "Send message"
         })
         .size(32.0, 32.0)
-        .radius(16.0)
+        .radius(4.0)
         .center()
-        .hover(if can_send {
-            p.teal.alpha(0.85)
-        } else {
-            p.selected
-        })
-        .fill(if can_send {
-            p.teal
-        } else if s.dark {
-            Color::WHITE.alpha(0.10)
-        } else {
-            Color::BLACK.alpha(0.06)
-        })
-        .child(icon("send", if can_send { p.on_teal } else { p.muted }))
+        // A framed key. Rune cannot move it on press, so a pressed key darkens instead.
+        .press(if can_send { p.coral.alpha(0.8) } else { p.line })
+        .fill(if can_send { p.coral } else { p.line })
+        .child(icon("send", if can_send { p.on_coral } else { p.muted }))
         .disabled(!can_send);
+    if can_send {
+        send = framed(send, p);
+    }
     if can_send {
         send = send.focusable(true).on_press_tx(|s: &mut State, tx| {
             let previous = s.current().native.follow_up;
@@ -6970,12 +7270,21 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         });
     }
     let action = if t.status.busy() && !s.demo && !t.has_draft_content() {
-        icon_button("stop-agent", "Stop agent", "stop", p, |s| {
-            s.current_mut().stop()
-        })
-        .size(32.0, 32.0)
-        .radius(16.0)
-        .border(1.0, p.line)
+        framed(
+            el().key("stop-agent")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label("Stop agent")
+                .focusable(true)
+                .size(32.0, 32.0)
+                .radius(4.0)
+                .center()
+                .fill(p.coral)
+                .press(p.coral.alpha(0.8))
+                .on_press(|s: &mut State| s.current_mut().stop())
+                .child(icon("stop", p.on_coral)),
+            p,
+        )
     } else {
         send
     };
@@ -7001,23 +7310,18 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
     let mut card = col()
         .key("composer")
-        .radius(16.0)
+        .radius(6.0)
         .fill(p.card)
+        // The pixel frame turns coral while the composer has focus or a file is over it.
         .border(
-            1.0,
-            if s.attachment_drop_hover {
-                p.teal
-            } else if t.draft.focused {
-                p.field_line
+            2.0,
+            if s.attachment_drop_hover || t.draft.focused {
+                p.coral
             } else {
-                p.line
+                p.frame
             },
         )
-        .shadow(
-            1.0,
-            2.0,
-            Color::BLACK.alpha(if s.dark { 0.0 } else { 0.05 }),
-        )
+        .box_shadow(hard_shadow(p))
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
             s.attach_paths(files);
@@ -7049,7 +7353,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 p.muted,
             )
             .color(p.ink)
-            .caret(p.teal, p.teal_bg)
+            .caret(p.coral, p.coral_bg)
             .w_full()
             .min_h(48.0)
             .max_h(200.0)
@@ -7086,7 +7390,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .child(
             attach_control(attach_locked, p)
                 .size(28.0, 28.0)
-                .radius(8.0),
+                .radius(4.0),
         )
         .child(spacer())
         .child(model_effort_trigger(s, p, narrow, locked));
@@ -7120,7 +7424,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .gap(6.0);
     footer = if s.demo {
         footer
-            .child(label("Demo data", SMALL, p.muted))
+            .child(pixel_text("Demo data", p.muted))
             .child(spacer())
             .child(
                 row()
@@ -7132,20 +7436,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                     .center_y()
                     .h(20.0)
                     .px(6.0)
-                    .radius(5.0)
-                    .hover(p.teal_bg)
+                    .radius(4.0)
+                    .hover(p.coral_bg)
                     .on_press(|s: &mut State| {
                         s.leave_demo();
                     })
-                    .child(label(
-                        "Open a real workspace",
-                        TextStyle::new(11.5, 500.0),
-                        p.teal,
-                    )),
+                    .child(pixel_text("Open a real workspace", p.sea)),
             )
     } else {
         footer.child(machine_selector(s, p)).child(spacer()).child(
-            button("access-mode", t.native.access.label(), p, |s| {
+            pixel_button("access-mode", t.native.access.label(), p, |s| {
                 s.current_mut().native.access_picker = true
             })
             .disabled(t.status.busy() || t.configuring || t.archived()),
@@ -7177,7 +7477,7 @@ fn machine_selector(s: &State, p: Palette) -> El {
         .center_y()
         .min_w(0.0)
         .shrink()
-        .radius(8.0)
+        .radius(4.0)
         .hover(p.selected)
         .focusable(true)
         .cursor(rune::Cursor::Pointer)
@@ -7195,7 +7495,7 @@ fn machine_selector(s: &State, p: Palette) -> El {
             .size(12.0, 12.0),
         )
         .child(
-            label(title, SMALL, p.muted)
+            pixel_text(title, p.muted)
                 .key("machine-selector-label")
                 .truncate()
                 .shrink()
@@ -7217,10 +7517,12 @@ fn machine_picker(s: &State, p: Palette) -> El {
         })
         .padding(4.0)
         .gap(1.0)
-        .radius(8.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .child(label("Run on", SMALL, p.muted).px(8.0).py(6.0));
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(pixel_label("Run on", p.muted).px(8.0).py(6.0));
     let servers = std::iter::once("local".to_owned()).chain(
         s.client
             .iter()
@@ -7233,7 +7535,7 @@ fn machine_picker(s: &State, p: Palette) -> El {
             if s.machine_connected(&server) {
                 ""
             } else {
-                " · Offline"
+                ", offline"
             }
         );
         let key = format!("machine-option-{server}");
@@ -7271,20 +7573,23 @@ fn machine_dialog(s: &State, p: Palette) -> El {
     let busy = s.machines.pending.is_some();
     let mut card = col().key("machine-dialog").role("dialog").label("Linked machines")
         .w((s.viewport_width-32.0).clamp(280.0,520.0)).max_h((s.viewport_height-64.0).max(240.0))
-        .scroll(ScrollSpec {stick_bottom:false}).padding(16.0).gap(12.0).radius(10.0)
-        .fill(p.card).border(0.5,p.line)
-        .child(row().center_y().child(label("Linked machines",TextStyle::new(16.0,550.0),p.ink)).child(spacer())
+        .scroll(ScrollSpec {stick_bottom:false}).padding(16.0).gap(12.0).radius(6.0)
+        .clip_rounded(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(row().center_y().child(label("Linked machines",DIALOG_TITLE,p.ink)).child(spacer())
             .child(icon_button("close-machines","Close","close",p,|s| {
                 s.machines.dialog=false;s.machines.code.replace_text("");s.machines.notice=None;
             })))
         .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
-        .child(label("Host",SMALL,p.ink))
+        .child(pixel_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).border(1.0,p.field_line).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(6.0).border(if s.machines.host.focused { 2.0 } else { 1.0 }, if s.machines.host.focused { p.coral } else { p.field_line }).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.host))
-        .child(label("Pairing code",SMALL,p.ink))
+        .child(pixel_label("Pairing code",p.muted))
         .child(text_input(&s.machines.code,BODY).key("machine-code").label("Pairing code").placeholder("PAIRCODE",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).border(1.0,p.field_line).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(6.0).border(if s.machines.code.focused { 2.0 } else { 1.0 }, if s.machines.code.focused { p.coral } else { p.field_line }).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.code))
         .child(primary_button("machine-link-submit","Link machine",p,|s| s.machine_action("link","")).disabled(busy))
         .child(row().flex_wrap().gap(8.0)
@@ -7383,7 +7688,7 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                     .gap(6.0)
                     .px(8.0)
                     .h(25.0)
-                    .radius(5.0)
+                    .radius(4.0)
                     .fill(p.selected)
                     .child(icon("thread", p.muted))
                     .child(label("Session", SMALL, p.ink)),
@@ -7420,13 +7725,13 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(label("Model", SMALL, p.muted))
+                .child(pixel_label("Model", p.muted))
                 .child(label(&t.model, LABEL, p.ink).wrap()),
         )
         .child(
             col()
                 .gap(5.0)
-                .child(label("Conversation", SMALL, p.muted))
+                .child(pixel_label("Conversation", p.muted))
                 .child(label(
                     if t.session.is_some() {
                         "Saved locally by Pi"
@@ -7483,8 +7788,8 @@ fn dialog(s: &State, p: Palette) -> El {
         .label("Pi needs your input")
         .padding(13.0)
         .gap(10.0)
-        .radius(7.0)
-        .fill(p.teal_bg)
+        .radius(6.0)
+        .fill(p.coral_bg)
         .border(1.0, p.line)
         .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
         .child(label(crate::model::string(request, "message"), BODY, p.ink).wrap());
@@ -7550,6 +7855,98 @@ pub(crate) mod tests {
             rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
         )
     }
+    #[test]
+    fn a_hairline_closes_the_chat_header_and_the_brief_toggle_is_an_icon_when_open() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.open_captain(0);
+            rt.frame(0.0);
+            let (header, _) = rt.presented("chat-header").unwrap();
+            let (rule, _) = rt.presented("chat-header-rule").unwrap();
+            assert_eq!(rule[3], 1.0, "{width}");
+            assert!((rule[1] - (header[1] + header[3])).abs() < 0.5, "{width}");
+            let (closed, _) = rt.presented("open-brief").unwrap();
+            assert!(closed[2] > 40.0, "{width}: the closed button names itself");
+            press(&mut rt, "open-brief");
+            rt.frame(1.0);
+            let (open, _) = rt.presented("open-brief").unwrap();
+            assert_eq!([open[2], open[3]], [24.0, 24.0], "{width}: icon only");
+        }
+    }
+    #[test]
+    fn dialog_scrims_cover_the_whole_window() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.begin_new_captain();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (scrim, _) = rt.presented("captain-editor-backdrop").unwrap();
+            assert_eq!(scrim, [0.0, 0.0, width, 720.0], "{width}");
+        }
+    }
+    #[test]
+    fn a_selected_portrait_changes_its_own_frame_and_no_cell_or_bounds() {
+        let mut rt = runtime(1280.0);
+        rt.state.begin_new_captain();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let faces = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
+            (0..crate::visuals::PORTRAITS)
+                .map(|n| {
+                    rt.presented(&format!("captain-portrait-face-{n}"))
+                        .unwrap()
+                        .0
+                })
+                .collect()
+        };
+        let cells = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
+            (0..crate::visuals::PORTRAITS)
+                .map(|n| rt.presented(&format!("captain-portrait-{n}")).unwrap().0)
+                .collect()
+        };
+        let (before_faces, before_cells) = (faces(&rt), cells(&rt));
+        assert!(before_faces.iter().all(|f| f[2] == 40.0 && f[3] == 40.0));
+        press(&mut rt, "captain-portrait-7");
+        rt.frame(1.0);
+        assert_eq!(faces(&rt), before_faces);
+        assert_eq!(cells(&rt), before_cells);
+    }
+    #[test]
+    fn remote_captain_status_lines_stay_inside_their_rows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.dark = false;
+            rt.frame(0.0);
+            let mut checked = 0;
+            for entry in sidebar_ui::entries(&rt.state)
+                .iter()
+                .filter(|entry| entry.captain)
+            {
+                let Some((row, _)) =
+                    rt.presented(&format!("machine-thread-{}-{}", entry.server, entry.id))
+                else {
+                    continue;
+                };
+                let Some((line, _)) =
+                    rt.presented(&format!("machine-status-{}-{}", entry.server, entry.id))
+                else {
+                    continue;
+                };
+                assert!(
+                    line[0] + line[2] <= row[0] + row[2] + 0.5,
+                    "{width}: the status line {line:?} runs past its row {row:?}"
+                );
+                checked += 1;
+            }
+            assert!(checked > 0, "{width}: no remote captain rows");
+        }
+    }
+
     #[test]
     fn fleet_navigation_keeps_one_header_and_stable_captain_positions_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
@@ -8099,6 +8496,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_acp_agent_sharing_a_built_in_id_gets_its_own_key() {
+        let mut rt = runtime(1280.0);
+        rt.state.harnesses.agents = vec![crate::harness::Agent {
+            id: "codex".into(),
+            name: "Codex ACP".into(),
+            command: "codex-acp".into(),
+            args: vec![],
+            env: vec![],
+        }];
+        rt.state.settings_picker = Some(SettingsPicker::Model);
+        rt.frame(0.0);
+        let keyed = |key: &str| {
+            rt.elements()
+                .into_iter()
+                .filter(|element| element.key.as_deref() == Some(key))
+                .count()
+        };
+        assert_eq!(keyed("choose-harness-codex"), 1);
+        assert_eq!(keyed("choose-harness-codex-2"), 1);
+    }
+
+    #[test]
     fn harness_picker_is_available_before_first_send_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -8319,23 +8738,42 @@ pub(crate) mod tests {
     fn reading_and_control_text_keep_accessible_contrast_in_both_themes() {
         for dark in [false, true] {
             let p = palette(dark);
-            for (foreground, background) in [
+            for (index, (foreground, background)) in [
                 (p.ink, p.panel),
                 (p.ink, p.bg),
                 (p.muted, p.panel),
                 (p.muted, p.bg),
                 (p.muted, p.card),
+                (p.faint, p.panel),
+                (p.faint, p.card),
+                (p.faint, p.bg),
+                (p.faint, p.bg.mix(p.selected, p.selected.a)),
+                (p.faint, p.card.mix(p.selected, p.selected.a)),
+                (p.faint, p.code_bg),
                 (p.ink, p.message_bg),
                 (p.muted, p.code_bg),
                 (p.muted, p.bg.mix(p.selected, p.selected.a)),
                 (p.muted, p.card.mix(p.selected, p.selected.a)),
-                (p.teal_text, p.panel),
-                (p.on_teal, p.teal),
-            ] {
+                (p.sea, p.panel),
+                (p.sea, p.card),
+                (p.sea, p.bg),
+                (p.sea, p.sea_bg),
+                (p.on_coral, p.coral),
+                (p.on_brass, p.brass),
+                (p.brass, p.panel),
+                (p.on_brass, crew_ui::brass_darkened(p, 0.2)),
+                (p.on_brass, crew_ui::brass_darkened(p, 0.32)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let a = foreground.luminance();
                 let b = background.luminance();
                 let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-                assert!(contrast >= 4.5, "text contrast {contrast:.2}, dark={dark}");
+                assert!(
+                    contrast >= 4.5,
+                    "text contrast {contrast:.2} in pair {index}, dark={dark}"
+                );
             }
         }
     }
@@ -10290,7 +10728,7 @@ pub(crate) mod tests {
         for width in [960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
             let (row, _) = rt.presented("attention-row").unwrap();
-            assert_eq!(row[3], 28.0);
+            assert_eq!(row[3], 24.0);
             assert_inside(&mut rt, width, &["attention-row", "attention-count"]);
             press(&mut rt, "attention-row");
             assert!(rt.state.attention_menu);
@@ -10357,6 +10795,241 @@ pub(crate) mod tests {
             assert_eq!(portrait[2], HERO_PORTRAIT);
             assert!(portrait[1] + portrait[3] < heading[1]);
             assert!(heading[1] + heading[3] < composer[1]);
+        }
+    }
+
+    #[test]
+    fn the_horizon_band_crowns_the_greeting_and_the_portrait_overlaps_its_edge() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            let (band, _) = rt.presented("horizon-band").unwrap();
+            let (heading, _) = rt.presented("empty-heading").unwrap();
+            assert_eq!(band[3], HORIZON_HEIGHT);
+            assert!(band[3] >= 96.0 && band[3] <= 120.0, "96 to 120 pt tall");
+            assert!(band[2] <= measure(true) + 0.5, "inside the content lane");
+            assert!(
+                band[0] >= pane[0] - 0.5 && band[0] + band[2] <= pane[0] + pane[2] + 0.5,
+                "band overflows the pane at {width}: {band:?} in {pane:?}"
+            );
+            assert!(
+                band[1] + band[3] <= heading[1],
+                "the band never sits behind text at {width}: {band:?} {heading:?}"
+            );
+
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            rt.frame(0.0);
+            let (band, _) = rt.presented("horizon-band").unwrap();
+            let (portrait, _) = rt.presented("captain-hero-portrait").unwrap();
+            let (heading, _) = rt.presented("captain-goal-heading").unwrap();
+            assert!(
+                portrait[1] < band[1] + band[3] && portrait[1] + portrait[3] > band[1] + band[3],
+                "the portrait crosses the band's bottom edge at {width}"
+            );
+            assert!(
+                portrait[1] > band[1],
+                "the portrait stays inside the band's top"
+            );
+            assert!(portrait[1] + portrait[3] < heading[1]);
+        }
+    }
+
+    #[test]
+    fn the_sidebar_sea_strip_sits_under_the_footer_icons() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            let (sidebar, _) = rt.presented("sidebar").unwrap();
+            let (footer, _) = rt.presented("sidebar-footer").unwrap();
+            let (sea, _) = rt.presented("sidebar-sea").unwrap();
+            assert_eq!(sea[3], SEA_HEIGHT);
+            assert!(
+                sea[1] >= footer[1] + footer[3] - 0.5,
+                "icons sit above the sea"
+            );
+            // It bleeds: flush to the window's left and bottom edges, and as wide as the sidebar.
+            let (root, _) = rt.presented("workspace-root").unwrap();
+            assert!(sea[0].abs() < 0.5, "flush left at {width}: {sea:?}");
+            assert!(
+                (sea[1] + sea[3] - (root[1] + root[3])).abs() < 0.5,
+                "flush to the bottom at {width}: {sea:?} in {root:?}"
+            );
+            assert!(
+                (sea[0] + sea[2] - (sidebar[0] + sidebar[2])).abs() < 0.5,
+                "the sidebar's full width at {width}: {sea:?} {sidebar:?}"
+            );
+        }
+    }
+
+    /// Opens `count` distinct threads. Each has a title and a sent message, so none is a blank
+    /// draft that `new_thread` would reuse.
+    fn open_distinct_threads(rt: &mut Runtime<State>, count: usize) {
+        for n in 0..count {
+            rt.state.new_thread();
+            let thread = rt.state.current_mut();
+            thread.title = format!("Thread number {n} with a longer title");
+            thread.life.latest_user_message_at = Some(lifecycle::now());
+        }
+    }
+
+    fn settle_frames(rt: &mut Runtime<State>) {
+        rt.invalidate();
+        rt.frame(0.0);
+        for _ in 0..4 {
+            rt.frame(1.0);
+        }
+    }
+
+    fn tab_key(rt: &Runtime<State>, id: usize) -> String {
+        if rt.state.current().id == id {
+            "active-tab".to_string()
+        } else {
+            format!("tab-{id}")
+        }
+    }
+
+    #[test]
+    fn tabs_share_the_strip_and_the_active_tab_stays_whole() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for extra in [0usize, 2, 6, 12] {
+                let mut rt = runtime(width);
+                open_distinct_threads(&mut rt, extra);
+                rt.set_viewport((width, 800.0), 1.0);
+                settle_frames(&mut rt);
+                let mut stages: Vec<(&str, Box<dyn Fn(&mut Runtime<State>)>)> = vec![
+                    ("the last tab", Box::new(|_| {})),
+                    (
+                        "the first tab",
+                        Box::new(|rt| {
+                            let first = rt.state.tabs[0];
+                            let index = rt.state.threads.iter().position(|t| t.id == first);
+                            rt.state.select_thread(index.unwrap());
+                        }),
+                    ),
+                    (
+                        "the last tab again",
+                        Box::new(|rt| {
+                            let last = *rt.state.tabs.last().unwrap();
+                            let index = rt.state.threads.iter().position(|t| t.id == last);
+                            rt.state.select_thread(index.unwrap());
+                        }),
+                    ),
+                    (
+                        "after closing the last tab",
+                        Box::new(|rt| {
+                            let last = *rt.state.tabs.last().unwrap();
+                            rt.state.close_tab(last);
+                        }),
+                    ),
+                ];
+                for (stage, step) in stages.drain(..) {
+                    step(&mut rt);
+                    settle_frames(&mut rt);
+                    let (strip, _) = rt.presented("thread-tabs").unwrap();
+                    let (plus, _) = rt.presented("new-tab").unwrap();
+                    let active = rt.presented("active-tab").map(|(rect, _)| rect).unwrap();
+                    let label = format!("{width}/{extra}/{stage}");
+                    assert!(
+                        plus[0] >= strip[0] + strip[2] - 0.5,
+                        "{label}: the plus overlaps the strip {strip:?} {plus:?}"
+                    );
+                    assert!(
+                        active[0] >= strip[0] - 0.5
+                            && active[0] + active[2] <= strip[0] + strip[2] + 0.5,
+                        "{label}: the active tab {active:?} is clipped by {strip:?}"
+                    );
+                    for id in rt.state.tabs.clone() {
+                        let (tab, _) = rt.presented(&tab_key(&rt, id)).unwrap();
+                        assert!(
+                            tab[2] >= TAB_MIN_WIDTH - 0.5 && tab[2] <= 285.5,
+                            "{label}: {tab:?}"
+                        );
+                    }
+                    let count = rt.state.tabs.len() as f32;
+                    if count * (TAB_MIN_WIDTH + TAB_GAP) <= strip[2] {
+                        // Everything fits at the minimum, so nothing scrolls and every tab is whole.
+                        for id in rt.state.tabs.clone() {
+                            let (tab, _) = rt.presented(&tab_key(&rt, id)).unwrap();
+                            assert!(
+                                tab[0] >= strip[0] - 0.5
+                                    && tab[0] + tab[2] <= strip[0] + strip[2] + 0.5,
+                                "{label}: tab {tab:?} escapes {strip:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_enabled_send_button_is_coral_and_the_stop_button_is_the_same_key() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            let fill_of = |rt: &Runtime<State>, key: &str| {
+                rt.elements()
+                    .into_iter()
+                    .find(|element| element.key.as_deref() == Some(key))
+                    .unwrap_or_else(|| panic!("{key} is missing"))
+                    .fill
+            };
+            let mut rt = runtime(1280.0);
+            rt.state.dark = dark;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(
+                fill_of(&rt, "send-message"),
+                p.line,
+                "disabled, dark={dark}"
+            );
+            rt.state.current_mut().draft.replace_text("Hello");
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(
+                fill_of(&rt, "send-message"),
+                p.coral,
+                "enabled, dark={dark}"
+            );
+            let (send, _) = rt.presented("send-message").unwrap();
+            assert_eq!((send[2], send[3]), (32.0, 32.0));
+            // While a run is busy and the draft is empty, the stop button takes its place with
+            // the same size and the same coral fill.
+            let t = rt.state.current_mut();
+            t.draft.replace_text("");
+            t.status = Status::Running;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(fill_of(&rt, "stop-agent"), p.coral, "stop, dark={dark}");
+            let (stop, _) = rt.presented("stop-agent").unwrap();
+            assert_eq!((stop[2], stop[3]), (32.0, 32.0));
+        }
+    }
+
+    #[test]
+    fn the_wordmark_stays_beside_the_attention_badge_in_a_docked_sidebar() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let rt = crew_runtime(width);
+            let (word, _) = rt.presented("shina-wordmark").unwrap_or_else(|| {
+                panic!("{width}: the wordmark is missing beside the attention badge")
+            });
+            let (badge, _) = rt.presented("attention-row").unwrap();
+            assert!(
+                word[0] + word[2] + 8.0 <= badge[0] + 0.5,
+                "{width}: the badge crowds the wordmark {word:?} {badge:?}"
+            );
+            // At 22 px the five cells are 70 px wide; the narrow fallback is 11 px.
+            assert!(
+                (word[2] - WORDMARK_WIDTH).abs() < 1.0 || word[2] < 40.0,
+                "{width}: {word:?}"
+            );
         }
     }
 

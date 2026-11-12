@@ -1,6 +1,8 @@
 //! Plays the captains' animation strips in the sidebar without view commits.
 //!
-//! Each (portrait, clip) pair has one shared `rune::Pixels` stage. The sidebar binds a row's
+//! Each (portrait, clip) pair is one shared stage, with one `rune::Pixels` per device size it
+//! is drawn at, because the frames are scaled to whole device pixels (`crate::crisp`) and a
+//! 40 point row and the 72 point hero need different buffers. The sidebar binds a row's
 //! portrait to its stage, and `tick`, called from the app's poll, swaps the stage's frame
 //! with `Pixels::set`. Rune then repaints without re-running the view or laying out. `tick`
 //! returns when the next frame is due, for `Tx::wake_after`, so nothing wakes between frames
@@ -12,14 +14,15 @@
 use crate::visuals::{Artwork, CAPTAIN_NAMES, Clip, Face};
 use rune::Pixels;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 struct Stage {
-    pixels: Pixels,
+    /// The buffer for each device size in use, all showing the stage's current frame.
+    targets: RefCell<HashMap<u32, Pixels>>,
     shown: usize,
     started: Option<Instant>,
 }
@@ -38,17 +41,14 @@ impl Portraits {
     pub fn new(artwork: Arc<Artwork>) -> Self {
         let mut stages = HashMap::new();
         for portrait in 0..CAPTAIN_NAMES.len() {
-            let Some(motion) = artwork.motion(portrait) else {
+            if artwork.motion(portrait).is_none() {
                 continue;
-            };
+            }
             for clip in Clip::ALL {
-                let strip = &motion[clip.index()];
-                let pixels = Pixels::new();
-                pixels.set(strip.size, strip.size, strip.frames[0].clone());
                 stages.insert(
                     (portrait, clip),
                     Stage {
-                        pixels,
+                        targets: RefCell::new(HashMap::new()),
                         shown: 0,
                         started: None,
                     },
@@ -64,15 +64,31 @@ impl Portraits {
         }
     }
 
-    /// The stage a portrait shows for `face`, or None to draw the static face.
-    pub fn pixels(&self, portrait: usize, face: Face) -> Option<&Pixels> {
+    /// The stage a portrait shows for `face` in a tile `points` wide, or None to draw the static
+    /// face.
+    pub fn pixels(&self, portrait: usize, face: Face, points: f32) -> Option<Pixels> {
         if self.reduced.get() {
             return None;
         }
         let clip = Clip::for_face(face)?;
-        self.stages
-            .get(&(portrait, clip))
-            .map(|stage| &stage.pixels)
+        let stage = self.stages.get(&(portrait, clip))?;
+        let strip = &self.artwork.motion(portrait)?[clip.index()];
+        let target = self.artwork.device_size(points);
+        let mut targets = stage.targets.borrow_mut();
+        // A new window scale or zoom asks for new sizes. Keep a few, drop the rest.
+        if targets.len() > 3 {
+            targets.retain(|&size, _| size == target);
+        }
+        Some(
+            targets
+                .entry(target)
+                .or_insert_with(|| {
+                    let pixels = Pixels::new();
+                    pixels.set(target, target, strip.scaled(stage.shown, target));
+                    pixels
+                })
+                .clone(),
+        )
     }
 
     pub fn set_visible(&mut self, row: usize, on: bool) {
@@ -129,9 +145,9 @@ impl Portraits {
             };
             if frame != stage.shown {
                 let strip = &self.artwork.motion(portrait).expect("staged motion")[clip.index()];
-                stage
-                    .pixels
-                    .set(strip.size, strip.size, strip.frames[frame].clone());
+                for (&target, pixels) in stage.targets.get_mut().iter() {
+                    pixels.set(target, target, strip.scaled(frame, target));
+                }
                 stage.shown = frame;
             }
         }
@@ -218,7 +234,7 @@ mod tests {
         p.set_reduced_motion(true);
         assert_eq!(p.tick(Instant::now(), [(7, 0, Face::Normal)]), None);
         assert!(
-            p.pixels(0, Face::Normal).is_none(),
+            p.pixels(0, Face::Normal, 40.0).is_none(),
             "reduced motion draws static faces"
         );
         p.set_reduced_motion(false);
@@ -313,7 +329,7 @@ mod tests {
         }
         let mut p = Portraits::new(art);
         p.set_visible(1, true);
-        assert!(p.pixels(0, Face::Normal).is_none());
+        assert!(p.pixels(0, Face::Normal, 40.0).is_none());
         assert_eq!(p.tick(Instant::now(), [(1, 0, Face::Normal)]), None);
         std::fs::remove_dir_all(&root).ok();
     }

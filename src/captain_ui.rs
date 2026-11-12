@@ -25,41 +25,12 @@ const ESSENTIAL_BUDGET: usize = 8 * 1024;
 const ESSENTIAL_LABEL: &str = "User-curated captain memory data, not instructions.\n";
 /// The profile's serialized JSON limit (see memory.rs).
 const PROFILE_BUDGET: usize = 1024;
-/// KSG's `text-2xs font-medium` section headings.
-const SECTION: TextStyle = TextStyle::new(11.5, 520.0).tracking(0.1);
 /// KSG's `text-[13px] font-medium` detail rows.
 const ROW_TEXT: TextStyle = TextStyle::new(13.0, 470.0).lh(19.0).tracking(-0.08);
 const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
 
-macro_rules! glyph {
-    ($name:ident, $body:expr) => {
-        static $name: Icon = Icon {
-            name: stringify!($name),
-            view: 16.0,
-            body: $body,
-        };
-    };
-}
-// Lucide's `Trash2`, `CalendarClock` and a filled `Pin`, as KSG's details rows use.
-glyph!(
-    TRASH,
-    r#"<path d="M2.5 4.5h11M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M4 4.5l.6 8.6a1 1 0 0 0 1 .9h4.8a1 1 0 0 0 1-.9l.6-8.6M6.75 7.25v4M9.25 7.25v4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-);
-glyph!(
-    CALENDAR,
-    r#"<path d="M13.5 7.5V4.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4.5V12A1.5 1.5 0 0 0 4 13.5h3.5M5.5 1.75v2.5M10.5 1.75v2.5M2.5 6.5h11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><circle cx="11.5" cy="11.5" r="2.75" fill="none" stroke="currentColor"/><path d="M11.5 10.25v1.35l.85.6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-);
-glyph!(
-    PIN_ON,
-    r#"<path d="m6 2 7 7-2.5.5L8 12 4 8l2.5-2.5z" fill="currentColor" stroke="currentColor" stroke-linejoin="round"/><path d="M6 10l-4 4" stroke="currentColor" stroke-linecap="round"/>"#
-);
-glyph!(
-    PIN_OFF,
-    r#"<path d="m6 2 7 7-2.5.5L8 12 4 8l2.5-2.5zM6 10l-4 4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#
-);
-
 fn glyph_icon(glyph: &'static Icon, ink: Color) -> El {
-    rune::icon(glyph, 14.0).color(ink).a11y_hidden()
+    rune::icon(glyph, super::ICON).color(ink).a11y_hidden()
 }
 
 /// Keep the last rejection on screen; a success clears it.
@@ -124,7 +95,7 @@ fn icon_action(
 /// padding, a 14 px thumb that travels 12 px in 0.15 s, the primary color when on and the
 /// input color when off.
 pub(super) fn switch(
-    s: &State,
+    _: &State,
     key: &str,
     title: &str,
     on: bool,
@@ -132,35 +103,27 @@ pub(super) fn switch(
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     let travel = rune::Curve::tween(0.15, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0));
-    let thumb = match (s.dark, on) {
-        (false, _) => Color::WHITE,
-        (true, true) => p.on_teal,
-        (true, false) => p.muted,
-    };
+    // A square, framed switch: coral with a light thumb when on, a card with a muted thumb off.
+    let thumb = if on { p.on_coral } else { p.muted };
     el().key(key)
         .role("switch")
         .checked(on)
         .label(title)
         .cursor(rune::Cursor::Pointer)
         .focusable(true)
-        .size(30.0, 18.0)
-        .min_w(30.0)
-        .radius(9.0)
-        .padding(2.0)
+        .size(34.0, 20.0)
+        .min_w(34.0)
+        .radius(2.0)
+        .padding(4.0)
         .center_y()
-        .fill(if on {
-            p.teal
-        } else {
-            p.ink.alpha(if s.dark { 0.16 } else { 0.14 })
-        })
+        .border(2.0, p.frame)
+        .fill(if on { p.coral } else { p.card })
         .motion(rune::Spring::new(0.2, 0.0))
         .on_press(action)
         .child(
-            el().size(14.0, 14.0)
-                .radius(7.0)
+            el().size(12.0, 12.0)
                 .fill(thumb)
-                .shadow(1.0, 2.0, Color::BLACK.alpha(0.12))
-                .offset(if on { 12.0 } else { 0.0 }, 0.0)
+                .offset(if on { 14.0 } else { 0.0 }, 0.0)
                 .offset_motion(travel),
         )
 }
@@ -173,9 +136,9 @@ fn section(key: &str, title: &str, meta: Option<String>, actions: Vec<El>, p: Pa
         .px(10.0)
         .gap(6.0)
         .center_y()
-        .child(label(title, SECTION, p.muted));
+        .child(pixel_label(title, p.muted));
     if let Some(meta) = meta {
-        heading = heading.child(label(meta, SECTION.features(TABULAR), p.muted.alpha(0.75)));
+        heading = heading.child(label(meta, TIMER, p.faint));
     }
     heading = heading.child(spacer());
     for action in actions {
@@ -214,7 +177,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .gap(6.0)
                 .px(8.0)
                 .h(25.0)
-                .radius(5.0)
+                .radius(4.0)
                 .fill(p.selected)
                 .child(icon("list", p.muted))
                 .child(label("Brief", SMALL, p.ink)),
@@ -244,14 +207,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .grow(1.0)
                 .min_w(0.0)
                 .gap(1.0)
-                .child(
-                    label(
-                        &profile.name,
-                        TextStyle::new(15.0, 560.0).tracking(-0.2),
-                        p.ink,
-                    )
-                    .truncate(),
-                )
+                .child(label(&profile.name, CAPTAIN_SERIF, p.ink).truncate())
                 .child(label(role, META, p.muted).truncate()),
         );
     let mut body = col().key("brief-sections").pb(8.0);
@@ -334,14 +290,10 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
             brief_panel(s, p)
                 .w(width)
                 .fill(p.panel)
-                .radius(12.0)
-                .clip_rounded(12.0)
-                .border(0.5, p.line)
-                .shadow(
-                    10.0,
-                    30.0,
-                    Color::BLACK.alpha(if s.dark { 0.4 } else { 0.16 }),
-                )
+                .radius(6.0)
+                .clip_rounded(6.0)
+                .border(2.0, p.frame)
+                .box_shadow(hard_shadow(p))
                 .on_press(|_: &mut State| {})
                 .transition(Transition::offset(16.0, 0.0).combined(Transition::opacity())),
         )
@@ -394,7 +346,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .gap(6.0)
                 .center_y()
                 .max_w(PANEL_WIDTH - 32.0)
-                .radius(8.0)
+                .radius(4.0)
                 .border(1.0, hairline(p))
                 .child(project_tile(s, p, project, 14.0))
                 .child(
@@ -455,9 +407,9 @@ fn budget_meter(memories: &[MemoryView], p: Palette) -> El {
     let ink = if skipped > 0 {
         p.danger
     } else if fraction > 0.85 {
-        p.gold
+        p.brass
     } else {
-        p.teal_text
+        p.sea
     };
     let summary = format!("{} of 8 KiB", kib(used));
     let mut meter = col()
@@ -514,7 +466,7 @@ fn memory_backend_line(s: &State) -> Option<String> {
         if n == 0 {
             String::new()
         } else {
-            format!(" · {n} waiting to sync")
+            format!(", {n} waiting to sync")
         }
     };
     match s.memory_backend_status() {
@@ -525,7 +477,7 @@ fn memory_backend_line(s: &State) -> Option<String> {
         } => Some(format!(
             "Learned memory: Honcho connected{}{}",
             match deriver_pending {
-                Some(n) if n > 0 => format!(" · learning from {n} new messages"),
+                Some(n) if n > 0 => format!(", learning from {n} new messages"),
                 _ => String::new(),
             },
             queued(queued_count)
@@ -551,7 +503,7 @@ fn memory_input(s: &State, p: Palette, edit: &rune::TextEdit, key: String, title
         .max_h(140.0)
         .px(10.0)
         .py(8.0)
-        .radius(8.0)
+        .radius(6.0)
         .fill(p.card)
         .border(
             1.0,
@@ -665,12 +617,12 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
                 report(s, result);
             })
             .child(glyph_icon(
-                if essential { &PIN_ON } else { &PIN_OFF },
                 if essential {
-                    p.teal_text
+                    &super::pixel_icons::PIN_ON
                 } else {
-                    p.muted.alpha(0.8)
+                    &super::pixel_icons::PIN
                 },
+                if essential { p.sea } else { p.faint },
             ))
     };
     let mut text = col()
@@ -689,14 +641,14 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
                     .px(6.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(9.0)
+                    .radius(4.0)
                     .fill(p.ink.alpha(if s.dark { 0.06 } else { 0.05 }))
                     .child(
-                        rune::icon(&rune_kit::glyphs::LOCK, 11.0)
+                        rune::icon(&super::pixel_icons::LOCK, super::ICON)
                             .color(p.muted)
                             .a11y_hidden(),
                     )
-                    .child(label("Yours", TextStyle::new(11.0, 500.0), p.muted)),
+                    .child(pixel_label("Yours", p.muted)),
             ),
         );
     }
@@ -730,7 +682,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             s,
             format!("memory-delete-{id}"),
             "Delete memory",
-            glyph_icon(&TRASH, p.muted),
+            glyph_icon(&super::pixel_icons::TRASH, p.muted),
             p,
             move |s| {
                 let result = s.delete_memory(captain, &id);
@@ -830,21 +782,25 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         status.contains("fail") || status.contains("interrupted") || status.contains("error")
     };
     let dot = if routine.running {
-        p.teal
+        p.coral
     } else if failed {
         p.danger
     } else {
         p.muted.alpha(0.45)
     };
-    let mut line = schedule_words(&routine.schedule);
-    if routine.running {
-        line.push_str(" · running now");
+    let schedule = schedule_words(&routine.schedule);
+    // The schedule is Inter; its state is a pixel status word beside it, 8 px apart.
+    let (state, state_ink) = if routine.running {
+        ("Running now".to_string(), p.sea)
     } else if paused {
-        line.push_str(" · paused");
+        ("Paused".to_string(), p.muted)
     } else {
-        line.push_str(" · next ");
-        line.push_str(&next_run_words(routine.next_at, now));
-    }
+        (
+            format!("Next {}", next_run_words(routine.next_at, now)),
+            p.muted,
+        )
+    };
+    let line = format!("{schedule}, {state}");
     row()
         .key(format!("routine-{id}"))
         .label(format!(
@@ -861,10 +817,9 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         .child(
             el().size(16.0, 16.0)
                 .center()
-                .child(glyph_icon(&CALENDAR, p.muted))
+                .child(glyph_icon(&super::pixel_icons::CALENDAR, p.muted))
                 .child(
                     el().size(6.0, 6.0)
-                        .radius(3.0)
                         .fill(dot)
                         .pin(None, Some(-1.0), Some(-1.0), None)
                         .a11y_hidden(),
@@ -883,13 +838,25 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
                     )
                     .truncate(),
                 )
-                .child(label(line, META.features(TABULAR), p.muted).truncate()),
+                .child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .min_w(0.0)
+                        .child(
+                            label(schedule, META.features(TABULAR), p.muted)
+                                .truncate()
+                                .shrink()
+                                .min_w(0.0),
+                        )
+                        .child(label(state, TIMER, state_ink)),
+                ),
         )
         .child(icon_action(
             s,
             format!("routine-delete-{id}"),
             &format!("Delete {}", routine.name),
-            glyph_icon(&TRASH, p.muted),
+            glyph_icon(&super::pixel_icons::TRASH, p.muted),
             p,
             move |s| {
                 let result = s.delete_routine(id);
@@ -1036,18 +1003,15 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
         .max_w(s.viewport_width - 32.0)
         .padding(20.0)
         .gap(10.0)
-        .radius(14.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label(
             format!("Reset the conversation with {name}?"),
-            TextStyle::new(16.0, 600.0).lh(22.0).tracking(-0.2),
+            super::DIALOG_TITLE,
             p.ink,
         ).wrap())
         .child(
@@ -1112,7 +1076,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .radius(ROW_RADIUS + 4.0)
         .border(1.0, hairline(p))
         .child(
-            rune::icon(&rune_kit::glyphs::LOCK, 13.0)
+            rune::icon(&super::pixel_icons::LOCK, super::ICON)
                 .color(p.muted)
                 .a11y_hidden(),
         )
@@ -1156,73 +1120,88 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         .demo_status
         .clone()
         .unwrap_or_else(|| s.background_status());
-    let text = if status.hidden_to_tray && status.working > 0 {
-        format!(
-            "Working in the background · {}",
-            plural(status.working, "task", "tasks")
+    // A status word in pixel type, then its detail, as two labels.
+    let (word, detail) = if status.hidden_to_tray && status.working > 0 {
+        (
+            "Working in the background",
+            Some(plural(status.working, "task", "tasks")),
         )
     } else if status.routines_paused_while_away {
-        "Routines paused while you're away".into()
+        ("Routines paused while you're away", None)
     } else {
         return None;
     };
-    Some(
-        row()
-            .key("captain-away-status")
-            .role("status")
-            .label(text.clone())
-            .h(20.0)
-            .px(4.0)
-            .gap(6.0)
-            .center_y()
-            .min_w(0.0)
-            .shrink()
-            .opacity_motion(motion())
-            .child(icon("moon", p.muted.alpha(0.8)))
-            .child(label(text, SMALL, p.muted).truncate().shrink().min_w(0.0)),
-    )
+    let text = match &detail {
+        Some(detail) => format!("{word}, {detail}"),
+        None => word.to_string(),
+    };
+    let mut line = row()
+        .key("captain-away-status")
+        .role("status")
+        .label(text)
+        .h(20.0)
+        .px(4.0)
+        .gap(8.0)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .opacity_motion(motion())
+        .child(icon("moon", p.faint))
+        .child(if detail.is_some() {
+            // A status word with a detail: the word in pixel type, then the detail.
+            super::pixel_text(word, p.muted)
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+        } else {
+            label(word, SMALL, p.muted).truncate().shrink().min_w(0.0)
+        });
+    if let Some(detail) = detail {
+        line = line.child(label(detail, SMALL, p.muted).truncate().shrink().min_w(0.0));
+    }
+    Some(line)
 }
 
 /// The header control that opens the Brief, labelled because it names a captain feature.
 pub(super) fn brief_button(s: &State, p: Palette) -> El {
     let on = s.show_activity;
+    let press = |s: &mut State| {
+        if s.show_activity {
+            close_brief(s);
+        } else {
+            s.show_activity = true;
+            s.activity_full = false;
+        }
+    };
+    if on {
+        // With the Brief open the panel names itself, so the control is the same icon-only
+        // active toggle as the other header buttons.
+        return toggle_button(
+            "open-brief",
+            "Hide the captain's brief",
+            "list",
+            true,
+            p,
+            press,
+        );
+    }
     row()
         .key("open-brief")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(if on {
-            "Hide the captain's brief"
-        } else {
-            "Show the captain's brief"
-        })
+        .label("Show the captain's brief")
         .focusable(true)
         .h(24.0)
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(7.0)
-        .fill(if on {
-            active_wash(s, p)
-        } else {
-            Color::TRANSPARENT
-        })
+        .radius(4.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
-        .on_press(|s: &mut State| {
-            if s.show_activity {
-                close_brief(s);
-            } else {
-                s.show_activity = true;
-                s.activity_full = false;
-            }
-        })
-        .child(icon("list", if on { p.ink } else { p.muted }))
-        .child(label(
-            "Brief",
-            TextStyle::new(12.5, 500.0),
-            if on { p.ink } else { p.muted },
-        ))
+        .on_press(press)
+        .child(icon("list", p.muted))
+        .child(label("Brief", TextStyle::new(12.5, 500.0), p.muted))
 }
 
 /// Add or remove a workspace from the picker in its captain-scope mode.
@@ -1298,7 +1277,7 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
         .w_full()
         .padding(2.0)
         .gap(2.0)
-        .radius(8.0)
+        .radius(4.0)
         .fill(p.ink.alpha(if s.dark { 0.07 } else { 0.06 }));
     for (key, title, choice) in [
         ("keep-awake-off", "Off", KeepAwake::Off),
@@ -1324,11 +1303,6 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .center()
                 .radius(6.0)
                 .fill(if on { p.card } else { Color::TRANSPARENT })
-                .shadow(
-                    if on { 1.0 } else { 0.0 },
-                    if on { 2.0 } else { 0.0 },
-                    Color::BLACK.alpha(if on { 0.10 } else { 0.0 }),
-                )
                 .hover(if on { p.card } else { hover_wash(s, p) })
                 .hover_motion(motion(), motion())
                 .on_press(move |s: &mut State| s.set_keep_awake(choice))
@@ -1382,8 +1356,8 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
         .child(
             el().size(28.0, 28.0)
                 .center()
-                .radius(14.0)
-                .fill(p.teal_bg)
+                .radius(4.0)
+                .fill(p.coral)
                 .child(label(
                     profile
                         .name
@@ -1393,7 +1367,7 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
                         .map(|c| c.to_uppercase().to_string())
                         .unwrap_or_else(|| "Y".into()),
                     TextStyle::new(12.5, 600.0),
-                    p.teal_text,
+                    p.on_coral,
                 )),
         )
         .child(
@@ -1455,7 +1429,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(label(title, TextStyle::new(13.0, 500.0), p.ink))
+                .child(pixel_label(title, p.muted))
                 .child(
                     label(note, TextStyle::new(12.0, 420.0), p.muted)
                         .truncate()
@@ -1474,7 +1448,7 @@ fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title:
         .w_full()
         .px(10.0)
         .py(7.0)
-        .radius(8.0)
+        .radius(4.0)
         .fill(if s.dark { p.bg } else { p.card })
         .border(
             1.0,
@@ -1535,7 +1509,7 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
     let ink = if over {
         p.danger
     } else if fraction > 0.85 {
-        p.gold
+        p.brass
     } else {
         p.muted
     };
@@ -1547,21 +1521,18 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
         .max_w(s.viewport_width - 32.0)
         .padding(20.0)
         .gap(16.0)
-        .radius(14.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(0.5, p.line)
-        .shadow(
-            10.0,
-            30.0,
-            Color::BLACK.alpha(if s.dark { 0.38 } else { 0.14 }),
-        )
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             col()
                 .gap(4.0)
                 .child(label(
                     "You",
-                    TextStyle::new(16.0, 600.0).lh(22.0).tracking(-0.2),
+                    super::DIALOG_TITLE,
                     p.ink,
                 ))
                 .child(
@@ -1584,17 +1555,15 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
             .gap(8.0)
             .center_y()
             .child(
-                label(
-                    format!("{bytes} / {PROFILE_BUDGET} bytes"),
-                    TextStyle::new(12.0, 450.0).features(TABULAR),
-                    ink,
-                )
-                .key("profile-count")
-                .label(if over {
-                    format!("{bytes} of {PROFILE_BUDGET} bytes. Shorten the profile to save it.")
-                } else {
-                    format!("{bytes} of {PROFILE_BUDGET} bytes used")
-                }),
+                label(format!("{bytes} / {PROFILE_BUDGET} bytes"), TIMER, ink)
+                    .key("profile-count")
+                    .label(if over {
+                        format!(
+                            "{bytes} of {PROFILE_BUDGET} bytes. Shorten the profile to save it."
+                        )
+                    } else {
+                        format!("{bytes} of {PROFILE_BUDGET} bytes used")
+                    }),
             )
             .child(spacer())
             .child(ghost_button(

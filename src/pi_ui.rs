@@ -13,13 +13,23 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
     let mut options = col().gap(2.0).w_full();
     for (i, option) in question.options.iter().enumerate() {
         let selected = !custom && answer.selected.contains(&option.value);
-        let indicator = if question.multi {
-            if selected { "[x]" } else { "[ ]" }
-        } else if selected {
-            "(*)"
-        } else {
-            "( )"
-        };
+        // A square mark: a filled coral square for a chosen checkbox, a coral square inside the
+        // frame for a chosen radio.
+        let indicator = el()
+            .size(14.0, 14.0)
+            .center()
+            .border(2.0, if selected { p.coral } else { p.field_line })
+            .fill(if selected && question.multi {
+                p.coral
+            } else {
+                Color::TRANSPARENT
+            })
+            .child(if selected && !question.multi {
+                el().size(6.0, 6.0).fill(p.coral)
+            } else {
+                el()
+            })
+            .a11y_hidden();
         options = options.child(
             row()
                 .key(format!("dialog-option-{i}"))
@@ -37,14 +47,14 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 .py(6.0)
                 .px(8.0)
                 .gap(10.0)
-                .radius(6.0)
+                .radius(4.0)
                 .fill(if selected {
                     p.selected
                 } else {
                     Color::TRANSPARENT
                 })
                 .hover(p.selected)
-                .child(label(indicator, SMALL, p.teal).w(20.0))
+                .child(el().w(20.0).center_y().child(indicator))
                 .child(
                     col()
                         .grow(1.0)
@@ -59,18 +69,11 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 .wrap_anywhere(),
                         ),
                 )
-                .child(
-                    label(
-                        if i < 9 {
-                            (i + 1).to_string()
-                        } else {
-                            String::new()
-                        },
-                        SMALL,
-                        p.muted,
-                    )
-                    .w(24.0),
-                )
+                .child(el().w(28.0).center().child(if i < 9 {
+                    keycap_chip(&(i + 1).to_string(), p)
+                } else {
+                    el()
+                }))
                 .on_press(move |s: &mut State| s.current_mut().questionnaire_toggle(i)),
         );
     }
@@ -87,21 +90,23 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 .w_full()
                 .padding(16.0)
                 .gap(8.0)
-                .radius(12.0)
+                .radius(6.0)
+                .clip_rounded(6.0)
                 .fill(p.card)
-                .border(1.0, p.line)
+                .border(2.0, p.frame)
+                .box_shadow(hard_shadow(p))
                 .child(
                     row()
                         .gap(8.0)
                         .child(
-                            label(&question.header, SMALL, p.muted)
+                            pixel_label(&question.header, p.muted)
                                 .grow(1.0)
                                 .min_w(0.0)
                                 .truncate(),
                         )
                         .child(label(
                             format!("{}/{}", form.index + 1, form.questions.len()),
-                            SMALL,
+                            TIMER,
                             p.muted,
                         )),
                 )
@@ -151,7 +156,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                             )
                             .disabled(!can_advance),
                         )
-                        .child(button("dialog-cancel", "Cancel", p, |s| {
+                        .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
                             s.current_mut().respond(json!({"cancelled":true}))
                         })),
                 ),
@@ -189,8 +194,8 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
                 .key(format!("pi-notification-{i}"))
                 .wrap_anywhere()
                 .padding(8.0)
-                .radius(8.0)
-                .fill(p.teal_bg)
+                .radius(6.0)
+                .fill(p.coral_bg)
                 .border(0.5, p.line),
         );
     }
@@ -216,9 +221,11 @@ pub(super) fn slash_menu(s: &State, p: Palette) -> El {
         .w_full()
         .max_h(288.0)
         .padding(4.0)
-        .radius(12.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(1.0, p.line)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
@@ -254,11 +261,11 @@ pub(super) fn slash_menu(s: &State, p: Palette) -> El {
                 .min_h(32.0)
                 .px(8.0)
                 .gap(8.0)
-                .radius(8.0)
+                .radius(4.0)
                 .center_y()
                 .cursor(rune::Cursor::Pointer)
                 .fill(if i == at {
-                    p.selected
+                    p.coral_bg
                 } else {
                     Color::TRANSPARENT
                 })
@@ -280,7 +287,7 @@ pub(super) fn slash_menu(s: &State, p: Palette) -> El {
                         .grow(1.0)
                         .min_w(0.0),
                 )
-                .child(label(&command.source, TextStyle::new(10.0, 400.0), p.muted)),
+                .child(pixel_label(&command.source, p.muted)),
         );
     }
     list
@@ -352,7 +359,7 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
             .gap(6.0)
             .px(12.0)
             .py(8.0)
-            .radius(16.0)
+            .radius(6.0)
             .border(1.0, p.line)
             .max_w(580.0)
             .shrink()
@@ -449,7 +456,7 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
                 .key(format!("pi-subagent-{}-{i}", tool.id))
                 .padding(8.0)
                 .gap(4.0)
-                .radius(8.0)
+                .radius(6.0)
                 .border(0.5, p.line)
                 .child(
                     row()
@@ -521,7 +528,7 @@ pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
             .gap(6.0)
             .px(12.0)
             .py(8.0)
-            .radius(8.0)
+            .radius(6.0)
             .border(0.5, p.line)
             .child(
                 row()
@@ -591,16 +598,18 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
         .max_h((s.viewport_height - 120.0).max(240.0))
         .padding(16.0)
         .gap(12.0)
-        .radius(12.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(1.0, p.line);
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p));
     if let Some(entry) = &t.native.confirm_rewind {
         let entry = entry.clone();
         card = card.child(label("Edit from here?", TextStyle::new(16.0,600.0),p.ink))
             .child(label("Rewind chat to before this message. Your prompt returns to the composer. Files are not changed. Pi keeps the original session on disk.",BODY,p.muted).wrap())
             .child(row().gap(8.0).flex_wrap()
                 .child(button("rewind-confirm", "Revert and keep changes",p,move |s| { s.current_mut().rewind(entry.clone()); s.checkpoint(); }))
-                .child(button("rewind-cancel", "Cancel",p,|s| s.current_mut().native.confirm_rewind = None)));
+                .child(secondary_button("rewind-cancel", "Cancel",p,|s| s.current_mut().native.confirm_rewind = None)));
     } else {
         card = card.child(label(
             if mode == ConversationMode::Fork {
@@ -608,7 +617,7 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
             } else {
                 "Edit from here"
             },
-            TextStyle::new(16.0, 600.0),
+            DIALOG_TITLE,
             p.ink,
         ));
         let mut list = col().max_h(360.0).gap(4.0).scroll(ScrollSpec {
@@ -631,7 +640,7 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
                     .min_h(36.0)
                     .px(8.0)
                     .py(6.0)
-                    .radius(8.0)
+                    .radius(4.0)
                     .hover(p.selected)
                     .child(
                         label(crate::model::string(point, "text"), BODY, p.ink)
@@ -650,7 +659,7 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
         }
         card = card
             .child(list)
-            .child(button("conversation-cancel", "Cancel", p, |s| {
+            .child(secondary_button("conversation-cancel", "Cancel", p, |s| {
                 s.current_mut().native.conversation = None
             }));
     }
@@ -670,9 +679,11 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
         .padding(8.0)
         .gap(4.0)
-        .radius(12.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .fill(p.card)
-        .border(1.0, p.line);
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p));
     for (mode, description) in [
         (
             AccessMode::ReadOnly,
@@ -700,7 +711,7 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .padding(8.0)
                 .gap(4.0)
-                .radius(8.0)
+                .radius(4.0)
                 .hover(p.selected)
                 .child(label(mode.label(), LABEL, p.ink))
                 .child(label(description, SMALL, p.muted).wrap())

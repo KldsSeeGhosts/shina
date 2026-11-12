@@ -10,11 +10,15 @@
 //! The embedded captains also have short animation strips (`<Clip>.strip.png`), which
 //! `crate::portraits` plays in the sidebar. A drop-in set may add the same four strips; a
 //! set without them, or with a strip of the wrong length, keeps static faces.
-use rune::{Image, ImageCache, Waker};
+use rune::{Image, ImageCache, Pixels, Waker};
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 /// How many portraits ship. Saved captains store an index, so new portraits only append.
@@ -186,6 +190,8 @@ impl Clip {
 /// One clip's frames as RGBA, ready for `rune::Pixels::set`.
 pub struct Strip {
     pub size: u32,
+    /// How many pixels one art cell spans in the frames, from `crisp::upscale`.
+    pub cell: u32,
     pub frames: Vec<Vec<u8>>,
 }
 
@@ -197,21 +203,74 @@ impl Strip {
         if size == 0 || sheet.width() != size * clip.frames() as u32 {
             return None;
         }
-        let frames = (0..clip.frames() as u32)
+        let frames: Vec<Vec<u8>> = (0..clip.frames() as u32)
             .map(|i| {
                 image::imageops::crop_imm(&sheet, i * size, 0, size, size)
                     .to_image()
                     .into_raw()
             })
             .collect();
-        Some(Self { size, frames })
+        let cell = crate::crisp::upscale(size, size, &frames[0]);
+        Some(Self { size, cell, frames })
+    }
+
+    /// Frame `index` as a `target` pixel square of whole scaled cells.
+    pub fn scaled(&self, index: usize, target: u32) -> Vec<u8> {
+        crate::crisp::fit(&self.frames[index], self.size, self.size, self.cell, target)
     }
 }
 
 /// Every clip for one captain, or none.
 pub type Motion = [Strip; 4];
 
-type Set = [Image; Face::COUNT];
+/// One face as the PNG it ships in, decoded the first time a size asks for it.
+#[derive(Clone)]
+struct Art {
+    png: Arc<[u8]>,
+    decoded: Arc<OnceLock<Option<Decoded>>>,
+}
+
+struct Decoded {
+    width: u32,
+    height: u32,
+    cell: u32,
+    rgba: Vec<u8>,
+}
+
+impl Art {
+    fn new(png: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            png: png.into(),
+            decoded: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn decoded(&self) -> Option<&Decoded> {
+        self.decoded
+            .get_or_init(|| {
+                let image = image::load_from_memory(&self.png).ok()?.to_rgba8();
+                let (width, height) = image.dimensions();
+                let rgba = image.into_raw();
+                let cell = crate::crisp::upscale(width, height, &rgba);
+                Some(Decoded {
+                    width,
+                    height,
+                    cell,
+                    rgba,
+                })
+            })
+            .as_ref()
+    }
+}
+
+type Set = [Art; Face::COUNT];
+
+/// What one scaled buffer is of: a face (captain, face index, head crop or bust) or a mark.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Shown {
+    Face(usize, usize, bool),
+    Mark(bool),
+}
 
 pub struct Artwork {
     crew: [Set; PORTRAITS],
@@ -219,11 +278,13 @@ pub struct Artwork {
     small: [Set; PORTRAITS],
     /// Animation strips for full busts. A captain without all four stays static.
     motion: [Option<Motion>; PORTRAITS],
-    pub mark: Image,
-    /// The same mark with a light badge, for the dark theme.
-    pub mark_dark: Image,
     /// KSG Code's Antigravity provider mark, a bitmap rather than an SVG.
     pub antigravity: Image,
+    /// Device pixels per point, as the view last saw them (the window's scale times the app's
+    /// zoom), as `f32` bits.
+    scale: AtomicU32,
+    /// Pre-scaled buffers by art and device size, so each is built once.
+    scaled: Mutex<HashMap<(Shown, u32), Pixels>>,
 }
 
 impl Artwork {
@@ -235,7 +296,7 @@ impl Artwork {
         let mut small = Vec::with_capacity(PORTRAITS);
         let mut motion = Vec::with_capacity(PORTRAITS);
         for captain in 0..PORTRAITS {
-            let (set, crop, strips) = portraits(&cache, captain, root.as_deref());
+            let (set, crop, strips) = portraits(captain, root.as_deref());
             crew.push(set);
             small.push(crop);
             motion.push(strips);
@@ -247,38 +308,82 @@ impl Artwork {
         ) else {
             unreachable!("one set per portrait");
         };
-        let mark_dark = mark(&cache, true);
-        let mark = mark(&cache, false);
         let antigravity = provider_mark(
             &cache,
             include_bytes!("../assets/providers/antigravity.png"),
         );
         // Startup only. Decode off-thread before the first frame, including headless fixtures.
-        for image in crew
-            .iter()
-            .chain(&small)
-            .flatten()
-            .chain([&mark, &mark_dark, &antigravity])
-        {
-            image.wait().expect("valid crew artwork");
-        }
+        antigravity.wait().expect("valid provider mark");
         Arc::new(Self {
             crew,
             small,
             motion,
-            mark,
-            mark_dark,
             antigravity,
+            scale: AtomicU32::new(1.0f32.to_bits()),
+            scaled: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn face(&self, captain: usize, face: Face) -> &Image {
-        &self.crew[captain.min(PORTRAITS - 1)][face.index()]
+    /// Records the device pixels per point the view draws at.
+    pub fn set_scale(&self, scale: f32) {
+        self.scale
+            .store(scale.max(0.25).to_bits(), Ordering::Relaxed);
     }
 
-    /// The head crop for small tiles. Drop-in sets without crops reuse the full bust.
-    pub fn small_face(&self, captain: usize, face: Face) -> &Image {
-        &self.small[captain.min(PORTRAITS - 1)][face.index()]
+    /// `points` in whole device pixels at the recorded scale.
+    pub fn device_size(&self, points: f32) -> u32 {
+        let scale = f32::from_bits(self.scale.load(Ordering::Relaxed));
+        (points * scale).round().max(1.0) as u32
+    }
+
+    fn pixels_for(&self, shown: Shown, target: u32) -> Pixels {
+        let mut cache = self.scaled.lock().unwrap();
+        cache
+            .entry((shown, target))
+            .or_insert_with(|| {
+                let pixels = Pixels::new();
+                let rgba = match shown {
+                    Shown::Face(captain, face, head) => {
+                        let set = if head { &self.small } else { &self.crew };
+                        set[captain][face].decoded().map(|art| {
+                            crate::crisp::fit(&art.rgba, art.width, art.height, art.cell, target)
+                        })
+                    }
+                    Shown::Mark(night) => {
+                        let size = crate::brand::SIZE as u32;
+                        Some(crate::crisp::fit(
+                            &crate::brand::pixels(night),
+                            size,
+                            size,
+                            1,
+                            target,
+                        ))
+                    }
+                };
+                // A face that failed to decode shows nothing rather than failing the view.
+                pixels.set(
+                    target,
+                    target,
+                    rgba.unwrap_or_else(|| vec![0; (target * target * 4) as usize]),
+                );
+                pixels
+            })
+            .clone()
+    }
+
+    /// A portrait's face for a tile `points` wide, scaled to whole device pixels. Tiles under
+    /// 30 points use the head crop.
+    pub fn face_pixels(&self, captain: usize, face: Face, points: f32) -> Pixels {
+        let captain = captain.min(PORTRAITS - 1);
+        self.pixels_for(
+            Shown::Face(captain, face.index(), points < 30.0),
+            self.device_size(points),
+        )
+    }
+
+    /// The app mark for a square `points` wide. `night` selects the dark-theme sail.
+    pub fn mark_pixels(&self, night: bool, points: f32) -> Pixels {
+        self.pixels_for(Shown::Mark(night), self.device_size(points))
     }
 
     /// A captain's animation strips, if its set has them.
@@ -298,15 +403,11 @@ fn sprite_root(workspace: &Path) -> Option<PathBuf> {
         })
 }
 
-fn portraits(
-    cache: &ImageCache,
-    captain: usize,
-    root: Option<&Path>,
-) -> (Set, Set, Option<Motion>) {
-    if let Some((set, small, folder)) = root.and_then(|root| load_set(cache, root, captain)) {
+fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Motion>) {
+    if let Some((set, small, folder)) = root.and_then(|root| load_set(root, captain)) {
         return (set, small, load_motion(&folder));
     }
-    let (set, small) = embedded(cache, captain);
+    let (set, small) = embedded(captain);
     (set, small, embedded_motion(captain))
 }
 
@@ -359,7 +460,7 @@ fn embedded_motion(captain: usize) -> Option<Motion> {
 
 /// A set is either the named folder or the numeric captain index. All six faces must
 /// decode as files before the whole set is accepted.
-fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
+fn load_set(root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
     let folders = [
         root.join(CAPTAIN_KEYS[captain]),
         root.join(captain.to_string()),
@@ -372,13 +473,13 @@ fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set
         let mut crops = Vec::with_capacity(Face::COUNT);
         for name in FACE_FILES {
             let bytes = std::fs::read(folder.join(format!("{name}.png"))).ok()?;
-            let image = cache.load(bytes);
-            image.wait().ok()?;
+            let image = Art::new(bytes);
+            image.decoded()?;
             // An optional `<Face>.small.png` head crop; otherwise small tiles use the bust.
             let crop = std::fs::read(folder.join(format!("{name}.small.png")))
                 .ok()
-                .map(|bytes| cache.load(bytes))
-                .filter(|crop| crop.wait().is_ok())
+                .map(Art::new)
+                .filter(|crop| crop.decoded().is_some())
                 .unwrap_or_else(|| image.clone());
             images.push(image);
             crops.push(crop);
@@ -390,54 +491,54 @@ fn load_set(cache: &ImageCache, root: &Path, captain: usize) -> Option<(Set, Set
     None
 }
 
-fn embedded(cache: &ImageCache, captain: usize) -> (Set, Set) {
+fn embedded(captain: usize) -> (Set, Set) {
     macro_rules! set {
         ($name:literal) => {
             (
                 [
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Normal.png")).as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Happy.png")).as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Determined.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Surprised.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Dizzy.png")).as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Sad.png")).as_slice(),
                     ),
                 ],
                 [
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Normal.small.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Happy.small.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Determined.small.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Surprised.small.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Dizzy.small.png"))
                             .as_slice(),
                     ),
-                    cache.load(
+                    Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Sad.small.png"))
                             .as_slice(),
                     ),
@@ -469,12 +570,75 @@ fn provider_mark(cache: &ImageCache, png: &[u8]) -> Image {
     cache.rgba(image.width(), image.height(), image.into_raw())
 }
 
-fn mark(cache: &ImageCache, light: bool) -> Image {
-    let image = cache.rgba(
-        crate::brand::SIZE as u32,
-        crate::brand::SIZE as u32,
-        crate::brand::pixels(light),
-    );
-    image.wait().expect("valid generated crew mark");
-    image
+/// The colour behind each portrait: the corner pixel of its neutral face. A captain's horizon
+/// band takes its sky from this.
+pub fn portrait_backdrop(portrait: usize) -> [u8; 3] {
+    static BACKDROPS: std::sync::OnceLock<[[u8; 3]; PORTRAITS]> = std::sync::OnceLock::new();
+    macro_rules! faces {
+        ($($name:literal),*) => {
+            [$(include_bytes!(concat!("../assets/crew/", $name, "/Normal.png")).as_slice()),*]
+        };
+    }
+    let backdrops = BACKDROPS.get_or_init(|| {
+        let faces: [&[u8]; PORTRAITS] = faces!(
+            "ember", "juniper", "sable", "pip", "bram", "wren", "rook", "nia", "jett", "otto",
+            "bolt", "kit"
+        );
+        faces.map(|bytes| {
+            image::load_from_memory(bytes)
+                .map(|face| {
+                    let [r, g, b, _] = face.to_rgba8().get_pixel(1, 1).0;
+                    [r, g, b]
+                })
+                .unwrap_or([0x1d, 0x2a, 0x45])
+        })
+    });
+    backdrops[portrait.min(PORTRAITS - 1)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faces_and_the_mark_are_scaled_to_whole_device_pixels_and_cached() {
+        let art = Artwork::load(Path::new(""));
+        for (scale, points) in [
+            (1.0, 40.0),
+            (2.0, 40.0),
+            (2.0, 72.0),
+            (2.0, 20.0),
+            (3.0, 24.0),
+        ] {
+            art.set_scale(scale);
+            let target = (points * scale) as u32;
+            assert_eq!(art.device_size(points), target);
+            let face = art.face_pixels(0, Face::Normal, points);
+            assert_eq!(face.size(), (target, target), "{points} pt at {scale}x");
+            let mark = art.mark_pixels(true, points);
+            assert_eq!(mark.size(), (target, target));
+            // A second request returns the same buffer instead of scaling again.
+            assert_eq!(
+                format!("{face:?}"),
+                format!("{:?}", art.face_pixels(0, Face::Normal, points))
+            );
+        }
+    }
+
+    #[test]
+    fn strip_frames_scale_without_blending_colours() {
+        let art = Artwork::load(Path::new(""));
+        let strip = &art.motion(0).expect("embedded strips")[Clip::Idle.index()];
+        assert_eq!(strip.cell, 6, "the strips ship at six pixels a cell");
+        let whole = strip.scaled(0, 80);
+        let source: std::collections::HashSet<[u8; 4]> = strip.frames[0]
+            .chunks(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(
+            whole
+                .chunks(4)
+                .all(|p| source.contains(&[p[0], p[1], p[2], p[3]]))
+        );
+    }
 }

@@ -252,7 +252,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .focusable(true)
         .w_full()
         .min_w(0.0)
-        .radius(8.0)
+        .radius(4.0)
         .hover(p.selected)
         .on_press(move |s: &mut State| s.open_machine_thread(&server, id));
     if entry.captain {
@@ -267,11 +267,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             .unwrap_or(0) as usize;
         let pixels = s
             .artwork
-            .face(
-                portrait.min(crate::visuals::CAPTAIN_NAMES.len() - 1),
-                face_for(status),
-            )
-            .pixels();
+            .face_pixels(portrait, face_for(status), CAPTAIN_FACE);
         let mut detail = Vec::new();
         let running = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
@@ -312,59 +308,62 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         ) {
             detail.push(workspace.into());
         }
-        detail.push(machine_line);
         let timer = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
             .filter(|view| status_of_view(view) == Status::Running)
             .filter_map(|view| view["elapsed"].as_u64())
             .max();
         let mut status_line = rune::row()
+            .key(format!("machine-status-{}-{id}", entry.server))
             .h(18.0)
-            .gap(4.0)
+            .w_full()
+            .gap(8.0)
             .center_y()
-            .child(
-                el().size(10.0, 10.0)
-                    .center()
-                    .child(status_mark(status, p, 6.0)),
-            )
-            .child(label(
+            .child(pixel_text(
                 status.label(),
-                CAPTAIN_STATUS,
                 if status == Status::Completed {
-                    p.teal_text
+                    p.sea
                 } else {
                     status_ink(status, p)
                 },
             ))
             .child(
-                label(format!("· {}", detail.join(" · ")), CAPTAIN_STATUS, p.muted)
+                label(detail.join(", "), CAPTAIN_STATUS, p.muted)
                     .truncate()
                     .shrink()
                     .grow(1.0)
                     .min_w(0.0),
+            )
+            // The machine name keeps its width up to a cap, so the detail before it gives way
+            // first and always ends in an ellipsis.
+            .child(
+                label(machine_line.clone(), CAPTAIN_STATUS, p.faint)
+                    .truncate()
+                    .shrink()
+                    .min_w(MACHINE_FLOOR)
+                    .max_w(MACHINE_CAP),
             );
         if let Some(seconds) = timer {
             status_line = status_line.child(
-                label(elapsed_label(seconds), SIDEBAR_TIMER, p.muted)
+                label(elapsed_label(seconds), PIXEL.features(TABULAR), p.muted)
                     .w(TIMER_SLOT)
                     .align(rune::Align::End),
             );
         }
-        return item.radius(10.0).child(
+        return item.radius(4.0).child(
             rune::row()
                 .h(CAPTAIN_SLOT + 12.0)
+                .w_full()
                 .pl(6.0)
                 .pr(8.0)
                 .gap(10.0)
                 .center_y()
                 .child(
-                    el().key(format!("machine-portrait-{}-{id}", entry.server))
-                        .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
-                        .radius(12.0)
-                        .clip_rounded(12.0)
-                        .border(0.5, p.gold.alpha(0.4))
-                        .pixels(pixels)
-                        .a11y_hidden(),
+                    el().size(CAPTAIN_SLOT, CAPTAIN_SLOT).center().child(
+                        pixel_portrait(&pixels, CAPTAIN_FACE, p)
+                            .key(format!("machine-portrait-{}-{id}", entry.server))
+                            .a11y_hidden(),
+                    ),
                 )
                 .child(
                     col()
@@ -389,9 +388,9 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                                         .center_y()
                                         .child(spacer())
                                         .child(if requests > 0 || status == Status::Waiting {
-                                            count_pill(requests.max(1), p.gold, p.on_teal)
+                                            count_pill(requests.max(1), CountKind::NeedsYou, p)
                                         } else if unread > 0 {
-                                            count_pill(unread, p.teal, p.on_teal)
+                                            count_pill(unread, CountKind::Unread, p)
                                         } else {
                                             el()
                                         }),
@@ -416,10 +415,25 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     meta = meta
         .child(project_tile(s, p, project_tile_data.as_ref(), 16.0))
         .child(
-            label(format!("{workspace} · {machine_line}"), CARD_META, p.muted)
-                .truncate()
+            rune::row()
                 .grow(1.0)
-                .min_w(0.0),
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(workspace, CARD_META, p.muted)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                // The workspace truncates first; the machine name keeps its width up to a cap.
+                .child(
+                    label(machine_line.clone(), CARD_META, p.faint)
+                        .truncate()
+                        .shrink()
+                        .min_w(MACHINE_FLOOR)
+                        .max_w(MACHINE_CAP),
+                ),
         );
     let at = lifecycle::now();
     let state_label = if view["request"]["method"] == "confirm" {
@@ -451,23 +465,15 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     };
     if let Some(age) = age {
         let ink = if status == Status::Waiting {
-            p.gold
+            p.brass
         } else if status == Status::Failed {
             p.danger
         } else if !state_label.is_empty() {
-            p.teal_text
+            p.sea
         } else {
             p.muted
         };
-        meta = meta.child(label(
-            age,
-            if state_label.is_empty() {
-                SMALL
-            } else {
-                SIDEBAR_TIMER
-            },
-            ink,
-        ));
+        meta = meta.child(label(age, PIXEL.features(TABULAR), ink));
     }
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
@@ -504,7 +510,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                     } else {
                         relative_time(entry.life.settled_at.unwrap_or(0) / 1000).unwrap_or_default()
                     },
-                    SMALL,
+                    PIXEL,
                     p.muted,
                 )),
         )

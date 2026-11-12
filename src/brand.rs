@@ -4,7 +4,7 @@
 
 pub const SIZE: usize = 32;
 
-type Rgb = [u8; 3];
+pub type Rgb = [u8; 3];
 
 const fn rgb(hex: u32) -> Rgb {
     [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
@@ -73,6 +73,55 @@ fn in_tile(x: usize, y: usize) -> bool {
 
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+}
+
+/// The boat alone, on the mark's 32 cell grid: mast, flag, sails, hull and portholes. The
+/// mark paints it over the sky, and the horizon band in the window paints it over its own.
+pub fn boat(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
+    let scene = if night { &NIGHT } else { &DAY };
+    for y in 4..=22 {
+        put(15, y, scene.mast);
+    }
+    for (x, y) in [(16, 4), (17, 4), (18, 4), (19, 4), (16, 5), (17, 5)] {
+        put(x, y, scene.flag);
+    }
+    for y in 7..=21usize {
+        let width = (((y - 6) as f32 * 0.72).round() as usize + 1).min(10);
+        for x in 16..16 + width {
+            let shade = x == 16 || y == 21;
+            put(x, y, if shade { scene.sail_shade } else { scene.sail });
+        }
+    }
+    for y in 10..=21usize {
+        let width = ((y - 9) as f32 * 0.62).round() as usize;
+        if width == 0 {
+            continue;
+        }
+        let first = 15 - width;
+        for x in first..=14 {
+            put(
+                x,
+                y,
+                if x == first {
+                    scene.jib_shade
+                } else {
+                    scene.jib
+                },
+            );
+        }
+    }
+    for x in 7..=25 {
+        put(x, 22, scene.hull);
+    }
+    for x in 8..=24 {
+        put(x, 23, scene.hull);
+    }
+    for x in 9..=23 {
+        put(x, 24, scene.hull_shade);
+    }
+    for x in [11, 15, 19] {
+        put(x, 23, scene.porthole);
+    }
 }
 
 /// RGBA pixels of the mark. `night` selects the dark-theme night sail.
@@ -146,49 +195,7 @@ pub fn pixels(night: bool) -> Vec<u8> {
         }
     }
 
-    for y in 4..=22 {
-        put(15, y, scene.mast);
-    }
-    for (x, y) in [(16, 4), (17, 4), (18, 4), (19, 4), (16, 5), (17, 5)] {
-        put(x, y, scene.flag);
-    }
-    for y in 7..=21usize {
-        let width = (((y - 6) as f32 * 0.72).round() as usize + 1).min(10);
-        for x in 16..16 + width {
-            let shade = x == 16 || y == 21;
-            put(x, y, if shade { scene.sail_shade } else { scene.sail });
-        }
-    }
-    for y in 10..=21usize {
-        let width = ((y - 9) as f32 * 0.62).round() as usize;
-        if width == 0 {
-            continue;
-        }
-        let first = 15 - width;
-        for x in first..=14 {
-            put(
-                x,
-                y,
-                if x == first {
-                    scene.jib_shade
-                } else {
-                    scene.jib
-                },
-            );
-        }
-    }
-    for x in 7..=25 {
-        put(x, 22, scene.hull);
-    }
-    for x in 8..=24 {
-        put(x, 23, scene.hull);
-    }
-    for x in 9..=23 {
-        put(x, 24, scene.hull_shade);
-    }
-    for x in [11, 15, 19] {
-        put(x, 23, scene.porthole);
-    }
+    boat(night, &mut put);
     for y in 25..SIZE {
         for x in 0..SIZE {
             let color = if y == 25 && (x + 3) % 7 < 2 {

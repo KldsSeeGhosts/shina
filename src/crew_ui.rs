@@ -3,14 +3,14 @@
 //! recovery notice at the top of the sidebar.
 //!
 //! One design language for all of them: hover is ink at 6 %, pressed or active at 8 %, hairline
-//! borders at 10 % ink, rows at a 10 px radius, and motion of 0.18 s on
-//! `cubic-bezier(.23, 1, .32, 1)`.
+//! borders in `line`, rows at a 4 px radius, cards at 6 px, and motion of 0.18 s on
+//! `cubic-bezier(.23, 1, .32, 1)`. The visual skin follows docs/ui/pixel-voyage.md.
 use super::*;
 use crate::model::{AttentionItem, AttentionKind, TaskState, TaskView};
 use rune::Transition;
 
 /// Row corners, shared by cards, chips and popover items.
-const ROW_RADIUS: f32 = 10.0;
+const ROW_RADIUS: f32 = 4.0;
 /// Width of a card's elapsed-time slot: room for "1h 05m" and "#8 queued" in tabular figures.
 const ELAPSED_SLOT: f32 = 72.0;
 /// Where a card's second and later lines start: past the status mark's 14 px slot and its gap.
@@ -30,7 +30,7 @@ pub(super) fn active_wash(s: &State, p: Palette) -> Color {
     p.ink.alpha(if s.dark { 0.05 } else { 0.08 })
 }
 pub(super) fn hairline(p: Palette) -> Color {
-    p.ink.alpha(0.10)
+    p.line
 }
 
 /// A quiet, outlined action: Decline, Dismiss, Open.
@@ -50,8 +50,8 @@ pub(super) fn ghost_button(
         .center_y()
         .h(28.0)
         .px(10.0)
-        .radius(8.0)
-        .border(1.0, hairline(p))
+        .radius(4.0)
+        .border(2.0, p.frame)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -65,20 +65,24 @@ pub(super) fn solid_button(
     p: Palette,
     action: impl Fn(&mut State) + 'static,
 ) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(title)
-        .focusable(true)
-        .center_y()
-        .h(28.0)
-        .px(12.0)
-        .radius(8.0)
-        .fill(p.teal)
-        .hover(p.teal.alpha(0.88))
-        .on_press(action)
-        .child(label(title, TextStyle::new(12.5, 560.0), p.on_teal))
+    framed(
+        row()
+            .key(key)
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(title)
+            .focusable(true)
+            .center_y()
+            .h(28.0)
+            .px(12.0)
+            .radius(4.0)
+            .fill(p.coral)
+            // Rune cannot move a button on press, so a pressed key darkens instead.
+            .press(p.coral.alpha(0.8))
+            .on_press(action)
+            .child(label(title, TextStyle::new(12.5, 600.0), p.on_coral)),
+        p,
+    )
 }
 
 fn open_thread(s: &mut State, id: usize) {
@@ -219,22 +223,20 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
                 .w(ELAPSED_SLOT)
                 .min_w(ELAPSED_SLOT)
                 .justify_end()
-                .child(label(task_clock(task), SMALL.features(TABULAR), tertiary)),
+                .child(label(task_clock(task), TIMER, tertiary)),
         );
     let meta = row()
         .pl(CARD_INDENT)
         .center_y()
-        .gap(6.0)
+        .gap(8.0)
         .min_w(0.0)
-        .child(label(word, SMALL, status_ink(status, p)))
-        .child(label("·", SMALL, tertiary))
+        .child(pixel_text(word, status_ink(status, p)))
         .child(
             label(&task.workspace_label, SMALL, p.muted)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         )
-        .child(label("·", SMALL, tertiary))
         .child(provider_icon(
             s,
             p,
@@ -251,7 +253,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .gap(3.0)
         .px(12.0)
         .py(10.0)
-        .radius(ROW_RADIUS)
+        .radius(6.0)
         .fill(p.card)
         .border(1.0, hairline(p))
         .hover(hover_wash(s, p))
@@ -370,7 +372,7 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
         .h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(8.0)
+        .radius(4.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -392,7 +394,7 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
             .muted(p.muted)
             .body_font(body_style(wide))
             .inline_code_bg(p.ink.alpha(if s.dark { 0.07 } else { 0.055 }))
-            .selection(p.teal_bg)
+            .selection(p.coral_bg)
             .code_block(p.card, p.line);
         let reply = truncate(reply, 1200);
         body = body.child(
@@ -461,7 +463,7 @@ pub(super) fn brief_block(
         .h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(8.0)
+        .radius(4.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -533,15 +535,22 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
         .filter(|task| task.state != TaskState::Queued)
         .count();
     let queued = tasks.len() - working;
-    let mut summary = vec![];
+    let (_, tertiary) = quiet_inks(p);
+    let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
     if working > 0 {
-        summary.push(format!("{working} working"));
+        summary = summary.child(
+            row()
+                .key("crew-tray-working")
+                .gap(6.0)
+                .center_y()
+                .child(count_pill(working, CountKind::Working, p))
+                .child(label("working", TIMER, tertiary)),
+        );
     }
     if queued > 0 {
-        summary.push(format!("{queued} queued"));
+        summary = summary.child(label(format!("{queued} queued"), TIMER, tertiary));
     }
     let stacked = lane < TRAY_STACK_WIDTH;
-    let (_, tertiary) = quiet_inks(p);
     let mut chips = if stacked {
         col().gap(2.0)
     } else {
@@ -574,7 +583,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .shrink()
                     .min_w(0.0),
             )
-            .child(label(task_clock(task), SMALL.features(TABULAR), tertiary));
+            .child(label(task_clock(task), TIMER, tertiary));
         chip = if stacked {
             chip.w_full()
         } else {
@@ -592,13 +601,11 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                 row()
                     .h(20.0)
                     .px(4.0)
-                    .gap(6.0)
+                    .gap(8.0)
                     .center_y()
-                    .child(label("Crew", TextStyle::new(12.0, 600.0), p.muted))
-                    .child(
-                        label(summary.join(" · "), SMALL.features(TABULAR), tertiary)
-                            .key("crew-tray-summary"),
-                    ),
+                    .child(pixel_label("Crew", p.muted))
+                    // One item per count, 8 px apart, never joined with a dot.
+                    .child(summary),
             )
             .child(chips),
     )
@@ -694,7 +701,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                 ))
                 .padding(12.0)
                 .gap(8.0)
-                .radius(ROW_RADIUS)
+                .radius(6.0)
                 .fill(p.card)
                 .border(1.0, hairline(p))
                 .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
@@ -703,14 +710,13 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                         .center_y()
                         .gap(8.0)
                         .child(mark_slot(Status::Waiting, p))
-                        .child(label(
+                        .child(pixel_text(
                             if approval {
                                 "Approval needed from"
                             } else {
                                 "Question from"
                             },
-                            TextStyle::new(13.0, 500.0),
-                            p.muted,
+                            status_ink(Status::Waiting, p),
                         ))
                         .child(
                             label(&item.short_title, TextStyle::new(13.0, 560.0), p.ink)
@@ -748,7 +754,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
     )
 }
 
-/// "Delegated by <captain> · Runs on its own · Open captain" above a worker's composer, ported
+/// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
 /// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
 pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
@@ -794,7 +800,7 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
         .pr(8.0)
         .gap(12.0)
         .center_y()
-        .radius(16.0)
+        .radius(6.0)
         .border(1.0, hairline(p))
         .child(who);
     if let Some(task) = &task {
@@ -804,12 +810,12 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
             row()
                 .key("parent-bar-status")
                 .center_y()
-                .gap(6.0)
+                .gap(8.0)
                 .shrink()
                 .min_w(0.0)
                 .child(mark_slot(status, p))
-                .child(label(word, SMALL, status_ink(status, p)))
-                .child(label(clock, SMALL.features(TABULAR), tertiary)),
+                .child(pixel_text(word, status_ink(status, p)))
+                .child(label(clock, TIMER, tertiary)),
         );
     }
     bar = bar.child(spacer());
@@ -876,55 +882,52 @@ fn attention_status(kind: AttentionKind) -> Status {
 /// rests. The strip has a fixed height, so the pill arriving never moves a sidebar row.
 pub(super) const ATTENTION_ANCHOR: &str = "attention-anchor";
 
+/// The brass badge fill darkened by `amount` toward black, for its hover and pressed states.
+/// The count keeps its colour, so the text contrast has to hold on these fills too.
+pub(super) fn brass_darkened(p: Palette, amount: f32) -> Color {
+    p.brass.mix(Color::BLACK, amount)
+}
+
 /// "N need you" at the top of the sidebar, shown only while something needs the user. It is
 /// one 28 px pill whatever the count, laid over the title strip beside Shina's name, so it
 /// slides and fades in without moving anything. A narrow sidebar shows the count alone.
-pub(super) fn attention_row(s: &State, p: Palette, compact: bool) -> Option<El> {
+pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
     let count = s.attention().len();
     if count == 0 {
         return None;
     }
     let open = s.attention_menu;
-    let mut pill = row()
-        .key("attention-row")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("{count} need you. Show them"))
-        .help(format!("{count} need you"))
-        .focusable(true)
-        .h(28.0)
-        .pl(6.0)
-        .pr(if compact { 8.0 } else { 6.0 })
-        .gap(5.0)
-        .center_y()
-        .radius(ROW_RADIUS)
-        .fill(if open {
-            active_wash(s, p)
-        } else {
-            p.gold.alpha(0.10)
-        })
-        .hover(active_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .transition(Transition::offset(6.0, 0.0).combined(Transition::opacity()))
-        .anchored_fit(ATTENTION_ANCHOR, rune::Side::Left, rune::Align::Center, 0.0)
-        .on_press(|s: &mut State| s.attention_menu = !s.attention_menu)
-        .child(mark_slot(Status::Waiting, p))
-        .child(
-            label(
-                if compact {
-                    count.to_string()
-                } else {
-                    format!("{count} need you")
-                },
-                TextStyle::new(12.5, 560.0).features(TABULAR),
-                p.ink,
-            )
-            .key("attention-count"),
-        );
-    if !compact {
-        pill = pill.child(icon("chevron", p.muted));
-    }
+    // A framed brass badge with the count, in its own slot beside the wordmark.
+    let pill = framed(
+        row()
+            .key("attention-row")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("{count} need you. Show them"))
+            .help(format!("{count} need you"))
+            .focusable(true)
+            .h(24.0)
+            .min_w(HEADER_BADGE)
+            .px(4.0)
+            .center()
+            .radius(4.0)
+            .fill(if open {
+                brass_darkened(p, 0.2)
+            } else {
+                p.brass
+            })
+            .hover(brass_darkened(p, 0.2))
+            .press(brass_darkened(p, 0.32))
+            .hover_motion(motion(), motion())
+            .transition(Transition::offset(6.0, 0.0).combined(Transition::opacity()))
+            .anchored_fit(ATTENTION_ANCHOR, rune::Side::Left, rune::Align::Center, 0.0)
+            .on_press(|s: &mut State| s.attention_menu = !s.attention_menu)
+            .child(
+                label(count.to_string(), PIXEL.features(TABULAR), p.on_brass)
+                    .key("attention-count"),
+            ),
+        p,
+    );
     Some(pill)
 }
 
@@ -954,7 +957,7 @@ pub(super) fn attention_menu(s: &State, p: Palette) -> El {
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(8.0)
+                .radius(4.0)
                 .hover(hover_wash(s, p))
                 .press(active_wash(s, p))
                 .on_press(move |s: &mut State| {
@@ -969,9 +972,8 @@ pub(super) fn attention_menu(s: &State, p: Palette) -> El {
                         .min_w(0.0),
                 )
                 .child(spacer())
-                .child(label(
+                .child(pixel_text(
                     attention_word(item.kind),
-                    SMALL,
                     if status == Status::Failed {
                         p.danger
                     } else {
@@ -1020,7 +1022,7 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
             .child(
                 row()
                     .gap(8.0)
-                    .child(el().pt(1.0).child(icon("alert", p.gold)))
+                    .child(el().pt(1.0).child(icon("alert", p.brass)))
                     .child(
                         label(notice, SMALL.lh(17.0), p.ink)
                             .wrap()
