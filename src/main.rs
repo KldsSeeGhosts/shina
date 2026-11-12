@@ -406,6 +406,7 @@ Error: none".into(),
         .into_iter()
         .enumerate()
         .map(|(block, child)| model::Tool {
+            raw_expanded: false,
             kind: None,
             changes: vec![],
             input: serde_json::Value::Null,

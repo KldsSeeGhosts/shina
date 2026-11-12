@@ -1050,7 +1050,14 @@ impl Client {
                     let output = item["aggregatedOutput"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| item.to_string());
+                        .or_else(|| item["output"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| {
+                            if metadata["toolKind"] == "other" {
+                                item.to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
                     let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
                         || item["exitCode"].as_i64().is_some_and(|code| code != 0);
                     let content = json!([{"type":"text","text":output}]);

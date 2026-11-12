@@ -176,6 +176,7 @@ impl ThreadView {
             }
             if let Some(old) = thread.tools.iter().find(|old| old.id == tool.id) {
                 tool.expanded = old.expanded;
+                tool.raw_expanded = old.raw_expanded;
                 tool.group_expanded = old.group_expanded;
             }
         }

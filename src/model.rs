@@ -178,6 +178,8 @@ pub struct Tool {
     #[serde(skip)]
     pub expanded: bool,
     #[serde(skip)]
+    pub raw_expanded: bool,
+    #[serde(skip)]
     pub group_expanded: bool,
     #[serde(skip)]
     pub started: Option<Instant>,
@@ -213,6 +215,7 @@ impl Tool {
             anchor,
             block: usize::MAX,
             expanded: false,
+            raw_expanded: false,
             group_expanded: false,
             started: None,
             duration_ms: None,
@@ -5784,7 +5787,7 @@ impl State {
         thread.tools = vec![
             Tool {
                 id: "example-1".into(),
-                kind: None, changes: vec![], input: Value::Null,
+                kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
                 name: "read".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5801,7 +5804,7 @@ impl State {
             },
             Tool {
                 id: "example-2".into(),
-                kind: None, changes: vec![], input: Value::Null,
+                kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
                 name: "read".into(),
                 detail: "tests/reconnect.test.ts".into(),
                 done: true,
@@ -5818,7 +5821,7 @@ impl State {
             },
             Tool {
                 id: "example-3".into(),
-                kind: None, changes: vec![], input: Value::Null,
+                kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
                 name: "edit".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5835,7 +5838,7 @@ impl State {
             },
             Tool {
                 id: "example-4".into(),
-                kind: None, changes: vec![], input: Value::Null,
+                kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
                 name: "powershell".into(),
                 detail: "npm test -- reconnect.test.ts".into(),
                 done: true,

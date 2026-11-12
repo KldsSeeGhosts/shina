@@ -22,6 +22,8 @@ mod pi_ui;
 mod pixel_icons;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
+#[path = "work_ui.rs"]
+mod work_ui;
 pub(crate) use pi_ui::questionnaire_key;
 
 /// Keyboard navigation uses the same server-scoped order as the unified sidebar.
@@ -6295,14 +6297,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             &tool.detail,
             tool.failed,
             tool.expanded,
-            match tool_kind(tool) {
-                ToolKind::Read => "eye",
-                ToolKind::List => "folder",
-                ToolKind::Search => "search",
-                ToolKind::Edit => "edit",
-                ToolKind::Run => "terminal",
-                ToolKind::Other => "wrench",
-            },
+            work_ui::kind_icon(tool.resolved_kind()),
             p,
         )
         .on_press(move |s: &mut State| {
@@ -6314,101 +6309,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         content = content.child(pi_ui::subagent_results(tool, p));
     }
     if tool.expanded {
-        content = content.child(
-            col()
-                .key(format!("tool-output-{}-{index}", t.id))
-                .role("group")
-                .label(format!("Output for {title}"))
-                .mb(4.0)
-                .ml(28.0)
-                .radius(6.0)
-                .fill(p.code_bg)
-                .border(1.0, p.line)
-                .child(
-                    label(&tool.detail, SMALL, p.muted)
-                        .wrap_anywhere()
-                        .selectable(true)
-                        .px(12.0)
-                        .pt(9.0)
-                        .pb(7.0),
-                )
-                .child(rule(p))
-                .child(
-                    col()
-                        .max_h(200.0)
-                        .px(12.0)
-                        .py(9.0)
-                        .scroll(ScrollSpec {
-                            stick_bottom: !tool.done,
-                        })
-                        .child(
-                            label(
-                                if tool.output.is_empty() {
-                                    if tool.done {
-                                        "No output"
-                                    } else {
-                                        "Waiting for output"
-                                    }
-                                } else {
-                                    &tool.output
-                                },
-                                TextStyle::new(12.0, 400.0)
-                                    .family(rune::Family::SystemMono)
-                                    .lh(18.0),
-                                if tool.output.is_empty() {
-                                    p.muted
-                                } else {
-                                    p.ink
-                                },
-                            )
-                            .wrap_anywhere()
-                            .selectable(true),
-                        ),
-                ),
-        );
-    }
-    if tool.expanded {
-        if let Some(exit) = tool.exit_code {
-            content = content.child(label(format!("Exit code {exit}"), SMALL, p.muted));
-        }
-        if let Some(parent) = &tool.parent_call {
-            content =
-                content.child(label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere());
-        }
-        if !tool.images.is_empty() {
-            content = content.child(message_images(
-                s,
-                p,
-                &tool.images,
-                &format!("tool-image-{}-{index}", t.id),
-            ));
-        }
-        if tool.subagents.is_empty()
-            && tool
-                .structured
-                .as_object()
-                .is_some_and(|data| data.values().any(|v| !v.is_null()))
-        {
-            content = content.child(
-                col()
-                    .max_h(200.0)
-                    .scroll(ScrollSpec {
-                        stick_bottom: false,
-                    })
-                    .child(
-                        label(
-                            truncate(
-                                &serde_json::to_string_pretty(&tool.structured).unwrap_or_default(),
-                                50_000,
-                            ),
-                            SMALL,
-                            p.ink,
-                        )
-                        .wrap_anywhere()
-                        .selectable(true),
-                    ),
-            );
-        }
+        content = content.child(work_ui::expanded(s, p, index));
     }
     content
 }
@@ -8417,7 +8318,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
-    fn runtime(width: f32) -> Runtime<State> {
+    pub(super) fn runtime(width: f32) -> Runtime<State> {
         let mut rt = Runtime::with_text(
             State::new(".".into(), false),
             view,
@@ -9512,7 +9413,7 @@ pub(crate) mod tests {
         assert!(rt.state.routines(0).is_empty());
         assert!(rt.state.current().pi.is_none());
     }
-    fn press(rt: &mut Runtime<State>, key: &str) {
+    pub(super) fn press(rt: &mut Runtime<State>, key: &str) {
         rt.frame(0.25);
         let (x, y) = rt
             .find(key)
