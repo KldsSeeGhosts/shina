@@ -23,7 +23,7 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
 const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 #[path = "pi_session.rs"]
-mod pi_session;
+pub(crate) mod pi_session;
 pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
@@ -343,10 +343,12 @@ pub struct Thread {
     pub draft: TextEdit,
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
+    pub typing_guard: crate::composer::TypingGuard,
     pub paste_history: crate::composer_paste::PasteHistory,
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
+    pub submission_error: Option<String>,
     pub pi: Option<Pi>,
     /// Image input support from Pi or the catalog. `None` when metadata is unavailable.
     pub supports_images: Option<bool>,
@@ -573,10 +575,12 @@ impl Thread {
             work: vec![],
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
+            typing_guard: crate::composer::TypingGuard::default(),
             paste_history: crate::composer_paste::PasteHistory::default(),
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
             attachment_error: None,
+            submission_error: None,
             pi: None,
             supports_images: None,
             model: DEFAULT_MODEL.into(),
@@ -928,10 +932,28 @@ impl Thread {
             }
         };
         self.prompt_history.reset();
+        self.typing_guard.on_blur_or_send();
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
         self.begin_prompt(prompt);
+    }
+
+    pub fn validate_prompt_length(&self, prompt: &Prompt) -> Option<String> {
+        let expanded =
+            crate::attachments::pi_message(prompt).unwrap_or_else(|_| prompt.text.clone());
+        crate::composer::prompt_length_validation_message(&expanded)
+    }
+
+    pub fn update_submission_error(&mut self) {
+        if self.submission_error.is_none() {
+            return;
+        }
+        let expanded = crate::composer_tokens::prompt(&self.draft, &self.draft_images)
+            .ok()
+            .and_then(|p| crate::attachments::pi_message(&p).ok())
+            .unwrap_or_else(|| crate::composer_rich::markdown(&self.draft));
+        self.submission_error = crate::composer::prompt_length_validation_message(&expanded);
     }
 
     fn begin_prompt(&mut self, prompt: Prompt) {
@@ -2064,6 +2086,7 @@ impl Thread {
                 ) {
                     self.reply.replace_text(string(&record, "prefill"));
                     self.request = Some(record);
+                    self.refresh_typing_guard();
                     self.status = Status::Waiting;
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
@@ -5499,6 +5522,13 @@ impl State {
                     return;
                 }
             };
+            if !self.headless
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return;
+            }
+            self.current_mut().submission_error = None;
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
                 "attachments":prompt.images.as_ref(),"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
@@ -5619,9 +5649,30 @@ impl State {
         }
         self.release_task_results(self.current().id);
         if self.current().status.busy() {
+            if !self.headless {
+                if let Ok(prompt) = crate::composer_tokens::prompt(
+                    &self.current().draft,
+                    &self.current().draft_images,
+                ) && let Some(error) = self.current().validate_prompt_length(&prompt)
+                {
+                    self.current_mut().submission_error = Some(error);
+                    return;
+                }
+                self.current_mut().submission_error = None;
+            }
             self.current_mut().send_during_run();
             self.checkpoint();
             return;
+        }
+        if !self.headless {
+            if let Ok(prompt) =
+                crate::composer_tokens::prompt(&self.current().draft, &self.current().draft_images)
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return;
+            }
+            self.current_mut().submission_error = None;
         }
         self.current_mut().send();
         let id = self.current().id;
@@ -6972,6 +7023,11 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         tx.wake_after(remaining);
     }
     changed |= state.poll_projects();
+    for thread in &mut state.threads {
+        if !thread.draft.focused {
+            thread.typing_guard.on_blur_or_send();
+        }
+    }
     if state.catalog.poll() {
         state.apply_catalog();
         changed = true;

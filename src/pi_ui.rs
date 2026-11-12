@@ -206,31 +206,68 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
     list
 }
 
-pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> bool {
     if s.undo_key(event, true) {
         return true;
     }
     if composer_menu::key(s, event) {
         return true;
     }
-    if event.key == rune::Key::Enter && (event.mods.ctrl || event.mods.cmd) {
-        let previous = s.current().native.follow_up;
-        s.current_mut().native.follow_up = !previous;
-        s.send();
-        s.current_mut().native.follow_up = previous;
+    let is_running = s.current().status.busy();
+    let is_composing = s.current().draft.is_composing();
+    let send_shortcut = s.preferences.send_shortcut;
+    let prompt_text = s.current().draft.text.clone();
+    if let Some(intent) = crate::composer::submission_intent_for_key(
+        event,
+        tx.key_repeat(),
+        is_composing,
+        is_running,
+        send_shortcut,
+        &prompt_text,
+    ) {
+        if !s.demo && !s.current().archived() {
+            let previous = s.current().native.follow_up;
+            if intent == crate::composer::SubmissionIntent::Alternate {
+                s.current_mut().native.follow_up = !previous;
+            }
+            s.send();
+            s.current_mut().native.follow_up = previous;
+        }
+        return true;
+    }
+    if event.key == rune::Key::Enter && !is_composing && !event.mods.alt {
+        if tx.key_repeat() {
+            return true;
+        }
+        let newline_event = rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                shift: true,
+                ..Default::default()
+            },
+        };
+        let t = s.current_mut();
+        if !t.composer_rules.key(&mut t.draft, &newline_event) {
+            t.draft.key(&newline_event, None);
+            t.composer_rules.changed(&mut t.draft);
+            t.update_submission_error();
+        }
         return true;
     }
     let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();
-    let entries: Vec<_> = t
-        .messages
-        .iter()
-        .filter(|m| m.role == "You")
-        .map(|m| m.text.as_str())
-        .collect();
-    if t.prompt_history
-        .navigate(&mut t.draft, &entries, event, menu_open)
-    {
+    let entries = crate::composer::build_history_entries(&t.messages);
+    let has_attachments = !t.draft_images.is_empty();
+    let has_pending_request = t.request.is_some();
+    if t.prompt_history.navigate(
+        &mut t.draft,
+        &entries,
+        event,
+        menu_open,
+        has_attachments,
+        has_pending_request,
+        None,
+    ) {
         return true;
     }
     false

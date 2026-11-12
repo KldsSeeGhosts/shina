@@ -152,7 +152,7 @@ pub struct PiSession {
     pub commands_error: Option<String>,
     pub(super) pending_command: Option<Value>,
     pub slash_index: usize,
-    pub slash_dismissed: Option<String>,
+    pub slash_dismissed: Option<crate::composer::DismissedTrigger>,
     pub follow_up: bool,
     pub steering: Vec<String>,
     pub follow_ups: Vec<String>,
@@ -256,17 +256,25 @@ impl Thread {
                 && self.harness_state["codexHistoryMode"] == "paginated"
     }
     pub fn slash_trigger(&self) -> Option<crate::composer::Trigger> {
-        if !self.draft.focused || self.native.slash_dismissed.as_ref() == Some(&self.draft.text) {
+        if !self.draft.focused {
             return None;
         }
-        crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')
+        let trigger = crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')?;
+        if self
+            .native
+            .slash_dismissed
+            .as_ref()
+            .is_some_and(|d| d.matches(&trigger))
+        {
+            return None;
+        }
+        Some(trigger)
     }
 
     pub fn slash_matches(&self) -> Vec<SlashCommand> {
         let Some(trigger) = self.slash_trigger() else {
             return vec![];
         };
-        let query = trigger.query.to_lowercase();
         let mut commands = vec![SlashCommand {
             name: "model".into(),
             description: "Switch response model for this thread".into(),
@@ -303,10 +311,7 @@ impl Thread {
                 })
                 .cloned(),
         );
-        commands.retain(|c| {
-            c.name.to_lowercase().contains(&query) || c.description.to_lowercase().contains(&query)
-        });
-        commands
+        crate::composer::rank_slash_commands(commands, &trigger.query)
     }
 
     pub fn can_compact(&self) -> bool {
@@ -716,7 +721,7 @@ impl Thread {
                 .find_map(|(id, params)| questionnaire::Questionnaire::rpiv(request, id, params))
         });
         // A previously focused, hidden composer must not receive questionnaire shortcuts.
-        if self.native.questionnaire.is_some() {
+        if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
             self.draft.focused = false;
             self.reply.focused = false;
         }
@@ -812,6 +817,33 @@ impl Thread {
         self.native.questionnaire_advance = None;
     }
 
+    pub(super) fn refresh_typing_guard(&mut self) {
+        let request_ids: Vec<String> = self
+            .request
+            .as_ref()
+            .and_then(|r| {
+                r["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| Some(r.to_string()))
+            })
+            .into_iter()
+            .collect();
+        self.typing_guard
+            .on_requests(&request_ids, self.draft.focused, Instant::now());
+    }
+
+    pub(crate) fn request_held_by_typing_guard(&self) -> bool {
+        let Some(request) = &self.request else {
+            return false;
+        };
+        let id = request["id"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| request.to_string());
+        self.typing_guard.is_held(&id)
+    }
+
     pub(super) fn native_deadline(&self) -> Option<Instant> {
         self.native
             .notifications
@@ -819,6 +851,7 @@ impl Thread {
             .map(|(_, deadline)| *deadline)
             .chain(self.native.dialog_deadline)
             .chain(self.native.questionnaire_advance)
+            .chain(self.typing_guard.deadline())
             .min()
     }
 
@@ -946,7 +979,7 @@ impl Thread {
         self.native
             .notifications
             .retain(|(_, deadline)| *deadline > now);
-        let changed = before != self.native.notifications.len();
+        let mut changed = before != self.native.notifications.len();
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
             self.cancel_questionnaire();
             self.native.dialog_deadline = None;
@@ -963,6 +996,7 @@ impl Thread {
             self.questionnaire_step(false);
             return true;
         }
+        changed |= self.typing_guard.release_if_idle(now);
         changed
     }
 

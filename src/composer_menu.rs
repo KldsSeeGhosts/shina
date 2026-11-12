@@ -18,10 +18,28 @@ struct Item {
 
 pub(super) fn trigger(s: &State) -> Option<Trigger> {
     let t = s.current();
-    if !t.draft.focused || t.native.slash_dismissed.as_ref() == Some(&t.draft.text) {
+    if !t.draft.focused {
         return None;
     }
-    crate::composer::trigger(&t.draft)
+    let candidate = crate::composer::trigger(&t.draft)?;
+    if t.native
+        .slash_dismissed
+        .as_ref()
+        .is_some_and(|d| d.matches(&candidate))
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+pub(super) fn clear_dismissed_if_changed(s: &mut State) {
+    let candidate = crate::composer::trigger(&s.current().draft);
+    let dismissed = s.current().native.slash_dismissed.clone();
+    if let Some(d) = dismissed
+        && candidate.as_ref().is_none_or(|c| !d.matches(c))
+    {
+        s.current_mut().native.slash_dismissed = None;
+    }
 }
 
 fn linked(s: &State) -> bool {
@@ -31,16 +49,23 @@ fn linked(s: &State) -> bool {
 fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
     let t = s.current();
     if trigger.marker == '$' {
-        let query = trigger.query.to_lowercase();
-        return (
-            t.native
-                .skills
-                .iter()
-                .filter(|skill| {
-                    skill.name.to_lowercase().contains(&query)
-                        || skill.description.to_lowercase().contains(&query)
-                })
-                .map(|skill| Item {
+        let normalized_query = crate::composer::normalize_search_query(&trigger.query, false);
+        let mut ranked: Vec<(usize, String, Item)> = t
+            .native
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let score = if normalized_query.is_empty() {
+                    0
+                } else {
+                    crate::composer::score_slash_command(
+                        &skill.name,
+                        &skill.description,
+                        &normalized_query,
+                        true,
+                    )?
+                };
+                let item = Item {
                     label: format!("${}", skill.name),
                     description: skill.description.clone(),
                     source: t.harness.clone(),
@@ -51,8 +76,15 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                         },
                         skill.name.clone(),
                     ),
-                })
-                .collect(),
+                };
+                Some((score, skill.name.to_lowercase(), item))
+            })
+            .collect();
+        if !normalized_query.is_empty() {
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
+        return (
+            ranked.into_iter().map(|(_, _, item)| item).collect(),
             vec![],
         );
     }
@@ -325,7 +357,10 @@ pub(super) fn key(s: &mut State, event: &rune::KeyEvent) -> bool {
         return false;
     };
     if event.key == rune::Key::Escape {
-        s.current_mut().native.slash_dismissed = Some(s.current().draft.text.clone());
+        s.current_mut().native.slash_dismissed = Some(crate::composer::DismissedTrigger {
+            marker: trigger.marker,
+            range_start: trigger.range.start,
+        });
         return true;
     }
     let (items, _) = items(s, &trigger);
