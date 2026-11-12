@@ -487,7 +487,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             shared.client_pids.lock().expect("clients").remove(&connection_id);
                         }
                         paged = params["protocolMinor"].as_u64().unwrap_or(0) >= 1;
-                        let minor = params["protocolMinor"].as_u64().unwrap_or(0).min(u64::from(protocol::MINOR));
+                        let minor = params["protocolMinor"].as_u64().unwrap_or(0).min(u64::from(shared.discovery.protocol_minor));
                         let mut capabilities = vec!["local-commands", "snapshot-subscriptions"];
                         if minor >= 1 { capabilities.extend(["projection-patches","history-paging","blob-paging","durable-devices"]); }
                         if minor >= 2 { capabilities.push("coordinated-restart"); }
@@ -893,6 +893,9 @@ mod tests {
     }
     impl Fixture {
         async fn new(name: &str) -> Self {
+            Self::with_minor(name, protocol::MINOR).await
+        }
+        async fn with_minor(name: &str, minor: u32) -> Self {
             let directory = crate::store::directory().unwrap().join(name);
             std::fs::create_dir_all(&directory).unwrap();
             let database = crate::database::Database::open(&directory).unwrap();
@@ -939,7 +942,7 @@ mod tests {
                     started_at: 0,
                     port: address.port(),
                     protocol_major: protocol::MAJOR,
-                    protocol_minor: protocol::MINOR,
+                    protocol_minor: minor,
                     binary_version: env!("CARGO_PKG_VERSION").into(),
                     bootstrap_token: server_auth::secret(),
                 },
@@ -1065,6 +1068,16 @@ mod tests {
             assert_eq!(created["result"]["projectId"], 1);
             assert!(created["result"]["threadId"].is_null());
             assert!(missing.is_dir());
+            let captain = crate::captains::Captain::presets().remove(0);
+            let created_captain = crate::client::remote_rpc(&link, "captain.put", json!({"record":captain.to_value(),"project":1})).await.unwrap();
+            assert_eq!(created_captain["status"], "accepted", "{created_captain}");
+            let scope = crate::client::remote_rpc(&link, "captain.scope", json!({"captain":0,"projects":[1]})).await.unwrap();
+            assert_eq!(scope["status"], "accepted", "{scope}");
+            let mut general = captain.clone();
+            general.name = "General".into();
+            let general = crate::client::remote_rpc(&link, "captain.put", json!({"record":general.to_value(),"project":null})).await.unwrap();
+            assert_eq!(general["status"], "accepted", "{general}");
+            wait_until(|| fixture.shared.snapshots.borrow()["state"]["index"]["captainScopes"]["1"] == json!([])).await;
             assert!(crate::client::remote_rpc(&link, "filesystem.browse", json!({"path":folder.join("secret-file")})).await.unwrap_err().contains("could not be read"));
             #[cfg(unix)] {
                 use std::os::unix::fs::PermissionsExt;
@@ -1078,6 +1091,10 @@ mod tests {
             fixture.shared.database.issue_scoped_device("operate-only", "operate-secret", &["paired","operate"]).unwrap();
             // A device without read cannot even complete hello or request a listing.
             assert!(fixture.shared.database.authorize("operate-only", "filesystem.browse", &json!({})).is_err());
+            let mut operator = link.clone();
+            operator.device_id = "operate-only".into();
+            operator.token = "operate-secret".into();
+            assert!(crate::client::remote_rpc(&operator, "filesystem.browse", json!({"path":folder})).await.unwrap_err().contains("read grant"));
             fixture.shared.database.issue_scoped_device("reader", "reader-secret", &["paired","read"]).unwrap();
             let mut reader = link.clone();
             reader.device_id = "reader".into();
@@ -1097,6 +1114,12 @@ mod tests {
             assert_eq!(hello["result"]["protocolMinor"], 3);
             assert!(!crate::client::supports_browse(&hello["result"]));
             assert!(crate::client::supports_browse(&json!({"capabilities":[protocol::FILESYSTEM_BROWSE]})));
+            let older = Fixture::with_minor("older-browse", 3).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let fallback = crate::client::remote_rpc(&older_link, "filesystem.browse", json!({"path":"~"})).await.unwrap_err();
+            assert!(fallback.contains("needs an update") && fallback.contains("Type a path"));
+            let typed = crate::client::remote_rpc(&older_link, "project.put", json!({"path":folder})).await.unwrap();
+            assert_eq!(typed["status"], "accepted");
         });
     }
 

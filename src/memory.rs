@@ -1129,7 +1129,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let project = state.add_project(std::env::temp_dir()).unwrap();
+        let project = state.add_project(std::env::temp_dir()).unwrap().unwrap();
         state.set_captain_scope(0, vec![project]).unwrap();
         state.checkpoint_and_flush().unwrap();
         let snapshot = state.snapshot();

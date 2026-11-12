@@ -397,6 +397,7 @@ mod tests {
                 if before.ends_with("method ==")
                     || (after.starts_with("=>") && !name.starts_with("subscription."))
                     || after.starts_with('|')
+                    || before.ends_with('|')
                     || before.ends_with("matches!(method,")
                 {
                     routed.insert(name);
@@ -404,6 +405,7 @@ mod tests {
             }
         }
         assert!(routed.len() > 60, "{routed:?}");
+        assert!(routed.contains("thread.subscribe") && routed.contains("filesystem.browse"));
         for method in routed {
             let expected = match method {
                 "hello"

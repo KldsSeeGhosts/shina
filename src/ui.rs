@@ -2595,17 +2595,20 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         card = card
             .child(pixel_label("Destination path on this server", p.muted))
             .child(
-                text_input(&s.machines.project_path, BODY)
-                    .key("remote-clone-path")
-                    .label("Host destination path")
-                    .single_line()
-                    .w_full()
-                    .padding(8.0)
-                    .radius(4.0)
-                    .fill(field)
-                    .field_focus(&s.machines.project_path, p)
-                    .color(p.ink)
-                    .on_edit(|s: &mut State| &mut s.machines.project_path),
+                text_input(
+                    &s.projects.clone_path,
+                    BODY.family(rune::Family::SystemMono),
+                )
+                .key("remote-clone-path")
+                .label("Host destination path")
+                .single_line()
+                .w_full()
+                .padding(8.0)
+                .radius(4.0)
+                .fill(field)
+                .field_focus(&s.projects.clone_path, p)
+                .color(p.ink)
+                .on_edit(|s: &mut State| &mut s.projects.clone_path),
             );
     }
     let hint = match s.clone_target() {
@@ -4017,6 +4020,56 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
+        .child({
+            // Ported from KSG Code's BranchToolbarEnvironmentSelector. A captain's host
+            // is immutable after creation, unlike an unsent conversation draft.
+            if machine_options(s).len() > 1 {
+                let mut lives = col()
+                    .key("captain-machine-row")
+                    .gap(5.0)
+                    .child(pixel_label("Lives on", p.muted))
+                    .child(
+                        menu_item(
+                            "captain-machine-choice",
+                            &s.machine_label(&editor.server),
+                            if editor.server == "local" {
+                                "monitor"
+                            } else {
+                                "cloud"
+                            },
+                            p,
+                        )
+                        .disabled(editing)
+                        .on_press(|s: &mut State| {
+                            let editor = s.captain_editor.as_mut().unwrap();
+                            if editor.editing.is_none() {
+                                editor.machine_picker = !editor.machine_picker;
+                            }
+                        }),
+                    );
+                if editor.machine_picker && !editing {
+                    for server in machine_options(s) {
+                        if !s.machine_connected(&server) {
+                            continue;
+                        }
+                        let title = s.machine_label(&server);
+                        lives = lives.child(
+                            machine_option(
+                                &format!("captain-machine-{server}"),
+                                &title,
+                                &server,
+                                true,
+                                p,
+                            )
+                            .on_press(move |s: &mut State| s.retarget_captain(&server)),
+                        );
+                    }
+                }
+                lives
+            } else {
+                el()
+            }
+        })
         .child(
             col()
                 .gap(5.0)
@@ -5232,6 +5285,7 @@ enum PickerChoice {
     NoProject,
     Project(usize),
     MachineProject(String, usize),
+    MachineNoProject(String),
 }
 
 /// The picker's rows that match its search, in display order.
@@ -5242,7 +5296,12 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
     if mode == ProjectPicker::Scope {
         choices.push((PickerChoice::All, "All workspaces".to_string(), None));
     }
-    if mode != ProjectPicker::CaptainScope {
+    let multiple = s
+        .client
+        .as_ref()
+        .is_some_and(|client| !client.linked.is_empty());
+    let across = mode == ProjectPicker::Scope || mode == ProjectPicker::NewThread && multiple;
+    if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
     for id in s.sorted_projects() {
@@ -5251,14 +5310,22 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             choices.push((
                 PickerChoice::Project(id),
                 project.name.clone(),
-                (mode == ProjectPicker::Scope && s.client.is_some())
-                    .then(|| s.machine_label(&s.machines.selected)),
+                (across && s.client.is_some()).then(|| s.machine_label(&s.machines.selected)),
             ));
         }
     }
-    if mode == ProjectPicker::Scope && s.client.is_some() {
+    if across && s.client.is_some() {
         for (server, view) in &s.machines.views {
             if server == &s.machines.selected {
+                continue;
+            }
+            if mode == ProjectPicker::NewThread
+                && (!s.machine_connected(server)
+                    || s.machines
+                        .draft_picker
+                        .as_ref()
+                        .is_some_and(|target| target != server))
+            {
                 continue;
             }
             for project in view["index"]["projects"].as_array().into_iter().flatten() {
@@ -5274,6 +5341,45 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
                 }
             }
         }
+    }
+    if mode == ProjectPicker::NewThread && multiple {
+        choices.retain(|(choice, _, _)| match choice {
+            PickerChoice::Project(_) => {
+                s.machine_connected(&s.machines.selected)
+                    && s.machines
+                        .draft_picker
+                        .as_ref()
+                        .is_none_or(|target| target == &s.machines.selected)
+            }
+            _ => true,
+        });
+        for server in machine_options(s) {
+            if !s.machine_connected(&server)
+                || s.machines
+                    .draft_picker
+                    .as_ref()
+                    .is_some_and(|target| target != &server)
+            {
+                continue;
+            }
+            choices.push((
+                PickerChoice::MachineNoProject(server.clone()),
+                "No workspace".into(),
+                Some(s.machine_label(&server)),
+            ));
+        }
+        choices.sort_by_key(|(choice, _, _)| {
+            let server = match choice {
+                PickerChoice::MachineProject(server, _)
+                | PickerChoice::MachineNoProject(server) => server,
+                _ => &s.machines.selected,
+            };
+            (
+                server != "local",
+                server.clone(),
+                !matches!(choice, PickerChoice::MachineNoProject(_)),
+            )
+        });
     }
     choices.retain(|(_, name, machine)| {
         query.is_empty()
@@ -5300,12 +5406,26 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         PickerChoice::MachineProject(server, id) => {
             if mode == ProjectPicker::Scope {
                 s.set_machine_scope(server, Some(id), shift);
+            } else if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
+                s.select_machine(&server);
+                if s.machines.selected == server {
+                    s.choose_draft_project(Some(id));
+                }
+            }
+            return;
+        }
+        PickerChoice::MachineNoProject(server) => {
+            if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
+                s.select_machine(&server);
+                if s.machines.selected == server {
+                    s.choose_draft_project(None);
+                }
             }
             return;
         }
     };
     match mode {
-        ProjectPicker::NewThread => s.new_thread_in(project),
+        ProjectPicker::NewThread => s.choose_draft_project(project),
         ProjectPicker::Scope => s.set_project_scope(project, shift),
         ProjectPicker::AddProject => {}
         ProjectPicker::CaptainScope => {
@@ -5326,7 +5446,7 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
     }
 }
 
-/// The workspace picker, as T3 Code's command palette: a centred modal that starts with a
+/// Ported from KSG Code's CommandPalette: a centred modal that starts with a
 /// search field and moves with the arrow keys. Enter picks the highlighted row; Shift adds a
 /// workspace to the filter.
 fn project_picker(s: &State, p: Palette) -> El {
@@ -5424,7 +5544,19 @@ fn project_picker(s: &State, p: Palette) -> El {
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
+    let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
+        if mode == ProjectPicker::NewThread && machine != &last_machine {
+            if let Some(machine) = machine {
+                list = list.child(
+                    label(machine, SMALL, p.muted)
+                        .key(format!("picker-machine-{index}"))
+                        .px(12.0)
+                        .py(6.0),
+                );
+            }
+            last_machine = machine.clone();
+        }
         let remote_project = if let PickerChoice::MachineProject(server, id) = choice {
             s.machines
                 .views
@@ -5446,6 +5578,14 @@ fn project_picker(s: &State, p: Palette) -> El {
             PickerChoice::MachineProject(server, id) => (
                 format!("choose-project-{server}-{id}"),
                 remote_project.as_ref(),
+            ),
+            PickerChoice::MachineNoProject(server) => (
+                if server == &s.machines.selected {
+                    "choose-no-project".into()
+                } else {
+                    format!("choose-no-project-{server}")
+                },
+                None,
             ),
         };
         let checked = match (mode, choice) {
@@ -5595,6 +5735,10 @@ fn add_sources(s: &State) -> Vec<(AddSource, String, String)> {
             "Choose a folder in the system dialog".into(),
         ),
     ];
+    if s.machines.selected != "local" {
+        items[0].1 = "Folder on this machine".into();
+        items.retain(|(source, _, _)| *source != AddSource::SystemPicker);
+    }
     let mut removed: Vec<_> = s.projects.entries.iter().filter(|p| p.hidden).collect();
     removed.sort_by_key(|p| std::cmp::Reverse(p.updated));
     for project in removed {
@@ -5636,13 +5780,24 @@ fn run_add_source(s: &mut State, tx: &mut Tx, source: AddSource) {
 }
 
 /// The folders the browse field lists, and the typed text up to the folder they are in.
-fn browse_entries(query: &str) -> (String, Vec<String>) {
-    let cut = query.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    let (dir, filter) = crate::projects::browse_split(query);
-    (
-        query[..cut].to_string(),
-        crate::projects::list_folders(&dir, &filter),
-    )
+fn browse_entries(s: &State) -> Vec<String> {
+    if s.projects.browser.request.as_ref()
+        != Some(&(s.machines.selected.clone(), s.picker_query.text.clone()))
+    {
+        return vec![];
+    }
+    s.projects
+        .browser
+        .listing
+        .as_ref()
+        .map(|listing| {
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether a key changes a search field's text, which sends a palette's highlight back to the
@@ -5656,14 +5811,16 @@ fn edits_text(event: &rune::KeyEvent) -> bool {
 }
 /// Move the browse field into a listed folder.
 fn browse_into(s: &mut State, name: &str) {
-    let (prefix, _) = browse_entries(&s.picker_query.text);
-    let prefix = if prefix.is_empty() && s.picker_query.text.trim() == "~" {
-        format!("~{}", std::path::MAIN_SEPARATOR)
-    } else {
-        prefix
-    };
-    s.picker_query
-        .replace_text(format!("{prefix}{name}{}", std::path::MAIN_SEPARATOR));
+    if let Some(path) = s
+        .projects
+        .browser
+        .listing
+        .as_ref()
+        .and_then(|listing| listing.entries.iter().find(|entry| entry.name == name))
+        .map(|entry| entry.path.clone())
+    {
+        s.picker_query.replace_text(path);
+    }
     s.picker_highlight = 0;
 }
 
@@ -5707,20 +5864,13 @@ const SUBMIT_CHORD: &str = if cfg!(target_os = "macos") {
     "Ctrl Enter"
 };
 
-/// Add workspace, as T3 Code's Add project palette: choose a source, then browse folders by
+/// Ported from KSG Code's CommandPalette Add project flow: choose a source, then browse by
 /// typing a path. Enter opens the highlighted folder, Ctrl+Enter adds the typed one, and a
 /// path that does not exist yet is created first.
 fn add_project_palette(s: &State, p: Palette) -> El {
-    if s.machines.selected != "local" {
-        return remote_project_dialog(s, p);
-    }
     let browsing = s.picker_browsing;
     let query = s.picker_query.text.clone();
-    let folders = if browsing {
-        browse_entries(&query).1
-    } else {
-        vec![]
-    };
+    let folders = if browsing { browse_entries(s) } else { vec![] };
     let sources = if browsing { vec![] } else { add_sources(s) };
     let count = if browsing {
         folders.len()
@@ -5728,9 +5878,20 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         sources.len()
     };
     let highlight = s.picker_highlight.min(count.saturating_sub(1));
-    let target = crate::projects::expand_path(&query);
-    let creates = browsing && !query.trim().is_empty() && !target.exists();
-    let submit = if creates { "Create & Add" } else { "Add" };
+    let current_listing = s.projects.browser.request.as_ref()
+        == Some(&(s.machines.selected.clone(), query.clone()))
+        && s.projects.browser.pending.is_none();
+    let creates = browsing
+        && current_listing
+        && !query.trim().is_empty()
+        && (s
+            .projects
+            .browser
+            .listing
+            .as_ref()
+            .is_some_and(|listing| !listing.target_exists)
+            || s.projects.browser.error.as_deref() == Some("That folder does not exist."));
+    let submit = if creates { "Create folder" } else { "Add" };
     let placeholder = if browsing {
         "Type a folder path"
     } else {
@@ -5750,83 +5911,86 @@ fn add_project_palette(s: &State, p: Palette) -> El {
             p.muted,
         )))
         .child(
-            rune::text_input(&s.picker_query, TextStyle::new(15.0, 420.0).tracking(-0.15))
-                .key("picker-search")
-                .label(placeholder)
-                .placeholder(placeholder, p.muted)
-                .color(p.ink)
-                .single_line()
-                .grow(1.0)
-                .min_w(0.0)
-                .on_edit(|s: &mut State| {
-                    s.projects.menu_error = None;
-                    &mut s.picker_query
-                })
-                .on_input_key(|s: &mut State, event, tx| {
-                    if edits_text(event) {
+            rune::text_input(
+                &s.picker_query,
+                if browsing {
+                    TextStyle::new(15.0, 420.0).family(rune::Family::SystemMono)
+                } else {
+                    TextStyle::new(15.0, 420.0).tracking(-0.15)
+                },
+            )
+            .key("picker-search")
+            .label(placeholder)
+            .placeholder(placeholder, p.muted)
+            .color(p.ink)
+            .single_line()
+            .grow(1.0)
+            .min_w(0.0)
+            .on_edit(|s: &mut State| {
+                s.projects.menu_error = None;
+                &mut s.picker_query
+            })
+            .on_input_key(|s: &mut State, event, tx| {
+                if edits_text(event) {
+                    s.picker_highlight = 0;
+                }
+                let browsing = s.picker_browsing;
+                let folders = if browsing { browse_entries(s) } else { vec![] };
+                let sources = if browsing { vec![] } else { add_sources(s) };
+                let count = if browsing {
+                    folders.len()
+                } else {
+                    sources.len()
+                };
+                let at = s.picker_highlight.min(count.saturating_sub(1));
+                let command = event.mods.cmd || event.mods.ctrl;
+                match event.key {
+                    rune::Key::Down if count > 0 => {
+                        s.picker_highlight = (at + 1).min(count - 1);
+                        true
+                    }
+                    rune::Key::Home => {
                         s.picker_highlight = 0;
+                        true
                     }
-                    let browsing = s.picker_browsing;
-                    let (_, folders) = if browsing {
-                        browse_entries(&s.picker_query.text)
-                    } else {
-                        (String::new(), vec![])
-                    };
-                    let sources = if browsing { vec![] } else { add_sources(s) };
-                    let count = if browsing {
-                        folders.len()
-                    } else {
-                        sources.len()
-                    };
-                    let at = s.picker_highlight.min(count.saturating_sub(1));
-                    let command = event.mods.cmd || event.mods.ctrl;
-                    match event.key {
-                        rune::Key::Down if count > 0 => {
-                            s.picker_highlight = (at + 1).min(count - 1);
-                            true
-                        }
-                        rune::Key::Home => {
-                            s.picker_highlight = 0;
-                            true
-                        }
-                        rune::Key::End if count > 0 => {
-                            s.picker_highlight = count - 1;
-                            true
-                        }
-                        rune::Key::Up => {
-                            s.picker_highlight = at.saturating_sub(1);
-                            true
-                        }
-                        rune::Key::Tab if browsing => {
-                            if let Some(name) = folders.get(at) {
-                                browse_into(s, &name.clone());
-                            }
-                            true
-                        }
-                        rune::Key::Enter if browsing => {
-                            match folders.get(at) {
-                                Some(name) if !command => browse_into(s, &name.clone()),
-                                _ => s.add_browsed_project(),
-                            }
-                            true
-                        }
-                        rune::Key::Enter => {
-                            if let Some((source, _, _)) = sources.get(at).cloned() {
-                                run_add_source(s, tx, source);
-                            }
-                            true
-                        }
-                        rune::Key::Escape => {
-                            if browsing {
-                                s.open_picker(ProjectPicker::AddProject);
-                            } else {
-                                s.project_picker = None;
-                            }
-                            true
-                        }
-                        _ => s.undo_key(event, true),
+                    rune::Key::End if count > 0 => {
+                        s.picker_highlight = count - 1;
+                        true
                     }
-                }),
+                    rune::Key::Up => {
+                        s.picker_highlight = at.saturating_sub(1);
+                        true
+                    }
+                    rune::Key::Tab if browsing => {
+                        if let Some(name) = folders.get(at) {
+                            browse_into(s, &name.clone());
+                        }
+                        true
+                    }
+                    rune::Key::Enter if browsing => {
+                        match folders.get(at) {
+                            Some(name) if !command => browse_into(s, &name.clone()),
+                            _ => s.add_browsed_project(),
+                        }
+                        true
+                    }
+                    rune::Key::Enter => {
+                        if let Some((source, _, _)) = sources.get(at).cloned() {
+                            run_add_source(s, tx, source);
+                        }
+                        true
+                    }
+                    rune::Key::Escape => {
+                        if browsing {
+                            s.open_picker(ProjectPicker::AddProject);
+                        } else {
+                            s.project_picker = None;
+                        }
+                        true
+                    }
+                    _ => s.undo_key(event, true),
+                }
+            }),
         );
     if browsing {
         field = field.child(
@@ -5834,7 +5998,11 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .key("browse-add")
                 .role("button")
                 .cursor(rune::Cursor::Pointer)
-                .label(format!("{submit} this folder"))
+                .label(if creates {
+                    "Create folder and add workspace"
+                } else {
+                    "Add this folder"
+                })
                 .focusable(true)
                 .h(28.0)
                 .px(8.0)
@@ -5843,8 +6011,15 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .radius(4.0)
                 .border(1.0, p.frame)
                 .hover(p.selected)
+                .disabled(s.client.is_some() && !s.machine_connected(&s.machines.selected))
                 .on_press(|s: &mut State| s.add_browsed_project())
-                .child(label(submit, TextStyle::new(12.5, 560.0), p.ink))
+                .child(label(submit, TextStyle::new(12.5, 560.0), p.ink).key(
+                    if s.machines.selected == "local" {
+                        "local-project-add"
+                    } else {
+                        "remote-project-add"
+                    },
+                ))
                 .child(
                     pixel_text(
                         if folders.is_empty() {
@@ -5866,13 +6041,57 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .max_h(480.0)
         .padding(4.0)
         .radius(6.0)
-        .on_press(|_: &mut State| {})
-        .child(field)
+        .on_press(|_: &mut State| {});
+    if machine_options(s).len() > 1 {
+        let mut machines = col().key("project-machine-row").gap(1.0);
+        for server in machine_options(s) {
+            let online = s.machine_connected(&server);
+            let title = s.machine_label(&server);
+            let key = format!("project-machine-{server}");
+            let locked = s
+                .captain_editor
+                .as_ref()
+                .is_some_and(|editor| editor.server != server)
+                || s.projects.return_picker == Some(ProjectPicker::CaptainScope)
+                    && server != s.machines.selected;
+            machines = machines.child(
+                machine_option(&key, &title, &server, online, p)
+                    .disabled(!online || locked)
+                    .on_press(move |s: &mut State| s.choose_project_machine(&server)),
+            );
+        }
+        card = card.child(machines);
+    }
+    card = card
+        .child(
+            el().key(if s.machines.selected == "local" {
+                "local-project-path"
+            } else {
+                "remote-project-path"
+            })
+            .child(field),
+        )
         .child(el().h(4.0));
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
     if browsing {
+        if let Some(parent) = s
+            .projects
+            .browser
+            .listing
+            .as_ref()
+            .and_then(|listing| listing.parent.clone())
+        {
+            list = list.child(
+                palette_row("browse-parent".into(), "folder", "..", &parent, false, p)
+                    .min_h(34.0)
+                    .on_press(move |s: &mut State| {
+                        s.picker_query.replace_text(&parent);
+                        s.picker_highlight = 0;
+                    }),
+            );
+        }
         for (index, name) in folders.iter().enumerate() {
             let entry = name.clone();
             list = list.child(
@@ -5888,11 +6107,29 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .on_press(move |s: &mut State| browse_into(s, &entry)),
             );
         }
-        if folders.is_empty() {
+        if s.projects.browser.pending.is_some()
+            || s.projects.browser.request.as_ref()
+                != Some(&(s.machines.selected.clone(), query.clone()))
+        {
+            list = list.child(
+                pixel_text("Loading", p.muted)
+                    .key("browse-loading")
+                    .px(8.0)
+                    .py(10.0),
+            );
+        } else if let Some(error) = &s.projects.browser.error {
+            list = list.child(
+                label(error, SMALL, p.muted)
+                    .key("browse-error")
+                    .wrap()
+                    .px(8.0)
+                    .py(10.0),
+            );
+        } else if folders.is_empty() {
             list = list.child(
                 label(
                     if creates {
-                        "No folder here yet. Add creates it."
+                        "No folder here yet."
                     } else {
                         "No folders inside this one."
                     },
@@ -5901,6 +6138,24 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 )
                 .px(8.0)
                 .py(10.0),
+            );
+        }
+        if s.projects
+            .browser
+            .listing
+            .as_ref()
+            .is_some_and(|listing| listing.truncated)
+        {
+            list = list.child(
+                label(
+                    "Showing the first 200 folders. Type a more specific path.",
+                    SMALL,
+                    p.muted,
+                )
+                .key("browse-truncated")
+                .wrap()
+                .px(8.0)
+                .py(6.0),
             );
         }
     } else {
@@ -5956,81 +6211,27 @@ fn add_project_palette(s: &State, p: Palette) -> El {
     card = card
         .child(el().h(0.5).w_full().mt(4.0).fill(p.line))
         .child(hints);
-    modal_frame(
+    if s.machines.selected != "local" {
+        card = card.child(button("remote-project-cancel", "Cancel", p, |s| {
+            s.project_picker = None
+        }));
+        card = el().key("remote-project-dialog").child(card);
+    }
+    let modal = modal_frame(
         "project-picker-backdrop",
         s,
         |s| s.project_picker = None,
         card,
-    )
-}
-
-/// Ported from KSG Code's AddEnvironmentDialog host input; paths belong to the selected server.
-fn remote_project_dialog(s: &State, p: Palette) -> El {
-    let card = col()
-        .key("remote-project-dialog")
-        .role("dialog")
-        .label("Add workspace on server")
-        .w((s.viewport_width - 32.0).clamp(280.0, 480.0))
-        .padding(16.0)
-        .gap(12.0)
-        .radius(6.0)
-        .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .child(
-            label(
-                format!("Workspace on {}", s.machine_label(&s.machines.selected)),
-                BODY,
-                p.ink,
-            )
-            .wrap(),
-        )
-        .child(
-            label(
-                "Enter an absolute path on that server. Shina does not copy or translate files.",
-                SMALL,
-                p.muted,
-            )
-            .wrap(),
-        )
-        .child(
-            text_input(&s.machines.project_path, BODY)
-                .key("remote-project-path")
-                .label("Host workspace path")
-                .single_line()
-                .w_full()
-                .padding(8.0)
-                .field_focus(&s.machines.project_path, p)
-                .color(p.ink)
-                .on_edit(|s: &mut State| &mut s.machines.project_path),
-        )
-        .child(
-            row()
-                .gap(8.0)
-                .child(spacer())
-                .child(button("remote-project-cancel", "Cancel", p, |s| {
-                    s.project_picker = None
-                }))
-                .child(
-                    primary_button("remote-project-add", "Add workspace", p, |s| {
-                        let path = std::path::PathBuf::from(&s.machines.project_path.text);
-                        match s.add_project(path) {
-                            Ok(_) => s.project_picker = None,
-                            Err(error) => s.machines.notice = Some(error),
-                        }
-                    })
-                    .disabled(!s.machine_connected(&s.machines.selected)),
-                ),
-        );
-    el().key("remote-project-backdrop")
-        .instant_changes()
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .center()
-        .fill(Color::BLACK.alpha(0.28))
-        .modal(false, |s: &mut State| s.project_picker = None)
-        .child(card)
+    );
+    if s.machines.selected == "local" {
+        modal
+    } else {
+        el().key("remote-project-backdrop")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .child(modal)
+    }
 }
 
 /// What a tool call does, for its one-line row: icon, past and present verb, and what it
@@ -8053,7 +8254,7 @@ fn machine_selector(s: &State, p: Palette) -> El {
         .hover(p.selected)
         .focusable(true)
         .cursor(rune::Cursor::Pointer)
-        .disabled(s.client.is_none())
+        .disabled(s.client.is_none() || !s.can_retarget_draft())
         .on_press(|s: &mut State| s.machines.picker = !s.machines.picker)
         .child(
             icon(
@@ -8067,13 +8268,43 @@ fn machine_selector(s: &State, p: Palette) -> El {
             .size(12.0, 12.0),
         )
         .child(
-            pixel_text(title, p.muted)
+            label(title, SMALL, p.muted)
                 .key("machine-selector-label")
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         )
         .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+fn machine_options(s: &State) -> Vec<String> {
+    std::iter::once("local".to_owned())
+        .chain(
+            s.client
+                .iter()
+                .flat_map(|client| client.linked.keys().cloned()),
+        )
+        .collect()
+}
+
+/// The same machine row is used in Run on, Add workspace and Lives on.
+fn machine_option(key: &str, title: &str, server: &str, online: bool, p: Palette) -> El {
+    let item = menu_item(
+        key,
+        title,
+        if server == "local" {
+            "monitor"
+        } else {
+            "cloud"
+        },
+        p,
+    )
+    .disabled(!online);
+    if online {
+        item
+    } else {
+        item.child(pixel_text("Offline", p.muted))
+    }
 }
 
 /// Ported from KSG Code's BranchToolbarEnvironmentSelector SelectPopup/SelectGroup.
@@ -8095,31 +8326,15 @@ fn machine_picker(s: &State, p: Palette) -> El {
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
         .child(pixel_label("Run on", p.muted).px(8.0).py(6.0));
-    let servers = std::iter::once("local".to_owned()).chain(
-        s.client
-            .iter()
-            .flat_map(|client| client.linked.keys().cloned()),
-    );
-    for server in servers {
+    for server in machine_options(s) {
         let title = s.machine_label(&server);
         let key = format!("machine-option-{server}");
         menu = menu.child(
-            menu_item(
-                &key,
-                &title,
-                if server == "local" {
-                    "monitor"
-                } else {
-                    "cloud"
+            machine_option(&key, &title, &server, s.machine_connected(&server), p).on_press(
+                move |s: &mut State| {
+                    s.retarget_draft(&server);
                 },
-                p,
-            )
-            .on_press(move |s: &mut State| {
-                s.select_machine(&server);
-                if s.machines.selected == server && s.machine_connected(&server) {
-                    s.new_thread_in(None);
-                }
-            }),
+            ),
         );
     }
     menu = menu.child(
@@ -8427,6 +8642,208 @@ pub(crate) mod tests {
         // As the app sets it in `main`.
         rt.set_tab_visits_controls(true);
         rt
+    }
+
+    fn connected_machines(rt: &mut Runtime<State>) {
+        let projection = rt.state.projection();
+        let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+        let (remote, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+        client.linked.insert("studio".into(), remote);
+        client.linked.insert(
+            "offline".into(),
+            crate::client::Client::new(rt.state.data_dir.clone()),
+        );
+        rt.state.client = Some(client);
+        for server in ["local", "studio", "offline"] {
+            rt.state
+                .machines
+                .views
+                .insert(server.into(), projection.clone());
+        }
+    }
+
+    fn finish_folder_listing(rt: &mut Runtime<State>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            rt.state.poll_folder_browser();
+            if rt.state.projects.browser.pending.is_none()
+                && rt.state.projects.browser.request.as_ref()
+                    == Some(&(
+                        rt.state.machines.selected.clone(),
+                        rt.state.picker_query.text.clone(),
+                    ))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder listing timed out"
+            );
+            std::thread::yield_now();
+        }
+        rt.invalidate();
+        rt.frame(0.0);
+    }
+
+    #[test]
+    fn linked_folder_palette_states_fit_at_every_supported_width() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for state in ["loading", "listing", "missing", "error", "older"] {
+                let mut rt = runtime(width);
+                connected_machines(&mut rt);
+                rt.state.machines.selected = "studio".into();
+                rt.state.open_picker(ProjectPicker::AddProject);
+                rt.state.browse_for_project();
+                rt.state.picker_query.replace_text("/srv/projects");
+                rt.state.projects.browser.request = Some(("studio".into(), "/srv/projects".into()));
+                let (_send, receive) = std::sync::mpsc::channel();
+                match state {
+                    "loading" => rt.state.projects.browser.pending = Some(receive),
+                    "error" => {
+                        rt.state.projects.browser.error =
+                            Some("That folder could not be read.".into())
+                    }
+                    "older" => {
+                        rt.state.projects.browser.error = Some(
+                            "This server needs an update to browse folders. Type a path instead."
+                                .into(),
+                        )
+                    }
+                    _ => {
+                        rt.state.projects.browser.listing = Some(crate::protocol::FolderListing {
+                            path: "/srv/projects".into(),
+                            parent: Some("/srv".into()),
+                            entries: if state == "missing" {
+                                vec![]
+                            } else {
+                                vec![crate::protocol::FolderEntry {
+                                    name: "shina".into(),
+                                    path: "/srv/projects/shina".into(),
+                                }]
+                            },
+                            target_exists: state != "missing",
+                            truncated: false,
+                        })
+                    }
+                }
+                rt.frame(0.0);
+                rt.frame(0.25);
+                let (card, _) = rt.presented("project-picker").unwrap();
+                for key in [
+                    "project-machine-row",
+                    "project-machine-local",
+                    "project-machine-studio",
+                    "project-machine-offline",
+                    "picker-search",
+                    "remote-project-path",
+                    "browse-add",
+                ] {
+                    let (rect, _) = rt
+                        .presented(key)
+                        .unwrap_or_else(|| panic!("{width} {state}: missing {key}"));
+                    assert!(
+                        rect[0] >= card[0] - 0.5 && rect[0] + rect[2] <= card[0] + card[2] + 0.5,
+                        "{width} {state} {key}: {rect:?} outside {card:?}"
+                    );
+                    assert!(
+                        rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                        "{width} {state} {key}: {rect:?}"
+                    );
+                }
+                assert!(
+                    rt.presented(match state {
+                        "loading" => "browse-loading",
+                        "listing" => "browse-0",
+                        "missing" => "remote-project-add",
+                        _ => "browse-error",
+                    })
+                    .is_some()
+                );
+                press(&mut rt, "project-machine-offline");
+                assert_eq!(rt.state.machines.selected, "studio");
+                if state == "listing" {
+                    press(&mut rt, "browse-0");
+                    assert_eq!(
+                        rt.state.picker_query.text, "/srv/projects/shina",
+                        "use the host path without joining on the client"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_thread_projects_group_online_machines_local_first_and_can_filter_a_retarget() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            connected_machines(&mut rt);
+            rt.state.open_picker(ProjectPicker::NewThread);
+            let choices = picker_choices(&rt.state, ProjectPicker::NewThread);
+            assert_eq!(choices.first().unwrap().2.as_deref(), Some("Local"));
+            assert!(choices.iter().any(|(choice,_,_)| matches!(choice, PickerChoice::MachineProject(server,_) if server == "studio")));
+            assert!(
+                !choices
+                    .iter()
+                    .any(|(_, _, machine)| machine.as_deref() == Some("offline"))
+            );
+            rt.frame(0.0);
+            for key in [
+                "project-picker",
+                "picker-machine-0",
+                "choose-no-project",
+                "choose-no-project-studio",
+                "choose-project-studio-1",
+            ] {
+                assert!(rt.presented(key).is_some(), "{width}: {key}");
+            }
+            rt.state.machines.draft_picker = Some("studio".into());
+            let choices = picker_choices(&rt.state, ProjectPicker::NewThread);
+            assert!(
+                choices
+                    .iter()
+                    .all(|(_, _, machine)| machine.as_deref() == Some("studio"))
+            );
+            rt.state.machines.draft_picker = None;
+            choose_picker(
+                &mut rt.state,
+                ProjectPicker::NewThread,
+                PickerChoice::MachineProject("studio".into(), 1),
+                false,
+            );
+            assert_eq!(rt.state.machines.selected, "studio");
+            assert!(rt.state.current().client_draft);
+            assert_eq!(rt.state.current().project, Some(1));
+        }
+    }
+
+    #[test]
+    fn captain_lives_on_row_fits_and_is_read_only_after_creation() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            connected_machines(&mut rt);
+            rt.state.begin_new_captain();
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (card, _) = rt.presented("captain-editor").unwrap();
+            let (lives, _) = rt.presented("captain-machine-row").unwrap();
+            assert!(
+                lives[0] >= card[0] && lives[0] + lives[2] <= card[0] + card[2] + 0.5,
+                "{width}: {lives:?}"
+            );
+            press(&mut rt, "captain-machine-choice");
+            rt.frame(0.25);
+            assert!(rt.presented("captain-machine-studio").is_some());
+            assert!(rt.presented("captain-machine-offline").is_none());
+            press(&mut rt, "captain-machine-studio");
+            assert_eq!(rt.state.captain_editor.as_ref().unwrap().server, "studio");
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.edit_captain(0);
+            rt.invalidate();
+            rt.frame(0.5);
+            press(&mut rt, "captain-machine-choice");
+            assert!(!rt.state.captain_editor.as_ref().unwrap().machine_picker);
+            assert_eq!(rt.state.captain_editor.as_ref().unwrap().server, "studio");
+        }
     }
     /// Tab once and return the focused element.
     fn tab(rt: &mut Runtime<State>) -> rune::ElementInfo {
@@ -12155,6 +12572,7 @@ pub(crate) mod tests {
         rt.state
             .picker_query
             .replace_text(format!("{}{sep}al", root.display()));
+        finish_folder_listing(&mut rt);
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("browse-0").is_some() && rt.find("browse-1").is_none());
@@ -12168,7 +12586,8 @@ pub(crate) mod tests {
         };
         rt.key(key(rune::Key::Enter, false));
         rt.frame(1.5);
-        assert!(rt.state.picker_query.text.ends_with(&format!("alpha{sep}")));
+        assert!(rt.state.picker_query.text.ends_with("alpha"));
+        finish_folder_listing(&mut rt);
         rt.key(key(rune::Key::Enter, true));
         rt.frame(2.0);
         assert!(rt.state.project_picker.is_none());
@@ -12185,6 +12604,7 @@ pub(crate) mod tests {
         rt.state
             .picker_query
             .replace_text(format!("{}{sep}gamma", root.display()));
+        finish_folder_listing(&mut rt);
         rt.invalidate();
         rt.frame(3.0);
         press(&mut rt, "browse-add");

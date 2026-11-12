@@ -22,11 +22,13 @@ pub struct Machines {
     pub receipts: std::collections::HashMap<String, Vec<crate::client::Event>>,
     pub recover: std::collections::HashMap<String, std::collections::HashMap<usize, uuid::Uuid>>,
     pub selection: std::collections::HashMap<String, Option<usize>>,
+    pub project_selection: std::collections::HashMap<String, (usize, String, Option<usize>)>,
+    /// The project picker opened by a draft retarget, restricted to this machine.
+    pub draft_picker: Option<String>,
     pub picker: bool,
     pub dialog: bool,
     pub host: rune::TextEdit,
     pub code: rune::TextEdit,
-    pub project_path: rune::TextEdit,
     pub notice: Option<String>,
     /// The text of `notice` while it is the unreachable-machines notice, so it clears itself
     /// when the connections are ready again and never clears another message.
@@ -52,11 +54,12 @@ impl Default for Machines {
             receipts: Default::default(),
             recover: Default::default(),
             selection: Default::default(),
+            project_selection: Default::default(),
+            draft_picker: None,
             picker: false,
             dialog: false,
             host: Default::default(),
             code: Default::default(),
-            project_path: Default::default(),
             notice: None,
             auto_notice: None,
             devices: Value::Null,

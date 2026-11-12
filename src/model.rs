@@ -287,6 +287,10 @@ pub struct BriefUi {
 }
 
 pub struct Thread {
+    /// Device-owned draft, promoted on Send rather than while choosing a host or project.
+    pub client_draft: bool,
+    client_creating: Option<uuid::Uuid>,
+    client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
     remote_send: Option<(uuid::Uuid, TextEdit, Vec<Attachment>)>,
     request_generation: String,
@@ -506,6 +510,9 @@ impl Thread {
             remote_send: None,
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
+            client_draft: false,
+            client_creating: None,
+            client_promoted: None,
             recovery_command: None,
             projected_harness_choice: false,
             id,
@@ -2704,6 +2711,14 @@ impl State {
     }
     /// Open the workspace picker with an empty search.
     pub fn open_picker(&mut self, mode: ProjectPicker) {
+        if mode == ProjectPicker::AddProject {
+            if self.project_picker != Some(ProjectPicker::AddProject) {
+                self.projects.return_picker = self.project_picker;
+            }
+            self.projects.browser = Default::default();
+        } else {
+            self.machines.draft_picker = None;
+        }
         if self.captain_editor.is_none() {
             self.cancel_captain_flow();
         }
@@ -2713,40 +2728,59 @@ impl State {
         self.picker_query.focused = true;
         self.picker_highlight = 0;
     }
-    /// Switch the Add workspace palette to browsing folders, starting beside the current
-    /// workspace or in the home folder.
+    /// Switch the Add workspace palette to browsing the selected server user's home.
     pub fn browse_for_project(&mut self) {
-        if self.machines.selected != "local" {
-            self.project_picker = Some(ProjectPicker::AddProject);
-            return;
-        }
-        let start = self
-            .project(self.current().project)
-            .and_then(|p| p.path.parent().map(std::path::Path::to_path_buf))
-            .filter(|p| p.is_dir())
-            .or_else(crate::projects::home_dir)
-            .unwrap_or_else(|| self.working_directory());
         self.project_picker = Some(ProjectPicker::AddProject);
         self.picker_browsing = true;
+        self.projects.browser = Default::default();
         self.picker_query = TextEdit::default();
-        self.picker_query
-            .replace_text(crate::projects::browse_text(&start));
+        // The answering host resolves home. Do not derive remote parents on this machine.
+        self.picker_query.replace_text("~");
         self.picker_query.focused = true;
         self.picker_highlight = 0;
     }
     /// Add the typed folder, creating it first when it does not exist yet.
     pub fn add_browsed_project(&mut self) {
-        if self.machines.selected != "local" {
-            let path = PathBuf::from(&self.machines.project_path.text);
-            if let Err(error) = self.add_project(path) {
-                self.projects.menu_error = Some(error);
+        let text = if self.picker_query.text.is_empty() {
+            self.projects
+                .browser
+                .listing
+                .as_ref()
+                .map(|listing| listing.path.clone())
+                .unwrap_or_default()
+        } else {
+            self.picker_query.text.clone()
+        };
+        if text.is_empty() {
+            return;
+        }
+        if self.client.is_some() {
+            let (purpose, captain) = self.project_selection_purpose();
+            let current_listing = self.projects.browser.request.as_ref()
+                == Some(&(
+                    self.machines.selected.clone(),
+                    self.picker_query.text.clone(),
+                ))
+                && self.projects.browser.pending.is_none();
+            let creates = self
+                .projects
+                .browser
+                .listing
+                .as_ref()
+                .is_some_and(|listing| !listing.target_exists)
+                || self.projects.browser.error.as_deref() == Some("That folder does not exist.");
+            let creates = current_listing && creates;
+            match self.remote("project.put", json!({"path":text,"createFolder":creates,"selectFor":purpose,"captain":captain})).expect("client") {
+                Ok(_) => {
+                    self.project_picker = None;
+                    self.picker_browsing = false;
+                    self.projects.menu_error = None;
+                }
+                Err(error) => self.projects.menu_error = Some(error),
             }
             return;
         }
-        let path = crate::projects::expand_path(&self.picker_query.text);
-        if path.as_os_str().is_empty() {
-            return;
-        }
+        let path = crate::projects::expand_path(&text);
         if !path.exists()
             && let Err(error) = std::fs::create_dir_all(&path)
         {
@@ -3562,7 +3596,10 @@ impl State {
         self.new_thread_in(project);
     }
     pub fn new_thread_in(&mut self, project: Option<ProjectId>) {
-        if self.forward("thread.create", json!({"project":project,"occupiedDrafts":self.threads.iter().filter(|t| t.has_draft_content()).map(|t| t.id).collect::<Vec<_>>()})) { self.project_picker = None; return; }
+        if self.client.is_some() {
+            self.new_client_draft(project);
+            return;
+        }
         if project.is_some() && self.project(project).is_none() {
             return;
         }
@@ -3598,7 +3635,7 @@ impl State {
         }
     }
     pub fn open_captain(&mut self, captain: usize) {
-        if self.forward("captain.open", json!({"threadId":self.current().id,"captain":captain,"project":self.captain_project,"assignProject":self.projects.captain_target})) {
+        if self.forward("captain.open", json!({"captain":captain,"project":self.captain_project.unwrap_or(self.current().project),"assignProject":self.projects.captain_target})) {
             self.captain_picker = false;
             return;
         }
@@ -3695,6 +3732,7 @@ impl State {
         }
         self.captain_picker = false;
         self.captain_editor = Some(CaptainEditor::new());
+        self.captain_editor.as_mut().unwrap().server = self.machines.selected.clone();
     }
 
     pub fn edit_captain(&mut self, captain: usize) {
@@ -3704,6 +3742,7 @@ impl State {
         };
         let mut editor = CaptainEditor::new();
         editor.editing = Some(captain);
+        editor.server = self.machines.selected.clone();
         editor.name.replace_text(&profile.name);
         editor.role.replace_text(&profile.role);
         editor.instructions.replace_text(&profile.instructions);
@@ -3721,9 +3760,14 @@ impl State {
     pub fn save_captain(&mut self) {
         if self.client.is_some() {
             if let Some(editor) = &self.captain_editor {
-                let params = json!({"threadId":self.current().id,"captain":editor.editing,"record":editor.profile().to_value(),"project":self.captain_project,"assignProject":self.projects.captain_target});
-                self.forward("captain.put", params);
-                self.captain_editor = None;
+                if editor.server != self.machines.selected {
+                    return;
+                }
+                let params = json!({"captain":editor.editing,"record":editor.profile().to_value(),"project":self.captain_project,"assignProject":self.projects.captain_target});
+                match self.remote("captain.put", params).expect("client") {
+                    Ok(_) => self.captain_editor = None,
+                    Err(error) => self.captain_editor.as_mut().unwrap().error = Some(error),
+                }
             }
             return;
         }
@@ -4647,6 +4691,10 @@ impl State {
                 self.choose_slash("model".into());
                 return;
             }
+            if self.current().client_draft {
+                self.promote_client_draft();
+                return;
+            }
             if self.current().remote_send.is_some() || !self.current().has_draft_content() {
                 return;
             }
@@ -4890,10 +4938,14 @@ impl State {
         }
         false
     }
-    pub fn add_project(&mut self, path: PathBuf) -> Result<ProjectId, String> {
-        if let Some(result) = self.remote("project.put", json!({"path":path})) {
+    pub fn add_project(&mut self, path: PathBuf) -> Result<Option<ProjectId>, String> {
+        let (purpose, captain) = self.project_selection_purpose();
+        if let Some(result) = self.remote(
+            "project.put",
+            json!({"path":path,"selectFor":purpose,"captain":captain}),
+        ) {
             result?;
-            return Ok(0);
+            return Ok(None);
         }
         if !path.is_absolute() {
             return Err("A workspace needs an absolute path on this server.".into());
@@ -4933,7 +4985,14 @@ impl State {
         }
         self.show_archive = false;
         self.checkpoint();
-        Ok(id)
+        if purpose != "project" {
+            self.machines.project_selection.insert(
+                self.machines.selected.clone(),
+                (id, purpose.into(), captain),
+            );
+            self.finish_project_selection();
+        }
+        Ok(Some(id))
     }
     #[cfg(test)]
     pub fn archive(&mut self) {
@@ -5924,6 +5983,7 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    let browsing = state.poll_folder_browser();
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -5931,10 +5991,10 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             tx.wake_after(wait);
             return true;
         }
-        return false;
+        return browsing;
     }
     if state.client.is_some() {
-        return state.poll_client(tx);
+        return state.poll_client(tx) | browsing;
     }
     let background_changed = state.poll_background_start(tx);
     if state.background.quitting {
@@ -5950,7 +6010,8 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if state.restart_approved && !rune::quitting() {
         state.cancel_update_exit();
     }
-    let mut changed = background_changed | state.updater.poll(Instant::now(), state.wake.clone());
+    let mut changed =
+        browsing | background_changed | state.updater.poll(Instant::now(), state.wake.clone());
     if let Some(remaining) = state.updater.remaining(Instant::now()) {
         tx.wake_after(remaining);
     }
@@ -10007,7 +10068,7 @@ mod tests {
     fn concurrent_project_threads_keep_their_cwds_and_scratch_threads_are_isolated() {
         let mut state = State::new(".".into(), false);
         let a = state.thread_directory(0).unwrap();
-        let b_id = state.add_project(std::env::temp_dir()).unwrap();
+        let b_id = state.add_project(std::env::temp_dir()).unwrap().unwrap();
         let b = state.active;
         let (a_commands, _a_events) = fake_pi(&mut state.threads[0], Status::Ready);
         let (b_commands, _b_events) = fake_pi(&mut state.threads[b], Status::Ready);
@@ -10061,7 +10122,7 @@ mod tests {
             first,
             "a second persona has an independent coordinator"
         );
-        let b = state.add_project(std::env::temp_dir()).unwrap();
+        let b = state.add_project(std::env::temp_dir()).unwrap().unwrap();
         state.open_captain(1);
         let second = state.current().id;
         assert_ne!(first, second);
@@ -10166,7 +10227,7 @@ mod tests {
         assert_eq!(restored.projects.entries[0].path, clean);
         assert_eq!(restored.current().project, Some(1));
         assert_eq!(restored.project_scope, ProjectScope::Project(1));
-        assert_eq!(restored.add_project(verbatim).unwrap(), 1);
+        assert_eq!(restored.add_project(verbatim).unwrap(), Some(1));
         assert_eq!(restored.projects.entries.len(), 1);
         assert!(restored.projects.next_id > 2);
     }
