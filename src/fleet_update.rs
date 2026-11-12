@@ -685,4 +685,22 @@ mod tests {
         assert!(!state.fleet.rows[1].failed);
         assert_eq!(state.fleet.pending_handoffs, 0);
     }
+    #[test]
+    fn client_poll_applies_fleet_progress_from_the_same_projection_batch() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.demo_fleet();
+        state.fleet.rows.truncate(2);
+        state.fleet.rows[1].server = "remote".into();
+        state.fleet.rows[1].attempted = true;
+        state.fleet.rows[1].update_id = Some("same-batch".into());
+        let (mut client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        let mut projection = state.projection();
+        projection["updateStatus"] = json!({"runningVersion":"99.0.0","state":"idle","lastOutcome":{"updateId":"same-batch","success":true,"tag":"v99.0.0"}});
+        remote.test_snapshot(projection);
+        client.linked.insert("remote".into(), remote);
+        state.client = Some(client);
+        crate::model::poll(&mut state, 0.0, &mut rune::Tx::default());
+        assert_eq!(state.fleet.rows[1].state, "updated to 99.0.0");
+    }
 }

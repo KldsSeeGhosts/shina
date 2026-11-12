@@ -6647,7 +6647,7 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    let browsing = state.poll_folder_browser() | state.poll_fleet() | state.poll_settings();
+    let browsing = state.poll_folder_browser() | state.poll_settings();
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -6660,6 +6660,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if state.client.is_some() {
         return state.poll_client(tx) | browsing;
     }
+    let browsing = browsing | state.poll_fleet();
     let background_changed = state.poll_background_start(tx);
     if state.background.quitting {
         return true;

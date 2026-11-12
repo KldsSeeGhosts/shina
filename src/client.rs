@@ -95,6 +95,10 @@ impl Client {
         self.commands.ready.store(true, Ordering::Release);
         self.input.take().expect("unused test client")
     }
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self, projection: Value) {
+        *self.snapshot.lock().expect("client snapshot") = Some(projection);
+    }
 
     #[cfg(test)]
     pub fn test_connected(directory: PathBuf) -> (Self, tokio::sync::mpsc::Receiver<Command>) {

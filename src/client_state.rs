@@ -1078,6 +1078,9 @@ impl State {
         if changed {
             self.checkpoint_client();
         }
+        // Fleet decisions must see this poll's projections, and precede the local
+        // restart check. Otherwise a final remote outcome can wait for an unrelated wake.
+        changed |= self.poll_fleet();
         if self.restart_for_update {
             self.restart_for_update = false;
             if let Err(error) = self.prepared_exit(true, None) {
