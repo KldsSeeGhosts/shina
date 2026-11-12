@@ -635,6 +635,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     if shared.remote { Err("Create pairing codes on the host.".into()) }
                     else { shared.pairing.lock().expect("pairing").create_scoped(crate::lifecycle::now(), params.get("args").unwrap_or(params)["peer"] == true) }
                 } else if matches!(method, "peer.link" | "peer.list" | "peer.unlink") {
+                    if method == "peer.link" {
+                        crate::model::warm_repository_records(&snapshots.borrow()["state"]["index"]["projects"]);
+                    }
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
                     let dispatch=if method=="peer.list" {Ok(None)} else {
@@ -952,19 +955,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
             let Ok(call) = incoming.try_recv() else {
                 break;
             };
-            let result = if !runtime
-                .database
-                .as_ref()
-                .expect("durable runtime")
-                .device_active(&call.device)?
-            {
-                Err("Authentication denied. This device was revoked.".into())
-            } else if call.command.method == "command.get" {
-                runtime.lookup_command(&call.device, &call.command.params)
-            } else {
-                runtime.command(&call.device, call.command)
-            };
-            let _ = call.reply.send(result);
+            runtime.accept_call(call);
             changed = true;
             if runtime.state.runtime_stop_requested {
                 stop.send_replace(true);
@@ -1109,12 +1100,7 @@ mod tests {
                 crate::store::with_directory(profile, || {
                     while !stopping.load(Ordering::Acquire) {
                         if let Ok(call) = incoming.try_recv() {
-                            let result = if call.command.method == "command.get" {
-                                runtime.lookup_command(&call.device, &call.command.params)
-                            } else {
-                                runtime.command(&call.device, call.command)
-                            };
-                            let _ = call.reply.send(result);
+                            runtime.accept_call(call);
                             let snapshot = Arc::new(runtime.snapshot());
                             worker_streams
                                 .lock()
@@ -1123,6 +1109,14 @@ mod tests {
                             snapshots.send_replace(snapshot);
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
+                        }
+                        if runtime.poll_prepared_calls() {
+                            let snapshot = Arc::new(runtime.snapshot());
+                            worker_streams
+                                .lock()
+                                .expect("history streams")
+                                .publish(&snapshot);
+                            snapshots.send_replace(snapshot);
                         }
                     }
                     runtime.shutdown().unwrap();

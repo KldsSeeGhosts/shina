@@ -484,6 +484,7 @@ impl State {
             return Err(error.clone());
         }
         self.runtime_enabled = true;
+        self.warm_repository_identities();
         self.start_task_recovery();
         self.refresh_catalog();
         self.checkpoint_and_flush()

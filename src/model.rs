@@ -53,7 +53,10 @@ pub use scope::RemoteProject;
 mod codex_model;
 #[path = "remote_tasks.rs"]
 mod remote_tasks;
-pub use remote_tasks::{PeerOrigin, RemoteState, RemoteTask, wait_for_peer_thread};
+pub(crate) use remote_tasks::Preparation;
+pub use remote_tasks::{
+    PeerOrigin, RemoteState, RemoteTask, wait_for_peer_thread, warm_repository_records,
+};
 
 struct Injection {
     text: String,
@@ -5245,6 +5248,16 @@ impl State {
     }
 
     fn mcp_request(&mut self, request: crate::mcp::Request) {
+        if request.tool == "delegate_task"
+            && let Some(preparation) = self.prepare_remote_delegation(request.thread, &request.args)
+        {
+            self.defer_remote_mcp(request, preparation);
+            return;
+        }
+        self.mcp_request_ready(request);
+    }
+
+    fn mcp_request_ready(&mut self, request: crate::mcp::Request) {
         if matches!(request.tool.as_str(), "read_thread" | "list_threads")
             && self.remote_transcript_request(&request)
         {
@@ -5890,6 +5903,9 @@ impl State {
             self.projects.entries.push(Project::new(id, path));
             id
         };
+        if let Some(project) = self.project(Some(id)) {
+            remote_tasks::repository(&project.path);
+        }
         if let Some(index) = self
             .threads
             .iter()
