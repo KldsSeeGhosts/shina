@@ -112,6 +112,137 @@ ACP and Codex use the same bounded connection queues, shutdown registry and per-
 
 Claude uses that same process owner, bounded queues, shutdown registry and kill-on-close implementation.
 
+## HTML tools
+
+`html_render` and `html_preview` use KSG Code's arguments and result objects.
+Pass exactly one of inline `html` or an absolute `path`. Only Full access permits
+a file path or local image inlining. Other modes can supply inline HTML with
+`data:image` images. Inline HTML is limited to 512,000 UTF-16 code units. A page
+with its images inlined is limited to 25 MiB, and each local image to 10 MiB.
+Images must have recognized image bytes. HTML files must start with a doctype or
+HTML root. CSS viewport-height units are rejected.
+
+`html_render` requires a `title` of 1 to 200 UTF-16 code units and an integer
+`height` of 80 to 2000 CSS pixels. Its result has `htmlRender` and `message`.
+`html_preview` accepts `width` of 240 to 1600 CSS pixels, default 728, and
+`appearance` of `dark` or `light`, default dark. It returns a PNG image content
+block and `width`, `contentHeight`, `capturedHeight`, `consoleMessages`,
+`missingImages` and `screenshot`. The screenshot's dimensions are CSS pixels;
+its PNG has twice those dimensions. Preview calls have no transcript card.
+
+### Durable references
+
+The normalized key is `Tool.structured.htmlRender`. Provider-native
+`structuredContent.htmlRender` remains readable too. Its camel-case keys are:
+
+- `attachmentId`, the HTML blob filename, `html-<thread>-<uuid>.html`.
+- `threadId`, the thread that owns the publication.
+- `title` and `height`, the tool's display request.
+- `html`, an object with `id` and `bytes` for the source blob.
+- `heights`, measured `[cssWidth, contentHeight]` pairs.
+- `light` and `dark`, optional snapshot objects with `id`, `bytes`, `width` and
+  `height`. These dimensions are physical PNG pixels.
+
+An atomic `<attachmentId>.json` manifest marks publication. Arbitrary HTML files
+and references to another thread cannot open as publications. The existing
+authenticated `/v1/blobs/<id>` path serves published HTML and snapshots through
+bounded offset/limit reads. Linked clients fetch those blobs and recreate the
+validated manifest locally. No attachment collector deletes published manifests
+or their blobs, including closed and archived threads. Unreferenced publications
+are retained too. Older transcripts need no migration.
+
+### Native isolation
+
+Rune draws only the stored PNG. `html_window::Renderer` separates capture from
+publishing and has a fake for tests. The owned `--html-native` helper starts
+before profile initialization and never starts MCP or a client listener. Closing
+a thread tab leaves its window open. Opening the same publication focuses that
+window. Quitting closes the helper's input pipe and terminates its process tree.
+
+The trusted in-memory host embeds escaped `srcdoc` HTML with only scripts and
+forms allowed. It never grants `allow-same-origin`. Its inherited CSP excludes
+file URLs and objects. The bridge accepts height/console reports and
+user-activated HTTP or HTTPS link requests. Theme updates go to the page. No
+filesystem operations, application commands, credentials or tokens enter it.
+
+On macOS, direct objc2 bindings create WKWebView with a fresh
+`nonPersistentDataStore`. A mandatory content rule blocks all direct HTTP,
+WebSocket and file requests. Static public resource URLs use custom schemes and
+a Rust loader that pins DNS answers, rechecks redirects and forwards no cookies.
+This avoids WKWebView's observed loopback proxy bypass. WK delegates cancel
+navigation and downloads, refuse new views and file choosers, and deny media and
+motion permissions. The iframe denies device and clipboard permissions. WebKit
+preferences disable file access, clipboard reads and peer connections. The view
+unregisters external drag types.
+
+On Windows, direct webview2-com bindings create an InPrivate controller in a
+unique temporary user-data directory. A custom scheme without an authority has
+an opaque origin. Host objects, extensions, SSO, dialogs, external drops and
+developer tools are off. Handlers refuse navigation, popups, downloads and
+permission requests. HTTP authentication and client certificate prompts are
+cancelled, and integrated authentication schemes are disabled. CDP intercepts file choosers, including in paused
+cross-process iframe targets, before those targets resume. Browser arguments
+force the proxy for loopback too, disable QUIC and restrict WebRTC to proxied
+traffic. Missing required APIs select browser fallback.
+
+Both the Mac resource loader and Windows CONNECT proxy check normalized URL hosts and every DNS answer. They reject
+private, loopback, link-local, private mapped IPv6 and transition addresses, then connects
+only to the checked numeric address. It also refuses public addresses assigned
+to this machine. Redirects create another checked connection. The Mac loader caps
+each resource at 25 MiB with a two-second request deadline. Each page has a
+separate nonpersistent session.
+
+Browser fallback has a separate random loopback port and a random
+single-publication URL. It serves no other files or APIs. Headers include
+`sandbox allow-scripts allow-forms`, `connect-src 'none'`, `nosniff`, no-store
+and permission denials. It sets no cookies and rejects Origin headers and
+unexpected Host headers. Without a request interceptor, it blocks all remote
+resources. Native pages can load static public scripts, images and fonts through
+the checked loader or proxy, but their CSP disables script-initiated connections.
+On Mac, common DOM URL setters use the custom scheme too. Other dynamically
+constructed raw HTTP resource URLs are blocked. Self-contained HTML with inlined
+assets avoids that restriction.
+
+Capture has a three-second settle deadline, a two-second snapshot deadline and
+a seven-second parent deadline. It uses the current conversation lane width at
+2x in each theme. A page that never settles gets a snapshot attempt at the
+deadline. Failed capture leaves the title and "Open to view". Linux uses that
+card and browser fallback without a native snapshot. Open native windows receive
+palette updates, and inline cards select the other stored PNG. Browser fallback
+keeps the theme selected when opened.
+
+New direct dependencies are `regex` and `url`, both MIT OR Apache-2.0;
+`objc2`, `objc2-foundation` and `block2`, MIT; `objc2-app-kit` and
+`objc2-web-kit`, Zlib OR Apache-2.0 OR MIT; `webview2-com`, MIT; and
+`windows` 0.61, MIT OR Apache-2.0. No wry dependency is used.
+New transitive packages are `aho-corasick`, Unlicense OR MIT;
+`regex-automata` and `regex-syntax`, MIT OR Apache-2.0;
+`webview2-com-macros` and `webview2-com-sys`, MIT; and the added versions of
+`windows-collections`, `windows-core`, `windows-future`, `windows-link`,
+`windows-numerics`, `windows-result`, `windows-strings` and `windows-threading`,
+all MIT OR Apache-2.0.
+
+### HTML validation and review
+
+Run `cargo build`, `cargo test` and `cargo fmt --check`. Focused coverage is
+`cargo test html_`. After a build, run
+`cargo test native_offscreen_capture_is_nonblank -- --ignored --nocapture`.
+It checks a nonuniform PNG, measured height and console output, and verifies
+that a loopback canary and a local script file are unreachable. Tests never use
+the real Shina profile.
+
+The Windows module can be type-checked on a non-Windows host with
+`cargo check --manifest-path tools/windows-html-check/Cargo.toml --target x86_64-pc-windows-msvc`.
+This uses the exact platform and network source with compile-only stubs for their callers.
+It does not replace a full Windows build, link test or native runtime test.
+
+The `html-render` and `html-render-dark` snapshot scenes use isolated temporary
+profiles. The card ports KSG's tool-row placement. Its requested native-specific
+presentation has a 6 px corner, a 2 px pixel frame and hard shadow, an 11 px
+Departure Mono HTML label, an Inter title and the existing open icon. Images keep
+their aspect ratio and clip below 480 pt. Finished cards remain visible outside
+the collapsed work log.
+
 ## Validation
 
 ### Typed transcript tools
