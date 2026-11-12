@@ -916,10 +916,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 (Some(pane), Some(lane)) => pane - lane >= CAPTAIN_HERO_HEIGHT,
                 _ => true,
             };
-            main.child(empty_thread(s, p, narrow, wide, main_width, hero_fits))
+            main.child(empty_thread(
+                s,
+                p,
+                narrow,
+                wide,
+                main_width,
+                hero_fits,
+                composer_caret_edges(cx, zoom),
+            ))
         } else {
             main.child(conversation(s, p, wide, main_width))
-                .child(composer(s, p, narrow, wide, main_width))
+                .child(composer(
+                    s,
+                    p,
+                    narrow,
+                    wide,
+                    main_width,
+                    composer_caret_edges(cx, zoom),
+                ))
         };
         body = body.child(main);
         context_popover_shown = true;
@@ -7600,6 +7615,7 @@ fn empty_thread(
     wide: bool,
     pane_width: f32,
     hero_fits: bool,
+    caret_edges: Option<[bool; 2]>,
 ) -> El {
     // A captain's hero keeps its height above a tall crew tray and takes the room from the
     // space below the composer. In a window too short for both, the composer stays on screen
@@ -7626,7 +7642,7 @@ fn empty_thread(
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, narrow, wide, pane_width))
+        .child(composer(s, p, narrow, wide, pane_width, caret_edges))
         .child(below)
 }
 
@@ -8366,6 +8382,8 @@ fn context_popover(s: &State, p: Palette) -> El {
 /// the messages above it, with `pb-4` under the footer.
 /// The composer field's height with its 4 pt padding: one line at rest, so the body is 48 pt.
 const COMPOSER_FIELD_MIN: f32 = 36.0;
+/// The composer text field's own padding, inside `composer-input`.
+const COMPOSER_FIELD_PAD: f32 = 4.0;
 /// KSG's `max-h-52`: a 200 pt text window inside the 4 pt padding, then the field scrolls.
 const COMPOSER_FIELD_MAX: f32 = 208.0;
 /// A composer that cannot send: demo data, an archived thread or an unreachable machine.
@@ -8383,7 +8401,36 @@ fn composer_frame(s: &State, p: Palette) -> Color {
         p.frame
     }
 }
-fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
+/// Whether the composer's caret is on its first and last visual line, `[first, last]`, or
+/// `None` before the field has drawn a caret. Ported from KSG Code's `isCaretOnVisualEdge` in
+/// `ComposerPromptEditorTiptap.tsx`: the caret line is on an edge when it is within half its
+/// height of that edge of the text. Prompt history uses it, so Up and Down move through a
+/// wrapped line before they recall a prompt.
+fn composer_caret_edges(cx: &Cx<State>, zoom: f32) -> Option<[bool; 2]> {
+    // The caret is in window points and layout reads are in the zoomed view's points.
+    let caret = cx.caret("composer-input")?.map(|v| v / zoom);
+    // Only the field's top and height matter, so a sideways move does not re-run the view.
+    let [top, height] = cx.window_layout_with("composer-input", |r| [r[1], r[3]])?;
+    let half = caret[3] / 2.0;
+    let first = caret[1] - (top + COMPOSER_FIELD_PAD) < half;
+    // A field at its minimum height holds one line with spare room under it, so its bottom
+    // edge is not the text's. Taller than that, the field ends where its text does.
+    let last = if height <= COMPOSER_FIELD_MIN + 0.5 {
+        first
+    } else {
+        top + height - COMPOSER_FIELD_PAD - (caret[1] + caret[3]) < half
+    };
+    Some([first, last])
+}
+
+fn composer(
+    s: &State,
+    p: Palette,
+    narrow: bool,
+    wide: bool,
+    pane_width: f32,
+    caret_edges: Option<[bool; 2]>,
+) -> El {
     let t = s.current();
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
@@ -8600,13 +8647,13 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .caret(p.coral, p.coral_bg)
         .w_full()
         .min_h(COMPOSER_FIELD_MIN)
-        .padding(4.0)
+        .padding(COMPOSER_FIELD_PAD)
         .on_edit(|s: &mut State| {
             s.current_mut().native.slash_index = 0;
             &mut s.current_mut().draft
         })
-        .on_input_key(|s: &mut State, event, tx| {
-            if pi_ui::composer_pi_key(s, event, tx) {
+        .on_input_key(move |s: &mut State, event, tx| {
+            if pi_ui::composer_pi_key(s, event, tx, caret_edges) {
                 composer_menu::scroll_selected(s, tx);
                 return true;
             }
@@ -15835,6 +15882,59 @@ pub(crate) mod tests {
                 rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
                 "{width}: {rect:?}"
             );
+        }
+    }
+
+    #[test]
+    fn prompt_history_follows_the_carets_visual_line_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // An older short prompt, then one that wraps over several lines with no newline.
+            let long = "wrapped ".repeat(60).trim_end().to_string();
+            rt.state.current_mut().messages = ["short", long.as_str()]
+                .into_iter()
+                .map(|text| crate::model::Message {
+                    role: "You",
+                    text: text.into(),
+                    images: Vec::new(),
+                })
+                .collect();
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            let mut time = 0.0;
+            let mut tap = |rt: &mut Runtime<State>, key: rune::Key| {
+                rt.key(rune::KeyEvent {
+                    key,
+                    mods: Default::default(),
+                });
+                // The caret's place reaches the view the frame after it is drawn.
+                for _ in 0..3 {
+                    time += 0.1;
+                    rt.frame(time);
+                }
+            };
+
+            tap(&mut rt, rune::Key::Up);
+            assert_eq!(rt.state.current().draft.text, long, "{width}: recall");
+            let (field, _) = rt.presented("composer-input").expect("composer input");
+            let lines = ((field[3] - 2.0 * COMPOSER_FIELD_PAD) / 23.0).round() as usize;
+            assert!(lines >= 2, "{width}: the prompt wraps, {field:?}");
+
+            // The caret starts on the last line. Up climbs the wrapped lines first, and only
+            // from the first line recalls the older prompt.
+            let mut presses = 0;
+            while rt.state.current().draft.text == long && presses < 40 {
+                tap(&mut rt, rune::Key::Up);
+                presses += 1;
+            }
+            assert_eq!(rt.state.current().draft.text, "short", "{width}: older");
+            assert_eq!(presses, lines, "{width}: one press a line, then the recall");
+
+            // Down from a one-line prompt goes forward, then leaves history from the last line.
+            tap(&mut rt, rune::Key::Down);
+            assert_eq!(rt.state.current().draft.text, long, "{width}: forward");
+            tap(&mut rt, rune::Key::Down);
+            assert_eq!(rt.state.current().draft.text, "", "{width}: leaves history");
         }
     }
 

@@ -206,7 +206,14 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
     list
 }
 
-pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> bool {
+/// `caret_edges` says whether the caret is on the field's first and last visual line, from
+/// `composer_caret_edges`; `None` falls back to the text's own line breaks.
+pub(super) fn composer_pi_key(
+    s: &mut State,
+    event: &rune::KeyEvent,
+    tx: &rune::Tx,
+    caret_edges: Option<[bool; 2]>,
+) -> bool {
     if s.undo_key(event, true) {
         return true;
     }
@@ -266,7 +273,13 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::
         menu_open,
         has_attachments,
         has_pending_request,
-        None,
+        caret_edges.map(|[first, last]| {
+            if event.key == rune::Key::Up {
+                first
+            } else {
+                last
+            }
+        }),
     ) {
         return true;
     }
