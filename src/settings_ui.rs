@@ -229,14 +229,7 @@ impl State {
                     ("Claude", crate::claude::process()),
                 ] {
                     let Ok(process) = process else { continue };
-                    let mut command = std::process::Command::new(process.get_program());
-                    if let Some(script) = process.get_args().find(|arg| {
-                        arg.to_string_lossy().ends_with(".js")
-                            || arg.to_string_lossy().ends_with(".mjs")
-                    }) {
-                        command.arg(script);
-                    }
-                    command.arg("--version");
+                    let mut command = version_command(&process);
                     if let Ok(output) = crate::process::output(
                         &mut command,
                         std::time::Duration::from_secs(2),
@@ -371,6 +364,28 @@ impl State {
 fn matches(s: &State, title: &str) -> bool {
     let query = s.settings.search.text.trim().to_lowercase();
     query.is_empty() || title.to_lowercase().contains(&query)
+}
+fn version_command(process: &std::process::Command) -> std::process::Command {
+    let mut command = std::process::Command::new(process.get_program());
+    if let Some(script) = process.get_args().find(|arg| {
+        arg.to_string_lossy().ends_with(".js") || arg.to_string_lossy().ends_with(".mjs")
+    }) {
+        command.arg(script);
+    }
+    for (name, value) in process.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    command
+        .arg("--version")
+        .env_remove(crate::mcp::URL_ENV)
+        .env_remove(crate::mcp::TOKEN_ENV)
+        .env_remove("SHINA_RUNTIME_MODE")
+        .env_remove("SHINA_PI_BRIDGE_PATH");
+    command
 }
 fn package_version(script: &std::path::Path) -> Option<String> {
     let script = script.canonicalize().ok()?;
@@ -1444,6 +1459,35 @@ mod tests {
         let mut invalid = defaults;
         invalid.snooze_minutes = vec![0];
         assert!(invalid.validate().is_err());
+    }
+    #[test]
+    fn version_probes_drop_thread_credentials_and_never_forward_prompt_or_server_arguments() {
+        let mut original = std::process::Command::new("node");
+        original
+            .arg("/tmp/fixture-agent.mjs")
+            .arg("app-server")
+            .arg("a prompt");
+        original.env(crate::mcp::TOKEN_ENV, "not-a-real-token");
+        let probe = version_command(&original);
+        assert_eq!(
+            probe
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/fixture-agent.mjs", "--version"]
+        );
+        for name in [
+            crate::mcp::TOKEN_ENV,
+            crate::mcp::URL_ENV,
+            "SHINA_RUNTIME_MODE",
+            "SHINA_PI_BRIDGE_PATH",
+        ] {
+            assert!(
+                probe
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none())
+            );
+        }
     }
     #[test]
     fn snooze_editor_preserves_duration_and_calendar_kinds_with_bounded_values() {
