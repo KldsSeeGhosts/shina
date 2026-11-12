@@ -8970,6 +8970,18 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
 fn dialog(s: &State, p: Palette) -> El {
     let t = s.current();
     let request = t.request.as_ref().expect("pending dialog");
+    let remote = s.remote_task(t.id);
+    let linked = remote.is_none_or(|r| {
+        s.client
+            .as_ref()
+            .is_some_and(|c| c.commands_for(&r.server_id).is_some())
+    });
+    let can_answer = linked
+        && remote.is_none_or(|r| s.machine_connected(&r.server_id))
+        && matches!(
+            crate::model::string(request, "method"),
+            "confirm" | "input" | "editor" | "select"
+        );
     let mut card = col()
         .key("pi-dialog")
         .role("group")
@@ -8986,10 +8998,13 @@ fn dialog(s: &State, p: Palette) -> El {
         "confirm" => {
             actions = actions
                 .child(button("dialog-confirm", "Confirm", p, |s| {
-                    s.current_mut().respond(json!({"confirmed":true}))
+                    let _ = s.respond_to_request(s.current().id, json!({"confirmed":true}));
                 }))
                 .child(button("dialog-session", "Allow for session", p, |s| {
-                    s.current_mut().approve_for_session()
+                    let _ = s.respond_to_request(
+                        s.current().id,
+                        json!({"confirmed":true,"allowForSession":true}),
+                    );
                 }));
         }
         "select" => {
@@ -9001,7 +9016,10 @@ fn dialog(s: &State, p: Palette) -> El {
                             &format!("dialog-option-{index}"),
                             option,
                             p,
-                            move |s| s.current_mut().respond(json!({"value":value})),
+                            move |s| {
+                                let _ =
+                                    s.respond_to_request(s.current().id, json!({"value":value}));
+                            },
                         ));
                     }
                 }
@@ -9021,17 +9039,41 @@ fn dialog(s: &State, p: Palette) -> El {
                     .radius(6.0)
                     .fill(p.card)
                     .field_focus(&t.reply, p)
+                    .disabled(!can_answer)
                     .on_edit(|s: &mut State| &mut s.current_mut().reply),
             );
             actions = actions.child(button("dialog-submit", "Submit reply", p, |s| {
                 let value = s.current().reply.text.clone();
-                s.current_mut().respond(json!({"value":value}));
+                let _ = s.respond_to_request(s.current().id, json!({"value":value}));
             }));
         }
     }
-    card.child(actions.child(button("dialog-cancel", "Cancel", p, |s| {
-        s.current_mut().respond(json!({"cancelled":true}))
-    })))
+    card = card.child(
+        actions
+            .child(button("dialog-cancel", "Cancel", p, |s| {
+                let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
+            }))
+            .disabled(!can_answer),
+    );
+    if !linked && let Some(remote) = remote {
+        card = card
+            .child(
+                label(
+                    format!("Link this desktop to {} to answer.", remote.label),
+                    SMALL,
+                    p.muted,
+                )
+                .wrap(),
+            )
+            .child(crew_ui::ghost_button(
+                s,
+                "dialog-link-machine".into(),
+                "Link machine",
+                p,
+                |s| s.machines.dialog = true,
+            ));
+    }
+    card
 }
 
 #[cfg(test)]
@@ -13725,6 +13767,39 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt
+    }
+
+    #[test]
+    fn remote_confirmation_without_a_device_link_shows_link_flow_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state
+                .demo_remote_task(2, "Studio", crate::model::RemoteState::Running);
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &["needs-you-2", "link-request-notice-2", "link-request-2"],
+            );
+            let before = rt
+                .state
+                .threads
+                .iter()
+                .find(|t| t.id == 2)
+                .unwrap()
+                .request
+                .clone();
+            press(&mut rt, "approve-2");
+            assert_eq!(
+                rt.state.threads.iter().find(|t| t.id == 2).unwrap().request,
+                before
+            );
+            press(&mut rt, "link-request-2");
+            assert!(rt.state.machines.dialog);
+            rt.frame(1.0);
+            assert_inside(&mut rt, width, &["machine-dialog", "machine-link-submit"]);
+        }
     }
 
     #[test]

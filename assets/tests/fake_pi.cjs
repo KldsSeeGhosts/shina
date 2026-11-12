@@ -15,6 +15,9 @@ const model = { provider: "cpa", id: "fixture", name: "Fixture", input: ["text"]
 const emit = (record) => process.stdout.write(JSON.stringify(record) + "\n");
 const response = (request, data) => emit({ type: "response", id: request.id, command: request.type, success: true, data });
 const save = () => { if (!ephemeral) fs.writeFileSync(session, JSON.stringify(messages)); };
+if (process.env.SHINA_MCP_URL) fs.writeFileSync(path.join(process.cwd(), "fixture-mcp.json"), JSON.stringify({
+  url: process.env.SHINA_MCP_URL, token: process.env.SHINA_MCP_TOKEN
+}));
 async function delegate() {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "delegate_task", arguments: { title: "Fixture child", prompt: "child-fixture" } } });
   await new Promise((resolve, reject) => {
@@ -39,12 +42,21 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   else if (request.type === "set_model") response(request, model);
   else if (request.type === "set_thinking_level") { thinking = request.level; response(request, { level: thinking }); }
   else if (request.type === "prompt") {
+    fs.appendFileSync(path.join(process.cwd(), "fixture-prompts.jsonl"), JSON.stringify(request.message) + "\n");
     messages.push({ role: "user", content: [{ type: "text", text: request.message }] }); save();
     running = true; response(request, {}); emit({ type: "agent_start" });
     if (request.message === "delegate-fixture") await delegate();
+    if (request.message.includes("remote-confirm-fixture")) {
+      emit({ type: "extension_ui_request", id: "remote-confirm", method: "confirm", title: "Run fixture command?", message: "A remote confirmation" });
+      return;
+    }
     setTimeout(() => {
-      const message = { role: "assistant", content: [{ type: "text", text: "Fixture complete" }], stopReason: "stop", timestamp: Date.now() };
+      const text = request.message.includes("remote-long-fixture")
+        ? "START FACT\n" + "界".repeat(5500) + "\nMIDDLE FACT\n" + "x".repeat(5500) + "\nEND FACT"
+        : "Fixture complete";
+      const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: Date.now() };
       messages.push(message); save();
+      fs.writeFileSync(path.join(process.cwd(), "fixture-finished-at"), String(message.timestamp));
       emit({ type: "message_end", message });
       running = false; emit({ type: "agent_end", messages }); emit({ type: "agent_settled" });
     }, 600);

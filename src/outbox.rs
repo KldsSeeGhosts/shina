@@ -92,6 +92,34 @@ pub fn drain(database: &crate::database::Database, effects: Vec<Effect>) -> Resu
 
 /// Debug-only crash injection for real-process integration tests. It is restricted
 /// to the explicit isolated profile and never accepts a general output path.
+pub fn peer_ack_boundary(
+    directory: &std::path::Path,
+    method: &str,
+    result: &Result<Value, String>,
+) {
+    #[cfg(debug_assertions)]
+    if method == "peer.task.ack"
+        && result
+            .as_ref()
+            .is_ok_and(|value| value["status"] == "accepted")
+        && std::env::var("SHINA_TEST_CRASH_EFFECT").ok().as_deref() == Some("peer-ack")
+        && directory.starts_with(std::env::temp_dir())
+        && directory
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+    {
+        // The target committed acknowledgement, but the home has not received it.
+        std::process::exit(86);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (directory, method, result);
+}
+
+/// Debug-only prompt crash injection, restricted to isolated integration profiles.
 #[cfg(debug_assertions)]
 fn crash_boundary(payload: &Value, phase: &str) {
     if payload["type"] == "prompt"

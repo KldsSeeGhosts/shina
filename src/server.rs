@@ -514,6 +514,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 4 { capabilities.push(protocol::FILESYSTEM_BROWSE); }
                         if minor >= 5 { capabilities.push(protocol::PEER_DELEGATION); }
                         if minor >= 6 { capabilities.push(protocol::LINKED_UPDATES); }
+                        if minor >= 7 { capabilities.extend([protocol::PEER_TASKS, protocol::THREAD_READ]); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -566,6 +567,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         database.authorize(&device, "filesystem.browse", &json!({}))?;
                         serde_json::to_value(listing).map_err(|_| "Could not encode the folder listing.".into())
                     }).await.unwrap_or_else(|_| Err("Folder listing failed.".into()))
+                } else if method == "peer.thread.wait" {
+                    crate::model::wait_for_peer_thread(snapshots.clone(), shared.database.clone(),
+                        device.clone(), shared.discovery.server_id.clone(), params["args"].clone()).await
                 } else if method == "thread.history" {
                     let current = snapshots.borrow().clone();
                     current["state"]["threads"].as_array()
@@ -637,6 +641,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     value["serverId"] = json!(shared.discovery.server_id);
                     value["instanceId"] = json!(shared.discovery.instance_id);
                 }
+                crate::outbox::peer_ack_boundary(&shared.directory, method, &result);
                 if !send(&mut socket, protocol::response(id, result)).await { break; }
             }
             changed = snapshots.changed() => {
@@ -1135,6 +1140,53 @@ mod tests {
     }
 
     #[test]
+    fn peer_contract_skew_requires_an_update_without_launching_a_worker() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let home = Fixture::new("skew-home").await;
+            let target = Fixture::with_minor("skew-target", 6).await;
+            let code = target
+                .shared
+                .pairing
+                .lock()
+                .unwrap()
+                .create_scoped(crate::lifecycle::now(), true)
+                .unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let peer = crate::peer::link_peer(
+                &home.shared.directory,
+                &home.shared.database,
+                &target.address.to_string(),
+                &code,
+            )
+            .await
+            .unwrap();
+            let link = peer.credential(&home.shared.directory).unwrap();
+            let error = crate::client::remote_rpc(&link, "peer.thread.launch", json!({}))
+                .await
+                .unwrap_err();
+            assert!(error.contains("Update required on "), "{error}");
+            assert!(error.contains(&target.address.to_string()), "{error}");
+            let read_error = crate::client::remote_rpc(
+                &link,
+                "peer.thread.read",
+                json!({"threadId":7,"read":{}}),
+            )
+            .await
+            .unwrap_err();
+            assert!(read_error.contains("Update required on "), "{read_error}");
+            assert!(
+                !target.shared.snapshots.borrow()["state"]["index"]["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["peerOrigin"].is_object())
+            );
+        });
+    }
+
+    #[test]
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;
@@ -1169,6 +1221,9 @@ mod tests {
             let foreign=crate::client::remote_rpc(&link,"peer.thread.stop",json!({"threadId":1})).await.unwrap();
             assert_eq!(foreign["status"],"rejected");
             assert!(foreign["result"]["error"].as_str().unwrap().contains("did not create"));
+            let unrelated = crate::client::remote_rpc(&link,"peer.thread.read",json!({"threadId":1,"read":{}})).await.unwrap();
+            assert_eq!(unrelated["status"],"accepted");
+            assert!(crate::client::remote_rpc(&link,"peer.thread.wait",json!({"threadId":1})).await.unwrap_err().contains("did not create"));
             let mut changed=command; changed.params["brief"]=json!("Different");
             assert!(crate::client::remote_command(&link,changed).await.unwrap_err().contains("different payload"));
             let mut wrong=link.clone(); wrong.server_id=home.shared.discovery.server_id.clone();
@@ -1186,7 +1241,7 @@ mod tests {
             assert!(peer.credential(&home.shared.directory).is_ok());
             target.listen().await;
             target.shared.database.revoke(&link.device_id).unwrap();
-            assert!(crate::client::remote_rpc(&link,"peer.thread.status",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
+            assert!(crate::client::remote_rpc(&link,"peer.thread.wait",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
         });
     }
 

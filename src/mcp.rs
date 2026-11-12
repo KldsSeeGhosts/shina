@@ -95,15 +95,16 @@ Uncertain tasks become interrupted and require the user to resume or dismiss the
 results wait for the parent's next user turn or an explicit user resume, never a boot-time turn.
 - `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
 A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop. \
-`task_status`, `read_thread` and `list_threads` report each thread's effective model and \
-reasoning under `selection`.
+`task_status` and `list_threads` report each thread's effective model and \
+reasoning under `selection`; `read_thread` returns it under `thread.selection`.
 - `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
 corrections or follow-up work. It also answers a pending crew input, editor or select question. \
 For select, send one listed option exactly. Confirmations always require the user. Only the parent may control a child.
 - `mcp__shina__list_threads`, `mcp__shina__read_thread`, and `mcp__shina__list_captains` read \
-the user's conversations and crew. list_threads defaults to the calling captain's home and crew, \
-or this thread's project for lone threads. Pass \
-all_projects:true to include other projects and project-less chats. Read a thread before you answer a question about it.";
+the user's conversations and crew. list_threads defaults to the caller's project. Pass \
+allProjects:true to include other projects and project-less chats. Both list_threads and read_thread \
+accept machine from orchestrator_capabilities.peers. Ids belong to the named machine. \
+Read a thread before you answer a question about it.";
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 
@@ -285,20 +286,34 @@ pub fn tools() -> Value {
         },
         {
             "name": "list_threads",
-            "description": "List the calling captain's home and crew, or lone threads in the caller's project. Includes project, machine and effective model selection. Use all_projects for every conversation.",
+            "description": "List or search threads locally or on a linked machine. Local default is the caller's project. For a linked machine, pass projectId or allProjects:true. Supports bounded cursor paging and titleContains search. Ids belong to the named machine. orchestrator_capabilities.peers reports threadLists availability.",
             "inputSchema": {"type":"object","properties":{
-                "include_archived": {"type":"boolean","description":"Include archived threads. Default false."},
-                "all_projects": {"type":"boolean","description":"Include all projects and project-less threads. Default false."}
+                "machine": {"type":"string","description":"Owning linked machine id, host or label. Omit for local."},
+                "projectId": {"type":"integer"},
+                "allProjects": {"type":"boolean"},
+                "includeArchived": {"type":"boolean"},
+                "includeSubagents": {"type":"boolean"},
+                "settled": {"type":"boolean"},
+                "snoozed": {"type":"boolean"},
+                "titleContains": {"type":"string"},
+                "statuses": {"type":"array","items":{"type":"string"}},
+                "cursor": {"type":"integer","minimum":0},
+                "limit": {"type":"integer","minimum":1,"maximum":100}
             }},
             "annotations": {"readOnlyHint": true}
         },
         {
             "name": "read_thread",
-            "description": "Read the most recent messages of a Shina thread, with its effective model and reasoning selection.",
+            "description": "Read any thread locally or on a linked machine, in stable position order. Ids belong to the named machine. Responses have thread, items, nextPosition and hasMore, with a 50000-character total text budget. Each item includes itemId, position, totalChars, textTruncated and nextTextOffset. For cut-off text, pass its continuation object back, or itemId with textOffset=nextTextOffset and the same machine. Page later items with afterPosition=nextPosition. Reading never sends a prompt or re-injects a completion.",
             "inputSchema": {"type":"object","properties":{
-                "thread_id": id,
-                "max_messages": {"type":"integer","description":"How many recent messages to return. Default 20, at most 100."}
-            },"required":["thread_id"]},
+                "threadId": id,
+                "machine": {"type":"string","description":"Owning linked machine id, host or label. Omit for local. Ids belong to that machine. orchestrator_capabilities.peers reports threadReads availability."},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"description":"Item count. Default 20. Starts at the first item unless afterPosition or itemId is given."},
+                "afterPosition": {"type":"integer","minimum":0,"description":"Return items after this stable position."},
+                "itemId": {"type":"string","description":"Read only this returned item, optionally continuing its text."},
+                "textOffset": {"type":"integer","minimum":0,"description":"Unicode character offset within itemId. Use nextTextOffset or the continuation object."},
+                "maxCharsPerItem": {"type":"integer","minimum":1,"maximum":50000,"description":"Default 6000. Combined item text is also capped at 50000 characters per call."}
+            },"required":["threadId"]},
             "annotations": {"readOnlyHint": true}
         },
         {
@@ -616,7 +631,7 @@ fn serve(
             let session = random_hex(2);
             let result = json!({
                 "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or(PROTOCOL),
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "experimental": {"shina": {"threadRead": 2, "peerTasks": 2}}},
                 "serverInfo": {"name": "Shina", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             });
