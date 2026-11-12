@@ -573,6 +573,75 @@ impl Streams {
         self.threads.get(&thread).map(|p| p.sequence)
     }
 
+    /// Ported from KSG `ThreadFind.searchThread` over the complete stored conversation.
+    pub fn find_thread(&self, thread: u64, params: &Value) -> Result<Value, String> {
+        let projection = self.threads.get(&thread).ok_or("Unknown thread.")?;
+        let query = params["query"]
+            .as_str()
+            .ok_or("Search query is required.")?;
+        let start = params
+            .get("start")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value::<crate::thread_find::ThreadFindStart>(v.clone()))
+            .transpose()
+            .map_err(|e| format!("Invalid find start: {e}"))?;
+        let offset = params["offset"].as_i64().unwrap_or(0);
+        let index = params["index"].as_u64().map(|n| n as usize);
+
+        let mut msg_rows: Vec<&Row> = projection
+            .rows
+            .iter()
+            .filter(|row| row.field == "messages")
+            .collect();
+        msg_rows.sort_by_key(|row| (row.ordinal, row.position));
+
+        let docs_owned: Vec<(String, &str, String)> = msg_rows
+            .into_iter()
+            .map(|row| {
+                let entry_id = row.item["id"]
+                    .as_str()
+                    .unwrap_or(&row.source_item_id)
+                    .to_owned();
+                let role = row.item["role"].as_str().unwrap_or("Pi");
+                let raw = row.item["text"].as_str().unwrap_or("");
+                let text = if role == "Shina" {
+                    raw.strip_prefix("[Shina] ")
+                        .map(|body| {
+                            body.split_once('\n')
+                                .filter(|(header, _)| header.starts_with("[delivery "))
+                                .map(|(_, rest)| rest)
+                                .unwrap_or(body)
+                        })
+                        .unwrap_or(raw)
+                        .to_owned()
+                } else {
+                    raw.to_owned()
+                };
+                (entry_id, role, text)
+            })
+            .collect();
+        let docs: Vec<crate::thread_find::SearchDocument<'_>> = docs_owned
+            .iter()
+            .map(
+                |(entry_id, role, text)| crate::thread_find::SearchDocument {
+                    entry_id,
+                    role,
+                    text,
+                },
+            )
+            .collect();
+
+        let result = crate::thread_find::search_documents(
+            &docs,
+            query,
+            start.as_ref(),
+            offset,
+            index,
+            projection.sequence,
+        );
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
     /// Ported from KSG ProjectionStore.getThreadHistoryPage and threadHistoryPaging.
     /// Page backwards by source identity. A content revision never invalidates the anchor.
     pub fn page(&self, thread: u64, cursor: Option<&str>, budget: usize) -> Result<Value, String> {

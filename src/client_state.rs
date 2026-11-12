@@ -1147,6 +1147,19 @@ impl State {
                             Some("Update drain cancelled. Normal operation resumed.".into());
                     }
                 }
+                crate::client::Event::Rpc { tag, result } => {
+                    if let Some(req_id) = tag
+                        .strip_prefix("find:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        && server == self.thread_find.server
+                    {
+                        let parsed = result.and_then(|val| {
+                            serde_json::from_value::<crate::thread_find::ThreadFindResult>(val)
+                                .map_err(|e| e.to_string())
+                        });
+                        self.apply_thread_find_result(req_id, parsed);
+                    }
+                }
                 crate::client::Event::Error(error) => {
                     if server == "local" {
                         self.storage_error = Some(error);
@@ -1726,6 +1739,7 @@ impl State {
         self.tab_epoch += 1;
         self.requested_tab = None;
         self.requested_tab_restore = None;
+        self.close_thread_find();
         self.machines.selected = server.into();
         let cached = self.machines.threads.remove(server);
         let cached_editors = cached.is_some();

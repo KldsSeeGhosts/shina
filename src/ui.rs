@@ -7092,7 +7092,13 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
-fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
+fn transcript_part(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    part: &TranscriptPart,
+    occ_base: &mut usize,
+) -> El {
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
@@ -7102,14 +7108,34 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
+            let message_id = &t.messages[*message].id;
             let offset = *from;
             let thread_id = t.id;
             let streaming = t.status == Status::Running && message + 1 == t.messages.len();
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let mut active_occ = None;
+            let find_param = find_query.map(|query| {
+                let hits = crate::thread_find::find_markdown_occurrences(chunk, query).len();
+                active_occ = s
+                    .thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == *message_id)
+                    .and_then(|m| {
+                        (m.occurrence >= *occ_base && m.occurrence < *occ_base + hits)
+                            .then_some(m.occurrence - *occ_base)
+                    });
+                *occ_base += hits;
+                (query, active_occ)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
             memo(
                 format!("message-{}-{message}-body-{from}", t.id),
-                (chunk, s.dark, streaming, wide),
+                (chunk, s.dark, streaming, wide, memo_find),
                 || {
-                    markdown_ui::render(
+                    markdown_ui::render_with_find(
                         chunk,
                         p,
                         s.dark,
@@ -7117,6 +7143,7 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
                         false,
                         streaming,
                         &format!("{thread_id}-{message_index}-{offset}"),
+                        find_param,
                     )
                 },
             )
@@ -7194,19 +7221,43 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 )),
         );
     }
+    let mut occ_base = 0usize;
+    let mut part_occs = vec![0usize; parts.len()];
+    if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+        let query = s.thread_find.query.text.trim();
+        let mut last_msg = None;
+        for (i, part) in parts.iter().enumerate() {
+            if let TranscriptPart::Text { message, from, to } = part {
+                if last_msg != Some(*message) {
+                    occ_base = 0;
+                    last_msg = Some(*message);
+                }
+                part_occs[i] = occ_base;
+                occ_base += crate::thread_find::find_markdown_occurrences(
+                    &t.messages[*message].text[*from..*to],
+                    query,
+                )
+                .len();
+            }
+        }
+    }
+    let render_part = |part_index: usize| {
+        let mut base = part_occs[part_index];
+        transcript_part(s, p, wide, &parts[part_index], &mut base)
+    };
     if let Some(index) = preamble {
-        response = response.child(transcript_part(s, p, wide, &parts[index]));
+        response = response.child(render_part(index));
     } else if live && last_work.is_none() {
         // Until Pi emits work, streamed text is the preamble.
-        for part in &parts {
-            response = response.child(transcript_part(s, p, wide, part));
+        for index in 0..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     let work_rows = |mut rows: El, lift_cards: bool| {
         if let Some(last) = last_work {
             for (index, part) in parts[..=last].iter().enumerate() {
                 if Some(index) != preamble && !(lift_cards && card(part)) {
-                    let row = transcript_part(s, p, wide, part);
+                    let row = render_part(index);
                     // Prose between tool rows keeps its paragraph rhythm and the lane's one
                     // left margin. Tool rows are indented as a group by the same amount while
                     // the turn runs and after it ends, so nothing jumps when it finishes.
@@ -7322,14 +7373,17 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         }
         response = response.child(section);
         if let Some(last) = last_work {
-            for part in parts[..=last].iter().filter(|part| card(part)) {
-                response = response.child(transcript_part(s, p, wide, part));
+            for (index, part) in parts[..=last].iter().enumerate() {
+                if card(part) {
+                    response = response.child(render_part(index));
+                }
             }
         }
     }
     if !live || last_work.is_some() {
-        for part in &parts[last_work.map_or(0, |index| index + 1)..] {
-            response = response.child(transcript_part(s, p, wide, part));
+        let from = last_work.map_or(0, |index| index + 1);
+        for index in from..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     response
@@ -7515,12 +7569,23 @@ fn build_user_or_system_row(
             user = user.child(message_images(s, p, &message.images, &key));
         }
         if !message.text.trim().is_empty() {
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let active_occ = find_query.and_then(|_| {
+                s.thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == message_id)
+                    .map(|m| m.occurrence)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
             user = user.child(
                 memo(
                     format!("msg-md-{}-{message_id}", t.id),
-                    (&message.text, s.dark, wide),
+                    (&message.text, s.dark, wide, memo_find),
                     || {
-                        markdown_ui::render(
+                        markdown_ui::render_with_find(
                             &message.text,
                             p,
                             s.dark,
@@ -7528,6 +7593,7 @@ fn build_user_or_system_row(
                             true,
                             false,
                             &format!("user-{}-{index}", t.id),
+                            find_query.map(|q| (q, active_occ)),
                         )
                     },
                 )
@@ -7555,6 +7621,35 @@ fn build_user_or_system_row(
     {
         crew_ui::brief_block(s, p, wide, brief)
     } else {
+        let display = message.display_text();
+        let mut lbl = label(display, body_style(wide), p.ink)
+            .wrap_anywhere()
+            .selectable(true);
+        if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+            let query = s.thread_find.query.text.trim();
+            let active_occ = s
+                .thread_find
+                .active_match
+                .as_ref()
+                .filter(|m| m.entry_id == message_id)
+                .map(|m| m.occurrence);
+            let ranges = crate::thread_find::find_plain_occurrences(display, query);
+            if !ranges.is_empty() {
+                lbl = lbl.text_highlights(ranges.into_iter().enumerate().map(|(i, range)| {
+                    let is_active = Some(i) == active_occ;
+                    let bg = if is_active {
+                        p.coral.alpha(0.42)
+                    } else {
+                        p.brass.alpha(0.32)
+                    };
+                    let mut hl = rune::TextHighlight::new(range, bg);
+                    if is_active {
+                        hl = hl.key("thread-find-active");
+                    }
+                    hl
+                }));
+            }
+        }
         col()
             .gap(4.0)
             .px(12.0)
@@ -7562,13 +7657,152 @@ fn build_user_or_system_row(
             .radius(6.0)
             .fill(p.coral_bg)
             .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
-            .child(
-                label(message.display_text(), body_style(wide), p.ink)
-                    .wrap_anywhere()
-                    .selectable(true),
-            )
+            .child(lbl)
     };
     col().w_full().child(body.key(key))
+}
+
+/// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
+fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
+    let find = &s.thread_find;
+    let trimmed = find.query.text.trim();
+    let has_query = !trimmed.is_empty();
+    let no_results = has_query
+        && !find.loading
+        && find.error.is_none()
+        && !find.unsupported
+        && find.total_matches == 0;
+    let status_text = if find.unsupported {
+        "Update required".to_owned()
+    } else if find.loading && find.total_matches == 0 {
+        "Searching…".to_owned()
+    } else if find.error.is_some() {
+        "Search failed".to_owned()
+    } else if has_query {
+        if find.total_matches == 0 {
+            "0/0".to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                find.active_index.min(find.total_matches - 1) + 1,
+                find.total_matches
+            )
+        }
+    } else {
+        String::new()
+    };
+    let nav_disabled = find.total_matches == 0 || find.loading || find.unsupported;
+    let bar_width = (pane_width - 24.0).clamp(200.0, 340.0);
+    let mut bar = row()
+        .key("thread-find-bar")
+        .role("search")
+        .label("Find in thread")
+        .w(bar_width)
+        .h(36.0)
+        .px(10.0)
+        .gap(4.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.card)
+        .on_layout_tx(|s: &mut State, _rect, tx| {
+            let changed = s.sync_thread_find_input();
+            let revealed = s.consume_pending_find_reveal(tx);
+            if !changed && !revealed {
+                tx.live_only();
+            }
+        })
+        .child(
+            text_input(&find.query, LABEL)
+                .key("thread-find-input")
+                .label("Find in thread")
+                .placeholder("Find in thread", p.muted)
+                .color(p.ink)
+                .single_line()
+                .grow(1.0)
+                .min_w(0.0)
+                .on_edit(|s: &mut State| &mut s.thread_find.query)
+                .on_input_key(|s: &mut State, event, tx| {
+                    if event.key == rune::Key::Enter {
+                        if event.mods.shift {
+                            s.step_thread_find(-1);
+                        } else {
+                            s.step_thread_find(1);
+                        }
+                        s.consume_pending_find_reveal(tx);
+                        true
+                    } else if event.key == rune::Key::Escape {
+                        s.close_thread_find();
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                        true
+                    } else {
+                        false
+                    }
+                }),
+        );
+    if !status_text.is_empty() {
+        bar = bar.child(
+            label(
+                status_text,
+                SMALL.features(TABULAR),
+                if no_results || find.error.is_some() || find.unsupported {
+                    p.danger
+                } else {
+                    p.muted
+                },
+            )
+            .key("thread-find-count")
+            .min_w(36.0)
+            .align(rune::Align::Center),
+        );
+    }
+    if find.error.is_some() && !find.unsupported {
+        bar = bar.child(
+            label("Retry", SMALL, p.ink)
+                .key("thread-find-retry")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .px(4.0)
+                .py(2.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .on_press(|s: &mut State| s.retry_thread_find()),
+        );
+    }
+    bar = bar
+        .child(
+            icon_button(
+                "thread-find-prev",
+                "Previous match",
+                "chevron-up",
+                p,
+                |_| {},
+            )
+            .disabled(nav_disabled)
+            .on_press_tx(|s: &mut State, tx| {
+                s.step_thread_find(-1);
+                s.consume_pending_find_reveal(tx);
+            }),
+        )
+        .child(
+            icon_button("thread-find-next", "Next match", "chevron", p, |_| {})
+                .disabled(nav_disabled)
+                .on_press_tx(|s: &mut State, tx| {
+                    s.step_thread_find(1);
+                    s.consume_pending_find_reveal(tx);
+                }),
+        )
+        .child(icon_button(
+            "thread-find-close",
+            "Close find",
+            "close",
+            p,
+            |s: &mut State| {
+                s.close_thread_find();
+                s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+            },
+        ));
+    framed(bar, p).pin(None, Some(12.0), Some(12.0), None)
 }
 
 /// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
@@ -7660,7 +7894,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             },
         );
 
-    let stick_bottom = !t.messages.is_empty() || !t.tools.is_empty();
+    let find_open = s.thread_find_active();
+    let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
     let scroller = col()
         .key(format!("conversation-{thread_id}"))
         .animated_changes()
@@ -7696,7 +7931,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .min_h(0.0)
         .child(scroller);
 
-    if s.timeline_is_far_from_bottom(thread_id) {
+    if s.timeline_is_far_from_bottom(thread_id) && !find_open {
         let pill = framed(
             row()
                 .key("scroll-to-end")
@@ -7726,6 +7961,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 .justify_center()
                 .child(pill),
         );
+    }
+    if find_open {
+        wrapper = wrapper.child(thread_find_bar(s, p, pane_width));
     }
 
     wrapper
@@ -13233,6 +13471,162 @@ pub(crate) mod tests {
                 rt.find("scroll-to-end").is_none(),
                 "{width}: pill hides at bottom"
             );
+        }
+    }
+
+    #[test]
+    fn find_bar_opens_via_chat_find_displays_counts_steps_matches_highlights_and_jumps_to_match() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.poll = Some(|s, _, tx| s.poll_thread_find(tx));
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    let prompt = if turn == 2 {
+                        "Early message with target-canary-word here".to_owned()
+                    } else if turn == 38 {
+                        "Late message with target-canary-word too".to_owned()
+                    } else {
+                        format!("Ordinary message {turn}")
+                    };
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: prompt,
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                    });
+                }
+            }
+            rt.frame(0.0);
+
+            // Wire chat.find shortcut (Ctrl+F / Cmd+F).
+            let mod_key = if cfg!(target_os = "macos") {
+                rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            } else {
+                rune::Mods {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            };
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("f".into()),
+                mods: mod_key,
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-find-bar").is_some(),
+                "{width}: bar opens"
+            );
+            assert!(
+                rt.presented("thread-find-input").is_some(),
+                "{width}: input shown"
+            );
+            assert!(
+                rt.presented("thread-find-prev").is_some(),
+                "{width}: prev shown"
+            );
+            assert!(
+                rt.presented("thread-find-next").is_some(),
+                "{width}: next shown"
+            );
+            assert!(
+                rt.presented("thread-find-close").is_some(),
+                "{width}: close shown"
+            );
+
+            // Bar stays inside the pane without clipping or overflowing.
+            let (bar, _) = rt.presented("thread-find-bar").unwrap();
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            assert!(
+                bar[0] >= pane[0] && bar[0] + bar[2] <= pane[0] + pane[2] + 0.5,
+                "{width}: bar {bar:?} outside pane {pane:?}"
+            );
+
+            // Typing a missing query reports 0/0.
+            rt.paste("missing-query-xyz");
+            rt.frame(0.2);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("0/0"),
+                "{width}"
+            );
+
+            // Replace with matching query -> shows 1/2, highlights match, and jumps to u-2!
+            rt.state.set_thread_find_query("target-canary-word".into());
+            rt.invalidate();
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-2").is_some(),
+                "{width}: jumped to match u-2"
+            );
+            assert!(
+                rt.elements().iter().any(|e| e.role == "mark"),
+                "{width}: highlight mark rendered"
+            );
+
+            // Next -> jumps to 2/2 (u-38); Next again wraps to 1/2 (u-2).
+            press(&mut rt, "thread-find-next");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("2/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-38").is_some(),
+                "{width}: jumped to match u-38"
+            );
+
+            press(&mut rt, "thread-find-prev");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+
+            // Close via close button restores composer focus.
+            press(&mut rt, "thread-find-close");
+            rt.frame(0.0);
+            assert!(rt.find("thread-find-bar").is_none(), "{width}: bar closed");
+            assert!(
+                rt.state.current().draft.focused,
+                "{width}: composer refocused"
+            );
+
+            // Explicit unsupported state for a peer without thread-find.
+            rt.state.open_thread_find();
+            rt.state.thread_find.unsupported = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("Update required"),
+                "{width}: unsupported peer state"
+            );
+            rt.state.close_thread_find();
         }
     }
 

@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 9;
+pub const MINOR: u32 = 10;
+pub const THREAD_FIND: &str = "thread-find";
+pub const THREAD_FIND_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to search within a thread.";
 pub const RUN_CONTROL: &str = "run-control";
 pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to stop or resume a specific run.";
@@ -51,6 +54,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.subscribe"
         | "subscription.cancel"
         | "thread.history"
+        | "thread.find"
         | "command.get"
         | "server.status"
         | "blobs.read"
@@ -480,6 +484,7 @@ mod tests {
                 | "thread.subscribe"
                 | "subscription.cancel"
                 | "thread.history"
+                | "thread.find"
                 | "command.get"
                 | "server.status"
                 | "blobs.read"

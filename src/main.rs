@@ -51,6 +51,7 @@ mod service;
 mod session;
 mod shell_env;
 mod store;
+mod thread_find;
 mod tray;
 mod ui;
 mod update;
@@ -155,6 +156,11 @@ fn key_inner(
         && let Some(notice) = &mut state.undo
     {
         notice.owns_text_key = false;
+    }
+    if state.thread_find.open && event.key == rune::Key::Escape {
+        state.close_thread_find();
+        state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
+        return true;
     }
     let Some(command) = command else {
         // No shortcut matched: KSG redirects plain typing to the composer.
@@ -269,6 +275,15 @@ fn dispatch_global_command(
         }
         "composer.focus" => {
             state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
+        }
+        "chat.find" => {
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            state.open_thread_find();
+            if let Some(tx) = tx {
+                tx.focus("thread-find-input", false);
+            }
         }
         "commandPalette.toggle" => {
             state.search.focused = true;

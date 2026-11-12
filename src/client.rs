@@ -71,6 +71,10 @@ impl Commands {
 
 pub enum Event {
     Receipt(Command, Value),
+    Rpc {
+        tag: String,
+        result: Result<Value, String>,
+    },
     Error(String),
     Maintenance(String, Value),
 }
@@ -90,6 +94,7 @@ pub struct Client {
     worker: Arc<Worker>,
     history_thread: Arc<AtomicUsize>,
     history_requests: Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
+    rpc_requests: Arc<Mutex<VecDeque<(String, String, Value)>>>,
 }
 
 impl Client {
@@ -135,6 +140,7 @@ impl Client {
             worker: Arc::default(),
             history_thread: Arc::default(),
             history_requests: Arc::default(),
+            rpc_requests: Arc::default(),
         }
     }
     pub fn set_device_directory(&mut self, directory: PathBuf) {
@@ -164,6 +170,7 @@ impl Client {
         let ready = self.commands.ready.clone();
         let history_thread = self.history_thread.clone();
         let history_requests = self.history_requests.clone();
+        let rpc_requests = self.rpc_requests.clone();
         let remote = self.remote.clone();
         let info = self.info.clone();
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
@@ -177,6 +184,7 @@ impl Client {
                     device_directory,
                     history_thread,
                     history_requests,
+                    rpc_requests,
                     remote,
                 ),
                 info,
@@ -247,6 +255,18 @@ impl Client {
             .lock()
             .expect("history requests")
             .push_back((thread, through_entry_id));
+    }
+    pub fn call_rpc(&self, tag: impl Into<String>, method: impl Into<String>, params: Value) {
+        self.rpc_requests.lock().expect("rpc requests").push_back((
+            tag.into(),
+            method.into(),
+            params,
+        ));
+    }
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.info.lock().expect("connection info")["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
     }
     pub fn event(&self) -> Option<Event> {
         self.events.try_recv().ok()
@@ -459,6 +479,7 @@ async fn supervise(
         PathBuf,
         Arc<AtomicUsize>,
         Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
+        Arc<Mutex<VecDeque<(String, String, Value)>>>,
         Option<crate::peer::Link>,
     ),
     info: Arc<Mutex<Value>>,
@@ -469,7 +490,8 @@ async fn supervise(
     ready: Arc<AtomicBool>,
     wake: rune::Waker,
 ) {
-    let (directory, device_directory, history_thread, history_requests, remote) = profile;
+    let (directory, device_directory, history_thread, history_requests, rpc_requests, remote) =
+        profile;
     let info_file = device_directory.join("connection-info.json");
     if let Ok(bytes) = std::fs::read(&info_file)
         && let Ok(value) = serde_json::from_slice(&bytes)
@@ -504,6 +526,8 @@ async fn supervise(
     let mut updating = false;
     let mut server_stopped = false;
     let mut cache = ProjectionCache::default();
+    let mut pending_rpcs = std::collections::HashMap::<String, String>::new();
+    let mut rpc_seq = 0u64;
     let image_generation = Arc::new(AtomicUsize::new(0));
     let (asset_changed, asset_updates) = tokio::sync::watch::channel(None);
     let image_job = remote.as_ref().map(|remote| {
@@ -736,7 +760,16 @@ async fn supervise(
                                 updating |= phase == "restarting";
                                 ready.store(cache.seq.is_some() && phase == "ready",Ordering::Release);
                             }
-                            if let Some(id) = value["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
+                            if let Some(id) = value["id"].as_str()
+                                && let Some(tag) = pending_rpcs.remove(id)
+                            {
+                                let result = if let Some(msg) = value["error"]["message"].as_str() {
+                                    Err(msg.to_owned())
+                                } else {
+                                    Ok(value["result"].clone())
+                                };
+                                let _ = output.try_send(Event::Rpc { tag, result });
+                            } else if let Some(id) = value["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
                                 && let Some(command) = pending.iter().find(|command| command.command_id == id) {
                                     let transient = value["error"]["message"].as_str().is_some_and(|text| text.contains("queue is full") || text.contains("Runtime unavailable"));
                                     if transient { disconnect = true; }
@@ -758,7 +791,7 @@ async fn supervise(
                     _ => { socket = None; report("Server disconnected. Reconnecting with the same command IDs.".into()); }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
                 while let Some((thread, through)) = history_requests
                     .lock()
                     .expect("history requests")
@@ -766,14 +799,32 @@ async fn supervise(
                 {
                     cache.request_earlier(thread as u64, through);
                 }
+                let mut disconnect = false;
+                while let Some((tag, method, params)) =
+                    rpc_requests.lock().expect("rpc requests").pop_front()
+                {
+                    rpc_seq += 1;
+                    let rpc_id = format!("rpc-{rpc_seq}");
+                    pending_rpcs.insert(rpc_id.clone(), tag);
+                    let req = json!({"jsonrpc":"2.0","id":rpc_id,"method":method,"params":params});
+                    if !send(connected, Message::Text(req.to_string().into())).await {
+                        disconnect = true;
+                        break;
+                    }
+                }
                 if let Some(projected) = cache.projected() {
                     *snapshot.lock().expect("client snapshot") = Some(projected);
                     wake();
                 }
-                if let Some(request) = cache.next_history()
-                    && !send(connected, Message::Text(request.to_string().into())).await {
-                        socket = None;
-                    }
+                if !disconnect
+                    && let Some(request) = cache.next_history()
+                    && !send(connected, Message::Text(request.to_string().into())).await
+                {
+                    disconnect = true;
+                }
+                if disconnect {
+                    socket = None;
+                }
             }
         }
     }

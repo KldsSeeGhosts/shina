@@ -8,6 +8,9 @@ mod history;
 #[allow(dead_code)]
 #[path = "../src/protocol.rs"]
 mod protocol;
+#[allow(dead_code)]
+#[path = "../src/thread_find.rs"]
+mod thread_find;
 
 use serde_json::{Value, json};
 use std::{
@@ -3300,4 +3303,183 @@ fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect(
             .is_err()
     );
     profile.stop();
+}
+
+#[test]
+fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked_machine_and_handles_old_peer()
+ {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut host_a = Profile::new();
+    let mut host_b = Profile::new();
+
+    // Seed 900 turns (2700 items) on host_b with an early unique needle at turn 3.
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    for turn in 0..900usize {
+        let prompt = if turn == 3 {
+            "Turn prompt 3 contains secret-albatross-needle inside".to_owned()
+        } else if turn == 895 {
+            "Turn prompt 895 also has secret-albatross-needle".to_owned()
+        } else {
+            format!("Turn prompt {turn}")
+        };
+        messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":prompt,"images":[]}));
+        let a_idx = messages.len();
+        messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Turn reply {turn}"),"images":[]}));
+        tools.push(json!({
+            "id":format!("tool-{turn}"),"name":"read","detail":"file.rs","done":true,"failed":false,
+            "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
+            "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
+        }));
+    }
+    let mut index = base["index"].clone();
+    index["threads"][0]["title"] = json!("Long searchable thread");
+    index["threads"][0]["renamed"] = json!(true);
+    index["threads"][0]["session"] = Value::Null;
+    let mut view = base["threads"][0].clone();
+    view["status"] = json!("Completed");
+    view["messages"] = json!(messages);
+    view["tools"] = json!(tools);
+    index["threadViews"] = json!([view]);
+    fs::write(host_b.root.join("Shina/index.json"), index.to_string()).unwrap();
+
+    host_a.launch(&["serve"]);
+    host_b.launch(&["serve"]);
+    let discovery_b = host_b.discovery();
+    let paired = host_b.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", discovery_b["port"].as_u64().unwrap());
+    assert!(host_a.cli(&["link", &host, &code]).status.success());
+
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            host_a
+                .root
+                .join("Shina/linked")
+                .join(discovery_b["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut linked_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let hello = linked_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("linked-hello"),
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-find")
+    );
+
+    // Search the complete stored conversation on linked machine host_b.
+    let found = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"secret-albatross-needle"}),
+        json!("find-1"),
+    );
+    assert!(found["error"].is_null(), "{found}");
+    assert_eq!(found["result"]["totalMatches"], 2);
+    assert_eq!(found["result"]["activeIndex"], 0);
+    assert_eq!(found["result"]["match"]["entryId"], "u-3");
+
+    // Step Next -> advances to u-895.
+    let next = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"secret-albatross-needle","start":{"entryId":"u-3","occurrence":0},"offset":1}),
+        json!("find-2"),
+    );
+    assert_eq!(next["result"]["activeIndex"], 1);
+    assert_eq!(next["result"]["match"]["entryId"], "u-895");
+
+    // Load initial scoped window via ProjectionCache, then jump to earlier match u-3!
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    linked_client.rpc("workspace.subscribe", json!({}), json!("sub"));
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({"state":protocol::compact(&linked_client.snapshot),"seq":linked_client.seq,"epoch":linked_client.epoch}),
+        ))
+        .unwrap();
+    linked_client.history_cache = Some(cache);
+    loop {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            linked_client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else if cache.histories.contains_key(&1) {
+            break;
+        }
+    }
+    // u-3 is NOT in initial window; requesting earlier throughEntryId="u-3" loads it!
+    {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        assert!(
+            !cache.histories[&1].1["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "u-3")
+        );
+        cache.request_earlier(1, Some("u-3".into()));
+    }
+    loop {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            linked_client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else {
+            break;
+        }
+    }
+    assert!(
+        linked_client.history_cache.as_ref().unwrap().histories[&1].1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "u-3")
+    );
+
+    // Peer without thread-find (protocolMinor 9) does not advertise "thread-find".
+    let mut old_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let old_hello = old_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":9,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert!(
+        !old_hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-find")
+    );
+
+    host_a.stop();
+    host_b.stop();
 }

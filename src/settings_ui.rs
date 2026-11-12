@@ -429,6 +429,7 @@ impl State {
         let editable_focus = composer_focus
             || self.search.focused
             || self.model_search.focused
+            || self.thread_find.query.focused
             || self.picker_query.focused
             || self.captain_picker_query.focused
             || self.rename_edit.focused

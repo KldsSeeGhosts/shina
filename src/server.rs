@@ -598,6 +598,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 8 { capabilities.push(protocol::REMOTE_PROJECT_SCOPE); }
                         if minor >= 8 { capabilities.push(protocol::COMPOSER_TRANSACTIONS); }
                         if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
+                        if minor >= 10 { capabilities.push(protocol::THREAD_FIND); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -702,6 +703,17 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             })
                         })
                     }
+                } else if method == "thread.find" {
+                    params["threadId"]
+                        .as_u64()
+                        .ok_or_else(|| "Invalid thread id.".to_owned())
+                        .and_then(|thread_id| {
+                            shared
+                                .history_streams
+                                .lock()
+                                .expect("history streams")
+                                .find_thread(thread_id, params)
+                        })
                 } else {
                     if shared.remote && matches!(method, "devices.grant" | "devices.revokeGrant") {
                         if !send(&mut socket, protocol::response(id, Err("Change update grants on the target machine itself.".into()))).await { break; }

@@ -278,6 +278,25 @@ pub struct AssistantWork {
     pub elapsed: Option<u64>,
 }
 
+#[derive(Default)]
+pub struct ThreadFindState {
+    pub open: bool,
+    pub server: String,
+    pub thread_id: usize,
+    pub query: TextEdit,
+    pub last_typed: String,
+    pub debounce_until: Option<Instant>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub unsupported: bool,
+    pub total_matches: usize,
+    pub active_index: usize,
+    pub active_match: Option<crate::thread_find::ThreadFindMatch>,
+    pub navigation: Vec<crate::thread_find::ThreadFindNavEntry>,
+    pub pending_reveal: Option<crate::thread_find::ThreadFindMatch>,
+    pub request_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPicker {
     Model,
@@ -2635,6 +2654,7 @@ pub struct State {
     /// (highest). The level is chosen on release.
     pub thinking_drag: Option<f32>,
     pub model_search: TextEdit,
+    pub thread_find: ThreadFindState,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub updater: crate::update::Updater,
@@ -2828,6 +2848,7 @@ impl State {
             settings_picker: None,
             thinking_drag: None,
             model_search: TextEdit::default(),
+            thread_find: ThreadFindState::default(),
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
             updater: Default::default(),
@@ -2921,6 +2942,12 @@ impl State {
         }
         self.selected_threads.clear();
         let id = self.current().id;
+        if self.thread_find.open
+            && (self.thread_find.server != self.machines.selected
+                || self.thread_find.thread_id != id)
+        {
+            self.close_thread_find();
+        }
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
         }
@@ -2979,6 +3006,285 @@ impl State {
     pub fn set_timeline_at_bottom(&mut self, thread_id: usize, at: bool) {
         self.timeline_at_bottom
             .insert((self.machines.selected.clone(), thread_id), at);
+    }
+    pub fn thread_find_active(&self) -> bool {
+        self.thread_find.open
+            && self.thread_find.server == self.machines.selected
+            && self.thread_find.thread_id == self.current().id
+    }
+    pub fn open_thread_find(&mut self) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        let same = self.thread_find.open
+            && self.thread_find.server == server
+            && self.thread_find.thread_id == thread_id;
+        if !same {
+            self.thread_find = ThreadFindState {
+                open: true,
+                server,
+                thread_id,
+                ..ThreadFindState::default()
+            };
+        }
+        self.thread_find.query.focused = true;
+        self.thread_find.query.anchor = 0;
+        self.thread_find.query.focus = self.thread_find.query.text.len();
+        if !self.thread_find.query.text.trim().is_empty() {
+            self.run_thread_find(None, 0);
+        }
+    }
+    #[allow(dead_code)]
+    pub fn open_thread_find_on_query(
+        &mut self,
+        query: String,
+        start: Option<crate::thread_find::ThreadFindStart>,
+    ) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        self.thread_find = ThreadFindState {
+            open: true,
+            server,
+            thread_id,
+            ..ThreadFindState::default()
+        };
+        let query: String = query
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        self.thread_find.query.replace_text(&query);
+        self.thread_find.query.focused = true;
+        self.thread_find.query.anchor = 0;
+        self.thread_find.query.focus = self.thread_find.query.text.len();
+        self.thread_find.last_typed = self.thread_find.query.text.clone();
+        if !query.trim().is_empty() {
+            self.run_thread_find(start.as_ref(), 0);
+        }
+    }
+    pub fn close_thread_find(&mut self) {
+        self.thread_find = ThreadFindState::default();
+    }
+    #[cfg(test)]
+    pub fn set_thread_find_query(&mut self, query: String) {
+        let query: String = query
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        self.thread_find.query.replace_text(&query);
+        self.thread_find.last_typed = query;
+        self.thread_find.debounce_until = None;
+        self.run_thread_find(None, 0);
+    }
+    pub fn retry_thread_find(&mut self) {
+        if !self.thread_find.open {
+            return;
+        }
+        self.run_thread_find(None, 0);
+    }
+    pub fn step_thread_find(&mut self, delta: i64) {
+        if !self.thread_find.open
+            || self.thread_find.total_matches == 0
+            || self.thread_find.loading
+            || self.thread_find.unsupported
+        {
+            return;
+        }
+        let total = self.thread_find.total_matches;
+        let next_index =
+            ((self.thread_find.active_index as i64 + delta).rem_euclid(total as i64)) as usize;
+        if let Some(entry) = self.thread_find.navigation.iter().find(|entry| {
+            next_index >= entry.start_index && next_index < entry.start_index + entry.count
+        }) {
+            let matched = crate::thread_find::ThreadFindMatch {
+                entry_id: entry.entry_id.clone(),
+                occurrence: next_index - entry.start_index,
+            };
+            self.thread_find.active_index = next_index;
+            self.thread_find.active_match = Some(matched.clone());
+            self.thread_find.pending_reveal = Some(matched);
+            return;
+        }
+        let start =
+            self.thread_find
+                .active_match
+                .as_ref()
+                .map(|m| crate::thread_find::ThreadFindStart {
+                    entry_id: m.entry_id.clone(),
+                    occurrence: m.occurrence,
+                });
+        self.run_thread_find(start.as_ref(), delta);
+    }
+    pub fn sync_thread_find_input(&mut self) -> bool {
+        if !self.thread_find.open {
+            return false;
+        }
+        let clipped: String = self
+            .thread_find
+            .query
+            .text
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        if clipped != self.thread_find.query.text {
+            self.thread_find.query.replace_text(&clipped);
+        }
+        if self.thread_find.query.text == self.thread_find.last_typed {
+            return false;
+        }
+        self.thread_find.last_typed = self.thread_find.query.text.clone();
+        if self.client.is_some() {
+            self.thread_find.debounce_until = Some(Instant::now() + Duration::from_millis(100));
+        } else {
+            self.thread_find.debounce_until = None;
+            self.run_thread_find(None, 0);
+        }
+        true
+    }
+    pub fn poll_thread_find(&mut self, tx: &mut Tx) -> bool {
+        let mut changed = self.sync_thread_find_input();
+        if let Some(until) = self.thread_find.debounce_until {
+            let now = Instant::now();
+            if now >= until {
+                self.thread_find.debounce_until = None;
+                self.run_thread_find(None, 0);
+                changed = true;
+            } else {
+                tx.wake_after(until.saturating_duration_since(now));
+            }
+        }
+        changed |= self.consume_pending_find_reveal(tx);
+        changed
+    }
+    fn run_thread_find(
+        &mut self,
+        start: Option<&crate::thread_find::ThreadFindStart>,
+        offset: i64,
+    ) {
+        if !self.thread_find.open {
+            return;
+        }
+        let query = self.thread_find.query.text.trim().to_owned();
+        if query.is_empty() {
+            self.thread_find.loading = false;
+            self.thread_find.error = None;
+            self.thread_find.unsupported = false;
+            self.thread_find.total_matches = 0;
+            self.thread_find.active_index = 0;
+            self.thread_find.active_match = None;
+            self.thread_find.navigation.clear();
+            self.thread_find.pending_reveal = None;
+            return;
+        }
+        self.thread_find.request_id += 1;
+        let req_id = self.thread_find.request_id;
+        let thread_id = self.thread_find.thread_id;
+        if let Some(client) = &self.client {
+            let target = if self.thread_find.server == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&self.thread_find.server)
+            };
+            let Some(target) = target else {
+                self.thread_find.loading = false;
+                self.thread_find.error = Some("Machine unavailable.".into());
+                return;
+            };
+            if !target.has_capability(crate::protocol::THREAD_FIND) {
+                self.thread_find.loading = false;
+                self.thread_find.unsupported = true;
+                self.thread_find.error = Some(crate::protocol::THREAD_FIND_UPDATE_REQUIRED.into());
+                return;
+            }
+            self.thread_find.unsupported = false;
+            self.thread_find.error = None;
+            self.thread_find.loading = true;
+            let mut params = json!({"threadId": thread_id, "query": query});
+            if let Some(start) = start {
+                params["start"] = json!(start);
+            }
+            if offset != 0 {
+                params["offset"] = json!(offset);
+            }
+            target.call_rpc(format!("find:{req_id}"), "thread.find", params);
+            return;
+        }
+        let t = self.current();
+        let docs_owned: Vec<(&str, &str, &str)> = t
+            .messages
+            .iter()
+            .map(|m| (m.id.as_str(), m.role, m.display_text()))
+            .collect();
+        let docs: Vec<crate::thread_find::SearchDocument<'_>> = docs_owned
+            .iter()
+            .map(
+                |(entry_id, role, text)| crate::thread_find::SearchDocument {
+                    entry_id,
+                    role,
+                    text,
+                },
+            )
+            .collect();
+        let result = crate::thread_find::search_documents(&docs, &query, start, offset, None, 0);
+        self.apply_thread_find_result(req_id, Ok(result));
+    }
+    pub fn apply_thread_find_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::thread_find::ThreadFindResult, String>,
+    ) {
+        if !self.thread_find.open || req_id != self.thread_find.request_id {
+            return;
+        }
+        self.thread_find.loading = false;
+        match result {
+            Ok(res) => {
+                self.thread_find.error = None;
+                self.thread_find.unsupported = false;
+                self.thread_find.total_matches = res.total_matches;
+                self.thread_find.active_index = res.active_index;
+                self.thread_find.navigation = res.navigation;
+                self.thread_find.active_match = res.active_match.clone();
+                self.thread_find.pending_reveal = res.active_match;
+            }
+            Err(err) => {
+                self.thread_find.error = Some(err);
+            }
+        }
+    }
+    pub fn consume_pending_find_reveal(&mut self, tx: &mut Tx) -> bool {
+        if !self.thread_find_active() {
+            return false;
+        }
+        let Some(matched) = self.thread_find.pending_reveal.clone() else {
+            return false;
+        };
+        let t = self.current_mut();
+        let Some(msg_idx) = t.messages.iter().position(|m| m.id == matched.entry_id) else {
+            if t.history_has_more && !t.history_loading && t.history_error.is_none() {
+                let tid = t.id;
+                self.load_earlier_history(tid, Some(matched.entry_id));
+                return true;
+            }
+            return false;
+        };
+        let tid = t.id;
+        let row_key = if t.messages[msg_idx].role == "Pi" {
+            let start = t.messages[..=msg_idx]
+                .iter()
+                .rposition(|m| m.role != "Pi")
+                .map_or(0, |i| i + 1);
+            if let Some(work) = t.work.iter_mut().find(|w| w.start == start) {
+                work.expanded = true;
+            }
+            format!("turn-{tid}-{}", t.messages[start].id)
+        } else {
+            format!("row-{tid}-{}", t.messages[msg_idx].id)
+        };
+        self.thread_find.pending_reveal = None;
+        tx.scroll_center_in_instant(
+            format!("conversation-{tid}"),
+            format!("{row_key}/thread-find-active"),
+        );
+        true
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
         thread.captain_home && !thread.delegated
@@ -7361,8 +7667,11 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     state.html_windows.theme(state.dark);
     let keybindings_changed = !state.headless && state.poll_keybindings();
-    let browsing =
-        state.poll_folder_browser() | state.poll_settings() | html_changed | keybindings_changed;
+    let browsing = state.poll_folder_browser()
+        | state.poll_settings()
+        | state.poll_thread_find(tx)
+        | html_changed
+        | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
