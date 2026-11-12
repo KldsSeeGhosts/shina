@@ -12,6 +12,8 @@ use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 #[path = "captain_ui.rs"]
 mod captain_ui;
+#[path = "composer_menu.rs"]
+mod composer_menu;
 #[path = "crew_ui.rs"]
 mod crew_ui;
 #[path = "markdown_ui.rs"]
@@ -872,6 +874,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(workspace.child(pane));
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
+    if context_popover_shown && composer_menu::trigger(s).is_some() {
+        root = root.child(composer_menu::overlay(s, p, cx, s.viewport_width));
+    }
     if context_popover_shown
         && context_ring_shown(s.current())
         && s.current().context.popover_open()
@@ -7848,7 +7853,6 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     {
         area = area.child(part);
     }
-    area = area.child(pi_ui::slash_menu(s, p));
     area = area.child(pi_ui::queued_messages(s, p));
     // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
@@ -7903,6 +7907,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             p.muted,
         )
         .color(p.ink)
+        .pill_colors(p.selected, Some(p.ink))
+        .pill_icon(composer_menu::pill_icon)
         .rich_style(rune::RichStyle {
             code_fg: Some(p.ink),
             code_bg: p.code_bg,
@@ -7938,6 +7944,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 return true;
             }
             if pi_ui::composer_pi_key(s, event) {
+                composer_menu::scroll_selected(s, tx);
                 return true;
             }
             let t = s.current_mut();
@@ -10057,6 +10064,101 @@ pub(crate) mod tests {
         });
         rt.frame(0.0);
         assert!(rt.find("slash-menu").is_none());
+    }
+
+    #[test]
+    fn caret_menu_stays_in_the_window_and_thread_pills_survive_undo() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let mut other = Thread::new(42);
+            other.title = "Mention target".into();
+            rt.state.threads.push(other);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("@Mention".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("mention-menu").unwrap();
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                menu[1] >= 8.0 && menu[1] + menu[3] <= 720.0 - 7.0,
+                "{width}: {menu:?}"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
+            assert!(
+                crate::composer_rich::markdown(&rt.state.current().draft)
+                    .contains("read_thread({\"thread_id\":42})")
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('z'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "@Mention");
+            assert_eq!(rt.state.current().draft.pills().count(), 0);
+        }
+    }
+
+    fn edge_caret_menu(s: &State, cx: &mut Cx<State>) -> El {
+        let p = palette(s.dark);
+        let width = s.viewport_width;
+        col()
+            .key("workspace-root")
+            .w_full()
+            .h_full()
+            .child(
+                text_input(&s.current().draft, COMPOSER)
+                    .key("composer-input")
+                    .absolute(width - 90.0, 8.0)
+                    .w(80.0)
+                    .on_edit(|s: &mut State| &mut s.current_mut().draft),
+            )
+            .child(composer_menu::overlay(s, p, cx, width))
+    }
+
+    #[test]
+    fn caret_menu_flips_below_a_top_right_caret_at_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut state = State::new(".".into(), false);
+            state.viewport_width = width;
+            state.current_mut().draft.replace_text("/");
+            state.current_mut().draft.focused = true;
+            let mut rt = Runtime::with_text(
+                state,
+                edge_caret_menu,
+                (width, 840.0),
+                Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            rt.frame(0.25);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("slash-menu").unwrap();
+            let (field, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                menu[1] >= field[1] + field[3],
+                "{width}: {menu:?}, field {field:?}"
+            );
+            assert!(menu[1] + menu[3] <= 833.0);
+        }
     }
 
     #[test]

@@ -206,133 +206,12 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
     list
 }
 
-/// Ported from KSG Code's chat/ComposerCommandMenu.tsx: rounded rows, 12 px label and description,
-/// a source badge, and a scrollable drawer above the composer. Pi supplies the workspace inventory.
-pub(super) fn slash_menu(s: &State, p: Palette) -> El {
-    let t = s.current();
-    let matches = t.slash_matches();
-    if t.slash_trigger().is_none() {
-        return el();
-    }
-    let mut list = col()
-        .key("slash-menu")
-        .role("listbox")
-        .label("Pi commands")
-        .w_full()
-        .max_h(288.0)
-        .padding(4.0)
-        .radius(6.0)
-        .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        });
-    if !t.native.commands_loaded {
-        list = list.child(
-            label(
-                t.native
-                    .commands_error
-                    .as_deref()
-                    .unwrap_or("Loading workspace commands..."),
-                SMALL,
-                p.muted,
-            )
-            .px(16.0)
-            .py(10.0),
-        );
-    }
-    if matches.is_empty() {
-        list = list.child(
-            label("No matching command.", SMALL, p.muted)
-                .px(16.0)
-                .py(10.0),
-        );
-    }
-    let at = t.native.slash_index.min(matches.len().saturating_sub(1));
-    for (i, command) in matches.iter().enumerate() {
-        let name = command.name.clone();
-        list = list.child(
-            row()
-                .key(format!("slash-item-{i}"))
-                .role("option")
-                .label(format!("/{} {}", command.name, command.description))
-                .min_h(32.0)
-                .px(8.0)
-                .gap(8.0)
-                .radius(4.0)
-                .center_y()
-                .cursor(rune::Cursor::Pointer)
-                .fill(if i == at {
-                    p.coral_bg
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(p.selected)
-                .on_press(move |s: &mut State| s.choose_slash(name.clone()))
-                .child(
-                    label(
-                        format!("/{}", command.name),
-                        TextStyle::new(12.0, 500.0),
-                        p.ink,
-                    )
-                    .max_w(220.0)
-                    .truncate()
-                    .shrink(),
-                )
-                .child(
-                    label(&command.description, SMALL, p.muted)
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(pixel_label(&command.source, p.muted)),
-        );
-    }
-    list
-}
-
 pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
     if s.undo_key(event, true) {
         return true;
     }
-    let matches = s.current().slash_matches();
-    if s.current().slash_trigger().is_some() && event.key == rune::Key::Escape {
-        s.current_mut().native.slash_dismissed = Some(s.current().draft.text.clone());
+    if composer_menu::key(s, event) {
         return true;
-    }
-    if !matches.is_empty() {
-        let at = s.current().native.slash_index.min(matches.len() - 1);
-        match event.key {
-            rune::Key::Down => {
-                s.current_mut().native.slash_index = (at + 1).min(matches.len() - 1);
-                return true;
-            }
-            rune::Key::Up => {
-                s.current_mut().native.slash_index = at.saturating_sub(1);
-                return true;
-            }
-            // The list's ends, as cmdk goes in KSG Code. The slash draft is one short line.
-            rune::Key::Home => {
-                s.current_mut().native.slash_index = 0;
-                return true;
-            }
-            rune::Key::End => {
-                s.current_mut().native.slash_index = matches.len() - 1;
-                return true;
-            }
-            rune::Key::Tab | rune::Key::Enter
-                if !event.mods.shift && !event.mods.ctrl && !event.mods.cmd =>
-            {
-                s.choose_slash(matches[at].name.clone());
-                return true;
-            }
-            rune::Key::Escape => {
-                s.current_mut().native.slash_dismissed = Some(s.current().draft.text.clone());
-                return true;
-            }
-            _ => {}
-        }
     }
     if event.key == rune::Key::Enter && (event.mods.ctrl || event.mods.cmd) {
         let previous = s.current().native.follow_up;
@@ -341,8 +220,8 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         s.current_mut().native.follow_up = previous;
         return true;
     }
+    let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();
-    let menu_open = t.slash_trigger().is_some();
     let entries: Vec<_> = t
         .messages
         .iter()

@@ -868,11 +868,15 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = Prompt::new(
-            crate::composer_rich::markdown(&self.draft),
-            self.draft_images.clone(),
-        );
+        let prompt = match crate::composer_tokens::prompt(&self.draft, &self.draft_images) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.attachment_error = Some(error);
+                return;
+            }
+        };
         self.prompt_history.reset();
+        self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
         self.begin_prompt(prompt);
@@ -2030,6 +2034,7 @@ pub struct State {
     client_recover: std::collections::HashMap<usize, uuid::Uuid>,
     recovered_inputs: std::collections::BTreeMap<usize, Value>,
     pub background: background::Background,
+    pub composer_sources: crate::composer_sources::Sources,
     pub data_dir: PathBuf,
     /// The open thread's id and whether it was a draft with content when it was opened. Like
     /// T3 Code's frozen draft row, the open draft's sidebar row neither pops in while typing nor
@@ -2228,6 +2233,7 @@ impl State {
             settled_visible: 10,
             undo: None,
             opened_draft: None,
+            composer_sources: crate::composer_sources::Sources::default(),
             snooze_menu: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
@@ -4690,8 +4696,18 @@ impl State {
             }
             // Do not clear until its receipt arrives and this exact editor content still matches.
             let revision = uuid::Uuid::new_v4();
-            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":crate::composer_rich::markdown(&self.current().draft),
-                "attachments":self.current().draft_images,"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+            let prompt = match crate::composer_tokens::prompt(
+                &self.current().draft,
+                &self.current().draft_images,
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.current_mut().attachment_error = Some(error);
+                    return;
+                }
+            };
+            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
+                "attachments":prompt.images.as_ref(),"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
                     self.current_mut().remote_send = Some((
@@ -4725,7 +4741,17 @@ impl State {
             .trim()
             .to_owned();
         let mut words = text.splitn(2, char::is_whitespace);
-        match words.next() {
+        match words.next().filter(|_| {
+            !self
+                .current()
+                .draft
+                .pills()
+                .any(|(r, _)| self.current().draft.text[..r.start].trim().is_empty())
+                && !crate::composer_tokens::starts_with_file_path(
+                    &text,
+                    &self.current().draft_images,
+                )
+        }) {
             Some("/model") => {
                 self.choose_slash("model".into());
                 return;
@@ -5965,6 +5991,7 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+    let composer_changed = state.composer_sources.take_changed();
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -5975,7 +6002,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         return false;
     }
     if state.client.is_some() {
-        return state.poll_client(tx);
+        return state.poll_client(tx) | composer_changed;
     }
     let background_changed = state.poll_background_start(tx);
     if state.background.quitting {
@@ -5991,7 +6018,9 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if state.restart_approved && !rune::quitting() {
         state.cancel_update_exit();
     }
-    let mut changed = background_changed | state.updater.poll(Instant::now(), state.wake.clone());
+    let mut changed = composer_changed
+        | background_changed
+        | state.updater.poll(Instant::now(), state.wake.clone());
     if let Some(remaining) = state.updater.remaining(Instant::now()) {
         tx.wake_after(remaining);
     }

@@ -127,6 +127,22 @@ fn mark_delimiters(mark: &Mark, content: &str) -> (String, String) {
 }
 
 fn inline(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
+    let pills: Vec<_> = edit
+        .pills()
+        .filter(|(r, _)| r.start >= range.start && r.end <= range.end)
+        .filter_map(|(r, id)| crate::composer_tokens::Token::decode(id).map(|token| (r, token)))
+        .collect();
+    if !pills.is_empty() {
+        let mut out = String::new();
+        let mut cursor = range.start;
+        for (pill, token) in pills {
+            out.push_str(&inline(edit, cursor..pill.start));
+            out.push_str(&token.source());
+            cursor = pill.end;
+        }
+        out.push_str(&inline(edit, cursor..range.end));
+        return out;
+    }
     let mut bounds = vec![range.start, range.end];
     let marks: Vec<_> = edit
         .marks()

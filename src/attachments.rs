@@ -238,6 +238,30 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
             return attach_image_file(&path);
         }
     }
+    file_reference(path, &metadata, &name)
+}
+
+/// An @ mention always refers to a path, including image paths. It does not request image input.
+pub fn reference_file(path: &Path) -> Result<Attachment, String> {
+    let path =
+        fs::canonicalize(path).map_err(|e| format!("Missing file {}: {e}", path.display()))?;
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("Choose a file or folder, not a device.".into());
+    }
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    file_reference(path, &metadata, &name)
+}
+
+fn file_reference(
+    path: PathBuf,
+    metadata: &fs::Metadata,
+    name: &str,
+) -> Result<Attachment, String> {
     let mime = if metadata.is_dir() {
         "inode/directory"
     } else if text_content(&path)?.is_some() {
@@ -247,7 +271,7 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
     };
     Ok(Attachment {
         id: file_id(&path),
-        name: clean_name(&name),
+        name: clean_name(name),
         mime: mime.into(),
         width: 0,
         height: 0,
