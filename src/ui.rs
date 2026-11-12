@@ -8225,7 +8225,7 @@ fn machine_dialog(s: &State, p: Palette) -> El {
         .box_shadow(hard_shadow(p))
         .child(row().center_y().child(label("Linked machines",DIALOG_TITLE,p.ink)).child(spacer())
             .child(icon_button("close-machines","Close","close",p,|s| {
-                s.machines.dialog=false;s.machines.code.replace_text("");s.machines.notice=None;
+                s.machines.dialog=false;s.machines.code.replace_text("");s.machines.peer_code.replace_text("");s.machines.notice=None;
             })))
         .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(pixel_label("Host",p.muted))
@@ -8297,6 +8297,88 @@ fn machine_dialog(s: &State, p: Palette) -> El {
                 ),
         );
     }
+    // The existing AddEnvironmentDialog fields also redeem a server-to-server peer code.
+    // Outbound links belong to the selected server, not to this desktop's client links.
+    card=card.child(rule(p)).child(pixel_label("Peers",p.muted))
+        .child(label("A peer link lets this server delegate work. Create its code on the target with shina pair --peer.",SMALL,p.muted).wrap());
+    let peer_busy = busy || s.machines.selected != "local";
+    for peer in &s.peers {
+        let id = peer.server_id.clone();
+        let reachable = peer.last_error.is_none()
+            && peer
+                .last_reached_at
+                .is_some_and(|at| crate::lifecycle::now().saturating_sub(at) < 90_000);
+        card = card.child(
+            row()
+                .key(format!("peer-row-{id}"))
+                .center_y()
+                .gap(8.0)
+                .child(
+                    label(&peer.label, SMALL, p.ink)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(pixel_text(
+                    if reachable { "Reachable" } else { "Offline" },
+                    p.muted,
+                ))
+                .child(
+                    button(
+                        &format!("peer-unlink-{id}"),
+                        "Unlink and revoke",
+                        p,
+                        move |s| s.machine_action("peer-unlink", &id),
+                    )
+                    .disabled(peer_busy),
+                ),
+        );
+    }
+    card = card
+        .child(pixel_label("Peer host", p.muted))
+        .child(
+            text_input(&s.machines.peer_host, BODY)
+                .key("peer-host")
+                .label("Peer host")
+                .single_line()
+                .w_full()
+                .padding(8.0)
+                .radius(6.0)
+                .field_focus(&s.machines.peer_host, p)
+                .color(p.ink)
+                .disabled(peer_busy)
+                .on_edit(|s: &mut State| &mut s.machines.peer_host),
+        )
+        .child(pixel_label("Peer code", p.muted))
+        .child(
+            text_input(&s.machines.peer_code, BODY)
+                .key("peer-code")
+                .label("Peer code")
+                .single_line()
+                .w_full()
+                .padding(8.0)
+                .radius(6.0)
+                .field_focus(&s.machines.peer_code, p)
+                .color(p.ink)
+                .disabled(peer_busy)
+                .on_edit(|s: &mut State| &mut s.machines.peer_code),
+        )
+        .child(
+            primary_button("peer-link-submit", "Link peer", p, |s| {
+                s.machine_action("peer-link", "")
+            })
+            .disabled(peer_busy),
+        );
+    if s.machines.selected != "local" {
+        card = card.child(
+            label(
+                "Manage this server's peer links on that host with shina peer.",
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        );
+    }
     el().key("machines-backdrop")
         .instant_changes()
         .absolute(0.0, 0.0)
@@ -8307,6 +8389,7 @@ fn machine_dialog(s: &State, p: Palette) -> El {
         .modal(false, |s: &mut State| {
             s.machines.dialog = false;
             s.machines.code.replace_text("");
+            s.machines.peer_code.replace_text("");
             s.machines.notice = None;
         })
         .child(card)
@@ -12924,6 +13007,56 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt
+    }
+
+    #[test]
+    fn remote_crew_tags_peer_dialog_and_inbound_parent_bar_fit_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state
+                .demo_remote_task(16, "Studio", crate::model::RemoteState::TargetOffline);
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "task-card-16",
+                    "task-machine-16",
+                    "crew-chip-16",
+                    "crew-machine-16",
+                ],
+            );
+            let title = rt.presented("task-title-16").unwrap().0;
+            let tag = rt.presented("task-machine-16").unwrap().0;
+            assert!(
+                tag[0] >= title[0] + title[2] - 0.5,
+                "{width}: {title:?}, {tag:?}"
+            );
+            press(&mut rt, "crew-chip-16");
+            rt.frame(1.0);
+            assert_inside(&mut rt, width, &["parent-bar", "remote-result-machine"]);
+            rt.state.current_mut().peer_origin=Some(serde_json::from_value(json!({
+                "deviceId":uuid::Uuid::new_v4(),"serverId":uuid::Uuid::new_v4(),"serverLabel":"Home",
+                "parentThreadId":7,"taskId":"task-1","captain":"Rook"
+            })).unwrap());
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_inside(&mut rt, width, &["parent-bar", "parent-bar-name"]);
+            rt.state.machines.dialog = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "machine-dialog",
+                    "peer-host",
+                    "peer-code",
+                    "peer-link-submit",
+                ],
+            );
+        }
     }
 
     #[test]

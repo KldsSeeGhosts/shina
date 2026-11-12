@@ -86,6 +86,20 @@ pub(super) fn solid_button(
 }
 
 fn open_thread(s: &mut State, id: usize) {
+    if let Some(remote) = s.remote_task(id).cloned()
+        && let Some(thread) = remote.thread_id
+        && s.client
+            .as_ref()
+            .is_some_and(|c| c.linked.contains_key(&remote.server_id))
+        && s.machines.views.get(&remote.server_id).is_some_and(|view| {
+            view["index"]["threads"]
+                .as_array()
+                .is_some_and(|threads| threads.iter().any(|t| t["id"] == thread))
+        })
+    {
+        s.open_machine_thread(&remote.server_id, thread);
+        return;
+    }
     if let Some(index) = s.threads.iter().position(|t| t.id == id) {
         s.select_thread(index);
     }
@@ -94,6 +108,28 @@ fn open_thread(s: &mut State, id: usize) {
 /// A task's place in the shared status vocabulary, and the word for it. A child that is
 /// asking for something needs the user whatever its task record says.
 fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
+    if let Some(remote) = &task.remote {
+        if remote.stop_owed && remote.state != crate::model::RemoteState::TargetOffline {
+            return (Status::Waiting, "Stop pending");
+        }
+        if remote.needs_you && !task.state.finished() {
+            return (Status::Waiting, "Needs you");
+        }
+        if task.state != TaskState::Queued {
+            return (
+                match remote.state {
+                    crate::model::RemoteState::Failed | crate::model::RemoteState::Revoked => {
+                        Status::Failed
+                    }
+                    crate::model::RemoteState::Done
+                    | crate::model::RemoteState::ResultPendingDelivery => Status::Completed,
+                    crate::model::RemoteState::TargetOffline => Status::Paused,
+                    _ => Status::Running,
+                },
+                remote.state.word(),
+            );
+        }
+    }
     if s.threads
         .iter()
         .any(|t| t.id == task.child_id && t.request.is_some())
@@ -210,6 +246,7 @@ pub(super) fn tool_part(s: &State, p: Palette, indices: &[usize]) -> El {
 /// A delegated task in the captain's transcript: what it is, where and on which model it runs,
 /// its live state, its last activity and its clock. The whole card opens the worker.
 /// The meta line follows KSG Code's `ProviderSubagentBar` (provider mark, model, live status).
+/// Remote machine labels and navigation port KSG's V2LifecycleRow and ThreadRelationshipsControl.
 pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
     let (status, word) = task_status(s, task);
     let child = task.child_id;
@@ -229,6 +266,21 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
             .truncate()
             .shrink()
             .min_w(0.0),
+        )
+        .child(
+            task.remote
+                .as_ref()
+                .map(|remote| {
+                    machine_tag(
+                        s,
+                        p,
+                        &remote.server_id,
+                        format!("task-machine-{child}"),
+                        SMALL,
+                        true,
+                    )
+                })
+                .unwrap_or_else(el),
         )
         .child(spacer())
         .child(
@@ -535,10 +587,11 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
         .tasks_for(t.id)
         .into_iter()
         .filter(|task| {
-            matches!(
-                task.state,
-                TaskState::Queued | TaskState::Starting | TaskState::Running
-            )
+            task.remote.as_ref().is_some_and(|remote| remote.stop_owed)
+                || matches!(
+                    task.state,
+                    TaskState::Queued | TaskState::Starting | TaskState::Running
+                )
         })
         .collect();
     if tasks.is_empty() {
@@ -553,7 +606,8 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             .count()
     };
     let (working, needs_you) = (count(Status::Running), count(Status::Waiting));
-    let queued = tasks.len() - working - needs_you;
+    let offline = count(Status::Paused);
+    let queued = tasks.len() - working - needs_you - offline;
     let (_, tertiary) = quiet_inks(p);
     // One label per count, each after its status square, 8 px apart and never joined.
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
@@ -566,6 +620,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             "needs you",
         ),
         ("crew-tray-queued", queued, Status::Ready, "queued"),
+        ("crew-tray-offline", offline, Status::Paused, "offline"),
     ] {
         if n > 0 {
             summary = summary.child(
@@ -591,7 +646,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
         let child = task.child_id;
         // A worker waiting on an approval is not running, so its timer gives way to the word.
         let waiting = status == Status::Waiting;
-        let clock = if waiting {
+        let clock = if waiting || task.remote.is_some() {
             word.to_string()
         } else {
             task_clock(task)
@@ -620,6 +675,21 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .truncate()
                     .shrink()
                     .min_w(0.0),
+            )
+            .child(
+                task.remote
+                    .as_ref()
+                    .map(|remote| {
+                        machine_tag(
+                            s,
+                            p,
+                            &remote.server_id,
+                            format!("crew-machine-{child}"),
+                            SMALL,
+                            true,
+                        )
+                    })
+                    .unwrap_or_else(el),
             )
             // The timer never shrinks: the title gives way first.
             .child(
@@ -826,6 +896,35 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
 /// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
 pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
+    // Ported from KSG Code's ThreadRelationshipsControl DelegatedFromRow.
+    if let Some(origin) = &t.peer_origin {
+        return Some(
+            row()
+                .key("parent-bar")
+                .role("group")
+                .label("Delegated work")
+                .min_h(48.0)
+                .py(8.0)
+                .px(20.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .border(1.0, hairline(p))
+                .child(
+                    label(
+                        format!(
+                            "Delegated from {} on {}",
+                            origin.captain, origin.server_label
+                        ),
+                        SMALL,
+                        p.muted,
+                    )
+                    .key("parent-bar-name")
+                    .wrap()
+                    .min_w(0.0),
+                ),
+        );
+    }
     let parent = t
         .parent
         .filter(|_| t.delegated)
@@ -858,6 +957,14 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .min_w(0.0),
         ),
     };
+    if let Some(remote) = s.remote_task(t.id) {
+        who = col().gap(4.0).min_w(0.0).shrink().child(who).child(
+            label(format!("Runs on {}", remote.label), SMALL, p.muted)
+                .truncate()
+                .min_w(0.0)
+                .key("remote-result-machine"),
+        );
+    }
     let mut bar = row()
         .key("parent-bar")
         .role("group")
