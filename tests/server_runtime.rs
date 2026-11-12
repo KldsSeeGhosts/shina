@@ -113,6 +113,12 @@ impl Profile {
         if let Some(fault) = fault {
             command.env("SHINA_TEST_CRASH_EFFECT", fault);
         }
+        if self.root.join("measure-storage").exists() {
+            command.env(
+                "SHINA_TEST_STORAGE_METRICS",
+                self.root.join("storage.jsonl"),
+            );
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -2000,6 +2006,156 @@ fn history_version_skew_is_negotiated_or_reports_update_required() {
 #[test]
 fn streaming_history_walk_finishes_before_settlement() {
     streaming_history_case(200_000, false);
+}
+
+#[test]
+fn streaming_storage_scaling() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let client = template.client(uuid::Uuid::new_v4());
+    let base = client.snapshot.clone();
+    drop(client);
+    template.stop();
+    let mut costs = Vec::new();
+    for count in [10, 100, 500] {
+        let mut profile = Profile::new();
+        let mut index = base["index"].clone();
+        let mut records = Vec::new();
+        let mut views = Vec::new();
+        for id in 1..=count {
+            let mut record = index["threads"][0].clone();
+            record["id"] = json!(id);
+            record["session"] = Value::Null;
+            records.push(record);
+            let mut view = base["threads"][0].clone();
+            view["id"] = json!(id);
+            view["status"] = json!("Completed");
+            view["messages"] = json!([{"role":"You","text":"x".repeat(if id == 1 {190_000} else {4096}),"images":[]}]);
+            views.push(view);
+        }
+        index["threads"] = json!(records);
+        index["threadViews"] = json!(views);
+        index["nextId"] = json!(count + 1);
+        fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
+        fs::write(profile.root.join("measure-storage"), "").unwrap();
+        profile.launch(&["serve"]);
+        let mut client = profile.client(uuid::Uuid::new_v4());
+        client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+            json!("measure-hello"),
+        );
+        client.rpc("workspace.subscribe", json!({}), json!("measure-subscribe"));
+        let db = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        let before_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
+            .unwrap()
+            .len();
+        std::thread::sleep(Duration::from_secs(3));
+        let after_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
+            .unwrap()
+            .len();
+        assert_eq!(before_idle, after_idle, "idle workspace wrote to WAL");
+        let receipt = client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"history-stream-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(receipt["result"]["status"], "accepted", "{receipt}");
+        std::thread::sleep(Duration::from_secs(3));
+        let samples: Vec<Value> = fs::read_to_string(profile.root.join("storage.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let start = receipt["result"]["seq"].as_u64().unwrap();
+        let samples: Vec<_> = samples
+            .iter()
+            .filter(|s| s["seq"].as_u64().unwrap() > start)
+            .collect();
+        let serialized: u64 = samples
+            .iter()
+            .map(|s| s["serialized"].as_u64().unwrap())
+            .sum();
+        let storage: u64 = samples.iter().map(|s| s["storage"].as_u64().unwrap()).sum();
+        println!(
+            "STORAGE threads={count} updates={} serialized/update={} WAL/update={} sequence_advances={} idle_WAL={}",
+            samples.len(),
+            serialized / samples.len() as u64,
+            storage / samples.len() as u64,
+            samples.len(),
+            after_idle - before_idle
+        );
+        costs.push((
+            serialized / samples.len() as u64,
+            storage / samples.len() as u64,
+        ));
+        drop(db);
+        profile.stop();
+    }
+    assert!(costs[2].0 <= costs[0].0 * 2, "{costs:?}");
+    assert!(costs[2].1 <= costs[0].1 * 2, "{costs:?}");
+}
+
+#[test]
+fn scoped_history_resumes_after_server_restart() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("resume-hello"),
+    );
+    let receipt = client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"first","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |s| {
+        s["threads"][0]["status"] == "Completed"
+    });
+    let initial = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1}),
+        json!("initial-history"),
+    );
+    let page: Value = serde_json::from_str(initial["result"]["data"].as_str().unwrap()).unwrap();
+    let sequence = page["snapshotSequence"].clone();
+    let identity = page["items"][0]["sourceItemId"].clone();
+    let epoch = initial["result"]["streamEpoch"].clone();
+    let receipt = client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"second","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |s| {
+        s["threads"][0]["status"] == "Completed"
+    });
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("resume-hello"),
+    );
+    let resumed = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1,"afterSequence":sequence,"streamEpoch":epoch}),
+        json!("resumed-history"),
+    );
+    assert_eq!(resumed["result"]["kind"], "synchronized", "{resumed}");
+    assert_eq!(resumed["result"]["streamEpoch"], epoch);
+    let current = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1}),
+        json!("current-history"),
+    );
+    let page: Value = serde_json::from_str(current["result"]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(page["items"][0]["sourceItemId"], identity);
+    profile.stop();
 }
 
 #[test]

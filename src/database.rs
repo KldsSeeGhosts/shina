@@ -9,6 +9,15 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
+// Debug-only isolated-profile measurement. Count encoded persistence payloads,
+// not allocations or wire traffic. Disable WAL recycling to measure appended bytes.
+static SERIALIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn encode(value: &Value) -> String {
+    let text = value.to_string();
+    SERIALIZED.fetch_add(text.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    text
+}
+
 const FILES: [&str; 6] = [
     "index.json",
     "server-inputs.json",
@@ -28,6 +37,7 @@ struct Inner {
     failure: Option<String>,
     dispatch_fenced: bool,
     claimed_dispatches: usize,
+    history_events: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -87,6 +97,11 @@ impl Database {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(error)?;
+        if cfg!(debug_assertions) && std::env::var_os("SHINA_TEST_STORAGE_METRICS").is_some() {
+            connection
+                .execute_batch("PRAGMA wal_autocheckpoint=0;")
+                .map_err(error)?;
+        }
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(error)?;
@@ -96,7 +111,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 4 {
+        if version > 5 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         connection
@@ -139,6 +154,13 @@ impl Database {
             crate::maintenance::backup_state(directory)?;
             let tx = connection.transaction().map_err(error)?;
             tx.execute_batch(include_str!("migrations/004.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
+        if version < 5 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/005.sql"))
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -189,6 +211,7 @@ impl Database {
             failure: None,
             dispatch_fenced: false,
             claimed_dispatches: 0,
+            history_events: Vec::new(),
         })));
         if !imported {
             let backup = directory.join("state.sqlite.import-v1.bak");
@@ -288,6 +311,22 @@ impl Database {
         {
             return Ok(Some(value.clone()));
         }
+        if matches!(name, "index.json" | "server-inputs.json")
+            && let Some(mut value) = crate::projection_store::read(&inner.connection, name)?
+        {
+            if name == "index.json" {
+                value["serverSeq"] = json!(
+                    inner
+                        .connection
+                        .query_row("SELECT seq FROM projection WHERE id=1", [], |r| r
+                            .get::<_, i64>(0))
+                        .optional()
+                        .map_err(error)?
+                        .unwrap_or(0)
+                );
+            }
+            return Ok(Some(value));
+        }
         let value: Option<String> = inner
             .connection
             .query_row("SELECT payload FROM documents WHERE name=?1", [name], |r| {
@@ -353,6 +392,21 @@ impl Database {
             return Err(error.clone());
         }
         let staged = std::mem::take(&mut inner.staged);
+        let history_events = std::mem::take(&mut inner.history_events);
+        let metrics_path = if cfg!(debug_assertions) {
+            std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
+        } else {
+            None
+        };
+        let wal = inner
+            .connection
+            .path()
+            .map(|p| PathBuf::from(format!("{p}-wal")));
+        let before = wal
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
         let revocations = std::mem::take(&mut inner.revocations);
         let result = (|| {
             let tx = inner.connection.transaction().map_err(error)?;
@@ -364,10 +418,14 @@ impl Database {
                 .map_err(error)?;
             }
             for (name, value) in staged {
+                if matches!(name.as_str(), "index.json" | "server-inputs.json") {
+                    crate::projection_store::write(&tx, &name, &value)?;
+                    continue;
+                }
                 tx.execute(
                     "INSERT INTO documents(name,payload) VALUES(?1,?2)
                      ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
-                    params![name, value.to_string()],
+                    params![name, encode(&value)],
                 )
                 .map_err(error)?;
                 if name == "honcho-outbox.json" {
@@ -421,14 +479,35 @@ impl Database {
                 params![
                     seq as i64,
                     receipt.map(|r| r.command_id.to_string()),
-                    patch.to_string()
+                    encode(patch)
                 ],
             )
             .map_err(error)?;
+            for event in history_events {
+                tx.execute(
+                    "INSERT INTO thread_events(thread_id,seq,schema,payload) VALUES(?1,?2,1,?3)",
+                    params![
+                        event["threadId"].as_u64().ok_or("Invalid thread event.")? as i64,
+                        seq as i64,
+                        encode(&event)
+                    ],
+                )
+                .map_err(error)?;
+            }
             tx.execute(
-                "INSERT INTO projection(id,seq,payload) VALUES(1,?1,?2)
+                "DELETE FROM thread_events WHERE seq <= ?1",
+                [seq.saturating_sub(1024) as i64],
+            )
+            .map_err(error)?;
+            let mut projection = projection.clone();
+            if let Some(index) = projection.as_object_mut().unwrap().remove("index") {
+                crate::projection_store::write(&tx, "workspace-index", &index)?;
+            }
+            crate::projection_store::write(&tx, "workspace", &projection)?;
+            tx.execute(
+                "INSERT INTO projection(id,seq,payload) VALUES(1,?1,'{\"schema\":2}')
                  ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,payload=excluded.payload",
-                params![seq as i64, projection.to_string()],
+                params![seq as i64],
             )
             .map_err(error)?;
             // Bound replay storage. Clients behind this range get a fresh paged snapshot.
@@ -440,6 +519,27 @@ impl Database {
             tx.commit().map_err(error)
         })();
         inner.batch = None;
+        if result.is_ok()
+            && let Some(path) = metrics_path
+        {
+            use std::io::Write;
+            let after = wal
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(
+                    file,
+                    "{}",
+                    json!({"seq":seq,"serialized":SERIALIZED.swap(0,std::sync::atomic::Ordering::Relaxed),"storage":after.saturating_sub(before)})
+                );
+            }
+        }
         if let Err(error) = &result {
             inner.failure = Some(error.clone());
         }
@@ -459,6 +559,48 @@ impl Database {
             .map_err(error)?;
         text.map(|text| serde_json::from_str(&text).map_err(error))
             .transpose()
+    }
+
+    pub fn stage_history(&self, events: Vec<Value>) {
+        self.0
+            .lock()
+            .expect("database")
+            .history_events
+            .extend(events);
+    }
+
+    pub fn history_events(&self) -> Result<Vec<Value>, String> {
+        self.history_events_after(0)
+    }
+    pub fn history_events_after(&self, after: u64) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        let mut stmt = inner
+            .connection
+            .prepare("SELECT schema,payload FROM thread_events WHERE seq>?1 ORDER BY seq,thread_id")
+            .map_err(error)?;
+        stmt.query_map([after as i64], |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(error)?
+        .map(|row| {
+            let (schema, text) = row.map_err(error)?;
+            if schema != 1 {
+                return Err(error("Thread events require a newer Shina binary."));
+            }
+            serde_json::from_str(&text).map_err(error)
+        })
+        .collect()
+    }
+
+    pub fn scoped_state(&self, thread: u64) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        let read = |scope: &str| -> Result<Value, String> {
+            let text:String=inner.connection.query_row("SELECT payload FROM projection_records WHERE document='index.json' AND scope=?1 AND key='$'",[scope],|r|r.get(0)).map_err(error)?;
+            serde_json::from_str(&text).map_err(error)
+        };
+        Ok(
+            json!({"index":{"threads":[read(&format!("threads/{thread}"))?]},"threads":[read(&format!("threadViews/{thread}"))?]}),
+        )
     }
 
     pub fn replay(&self, after: u64, through: u64) -> Result<Option<Vec<Value>>, String> {
@@ -859,18 +1001,37 @@ impl Database {
     }
 
     pub fn projection(&self) -> Result<Option<Value>, String> {
-        let text: Option<String> = self
-            .0
-            .lock()
-            .expect("database")
+        let inner = self.0.lock().expect("database");
+        self.projection_locked(&inner.connection)
+    }
+    fn projection_locked(&self, connection: &Connection) -> Result<Option<Value>, String> {
+        if let Some(mut value) = crate::projection_store::read(connection, "workspace")? {
+            value["index"] = crate::projection_store::read(connection, "workspace-index")?
+                .ok_or("Missing workspace index.")?;
+            return Ok(Some(value));
+        }
+        let text: Option<String> = self.read_projection_legacy(connection)?;
+        text.map(|text| serde_json::from_str(&text).map_err(error))
+            .transpose()
+    }
+    pub fn committed_snapshot(&self) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        let state = self
+            .projection_locked(&inner.connection)?
+            .ok_or("Missing committed projection.")?;
+        let seq: i64 = inner
             .connection
+            .query_row("SELECT seq FROM projection WHERE id=1", [], |r| r.get(0))
+            .map_err(error)?;
+        Ok(json!({"seq":seq,"state":state}))
+    }
+    fn read_projection_legacy(&self, connection: &Connection) -> Result<Option<String>, String> {
+        connection
             .query_row("SELECT payload FROM projection WHERE id=1", [], |r| {
                 r.get(0)
             })
             .optional()
-            .map_err(error)?;
-        text.map(|text| serde_json::from_str(&text).map_err(error))
-            .transpose()
+            .map_err(error)
     }
 
     /// SQLite creates a consistent, non-overwriting backup, including committed WAL pages.
@@ -904,6 +1065,7 @@ impl Database {
         inner.batch = None;
         inner.staged.clear();
         inner.revocations.clear();
+        inner.history_events.clear();
     }
 
     pub fn finish_if_unchanged(&self) -> Result<bool, String> {
@@ -912,6 +1074,11 @@ impl Database {
             return Ok(false);
         }
         for (name, value) in &inner.staged {
+            if name == "index.json" {
+                // Runtime only stages index scopes after reducer work. It decides
+                // whether there is a projection change before this boundary.
+                return Ok(false);
+            }
             let old: Option<String> = inner
                 .connection
                 .query_row("SELECT payload FROM documents WHERE name=?1", [name], |r| {
@@ -919,7 +1086,12 @@ impl Database {
                 })
                 .optional()
                 .map_err(error)?;
-            if old.as_deref() != Some(value.to_string().as_str()) {
+            if old
+                .map(|old| serde_json::from_str::<Value>(&old).map_err(error))
+                .transpose()?
+                .as_ref()
+                != Some(value)
+            {
                 return Ok(false);
             }
         }

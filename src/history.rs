@@ -18,6 +18,79 @@ const RETAIN_EVENTS: usize = 1024;
 const RETAIN_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 75;
 
+/// KSG stores the identity and sequence beside each projected turn item.
+/// Match known records before allocating IDs, including adapter history refreshes.
+/// The resulting metadata is persisted in the same item row as its payload.
+pub fn stamp(before: &Value, after: &mut Value, sequence: u64) {
+    let mut identities = json!({});
+    let mut changed = false;
+    for field in protocol::HISTORY_FIELDS {
+        let Some(items) = after[field].as_array() else {
+            changed |= before[field] != after[field];
+            continue;
+        };
+        let old = before[field].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let mut used = HashSet::new();
+        let mut rows = Vec::new();
+        for (ordinal, item) in items.iter().enumerate() {
+            let exact = old
+                .iter()
+                .enumerate()
+                .find(|(i, old)| !used.contains(i) && *old == item)
+                .map(|(i, _)| i);
+            let matched = exact.or_else(|| {
+                old.get(ordinal)
+                    .filter(|old| {
+                        !used.contains(&ordinal)
+                            && old.get("id") == item.get("id")
+                            && old.get("role") == item.get("role")
+                    })
+                    .map(|_| ordinal)
+            });
+            let identity = item
+                .get("id")
+                .filter(|id| !id.is_null())
+                .map(|id| {
+                    format!(
+                        "{field}:{}",
+                        id.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| id.to_string())
+                    )
+                })
+                .or_else(|| {
+                    matched.and_then(|index| {
+                        used.insert(index);
+                        before["_history"][field][index]["id"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                })
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let unchanged = matched.is_some_and(|i| i == ordinal && old[i] == *item);
+            let position = if unchanged {
+                matched
+                    .and_then(|i| before["_history"][field][i]["sequence"].as_u64())
+                    .unwrap_or(sequence)
+            } else {
+                sequence
+            };
+            changed |= !unchanged;
+            rows.push(json!({"id":identity,"sequence":position}));
+        }
+        changed |= old.len() != items.len();
+        identities[field] = json!(rows);
+    }
+    after["_history"] = identities;
+    let high = if changed {
+        sequence
+    } else {
+        before["historySequence"].as_u64().unwrap_or(sequence)
+    };
+    after["historySequence"] = json!(high);
+    after["historyRevision"] = json!(high.to_string());
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Row {
@@ -76,8 +149,10 @@ impl Streams {
                 continue;
             };
             retained.insert(id);
-            let history = protocol::history_payload(thread);
-            let revision = protocol::revision(&history);
+            let revision = thread["historyRevision"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| protocol::revision(&protocol::history_payload(thread)));
             if self
                 .threads
                 .get(&id)
@@ -86,6 +161,7 @@ impl Streams {
                 continue;
             }
             let before = self.threads.remove(&id);
+            let history = protocol::history_payload(thread);
             let mut rows = Vec::new();
             let mut fields = json!({"id":id});
             for field in protocol::HISTORY_FIELDS {
@@ -102,7 +178,8 @@ impl Streams {
                 // Intrinsic tool/work IDs take precedence. A new server starts a new epoch.
                 let mut used = HashSet::new();
                 let mut exact: HashMap<String, VecDeque<&Row>> = HashMap::new();
-                for row in &old {
+                let durable = thread["_history"][field].is_array();
+                for row in old.iter().filter(|_| !durable) {
                     exact
                         .entry(row.item.to_string())
                         .or_default()
@@ -110,35 +187,44 @@ impl Streams {
                 }
                 let mut identities = Vec::new();
                 for item in items {
-                    let found = exact
-                        .get_mut(&item.to_string())
-                        .and_then(VecDeque::pop_front);
+                    let found = if durable {
+                        None
+                    } else {
+                        exact
+                            .get_mut(&item.to_string())
+                            .and_then(VecDeque::pop_front)
+                    };
                     if let Some(row) = found {
                         used.insert(row.source_item_id.clone());
                     }
                     identities.push(found.map(|row| row.source_item_id.clone()));
                 }
                 for (ordinal, item) in items.iter().enumerate() {
-                    let identity = identities[ordinal]
-                        .take()
-                        .or_else(|| {
-                            let intrinsic = item.get("id").filter(|id| !id.is_null());
-                            let candidate = if let Some(intrinsic) = intrinsic {
-                                old.iter()
-                                    .find(|row| row.item.get("id") == Some(intrinsic))
-                                    .copied()
-                            } else {
-                                old.get(ordinal)
-                                    .copied()
-                                    .filter(|row| row.item["role"] == item["role"])
-                            };
-                            candidate
-                                .filter(|row| !used.contains(&row.source_item_id))
-                                .map(|row| row.source_item_id.clone())
-                        })
+                    let identity = thread["_history"][field][ordinal]["id"]
+                        .as_str()
+                        .map(str::to_owned)
                         .unwrap_or_else(|| {
-                            self.next_id += 1;
-                            format!("{field}:{}", self.next_id)
+                            identities[ordinal]
+                                .take()
+                                .or_else(|| {
+                                    let intrinsic = item.get("id").filter(|id| !id.is_null());
+                                    let candidate = if let Some(intrinsic) = intrinsic {
+                                        old.iter()
+                                            .find(|row| row.item.get("id") == Some(intrinsic))
+                                            .copied()
+                                    } else {
+                                        old.get(ordinal)
+                                            .copied()
+                                            .filter(|row| row.item["role"] == item["role"])
+                                    };
+                                    candidate
+                                        .filter(|row| !used.contains(&row.source_item_id))
+                                        .map(|row| row.source_item_id.clone())
+                                })
+                                .unwrap_or_else(|| {
+                                    self.next_id += 1;
+                                    format!("{field}:{}", self.next_id)
+                                })
                         });
                     used.insert(identity.clone());
                     rows.push(Row {
@@ -173,6 +259,11 @@ impl Streams {
                 if before.fields != fields {
                     changes.push(json!({"type":"fields.updated","fields":fields}));
                 }
+            } else {
+                for row in &rows {
+                    changes.push(json!({"type":"item.updated","row":row}));
+                }
+                changes.push(json!({"type":"fields.updated","fields":fields}));
             }
             if !changes.is_empty() {
                 let count = changes.len();
@@ -182,7 +273,7 @@ impl Streams {
                 self.bytes += bytes;
                 self.events.push_back(Event {
                     thread: id,
-                    sequence,
+                    sequence: thread["historySequence"].as_u64().unwrap_or(sequence),
                     value,
                     bytes,
                     count,
@@ -191,7 +282,7 @@ impl Streams {
             self.threads.insert(
                 id,
                 Projection {
-                    sequence,
+                    sequence: thread["historySequence"].as_u64().unwrap_or(sequence),
                     rows,
                     fields,
                     revision,
@@ -222,6 +313,113 @@ impl Streams {
             self.bytes -= event.bytes;
             self.pruned.insert(event.thread, event.sequence);
         }
+    }
+
+    pub fn restore(&mut self, events: Vec<Value>) {
+        self.events.clear();
+        self.bytes = 0;
+        for (id, projection) in &self.threads {
+            self.pruned.insert(*id, projection.sequence);
+        }
+        for value in events {
+            let thread = value["threadId"].as_u64().unwrap();
+            let sequence = value["sequence"].as_u64().unwrap();
+            self.pruned
+                .entry(thread)
+                .and_modify(|p| *p = (*p).min(sequence.saturating_sub(1)));
+            let bytes = value.to_string().len();
+            self.bytes += bytes;
+            let count = value["events"].as_array().map(Vec::len).unwrap_or(1);
+            self.events.push_back(Event {
+                thread,
+                sequence,
+                value,
+                bytes,
+                count,
+            });
+        }
+        while self.events.len() > RETAIN_EVENTS || self.bytes > RETAIN_BYTES {
+            let event = self.events.pop_front().unwrap();
+            self.bytes -= event.bytes;
+            self.pruned.insert(event.thread, event.sequence);
+        }
+    }
+
+    pub fn committed_events(&self, after: u64) -> Vec<Value> {
+        self.events
+            .iter()
+            .filter(|e| e.sequence > after)
+            .map(|e| e.value.clone())
+            .collect()
+    }
+
+    /// Publish persisted deltas without inspecting inactive thread histories.
+    pub fn ingest(&mut self, events: Vec<Value>) -> Result<(), String> {
+        for value in events {
+            let thread = value["threadId"]
+                .as_u64()
+                .ok_or("Invalid committed thread.")?;
+            let sequence = value["sequence"]
+                .as_u64()
+                .ok_or("Invalid committed sequence.")?;
+            if value["kind"] == "deleted" {
+                self.threads.remove(&thread);
+            } else {
+                let projection = self.threads.entry(thread).or_insert_with(|| Projection {
+                    sequence: 0,
+                    rows: vec![],
+                    fields: json!({"id":thread}),
+                    revision: String::new(),
+                });
+                if sequence <= projection.sequence {
+                    continue;
+                }
+                for event in value["events"]
+                    .as_array()
+                    .ok_or("Invalid committed events.")?
+                {
+                    match event["type"].as_str() {
+                        Some("item.updated") => {
+                            let row: Row = serde_json::from_value(event["row"].clone())
+                                .map_err(|e| e.to_string())?;
+                            if let Some(old) = projection
+                                .rows
+                                .iter_mut()
+                                .find(|r| r.source_item_id == row.source_item_id)
+                            {
+                                *old = row;
+                            } else {
+                                projection.rows.push(row);
+                            }
+                        }
+                        Some("item.removed") => projection
+                            .rows
+                            .retain(|r| event["sourceItemId"] != r.source_item_id),
+                        Some("fields.updated") => projection.fields = event["fields"].clone(),
+                        _ => {}
+                    }
+                }
+                projection.rows.sort_by_key(|r| r.position);
+                projection.sequence = sequence;
+                projection.revision = value["historyRevision"].as_str().unwrap_or("").into();
+            }
+            let bytes = value.to_string().len();
+            let count = value["events"].as_array().map(Vec::len).unwrap_or(1);
+            self.bytes += bytes;
+            self.events.push_back(Event {
+                thread,
+                sequence,
+                value,
+                bytes,
+                count,
+            });
+        }
+        while self.events.len() > RETAIN_EVENTS || self.bytes > RETAIN_BYTES {
+            let event = self.events.pop_front().unwrap();
+            self.bytes -= event.bytes;
+            self.pruned.insert(event.thread, event.sequence);
+        }
+        Ok(())
     }
 
     /// Ported from KSG ThreadStream.decideThreadResume and ws.subscribeThread.

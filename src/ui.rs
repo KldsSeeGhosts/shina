@@ -10354,6 +10354,7 @@ pub(crate) mod tests {
                 "segment".repeat(40)
             );
             rt.state.current_mut().messages = vec![crate::model::Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "You",
                 text: source.clone(),
                 images: vec![],
@@ -10399,11 +10400,13 @@ pub(crate) mod tests {
             thread.captain = None;
             thread.messages = vec![
                 crate::model::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
                     text: "Explain **this change**.".into(),
                     images: vec![],
                 },
                 crate::model::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "Pi",
                     text: "```rust\nlet ready = true;\n```".into(),
                     images: vec![],
@@ -11575,6 +11578,7 @@ pub(crate) mod tests {
         );
         for message in 0..6 {
             rt.state.current_mut().messages.push(crate::model::Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "You",
                 text: format!("Screenshot batch {message}"),
                 images: (0..8)
@@ -13018,6 +13022,7 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             let t = rt.state.current_mut();
             t.messages.push(crate::model::Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "You",
                 text: "Go".into(),
                 images: vec![],
@@ -13282,6 +13287,7 @@ pub(crate) mod tests {
             "args":{"path":"README.md"}
         }));
         rt.state.current_mut().messages.push(crate::model::Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Shina",
             text: "A delegated task finished.".into(),
             images: Vec::new(),

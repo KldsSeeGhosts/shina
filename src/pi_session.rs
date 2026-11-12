@@ -1343,6 +1343,7 @@ impl Thread {
                     && record["message"]["display"] != false =>
             {
                 self.messages.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "Shina",
                     text: content_text(&record["message"]["content"]),
                     images: content_images(&record["message"]["content"]),
@@ -1389,6 +1390,7 @@ impl Thread {
                         .any(|m| m.role == "Shina" && m.text == text)
                     {
                         self.messages.push(Message {
+                            id: uuid::Uuid::new_v4().to_string(),
                             role: "Shina",
                             text,
                             images: content_images(&message["content"]),
@@ -1415,6 +1417,7 @@ impl Thread {
                     Prompt::new(text, content_images(&message["content"]))
                 };
                 self.messages.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
                     text: original.text,
                     images: original.images.to_vec(),
@@ -1428,6 +1431,7 @@ impl Thread {
                 );
                 self.diagnostic(&message);
                 self.messages.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "Shina",
                     text: message,
                     images: vec![],

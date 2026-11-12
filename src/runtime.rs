@@ -126,6 +126,7 @@ impl RuntimeState {
     }
 
     pub fn command(&mut self, device: &str, command: Command) -> Result<Value, String> {
+        self.state.persistence_scope = None;
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -343,8 +344,13 @@ impl RuntimeState {
                 return false;
             }
             let capture = crate::outbox::Capture::begin();
-            let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
-                | self.state.collect_recovered_inputs();
+            self.state.persistence_scope = Some(Default::default());
+            let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default());
+            let recovered = self.state.collect_recovered_inputs();
+            if recovered || update_changed {
+                self.state.persistence_scope = None;
+            }
+            let changed = changed | recovered;
             let effects = capture.finish();
             if !changed && !update_changed && effects.is_empty() && self.pending_effects.is_empty()
             {
@@ -385,16 +391,23 @@ impl RuntimeState {
     }
 
     pub fn snapshot(&self) -> Value {
-        let mut maintenance = self.maintenance.status();
-        if self.state.runtime_stop_requested && !self.maintenance.fenced() {
-            maintenance["phase"] = json!("stopping");
-        }
+        let mut value = self.notification();
+        let maintenance = value["maintenance"].clone();
         let mut state = self.last_projection.clone();
         state["updateStatus"] = self
             .updates
             .status(self.state.update_restart_blocker(), &maintenance);
         state["updateNotice"] = json!(self.updates.outcome);
-        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":state,"historyCursor":null,"maintenance":maintenance})
+        value["state"] = state;
+        value
+    }
+    /// Watchers need the committed cursor, not another copy of every transcript.
+    pub fn notification(&self) -> Value {
+        let mut maintenance = self.maintenance.status();
+        if self.state.runtime_stop_requested && !self.maintenance.fenced() {
+            maintenance["phase"] = json!("stopping");
+        }
+        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"historyCursor":null,"maintenance":maintenance})
     }
 
     fn maintenance_command(&mut self, command: &Command) -> Option<Result<Value, String>> {
@@ -489,34 +502,78 @@ impl RuntimeState {
     ) -> Result<(), String> {
         let database = self.database.clone().ok_or("No runtime database.")?;
         let result = (|| {
-            self.state.checkpoint_and_flush()?;
-            let mut projection = self.state.projection();
-            projection["updateStatus"] = self.updates.status(
-                self.state.update_restart_blocker(),
-                &self.maintenance.status(),
-            );
-            projection["updateNotice"] = json!(self.updates.outcome);
-            if receipt.is_none()
-                && effects.is_empty()
-                && self.pending_effects.is_empty()
-                && projection == self.last_projection
-                && database.finish_if_unchanged()?
+            if effects.len() > 0
+                && self
+                    .state
+                    .persistence_scope
+                    .as_ref()
+                    .is_some_and(|s| s.is_empty())
             {
-                return Ok(());
+                self.state.persistence_scope = None;
             }
-            self.seq = self
+            let mut index = self
+                .state
+                .snapshot_scoped(self.state.persistence_scope.as_ref());
+            let next = self
                 .seq
                 .checked_add(1)
                 .filter(|seq| *seq <= i64::MAX as u64)
                 .ok_or("Server sequence exhausted.")?;
+            for view in index["threadViews"].as_array_mut().unwrap() {
+                let before = self.last_projection["threads"]
+                    .as_array()
+                    .and_then(|threads| threads.iter().find(|t| t["id"] == view["id"]))
+                    .unwrap_or(&Value::Null);
+                crate::history::stamp(before, view, next);
+            }
+            let mut projection = self.state.projection_from_snapshot(index.clone());
+            {
+                projection["updateStatus"] = self.updates.status(
+                    self.state.update_restart_blocker(),
+                    &self.maintenance.status(),
+                );
+                projection["updateNotice"] = json!(self.updates.outcome);
+            }
+            let previous_threads = if projection["_partial"] == true {
+                json!(
+                    projection["threads"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|t| self.last_projection["threads"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|old| old["id"] == t["id"])
+                            .cloned())
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                self.last_projection["threads"].clone()
+            };
+            let previous = json!({"seq":self.seq,"state":{"threads":previous_threads}});
+            let mut history = crate::history::Streams::new(&previous);
+            history.publish(&json!({"seq":next,"state":{"threads":projection["threads"]}}));
+            database.stage_history(history.committed_events(self.seq));
+            let patch = update_projection(&mut self.last_projection, &projection);
+            if receipt.is_none()
+                && effects.is_empty()
+                && self.pending_effects.is_empty()
+                && patch.as_array().is_some_and(Vec::is_empty)
+                && database.finish_if_unchanged()?
+            {
+                return Ok(());
+            }
+            self.seq = next;
             self.state.advance_server_sequence(self.seq);
-            self.state.checkpoint_and_flush()?;
-            let patch = crate::protocol::diff(
-                &crate::protocol::compact(&self.last_projection),
-                &crate::protocol::compact(&projection),
-            );
+            index["serverSeq"] = json!(self.seq);
+            database.write("index.json", index)?;
+            database.write(
+                "server-inputs.json",
+                self.state
+                    .runtime_input_snapshot(self.state.persistence_scope.as_ref()),
+            )?;
             database.commit(self.seq, &projection, &patch, receipt, &effects)?;
-            self.last_projection = projection;
             self.pending_effects.extend(effects);
             if self.maintenance.fenced() || self.validation_hold {
                 return Ok(());
@@ -543,6 +600,7 @@ impl RuntimeState {
     }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
+        self.state.persistence_scope = None;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -593,6 +651,65 @@ impl RuntimeState {
         }
         result
     }
+}
+
+/// Apply only changed scopes. Paths retain their workspace indices on the wire.
+fn update_projection(current: &mut Value, delta: &Value) -> Value {
+    if delta["_partial"] != true {
+        let patch = crate::protocol::diff(
+            &crate::protocol::compact(current),
+            &crate::protocol::compact(delta),
+        );
+        *current = delta.clone();
+        return patch;
+    }
+    let mut patches = Vec::new();
+    for (key, value) in delta.as_object().unwrap() {
+        if key == "_partial" {
+            continue;
+        }
+        if key == "index" {
+            let nested = update_projection(&mut current["index"], value);
+            for mut patch in nested.as_array().unwrap().clone() {
+                patch["path"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, json!("index"));
+                patches.push(patch);
+            }
+        } else if key == "threads" {
+            for thread in value.as_array().unwrap() {
+                let threads = current["threads"].as_array_mut().unwrap();
+                let index = threads
+                    .iter()
+                    .position(|t| t["id"] == thread["id"])
+                    .expect("dirty existing thread");
+                let compact = |t: &Value| {
+                    crate::protocol::compact(&json!({"threads":[t]}))["threads"][0].clone()
+                };
+                let change = if thread.get("messages").is_some() {
+                    crate::protocol::diff(&compact(&threads[index]), &compact(thread))
+                } else {
+                    crate::protocol::diff(&threads[index], thread)
+                };
+                for mut patch in change.as_array().unwrap().clone() {
+                    let path = patch["path"].as_array_mut().unwrap();
+                    path.insert(0, json!(index.to_string()));
+                    path.insert(0, json!("threads"));
+                    patches.push(patch);
+                }
+                threads[index] = thread.clone();
+            }
+        } else {
+            let change = crate::protocol::diff(&current[key], value);
+            for mut patch in change.as_array().unwrap().clone() {
+                patch["path"].as_array_mut().unwrap().insert(0, json!(key));
+                patches.push(patch);
+            }
+            current[key] = value.clone();
+        }
+    }
+    json!(patches)
 }
 
 pub const TICK: Duration = Duration::from_millis(25);

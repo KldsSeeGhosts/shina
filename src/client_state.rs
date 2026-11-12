@@ -2,11 +2,62 @@
 use super::*;
 use crate::protocol::{Command, Receipt};
 
+// A fixed monotonic/wall-clock pair makes a start timestamp stable across captures.
+fn stable_timestamp(at: Instant) -> u64 {
+    static CLOCK: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
+    let (instant, unix) = CLOCK.get_or_init(|| (Instant::now(), crate::lifecycle::now()));
+    if at >= *instant {
+        unix.saturating_add(at.duration_since(*instant).as_millis() as u64)
+    } else {
+        unix.saturating_sub(instant.duration_since(at).as_millis() as u64)
+    }
+}
+fn timestamp_instant(unix: u64) -> Option<Instant> {
+    Instant::now().checked_sub(Duration::from_millis(
+        crate::lifecycle::now().saturating_sub(unix),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn running_projection_timestamps_do_not_advance_with_presentation_time() {
+    let mut thread = Thread::new(1);
+    thread.status = Status::Running;
+    thread.started = Some(Instant::now());
+    thread.tools.push(Tool::new(
+        "clock",
+        "test",
+        &json!({}),
+        ToolAnchor {
+            message: 0,
+            offset: 0,
+        },
+    ));
+    thread.tools[0].started = Some(Instant::now());
+    let first = serde_json::to_value(ThreadView::capture(&thread)).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        first,
+        serde_json::to_value(ThreadView::capture(&thread)).unwrap()
+    );
+    let mut client = Thread::new(1);
+    serde_json::from_value::<ThreadView>(first)
+        .unwrap()
+        .apply(&mut client)
+        .unwrap();
+    assert!(client.started.unwrap().elapsed() >= Duration::from_secs(1));
+    assert!(client.tools[0].started.unwrap().elapsed() >= Duration::from_secs(1));
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MessageView {
+    #[serde(default = "new_message_id")]
+    id: String,
     role: String,
     text: String,
     images: Vec<Attachment>,
+}
+fn new_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -39,6 +90,12 @@ struct ThreadView {
     request: Option<Value>,
     questionnaire: Value,
     elapsed: Option<u64>,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    tool_started_at: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    thought_started_at: Vec<Option<u64>>,
     queue: Vec<(usize, String, Vec<Attachment>)>,
     steering: Vec<String>,
     follow_ups: Vec<String>,
@@ -71,6 +128,7 @@ impl ThreadView {
                 .messages
                 .iter()
                 .map(|m| MessageView {
+                    id: m.id.clone(),
                     role: m.role.into(),
                     text: m.text.clone(),
                     images: m.images.clone(),
@@ -81,12 +139,7 @@ impl ThreadView {
                 .iter()
                 .map(|tool| {
                     let mut tool = tool.clone();
-                    if !tool.done {
-                        tool.duration_ms = tool
-                            .started
-                            .map(|at| at.elapsed().as_secs().saturating_mul(1000))
-                            .or(tool.duration_ms);
-                    }
+                    tool.started = None;
                     tool
                 })
                 .collect(),
@@ -95,12 +148,7 @@ impl ThreadView {
                 .iter()
                 .map(|thought| {
                     let mut thought = thought.clone();
-                    if !thought.done {
-                        thought.duration_ms = thought
-                            .started
-                            .map(|at| at.elapsed().as_secs().saturating_mul(1000))
-                            .or(thought.duration_ms);
-                    }
+                    thought.started = None;
                     thought
                 })
                 .collect(),
@@ -126,10 +174,18 @@ impl ThreadView {
                 request
             }),
             questionnaire: thread.projected_form(),
-            elapsed: thread
-                .started
-                .map(|at| at.elapsed().as_secs())
-                .or(thread.elapsed),
+            elapsed: thread.elapsed,
+            started_at: thread.started.map(stable_timestamp),
+            tool_started_at: thread
+                .tools
+                .iter()
+                .filter_map(|t| Some((t.id.clone(), stable_timestamp(t.started?))))
+                .collect(),
+            thought_started_at: thread
+                .thoughts
+                .iter()
+                .map(|t| t.started.map(stable_timestamp))
+                .collect(),
             queue: thread
                 .native
                 .queue
@@ -163,6 +219,7 @@ impl ThreadView {
             .into_iter()
             .map(|message| {
                 Ok(Message {
+                    id: message.id,
                     role: match message.role.as_str() {
                         "You" => "You",
                         "Pi" => "Pi",
@@ -177,9 +234,15 @@ impl ThreadView {
         let mut tools = self.tools;
         for tool in &mut tools {
             if !tool.done {
-                tool.started = tool
-                    .duration_ms
-                    .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
+                tool.started = self
+                    .tool_started_at
+                    .get(&tool.id)
+                    .copied()
+                    .and_then(timestamp_instant)
+                    .or_else(|| {
+                        tool.duration_ms
+                            .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
+                    });
             }
             if let Some(old) = thread.tools.iter().find(|old| old.id == tool.id) {
                 tool.expanded = old.expanded;
@@ -189,11 +252,19 @@ impl ThreadView {
         }
         thread.tools = tools;
         let mut thoughts = self.thoughts;
-        for thought in &mut thoughts {
+        for (index, thought) in thoughts.iter_mut().enumerate() {
             if !thought.done {
-                thought.started = thought
-                    .duration_ms
-                    .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
+                thought.started = self
+                    .thought_started_at
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .and_then(timestamp_instant)
+                    .or_else(|| {
+                        thought
+                            .duration_ms
+                            .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
+                    });
             }
             thought.expanded = thread
                 .thoughts
@@ -251,9 +322,14 @@ impl ThreadView {
         }
         thread.elapsed = self.elapsed;
         thread.started = self
-            .elapsed
+            .started_at
+            .and_then(timestamp_instant)
             .filter(|_| thread.status.busy())
-            .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs)));
+            .or_else(|| {
+                self.elapsed
+                    .filter(|_| thread.status.busy())
+                    .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs)))
+            });
         thread.native.queue = self
             .queue
             .into_iter()
@@ -404,6 +480,7 @@ impl State {
         archived.project = Some(project);
         archived.life.archived_at = Some(lifecycle::now());
         archived.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "Retained archived reply".into(),
             images: vec![],
@@ -645,15 +722,33 @@ impl State {
     }
 
     pub(super) fn thread_views(&self) -> Value {
+        self.thread_views_scoped(None)
+    }
+    pub(super) fn thread_views_scoped(
+        &self,
+        scope: Option<&std::collections::HashSet<usize>>,
+    ) -> Value {
         json!(
             self.threads
                 .iter()
+                .filter(|t| scope.is_none_or(|scope| scope.contains(&t.id)))
                 .map(ThreadView::capture)
                 .collect::<Vec<_>>()
         )
     }
     pub fn projection(&self) -> Value {
-        let mut index = self.snapshot();
+        self.projection_from_snapshot(self.snapshot())
+    }
+    pub(crate) fn projection_from_snapshot(&self, mut index: Value) -> Value {
+        let views = index
+            .as_object_mut()
+            .unwrap()
+            .remove("threadViews")
+            .unwrap_or_else(|| self.thread_views());
+        if index["_partial"] == true {
+            index.as_object_mut().unwrap().remove("runtimeInputs");
+            return json!({"_partial":true,"index":index,"threads":views});
+        }
         for key in [
             "commandReceipts",
             "commandIntents",
@@ -664,7 +759,7 @@ impl State {
             index.as_object_mut().expect("index").remove(key);
         }
         json!({
-            "index":index,"threads":self.thread_views(),"recoveryNotice":self.recovery_notice,
+            "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
@@ -4157,6 +4252,7 @@ mod tests {
     fn switching_back_to_legacy_keeps_server_transcripts_and_receipts() {
         let (mut runtime, _commands) = wired();
         runtime.state.current_mut().messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "durable server reply".into(),
             images: vec![],

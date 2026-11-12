@@ -586,7 +586,7 @@ impl Store {
 
     pub fn save(&mut self, value: Value) {
         if let Some((database, name)) = &self.database {
-            let serialized = value.to_string();
+            let serialized = crate::database::encode(&value);
             if serialized == self.last {
                 return;
             }

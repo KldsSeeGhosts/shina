@@ -384,8 +384,23 @@ async fn send(socket: &mut WebSocket, value: Value) -> bool {
     )
 }
 
-async fn snapshot(socket: &mut WebSocket, value: &Value, paged: bool) -> bool {
+async fn snapshot(
+    socket: &mut WebSocket,
+    value: &Value,
+    paged: bool,
+    database: &crate::database::Database,
+) -> bool {
     let mut snapshot = value.clone();
+    if snapshot["state"].is_null() {
+        let database = database.clone();
+        let Ok(Ok(committed)) =
+            tokio::task::spawn_blocking(move || database.committed_snapshot()).await
+        else {
+            return false;
+        };
+        snapshot["state"] = committed["state"].clone();
+        snapshot["seq"] = committed["seq"].clone();
+    }
     snapshot["subscriptionId"] = json!("workspace");
     if paged {
         snapshot["state"] = protocol::compact(&snapshot["state"]);
@@ -447,7 +462,7 @@ async fn synchronize(
         }
         return true;
     }
-    snapshot(socket, current, paged).await
+    snapshot(socket, current, paged, &shared.database).await
 }
 
 // Ported from KSG ws.subscribeOrchestrationV2Thread. Data fragments are wire-only.
@@ -491,7 +506,7 @@ async fn replay_thread(
         let mut cursor = high;
         for event in events {
             cursor = cursor.max(event["sequence"].as_u64().unwrap_or(after));
-            if !thread_stream(socket, event, &shared.discovery.instance_id).await {
+            if !thread_stream(socket, event, &shared.discovery.epoch).await {
                 return None;
             }
         }
@@ -500,7 +515,7 @@ async fn replay_thread(
         thread_stream(
             socket,
             json!({"kind":"snapshot-required","threadId":thread,"sequence":high}),
-            &shared.discovery.instance_id,
+            &shared.discovery.epoch,
         )
         .await
         .then_some(high)
@@ -594,16 +609,16 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         let replay = {
                             let streams = shared.history_streams.lock().expect("history streams");
                             let events = params["afterSequence"].as_u64()
-                                .filter(|_| params["streamEpoch"] == shared.discovery.instance_id)
+                                .filter(|_| params["streamEpoch"] == shared.discovery.epoch)
                                 .and_then(|after| streams.replay(thread, after));
                             (events,streams.high_water(thread).unwrap_or(0))
                         };
                         if let (Some(events),high) = replay {
                             for event in events {
-                                if !thread_stream(&mut socket, event, &shared.discovery.instance_id).await { return; }
+                                if !thread_stream(&mut socket, event, &shared.discovery.epoch).await { return; }
                             }
                             active_thread = Some((thread,high));
-                            Ok(json!({"kind":"synchronized","threadId":thread,"snapshotSequence":high,"streamEpoch":shared.discovery.instance_id}))
+                            Ok(json!({"kind":"synchronized","threadId":thread,"snapshotSequence":high,"streamEpoch":shared.discovery.epoch}))
                         } else {
                             // Register from this exact snapshot sequence before reading later publishes.
                             let page = shared.history_streams.lock().expect("history streams")
@@ -611,7 +626,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             if let Ok(page) = &page { active_thread = Some((thread,page["snapshotSequence"].as_u64().unwrap_or(0))); }
                             history_leases.read(thread, &json!({"byteBudget":params["byteBudget"]}), Instant::now(), || page).map(|mut page| {
                                 page["kind"] = json!("snapshot");
-                                page["streamEpoch"] = json!(shared.discovery.instance_id);
+                                page["streamEpoch"] = json!(shared.discovery.epoch);
                                 page
                             })
                         }
@@ -859,9 +874,14 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         .map_err(|e| e.to_string())?;
     let (calls, mut incoming) = mpsc::channel::<Call>(32);
     let (snapshots, receive) = watch::channel(Arc::new(runtime.snapshot()));
+    let mut published_sequence = runtime.seq;
     let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
         &snapshots.borrow(),
     )));
+    history_streams
+        .lock()
+        .expect("history streams")
+        .restore(runtime.database.as_ref().unwrap().history_events()?);
     let (stop, mut stopping) = watch::channel(false);
     let stop_state = stopping.clone();
     let network = tokio::runtime::Builder::new_multi_thread()
@@ -985,11 +1005,15 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
             return Err(error);
         }
         if changed {
-            let snapshot = Arc::new(runtime.snapshot());
-            history_streams
-                .lock()
-                .expect("history streams")
-                .publish(&snapshot);
+            let snapshot = Arc::new(runtime.notification());
+            history_streams.lock().expect("history streams").ingest(
+                runtime
+                    .database
+                    .as_ref()
+                    .unwrap()
+                    .history_events_after(published_sequence)?,
+            )?;
+            published_sequence = runtime.seq;
             snapshots.send_replace(snapshot);
         }
         let _ = wake_receive.recv_timeout(runtime::TICK);
@@ -1099,6 +1123,10 @@ mod tests {
             let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
                 &snapshots.borrow(),
             )));
+            history_streams
+                .lock()
+                .unwrap()
+                .restore(database.history_events().unwrap());
             let worker_streams = history_streams.clone();
             let (disconnect, shutdown) = watch::channel(false);
             let stop = Arc::new(AtomicBool::new(false));

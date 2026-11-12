@@ -37,6 +37,7 @@ mod peer;
 mod portraits;
 mod power;
 mod process;
+mod projection_store;
 mod projects;
 mod protocol;
 mod routines;
@@ -238,6 +239,7 @@ fn html_demo(state: &mut State) {
     thread.captain = None;
     thread.title = "HTML rendering example".into();
     thread.messages = vec![model::Message {
+        id: uuid::Uuid::new_v4().to_string(),
         role: "You",
         text: "Show an example HTML chart.".into(),
         images: vec![],
@@ -305,8 +307,8 @@ fn markdown_demo(state: &mut State) {
     thread.work.clear();
     thread.captain = None;
     thread.messages = vec![
-        model::Message { role: "You", text: "Keep the setup order:\nattach the listener\nopen the socket\n\n```rust\nlet ready = true;\n```".into(), images: vec![] },
-        model::Message { role: "Pi", text: "Register the listener before opening the socket.\n\n```rust\nlet ready = true;\nif ready {\n    socket.open();\n}\n```\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nBoth blocks have a code-only copy action.".into(), images: vec![] },
+        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Keep the setup order:\nattach the listener\nopen the socket\n\n```rust\nlet ready = true;\n```".into(), images: vec![] },
+        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "Register the listener before opening the socket.\n\n```rust\nlet ready = true;\nif ready {\n    socket.open();\n}\n```\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nBoth blocks have a code-only copy action.".into(), images: vec![] },
     ];
 }
 
@@ -322,12 +324,12 @@ fn captain_workspace_demo(state: &mut State) {
     state.threads[home].title = "Polish the Shina workspace".into();
     state.threads[home].renamed = true;
     state.threads[home].messages = vec![
-        model::Message {
+        model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "You",
             text: "Refine the sidebar and composer. Keep our captains and existing animations, but give each kind of work one clear place.".into(),
             images: vec![],
         },
-        model::Message {
+        model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "The workspace filter now applies to every conversation.\n\nI'll keep the sidebar review and reconnect fix under this captain. Independent conversations stay in the thread list, with the same pin, snooze, and settle controls.\n\nThe sidebar review needs your approval. You can open the worker directly without leaving this body of work.".into(),
             images: vec![],
@@ -460,12 +462,12 @@ fn crew_tasks_demo(state: &mut State) {
         .unwrap();
     home.messages = vec![
         request,
-        model::Message {
+        model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: plan.into(),
             images: vec![],
         },
-        model::Message {
+        model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Shina",
             text: "Shina: task #1 finished
 Task id: demo
@@ -476,7 +478,7 @@ Reconnect now retries with backoff and keeps the draft. I added a regression tes
 Error: none".into(),
             images: vec![],
         },
-        model::Message {
+        model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "The reconnect fix is in and tested. The sidebar review is waiting on your approval below, and the crew tray notes start when a slot frees up.".into(),
             images: vec![],
@@ -596,6 +598,7 @@ fn captain_brief_demo(state: &mut State) {
     earlier.life.created_at = earlier.updated * 1000;
     earlier.life.updated_at = earlier.life.created_at;
     earlier.messages = vec![model::Message {
+        id: uuid::Uuid::new_v4().to_string(),
         role: "You",
         text: "Example message in an earlier conversation.".into(),
         images: vec![],
@@ -877,7 +880,7 @@ fn main() {
                 t.status = model::Status::Running;
                 t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(65));
                 t.messages = vec![
-                    model::Message {
+                    model::Message { id: uuid::Uuid::new_v4().to_string(),
                         role: "Shina",
                         text: "Shina: task from parent #7
 
