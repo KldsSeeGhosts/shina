@@ -6035,46 +6035,27 @@ fn remote_project_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// What a tool call does, for its one-line row: icon, past and present verb, and what it
-/// acts on. Reads, listings and searches count as exploring when grouped, as Cursor does.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ToolKind {
-    Read,
-    List,
-    Search,
-    Edit,
-    Run,
-    Other,
-}
-
-fn tool_kind(tool: &Tool) -> ToolKind {
-    use crate::work::ToolKind as Kind;
-    match tool.resolved_kind() {
-        Kind::Read => ToolKind::Read,
-        Kind::FileChange => ToolKind::Edit,
-        Kind::Command => ToolKind::Run,
-        Kind::FileSearch | Kind::WebSearch => ToolKind::Search,
-        Kind::List => ToolKind::List,
-        _ => ToolKind::Other,
-    }
-}
-
 /// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
 fn tool_verb(tool: &Tool) -> String {
+    use crate::work::ToolKind::*;
     let done = tool.done || tool.failed;
-    match (tool_kind(tool), done) {
-        (ToolKind::Read, true) => "Read".into(),
-        (ToolKind::Read, false) => "Reading".into(),
-        (ToolKind::List, true) => "Listed".into(),
-        (ToolKind::List, false) => "Listing".into(),
-        (ToolKind::Search, true) => "Searched".into(),
-        (ToolKind::Search, false) => "Searching".into(),
-        (ToolKind::Edit, true) => "Edited".into(),
-        (ToolKind::Edit, false) => "Editing".into(),
-        (ToolKind::Run, true) => "Ran".into(),
-        (ToolKind::Run, false) => "Running".into(),
-        (ToolKind::Other, true) => format!("Called {}", tool.name),
-        (ToolKind::Other, false) => format!("Calling {}", tool.name),
+    match (tool.resolved_kind(), done) {
+        (Read, true) => "Read".into(),
+        (Read, false) => "Reading".into(),
+        (List, true) => "Listed".into(),
+        (List, false) => "Listing".into(),
+        (FileSearch | WebSearch, true) => "Searched".into(),
+        (FileSearch | WebSearch, false) => "Searching".into(),
+        (FileChange, true) => "Changed".into(),
+        (FileChange, false) => "Changing".into(),
+        (Command, true) => "Ran".into(),
+        (Command, false) => "Running".into(),
+        (Subagent, true) => "Delegated".into(),
+        (Subagent, false) => "Delegating".into(),
+        (Plan, true) => "Updated plan".into(),
+        (Plan, false) => "Updating plan".into(),
+        (Other, true) => format!("Called {}", tool.name),
+        (Other, false) => format!("Calling {}", tool.name),
     }
 }
 
@@ -6091,64 +6072,9 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// One line for a batch: "Explored 3 files, 2 searches", "Edited 1 file", "Ran 2 commands".
+/// Ported from KSG Code's work-log/presentation.ts summarizeToolGroup.
 fn tool_summary(tools: &[&Tool]) -> String {
-    let count = |kind: ToolKind| tools.iter().filter(|t| tool_kind(t) == kind).count();
-    let (read, list, search) = (
-        count(ToolKind::Read),
-        count(ToolKind::List),
-        count(ToolKind::Search),
-    );
-    let mut parts = vec![];
-    if read + list + search > 0 {
-        let mut explored = vec![];
-        if read > 0 {
-            explored.push(plural(read, "file", "files"));
-        }
-        if list > 0 {
-            explored.push(plural(list, "directory", "directories"));
-        }
-        if search > 0 {
-            explored.push(plural(search, "search", "searches"));
-        }
-        // A batch of reads alone reads as plain "Read 2 files".
-        let verb = if list + search == 0 {
-            "Read"
-        } else if read + search == 0 {
-            "Listed"
-        } else if read + list == 0 {
-            "Searched"
-        } else {
-            "Explored"
-        };
-        parts.push(if verb == "Searched" {
-            format!("Ran {}", explored.join(", "))
-        } else {
-            format!("{verb} {}", explored.join(", "))
-        });
-    }
-    for (kind, verb, one, many) in [
-        (ToolKind::Edit, "Edited", "file", "files"),
-        (ToolKind::Run, "Ran", "command", "commands"),
-        (ToolKind::Other, "Called", "tool", "tools"),
-    ] {
-        let n = count(kind);
-        if n > 0 {
-            parts.push(format!("{verb} {}", plural(n, one, many)));
-        }
-    }
-    parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| {
-            if i == 0 {
-                part.clone()
-            } else {
-                part.to_lowercase()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    crate::work::summarize(tools)
 }
 
 /// Turn and thinking durations, as Cursor writes them: 45s, 2m 5s, 1h 3m.
@@ -6168,7 +6094,7 @@ enum TranscriptPart {
         to: usize,
     },
     Tools(Vec<usize>),
-    Thought(usize),
+    Thought(Vec<usize>),
 }
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
@@ -6208,7 +6134,11 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
                 parts.push(TranscriptPart::Text { message, from, to });
             }
             if thinking {
-                parts.push(TranscriptPart::Thought(index));
+                if let Some(TranscriptPart::Thought(indices)) = parts.last_mut() {
+                    indices.push(index);
+                } else {
+                    parts.push(TranscriptPart::Thought(vec![index]));
+                }
             } else if previous_anchor == Some(anchor)
                 && let Some(TranscriptPart::Tools(indices)) = parts.last_mut()
             {
@@ -6353,80 +6283,11 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
-fn inline_thought(s: &State, p: Palette, index: usize) -> El {
-    let t = s.current();
-    let thought = &t.thoughts[index];
-    let timing = thought.duration_ms.or_else(|| {
-        (!thought.done)
-            .then(|| {
-                thought
-                    .started
-                    .map(|start| start.elapsed().as_millis() as u64)
-            })
-            .flatten()
-    });
-    let (verb, detail) = match (thought.done, timing) {
-        (true, Some(ms)) if ms < 500 => ("Thought", "briefly".to_string()),
-        (true, Some(ms)) => ("Thought", elapsed_label(ms / 1000)),
-        (false, Some(ms)) => ("Thinking", elapsed_label(ms / 1000)),
-        (true, None) => ("Thought", String::new()),
-        (false, None) => ("Thinking", String::new()),
-    };
-    let mut content = col().gap(4.0).child(
-        activity_line(
-            format!("inline-thought-{}-{index}", t.id),
-            format!(
-                "{} thinking text",
-                if thought.expanded { "Hide" } else { "Show" }
-            ),
-            verb.into(),
-            &detail,
-            false,
-            thought.expanded,
-            "brain",
-            p,
-        )
-        .on_press(move |s: &mut State| {
-            let thought = &mut s.current_mut().thoughts[index];
-            thought.expanded = !thought.expanded;
-        }),
-    );
-    if thought.expanded {
-        // Thinking reads as a quiet aside, not a boxed output.
-        content = content.child(
-            col()
-                .key(format!("thought-output-{}-{index}", t.id))
-                .role("group")
-                .label("Thinking text")
-                .pl(28.0)
-                .mb(4.0)
-                .max_h(220.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: !thought.done,
-                })
-                .child(
-                    label(
-                        if thought.text.is_empty() {
-                            "Pi did not provide visible thinking text."
-                        } else {
-                            &thought.text
-                        },
-                        TextStyle::new(13.0, 400.0).lh(20.0),
-                        p.faint,
-                    )
-                    .wrap_anywhere()
-                    .selectable(true),
-                ),
-        );
-    }
-    content
-}
-
 fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
-        TranscriptPart::Thought(index) => inline_thought(s, p, *index),
+        TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
@@ -11699,14 +11560,14 @@ pub(crate) mod tests {
         );
         assert_eq!(
             tool_summary(&t.tools[2..].iter().collect::<Vec<_>>()),
-            "Edited 1 file, ran 1 command"
+            "Changed 1 file and ran 1 command"
         );
         let explored = [&t.tools[0], &t.tools[0]];
         let mut search = t.tools[0].clone();
         search.name = "grep".into();
         assert_eq!(
             tool_summary(&[explored[0], explored[1], &search]),
-            "Explored 2 files, 1 search"
+            "Read 2 files and searched code 1 time"
         );
         assert_eq!(elapsed_label(125), "2m 5s");
         assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
@@ -11729,7 +11590,7 @@ pub(crate) mod tests {
             turn_parts(&thread, 0, 1),
             vec![
                 TranscriptPart::Tools(vec![0]),
-                TranscriptPart::Thought(0),
+                TranscriptPart::Thought(vec![0]),
                 TranscriptPart::Tools(vec![1]),
                 TranscriptPart::Text {
                     message: 0,

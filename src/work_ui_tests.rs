@@ -107,3 +107,65 @@ fn raw_is_a_closed_disclosure_and_web_links_use_rune_open_url() {
     assert!(rt.state.current().tools[0].raw_expanded);
     assert!(rt.find(&format!("tool-raw-{id}-0")).is_some());
 }
+
+#[test]
+fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        t.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,
+            "data":{"messages":[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"First thought."},
+                {"type":"thinking","thinking":"Second thought."},
+                {"type":"thinking","thinking":"Third thought."},
+                {"type":"toolCall","id":"read","name":"read","arguments":{"path":"a.rs"}},
+                {"type":"thinking","thinking":"After the tool."}]}]}}),
+        );
+        assert_eq!(
+            turn_parts(t, 0, 1),
+            vec![
+                TranscriptPart::Thought(vec![0, 1, 2]),
+                TranscriptPart::Tools(vec![0]),
+                TranscriptPart::Thought(vec![3])
+            ]
+        );
+        t.work[0].expanded = true;
+        let id = t.id;
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(rt.find(&format!("inline-thought-{id}-0")).is_some());
+        assert!(rt.find(&format!("inline-thought-{id}-1")).is_none());
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Thought ×3"))
+        );
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Thought"))
+        );
+        press(&mut rt, &format!("inline-thought-{id}-0"));
+        rt.frame(2.0);
+        let mut previous_y = f32::NEG_INFINITY;
+        for index in 0..3 {
+            let (rect, _) = rt
+                .presented(&format!("thought-output-{id}-{index}"))
+                .unwrap();
+            assert!(rect[1] > previous_y, "{width}: thought order");
+            previous_y = rect[1];
+        }
+        assert!(rt.find(&format!("thought-output-{id}-3")).is_none());
+        assert_eq!(
+            rt.elements()
+                .iter()
+                .filter(|e| e
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("toggle-work-")))
+                .count(),
+            1
+        );
+    }
+}

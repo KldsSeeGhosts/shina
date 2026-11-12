@@ -97,6 +97,67 @@ fn output(tool: &Tool, p: Palette, id: &str) -> El {
     )
 }
 
+/// Ported from KSG Code's reasoning-only group summary. Keep one disclosure per
+/// consecutive run of thoughts, with the original text keys inside it.
+pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
+    let t = s.current();
+    let first = indices[0];
+    let expanded = t.thoughts[first].expanded;
+    let title = if indices.len() == 1 {
+        "Thought".into()
+    } else {
+        format!("Thought ×{}", indices.len())
+    };
+    let mut content = col().min_w(0.0).gap(4.0).child(
+        activity_line(
+            format!("inline-thought-{}-{first}", t.id),
+            format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
+            title,
+            "",
+            false,
+            expanded,
+            "brain",
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            let thought = &mut s.current_mut().thoughts[first];
+            thought.expanded = !thought.expanded;
+        }),
+    );
+    if expanded {
+        for index in indices {
+            let thought = &t.thoughts[*index];
+            content = content.child(
+                col()
+                    .key(format!("thought-output-{}-{index}", t.id))
+                    .role("group")
+                    .label("Thinking text")
+                    .min_w(0.0)
+                    .pl(28.0)
+                    .mb(4.0)
+                    .max_h(200.0)
+                    .scroll(ScrollSpec {
+                        stick_bottom: !thought.done,
+                    })
+                    .child(
+                        label(
+                            if thought.text.is_empty() {
+                                "The provider did not provide visible thinking text."
+                            } else {
+                                &thought.text
+                            },
+                            TextStyle::new(13.0, 400.0).lh(20.0),
+                            p.faint,
+                        )
+                        .wrap_anywhere()
+                        .selectable(true),
+                    ),
+            );
+        }
+    }
+    content
+}
+
 /// The existing output frame owns padding and caps, not a second inspector or drawer.
 pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();

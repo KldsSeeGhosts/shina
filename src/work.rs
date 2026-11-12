@@ -154,3 +154,188 @@ pub fn result_metadata(kind: ToolKind, changes: Vec<FileChange>, source: &Value)
         "webResults":source.get("results").filter(|_|kind == ToolKind::WebSearch)
     })
 }
+
+/// KSG's summarizeToolGroup: two highest-priority actions, in first-seen order,
+/// plus the number of calls not represented by those actions.
+pub fn summarize(tools: &[&Tool]) -> String {
+    use ToolKind::*;
+    let mut groups: Vec<(ToolKind, Vec<&Tool>)> = vec![];
+    for tool in tools {
+        let kind = tool.resolved_kind();
+        if let Some((_, calls)) = groups.iter_mut().find(|(k, _)| *k == kind) {
+            calls.push(tool);
+        } else {
+            groups.push((kind, vec![tool]));
+        }
+    }
+    let mut selected: Vec<_> = (0..groups.len()).collect();
+    selected.sort_by_key(|i| {
+        (
+            match groups[*i].0 {
+                Command | FileChange | Subagent => 0,
+                Other | Plan => 2,
+                _ => 1,
+            },
+            *i,
+        )
+    });
+    selected.truncate(2);
+    selected.sort_unstable();
+    let count = |n, one, many| format!("{n} {}", if n == 1 { one } else { many });
+    let mut labels = vec![];
+    for i in &selected {
+        let (kind, calls) = &groups[*i];
+        let running = calls.iter().any(|t| !t.done && !t.failed);
+        let n = if *kind == FileChange {
+            let mut paths = std::collections::HashSet::new();
+            let mut unknown = 0;
+            for call in calls {
+                if call.changes.is_empty() {
+                    let path = call.input["path"]
+                        .as_str()
+                        .or_else(|| call.input["file_path"].as_str())
+                        .unwrap_or(&call.detail);
+                    if path.is_empty() {
+                        unknown += 1;
+                    } else {
+                        paths.insert(path.replace('\\', "/"));
+                    }
+                } else {
+                    paths.extend(call.changes.iter().map(|c| c.path.replace('\\', "/")));
+                }
+            }
+            paths.len() + unknown
+        } else {
+            calls.len()
+        };
+        labels.push(match kind {
+            Command => format!(
+                "{} {}",
+                if running { "Running" } else { "Ran" },
+                count(n, "command", "commands")
+            ),
+            FileChange => format!(
+                "{} {}",
+                if running { "Changing" } else { "Changed" },
+                count(n, "file", "files")
+            ),
+            FileSearch => format!(
+                "{} code {}",
+                if running { "Searching" } else { "Searched" },
+                count(n, "time", "times")
+            ),
+            WebSearch => format!(
+                "{} the web {}",
+                if running { "Searching" } else { "Searched" },
+                count(n, "time", "times")
+            ),
+            Read => format!(
+                "{} {}",
+                if running { "Reading" } else { "Read" },
+                count(n, "file", "files")
+            ),
+            List => format!(
+                "{} {}",
+                if running { "Listing" } else { "Listed" },
+                count(n, "directory", "directories")
+            ),
+            Subagent => format!(
+                "{} {}",
+                if running { "Delegating" } else { "Delegated" },
+                count(n, "task", "tasks")
+            ),
+            Plan => format!(
+                "{} {}",
+                if running { "Updating" } else { "Updated" },
+                count(n, "plan", "plans")
+            ),
+            Other => format!(
+                "{} {}",
+                if running { "Using" } else { "Used" },
+                count(n, "tool", "tools")
+            ),
+        });
+    }
+    let remaining: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !selected.contains(i))
+        .flat_map(|(_, (_, calls))| calls)
+        .collect();
+    if !remaining.is_empty() {
+        labels.push(format!(
+            "{} {}",
+            if remaining.iter().any(|t| !t.done && !t.failed) {
+                "Performing"
+            } else {
+                "Performed"
+            },
+            count(remaining.len(), "other action", "other actions")
+        ));
+    }
+    for label in labels.iter_mut().skip(1) {
+        label.replace_range(..1, &label[..1].to_ascii_lowercase());
+    }
+    match labels.len() {
+        0 => String::new(),
+        1 => labels.remove(0),
+        2 => labels.join(" and "),
+        _ => format!(
+            "{}, and {}",
+            labels[..labels.len() - 1].join(", "),
+            labels.last().unwrap()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Thread;
+
+    #[test]
+    fn summaries_prioritize_changes_commands_and_delegations_and_count_distinct_paths() {
+        let mut thread = Thread::new(1);
+        for (i, kind) in [
+            ToolKind::Read,
+            ToolKind::FileChange,
+            ToolKind::FileChange,
+            ToolKind::Command,
+            ToolKind::WebSearch,
+            ToolKind::Other,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            thread.apply(
+                json!({"type":"tool_execution_start","toolCallId":i.to_string(),
+                "toolName":"opaque","toolKind":kind,"args":{"path":"a.rs"}}),
+            );
+        }
+        for tool in &mut thread.tools {
+            tool.done = true;
+        }
+        thread.tools[1].changes = vec![
+            FileChange::new("a.rs", "update", ""),
+            FileChange::new("b.rs", "delete", ""),
+        ];
+        assert_eq!(
+            summarize(&thread.tools.iter().collect::<Vec<_>>()),
+            "Changed 2 files, ran 1 command, and performed 3 other actions"
+        );
+        thread.tools[3].done = false;
+        assert_eq!(
+            summarize(&thread.tools.iter().collect::<Vec<_>>()),
+            "Changed 2 files, running 1 command, and performed 3 other actions"
+        );
+        thread.tools[0].done = false;
+        assert_eq!(
+            summarize(&thread.tools.iter().collect::<Vec<_>>()),
+            "Changed 2 files, running 1 command, and performing 3 other actions"
+        );
+        assert_eq!(
+            summarize(&[&thread.tools[3], &thread.tools[1]]),
+            "Running 1 command and changed 2 files"
+        );
+    }
+}
