@@ -551,21 +551,10 @@ impl Database {
         let scopes: Vec<String> =
             serde_json::from_str(&text.ok_or("Authentication denied. Device unknown or revoked.")?)
                 .map_err(error)?;
-        let scope = match method {
-            "hello"
-            | "workspace.subscribe"
-            | "thread.subscribe"
-            | "subscription.cancel"
-            | "thread.history"
-            | "command.get"
-            | "server.status"
-            | "blobs.read" => "read",
-            "request.respond" => "approve",
-            "devices.revoke" if args["deviceId"] == id => "read",
-            "devices.list" | "devices.pair" | "devices.revoke" => "maintain",
-            method if method.starts_with("server.") => "maintain",
-            method if method.starts_with("peer.") => "peer-delegate",
-            _ => "operate",
+        let scope = if method == "devices.revoke" && args["deviceId"] == id {
+            "read"
+        } else {
+            crate::protocol::method_grant(method).ok_or("Unknown protocol method.")?
         };
         if scopes.iter().any(|granted| granted == scope) {
             Ok(())

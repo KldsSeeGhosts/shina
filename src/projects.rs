@@ -902,6 +902,75 @@ pub fn expand_path(input: &str) -> PathBuf {
     }
 }
 
+/// Ported from KSG Code's WorkspaceEntries: resolve on the owning host and list one folder.
+/// Errors deliberately omit OS error text, which can disclose symlink targets or other paths.
+/// Partial paths filter one parent directory, as KSG's CommandPalette does.
+/// This splitting happens on the server, never on a client of another host.
+pub fn browse_folder(input: &str, partial: bool) -> Result<crate::protocol::FolderListing, String> {
+    let path = if input.is_empty() {
+        home_dir().ok_or("The server home folder is unavailable.")?
+    } else {
+        expand_path(input)
+    };
+    if !path.is_absolute() {
+        return Err("Use an absolute path or ~ on this server.".into());
+    }
+    let target_exists = path.is_dir();
+    let (path, filter) = if partial && !target_exists && !input.ends_with(['/', '\\']) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        (path.parent().unwrap_or(&path).to_path_buf(), name)
+    } else {
+        (path, String::new())
+    };
+    let path = path.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "That folder does not exist."
+        } else {
+            "That folder could not be read."
+        }
+        .to_string()
+    })?;
+    let read = fs::read_dir(&path).map_err(|_| "That folder could not be read.")?;
+    let mut entries = std::collections::BTreeMap::new();
+    let mut truncated = false;
+    for entry in read {
+        let entry = entry.map_err(|_| "That folder could not be read.")?;
+        // Do not follow symlinks into another directory while listing.
+        if !entry
+            .file_type()
+            .map_err(|_| "That folder could not be read.")?
+            .is_dir()
+        {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !filter.is_empty() && !name.to_lowercase().starts_with(&filter) {
+            continue;
+        }
+        entries.insert(name, entry.path().to_string_lossy().into_owned());
+        if entries.len() > crate::protocol::MAX_BROWSE_ENTRIES {
+            truncated = true;
+            entries.pop_last();
+        }
+    }
+    Ok(crate::protocol::FolderListing {
+        parent: path.parent().map(|p| p.to_string_lossy().into_owned()),
+        path: path.to_string_lossy().into_owned(),
+        entries: entries
+            .into_iter()
+            .map(|(name, path)| crate::protocol::FolderEntry { name, path })
+            .collect(),
+        truncated,
+        target_exists,
+    })
+}
+
 /// A folder written for the browse field: under home it starts with `~`, and it ends with a
 /// separator so the list shows what is inside it.
 pub fn browse_text(dir: &Path) -> String {

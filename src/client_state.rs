@@ -1681,8 +1681,16 @@ impl State {
                     .ok_or("No recoverable input.".into());
             }
             "project.put" => {
-                let id = self.add_project(PathBuf::from(text("path")?))?;
-                return Ok(json!({"projectId":id,"threadId":self.current().id}));
+                let path = crate::projects::expand_path(&text("path")?);
+                if !path.is_absolute() {
+                    return Err("A workspace needs an absolute path on this server.".into());
+                }
+                if args["createFolder"] == true {
+                    std::fs::create_dir_all(&path)
+                        .map_err(|_| "That folder could not be created.")?;
+                }
+                let id = self.add_project(path)?;
+                return Ok(json!({"projectId":id}));
             }
             "project.remove" => self.remove_project(number("projectId")?),
             "project.clone" => {
