@@ -150,6 +150,7 @@ pub struct PiSession {
     pub commands_loaded: bool,
     pub commands_requested: bool,
     pub commands_error: Option<String>,
+    pub(super) pending_command: Option<Value>,
     pub slash_index: usize,
     pub slash_dismissed: Option<String>,
     pub follow_up: bool,
@@ -208,6 +209,7 @@ impl PiSession {
             || self.lifecycle.is_some()
             || self.lifecycle_id.is_some()
             || self.refreshing_session
+            || self.pending_command.is_some()
     }
 }
 
@@ -225,7 +227,7 @@ impl Tool {
             self.subagents = result["details"]["results"].as_array().into_iter().flatten().take(32).filter_map(|agent| {
                 let name = agent["agent"].as_str()?;
                 let task = agent["task"].as_str()?;
-                let finished = self.done || agent["finished"] == true;
+                let finished = agent["finished"].as_bool().unwrap_or(self.done);
                 let status = if !finished { "Working" } else if agent["stopReason"] == "aborted" { "Stopped" }
                     else if agent["exitCode"].as_i64().unwrap_or(0) != 0 || agent["stopReason"] == "error" { "Failed" } else { "Done" };
                 let text = if status == "Failed" || status == "Stopped" {
@@ -242,6 +244,17 @@ impl Tool {
 }
 
 impl Thread {
+    pub fn can_change_conversation(&self) -> bool {
+        self.harness == "pi"
+            || self.harness == "codex" && self.harness_state["codexNativeExtensions"] == true
+    }
+
+    pub fn can_rewind_conversation(&self) -> bool {
+        self.harness == "pi"
+            || self.harness == "codex"
+                && self.can_change_conversation()
+                && self.harness_state["codexHistoryMode"] == "paginated"
+    }
     pub fn slash_trigger(&self) -> Option<crate::composer::Trigger> {
         if !self.draft.focused || self.native.slash_dismissed.as_ref() == Some(&self.draft.text) {
             return None;
@@ -464,6 +477,10 @@ impl Thread {
         if self.initializing || self.pi.is_none() {
             return false;
         }
+        if let Some(command) = self.native.pending_command.take() {
+            self.command("native_command", command);
+            return true;
+        }
         if self.native.lifecycle_id.is_some() || self.native.refreshing_session {
             return true;
         }
@@ -576,8 +593,9 @@ impl Thread {
     }
 
     pub fn request_fork_points(&mut self, mode: ConversationMode) {
-        if self.harness != "pi" {
-            self.error = Some("Conversation forks and rewinds are Pi-only in Shina.".into());
+        if !self.can_rewind_conversation() {
+            self.error =
+                Some("This harness has no verified conversation fork or rewind protocol.".into());
             return;
         }
         if self.status.busy() || self.configuring || self.session.is_none() {
@@ -877,6 +895,13 @@ impl Thread {
     }
 
     pub(super) fn native_disconnect(&mut self) {
+        if let Some(command) = self.native.pending_command.take() {
+            self.draft.replace_text(&format!(
+                "/{} {}",
+                string(&command, "name"),
+                string(&command, "arguments")
+            ));
+        }
         self.native.questionnaire = None;
         self.native.questionnaire_advance = None;
         self.native.questionnaires.clear();
@@ -1136,7 +1161,7 @@ impl Thread {
                         );
                         return true;
                     };
-                    if self.session.as_deref() == Some(session) {
+                    if self.harness != "codex" && self.session.as_deref() == Some(session) {
                         self.fail_session(
                             "Pi did not create a distinct session after the fork. Retry to reload."
                                 .into(),
@@ -1186,6 +1211,7 @@ impl Thread {
                     // Route through the existing authoritative history reducer.
                     let mut history = record.clone();
                     history["id"] = json!("history");
+                    history["data"]["replaceHistory"] = json!(true);
                     self.apply(history);
                     self.refresh_context_usage();
                     return true;
@@ -1635,8 +1661,9 @@ impl State {
         ) {
             return;
         }
-        if self.current().harness != "pi" {
-            self.current_mut().error = Some("Conversation forks are Pi-only in Shina.".into());
+        if !self.current().can_change_conversation() {
+            self.current_mut().error =
+                Some("This harness has no verified conversation fork protocol.".into());
             return;
         }
         if self.demo
@@ -1651,6 +1678,11 @@ impl State {
             return;
         };
         let mut thread = Thread::new(self.next_id);
+        thread.harness = source.harness.clone();
+        thread.models = source.models.clone();
+        thread.harness_state["codexNativeExtensions"] =
+            source.harness_state["codexNativeExtensions"].clone();
+        thread.harness_state["serviceTier"] = source.harness_state["serviceTier"].clone();
         thread.title = format!("{} (fork)", source.title);
         thread.renamed = true;
         thread.project = source.project;

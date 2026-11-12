@@ -643,6 +643,7 @@ impl State {
         }
         json!({
             "index":index,"threads":self.thread_views(),"recoveryNotice":self.recovery_notice,
+            "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
@@ -704,7 +705,8 @@ impl State {
                 .filter(|t| t.client_draft)
                 .map(|t| json!({
                     "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
-                    "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life
+                    "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life,
+                    "serviceTier":t.harness_state["serviceTier"]
                 }))
                 .collect::<Vec<_>>()
         );
@@ -1159,6 +1161,7 @@ impl State {
                 thread.selected_model =
                     serde_json::from_value(draft["model"].clone()).unwrap_or_default();
                 thread.selected_thinking = draft["thinking"].as_str().map(str::to_owned);
+                thread.harness_state["serviceTier"] = draft["serviceTier"].clone();
                 thread.native.access = draft["access"]
                     .as_str()
                     .and_then(AccessMode::parse)
@@ -1211,6 +1214,7 @@ impl State {
             .map(Value::take)
             .unwrap_or(Value::Null);
         self.client_views = projection;
+        self.apply_native_catalogs();
         if first && !local.is_null() {
             self.restore_ui(&local)?;
             if restore_navigation && let Some(tabs) = local["tabs"].as_array() {
@@ -1550,6 +1554,7 @@ impl State {
         if reuse.is_none() || self.threads[index].selected_model.is_none() {
             self.inherit_composer(index, seed);
         }
+        self.apply_native_catalogs();
         self.select_thread(index);
     }
 
@@ -1577,7 +1582,8 @@ impl State {
         let thread = self.current();
         let params = json!({"project":thread.project,"clientDraft":thread.id,
             "occupiedDrafts":self.threads.iter().filter(|t| !t.client_draft && (t.has_draft_content() || self.tabs.contains(&t.id))).map(|t| t.id).collect::<Vec<_>>(),
-            "harness":thread.harness,"selectedModel":thread.selected_model,"thinking":thread.selected_thinking,"access":thread.native.access.id()});
+            "harness":thread.harness,"selectedModel":thread.selected_model,"thinking":thread.selected_thinking,"access":thread.native.access.id(),
+            "serviceTier":thread.harness_state["serviceTier"]});
         match self.remote("thread.create", params).expect("client") {
             Ok(command) => {
                 let thread = self.current_mut();
@@ -2124,6 +2130,9 @@ impl State {
                 if let Some(thinking) = args["thinking"].as_str() {
                     self.current_mut().set_thinking(thinking.into());
                 }
+                if let Some(tier) = args["serviceTier"].as_str() {
+                    self.current_mut().set_service_tier(tier.into());
+                }
                 if let Some(access) = args["access"].as_str() {
                     self.set_access_mode(AccessMode::parse(access).ok_or("Unknown access mode.")?);
                 }
@@ -2157,6 +2166,9 @@ impl State {
                 }
                 if let Some(thinking) = args["thinking"].as_str() {
                     self.current_mut().set_thinking(thinking.into());
+                }
+                if let Some(tier) = args["serviceTier"].as_str() {
+                    self.current_mut().set_service_tier(tier.into());
                 }
                 if let Some(access) = args["access"].as_str().and_then(AccessMode::parse) {
                     self.current_mut().native.access = access;
@@ -3079,6 +3091,37 @@ mod tests {
         assert_eq!(create.params["harness"], "codex");
         assert_eq!(create.params["selectedModel"], json!(["codex", "chosen"]));
         assert_eq!(create.params["thinking"], "high");
+    }
+
+    #[test]
+    fn native_catalog_projection_populates_a_device_draft_before_any_native_session() {
+        let (mut state, mut server, mut commands) = tab_client();
+        server.codex_catalog.models = vec![AgentModel::from_harness_value(&json!({
+            "provider":"codex","id":"catalog-only","name":"Catalog only","thinkingLevels":["low","high"],
+            "serviceTiers":[{"id":"default","name":"Standard"},{"id":"fast","name":"Fast"}]
+        }),"codex").unwrap()];
+        state.apply_projection(server.projection()).unwrap();
+        state.new_thread_in(Some(1));
+        state.choose_harness("codex");
+        assert!(state.current().client_draft);
+        assert!(state.current().session.is_none());
+        assert_eq!(state.current().models[0].id, "catalog-only");
+        state
+            .current_mut()
+            .set_model("codex".into(), "catalog-only".into());
+        state.current_mut().set_service_tier("fast".into());
+        assert!(commands.try_recv().is_err());
+        state.current_mut().draft.replace_text("Fixture");
+        state.send();
+        let create = commands.try_recv().unwrap();
+        assert_eq!(create.params["serviceTier"], "fast");
+        let result = server.execute_command(&create).unwrap();
+        let created = server
+            .threads
+            .iter()
+            .find(|thread| Some(thread.id as u64) == result["threadId"].as_u64())
+            .unwrap();
+        assert_eq!(created.harness_state["serviceTier"], "fast");
     }
 
     #[test]

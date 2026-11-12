@@ -1125,6 +1125,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
         model_list(s, p, can_choose, 320.0, card)
     } else {
         card.child(effort_slider(t, s.thinking_drag, p, can_choose))
+            .child(service_tier_picker(t, p, can_choose))
             .child(rule(p))
             .child(model_row(s, p))
     };
@@ -1136,7 +1137,9 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 .pb(10.0),
         );
     }
-    if let Some(error) = &s.catalog.error {
+    if t.harness == "pi"
+        && let Some(error) = &s.catalog.error
+    {
         card = card
             .child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0))
             .child(
@@ -1145,10 +1148,86 @@ fn settings_picker(s: &State, p: Palette) -> El {
                     .mb(8.0),
             );
     }
+    if let (_, Some(error)) = s.native_catalog_status(&t.harness) {
+        card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
+            SMALL, p.muted).key("native-catalog-error").wrap_anywhere().px(16.0).py(8.0));
+    }
     // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
     // layer draws over the page and shifts the card to stay inside the window.
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
         .modal(true, |s: &mut State| s.settings_picker = None)
+}
+
+/// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
+fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
+    let Some(model) = t
+        .models
+        .iter()
+        .find(|model| model.id == t.model_id && model.provider == "codex")
+    else {
+        return el();
+    };
+    if model.service_tiers.is_empty() {
+        return el();
+    }
+    let mut choices = row()
+        .key("service-tier-options")
+        .role("radiogroup")
+        .label("Service tier")
+        .gap(4.0)
+        .w_full();
+    let selected = t.harness_state["serviceTier"]
+        .as_str()
+        .or_else(|| t.harness_state["effectiveServiceTier"].as_str())
+        .or_else(|| {
+            model
+                .service_tiers
+                .iter()
+                .find(|tier| tier["isDefault"] == true)
+                .and_then(|tier| tier["id"].as_str())
+        })
+        .unwrap_or("default");
+    for (index, tier) in model.service_tiers.iter().enumerate() {
+        let Some(id) = tier["id"].as_str() else {
+            continue;
+        };
+        let name = tier["name"].as_str().unwrap_or(id);
+        let id = id.to_owned();
+        let on = selected == id;
+        choices = choices.child(
+            row()
+                .key(format!("service-tier-{index}"))
+                .role("radio")
+                .label(name)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(24.0)
+                .w(0.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .px(8.0)
+                .center_y()
+                .justify_center()
+                .radius(4.0)
+                .fill(if on { p.selected } else { Color::TRANSPARENT })
+                .hover(p.selected)
+                .focus_fill(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .child(label(name, SMALL, if on { p.ink } else { p.muted }).truncate())
+                .on_press(move |s: &mut State| {
+                    s.current_mut().set_service_tier(id.clone());
+                    s.checkpoint();
+                }),
+        );
+    }
+    col()
+        .key("service-tier-picker")
+        .px(16.0)
+        .pb(12.0)
+        .gap(8.0)
+        .child(pixel_text("Service tier", p.muted))
+        .child(choices)
 }
 
 const SLIDER_H: f32 = 28.0;
@@ -1715,7 +1794,13 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             )
             .child(
                 label(
-                    if t.harness != "pi" && t.models.is_empty() {
+                    if matches!(t.harness.as_str(), "codex" | "claude") && t.models.is_empty() {
+                        if s.native_catalog_status(&t.harness).0 {
+                            "Reading the harness catalog..."
+                        } else {
+                            "Catalog not available. Models will be read when a session starts."
+                        }
+                    } else if t.harness != "pi" && t.models.is_empty() {
                         "This harness uses its configured model until it reports available models."
                     } else if t.models.is_empty() && s.catalog.remaining().is_some() {
                         "Reading the CPA catalog..."
@@ -4649,7 +4734,11 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
         );
     }
     if id == s.current().id && thread.session.is_some() {
-        let locked = s.demo || thread.status.busy() || thread.configuring || thread.archived();
+        let locked = s.demo
+            || thread.status.busy()
+            || thread.configuring
+            || thread.archived()
+            || !thread.can_change_conversation();
         actions = actions
             .child(
                 menu_item("menu-fork-conversation", "Fork conversation", "thread", p)
@@ -4662,7 +4751,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
             )
             .child(
                 menu_item("menu-fork-message", "Fork from message...", "thread", p)
-                    .disabled(locked)
+                    .disabled(locked || !thread.can_rewind_conversation())
                     .on_press(|s: &mut State| {
                         s.thread_menu = false;
                         s.row_menu = None;
@@ -4671,7 +4760,7 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
             )
             .child(
                 menu_item("menu-rewind", "Edit from here...", "edit", p)
-                    .disabled(locked)
+                    .disabled(locked || !thread.can_rewind_conversation())
                     .on_press(|s: &mut State| {
                         s.thread_menu = false;
                         s.row_menu = None;
@@ -7436,15 +7525,22 @@ fn context_limit(t: &Thread) -> Option<u64> {
 
 /// The ring appears once Pi or the model catalog knows a capacity, or once Pi reports usage.
 fn context_available(t: &Thread) -> bool {
-    t.context.usage.has_usage() || context_limit(t).is_some()
+    t.context.usage.has_usage() || context_limit(t).is_some() || usage_limits_available(t)
+}
+
+fn usage_limits_available(t: &Thread) -> bool {
+    t.harness_state["usageLimits"]["windows"]
+        .as_array()
+        .is_some_and(|windows| !windows.is_empty())
 }
 
 /// A fresh draft has nothing to measure yet, so it shows no empty dashed ring.
 fn context_ring_shown(t: &Thread) -> bool {
-    context_available(t)
-        && (t.context.usage.has_usage()
-            || t.context.phase != ContextPhase::Idle
-            || !t.messages.is_empty())
+    usage_limits_available(t)
+        || context_available(t)
+            && (t.context.usage.has_usage()
+                || t.context.phase != ContextPhase::Idle
+                || !t.messages.is_empty())
 }
 
 fn context_ink(percent: f64, p: Palette) -> Color {
@@ -7725,6 +7821,77 @@ fn context_popover(s: &State, p: Palette) -> El {
     {
         card = card.child(figure_row("Cost", context_cost_text(cost)));
     }
+    // Ported from KSG Code's usage/UsageLimits.WindowBar. The context placement is
+    // Shina-specific, requested here; it reuses this popover's rows and 6 px bars.
+    if let Some(windows) = t.harness_state["usageLimits"]["windows"].as_array()
+        && !windows.is_empty()
+    {
+        let mut block = col()
+            .key("context-usage-limits")
+            .gap(8.0)
+            .child(rule(p))
+            .child(pixel_text("Usage", p.muted).key("usage-heading"));
+        for (index, window) in windows.iter().take(16).enumerate() {
+            let Some(percent) = window["usedPercent"].as_f64().filter(|n| n.is_finite()) else {
+                continue;
+            };
+            let fraction = percent.clamp(0.0, 100.0) as f32 / 100.0;
+            let reset = window["resetsAt"]
+                .as_i64()
+                .and_then(chrono::DateTime::from_timestamp_secs)
+                .map(|time| {
+                    format!(
+                        "Resets {}",
+                        time.with_timezone(&chrono::Local).format("%b %d %H:%M")
+                    )
+                })
+                .unwrap_or_else(|| "Reset not reported".into());
+            block = block.child(
+                col()
+                    .key(format!("usage-window-{index}"))
+                    .gap(4.0)
+                    .child(
+                        row()
+                            .gap(8.0)
+                            .center_y()
+                            .child(
+                                label(window["name"].as_str().unwrap_or("Usage"), SMALL, p.muted)
+                                    .truncate()
+                                    .min_w(0.0)
+                                    .grow(1.0),
+                            )
+                            .child(
+                                pixel_text(context_percent_text(percent), p.ink)
+                                    .key(format!("usage-percent-{index}")),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .key(format!("usage-bar-{index}"))
+                            .role("progressbar")
+                            .label(format!("{} used", context_percent_text(percent)))
+                            .w_full()
+                            .h(6.0)
+                            .radius(2.0)
+                            .clip_rounded(2.0)
+                            .fill(p.line)
+                            .child(
+                                el().key(format!("usage-fill-{index}"))
+                                    .w_frac(fraction)
+                                    .h_full()
+                                    .radius(2.0)
+                                    .fill(if percent >= 90.0 { p.coral } else { p.faint }),
+                            ),
+                    )
+                    .child(
+                        pixel_text(reset, p.muted)
+                            .key(format!("usage-reset-{index}"))
+                            .wrap(),
+                    ),
+            );
+        }
+        card = card.child(block);
+    }
     if let Some(state) = t.context.state_text() {
         card = card.child(
             label(
@@ -7829,6 +7996,22 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                     el()
                 }),
         );
+        let command = if t.harness == "codex" && error.contains("`codex login`") {
+            Some("codex login")
+        } else if t.harness == "claude" && error.contains("`claude auth login`") {
+            Some("claude auth login")
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            area = area.child(
+                button("copy-sign-in-command", "Copy command", p, |_| {}).on_press_tx(
+                    move |_: &mut State, tx| {
+                        tx.copy(command.to_owned());
+                    },
+                ),
+            );
+        }
     }
     if let Some(error) = &t.attachment_error {
         area = area.child(
@@ -12039,6 +12222,98 @@ pub(crate) mod tests {
         assert!(!compact.focusable, "no second compaction while one runs");
         press(&mut rt, "compact-context");
         assert_eq!(rt.state.current().context.phase, ContextPhase::Compacting);
+    }
+
+    #[test]
+    fn usage_limits_and_service_tiers_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = context_fixture(width);
+            let t = rt.state.current_mut();
+            t.context.details_open = true;
+            t.harness_state["usageLimits"] = json!({"windows":[
+                {"id":"primary","name":"5 hour","usedPercent":90,"resetsAt":2100000000},
+                {"id":"secondary","name":"7 day","usedPercent":25,"resetsAt":null}]});
+            rt.invalidate();
+            rt.frame(0.3);
+            let (card, _) = rt.presented("context-details").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5,
+                "{width}: {card:?}"
+            );
+            for index in 0..2 {
+                for prefix in ["usage-bar", "usage-reset", "usage-percent"] {
+                    let (rect, _) = rt.presented(&format!("{prefix}-{index}")).unwrap();
+                    assert!(
+                        rect[0] >= card[0] && rect[0] + rect[2] <= card[0] + card[2] + 0.5,
+                        "{width}: {prefix} {rect:?}"
+                    );
+                }
+            }
+            assert_eq!(rt.presented("usage-bar-0").unwrap().0[3], 6.0);
+            let fill = |rt: &Runtime<State>, key: &str| {
+                rt.elements()
+                    .into_iter()
+                    .find(|element| element.key.as_deref() == Some(key))
+                    .unwrap()
+                    .fill
+            };
+            assert_eq!(fill(&rt, "usage-fill-0"), palette(rt.state.dark).coral);
+            assert_eq!(fill(&rt, "usage-fill-1"), palette(rt.state.dark).faint);
+            rt.state.current_mut().context = Default::default();
+            rt.state.current_mut().context_window = None;
+            rt.state.current_mut().context.details_open = true;
+            rt.invalidate();
+            rt.frame(0.35);
+            assert!(
+                rt.find("context-usage-limits").is_some(),
+                "limits remain accessible without context capacity"
+            );
+            rt.state.current_mut().harness_state["usageLimits"] = json!({"windows":[]});
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(rt.find("context-usage-limits").is_none());
+            let t = rt.state.current_mut();
+            t.context.close_popover();
+            t.harness = "codex".into();
+            t.model_provider = "codex".into();
+            t.model_id = "fixture".into();
+            t.models = vec![crate::session::AgentModel::from_harness_value(&json!({
+                "provider":"codex","id":"fixture","name":"Fixture","thinkingLevels":["low","high"],
+                "serviceTiers":[{"id":"default","name":"Standard"},{"id":"fast","name":"Fast"}]
+            }),"codex").unwrap()];
+            t.thinking_levels = vec!["low".into(), "high".into()];
+            t.thinking = "high".into();
+            rt.state.settings_picker = Some(SettingsPicker::Thinking);
+            rt.invalidate();
+            rt.frame(0.5);
+            let (picker, _) = rt.presented("pi-settings-picker").unwrap();
+            let (control, _) = rt.presented("service-tier-picker").unwrap();
+            assert!(
+                control[0] >= picker[0] && control[0] + control[2] <= picker[0] + picker[2] + 0.5
+            );
+            assert!(picker[0] >= 0.0 && picker[0] + picker[2] <= width + 0.5);
+            press(&mut rt, "service-tier-1");
+            assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
+        }
+    }
+
+    #[test]
+    fn sign_in_guidance_copies_only_the_manual_command() {
+        for (harness, command) in [("codex", "codex login"), ("claude", "claude auth login")] {
+            let mut rt = runtime(960.0);
+            rt.state.current_mut().harness = harness.into();
+            rt.state.current_mut().error = Some(format!(
+                "Authentication failed. Run `{command}` outside Shina."
+            ));
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            rt.frame(0.0);
+            press(&mut rt, "copy-sign-in-command");
+            assert_eq!(
+                clipboard.text().as_deref().map(|text| text.as_str()),
+                Some(command)
+            );
+        }
     }
 
     #[test]

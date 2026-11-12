@@ -2,6 +2,447 @@ use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
 #[test]
+fn prompt_free_probe_paginates_models_and_discovers_workspace_skills() {
+    for flags in [
+        vec![],
+        vec!["--paginated-models"],
+        vec!["--skills-unsupported"],
+        vec!["--legacy-version"],
+        vec!["--model-failure"],
+    ] {
+        let dir = crate::store::directory().unwrap();
+        let log = dir.join(format!("probe-{}.jsonl", flags.join("-")));
+        let script = dir.join("probe.py");
+        std::fs::write(&script, include_str!("../assets/tests/fake_codex.py")).unwrap();
+        let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+        command
+            .arg("-u")
+            .arg(script)
+            .arg("--log")
+            .arg(&log)
+            .args(&flags);
+        let models = !flags.is_empty();
+        let workspace = if models {
+            dir.clone()
+        } else {
+            dir.join("changed-workspace")
+        };
+        let start = Start::discovery("codex", workspace.clone());
+        let owner = start.owner.clone();
+        let pi = Pi::worker(
+            Arc::new(|| {}),
+            owner,
+            None,
+            move |input, events, wake, stopped, owner| {
+                run_mode(
+                    command,
+                    start,
+                    input,
+                    events,
+                    wake,
+                    stopped,
+                    owner,
+                    Some(models),
+                )
+            },
+        );
+        let mut output = vec![];
+        loop {
+            match pi
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .expect("probe deadline")
+            {
+                Event::Record(record) => output.push(record),
+                Event::Error(error) => {
+                    assert!(flags.contains(&"--model-failure"), "{error}");
+                    assert!(error.contains("Fixture model failure"));
+                    break;
+                }
+                Event::Exited => break,
+                Event::Diagnostic(_) => {}
+            }
+        }
+        let wire = records(&log);
+        assert_eq!(
+            wire.iter().filter(|r| r["method"] == "initialize").count(),
+            1
+        );
+        assert!(!wire.iter().any(|r| matches!(
+            r["method"].as_str(),
+            Some("thread/start" | "thread/resume" | "turn/start")
+        )));
+        if !models {
+            assert!(!wire.iter().any(|record| record["method"] == "model/list"));
+            assert!(wire.iter().any(|record| record["method"] == "skills/list"
+                && record["params"]["cwds"] == json!([workspace])));
+        }
+        if flags.contains(&"--paginated-models") {
+            let models = &output
+                .iter()
+                .find(|r| r["command"] == "get_available_models")
+                .unwrap()["data"]["models"];
+            assert_eq!(models.as_array().unwrap().len(), 2);
+            assert_eq!(models[0]["thinkingLevels"], json!(["low", "high"]));
+            assert_eq!(models[0]["serviceTiers"][1]["id"], "fast");
+            assert!(wire.iter().any(|r| r["params"]["cursor"] == "second-page"));
+        }
+        if !flags.contains(&"--model-failure") {
+            let commands = &output
+                .iter()
+                .find(|r| r["command"] == "get_commands")
+                .unwrap()["data"]["commands"];
+            assert_eq!(
+                commands
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["name"] == "goal"),
+                !flags.contains(&"--legacy-version")
+            );
+        }
+    }
+}
+
+#[test]
+fn native_goals_feedback_and_service_tiers_never_become_prompts() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    for (name, arguments) in [
+        ("goal", "Implement fixture"),
+        ("goal", "pause"),
+        ("goal", "resume"),
+        ("goal", ""),
+        ("goal", "clear"),
+        ("feedback", "Fixture feedback"),
+    ]
+    .into_iter()
+    {
+        thread.command("native_command", json!({"name":name,"arguments":arguments}));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline);
+            if let Ok(Event::Record(record)) = thread
+                .pi
+                .as_ref()
+                .unwrap()
+                .events
+                .recv_timeout(Duration::from_millis(50))
+            {
+                let done = record["command"]
+                    == if name == "goal" {
+                        "native_goal"
+                    } else {
+                        "native_feedback"
+                    };
+                thread.apply(record);
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(!records(&log).iter().any(|r| r["method"] == "turn/start"));
+    thread.set_service_tier("fast".into());
+    thread.draft.replace_text("Fixture turn");
+    thread.send();
+    pump(&mut thread, |t| t.status == Status::Completed);
+    let wire = records(&log);
+    assert_eq!(
+        wire.iter()
+            .filter(|record| record["method"] == "thread/settings/update")
+            .count(),
+        2
+    );
+    let turn = wire.iter().find(|r| r["method"] == "turn/start").unwrap();
+    assert_eq!(turn["params"]["serviceTierForTurn"], "fast");
+    assert!(
+        turn["params"].get("serviceTier").is_none(),
+        "override is turn-only"
+    );
+
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.ready = true;
+    client.native_extensions = true;
+    client.session = Some("fixture".into());
+    for message in ["/goal objective", "/feedback issue"] {
+        client
+            .command(json!({"type":"prompt","id":"direct","message":message}))
+            .unwrap();
+    }
+    assert!(!client.wire.iter().any(|r| r["method"] == "turn/start"));
+    let setting = client
+        .wire
+        .iter()
+        .find(|record| record["method"] == "thread/settings/update")
+        .unwrap()["id"]
+        .clone();
+    client.wire.clear();
+    client
+        .command(json!({"type":"abort","id":"cancel-activation"}))
+        .unwrap();
+    client.incoming(json!({"id":setting,"result":{}})).unwrap();
+    assert!(
+        !client
+            .wire
+            .iter()
+            .any(|record| record["method"] == "thread/goal/set")
+    );
+}
+
+#[test]
+fn stopping_a_native_goal_pauses_it_and_unsolicited_turns_report_running() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.ready = true;
+    client.native_extensions = true;
+    client.session = Some("fixture".into());
+    client
+        .notification(
+            "thread/goal/updated",
+            &json!({"goal":{"objective":"Fixture","status":"active"}}),
+        )
+        .unwrap();
+    client
+        .notification("turn/started", &json!({"turn":{"id":"goal-turn"}}))
+        .unwrap();
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|record| record["type"] == "agent_start")
+    );
+    client.command(json!({"type":"abort","id":"stop"})).unwrap();
+    assert!(
+        client
+            .wire
+            .iter()
+            .any(|record| record["method"] == "thread/goal/set"
+                && record["params"]["status"] == "paused"
+                && record["params"]["origin"] == "user")
+    );
+    assert!(
+        client
+            .wire
+            .iter()
+            .any(|record| record["method"] == "turn/interrupt")
+    );
+    assert!(
+        !client
+            .wire
+            .iter()
+            .any(|record| record["method"] == "turn/start")
+    );
+    client.wire.clear();
+    client
+        .command(
+            json!({"type":"native_command","name":"goal","arguments":"pause","id":"pause-running"}),
+        )
+        .unwrap();
+    assert!(
+        client
+            .wire
+            .iter()
+            .any(|record| record["method"] == "thread/goal/set"
+                && record["params"]["status"] == "paused")
+    );
+}
+
+#[test]
+fn native_working_directory_changes_invalidate_and_refresh_skills() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.ready = true;
+    client.skill_commands = vec![json!({"name":"$old-project"})];
+    let cwd = client.start.workspace.join("new-project");
+    client
+        .notification(
+            "thread/settings/updated",
+            &json!({"threadSettings":{"cwd":cwd}}),
+        )
+        .unwrap();
+    assert!(client.skill_commands.is_empty());
+    let request = client.wire.last().unwrap().clone();
+    assert_eq!(request["method"], "skills/list");
+    assert_eq!(request["params"], json!({"cwds":[cwd],"forceReload":true}));
+    client.incoming(json!({"id":request["id"],"result":{"data":[{"cwd":cwd,"skills":[{"name":"new-project","enabled":true}]}]}})).unwrap();
+    assert_eq!(client.skill_commands[0]["name"], "$new-project");
+}
+
+#[test]
+fn codex_fork_and_revert_use_native_turn_boundaries_and_refresh_history() {
+    let (mut thread, log) = fixture(
+        SessionSource::Fork("codex-fixture-thread".into()),
+        "read-only",
+        &[],
+    );
+    pump(&mut thread, |t| t.native.commands_loaded);
+    assert_eq!(thread.session.as_deref(), Some("codex-fixture-fork"));
+    thread.request_fork_points(crate::model::ConversationMode::Rewind);
+    pump(&mut thread, |t| !t.native.fork_points.is_empty());
+    assert_eq!(thread.native.fork_points[0]["entryId"], "old");
+    thread.rewind("old".into());
+    pump(&mut thread, |t| {
+        !t.configuring && !t.initializing && t.messages.is_empty()
+    });
+    assert_eq!(thread.draft.text, "Prior prompt");
+    assert_eq!(thread.session.as_deref(), Some("codex-fixture-fork"));
+    let wire = records(&log);
+    let fork = wire.iter().find(|r| r["method"] == "thread/fork").unwrap();
+    assert_eq!(fork["params"]["threadId"], "codex-fixture-thread");
+    let revert = wire
+        .iter()
+        .find(|r| r["method"] == "thread/revert")
+        .unwrap();
+    assert_eq!(
+        revert["params"],
+        json!({"threadId":"codex-fixture-fork","beforeTurnId":"old"})
+    );
+    assert!(!wire.iter().any(|r| r["method"] == "turn/start"));
+}
+
+#[test]
+fn schema_item_fixture_preserves_tools_results_and_generic_items() {
+    use crate::work::ToolKind::*;
+    let (mut thread, _) = fixture(
+        SessionSource::New,
+        "read-only",
+        &["--all-items", "--automatic-compaction"],
+    );
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.draft.replace_text("Every item");
+    thread.send();
+    pump(&mut thread, |t| {
+        t.status == Status::Completed && t.harness_state["usageLimits"]["windows"].is_array()
+    });
+    for (id, kind) in [
+        ("hook", Other),
+        ("function", Other),
+        ("files", FileChange),
+        ("mcp", Other),
+        ("dynamic", Other),
+        ("collab", Subagent),
+        ("activity", Subagent),
+        ("web", WebSearch),
+        ("image", Read),
+        ("sleep", Other),
+        ("generated", Other),
+        ("review-in", Other),
+        ("review-out", Other),
+        ("codex-plan-plan-item", Plan),
+        ("cmd", Command),
+    ] {
+        let tool = thread
+            .tools
+            .iter()
+            .find(|tool| tool.id == id)
+            .unwrap_or_else(|| panic!("Missing {id}"));
+        assert_eq!(tool.kind, Some(kind), "{id}");
+    }
+    let tool = |id: &str| thread.tools.iter().find(|tool| tool.id == id).unwrap();
+    assert_eq!(tool("mcp").name, "fixture-server/lookup");
+    assert_eq!(tool("mcp").output, "MCP result");
+    assert_eq!(tool("mcp").structured["structuredContent"]["answer"], 42);
+    assert_eq!(tool("dynamic").name, "fixture-namespace/lookup");
+    assert_eq!(tool("dynamic").output, "Dynamic result");
+    assert_eq!(tool("function").output, "Function result");
+    assert_eq!(tool("files").changes.len(), 2);
+    assert_eq!(tool("files").changes[0].old_path.as_deref(), Some("old.rs"));
+    assert_eq!(tool("files").changes[0].path, "new.rs");
+    assert_eq!(tool("collab").subagents[0]["output"], "Child result");
+    assert_eq!(
+        tool("web").structured["webResults"][0]["url"],
+        "https://example.com"
+    );
+    assert_eq!(tool("cmd").exit_code, Some(0));
+    assert_eq!(tool("child:nested").parent_call.as_deref(), Some("collab"));
+    assert_eq!(tool("child:nested").output, "child directory");
+    assert_eq!(thread.thoughts[0].text, "Checking");
+    assert!(!thread.native.compactions.is_empty());
+    assert_eq!(
+        thread.harness_state["usageLimits"]["windows"][0]["usedPercent"],
+        92.0
+    );
+    thread.command("get_messages", json!({}));
+    let mut restored = Thread::new(32);
+    loop {
+        match thread
+            .pi
+            .as_ref()
+            .unwrap()
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            Event::Record(mut record) if record["command"] == "get_messages" => {
+                record["id"] = json!("history");
+                restored.apply(record);
+                break;
+            }
+            Event::Record(record) => thread.apply(record),
+            event => panic!(
+                "Unexpected history event: {}",
+                match event {
+                    Event::Error(error) => error,
+                    _ => "Disconnected".into(),
+                }
+            ),
+        }
+    }
+    for live in &thread.tools {
+        let saved = restored
+            .tools
+            .iter()
+            .find(|tool| tool.id == live.id)
+            .unwrap_or_else(|| panic!("Replay lost {}", live.id));
+        assert_eq!(saved.kind, live.kind, "{}", live.id);
+        assert_eq!(saved.changes, live.changes, "{}", live.id);
+        assert_eq!(saved.parent_call, live.parent_call, "{}", live.id);
+        assert_eq!(saved.output, live.output, "{}", live.id);
+    }
+}
+
+#[test]
+fn sparse_usage_updates_keep_other_windows_and_auth_errors_name_the_command() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client
+        .notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits":{
+        "primary":{"usedPercent":90,"windowDurationMins":300,"resetsAt":123},
+        "secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":456}}}),
+        )
+        .unwrap();
+    client.events.clear();
+    client
+        .notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits":{
+        "primary":{"usedPercent":91,"windowDurationMins":300,"resetsAt":123},"secondary":null}}),
+        )
+        .unwrap();
+    assert_eq!(client.usage_limits["windows"][0]["usedPercent"], 91.0);
+    assert_eq!(client.usage_limits["windows"][1]["usedPercent"], 40.0);
+    let before = client.usage_limits.clone();
+    client
+        .notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits":{
+        "limitId":"other-model","primary":{"usedPercent":100}}}),
+        )
+        .unwrap();
+    assert_eq!(client.usage_limits, before);
+    client
+        .notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits":{
+        "individualLimit":{"remainingPercent":20,"resetsAt":789}}}),
+        )
+        .unwrap();
+    assert_eq!(client.usage_limits["windows"][2]["usedPercent"], 80.0);
+    assert!(auth_guidance("Not authenticated").contains("`codex login`"));
+    assert_eq!(auth_guidance("Other error"), "Other error");
+}
+
+#[test]
 fn typed_items_survive_live_and_history_reduction() {
     use crate::work::ToolKind::*;
     for (native, expected) in [

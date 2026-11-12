@@ -24,6 +24,8 @@ use std::{
 };
 
 pub const MISSING: &str = "Claude Code is unavailable. Shina checks PATH and ~/.local/bin or ~/.claude/local; set SHINA_CLAUDE_CLI to override.";
+pub const AUTH_ERROR: &str =
+    "Claude authentication failed. Run `claude auth login` outside Shina, then retry.";
 
 pub fn process() -> Result<Command, String> {
     let candidates = if let Some(path) = std::env::var_os("SHINA_CLAUDE_CLI") {
@@ -75,6 +77,19 @@ fn resolve_process(candidates: Vec<PathBuf>) -> Result<Command, String> {
 
 pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
+}
+
+pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
+    let command = process()?;
+    let start = Start::discovery("claude", workspace);
+    Ok(Pi::worker(
+        wake,
+        start.owner.clone(),
+        None,
+        move |input, events, wake, stopped, owner| {
+            run_mode(command, start, input, events, wake, stopped, owner, true)
+        },
+    ))
 }
 
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {
@@ -195,6 +210,7 @@ struct Client {
     compactions: Vec<Value>,
     wire: Vec<Value>,
     events: Vec<Value>,
+    usage_limits: Value,
 }
 
 impl Client {
@@ -236,6 +252,7 @@ impl Client {
             compactions: vec![],
             wire: vec![],
             events: vec![],
+            usage_limits: Value::Null,
         }
     }
 
@@ -244,6 +261,20 @@ impl Client {
     }
 
     fn launch(&self, command: &mut Command) {
+        if self.start.link.is_none() {
+            command.args([
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--permission-prompt-tool=stdio",
+                "--no-session-persistence",
+            ]);
+            command.arg("--session-id").arg(&self.session);
+            return;
+        }
         let link = self.start.link.as_ref().unwrap();
         command
             .args([
@@ -337,7 +368,10 @@ impl Client {
 
     fn redact(&self, message: &str) -> String {
         crate::update::redact(&crate::projects::redact(
-            &message.replace(&self.start.link.as_ref().unwrap().token, "[redacted]"),
+            &self.start.link.as_ref().map_or_else(
+                || message.into(),
+                |link| message.replace(&link.token, "[redacted]"),
+            ),
         ))
     }
 
@@ -464,6 +498,9 @@ impl Client {
                     let error =
                         self.redact(response["error"].as_str().unwrap_or("Unknown Claude error"));
                     if pending.request["subtype"] == "initialize" || auth_error(&error) {
+                        if auth_error(&error) {
+                            return Err(format!("{error}\n{AUTH_ERROR}"));
+                        }
                         return Err(format!(
                             "Claude startup failed: {error}. Sign in with the Claude CLI outside Shina, then retry."
                         ));
@@ -555,7 +592,7 @@ impl Client {
             }
             "stream_event" => self.stream(&record),
             "assistant" if record["error"] == "authentication_failed" => {
-                return Err("Claude authentication failed. Sign in with the Claude CLI outside Shina, then retry.".into());
+                return Err(AUTH_ERROR.into());
             }
             "assistant" | "user" => self.message(&record, true),
             "result" => {
@@ -590,6 +627,9 @@ impl Client {
                         || auth_error(error)
                         || record.get("startup_failure_reason").is_some())
                 {
+                    if auth_error(error) {
+                        return Err(format!("{error}\n{AUTH_ERROR}"));
+                    }
                     return Err(format!(
                         "Claude failed: {error}. Sign in with the Claude CLI outside Shina, then retry. No prompt was retried."
                     ));
@@ -692,7 +732,7 @@ impl Client {
                     }
                 }
                 "api_retry" if record["error_status"] == 401 => {
-                    return Err("Claude authentication failed. Sign in with the Claude CLI outside Shina, then retry.".into());
+                    return Err(AUTH_ERROR.into());
                 }
                 "local_command_output" => {
                     let message = json!({"role":"assistant","content":[{"type":"text","text":record["content"]}],"stopReason":"stop"});
@@ -716,10 +756,12 @@ impl Client {
                     self.compact_failure =
                         Some("Claude usage limit reached during native compaction.".into());
                 }
-                self.update("usageLimits", record["rate_limit_info"].clone());
+                self.usage_limits =
+                    crate::usage_limits::claude(&record["rate_limit_info"], &self.usage_limits);
+                self.update("usageLimits", self.usage_limits.clone());
             }
             "auth_status" if record["error"].is_string() => {
-                return Err("Claude authentication failed. Sign in with the Claude CLI outside Shina, then retry.".into());
+                return Err(AUTH_ERROR.into());
             }
             _ => {}
         }
@@ -1728,7 +1770,7 @@ fn repository_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn run(
-    mut command: Command,
+    command: Command,
     start: Start,
     input: Receiver<Value>,
     events: &SyncSender<Event>,
@@ -1736,6 +1778,24 @@ fn run(
     stopped: &AtomicBool,
     owner: &SessionOwner,
 ) -> Result<(), String> {
+    run_mode(command, start, input, events, wake, stopped, owner, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mode(
+    mut command: Command,
+    start: Start,
+    input: Receiver<Value>,
+    events: &SyncSender<Event>,
+    wake: &Waker,
+    stopped: &AtomicBool,
+    owner: &SessionOwner,
+    probe: bool,
+) -> Result<(), String> {
+    if probe && !start.workspace.exists() {
+        std::fs::create_dir_all(&start.workspace)
+            .map_err(|error| format!("Could not create the discovery directory: {error}"))?;
+    }
     let mut client = Client::new(start);
     if let Some((_, Some(path))) = command
         .get_envs()
@@ -1832,6 +1892,9 @@ fn run(
                 if !backend::publish(events, wake, Event::Record(record)) {
                     return Ok(());
                 }
+            }
+            if probe && client.ready {
+                return Ok(());
             }
             for _ in 0..64 {
                 match records.try_recv() {

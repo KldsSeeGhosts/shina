@@ -68,10 +68,29 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
 }
 
+pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Result<Pi, String> {
+    let command = process()?;
+    let start = Start::discovery("codex", workspace);
+    Ok(Pi::worker(
+        wake,
+        start.owner.clone(),
+        None,
+        move |input, events, wake, stopped, owner| {
+            run_mode(
+                command,
+                start,
+                input,
+                events,
+                wake,
+                stopped,
+                owner,
+                Some(models),
+            )
+        },
+    ))
+}
+
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {
-    if matches!(start.source, SessionSource::Fork(_)) {
-        return Err("Codex conversation forks are not implemented in Shina.".into());
-    }
     if start.link.is_none() {
         return Err("Codex requires Shina's thread-scoped MCP endpoint.".into());
     }
@@ -150,6 +169,7 @@ struct Client {
     queued: VecDeque<Value>,
     models: Vec<Value>,
     raw_models: Vec<Value>,
+    model_cursors: HashSet<String>,
     skill_commands: Vec<Value>,
     model: Value,
     effort: String,
@@ -162,6 +182,18 @@ struct Client {
     completed: HashSet<String>,
     wire: Vec<Value>,
     events: Vec<Value>,
+    probe: Option<bool>,
+    skills_loaded: bool,
+    native_extensions: bool,
+    service_tier: Option<String>,
+    turns: Vec<Value>,
+    turn_items: Vec<Value>,
+    usage_limits: Value,
+    history_mode: String,
+    hydration: Option<(Value, Value)>,
+    history_cursors: HashSet<String>,
+    child_parents: HashMap<String, String>,
+    goal: Value,
 }
 
 impl Client {
@@ -187,6 +219,7 @@ impl Client {
             queued: VecDeque::new(),
             models: vec![],
             raw_models: vec![],
+            model_cursors: HashSet::new(),
             skill_commands: vec![],
             model: Value::Null,
             effort: String::new(),
@@ -199,6 +232,18 @@ impl Client {
             completed: HashSet::new(),
             wire: vec![],
             events: vec![],
+            probe: None,
+            skills_loaded: false,
+            native_extensions: false,
+            service_tier: None,
+            turns: vec![],
+            turn_items: vec![],
+            usage_limits: Value::Null,
+            history_mode: "legacy".into(),
+            hydration: None,
+            history_cursors: HashSet::new(),
+            child_parents: HashMap::new(),
+            goal: Value::Null,
         }
     }
 
@@ -257,7 +302,7 @@ impl Client {
     fn state(&self) -> Value {
         json!({"sessionFile":self.session,"isStreaming":self.running,
             "isCompacting":self.compacting || self.compact_request.is_some(),
-            "model":self.model,"thinkingLevel":self.effort})
+            "model":self.model,"thinkingLevel":self.effort,"serviceTier":self.service_tier})
     }
 
     fn reply(&mut self, request: &Value, data: Value) {
@@ -278,6 +323,14 @@ impl Client {
             if let Some(id) = params["threadId"].as_str()
                 && self.session.as_deref().is_some_and(|session| session != id)
             {
+                if let Some(parent) = self.child_parents.get(id).cloned() {
+                    if record.get("id").is_some() {
+                        self.server_request(method, &record);
+                    } else {
+                        self.child_notification(method, params, &parent)?;
+                    }
+                    return Ok(());
+                }
                 return Err("Codex sent an event for another thread.".into());
             }
             if record.get("id").is_some() {
@@ -305,6 +358,7 @@ impl Client {
             let error = format!(
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
+            let error = auth_guidance(&error);
             if kind == "skills" {
                 let lower = error.to_ascii_lowercase();
                 if matches!(record["error"]["code"].as_i64(), Some(401 | 403))
@@ -320,10 +374,21 @@ impl Client {
                 {
                     return Err(error);
                 }
+                self.skills_loaded = true;
+                if self.probe.is_some() {
+                    self.reply(
+                        &json!({"type":"get_commands","id":"commands"}),
+                        json!({"commands":self.commands()}),
+                    );
+                    return Ok(());
+                }
                 self.reject(&json!({"type":"get_commands","id":request["id"]}), error);
                 return Ok(());
             }
-            if matches!(kind, "initialize" | "start" | "models" | "prompt") {
+            if matches!(
+                kind,
+                "initialize" | "start" | "models" | "prompt" | "goal_stop"
+            ) {
                 // Never retry an accepted turn, or attempt login after a denial.
                 return Err(error);
             }
@@ -349,22 +414,32 @@ impl Client {
         let result = &record["result"];
         match kind {
             "initialize" => {
+                self.native_extensions = supports_extensions(result);
+                self.events.push(
+                    json!({"type":"harness_update","field":"codexNativeExtensions",
+                    "value":self.native_extensions}),
+                );
                 self.wire.push(json!({"method":"initialized"}));
                 self.request(
                     "skills/list",
                     json!({"cwds":[self.start.workspace]}),
                     json!({"type":"skills","id":"commands"}),
                 );
-                self.request("model/list", json!({"limit":100}), json!({"type":"models"}));
+                if self.probe != Some(false) {
+                    self.request("model/list", json!({"limit":100}), json!({"type":"models"}));
+                } else {
+                    self.ready = true;
+                }
             }
             "skills" => {
                 self.skill_commands =
                     crate::composer_skills::codex_commands(result, &self.start.workspace);
+                self.skills_loaded = true;
                 // Discovery may beat thread/start. Do not expose readiness before a session exists.
                 if self.ready {
                     self.reply(
                         &json!({"type":"get_commands","id":request["id"]}),
-                        json!({"commands":self.skill_commands}),
+                        json!({"commands":self.commands()}),
                     );
                 }
             }
@@ -377,11 +452,10 @@ impl Client {
                     return Err("Codex model list exceeds Shina's limit.".into());
                 }
                 if let Some(cursor) = result["nextCursor"].as_str().filter(|s| !s.is_empty()) {
-                    self.request(
-                        "model/list",
-                        json!({"limit":100,"cursor":cursor}),
-                        json!({"type":"models"}),
-                    );
+                    if !self.model_cursors.insert(cursor.into()) {
+                        return Err("Codex model list repeated a pagination cursor.".into());
+                    }
+                    self.request("model/list", json!({"limit":100,"cursor":cursor}), request);
                 } else {
                     self.models = self
                         .raw_models
@@ -389,82 +463,106 @@ impl Client {
                         .filter(|m| m["hidden"] != true)
                         .filter_map(model_value)
                         .collect();
+                    if self.ready && self.probe.is_none() {
+                        if let Some(model) = self
+                            .models
+                            .iter()
+                            .find(|model| model["id"] == self.model["id"])
+                        {
+                            self.model = model.clone();
+                        }
+                        self.reply(
+                            &json!({"type":"get_available_models","id":request["id"]}),
+                            json!({"models":self.models}),
+                        );
+                        self.reply(
+                            &json!({"type":"get_available_thinking_levels","id":"levels"}),
+                            json!({"levels":self.levels()}),
+                        );
+                        return Ok(());
+                    }
+                    if self.probe.is_some() {
+                        self.reply(
+                            &json!({"type":"get_available_models","id":"models"}),
+                            json!({"models":self.models}),
+                        );
+                        self.ready = true;
+                        if self.skills_loaded {
+                            self.reply(
+                                &json!({"type":"get_commands","id":"commands"}),
+                                json!({"commands":self.commands()}),
+                            );
+                        }
+                        return Ok(());
+                    }
                     let mut params = self.session_params();
                     let method = match &self.start.source {
-                        SessionSource::New => "thread/start",
+                        SessionSource::New => {
+                            if self.native_extensions {
+                                params["historyMode"] = json!("paginated");
+                            }
+                            "thread/start"
+                        }
                         SessionSource::Resume(id) => {
                             params["threadId"] = json!(id);
                             "thread/resume"
                         }
-                        SessionSource::Fork(_) => return Err("Codex forks are unsupported.".into()),
+                        SessionSource::Fork(id) => {
+                            if !self.native_extensions {
+                                return Err("This Codex version has no verified conversation fork protocol. Update Codex outside Shina.".into());
+                            }
+                            params["threadId"] = json!(id);
+                            params["deferGoalContinuation"] = json!(true);
+                            "thread/fork"
+                        }
                     };
                     self.request(method, params, json!({"type":"start"}));
                 }
             }
             "start" => {
-                let id = result["thread"]["id"]
+                self.history_mode = result["thread"]["historyMode"]
                     .as_str()
-                    .filter(|id| !id.is_empty())
-                    .ok_or("Codex did not return a thread id.")?;
-                if let SessionSource::Resume(expected) = &self.start.source
-                    && id != expected
-                {
-                    return Err("Codex resumed a different thread.".into());
-                }
-                self.session = Some(id.into());
-                let model = result["model"]
-                    .as_str()
-                    .or_else(|| result["thread"]["model"].as_str());
-                self.model = model
-                    .and_then(|id| self.models.iter().find(|m| m["id"] == id).cloned())
-                    .or_else(|| model.map(|id| json!({"provider":"codex","id":id,"name":id})))
-                    .unwrap_or(Value::Null);
-                self.effort = result["reasoningEffort"]
-                    .as_str()
-                    .or_else(|| result["thread"]["reasoningEffort"].as_str())
-                    .or_else(|| {
-                        self.raw_models
-                            .iter()
-                            .find(|m| Some(m["model"].as_str().unwrap_or("")) == model)
-                            .and_then(|m| m["defaultReasoningEffort"].as_str())
-                    })
-                    .unwrap_or("")
+                    .unwrap_or("legacy")
                     .into();
-                for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
-                    self.replay(turn);
-                }
-                if let Some(active) = result["thread"]["turns"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|t| t["status"] == "inProgress")
+                if self.native_extensions
+                    && self.history_mode == "paginated"
+                    && !matches!(self.start.source, SessionSource::New)
                 {
-                    self.running = true;
-                    self.turn = active["id"].as_str().map(str::to_owned);
+                    self.begin_hydration(result.clone(), request)?;
+                } else {
+                    self.started(result)?;
                 }
-                self.ready = true;
-                self.reply(
-                    &json!({"type":"get_available_models","id":"models"}),
-                    json!({"models":self.models}),
-                );
-                self.reply(
-                    &json!({"type":"get_available_thinking_levels","id":"levels"}),
-                    json!({"levels":self.levels()}),
-                );
-                self.reply(&json!({"type":"get_state","id":"state"}), self.state());
-                self.reply(
-                    &json!({"type":"get_messages","id":"history"}),
-                    json!({"messages":self.history,"compactions":self.compactions}),
-                );
-                if self.compacting {
-                    self.events.push(json!({"type":"compaction_start"}));
+            }
+            "hydrate" => {
+                let page = result["data"]
+                    .as_array()
+                    .ok_or("Codex returned invalid turn history.")?;
+                let (snapshot, _) = self
+                    .hydration
+                    .as_mut()
+                    .ok_or("Codex history was not requested.")?;
+                let turns = snapshot["thread"]["turns"].as_array_mut().unwrap();
+                turns.extend(page.iter().cloned());
+                if turns.len() > 100_000 {
+                    return Err("Codex history exceeds Shina's turn limit.".into());
                 }
-                self.reply(
-                    &json!({"type":"get_commands","id":"commands"}),
-                    json!({"commands":self.skill_commands}),
-                );
-                self.events
-                    .push(json!({"type":"harness_update","field":"awareness","value":true}));
+                if let Some(cursor) = result["nextCursor"]
+                    .as_str()
+                    .filter(|cursor| !cursor.is_empty())
+                {
+                    if !self.history_cursors.insert(cursor.into()) {
+                        return Err("Codex turn history repeated a pagination cursor.".into());
+                    }
+                    self.request_history(Some(cursor.into()));
+                } else {
+                    let (snapshot, original) = self.hydration.take().unwrap();
+                    if original["type"] == "fork" {
+                        self.reset_history(&snapshot["thread"]);
+                        self.reply(&original, json!({}));
+                    } else {
+                        self.started(&snapshot)?;
+                    }
+                }
             }
             "prompt" => {
                 if self.turn.is_none() && self.running {
@@ -483,8 +581,154 @@ impl Client {
             "abort" => self.reply(&request, json!({})),
             // thread/compact/start returns {} before the compact turn finishes.
             "compact" => {}
+            "goal_settings" => {
+                if request["cancelled"] == true {
+                    self.reply(
+                        &json!({"type":"native_goal","id":request["id"]}),
+                        json!({"cancelled":true}),
+                    );
+                } else {
+                    self.request(
+                        "thread/goal/set",
+                        request["params"].clone(),
+                        json!({"type":"native_goal","id":request["id"]}),
+                    );
+                }
+            }
+            "goal_state" | "goal_stop" => {
+                self.goal = result["goal"].clone();
+                self.events
+                    .push(json!({"type":"harness_update","field":"goal","value":self.goal}));
+            }
+            "native_goal" => {
+                self.goal = result["goal"].clone();
+                self.events
+                    .push(json!({"type":"harness_update","field":"goal","value":result["goal"]}));
+                self.events.push(json!({"type":"extension_ui_request","method":"notify",
+                    "message":if result["goal"].is_null() {"No goal is set.".into()} else {result["goal"].to_string()}}));
+                self.reply(&request, result.clone());
+            }
+            "native_feedback" => {
+                self.events
+                    .push(json!({"type":"extension_ui_request","method":"notify",
+                    "message":"Codex feedback was sent to OpenAI."}));
+                self.reply(&request, result.clone());
+            }
+            "fork" => {
+                self.begin_hydration(result.clone(), request)?;
+            }
             "steer" => self.reply(&request["original"], json!({})),
             _ => self.reply(&request, result.clone()),
+        }
+        Ok(())
+    }
+
+    fn begin_hydration(&mut self, mut result: Value, request: Value) -> Result<(), String> {
+        let id = result["thread"]["id"]
+            .as_str()
+            .ok_or("Codex history lacks a thread id.")?;
+        if request["type"] == "fork" && self.session.as_deref() != Some(id) {
+            return Err("Codex reverted a different thread.".into());
+        }
+        if let SessionSource::Resume(expected) = &self.start.source
+            && id != expected
+        {
+            return Err("Codex resumed a different thread.".into());
+        }
+        self.session = Some(id.into());
+        result["thread"]["turns"] = json!([]);
+        self.hydration = Some((result, request));
+        self.history_cursors.clear();
+        self.request_history(None);
+        Ok(())
+    }
+
+    fn request_history(&mut self, cursor: Option<String>) {
+        self.request("thread/turns/list",
+            json!({"threadId":self.session,"limit":100,"sortDirection":"asc","itemsView":"full","cursor":cursor}),
+            json!({"type":"hydrate"}));
+    }
+
+    fn started(&mut self, result: &Value) -> Result<(), String> {
+        let id = result["thread"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("Codex did not return a thread id.")?;
+        if let SessionSource::Resume(expected) = &self.start.source
+            && id != expected
+        {
+            return Err("Codex resumed a different thread.".into());
+        }
+        if let SessionSource::Fork(source) = &self.start.source
+            && id == source
+        {
+            return Err(
+                "Codex did not create a distinct fork. The source was left unchanged.".into(),
+            );
+        }
+        self.session = Some(id.into());
+        self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
+        self.events.push(json!({"type":"harness_update","field":"effectiveServiceTier","value":self.service_tier}));
+        self.events.push(
+            json!({"type":"harness_update","field":"codexHistoryMode","value":self.history_mode}),
+        );
+        let model = result["model"]
+            .as_str()
+            .or_else(|| result["thread"]["model"].as_str());
+        self.model = model
+            .and_then(|id| self.models.iter().find(|m| m["id"] == id).cloned())
+            .or_else(|| model.map(|id| json!({"provider":"codex","id":id,"name":id})))
+            .unwrap_or(Value::Null);
+        self.effort = result["reasoningEffort"]
+            .as_str()
+            .or_else(|| result["thread"]["reasoningEffort"].as_str())
+            .or_else(|| {
+                self.raw_models
+                    .iter()
+                    .find(|m| Some(m["model"].as_str().unwrap_or("")) == model)
+                    .and_then(|m| m["defaultReasoningEffort"].as_str())
+            })
+            .unwrap_or("")
+            .into();
+        for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
+            self.replay(turn);
+            self.turns.push(turn.clone());
+        }
+        if let Some(active) = self
+            .turns
+            .iter()
+            .find(|turn| turn["status"] == "inProgress")
+        {
+            self.running = true;
+            self.turn = active["id"].as_str().map(str::to_owned);
+        }
+        self.ready = true;
+        self.reply(
+            &json!({"type":"get_available_models","id":"models"}),
+            json!({"models":self.models}),
+        );
+        self.reply(
+            &json!({"type":"get_available_thinking_levels","id":"levels"}),
+            json!({"levels":self.levels()}),
+        );
+        self.reply(&json!({"type":"get_state","id":"state"}), self.state());
+        self.reply(&json!({"type":"get_messages","id":"history"}),
+            json!({"messages":self.history,"compactions":self.compactions,"forkMessages":self.fork_messages()}));
+        if self.compacting {
+            self.events.push(json!({"type":"compaction_start"}));
+        }
+        self.reply(
+            &json!({"type":"get_commands","id":"commands"}),
+            json!({"commands":self.commands()}),
+        );
+        self.events
+            .push(json!({"type":"harness_update","field":"awareness","value":true}));
+        if self.native_extensions {
+            self.request(
+                "thread/goal/get",
+                json!({"threadId":self.session}),
+                json!({"type":"goal_state"}),
+            );
         }
         Ok(())
     }
@@ -503,6 +747,66 @@ impl Client {
             .get("thinkingLevels")
             .cloned()
             .unwrap_or_else(|| json!([]))
+    }
+
+    fn commands(&self) -> Vec<Value> {
+        let mut commands = self.skill_commands.clone();
+        if self.native_extensions {
+            commands.extend([
+                json!({"name":"goal","description":"Set a goal Codex keeps working toward until it is done. Objective, or pause, resume, clear.","source":"Codex"}),
+                json!({"name":"feedback","description":"Send this thread and Codex logs to OpenAI. Describe the issue, optionally.","source":"Codex"}),
+            ]);
+        }
+        commands
+    }
+
+    fn cancel_goal_activation(&mut self) {
+        for pending in self
+            .pending
+            .values_mut()
+            .filter(|pending| pending.request["type"] == "goal_settings")
+        {
+            pending.request["cancelled"] = json!(true);
+        }
+    }
+
+    fn fork_messages(&self) -> Vec<Value> {
+        self.turns
+            .iter()
+            .flat_map(|turn| {
+                turn["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "userMessage")
+                    .map(|item| {
+                        let content = replay_input(&item["content"]);
+                        let text = content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        json!({"entryId":turn["id"],"text":text,"content":content})
+                    })
+            })
+            .collect()
+    }
+
+    fn reset_history(&mut self, thread: &Value) {
+        self.history.clear();
+        self.items.clear();
+        self.completed.clear();
+        self.compactions.clear();
+        self.compacted_turns.clear();
+        self.text.clear();
+        self.child_parents.clear();
+        self.turns = thread["turns"].as_array().cloned().unwrap_or_default();
+        for turn in self.turns.clone() {
+            self.replay(&turn);
+        }
+        self.invalidate_usage();
     }
 
     fn command(&mut self, record: Value) -> Result<(), String> {
@@ -551,6 +855,24 @@ impl Client {
         if !self.ready {
             return Err("Codex session is not initialized.".into());
         }
+        if kind == "prompt" {
+            let mut words = record["message"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .splitn(2, char::is_whitespace);
+            if let Some(name @ ("/goal" | "/feedback")) = words.next() {
+                if !self.native_extensions {
+                    self.reject(
+                        &record,
+                        "This Codex version has no verified native command protocol.",
+                    );
+                    return Ok(());
+                }
+                return self.command(json!({"type":"native_command","id":record["id"],
+                    "name":name.trim_start_matches('/'),"arguments":words.next().unwrap_or("")}));
+            }
+        }
         match kind {
             "get_state" => self.reply(&record, self.state()),
             "get_messages" | "get_entries" => {
@@ -558,18 +880,137 @@ impl Client {
                 record["type"] = json!("get_messages");
                 self.reply(
                     &record,
-                    json!({"messages":self.history,"compactions":self.compactions}),
+                    json!({"messages":self.history,"compactions":self.compactions,"forkMessages":self.fork_messages()}),
                 );
             }
-            "get_available_models" => self.reply(&record, json!({"models":self.models})),
+            "get_available_models" => {
+                if self
+                    .pending
+                    .values()
+                    .any(|pending| pending.request["type"] == "models")
+                {
+                    self.reply(&record, json!({"models":self.models}));
+                    return Ok(());
+                }
+                self.raw_models.clear();
+                self.model_cursors.clear();
+                self.request(
+                    "model/list",
+                    json!({"limit":100}),
+                    json!({"type":"models","id":record["id"]}),
+                );
+            }
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":self.levels()})),
             "get_session_stats" => self.reply(&record, json!({"contextUsage":self.usage})),
             "get_commands" => self.request(
                 "skills/list",
-                json!({"cwds":[self.start.workspace]}),
+                json!({"cwds":[self.start.workspace],"forceReload":true}),
                 json!({"type":"skills","id":record["id"]}),
             ),
             "set_session_name" => self.reply(&record, json!({})),
+            "set_service_tier" => {
+                if self.running
+                    || !service_tiers(&self.model)
+                        .iter()
+                        .any(|tier| tier["id"] == record["tier"])
+                {
+                    self.reject(
+                        &record,
+                        "Choose an advertised Codex service tier while idle.",
+                    );
+                } else {
+                    self.service_tier = record["tier"].as_str().map(str::to_owned);
+                    self.reply(&record, json!({"serviceTier":self.service_tier}));
+                }
+            }
+            "native_command" if self.native_extensions => {
+                let text = record["arguments"].as_str().unwrap_or("").trim();
+                if self.running
+                    && record["name"] == "goal"
+                    && !matches!(text, "" | "pause" | "clear")
+                {
+                    self.reject(
+                        &record,
+                        "Wait for Codex to finish before running this command.",
+                    );
+                    return Ok(());
+                }
+                match record["name"].as_str() {
+                    Some("feedback") => self.request(
+                        "feedback/upload",
+                        json!({"threadId":self.session,"classification":"bug","includeLogs":true,
+                            "reason":if text.is_empty() {Value::Null} else {json!(text)}}),
+                        json!({"type":"native_feedback","id":record["id"]}),
+                    ),
+                    Some("goal") => {
+                        if matches!(text, "pause" | "clear") {
+                            self.cancel_goal_activation();
+                        }
+                        let mut params = json!({"threadId":self.session});
+                        let method = match text {
+                            "" => "thread/goal/get",
+                            "clear" => "thread/goal/clear",
+                            "pause" | "resume" => {
+                                params["status"] =
+                                    json!(if text == "pause" { "paused" } else { "active" });
+                                params["origin"] = json!("user");
+                                "thread/goal/set"
+                            }
+                            objective => {
+                                params["objective"] = json!(objective);
+                                params["status"] = json!("active");
+                                params["origin"] = json!("user");
+                                "thread/goal/set"
+                            }
+                        };
+                        if params["status"] == "active" {
+                            // Codex starts a goal turn itself. Apply the current policy/model
+                            // first, natively, so it cannot reuse a stale, broader turn policy.
+                            let (approval, _, sandbox) = policy(self.access());
+                            let mut settings = json!({"threadId":self.session,"cwd":self.start.workspace,
+                                "approvalPolicy":approval,"approvalsReviewer":"user","sandboxPolicy":sandbox});
+                            if let Some(model) = self.model["id"].as_str() {
+                                settings["model"] = json!(model);
+                            }
+                            if !self.effort.is_empty() {
+                                settings["effort"] = json!(self.effort);
+                            }
+                            self.request(
+                                "thread/settings/update",
+                                settings,
+                                json!({"type":"goal_settings","id":record["id"],"params":params}),
+                            );
+                        } else {
+                            self.request(
+                                method,
+                                params,
+                                json!({"type":"native_goal","id":record["id"]}),
+                            );
+                        }
+                    }
+                    _ => self.reject(&record, "Unknown native Codex command."),
+                }
+            }
+            "fork" if self.native_extensions => {
+                let entry = record["entryId"].as_str().unwrap_or("");
+                if self.history_mode != "paginated" {
+                    self.reject(&record, "Codex cannot rewind a legacy-history thread. Start a new paginated Codex thread.");
+                } else if self.running
+                    || !self
+                        .fork_messages()
+                        .iter()
+                        .any(|point| point["entryId"] == entry)
+                {
+                    self.reject(&record, "Choose a Codex user turn while idle.");
+                } else {
+                    // Rewind replaces conversation history only, never files on disk.
+                    self.request(
+                        "thread/revert",
+                        json!({"threadId":self.session,"beforeTurnId":entry}),
+                        record,
+                    );
+                }
+            }
             "compact" => {
                 if self.running {
                     self.reject(
@@ -609,6 +1050,14 @@ impl Client {
                 self.queue_update();
             }
             "abort" => {
+                self.cancel_goal_activation();
+                if self.native_extensions && self.goal["status"] == "active" {
+                    self.request(
+                        "thread/goal/set",
+                        json!({"threadId":self.session,"status":"paused","origin":"user"}),
+                        json!({"type":"goal_stop"}),
+                    );
+                }
                 self.cancelling = self.running;
                 for (_, approval) in std::mem::take(&mut self.approvals) {
                     self.answer_approval(approval, false);
@@ -661,6 +1110,7 @@ impl Client {
                     .cloned()
                 {
                     self.model = model;
+                    self.service_tier = None;
                     if !self
                         .levels()
                         .as_array()
@@ -702,6 +1152,15 @@ impl Client {
     }
 
     fn prompt(&mut self, record: Value) -> Result<(), String> {
+        if let Some(tier) = record["serviceTier"].as_str() {
+            if !service_tiers(&self.model)
+                .iter()
+                .any(|option| option["id"] == tier)
+            {
+                return Err("The chosen Codex service tier is no longer advertised.".into());
+            }
+            self.service_tier = Some(tier.into());
+        }
         let input = codex_input(&record)?;
         let (approval, _, sandbox) = policy(self.access());
         let mut params = json!({"threadId":self.session,"cwd":self.start.workspace,
@@ -712,6 +1171,9 @@ impl Client {
         }
         if !self.effort.is_empty() {
             params["effort"] = json!(self.effort);
+        }
+        if let Some(tier) = &self.service_tier {
+            params["serviceTierForTurn"] = json!(tier);
         }
         self.running = true;
         self.cancelling = false;
@@ -825,6 +1287,9 @@ impl Client {
     fn notification(&mut self, method: &str, params: &Value) -> Result<(), String> {
         match method {
             "turn/started" => {
+                if !self.running {
+                    self.events.push(json!({"type":"agent_start"}));
+                }
                 self.retry_attempt = 0;
                 self.retrying = false;
                 self.running = true;
@@ -870,6 +1335,43 @@ impl Client {
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("codex-plan-{turn}"));
                 self.plan(params, &id, true);
+            }
+            "thread/settings/updated" => {
+                if let Some(cwd) = params["threadSettings"]["cwd"].as_str() {
+                    let cwd = PathBuf::from(cwd);
+                    if !cwd.is_absolute() {
+                        return Err("Codex reported a non-absolute working directory.".into());
+                    }
+                    if cwd != self.start.workspace {
+                        self.start.workspace = cwd;
+                        self.skill_commands.clear();
+                        self.skills_loaded = false;
+                        self.reply(
+                            &json!({"type":"get_commands","id":"commands"}),
+                            json!({"commands":self.commands()}),
+                        );
+                        self.request(
+                            "skills/list",
+                            json!({"cwds":[self.start.workspace],"forceReload":true}),
+                            json!({"type":"skills","id":"commands"}),
+                        );
+                    }
+                }
+            }
+            "account/rateLimits/updated" => {
+                self.usage_limits =
+                    crate::usage_limits::codex(&params["rateLimits"], &self.usage_limits);
+                self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
+            }
+            "thread/goal/updated" => {
+                self.goal = params["goal"].clone();
+                self.events
+                    .push(json!({"type":"harness_update","field":"goal","value":self.goal}));
+            }
+            "thread/goal/cleared" => {
+                self.goal = Value::Null;
+                self.events
+                    .push(json!({"type":"harness_update","field":"goal","value":null}));
             }
             "thread/tokenUsage/updated" => {
                 if self.compacting {
@@ -946,9 +1448,12 @@ impl Client {
                     }
                 }
                 self.finish_history_turn(turn);
+                let mut saved = turn.clone();
+                saved["items"] = json!(std::mem::take(&mut self.turn_items));
+                self.turns.push(saved);
                 if failed {
                     self.events.push(json!({"type":"message_end","message":{"role":"assistant","stopReason":"error",
-                        "errorMessage":self.redact(turn["error"]["message"].as_str().unwrap_or("Codex turn failed."))}}));
+                        "errorMessage":auth_guidance(&self.redact(turn["error"]["message"].as_str().unwrap_or("Codex turn failed.")))}}));
                 }
                 self.running = false;
                 self.turn = None;
@@ -984,10 +1489,12 @@ impl Client {
                         self.redact(params["error"]["message"].as_str().unwrap_or("Codex failed."))}));
                     self.retrying = false;
                 }
-                return Err(self.redact(
-                    params["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Codex failed."),
+                return Err(auth_guidance(
+                    &self.redact(
+                        params["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex failed."),
+                    ),
                 ));
             }
             _ => {}
@@ -1046,6 +1553,24 @@ impl Client {
         let new = !self.items.contains_key(id);
         self.items.insert(id.into(), item.clone());
         let kind = item["type"].as_str().unwrap_or("");
+        if kind == "collabAgentToolCall" && item["tool"] == "spawnAgent" {
+            for child in item["receiverThreadIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                self.child_parents
+                    .entry(child.into())
+                    .or_insert_with(|| id.into());
+            }
+        } else if kind == "subAgentActivity"
+            && let Some(child) = item["agentThreadId"].as_str()
+        {
+            self.child_parents
+                .entry(child.into())
+                .or_insert_with(|| id.into());
+        }
         match kind {
             "contextCompaction" => {
                 // Some versions send the deprecated notification first. It already
@@ -1112,16 +1637,27 @@ impl Client {
                     }
                 }
             }
-            "plan" if done => self.plan(item, &format!("codex-plan-{id}"), emit),
-            "userMessage" | "agentMessage" | "reasoning" | "plan" => {}
+            "plan" | "todoList" if done => self.plan(item, &format!("codex-plan-{id}"), emit),
+            "userMessage" | "agentMessage" | "reasoning" | "plan" | "todoList" => {}
             _ => {
                 let name = match kind {
-                    "commandExecution" => "command",
-                    "fileChange" => "patch",
-                    "mcpToolCall" | "dynamicToolCall" => {
-                        item["tool"].as_str().unwrap_or("Codex tool")
+                    "commandExecution" => "command".into(),
+                    "fileChange" => "patch".into(),
+                    "collabAgentToolCall"
+                    | "subAgentActivity"
+                    | "collabAgentSpawn"
+                    | "collabAgentInteraction" => "subagent".into(),
+                    "mcpToolCall" | "dynamicToolCall" | "functionCallOutput" => {
+                        let tool = item["tool"]
+                            .as_str()
+                            .or_else(|| item["name"].as_str())
+                            .unwrap_or("Codex tool");
+                        item["server"]
+                            .as_str()
+                            .or_else(|| item["namespace"].as_str())
+                            .map_or_else(|| tool.into(), |server| format!("{server}/{tool}"))
                     }
-                    _ => kind,
+                    _ => kind.to_owned(),
                 };
                 let metadata = tool_metadata(item);
                 if new {
@@ -1131,23 +1667,30 @@ impl Client {
                     }
                 }
                 if done {
-                    let output = item["aggregatedOutput"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| item["output"].as_str().map(str::to_owned))
-                        .unwrap_or_else(|| {
-                            if metadata["toolKind"] == "other" {
-                                item.to_string()
-                            } else {
-                                String::new()
-                            }
-                        });
                     let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
-                        || item["exitCode"].as_i64().is_some_and(|code| code != 0);
-                    let content = json!([{"type":"text","text":output}]);
+                        || item["exitCode"].as_i64().is_some_and(|code| code != 0)
+                        || item["success"] == false
+                        || !item["error"].is_null();
                     let mut result = metadata;
-                    result["content"] = content;
+                    result["content"] = tool_content(item);
+                    if item["aggregatedOutput"].as_str().is_none()
+                        && item["output"].as_str().is_none()
+                        && let Some(output) = self.text.get(&format!("output:{id}"))
+                    {
+                        result["content"] = json!([{"type":"text","text":output}]);
+                    }
                     result["details"] = json!({"codex":item,"exitCode":item["exitCode"]});
+                    if let Some(structured) = item["result"].get("structuredContent") {
+                        result["structuredContent"] = structured.clone();
+                    }
+                    result["nestedCalls"] = item
+                        .get("nestedCalls")
+                        .or_else(|| item["result"]["structuredContent"].get("nestedCalls"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if matches!(kind, "collabAgentToolCall" | "subAgentActivity") {
+                        result["details"]["results"] = subagent_results(item);
+                    }
                     let mut saved = result.clone();
                     saved["role"] = json!("toolResult");
                     saved["toolCallId"] = json!(id);
@@ -1162,10 +1705,69 @@ impl Client {
             }
         }
         if done {
+            if emit {
+                self.turn_items.push(item.clone());
+            }
             self.completed.insert(id.into());
             self.items.remove(id);
             self.text.remove(&format!("output:{id}"));
         }
+    }
+
+    /// Nested notifications retain their native parent; they never settle the root turn.
+    fn child_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+        parent: &str,
+    ) -> Result<(), String> {
+        let thread = params["threadId"].as_str().unwrap_or("");
+        match method {
+            "item/started" | "item/completed" => {
+                if matches!(
+                    params["item"]["type"].as_str(),
+                    Some(
+                        "userMessage"
+                            | "agentMessage"
+                            | "reasoning"
+                            | "contextCompaction"
+                            | "plan"
+                            | "todoList"
+                    )
+                ) {
+                    return Ok(());
+                }
+                let mut item = params["item"].clone();
+                let Some(id) = item["id"].as_str() else {
+                    return Ok(());
+                };
+                item["id"] = json!(format!("{thread}:{id}"));
+                let (history, events, turns) =
+                    (self.history.len(), self.events.len(), self.turn_items.len());
+                self.item(&item, method == "item/completed", true);
+                self.turn_items.truncate(turns);
+                for message in &mut self.history[history..] {
+                    for block in message["content"].as_array_mut().into_iter().flatten() {
+                        if block["type"] == "toolCall" {
+                            block["parentToolCallId"] = json!(parent);
+                        }
+                    }
+                }
+                for event in &mut self.events[events..] {
+                    event["parentToolCallId"] = json!(parent);
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                let mut params = params.clone();
+                params["itemId"] = json!(format!(
+                    "{thread}:{}",
+                    params["itemId"].as_str().unwrap_or("")
+                ));
+                self.notification(method, &params)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn plan(&mut self, source: &Value, id: &str, emit: bool) {
@@ -1322,10 +1924,61 @@ fn model_value(model: &Value) -> Option<Value> {
     Some(
         json!({"provider":"codex","id":id,"name":model["displayName"].as_str().unwrap_or(id),
         "thinkingLevels":levels,"input":model.get("inputModalities").cloned().unwrap_or_else(||json!(["text","image"])),
-        "contextWindow":model["contextWindow"]}),
+        "contextWindow":model["contextWindow"],"serviceTiers":service_tiers(model),
+        "defaultServiceTier":model["defaultServiceTier"]}),
     )
 }
 
+pub(crate) fn service_tiers(model: &Value) -> Vec<Value> {
+    let mut tiers = model["serviceTiers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if tiers.is_empty() {
+        tiers.extend(model["additionalSpeedTiers"].as_array().into_iter().flatten()
+            .filter_map(|tier| tier.as_str())
+            .map(|id| json!({"id":id,"name":if id == "fast" {"Fast"} else {id},"description":""})));
+    }
+    tiers.retain(|tier| tier["id"].as_str().is_some_and(|id| !id.is_empty()));
+    if !tiers.is_empty() && !tiers.iter().any(|tier| tier["id"] == "default") {
+        tiers.insert(
+            0,
+            json!({"id":"default","name":"Standard","description":"Standard speed"}),
+        );
+    }
+    let default = model["defaultServiceTier"].as_str().unwrap_or("default");
+    for tier in &mut tiers {
+        tier["isDefault"] = json!(tier["id"] == default);
+    }
+    tiers
+}
+
+/// These optional methods and fields were checked in the 0.167.2 generated schema.
+/// Unknown/older versions retain the existing compact-only contract.
+fn supports_extensions(initialize: &Value) -> bool {
+    initialize["userAgent"]
+        .as_str()
+        .into_iter()
+        .flat_map(|ua| ua.split_whitespace())
+        .filter_map(|part| part.split_once('/').map(|(_, version)| version))
+        .filter_map(|version| {
+            let parts: Vec<_> = version.split('.').take(3).map(str::parse::<u32>).collect();
+            if let [Ok(major), Ok(minor), Ok(patch)] = parts.as_slice() {
+                Some((*major, *minor, *patch) >= (0, 167, 2))
+            } else {
+                None
+            }
+        })
+        .any(|supported| supported)
+}
+
+pub(crate) fn auth_guidance(message: &str) -> String {
+    if crate::usage_limits::authentication_error(message) {
+        format!("{message}\nRun `codex login` outside Shina, then retry.")
+    } else {
+        message.into()
+    }
+}
 pub(crate) fn developer_instructions(start: &Start) -> String {
     format!(
         "{}\n\n{}",
@@ -1407,7 +2060,7 @@ fn replay_input(content: &Value) -> Value {
 }
 
 fn run(
-    mut command: Command,
+    command: Command,
     start: Start,
     input: Receiver<Value>,
     events: &SyncSender<Event>,
@@ -1415,6 +2068,24 @@ fn run(
     stopped: &AtomicBool,
     owner: &SessionOwner,
 ) -> Result<(), String> {
+    run_mode(command, start, input, events, wake, stopped, owner, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mode(
+    mut command: Command,
+    start: Start,
+    input: Receiver<Value>,
+    events: &SyncSender<Event>,
+    wake: &Waker,
+    stopped: &AtomicBool,
+    owner: &SessionOwner,
+    probe: Option<bool>,
+) -> Result<(), String> {
+    if probe.is_some() && !start.workspace.exists() {
+        std::fs::create_dir_all(&start.workspace)
+            .map_err(|error| format!("Could not create the discovery directory: {error}"))?;
+    }
     command
         .current_dir(&start.workspace)
         .stdin(Stdio::piped())
@@ -1466,6 +2137,7 @@ fn run(
         let _ = result_tx.send(result);
     });
     let mut client = Client::new(start);
+    client.probe = probe;
     client.initialize();
     let result = (|| {
         loop {
@@ -1504,6 +2176,9 @@ fn run(
                 if !backend::publish(events, wake, Event::Record(record)) {
                     return Ok(());
                 }
+            }
+            if probe.is_some() && client.ready && client.skills_loaded {
+                return Ok(());
             }
             for _ in 0..64 {
                 match records.try_recv() {
@@ -1570,7 +2245,10 @@ fn tool_metadata(item: &Value) -> Value {
         "webSearch" | "webFetch" => ToolKind::WebSearch,
         "readFile" | "imageView" => ToolKind::Read,
         "listDirectory" => ToolKind::List,
-        "collabAgentToolCall" | "collabAgentSpawn" | "collabAgentInteraction" => ToolKind::Subagent,
+        "collabAgentToolCall"
+        | "collabAgentSpawn"
+        | "collabAgentInteraction"
+        | "subAgentActivity" => ToolKind::Subagent,
         "todoList" | "plan" => ToolKind::Plan,
         _ => ToolKind::Other,
     };
@@ -1599,4 +2277,64 @@ fn tool_metadata(item: &Value) -> Value {
     let mut metadata = result_metadata(kind, changes, item);
     metadata["input"] = item.clone();
     metadata
+}
+
+fn subagent_results(item: &Value) -> Value {
+    let mut agents = item["agentsStates"].as_object().map(|states| states.iter().map(|(id, state)| {
+        json!({"agent":id,"task":item["prompt"].as_str().unwrap_or("Codex subagent"),
+            "model":item["model"],"finished":!matches!(state["status"].as_str(),Some("pendingInit"|"running")),
+            "stopReason":if state["status"] == "errored" {"error"} else if state["status"] == "shutdown" {"aborted"} else {"stop"},
+            "exitCode":if state["status"] == "errored" {1} else {0},
+            "messages":[{"role":"assistant","content":[{"type":"text","text":state["message"].as_str().unwrap_or("")}]}]})
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    if agents.is_empty()
+        && let Some(id) = item["agentThreadId"].as_str()
+    {
+        agents.push(
+            json!({"agent":id,"task":item["agentPath"],"model":item["model"],
+            "finished":item["kind"] == "completed" || item["kind"] == "interrupted",
+            "stopReason":if item["kind"] == "interrupted" {"aborted"} else {"stop"},"exitCode":0}),
+        );
+    }
+    json!(agents)
+}
+
+fn tool_content(item: &Value) -> Value {
+    if let Some(content) = item["result"]["content"].as_array() {
+        return json!(content);
+    }
+    let content = item["contentItems"]
+        .as_array()
+        .or_else(|| item["output"].as_array());
+    if let Some(content) = content {
+        return json!(
+            content
+                .iter()
+                .filter_map(|part| {
+                    if let Some(text) = part["text"].as_str() {
+                        Some(json!({"type":"text","text":text}))
+                    } else {
+                        let url = part["imageUrl"]
+                            .as_str()
+                            .or_else(|| part["image_url"].as_str())?;
+                        let (mime, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+                        Some(json!({"type":"image","mimeType":mime,"data":data}))
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    if item["type"] == "imageView"
+        && let Some(path) = item["path"].as_str()
+        && let Ok(image) = crate::attachments::attach_file(std::path::Path::new(path))
+        && image.is_image()
+    {
+        return json!([{"type":"image","shinaAttachment":image.to_value()}]);
+    }
+    let output = item["aggregatedOutput"]
+        .as_str()
+        .or_else(|| item["output"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| item.to_string());
+    json!([{"type":"text","text":output}])
 }

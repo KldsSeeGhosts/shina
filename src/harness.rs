@@ -19,6 +19,21 @@ pub fn supports_compaction(id: &str) -> bool {
     matches!(id, "pi" | "codex" | "claude")
 }
 
+impl Start {
+    /// Metadata discovery never registers MCP, starts a conversation or sends a prompt.
+    pub(crate) fn discovery(id: &str, workspace: PathBuf) -> Self {
+        Self {
+            id: id.into(),
+            workspace,
+            source: SessionSource::New,
+            instructions: None,
+            link: None,
+            owner: Arc::default(),
+            context_sent: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agent {

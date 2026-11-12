@@ -3,6 +3,82 @@ use crate::model::{AccessMode, Status, Thread};
 
 const SESSION: &str = "40000000-0000-4000-8000-000000000031";
 
+#[test]
+fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
+    let dir = crate::store::directory().unwrap();
+    let script = dir.join("claude-probe.py");
+    std::fs::write(&script, include_str!("../assets/tests/fake_claude.py")).unwrap();
+    let log = dir.join("claude-probe.jsonl");
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command
+        .arg("-u")
+        .arg(script)
+        .arg("--log")
+        .arg(&log)
+        .env("CLAUDE_CONFIG_DIR", dir.join("probe-config"));
+    let start = Start::discovery("claude", dir.clone());
+    let pi = Pi::worker(
+        Arc::new(|| {}),
+        start.owner.clone(),
+        None,
+        move |input, events, wake, stopped, owner| {
+            run_mode(command, start, input, events, wake, stopped, owner, true)
+        },
+    );
+    let mut models = Value::Null;
+    loop {
+        match pi
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("probe timeout")
+        {
+            Event::Record(record) if record["command"] == "get_available_models" => {
+                models = record["data"]["models"].clone()
+            }
+            Event::Record(_) => {}
+            Event::Exited => break,
+            Event::Error(error) => panic!("{error}"),
+            Event::Diagnostic(_) => {}
+        }
+    }
+    assert!(
+        models
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "default")
+    );
+    let wire = records(&log);
+    assert!(wire.iter().all(|record| record["type"] != "user"));
+    let mut launch = Command::new("claude");
+    Client::new(Start::discovery("claude", dir)).launch(&mut launch);
+    let args: Vec<_> = launch
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.contains(&"--no-session-persistence".into()));
+    assert!(!args.contains(&"--mcp-config".into()));
+}
+
+#[test]
+fn claude_usage_windows_merge_and_authentication_errors_name_manual_login() {
+    let mut client = client("read-only");
+    for info in [
+        json!({"rateLimitType":"five_hour","utilization":0.9,"resetsAt":123}),
+        json!({"rateLimitType":"seven_day","utilization":0.4,"resetsAt":456}),
+    ] {
+        client
+            .incoming(json!({"type":"rate_limit_event","rate_limit_info":info}))
+            .unwrap();
+    }
+    assert_eq!(client.usage_limits["windows"][0]["usedPercent"], 90.0);
+    assert_eq!(client.usage_limits["windows"][1]["resetsAt"], 456);
+    let error = client
+        .incoming(json!({"type":"assistant","error":"authentication_failed"}))
+        .unwrap_err();
+    assert!(error.contains("`claude auth login`"));
+}
+
 fn spec(source: SessionSource, access: &str) -> Start {
     Start {
         id: "claude".into(),
@@ -404,7 +480,7 @@ fn authentication_failure_stops_without_retry() {
             .events
             .recv_timeout(Duration::from_millis(100))
         {
-            assert!(error.contains("Sign in with the Claude CLI"));
+            assert!(error.contains("`claude auth login`"));
             break;
         }
     }

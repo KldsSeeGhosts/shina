@@ -21,6 +21,8 @@ pub struct AgentModel {
     pub context_window: Option<u64>,
     /// Whether the model's `input` metadata accepts images.
     pub supports_images: Option<bool>,
+    #[serde(default)]
+    pub service_tiers: Vec<Value>,
 }
 
 impl AgentModel {
@@ -48,6 +50,10 @@ impl AgentModel {
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
+            service_tiers: model["serviceTiers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
         })
     }
     pub fn from_value(model: &Value) -> Option<Self> {
@@ -79,7 +85,145 @@ impl AgentModel {
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
+            service_tiers: vec![],
         })
+    }
+}
+
+/// KSG's cached provider probe. One model probe per app start/explicit refresh,
+/// with a separate working-directory skill inventory. No thread or prompt is created.
+#[derive(Default)]
+pub struct NativeCatalog {
+    pub models: Vec<AgentModel>,
+    pub error: Option<String>,
+    pub commands: Vec<Value>,
+    pub extensions: bool,
+    pub cwd: Option<PathBuf>,
+    pub revision: u64,
+    pi: Option<Pi>,
+    attempted: bool,
+    complete: bool,
+    models_loaded: bool,
+    commands_loaded: bool,
+    started: Option<Instant>,
+}
+
+impl NativeCatalog {
+    pub fn snapshot(&self) -> Value {
+        serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
+            "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading()})
+    }
+    pub fn loading(&self) -> bool {
+        self.pi.is_some()
+    }
+
+    pub fn refresh(&mut self, harness: &str, workspace: PathBuf, wake: Waker, force: bool) {
+        if self.pi.is_some() {
+            return;
+        }
+        let changed = self.cwd.as_ref() != Some(&workspace);
+        if !force && self.attempted && (!changed || self.error.is_some()) {
+            return;
+        }
+        let models = force || !self.attempted;
+        self.attempted = true;
+        self.revision += 1;
+        self.cwd = Some(workspace.clone());
+        self.commands.clear();
+        self.commands_loaded = false;
+        self.models_loaded = !models;
+        self.complete = false;
+        self.error = None;
+        self.started = Some(Instant::now());
+        let result = match harness {
+            "codex" => crate::codex::discover(workspace, wake, models),
+            "claude" => crate::claude::discover(workspace, wake),
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(pi) => self.pi = Some(pi),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    pub fn poll(&mut self, harness: &str) -> bool {
+        let mut changed = false;
+        for _ in 0..256 {
+            let Some(event) = self.pi.as_ref().and_then(|pi| pi.events.try_recv().ok()) else {
+                break;
+            };
+            changed = true;
+            match event {
+                Event::Record(record) if record["type"] == "harness_update" => {
+                    if record["field"] == "codexNativeExtensions" {
+                        self.extensions = record["value"] == true;
+                    }
+                }
+                Event::Record(record) if record["type"] == "response" => {
+                    if record["success"] == false {
+                        self.fail(
+                            record["error"]
+                                .as_str()
+                                .unwrap_or("Discovery failed.")
+                                .into(),
+                        );
+                        break;
+                    }
+                    match record["command"].as_str() {
+                        Some("get_available_models") => {
+                            self.models = record["data"]["models"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|model| AgentModel::from_harness_value(model, harness))
+                                .collect();
+                            self.models_loaded = true;
+                            self.revision += 1;
+                        }
+                        Some("get_commands") => {
+                            self.commands = record["data"]["commands"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            self.commands_loaded = true;
+                        }
+                        _ => {}
+                    }
+                    if self.models_loaded && self.commands_loaded {
+                        self.pi = None;
+                        self.started = None;
+                        self.complete = true;
+                        self.revision += 1;
+                        break;
+                    }
+                }
+                Event::Error(error) => {
+                    self.fail(error);
+                    break;
+                }
+                Event::Exited => {
+                    self.fail(format!("{harness} stopped during catalog discovery."));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if self.started.is_some_and(|at| at.elapsed() >= START_TIMEOUT) {
+            self.fail(format!("{harness} catalog discovery timed out."));
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn commands_ready(&self) -> bool {
+        self.complete
+    }
+
+    fn fail(&mut self, error: String) {
+        self.revision += 1;
+        self.error = Some(error);
+        self.pi = None;
+        self.started = None;
     }
 }
 
@@ -187,6 +331,34 @@ impl Catalog {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_catalog_caches_models_and_workspace_commands_without_a_thread() {
+        for harness in ["codex", "claude"] {
+            let (pi, commands, events) = Pi::test_connection();
+            let mut catalog = NativeCatalog {
+                pi: Some(pi),
+                ..Default::default()
+            };
+            events
+                .send(Event::Record(
+                    json!({"type":"response","command":"get_available_models","success":true,
+                "data":{"models":[{"provider":harness,"id":"fixture","thinkingLevels":["high"]}]}}),
+                ))
+                .unwrap();
+            events
+                .send(Event::Record(
+                    json!({"type":"response","command":"get_commands","success":true,
+                "data":{"commands":[{"name":"$fixture","description":"Project skill"}]}}),
+                ))
+                .unwrap();
+            assert!(catalog.poll(harness));
+            assert!(catalog.pi.is_none());
+            assert!(catalog.commands_ready());
+            assert_eq!(catalog.models[0].thinking_levels, ["high"]);
+            assert!(commands.try_recv().is_err());
+        }
+    }
 
     #[test]
     fn catalog_discovery_is_independent_of_a_thread_and_releases_its_process() {
