@@ -1287,8 +1287,10 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             .split_once(": ")
             .map(|(word, detail)| (word, Some(detail)))
             .unwrap_or((&machine.state, None));
+        // The status word and its reason share the right edge.
         let mut control = col()
             .gap(4.0)
+            .items_end()
             .max_w(240.0)
             .child(pixel_text(word, if machine.failed { p.danger } else { p.muted }).wrap());
         if let Some(detail) = detail {
