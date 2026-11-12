@@ -2,6 +2,10 @@
 //! ComposerPromptEditorTiptap.tsx and composer-rich-text-doc.ts.
 use rune::{Block, Key, KeyEvent, Mark, TextEdit};
 
+#[cfg(test)]
+#[path = "composer_edit_tests.rs"]
+mod parity_tests;
+
 pub fn draft(text: impl Into<String>) -> TextEdit {
     TextEdit::new(text).rich().allow_marks([
         Mark::Bold,
