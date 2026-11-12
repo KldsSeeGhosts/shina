@@ -256,15 +256,18 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::
     }
     let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();
-    let entries: Vec<_> = t
-        .messages
-        .iter()
-        .filter(|m| m.role == "You")
-        .map(|m| m.text.as_str())
-        .collect();
-    if t.prompt_history
-        .navigate(&mut t.draft, &entries, event, menu_open)
-    {
+    let entries = crate::composer::build_history_entries(&t.messages);
+    let has_attachments = !t.draft_images.is_empty();
+    let has_pending_request = t.request.is_some();
+    if t.prompt_history.navigate(
+        &mut t.draft,
+        &entries,
+        event,
+        menu_open,
+        has_attachments,
+        has_pending_request,
+        None,
+    ) {
         return true;
     }
     false

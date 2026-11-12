@@ -144,10 +144,48 @@ pub fn trigger(edit: &TextEdit) -> Option<Trigger> {
     })
 }
 
+const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT: &str =
+    "Please review the attached context before proceeding.";
+const PLAN_IMPLEMENTATION_PROMPT_PREFIX: &str = "PLEASE IMPLEMENT THIS PLAN:\n";
+
+/// Ported from KSG Code's `recallableComposerPrompt` and `buildComposerPromptHistoryEntries`.
+pub fn recallable_prompt(message_text: &str) -> String {
+    let mut prompt = message_text.trim();
+    if let Some(rest) = prompt.strip_prefix("Ultrathink:\n") {
+        prompt = rest;
+    }
+    let trimmed = prompt.trim();
+    if trimmed == ATTACHMENT_ONLY_BOOTSTRAP_PROMPT
+        || trimmed.starts_with(PLAN_IMPLEMENTATION_PROMPT_PREFIX)
+    {
+        return String::new();
+    }
+    trimmed.to_owned()
+}
+
+pub fn build_history_entries(messages: &[crate::model::Message]) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for message in messages {
+        if message.role != "You" {
+            continue;
+        }
+        let prompt = recallable_prompt(&message.text);
+        if prompt.is_empty() {
+            continue;
+        }
+        if entries.last().is_some_and(|prev| prev == &prompt) {
+            continue;
+        }
+        entries.push(prompt);
+    }
+    entries
+}
+
 /// Per-thread browsing state. Keep the whole edit so recall also preserves the caret and marks.
 #[derive(Default)]
 pub struct History {
     position: Option<usize>,
+    recalled: Option<String>,
     saved: Option<TextEdit>,
 }
 
@@ -156,15 +194,21 @@ impl History {
         *self = Self::default();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn navigate(
         &mut self,
         edit: &mut TextEdit,
-        entries: &[&str],
+        entries: &[String],
         event: &KeyEvent,
         menu_open: bool,
+        has_attachments: bool,
+        has_pending_request: bool,
+        caret_on_visual_edge: Option<bool>,
     ) -> bool {
         let m = event.mods;
         if menu_open
+            || has_pending_request
+            || has_attachments
             || m.shift
             || m.alt
             || m.cmd
@@ -182,30 +226,44 @@ impl History {
         {
             return false;
         }
+        if caret_on_visual_edge == Some(false) {
+            return false;
+        }
+        // Check if we are currently in an active recalled position matching the current text.
+        let active_index = self
+            .position
+            .filter(|_| self.recalled.as_deref() == Some(edit.text.as_str()))
+            .filter(|&i| i < entries.len());
+        if backward && active_index.is_none() && !edit.text.is_empty() {
+            return false;
+        }
         let next = if backward {
-            let at = self.position.unwrap_or(entries.len());
+            let at = active_index.unwrap_or(entries.len());
             if at == 0 {
-                return self.position.is_some();
+                return active_index.is_some();
             }
             at - 1
         } else {
-            let Some(at) = self.position else {
+            let Some(at) = active_index else {
                 return false;
             };
             at + 1
         };
-        if self.position.is_none() {
+        if active_index.is_none() {
             self.saved = Some(edit.clone());
         }
         if next >= entries.len() {
             if let Some(saved) = self.saved.take() {
                 *edit = saved;
+            } else {
+                edit.replace_text("");
             }
             self.reset();
         } else {
-            edit.replace_text(entries[next]);
+            edit.replace_text(&entries[next]);
             edit.focused = true;
             self.position = Some(next);
+            self.recalled = Some(entries[next].clone());
         }
         true
     }
@@ -223,46 +281,239 @@ mod tests {
     }
 
     #[test]
-    fn history_restores_the_unsent_edit_and_caret() {
+    fn history_starts_only_from_empty_composer_without_attachments() {
         let mut history = History::default();
-        let mut edit = TextEdit::new("unfinished\nsecond line");
-        edit.set_caret(3);
-        let entries = ["first", "second"];
-        assert!(history.navigate(&mut edit, &entries, &key(Key::Up), false));
-        assert_eq!(edit.text, "second");
-        assert!(history.navigate(&mut edit, &entries, &key(Key::Up), false));
-        assert_eq!(edit.text, "first");
-        assert!(history.navigate(&mut edit, &entries, &key(Key::Down), false));
-        assert_eq!(edit.text, "second");
-        assert!(history.navigate(&mut edit, &entries, &key(Key::Down), false));
-        assert_eq!(edit.text, "unfinished\nsecond line");
-        assert_eq!(edit.focus, 3);
+        let entries = vec!["first".to_owned(), "second".to_owned()];
+
+        // Non-empty draft blocks starting history recall.
+        let mut edit = TextEdit::new("unfinished");
+        edit.set_caret(0);
+        assert!(!history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(edit.text, "unfinished");
+
+        // Attachments block starting history recall even when text is empty.
+        let mut empty = TextEdit::new("");
+        assert!(!history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Up),
+            false,
+            true,
+            false,
+            None
+        ));
+
+        // Pending request blocks history recall.
+        assert!(!history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            true,
+            None
+        ));
+
+        // Empty composer with no attachments recalls the latest entry, then Down restores empty.
+        assert!(history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(empty.text, "second");
+        assert!(history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(empty.text, "first");
+        assert!(history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Down),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(empty.text, "second");
+        assert!(history.navigate(
+            &mut empty,
+            &entries,
+            &key(Key::Down),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(empty.text, "");
     }
 
     #[test]
-    fn editing_a_recalled_prompt_does_not_discard_the_original_unsent_draft() {
+    fn editing_a_recalled_prompt_exits_history_browsing() {
         let mut history = History::default();
-        let mut edit = TextEdit::new("original unsent");
-        assert!(history.navigate(&mut edit, &["sent"], &key(Key::Up), false));
+        let mut edit = TextEdit::new("");
+        let entries = vec!["sent".to_owned()];
+        assert!(history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(edit.text, "sent");
         edit.insert(" changed");
-        assert!(history.navigate(&mut edit, &["sent"], &key(Key::Down), false));
-        assert_eq!(edit.text, "original unsent");
+        // Edited recalled prompt no longer matches position.recalled, so Down does not overwrite it.
+        assert!(!history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Down),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(edit.text, "sent changed");
     }
 
     #[test]
-    fn history_respects_line_edges_menus_selections_and_modifiers() {
+    fn history_respects_line_edges_visual_edges_menus_selections_and_modifiers() {
         let mut history = History::default();
-        let mut edit = TextEdit::new("first\nlast");
-        assert!(!history.navigate(&mut edit, &["sent"], &key(Key::Up), false));
+        let entries = vec!["first\nlast".to_owned(), "other".to_owned()];
+        let mut edit = TextEdit::new("");
+        assert!(history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(edit.text, "other");
+        assert!(history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        assert_eq!(edit.text, "first\nlast");
+        // Caret at end of multi-line recalled prompt cannot step backward on Up.
+        assert!(!history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
         edit.set_caret(0);
-        assert!(!history.navigate(&mut edit, &["sent"], &key(Key::Up), true));
-        edit.set_selection(0, 2);
-        assert!(!history.navigate(&mut edit, &["sent"], &key(Key::Up), false));
-        edit.set_caret(0);
+        // Caret at start of multi-line recalled prompt cannot step forward on Down.
+        assert!(!history.navigate(
+            &mut edit,
+            &entries,
+            &key(Key::Down),
+            false,
+            false,
+            false,
+            None
+        ));
+        // Visual edge false (wrapped line) blocks navigation even without logical newlines.
+        let mut wrapped = TextEdit::new("");
+        assert!(history.navigate(
+            &mut wrapped,
+            &[String::from("one long wrapped line")],
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            Some(true)
+        ));
+        assert!(!history.navigate(
+            &mut wrapped,
+            &[String::from("one long wrapped line")],
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            Some(false)
+        ));
+        // Menu open, selection, modifiers, empty entries.
+        let mut blank = TextEdit::new("");
+        assert!(!history.navigate(
+            &mut blank,
+            &entries,
+            &key(Key::Up),
+            true,
+            false,
+            false,
+            None
+        ));
+        blank.replace_text("x");
+        blank.set_selection(0, 1);
+        assert!(!history.navigate(
+            &mut blank,
+            &entries,
+            &key(Key::Up),
+            false,
+            false,
+            false,
+            None
+        ));
+        let mut empty = TextEdit::new("");
         let mut modified = key(Key::Up);
         modified.mods.shift = true;
-        assert!(!history.navigate(&mut edit, &["sent"], &modified, false));
-        assert!(!history.navigate(&mut edit, &[], &key(Key::Up), false));
+        assert!(!history.navigate(&mut empty, &entries, &modified, false, false, false, None));
+        assert!(!history.navigate(&mut empty, &[], &key(Key::Up), false, false, false, None));
+    }
+
+    #[test]
+    fn history_filters_generated_prompts_and_collapses_consecutive_duplicates() {
+        let msg = |role: &'static str, text: &str| crate::model::Message {
+            role,
+            text: text.to_owned(),
+            images: vec![],
+        };
+        let messages = vec![
+            msg("You", "hello"),
+            msg("Assistant", "hi"),
+            msg("You", "hello"),
+            msg("You", ATTACHMENT_ONLY_BOOTSTRAP_PROMPT),
+            msg("You", "PLEASE IMPLEMENT THIS PLAN:\nstep 1"),
+            msg("You", "Ultrathink:\n  deep thought  "),
+            msg("You", "deep thought"),
+            msg("You", "final"),
+        ];
+        assert_eq!(
+            build_history_entries(&messages),
+            vec![
+                "hello".to_owned(),
+                "deep thought".to_owned(),
+                "final".to_owned(),
+            ]
+        );
     }
 
     #[test]
