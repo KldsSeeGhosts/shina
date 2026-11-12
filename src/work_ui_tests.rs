@@ -218,6 +218,49 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
 }
 
 #[test]
+fn find_reveals_a_folded_proposed_plan_and_highlights_its_title_and_body() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        let mut rt = runtime(width);
+        rt.poll = Some(|s, _, tx| s.poll_thread_find(tx));
+        let t = rt.state.current_mut();
+        t.apply(json!({"type":"harness_update","field":"plan","value":{
+            "planId":"find-plan","markdown":"# Needle proposal\n\n## Summary\n\nUse **needle** in the body."}}));
+        t.status = crate::model::Status::Completed;
+        t.work[0].expanded = false;
+        for index in 0..80 {
+            t.messages.push(crate::model::Message {
+                id: format!("later-{index}"),
+                role: "You",
+                text: format!("Later message {index}"),
+                images: vec![],
+            });
+        }
+        rt.frame(0.0);
+        assert!(rt.find("plan-card-1-0").is_none());
+        rt.update(|s, _| s.open_thread_find_on_query("needle".into(), None));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.thread_find.total_matches, 2, "{width}");
+        assert!(rt.state.current().work[0].expanded);
+        assert!(rt.presented("plan-card-1-0").is_some(), "{width}");
+        assert!(
+            rt.elements().iter().any(|element| element.role == "mark"),
+            "{width}: title highlight"
+        );
+        rt.update(|s, _| s.step_thread_find(1));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.thread_find.active_index, 1);
+        assert!(
+            rt.elements().iter().any(|element| element.role == "mark"),
+            "{width}: body highlight"
+        );
+    }
+}
+
+#[test]
 fn plans_fit_at_all_widths_and_updates_do_not_add_a_card() {
     for width in [620.0, 960.0, 1280.0, 1920.0] {
         for markdown in [false, true] {

@@ -3350,23 +3350,17 @@ impl State {
             return;
         }
         let t = self.current();
-        let docs_owned: Vec<(&str, &str, &str)> = t
-            .messages
-            .iter()
-            .map(|m| (m.id.as_str(), m.role, m.display_text()))
-            .collect();
-        let docs: Vec<crate::thread_find::SearchDocument<'_>> = docs_owned
-            .iter()
-            .map(
-                |(entry_id, role, text)| crate::thread_find::SearchDocument {
-                    entry_id,
-                    role,
-                    text,
-                },
+        let messages: Vec<_> = t.messages.iter().map(|message|
+            json!({"id":message.id,"role":message.role,"text":message.display_text()})).collect();
+        let streams = crate::history::Streams::new(&json!({"seq":0,
+            "state":{"threads":[{"id":t.id,"messages":messages,"tools":t.tools}]}}));
+        let result = streams
+            .find_thread(
+                t.id as u64,
+                &json!({"query":query,"start":start,"offset":offset}),
             )
-            .collect();
-        let result = crate::thread_find::search_documents(&docs, &query, start, offset, None, 0);
-        self.apply_thread_find_result(req_id, Ok(result));
+            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
+        self.apply_thread_find_result(req_id, result);
     }
     pub fn apply_thread_find_result(
         &mut self,
@@ -3400,7 +3394,15 @@ impl State {
             return false;
         };
         let t = self.current_mut();
-        let Some(msg_idx) = t.messages.iter().position(|m| m.id == matched.entry_id) else {
+        let plan_index = t.tools.iter().position(|tool| {
+            tool.id == matched.entry_id && tool.resolved_kind() == crate::work::ToolKind::Plan
+        });
+        let msg_idx = t
+            .messages
+            .iter()
+            .position(|m| m.id == matched.entry_id)
+            .or_else(|| plan_index.map(|index| t.tools[index].anchor.message));
+        let Some(msg_idx) = msg_idx else {
             if t.history_has_more && !t.history_loading && t.history_error.is_none() {
                 let tid = t.id;
                 self.load_earlier_history(tid, Some(matched.entry_id));
@@ -3409,13 +3411,24 @@ impl State {
             return false;
         };
         let tid = t.id;
-        let row_key = if t.messages[msg_idx].role == "Pi" {
+        let row_key = if plan_index.is_some() || t.messages[msg_idx].role == "Pi" {
             let start = t.messages[..=msg_idx]
                 .iter()
                 .rposition(|m| m.role != "Pi")
                 .map_or(0, |i| i + 1);
             if let Some(work) = t.work.iter_mut().find(|w| w.start == start) {
                 work.expanded = true;
+            } else if plan_index.is_some() {
+                t.work.push(AssistantWork {
+                    start,
+                    stopped: false,
+                    stopped_order: 0,
+                    expanded: true,
+                    elapsed: None,
+                });
+            }
+            if let Some(index) = plan_index {
+                t.tools[index].expanded = true;
             }
             format!("turn-{tid}-{}", t.messages[start].id)
         } else {

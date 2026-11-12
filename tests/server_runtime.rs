@@ -3338,6 +3338,15 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
             "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
             "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
         }));
+        if turn == 3 {
+            let mut plan = tools.last().unwrap().clone();
+            plan["id"] = json!("old-plan");
+            plan["name"] = json!("plan");
+            plan["kind"] = json!("plan");
+            plan["input"] = json!({"markdown":"# Stored proposal\n\n## Summary\n\nA deepplanneedle in a stored plan."});
+            plan["order"] = json!(2);
+            tools.push(plan);
+        }
     }
     let mut index = base["index"].clone();
     index["threads"][0]["title"] = json!("Long searchable thread");
@@ -3411,6 +3420,13 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
     );
     assert_eq!(next["result"]["activeIndex"], 1);
     assert_eq!(next["result"]["match"]["entryId"], "u-895");
+    let plan = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"deepplanneedle"}),
+        json!("find-plan"),
+    );
+    assert_eq!(plan["result"]["totalMatches"], 1, "{plan}");
+    assert_eq!(plan["result"]["match"]["entryId"], "old-plan");
 
     // Load initial scoped window via ProjectionCache, then jump to earlier match u-3!
     let mut cache = client_history::ProjectionCache::default();
@@ -3466,6 +3482,26 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
             .iter()
             .any(|m| m["id"] == "u-3")
     );
+    assert!(
+        linked_client.history_cache.as_ref().unwrap().histories[&1].1["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["id"] == "old-plan")
+    );
+    let mut reconnected =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    reconnected.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("reconnect"),
+    );
+    let plan = reconnected.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"Stored proposal"}),
+        json!("plan-title"),
+    );
+    assert_eq!(plan["result"]["match"]["entryId"], "old-plan", "{plan}");
 
     // Peer without thread-find (protocolMinor 9) does not advertise "thread-find".
     let mut old_client =
