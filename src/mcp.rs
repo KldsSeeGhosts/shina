@@ -61,7 +61,7 @@ ids, each model's supported reasoning levels, the default and caller selections,
 runtime and host limits. Call it before naming a model, then use an exact `models[].id` and one \
 exact entry from that model's `reasoning_levels`. `ready: false` means model discovery \
 has not produced a usable catalog; do not invent model ids or reasoning levels. Delegated work \
-runs in Pi, Codex, or an installed ACP harness on local machines. Pi uses CPA; Codex and ACP \
+runs in Pi, Codex, Claude, or an installed ACP harness on local machines. Pi uses CPA; the other harnesses \
 use their own configured providers and login. Shina never changes their configuration or authentication.
 - `mcp__shina__delegate_task` starts independent work in a new Shina thread, in the selected scoped \
 workspace and under the calling captain, if any. Each captain owns its crew even when several \
@@ -70,7 +70,7 @@ thread a complete brief: it has no access to this conversation. A delegated thre
 delegate further. \
 Pass an optional `target` shaped like `{\"harness\":\"codex\",\"model\":\"<id from \
 orchestrator_capabilities>\",\"options\":{\"reasoning\":\"<level for that model>\"}}`. \
-`target.harness` accepts pi, codex, or an installed ACP id. `target.model` is required unless \
+`target.harness` accepts pi, codex, claude, or an installed ACP id. `target.model` is required unless \
 target.harness is present. Omit model to use that harness's configured default. \
 `provider` defaults to cpa for Pi, otherwise the harness id, and \
 `thinking` is accepted as an alias for `reasoning`. Omit \
@@ -230,7 +230,7 @@ pub fn tools() -> Value {
         "type":"object",
         "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
         "properties":{
-            "harness":{"type":"string","description":"pi, codex, or an installed ACP id. Defaults to the parent's harness."},
+            "harness":{"type":"string","description":"pi, codex, claude, or an installed ACP id. Defaults to the parent's harness."},
             "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{

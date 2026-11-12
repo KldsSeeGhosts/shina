@@ -4,7 +4,8 @@ use super::*;
 impl Thread {
     /// Native app-server usage is push-based, including refreshes after compaction.
     pub(super) fn apply_codex(&mut self, record: &Value) -> bool {
-        if self.harness != "codex" || record["type"] != "context_usage" {
+        if !matches!(self.harness.as_str(), "codex" | "claude") || record["type"] != "context_usage"
+        {
             return false;
         }
         if self.context.phase != crate::context::ContextPhase::Compacting {
@@ -18,6 +19,8 @@ impl Thread {
     pub(crate) fn context_harness_text(&self, text: &str) -> String {
         if self.harness == "codex" {
             text.replace("Pi", "Codex")
+        } else if self.harness == "claude" {
+            text.replace("Pi", "Claude")
         } else {
             text.into()
         }
@@ -26,7 +29,7 @@ impl Thread {
 
 impl State {
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
-        if matches!(id, "pi" | "codex") {
+        if matches!(id, "pi" | "codex" | "claude") {
             Ok(())
         } else {
             self.harnesses.find(id).map(drop)
@@ -61,18 +64,24 @@ impl State {
         let codex_models = self.harness_models("codex");
         harnesses.push(json!({"id":"codex","name":"Codex","provider":"codex",
             "ready":!codex_models.is_empty(),"protocol":"codex.app-server"}));
+        let claude_models = self.harness_models("claude");
+        harnesses.push(json!({"id":"claude","name":"Claude","provider":"claude",
+            "ready":!claude_models.is_empty(),"available":crate::claude::process().is_ok(),
+            "protocol":"claude.stream-json"}));
         harnesses.extend(self.harnesses.agents.iter().map(
             |agent| json!({"id":agent.id,"name":agent.name,"provider":agent.id,"protocol":"acp"}),
         ));
         capabilities["harnesses"] = json!(harnesses);
         let values = capabilities["models"].as_array_mut().expect("models array");
-        for model in codex_models {
+        for model in codex_models.into_iter().chain(claude_models) {
             if !values
                 .iter()
                 .any(|m| m["provider"] == model.provider && m["id"] == model.id)
             {
-                values.push(json!({"harness":"codex","provider":"codex","id":model.id,
-                    "name":model.name,"reasoning_levels":model.thinking_levels}));
+                values.push(
+                    json!({"harness":model.provider,"provider":model.provider,"id":model.id,
+                    "name":model.name,"reasoning_levels":model.thinking_levels}),
+                );
             }
         }
         for value in values.iter_mut() {
@@ -85,7 +94,7 @@ impl State {
             }
         }
         capabilities["ready"] = json!(!values.is_empty());
-        capabilities["runtime"]["providers"] = json!(["cpa", "codex"]);
+        capabilities["runtime"]["providers"] = json!(["cpa", "codex", "claude"]);
     }
 
     /// One default for new lone threads and captain homes. Workers inherit their parent.
@@ -104,9 +113,9 @@ impl State {
         self.checkpoint();
     }
 
-    /// Harness ids a thread can use: Pi, Codex, then registered ACP agents.
+    /// Harness ids a thread can use: built-ins, then registered ACP agents.
     pub(crate) fn harness_ids(&self) -> Vec<String> {
-        let mut ids = vec!["pi".to_string(), "codex".to_string()];
+        let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
         ids
     }
@@ -115,6 +124,52 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_delegation_capabilities_and_harness_inheritance() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        state.threads[0].harness = "claude".into();
+        state.threads[0].models = vec![
+            AgentModel::from_harness_value(
+                &json!({"provider":"claude","id":"default","thinkingLevels":["low","high"]}),
+                "claude",
+            )
+            .unwrap(),
+        ];
+        state.threads[0].set_model("claude".into(), "default".into());
+        let capabilities = state
+            .mcp_call(1, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert!(
+            capabilities["harnesses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["id"] == "claude")
+        );
+        assert!(
+            capabilities["models"].as_array().unwrap().iter().any(
+                |m| m["harness"] == "claude" && m["reasoning_levels"] == json!(["low", "high"])
+            )
+        );
+        for target in [
+            None,
+            Some(json!({"harness":"claude","model":"default","options":{"reasoning":"low"}})),
+        ] {
+            let mut args = json!({"prompt":"Fixture task"});
+            if let Some(target) = target {
+                args["target"] = target;
+            }
+            let result = state.mcp_call(1, "delegate_task", &args).unwrap();
+            let child = state
+                .threads
+                .iter()
+                .find(|t| Some(t.id as u64) == result["thread_id"].as_u64())
+                .unwrap();
+            assert_eq!(child.harness, "claude");
+        }
+    }
 
     #[test]
     fn codex_slash_compact_is_native_and_acp_keeps_its_own_commands() {

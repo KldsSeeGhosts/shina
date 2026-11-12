@@ -134,7 +134,7 @@ struct Launch {
 }
 
 impl Pi {
-    /// ACP shares Pi's bounded connection, per-thread owner and shutdown registry.
+    /// ACP, Codex and Claude share Pi's bounded connection, owner and shutdown registry.
     pub(crate) fn worker(
         wake: Waker,
         owner: Arc<SessionOwner>,

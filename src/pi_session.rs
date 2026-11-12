@@ -252,7 +252,9 @@ impl Thread {
                 } else {
                     "Summarize context, with optional instructions".into()
                 },
-                source: if self.harness == "codex" {
+                source: if self.harness == "claude" {
+                    "Claude"
+                } else if self.harness == "codex" {
                     "Codex"
                 } else {
                     "Pi"
@@ -286,7 +288,7 @@ impl Thread {
             && self.request.is_none()
             && self.session.is_some()
             && crate::harness::supports_compaction(&self.harness)
-            && (self.harness == "codex" && !self.status.busy()
+            && (matches!(self.harness.as_str(), "codex" | "claude") && !self.status.busy()
                 || self.harness == "pi" && self.model_provider == "cpa")
     }
 
@@ -303,7 +305,7 @@ impl Thread {
             || self.native.operating()
             || self.request.is_some()
             || self.context.phase == crate::context::ContextPhase::Compacting
-            || self.harness == "codex" && self.status.busy()
+            || matches!(self.harness.as_str(), "codex" | "claude") && self.status.busy()
         {
             return;
         }
@@ -335,7 +337,7 @@ impl Thread {
         let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex") {
+        if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex" | "claude") {
             self.serial += 1;
             self.native.queue.push_back(QueuedMessage {
                 id: self.serial,
@@ -920,6 +922,21 @@ impl Thread {
             return true;
         }
         match string(record, "type") {
+            "extension_ui_cancel" => {
+                self.native
+                    .dialogs
+                    .retain(|(request, _)| request["id"] != record["id"]);
+                if self
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request["id"] == record["id"])
+                {
+                    self.cancel_questionnaire();
+                    self.request = None;
+                    self.native_dialog_done();
+                }
+                return true;
+            }
             "tool_execution_start" if record["toolName"] == "ask_user_question" => {
                 if let Some(id) = record["toolCallId"].as_str()
                     && self.native.questionnaires.len() < 32
@@ -1156,7 +1173,7 @@ impl Thread {
                     self.native.compact_id = None;
                     if record["success"] == false {
                         self.error = Some(string(record, "error").into());
-                        if self.harness != "codex"
+                        if !matches!(self.harness.as_str(), "codex" | "claude")
                             || self
                                 .native
                                 .compactions
@@ -1215,7 +1232,14 @@ impl Thread {
                                     .iter()
                                     .filter_map(Value::as_str)
                                     .filter(|s| !s.starts_with(INJECTION_PREFIX))
-                                    .map(str::to_owned),
+                                    .map(|s| {
+                                        if self.harness == "claude" {
+                                            memory::without_diff(s)
+                                        } else {
+                                            s
+                                        }
+                                        .to_owned()
+                                    }),
                             );
                         }
                     }
@@ -1226,6 +1250,33 @@ impl Thread {
                             texts.remove(i);
                         }
                         self.restore_prompt(&send.prompt);
+                    }
+                    // Claude's interrupt receipt can prove an already-streamed
+                    // input was cancelled. Preserve its images and path references.
+                    if self.harness == "claude" {
+                        for message in record["data"]["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .rev()
+                        {
+                            let text = content_text(&message["content"]);
+                            if text.starts_with(INJECTION_PREFIX) {
+                                continue;
+                            }
+                            if let Some(i) = texts.iter().position(|s| *s == text) {
+                                texts.remove(i);
+                            }
+                            let mut images = content_images(&message["content"]);
+                            images.extend(
+                                message["attachments"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Attachment::from_value),
+                            );
+                            self.restore_prompt(&Prompt::new(text, images));
+                        }
                     }
                     if !texts.is_empty() {
                         self.restore_prompt(&Prompt::new(texts.join("\n\n"), vec![]));
@@ -1447,7 +1498,7 @@ impl State {
             return;
         }
         if self.demo
-            || self.current().status.busy()
+            || self.current().status.busy() && self.current().harness != "claude"
             || self.current().configuring
             || self.current().archived()
         {
@@ -1455,6 +1506,16 @@ impl State {
         }
         self.current_mut().native.access_picker = false;
         if self.current().native.access == access {
+            return;
+        }
+        if self.current().harness == "claude"
+            && self.current().pi.is_some()
+            && !self.current().initializing
+        {
+            self.current_mut().native.access = access;
+            self.current_mut()
+                .command("set_access_mode", json!({"accessMode":access.id()}));
+            self.checkpoint();
             return;
         }
         self.current_mut().disconnect();

@@ -719,7 +719,7 @@ impl Thread {
         if self.forward("thread.configure", json!({"thinking":level})) {
             return;
         }
-        if !matches!(self.harness.as_str(), "pi" | "codex") {
+        if !matches!(self.harness.as_str(), "pi" | "codex" | "claude") {
             self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
         }
@@ -930,10 +930,10 @@ impl Thread {
         self.operation_deadline = None;
         if self.initializing
             || self.queued_prompt.is_some()
-            || self.native.operating() && self.harness != "codex"
+            || self.native.operating() && !matches!(self.harness.as_str(), "codex" | "claude")
             || self.has_pending_sends()
             || self.context.phase == crate::context::ContextPhase::Compacting
-                && self.harness != "codex"
+                && !matches!(self.harness.as_str(), "codex" | "claude")
         {
             self.disconnect();
             self.complete_task("cancelled");
@@ -1405,6 +1405,7 @@ impl Thread {
                     let mut tool =
                         Tool::new(id, string(block, "name"), &block["arguments"], anchor);
                     tool.block = block_index;
+                    tool.parent_call = block["parentToolCallId"].as_str().map(str::to_owned);
                     if restored {
                         tool.done = true;
                         tool.failed = true;
@@ -1834,6 +1835,9 @@ impl Thread {
                 let id = string(&record, "toolCallId");
                 if let Some(tool) = self.tools.iter_mut().rev().find(|tool| tool.id == id) {
                     tool.started.get_or_insert_with(Instant::now);
+                    if let Some(parent) = record["parentToolCallId"].as_str() {
+                        tool.parent_call = Some(parent.into());
+                    }
                 } else {
                     self.assistant();
                     let anchor = ToolAnchor {
@@ -4031,8 +4035,10 @@ impl State {
                     self.threads[index].memory_prompt()
                 )
             });
-        if matches!(self.threads[index].harness.as_str(), "pi" | "codex")
-            || self.threads[index].session.is_none()
+        if matches!(
+            self.threads[index].harness.as_str(),
+            "pi" | "codex" | "claude"
+        ) || self.threads[index].session.is_none()
         {
             self.threads[index].memory_context = self.threads[index]
                 .memory
@@ -4775,7 +4781,7 @@ impl State {
             return;
         }
         self.harnesses = crate::harness::Registry::read();
-        if self.current().harness == "codex"
+        if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_none()
             && self.current().status != Status::Failed
             && !self.current().archived()
@@ -4833,7 +4839,7 @@ impl State {
             self.apply_catalog();
         }
         self.checkpoint();
-        if id == "codex" && self.runtime_enabled && !self.demo {
+        if matches!(id, "codex" | "claude") && self.runtime_enabled && !self.demo {
             self.connect_thread(self.active);
         }
     }
@@ -6255,7 +6261,7 @@ fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, Str
                 .as_str()
                 .filter(|id| crate::harness::valid_id(id))
                 .map(str::to_owned)
-                .ok_or("target.harness must be pi, codex, or an installed ACP id.")
+                .ok_or("target.harness must be pi, codex, claude, or an installed ACP id.")
         })
         .transpose()?;
     if !object.contains_key("model") && harness.is_none() {
@@ -8481,7 +8487,7 @@ mod tests {
         assert_eq!(capabilities["runtime"]["harness"], "pi");
         assert_eq!(
             capabilities["runtime"]["providers"],
-            json!(["cpa", "codex"])
+            json!(["cpa", "codex", "claude"])
         );
         assert_eq!(capabilities["runtime"]["hosts"], json!(["local"]));
         assert_eq!(capabilities["runtime"]["machine"], "local");

@@ -16,7 +16,7 @@ pub use crate::backend::Pi as Session;
 /// Native compaction uses the shared `compact` command and compaction_start/end
 /// events. ACP has no standard equivalent. Acknowledgement is not completion.
 pub fn supports_compaction(id: &str) -> bool {
-    matches!(id, "pi" | "codex")
+    matches!(id, "pi" | "codex" | "claude")
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,7 +65,7 @@ impl Registry {
                     let mut ids = HashSet::new();
                     for agent in agents {
                         if !valid_id(&agent.id)
-                            || matches!(agent.id.as_str(), "pi" | "codex")
+                            || matches!(agent.id.as_str(), "pi" | "codex" | "claude")
                             || !ids.insert(agent.id.clone())
                             || agent.command.trim().is_empty()
                             || agent.name.trim().is_empty()
@@ -255,6 +255,9 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
         if start.id == "codex" {
             return crate::codex::start(start, wake);
         }
+        if start.id == "claude" {
+            return crate::claude::start(start, wake);
+        }
         let agent = Registry::read().find(&start.id)?;
         crate::acp::start(agent, start, wake)
     }
@@ -357,6 +360,7 @@ mod tests {
         assert!(!dir.join("harnesses.json").exists());
         for invalid in [
             r#"[{"id":"pi","name":"Other","command":"agent"}]"#,
+            r#"[{"id":"claude","name":"Other","command":"agent"}]"#,
             r#"[{"id":"bad id","name":"Other","command":"agent"}]"#,
             r#"[{"id":"ok","name":"Other","command":"agent","env":{"TOKEN":"secret"}}]"#,
         ] {
