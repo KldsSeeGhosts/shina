@@ -84,6 +84,8 @@ impl Captain {
 }
 
 pub struct CaptainEditor {
+    pub server: String,
+    pub machine_picker: bool,
     pub editing: Option<usize>,
     pub name: TextEdit,
     pub role: TextEdit,
@@ -95,6 +97,8 @@ pub struct CaptainEditor {
 impl CaptainEditor {
     pub fn new() -> Self {
         let mut editor = Self {
+            server: "local".into(),
+            machine_picker: false,
             editing: None,
             name: TextEdit::default(),
             role: TextEdit::default(),

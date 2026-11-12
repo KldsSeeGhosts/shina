@@ -3,7 +3,98 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 3;
+pub const MINOR: u32 = 4;
+pub const MAX_BROWSE_ENTRIES: usize = 200;
+pub const FILESYSTEM_BROWSE: &str = "filesystem-browse";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderEntry {
+    pub name: String,
+    /// An opaque path on the answering host. Clients must not join or normalize it.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<FolderEntry>,
+    pub truncated: bool,
+    pub target_exists: bool,
+}
+
+/// Every routed method has an explicit grant. Unknown methods fail closed.
+pub fn method_grant(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "hello"
+        | "workspace.subscribe"
+        | "thread.subscribe"
+        | "subscription.cancel"
+        | "thread.history"
+        | "command.get"
+        | "server.status"
+        | "blobs.read"
+        | "filesystem.browse" => "read",
+        "request.respond" => "approve",
+        "devices.list"
+        | "devices.pair"
+        | "devices.revoke"
+        | "server.validateRestart"
+        | "server.prepareRestart"
+        | "server.cancelRestart"
+        | "server.clientReady"
+        | "server.commitRestart"
+        | "server.stop" => "maintain",
+        "peer.link" | "peer.list" | "peer.unlink" => "peer-delegate",
+        "thread.send"
+        | "thread.stop"
+        | "thread.configure"
+        | "thread.retry"
+        | "thread.visit"
+        | "thread.create"
+        | "thread.rename"
+        | "thread.delete"
+        | "thread.lifecycle"
+        | "thread.undo"
+        | "thread.drop"
+        | "thread.compact"
+        | "thread.fork"
+        | "thread.rewind"
+        | "thread.forkPoints"
+        | "settings.autoSettle"
+        | "settings.defaultHarness"
+        | "background.keepAwake"
+        | "queue.remove"
+        | "queue.sendNow"
+        | "queue.edit"
+        | "input.claim"
+        | "project.put"
+        | "project.remove"
+        | "project.clone"
+        | "project.cancelClone"
+        | "catalog.refresh"
+        | "commands.refresh"
+        | "captain.open"
+        | "captain.put"
+        | "captain.scope"
+        | "captain.reset"
+        | "memory.put"
+        | "memory.remove"
+        | "profile.put"
+        | "routine.pause"
+        | "routine.remove"
+        | "task.resume"
+        | "task.dismiss"
+        | "task.resumeResults"
+        | "task.delegate"
+        | "task.send"
+        | "task.cancel"
+        | "uploads.write" => "operate",
+        _ => return None,
+    })
+}
 pub const MAX_CONTROL: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_BYTES: usize = 256 * 1024;
@@ -268,6 +359,83 @@ pub fn notification(method: &str, params: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_routed_protocol_method_has_an_explicit_grant() {
+        // Read the actual dispatch code, so adding a route without updating authorization fails.
+        let reducer = include_str!("client_state.rs")
+            .split("pub fn execute_command")
+            .nth(1)
+            .unwrap();
+        let reducer = reducer.split("impl Thread").next().unwrap();
+        let runtime = include_str!("runtime.rs")
+            .split("fn maintenance_command")
+            .nth(1)
+            .unwrap();
+        let runtime = runtime.split("pub fn failure").next().unwrap();
+        let server = include_str!("server.rs")
+            .split("async fn connection")
+            .nth(1)
+            .unwrap();
+        let server = server.split("pub fn serve").next().unwrap();
+        let mut routed = std::collections::BTreeSet::from([
+            "hello",
+            "blobs.read",
+            "uploads.write",
+            "devices.revoke",
+            "command.get",
+        ]);
+        for source in [reducer, runtime, server] {
+            let pieces: Vec<_> = source.split('"').collect();
+            for i in (1..pieces.len()).step_by(2) {
+                let name = pieces[i];
+                if !name.contains('.') || !name.chars().all(|c| c.is_ascii_alphabetic() || c == '.')
+                {
+                    continue;
+                }
+                let before = pieces[i - 1].trim_end();
+                let after = pieces.get(i + 1).copied().unwrap_or("").trim_start();
+                if before.ends_with("method ==")
+                    || (after.starts_with("=>") && !name.starts_with("subscription."))
+                    || after.starts_with('|')
+                    || before.ends_with('|')
+                    || before.ends_with("matches!(method,")
+                {
+                    routed.insert(name);
+                }
+            }
+        }
+        assert!(routed.len() > 60, "{routed:?}");
+        assert!(routed.contains("thread.subscribe") && routed.contains("filesystem.browse"));
+        for method in routed {
+            let expected = match method {
+                "hello"
+                | "workspace.subscribe"
+                | "thread.subscribe"
+                | "subscription.cancel"
+                | "thread.history"
+                | "command.get"
+                | "server.status"
+                | "blobs.read"
+                | "filesystem.browse" => "read",
+                "request.respond" => "approve",
+                "devices.list"
+                | "devices.pair"
+                | "devices.revoke"
+                | "server.validateRestart"
+                | "server.prepareRestart"
+                | "server.cancelRestart"
+                | "server.clientReady"
+                | "server.commitRestart"
+                | "server.stop" => "maintain",
+                _ => "operate",
+            };
+            assert_eq!(method_grant(method), Some(expected), "{method}");
+        }
+        for method in ["unknown.mutation", "server.newMethod", "peer.newMethod"] {
+            assert_eq!(method_grant(method), None, "{method}");
+        }
+    }
+
     #[test]
     fn receipt_hashes_ignore_object_key_order_but_not_content() {
         let a = Command::new(

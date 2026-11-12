@@ -4,6 +4,8 @@ A Captain is the assistant, with a profile, one primary home conversation, an or
 
 A Thread is a conversation backed by Pi or an ACP session. A captain's home is a thread, not a separate assistant for each project. A Task is a durable delegated brief, state, result and delivery record. Its worker has a separate thread and cannot delegate further. Resetting the captain's conversation does not erase its tasks.
 
+When machines are linked, the new captain editor's "Lives on" row chooses its home server. The choice is read-only after creation. Workspace choices and folder browsing stay on that server, including when adding folders to an existing captain's scope. Switching the home server while creating a captain retains the profile fields and clears the previous server's workspace choice. It does not copy folders or delegate across servers.
+
 ## Continuous homes and migration
 
 Opening a captain opens its primary home regardless of the sidebar's workspace filter. The index stores `captainHomes` and `captainScopes` separately from the profile. Captain ids stay stable so `memory.json` can refer to them. Migration retains unused preset profiles too, rather than deleting profiles and renumbering the roster.

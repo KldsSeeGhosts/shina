@@ -72,17 +72,23 @@ impl State {
             return result.map(|_| ());
         }
         self.require_captain(captain)?;
+        let home = self.captain_home(captain);
+        let machine = self
+            .threads
+            .iter()
+            .find(|thread| Some(thread.id) == home)
+            .map(|thread| thread.machine.as_str())
+            .unwrap_or("local");
         let mut scope = Vec::new();
         for id in projects {
             let project = self.project(Some(id)).ok_or("Unknown workspace.")?;
-            if project.machine != "local" {
-                return Err("Captain scope currently supports local workspaces only.".into());
+            if project.machine != machine {
+                return Err("A captain's scope must stay on its home server.".into());
             }
             if !scope.contains(&id) {
                 scope.push(id);
             }
         }
-        let home = self.captain_home(captain);
         if let Some(thread) = self.threads.iter().find(|t| Some(t.id) == home)
             && (thread.status.busy() || thread.configuring || thread.queued())
         {
@@ -100,7 +106,6 @@ impl State {
             }
             thread.disconnect();
             thread.project = scope.first().copied();
-            thread.machine = "local".into();
             // ACP's startup awareness is once per session. Send scope as a next-prompt diff.
             thread.scope_context_pending = true;
         }
@@ -389,7 +394,7 @@ mod tests {
             )
             .unwrap();
         let worker = source.threads.last().unwrap().id;
-        let second_project = source.add_project(std::env::temp_dir()).unwrap();
+        let second_project = source.add_project(std::env::temp_dir()).unwrap().unwrap();
         let mut second = Thread::new(source.next_id);
         second.project = Some(second_project);
         second.captain = Some(0);
@@ -507,7 +512,7 @@ mod tests {
     fn workspace_is_required_for_multiple_scope_entries_and_rejected_outside_scope() {
         let mut state = fixture();
         let home = state.current().id;
-        let b = state.add_project(std::env::temp_dir()).unwrap();
+        let b = state.add_project(std::env::temp_dir()).unwrap().unwrap();
         state.set_captain_scope(0, vec![1, b, 1]).unwrap();
         assert_eq!(state.captain_scope(0), vec![1, b]);
         let before = (state.next_id, state.tasks.len());

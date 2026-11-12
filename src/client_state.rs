@@ -370,7 +370,7 @@ impl State {
         state.captains = Captain::presets();
         let workspace = directory.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let project = state.add_project(workspace).unwrap();
+        let project = state.add_project(workspace).unwrap().unwrap();
         state.captain_project = Some(Some(project));
         state.open_captain(0);
         let home = state.current().id;
@@ -694,6 +694,16 @@ impl State {
 
     pub(super) fn checkpoint_client(&mut self) {
         let mut ui = self.ui_snapshot();
+        ui["clientDrafts"] = json!(
+            self.threads
+                .iter()
+                .filter(|t| t.client_draft)
+                .map(|t| json!({
+                    "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
+                    "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life
+                }))
+                .collect::<Vec<_>>()
+        );
         ui["pendingMessages"] = json!({});
         ui["active"] = json!(self.current().id);
         ui["tabs"] = json!(self.tabs);
@@ -776,15 +786,25 @@ impl State {
                 break;
             };
             changed = true;
+            if let crate::client::Event::Receipt(command, value) = &event
+                && command.method == "thread.create"
+                && command.params["clientDraft"].is_u64()
+            {
+                self.complete_client_creation(&server, command, value);
+                continue;
+            }
             if server != self.machines.selected
                 && matches!(event, crate::client::Event::Receipt(..))
             {
                 if let crate::client::Event::Receipt(command, value) = &event
                     && let Some(thread) =
                         self.machines.threads.get_mut(&server).and_then(|threads| {
-                            threads
-                                .iter_mut()
-                                .find(|thread| json!(thread.id) == command.params["threadId"])
+                            threads.iter_mut().find(|thread| {
+                                thread
+                                    .remote_send
+                                    .as_ref()
+                                    .is_some_and(|(id, _, _)| *id == command.command_id)
+                            })
                         })
                     && thread
                         .remote_send
@@ -848,11 +868,12 @@ impl State {
                 }
                 crate::client::Event::Receipt(command, value) => {
                     self.apply_tab_receipt(&server, &command, &value);
-                    if let Some(thread) = self
-                        .threads
-                        .iter_mut()
-                        .find(|t| json!(t.id) == command.params["threadId"])
-                        && let Some((id, edit, attachments)) = thread.remote_send.take()
+                    if let Some(thread) = self.threads.iter_mut().find(|thread| {
+                        thread
+                            .remote_send
+                            .as_ref()
+                            .is_some_and(|(id, _, _)| *id == command.command_id)
+                    }) && let Some((id, edit, attachments)) = thread.remote_send.take()
                     {
                         if id == command.command_id {
                             if value["result"]["status"] == "accepted"
@@ -871,6 +892,21 @@ impl State {
                             self.restart_notice = Some(error.into());
                         }
                     } else if value["result"]["status"] == "accepted" {
+                        if command.method == "project.put"
+                            && let Some(id) = value["result"]["result"]["projectId"].as_u64()
+                        {
+                            self.machines.project_selection.insert(
+                                server.clone(),
+                                (
+                                    id as usize,
+                                    command.params["selectFor"]
+                                        .as_str()
+                                        .unwrap_or("project")
+                                        .into(),
+                                    command.params["captain"].as_u64().map(|id| id as usize),
+                                ),
+                            );
+                        }
                         if matches!(command.method.as_str(), "thread.stop" | "thread.rewind")
                             && let Some(id) = command.params["threadId"].as_u64()
                         {
@@ -896,6 +932,14 @@ impl State {
                             thread.native.follow_up = true;
                         }
                     } else {
+                        if let Some(id) = command.params["clientDraft"].as_u64()
+                            && let Some(draft) = self
+                                .threads
+                                .iter_mut()
+                                .find(|thread| thread.id == id as usize && thread.client_draft)
+                        {
+                            draft.client_creating = None;
+                        }
                         self.storage_error = Some(value["error"]["message"].as_str().or(value["result"]["result"]["error"].as_str()).unwrap_or("Command outcome is uncertain. Inspect the receipt before retrying.").into());
                     }
                 }
@@ -959,12 +1003,8 @@ impl State {
                 Err(error) => self.machines.notice = Some(error),
             }
         }
-        if let Some(id) = self.client_select
-            && let Some(index) = self.threads.iter().position(|t| t.id == id)
-        {
-            self.client_select = None;
-            self.select_thread(index);
-        }
+        self.finish_client_promotions();
+        self.finish_project_selection();
         self.open_requested_tab();
         for (id, command_id) in self.client_recover.clone() {
             if self
@@ -1007,6 +1047,8 @@ impl State {
         if let Some(notice) = &self.undo {
             if notice.expires <= at {
                 self.undo = None;
+                self.deleted_threads.clear();
+                self.deleted_records = None;
                 changed = true;
             } else {
                 tx.wake_after(Duration::from_millis(notice.expires - at));
@@ -1085,6 +1127,45 @@ impl State {
                 .cloned();
             self.threads.push(thread);
         }
+        // Keep device drafts and open tabs, even after another device deletes a server record.
+        self.threads.extend(
+            old.into_iter()
+                .filter(|t| t.client_draft || tabs.contains(&t.id)),
+        );
+        if first
+            && let Some(drafts) = self.client_views["localUi"]["clientDrafts"]
+                .as_array()
+                .cloned()
+        {
+            for draft in drafts {
+                let Some(id) = draft["id"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| *id > usize::MAX / 2)
+                else {
+                    continue;
+                };
+                if self.threads.iter().any(|thread| thread.id == id) {
+                    continue;
+                }
+                let mut thread = Thread::new(id);
+                thread.client_draft = true;
+                thread.project = draft["project"].as_u64().map(|id| id as usize);
+                thread.harness = draft["harness"].as_str().unwrap_or("pi").into();
+                thread.selected_model =
+                    serde_json::from_value(draft["model"].clone()).unwrap_or_default();
+                thread.selected_thinking = draft["thinking"].as_str().map(str::to_owned);
+                thread.native.access = draft["access"]
+                    .as_str()
+                    .and_then(AccessMode::parse)
+                    .unwrap_or_default();
+                if let Some(life) = draft.get("life") {
+                    thread.life = serde_json::from_value(life.clone())
+                        .map_err(|_| "Invalid saved client draft lifecycle.")?;
+                }
+                self.threads.push(thread);
+            }
+        }
         let views: Vec<ThreadView> =
             serde_json::from_value(projection["threads"].clone()).map_err(|e| e.to_string())?;
         for view in views {
@@ -1092,10 +1173,6 @@ impl State {
                 view.apply(thread)?;
             }
         }
-        // A background deletion cannot close this device's tabs or move its focus.
-        // Retain their last view until the user closes them or an owned delete receipt arrives.
-        self.threads
-            .extend(old.into_iter().filter(|t| tabs.contains(&t.id)));
         self.active = self
             .threads
             .iter()
@@ -1110,15 +1187,11 @@ impl State {
         self.project_scope = scope;
         self.scope_additional = additional;
         self.recovery_notice = projection["recoveryNotice"].as_str().map(str::to_owned);
-        if !self.undo.as_ref().is_some_and(|notice| {
-            notice.action == Action::Discard
-                && notice.expires > lifecycle::now()
-                && notice.entries.iter().any(|e| {
-                    e.steps
-                        .iter()
-                        .any(|step| matches!(step, UndoStep::RestoreDraft(_)))
-                })
-        }) {
+        if !self
+            .undo
+            .as_ref()
+            .is_some_and(|notice| notice.expires > lifecycle::now() && self.client_undo_is_local())
+        {
             self.undo =
                 serde_json::from_value(projection["undo"].clone()).map_err(|e| e.to_string())?;
         }
@@ -1153,7 +1226,9 @@ impl State {
                 self.active = index;
             }
         }
-        if first {
+        if self.threads.is_empty() {
+            self.new_client_draft(None);
+        } else if first {
             let id = self.current().id;
             insert_tab(&mut self.tabs, id, id);
         }
@@ -1218,8 +1293,10 @@ impl State {
     }
     /// The open thread's machine, by name, while this desktop cannot reach it.
     pub fn unreachable_selected(&self) -> Option<String> {
-        (self.client.is_some() && !self.machine_connected(&self.machines.selected))
-            .then(|| self.machine_label(&self.machines.selected))
+        (self.client.is_some()
+            && (!self.machine_connected(&self.machines.selected)
+                || !self.machines.views.contains_key(&self.machines.selected)))
+        .then(|| self.machine_label(&self.machines.selected))
     }
     /// Raises one notice naming every linked machine that is down ("Studio and Laptop are
     /// unreachable. Reconnecting.") and clears it when all of them are ready again. It never
@@ -1259,11 +1336,18 @@ impl State {
         if server == self.machines.selected {
             return;
         }
-        let Some(projection) = self.machines.views.get(server).cloned() else {
+        let projection = self.machines.views.get(server).cloned();
+        if projection.is_none()
+            && server != "local"
+            && !self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.linked.contains_key(server))
+        {
             self.machines.notice =
                 Some("This machine is unreachable and has no cached workspace yet.".into());
             return;
-        };
+        }
         self.machines
             .scope_server
             .get_or_insert_with(|| self.machines.selected.clone());
@@ -1282,9 +1366,9 @@ impl State {
             self.machines.selected.clone(),
             std::mem::take(&mut self.client_recover),
         );
-        self.machines
-            .selection
-            .insert(self.machines.selected.clone(), self.client_select.take());
+        self.tab_epoch += 1;
+        self.requested_tab = None;
+        self.requested_tab_restore = None;
         self.machines.selected = server.into();
         self.threads = self
             .machines
@@ -1293,7 +1377,6 @@ impl State {
             .unwrap_or_else(|| vec![Thread::new(1)]);
         self.active = 0;
         self.tabs.clear();
-        self.client_select = self.machines.selection.remove(server).flatten();
         self.client_recover = self.machines.recover.remove(server).unwrap_or_default();
         self.selected_threads.clear();
         self.project_scope = ProjectScope::All;
@@ -1302,6 +1385,8 @@ impl State {
         self.captain_editor = None;
         self.row_menu = None;
         self.undo = None;
+        self.deleted_threads.clear();
+        self.deleted_records = None;
         // Theme, zoom and the sidebar's layout belong to this device, not to the machine. A
         // machine's saved UI only brings back its drafts, tabs, open thread and workspace filter.
         let device = (
@@ -1313,8 +1398,43 @@ impl State {
             self.background.settings.clone(),
         );
         self.client_views = json!({"localUi":self.machines.ui[server]});
-        if let Err(error) = self.apply_projection(projection) {
-            self.storage_error = Some(error);
+        if let Some(projection) = projection {
+            if let Err(error) = self.apply_projection(projection) {
+                self.storage_error = Some(error);
+            }
+        } else {
+            // No target records are available yet. Keep commands disabled and show the
+            // existing reconnecting state, never the previous machine's folders or captains.
+            self.projects.entries.clear();
+            self.captains.clear();
+            self.captain_scopes.clear();
+            self.captain_homes.clear();
+            self.tasks.clear();
+        }
+        let restored_tabs: Vec<_> = self.machines.ui[server]["tabs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .map(|id| id as usize)
+            .filter(|id| self.threads.iter().any(|t| t.id == *id))
+            .collect();
+        if restored_tabs.is_empty() {
+            self.tabs.clear();
+            self.new_client_draft(None);
+        } else {
+            self.tabs = restored_tabs;
+            let active = self.machines.ui[server]["active"]
+                .as_u64()
+                .map(|id| id as usize)
+                .filter(|id| self.tabs.contains(id))
+                .unwrap_or(self.tabs[0]);
+            self.active = self
+                .threads
+                .iter()
+                .position(|t| t.id == active)
+                .expect("restored active tab");
+            self.capture_opened_draft();
         }
         (
             self.dark,
@@ -1330,6 +1450,294 @@ impl State {
             self.machines.scope_server,
             self.machines.scope_remote,
         ) = filter;
+    }
+
+    /// KSG useDraftEnvironmentRouting locks promoted, started and running conversations.
+    pub fn can_retarget_draft(&self) -> bool {
+        let thread = self.current();
+        !thread.captain_home
+            && !thread.delegated
+            && !thread.archived()
+            && thread.messages.is_empty()
+            && thread.session.is_none()
+            && thread.life.latest_user_message_at.is_none()
+            && thread.life.last_completed_at.is_none()
+            && !thread.status.busy()
+            && !thread.configuring
+            && !thread.queued()
+            && thread.remote_send.is_none()
+            && thread.client_creating.is_none()
+            && thread.client_promoted.is_none()
+    }
+
+    /// Retarget only the unsent editor. No command runs on either host until Send.
+    pub fn retarget_draft(&mut self, server: &str) {
+        if !self.can_retarget_draft() || !self.machine_connected(server) {
+            return;
+        }
+        if server == self.machines.selected {
+            self.machines.picker = false;
+            return;
+        }
+        let source = (self.machines.selected.clone(), self.current().id);
+        let draft = self.current().draft.clone();
+        let images = self.current().draft_images.clone();
+        self.select_machine(server);
+        if self.machines.selected != server {
+            return;
+        }
+        self.new_client_draft(None);
+        self.current_mut().draft = draft;
+        self.current_mut().draft_images = images;
+        if let Some(thread) = self
+            .machines
+            .threads
+            .get_mut(&source.0)
+            .and_then(|threads| threads.iter_mut().find(|thread| thread.id == source.1))
+        {
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+        }
+        // Update the old machine's saved editor too, so a later switch cannot restore a copy.
+        self.machines.ui[&source.0]["drafts"][source.1.to_string()] = json!("");
+        self.open_picker(ProjectPicker::NewThread);
+        self.machines.draft_picker = Some(server.into());
+        self.checkpoint();
+    }
+
+    pub(super) fn new_client_draft(&mut self, project: Option<usize>) {
+        let seed = self.composer_seed();
+        self.new_client_draft_with_seed(project, &seed);
+    }
+
+    pub(super) fn new_client_draft_with_seed(&mut self, project: Option<usize>, seed: &Value) {
+        if project.is_some() && self.project(project).is_none() {
+            return;
+        }
+        let reuse = self.threads.iter().position(|thread| {
+            thread.client_draft
+                && thread.project == project
+                && thread.blank_draft()
+                && thread.client_creating.is_none()
+                && thread.client_promoted.is_none()
+        });
+        let index = reuse.unwrap_or_else(|| {
+            let id = self
+                .threads
+                .iter()
+                .chain(self.deleted_threads.iter())
+                .filter(|t| t.client_draft)
+                .map(|t| t.id)
+                .min()
+                .unwrap_or(usize::MAX)
+                .min(self.next_client_draft)
+                .saturating_sub(1);
+            self.next_client_draft = id;
+            let mut thread = Thread::new(id);
+            thread.client_draft = true;
+            thread.harness = self.default_harness.clone();
+            thread.project = project;
+            self.threads.push(thread);
+            self.threads.len() - 1
+        });
+        self.project_picker = None;
+        self.show_archive = false;
+        self.apply_catalog();
+        if reuse.is_none() || self.threads[index].selected_model.is_none() {
+            self.inherit_composer(index, seed);
+        }
+        self.select_thread(index);
+    }
+
+    pub fn choose_draft_project(&mut self, project: Option<usize>) {
+        if self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
+            && self.current().client_draft
+        {
+            self.current_mut().project = project;
+            self.project_picker = None;
+            self.machines.draft_picker = None;
+            self.checkpoint();
+        } else {
+            self.new_thread_in(project);
+        }
+    }
+
+    pub(super) fn promote_client_draft(&mut self) {
+        if !self.current().has_draft_content()
+            || self.current().client_creating.is_some()
+            || self.current().remote_send.is_some()
+            || self.current().client_promoted.is_some()
+        {
+            return;
+        }
+        let thread = self.current();
+        let params = json!({"project":thread.project,"clientDraft":thread.id,
+            "occupiedDrafts":self.threads.iter().filter(|t| !t.client_draft && (t.has_draft_content() || self.tabs.contains(&t.id))).map(|t| t.id).collect::<Vec<_>>(),
+            "harness":thread.harness,"selectedModel":thread.selected_model,"thinking":thread.selected_thinking,"access":thread.native.access.id()});
+        match self.remote("thread.create", params).expect("client") {
+            Ok(command) => {
+                let thread = self.current_mut();
+                thread.client_creating = Some(command);
+                thread.remote_send =
+                    Some((command, thread.draft.clone(), thread.draft_images.clone()));
+            }
+            Err(error) => self.storage_error = Some(error),
+        }
+    }
+
+    /// Follow the owning server after Send, even if the user navigated before its receipt.
+    fn complete_client_creation(&mut self, server: &str, command: &Command, value: &Value) {
+        let commands = self
+            .client
+            .as_ref()
+            .and_then(|client| client.commands_for(server))
+            .cloned();
+        let threads = if server == self.machines.selected {
+            &mut self.threads
+        } else {
+            let Some(threads) = self.machines.threads.get_mut(server) else {
+                return;
+            };
+            threads
+        };
+        let Some(draft) = threads.iter_mut().find(|thread| {
+            thread.client_draft
+                && json!(thread.id) == command.params["clientDraft"]
+                && thread.client_creating == Some(command.command_id)
+        }) else {
+            return;
+        };
+        draft.client_creating = None;
+        let submitted = draft.remote_send.take();
+        if value["result"]["status"] != "accepted" {
+            let error = value["error"]["message"]
+                .as_str()
+                .or(value["result"]["result"]["error"].as_str())
+                .unwrap_or("Thread creation was not confirmed. Your draft was kept.")
+                .to_string();
+            draft.error = Some(error.clone());
+            self.machines.notice = Some(error);
+            return;
+        }
+        let Some(id) = value["result"]["result"]["threadId"].as_u64() else {
+            return;
+        };
+        draft.client_promoted = Some(id as usize);
+        let Some((_, edit, images)) = submitted else {
+            return;
+        };
+        let params = json!({"threadId":id,"text":edit.text,"attachments":images,
+            "editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+        let result = commands
+            .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
+            .and_then(|commands| commands.send("thread.send", params));
+        match result {
+            Ok(id) => draft.remote_send = Some((id, edit, images)),
+            Err(error) => {
+                draft.error = Some(error.clone());
+                self.machines.notice = Some(error);
+            }
+        }
+    }
+
+    fn finish_client_promotions(&mut self) {
+        let promotions: Vec<_> = self
+            .threads
+            .iter()
+            .filter_map(|t| t.client_promoted.map(|id| (t.id, id)))
+            .collect();
+        for (draft_id, id) in promotions {
+            let Some(index) = self.threads.iter().position(|t| t.id == id) else {
+                continue;
+            };
+            let Some(draft_index) = self.threads.iter().position(|t| t.id == draft_id) else {
+                continue;
+            };
+            let text = std::mem::take(&mut self.threads[draft_index].draft);
+            let images = std::mem::take(&mut self.threads[draft_index].draft_images);
+            let sending = self.threads[draft_index].remote_send.take();
+            self.threads[index].draft = text;
+            self.threads[index].draft_images = images;
+            self.threads[index].remote_send = sending;
+            let active = self.current().id;
+            if self.tabs.contains(&draft_id) {
+                self.tabs.retain(|tab| *tab != id);
+            }
+            for tab in &mut self.tabs {
+                if *tab == draft_id {
+                    *tab = id;
+                }
+            }
+            self.threads.remove(draft_index);
+            self.active = self
+                .threads
+                .iter()
+                .position(|t| t.id == if active == draft_id { id } else { active })
+                .expect("active promotion thread");
+            if active == draft_id {
+                self.focus_thread(self.active);
+            }
+            self.checkpoint();
+        }
+    }
+
+    pub(super) fn project_selection_purpose(&self) -> (&'static str, Option<usize>) {
+        if self.captain_editor.is_some() {
+            ("captain", None)
+        } else if self.projects.return_picker == Some(ProjectPicker::CaptainScope) {
+            ("scope", self.current().captain)
+        } else {
+            ("project", None)
+        }
+    }
+
+    pub(super) fn finish_project_selection(&mut self) {
+        let server = self.machines.selected.clone();
+        let Some((id, purpose, captain)) = self.machines.project_selection.get(&server).cloned()
+        else {
+            return;
+        };
+        if self.project(Some(id)).is_none() {
+            return;
+        }
+        self.machines.project_selection.remove(&server);
+        match purpose.as_str() {
+            "captain" => self.captain_project = Some(Some(id)),
+            "scope" => {
+                if let Some(captain) = captain {
+                    let mut scope = self.captain_scope(captain);
+                    if !scope.contains(&id) {
+                        scope.push(id);
+                    }
+                    let result = self.set_captain_scope(captain, scope);
+                    self.brief.error = result.err();
+                }
+            }
+            _ => self.set_project_scope(Some(id), false),
+        }
+        self.projects.return_picker = None;
+        self.checkpoint();
+    }
+
+    pub fn retarget_captain(&mut self, server: &str) {
+        if !self.machine_connected(server)
+            || self
+                .captain_editor
+                .as_ref()
+                .is_none_or(|editor| editor.editing.is_some())
+        {
+            return;
+        }
+        let editor = self.captain_editor.take();
+        self.select_machine(server);
+        self.captain_editor = editor;
+        if self.machines.selected == server {
+            let editor = self.captain_editor.as_mut().unwrap();
+            editor.server = server.into();
+            editor.machine_picker = false;
+            self.captain_project = Some(None);
+            self.projects.captain_target = None;
+        }
     }
     /// Opens a thread on any linked machine, as one click in the unified sidebar.
     pub fn open_machine_thread(&mut self, server: &str, id: usize) {
@@ -1416,8 +1824,24 @@ impl State {
         });
     }
     pub(crate) fn forward(&mut self, method: &str, params: Value) -> bool {
+        if self.client.is_some()
+            && matches!(method, "thread.lifecycle" | "thread.drop" | "thread.rename")
+            && self
+                .threads
+                .iter()
+                .any(|t| t.client_draft && json!(t.id) == params["threadId"])
+        {
+            return false;
+        }
+        if self.client.is_some() && self.current().client_draft {
+            match method {
+                "thread.configure" => return false,
+                "thread.visit" => return true,
+                _ => {}
+            }
+        }
         let intent = match method {
-            "thread.create" | "thread.fork" | "captain.open" | "captain.put" | "project.put" => {
+            "thread.create" | "thread.fork" | "captain.open" | "captain.put" => {
                 Some(TabIntent::Open(None))
             }
             "thread.delete" => params["threadId"].as_u64().map(|id| {
@@ -1487,19 +1911,6 @@ impl State {
             true
         } else {
             false
-        }
-    }
-    pub(super) fn request_new_thread(
-        &mut self,
-        project: Option<ProjectId>,
-        replace: Option<usize>,
-    ) {
-        let params = json!({"project":project,"seed":self.composer_seed(),
-            "occupiedDrafts":self.threads.iter().filter(|t| t.has_draft_content()).map(|t| t.id).collect::<Vec<_>>()});
-        if let Some(Err(error)) =
-            self.request_tab_command("thread.create", params, TabIntent::Open(replace))
-        {
-            self.storage_error = Some(error);
         }
     }
     pub(super) fn request_tab_command(
@@ -1717,6 +2128,9 @@ impl State {
             "thread.visit" => self.current_mut().life.last_visited_at = Some(lifecycle::now()),
             "thread.create" => {
                 let project = args["project"].as_u64().map(|id| id as usize);
+                if let Some(harness) = args["harness"].as_str() {
+                    self.validate_harness(harness)?;
+                }
                 if project.is_some() && self.project(project).is_none() {
                     return Err("Unknown project.".into());
                 }
@@ -1728,6 +2142,21 @@ impl State {
                     self.composer_seed()
                 };
                 self.create_thread_in(project, &occupied, &seed);
+                if let Some(harness) = args["harness"].as_str() {
+                    self.choose_harness(harness);
+                }
+                if let Ok(Some((provider, model))) = serde_json::from_value::<
+                    Option<(String, String)>,
+                >(args["selectedModel"].clone())
+                {
+                    self.current_mut().set_model(provider, model);
+                }
+                if let Some(thinking) = args["thinking"].as_str() {
+                    self.current_mut().set_thinking(thinking.into());
+                }
+                if let Some(access) = args["access"].as_str().and_then(AccessMode::parse) {
+                    self.current_mut().native.access = access;
+                }
                 return Ok(json!({"threadId":self.current().id}));
             }
             "thread.rename" => {
@@ -1887,8 +2316,18 @@ impl State {
                     .ok_or("No recoverable input.".into());
             }
             "project.put" => {
-                let id = self.add_project(PathBuf::from(text("path")?))?;
-                return Ok(json!({"projectId":id,"threadId":self.current().id}));
+                let path = crate::projects::expand_path(&text("path")?);
+                if !path.is_absolute() {
+                    return Err("A workspace needs an absolute path on this server.".into());
+                }
+                if args["createFolder"] == true {
+                    std::fs::create_dir_all(&path)
+                        .map_err(|_| "That folder could not be created.")?;
+                }
+                let id = self
+                    .add_project(path)?
+                    .ok_or("The owning server did not register the project.")?;
+                return Ok(json!({"projectId":id}));
             }
             "project.remove" => self.remove_project(number("projectId")?),
             "project.clone" => {
@@ -1903,8 +2342,11 @@ impl State {
             "catalog.refresh" => self.refresh_catalog(),
             "commands.refresh" => self.current_mut().refresh_commands(),
             "captain.open" => {
-                self.captain_project =
-                    serde_json::from_value(args["project"].clone()).map_err(|e| e.to_string())?;
+                self.captain_project = args
+                    .get("project")
+                    .map(|value| serde_json::from_value::<Option<ProjectId>>(value.clone()))
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
                 self.projects.captain_target = args["assignProject"].as_u64().map(|id| id as usize);
                 self.open_captain(number("captain")?);
                 return Ok(json!({"threadId":self.current().id}));
@@ -1924,8 +2366,11 @@ impl State {
                 editor.instructions.replace_text(captain.instructions);
                 editor.portrait = captain.portrait;
                 self.captain_editor = Some(editor);
-                self.captain_project =
-                    serde_json::from_value(args["project"].clone()).map_err(|e| e.to_string())?;
+                self.captain_project = args
+                    .get("project")
+                    .map(|value| serde_json::from_value::<Option<ProjectId>>(value.clone()))
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
                 self.projects.captain_target = args["assignProject"].as_u64().map(|id| id as usize);
                 self.save_captain();
                 if let Some(editor) = self.captain_editor.take() {
@@ -2093,7 +2538,14 @@ mod tests {
         state.apply_tab_receipt("local", &other, &accepted(json!({"threadId":4})));
         state.open_requested_tab();
         assert_eq!(state.tabs, [1, 2, 3]);
-        state.new_thread_in(None);
+        state
+            .request_tab_command(
+                "thread.create",
+                json!({"project":null}),
+                TabIntent::Open(None),
+            )
+            .unwrap()
+            .unwrap();
         let command = std::iter::from_fn(|| commands.try_recv().ok())
             .find(|c| c.method == "thread.create")
             .unwrap();
@@ -2107,7 +2559,10 @@ mod tests {
         assert_eq!(state.tabs, [1, 2, fresh, 3]);
         assert_eq!(state.current().id, fresh);
 
-        state.new_thread_in(Some(1));
+        state
+            .request_tab_command("thread.create", json!({"project":1}), TabIntent::Open(None))
+            .unwrap()
+            .unwrap();
         let command = std::iter::from_fn(|| commands.try_recv().ok())
             .find(|c| c.method == "thread.create")
             .unwrap();
@@ -2198,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn client_last_archive_discard_and_delete_tabs_wait_for_their_own_replacement_receipt() {
+    fn client_last_archive_discard_and_delete_tabs_get_a_local_replacement() {
         for action in ["archive", "discard", "delete"] {
             let (mut state, mut server, mut commands) = tab_client();
             state.tabs = vec![2];
@@ -2219,12 +2674,11 @@ mod tests {
             let result = server.execute_command(&command).unwrap();
             state.apply_projection(server.projection()).unwrap();
             state.apply_tab_receipt("local", &command, &accepted(result));
-            assert_eq!(state.tabs, [2], "keep a tab while create is pending");
-            let command = std::iter::from_fn(|| commands.try_recv().ok())
-                .find(|c| c.method == "thread.create")
-                .unwrap();
-            let result = server.execute_command(&command).unwrap();
-            state.apply_tab_receipt("local", &command, &accepted(result));
+            assert!(state.current().client_draft);
+            assert!(
+                commands.try_recv().is_err(),
+                "replacement must not create a server thread"
+            );
             state.apply_projection(server.projection()).unwrap();
             state.open_requested_tab();
             assert!(state.current().blank_draft());
@@ -2316,6 +2770,104 @@ mod tests {
             tabs.into_iter()
                 .map(|id| if id == old { fresh } else { id })
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn paired_client_fixture() -> (
+        State,
+        tokio::sync::mpsc::Receiver<Command>,
+        tokio::sync::mpsc::Receiver<Command>,
+        Value,
+    ) {
+        let (runtime, _) = wired();
+        let projection = runtime.state.projection();
+        let mut state = State::new(PathBuf::new(), false);
+        let (mut client, local) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote, commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("studio".into(), remote);
+        state.client = Some(client);
+        state
+            .machines
+            .views
+            .insert("local".into(), projection.clone());
+        state
+            .machines
+            .views
+            .insert("studio".into(), projection.clone());
+        state.apply_projection(projection.clone()).unwrap();
+        // This fixture starts with an existing device session on each host.
+        state.checkpoint_client();
+        state.machines.ui["studio"] = state.machines.ui["local"].clone();
+        (state, local, commands, projection)
+    }
+
+    #[test]
+    fn retargeting_keeps_the_editor_and_images_and_creates_only_on_send() {
+        let (mut state, mut local, mut remote, projection) = paired_client_fixture();
+        let image = Attachment {
+            id: "draft.png".into(),
+            name: "draft.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 4,
+            path: None,
+        };
+        state
+            .current_mut()
+            .draft
+            .replace_text("Keep the exact draft");
+        state.current_mut().draft_images.push(image.clone());
+        state.retarget_draft("studio");
+        assert_eq!(state.machines.selected, "studio");
+        assert!(state.current().client_draft);
+        assert_eq!(state.current().draft.text, "Keep the exact draft");
+        assert_eq!(state.current().draft_images, [image.clone()]);
+        assert_eq!(state.machines.draft_picker.as_deref(), Some("studio"));
+        assert!(local.try_recv().is_err());
+        assert!(
+            remote.try_recv().is_err(),
+            "retargeting must not send thread.create or visit"
+        );
+        state.choose_draft_project(None);
+        let id = state.current().id;
+        state.apply_projection(projection.clone()).unwrap();
+        assert_eq!(state.current().id, id);
+        assert_eq!(state.current().draft.text, "Keep the exact draft");
+        state.send();
+        let create = remote.try_recv().unwrap();
+        assert_eq!(create.method, "thread.create");
+        assert_eq!(create.params["clientDraft"], json!(id));
+        state.send();
+        assert!(
+            remote.try_recv().is_err(),
+            "a second Send cannot duplicate promotion"
+        );
+        state.machines.receipts.insert(
+            "studio".into(),
+            vec![crate::client::Event::Receipt(
+                create,
+                json!({"result":{"status":"accepted","result":{"threadId":1}}}),
+            )],
+        );
+        state.poll_client(&mut Tx::default());
+        let send = remote.try_recv().unwrap();
+        assert_eq!(send.method, "thread.send");
+        let visit = remote.try_recv().unwrap();
+        assert_eq!(visit.method, "thread.visit");
+        assert_eq!(send.params["text"], "Keep the exact draft");
+        assert_eq!(send.params["attachments"][0]["id"], image.id);
+        assert_eq!(state.current().id, 1);
+        assert!(!state.current().client_draft);
+        assert_eq!(
+            state.current().draft.text,
+            "Keep the exact draft",
+            "clear only on send receipt"
+        );
+        state.select_machine("local");
+        assert!(
+            state.current().draft.text.is_empty(),
+            "the draft moved, it was not copied"
         );
     }
 
@@ -2443,8 +2995,18 @@ mod tests {
     #[test]
     fn the_latest_create_request_wins_without_waiting_for_an_earlier_receipt() {
         let (mut state, mut server, mut commands) = tab_client();
-        state.new_thread_in(None);
-        state.new_thread_in(Some(1));
+        state
+            .request_tab_command(
+                "thread.create",
+                json!({"project":null}),
+                TabIntent::Open(None),
+            )
+            .unwrap()
+            .unwrap();
+        state
+            .request_tab_command("thread.create", json!({"project":1}), TabIntent::Open(None))
+            .unwrap()
+            .unwrap();
         let creates: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
             .filter(|c| c.method == "thread.create")
             .collect();
@@ -2474,18 +3036,559 @@ mod tests {
         source.selected_thinking = Some("high".into());
         state.apply_projection(server.projection()).unwrap();
         state.new_thread_in(Some(1));
-        let command = commands.try_recv().unwrap();
+        let draft = state.current().id;
+        assert_eq!(state.tabs, [1, 2, draft, 3]);
+        assert!(state.current().client_draft);
+        assert!(commands.try_recv().is_err(), "new drafts are device-owned");
         server.threads[1].selected_model = Some(("codex".into(), "changed-elsewhere".into()));
-        let result = server.execute_command(&command).unwrap();
         state.apply_projection(server.projection()).unwrap();
-        state.apply_tab_receipt("local", &command, &accepted(result));
-        state.open_requested_tab();
+        assert_eq!(state.current().id, draft);
         assert_eq!(state.current().harness, "codex");
         assert_eq!(
             state.current().selected_model,
             Some(("codex".into(), "chosen".into()))
         );
         assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+        state.new_thread_in(Some(1));
+        assert_eq!(
+            state.current().id,
+            draft,
+            "reuse the one blank project draft"
+        );
+        assert_eq!(state.tabs, [1, 2, draft, 3]);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Send with the inherited selection");
+        state.send();
+        let create = commands.try_recv().unwrap();
+        assert_eq!(create.params["harness"], "codex");
+        assert_eq!(create.params["selectedModel"], json!(["codex", "chosen"]));
+        assert_eq!(create.params["thinking"], "high");
+    }
+
+    #[test]
+    fn client_promotion_replaces_its_tab_in_place_without_overriding_later_navigation() {
+        for navigate in [false, true] {
+            for receipt_first in [false, true] {
+                let (mut state, mut server, mut commands) = tab_client();
+                // An open blank server thread must not be reused by this promotion.
+                server.threads[0] = Thread::new(1);
+                server.threads[0].project = Some(1);
+                state.apply_projection(server.projection()).unwrap();
+                state.new_thread_in(Some(1));
+                let draft = state.current().id;
+                state.current_mut().draft.replace_text("Captured prompt");
+                state.send();
+                let create = commands.try_recv().unwrap();
+                let result = server.execute_command(&create).unwrap();
+                let id = result["threadId"].as_u64().unwrap() as usize;
+                assert_ne!(id, 1);
+                let expected = vec![1, 2, id, 3];
+                state.complete_client_creation("local", &create, &accepted(result));
+                let send = commands.try_recv().unwrap();
+                assert_eq!(send.method, "thread.send");
+                assert_eq!(send.params["threadId"], id);
+                if navigate {
+                    state.select_thread(0);
+                }
+                if receipt_first {
+                    // The draft still has its device ID. Match the send by command ID.
+                    state.machines.receipts.insert(
+                        "local".into(),
+                        vec![crate::client::Event::Receipt(
+                            send.clone(),
+                            accepted(json!({})),
+                        )],
+                    );
+                    state.poll_client(&mut Tx::default());
+                    assert!(
+                        state
+                            .threads
+                            .iter()
+                            .find(|t| t.id == draft)
+                            .unwrap()
+                            .draft
+                            .text
+                            .is_empty()
+                    );
+                }
+                state.apply_projection(server.projection()).unwrap();
+                state.finish_client_promotions();
+                assert_eq!(state.tabs, expected);
+                assert_eq!(state.current().id, if navigate { 1 } else { id });
+                assert!(!state.threads.iter().any(|t| t.id == draft));
+                assert!(
+                    !state
+                        .threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .client_draft
+                );
+                if !receipt_first {
+                    state.machines.receipts.insert(
+                        "local".into(),
+                        vec![crate::client::Event::Receipt(send, accepted(json!({})))],
+                    );
+                    state.poll_client(&mut Tx::default());
+                }
+                assert!(
+                    state
+                        .threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .draft
+                        .text
+                        .is_empty()
+                );
+                assert_eq!(state.tabs, expected);
+                assert_eq!(state.current().id, if navigate { 1 } else { id });
+            }
+        }
+    }
+
+    #[test]
+    fn fork_and_captain_receipts_open_only_for_owned_current_tab_intents() {
+        for method in [
+            "thread.fork",
+            "captain.open",
+            "captain.put",
+            "captain.reset",
+        ] {
+            for stale in [false, true] {
+                let (mut state, _, mut commands) = tab_client();
+                let other = Command::new(method, json!({}));
+                state.machines.receipts.insert(
+                    "local".into(),
+                    vec![crate::client::Event::Receipt(
+                        other,
+                        accepted(json!({"threadId":4})),
+                    )],
+                );
+                state.poll_client(&mut Tx::default());
+                assert_eq!(state.tabs, [1, 2, 3], "{method}");
+                assert_eq!(state.current().id, 2, "{method}");
+                match method {
+                    "captain.put" => {
+                        state.begin_new_captain();
+                        state.save_captain();
+                    }
+                    "captain.reset" => state.reset_captain_conversation(0).unwrap(),
+                    _ => {
+                        state.forward(method, json!({"threadId":2,"captain":0}));
+                    }
+                }
+                let command = commands.try_recv().unwrap();
+                assert_eq!(command.method, method);
+                if stale {
+                    state.select_thread(0);
+                }
+                state.machines.receipts.insert(
+                    "local".into(),
+                    vec![crate::client::Event::Receipt(
+                        command,
+                        accepted(json!({"threadId":4})),
+                    )],
+                );
+                state.poll_client(&mut Tx::default());
+                assert_eq!(
+                    state.tabs,
+                    if stale {
+                        vec![1, 2, 3]
+                    } else {
+                        vec![1, 2, 4, 3]
+                    },
+                    "{method}"
+                );
+                assert_eq!(state.current().id, if stale { 1 } else { 4 }, "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_client_draft_discards_it_without_any_server_command() {
+        for sole in [false, true] {
+            let (mut state, server, mut commands) = tab_client();
+            state.new_thread_in(Some(1));
+            let draft = state.current().id;
+            if sole {
+                state.tabs = vec![draft];
+            }
+            state.close_tab(draft);
+            assert!(!state.threads.iter().any(|t| t.id == draft));
+            assert!(!state.tabs.contains(&draft));
+            assert!(state.tabs.contains(&state.current().id));
+            if sole {
+                assert!(state.current().client_draft);
+                assert_eq!(state.current().project, Some(1));
+                assert_eq!(state.tabs, [state.current().id]);
+            } else {
+                assert_eq!(state.tabs, [1, 2, 3]);
+                assert_eq!(state.current().id, 3);
+            }
+            assert!(commands.try_recv().is_err());
+            state.apply_projection(server.projection()).unwrap();
+            assert!(
+                !state.threads.iter().any(|t| t.id == draft),
+                "projection cannot resurrect a closed draft"
+            );
+        }
+    }
+
+    #[test]
+    fn client_draft_archive_discard_and_delete_are_local_and_restore_the_tab_on_undo() {
+        for action in [Action::Archive, Action::Discard, Action::Delete] {
+            let (mut state, server, mut commands) = tab_client();
+            state.new_thread_in(Some(1));
+            let draft = state.current().id;
+            state
+                .current_mut()
+                .draft
+                .replace_text("Private local draft");
+            state.tabs = vec![draft];
+            match action {
+                Action::Archive => state.archive_thread(draft),
+                Action::Discard => state.discard_draft(draft),
+                _ => {
+                    state.request_delete(draft);
+                    state.confirm_delete();
+                }
+            }
+            let replacement = state.current().id;
+            assert_ne!(replacement, draft);
+            assert!(state.current().client_draft);
+            assert_eq!(state.current().project, Some(1));
+            assert_eq!(state.tabs, [replacement]);
+            assert!(commands.try_recv().is_err());
+            if action == Action::Archive {
+                let mut restored = State::new(PathBuf::new(), false);
+                restored.client = Some(crate::client::Client::new(restored.data_dir.clone()));
+                restored.client_views["localUi"] = state.machines.ui["local"].clone();
+                restored.apply_projection(server.projection()).unwrap();
+                let archived = restored.threads.iter().find(|t| t.id == draft).unwrap();
+                assert!(archived.archived());
+                assert_eq!(archived.draft.text, "Private local draft");
+                assert_eq!(restored.tabs, [replacement]);
+            }
+            state.apply_projection(server.projection()).unwrap();
+            state.undo_thread_action();
+            assert_eq!(state.tabs, [draft, replacement]);
+            assert_eq!(state.current().id, draft);
+            assert_eq!(state.current().draft.text, "Private local draft");
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settling_a_client_draft_and_undoing_it_never_send_its_device_id_to_the_server() {
+        let (mut state, server, mut commands) = tab_client();
+        state.new_thread_in(Some(1));
+        let draft = state.current().id;
+        state.current_mut().draft.replace_text("Still private");
+        state.settle_thread(draft);
+        assert_eq!(state.tabs, [1, 2, 3]);
+        assert_eq!(state.current().id, 3);
+        state.apply_projection(server.projection()).unwrap();
+        state.undo_thread_action();
+        assert_eq!(state.tabs, [1, 2, draft, 3]);
+        assert_eq!(state.current().id, draft);
+        assert_eq!(state.current().draft.text, "Still private");
+        for command in std::iter::from_fn(|| commands.try_recv().ok()) {
+            assert_eq!(command.method, "thread.visit");
+            assert_ne!(command.params["threadId"], json!(draft));
+        }
+    }
+
+    #[test]
+    fn machine_switches_without_saved_tabs_open_a_device_draft_and_restore_it() {
+        for cached in [false, true] {
+            let (mut state, mut local, mut remote, projection) = paired_client_fixture();
+            state.machines.ui.as_object_mut().unwrap().remove("studio");
+            if !cached {
+                state.machines.views.remove("studio");
+            }
+            state.select_machine("studio");
+            let draft = state.current().id;
+            assert!(state.current().client_draft);
+            assert_eq!(state.tabs, [draft]);
+            assert_eq!(state.machines.selected, "studio");
+            if !cached {
+                state.apply_projection(projection).unwrap();
+                assert_eq!(state.current().id, draft);
+                assert_eq!(state.tabs, [draft]);
+            }
+            state
+                .current_mut()
+                .draft
+                .replace_text("Remote device draft");
+            state.select_machine("local");
+            state.select_machine("studio");
+            assert_eq!(state.current().id, draft);
+            assert_eq!(state.tabs, [draft]);
+            assert_eq!(state.current().draft.text, "Remote device draft");
+            assert!(local.try_recv().is_err());
+            assert!(remote.try_recv().is_err());
+        }
+        let (mut state, _, _, _) = paired_client_fixture();
+        state.machines.ui["studio"]["tabs"] = json!([999]);
+        state.machines.ui["studio"]["active"] = json!(999);
+        state.select_machine("studio");
+        assert!(
+            state.current().client_draft,
+            "deleted saved tabs need a draft too"
+        );
+        assert_eq!(state.tabs, [state.current().id]);
+    }
+
+    #[test]
+    fn an_owned_project_put_receipt_selects_only_its_project_even_with_a_thread_id() {
+        let (mut state, mut server, mut commands) = tab_client();
+        let before = (state.tabs.clone(), state.current().id);
+        assert_eq!(
+            state.add_project(PathBuf::from("/srv/project")).unwrap(),
+            None
+        );
+        let command = commands.try_recv().unwrap();
+        assert!(
+            !state
+                .tab_intents
+                .contains_key(&("local".into(), command.command_id))
+        );
+        server
+            .projects
+            .entries
+            .push(Project::new(9, PathBuf::from("/srv/project")));
+        server.projects.next_id = 10;
+        state.apply_projection(server.projection()).unwrap();
+        state.machines.receipts.insert(
+            "local".into(),
+            vec![crate::client::Event::Receipt(
+                command,
+                accepted(json!({"projectId":9,"threadId":4})),
+            )],
+        );
+        state.poll_client(&mut Tx::default());
+        assert_eq!((state.tabs.clone(), state.current().id), before);
+        assert_eq!(state.project_scope, ProjectScope::Project(9));
+    }
+
+    #[test]
+    fn client_draft_metadata_and_editor_restore_without_server_records() {
+        let (mut state, _, _, projection) = paired_client_fixture();
+        state.new_thread_in(None);
+        let id = state.current().id;
+        state
+            .current_mut()
+            .draft
+            .replace_text("Persist this unsent draft");
+        state.checkpoint_client();
+        let saved = state.machines.ui["local"].clone();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.client = Some(crate::client::Client::new(restored.data_dir.clone()));
+        restored.client_views["localUi"] = saved;
+        restored.apply_projection(projection).unwrap();
+        assert_eq!(restored.current().id, id);
+        assert!(restored.current().client_draft);
+        assert_eq!(restored.current().draft.text, "Persist this unsent draft");
+    }
+
+    #[test]
+    fn a_promotion_receipt_submits_the_captured_revision_on_its_host_after_navigation() {
+        let (mut state, mut local, mut remote, _) = paired_client_fixture();
+        state.retarget_draft("studio");
+        state
+            .current_mut()
+            .draft
+            .replace_text("The submitted revision");
+        state.send();
+        let create = remote.try_recv().unwrap();
+        state
+            .current_mut()
+            .draft
+            .replace_text("New edits after Send");
+        state.select_machine("local");
+        state.complete_client_creation(
+            "studio",
+            &create,
+            &json!({"result":{"status":"accepted","result":{"threadId":1}}}),
+        );
+        assert_eq!(state.machines.selected, "local");
+        assert!(local.try_recv().is_err());
+        let sent = remote.try_recv().unwrap();
+        assert_eq!(sent.method, "thread.send");
+        assert_eq!(sent.params["text"], "The submitted revision");
+        state.select_machine("studio");
+        state.finish_client_promotions();
+        assert_eq!(state.current().id, 1);
+        assert_eq!(state.current().draft.text, "New edits after Send");
+        state.machines.receipts.insert(
+            "studio".into(),
+            vec![crate::client::Event::Receipt(
+                sent,
+                json!({"result":{"status":"accepted","result":{}}}),
+            )],
+        );
+        state.poll_client(&mut Tx::default());
+        assert_eq!(
+            state.current().draft.text,
+            "New edits after Send",
+            "the receipt cannot clear a later editor revision"
+        );
+    }
+
+    #[test]
+    fn started_and_offline_threads_cannot_be_retargeted() {
+        let (mut state, _, mut remote, _) = paired_client_fixture();
+        state.current_mut().draft.replace_text("Stay here");
+        state.current_mut().session = Some("started".into());
+        state.retarget_draft("studio");
+        assert_eq!(state.machines.selected, "local");
+        state.current_mut().session = None;
+        state.current_mut().life.latest_user_message_at = Some(1);
+        assert!(
+            !state.can_retarget_draft(),
+            "history may not have loaded on an offline host"
+        );
+        state.current_mut().life.latest_user_message_at = None;
+        state.client.as_mut().unwrap().linked.insert(
+            "studio".into(),
+            crate::client::Client::new(state.data_dir.clone()),
+        );
+        state.retarget_draft("studio");
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.current().draft.text, "Stay here");
+        assert!(remote.try_recv().is_err());
+    }
+
+    #[test]
+    fn project_receipts_wait_for_the_project_projection_and_never_select_threads() {
+        let (mut state, _, _, mut projection) = paired_client_fixture();
+        let active = state.current().id;
+        let tabs = state.tabs.clone();
+        let command = Command::new(
+            "project.put",
+            json!({"path":"/srv/new","selectFor":"project"}),
+        );
+        state.machines.receipts.insert(
+            "local".into(),
+            vec![crate::client::Event::Receipt(
+                command,
+                json!({"result":{"status":"accepted","result":{"projectId":9,"threadId":999}}}),
+            )],
+        );
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.current().id, active);
+        assert_eq!(state.tabs, tabs);
+        assert!(state.requested_tab.is_none());
+        assert!(state.machines.project_selection.contains_key("local"));
+        projection["index"]["projects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":9,"name":"New","path":"/srv/new","machine":"local"}));
+        projection["index"]["nextProjectId"] = json!(10);
+        state.apply_projection(projection).unwrap();
+        state.finish_project_selection();
+        assert_eq!(state.project_scope, ProjectScope::Project(9));
+        assert_eq!(state.current().id, active);
+        assert_eq!(state.tabs, tabs);
+        assert!(state.machines.project_selection.is_empty());
+    }
+
+    #[test]
+    fn captain_target_is_one_server_and_switching_preserves_the_form() {
+        let (mut state, mut local, mut remote, _) = paired_client_fixture();
+        state.begin_new_captain();
+        state
+            .captain_editor
+            .as_mut()
+            .unwrap()
+            .name
+            .replace_text("Studio captain");
+        state.retarget_captain("studio");
+        assert_eq!(state.machines.selected, "studio");
+        assert_eq!(state.captain_editor.as_ref().unwrap().server, "studio");
+        assert_eq!(
+            state.captain_editor.as_ref().unwrap().name.text,
+            "Studio captain"
+        );
+        state.save_captain();
+        let create = remote.try_recv().unwrap();
+        assert_eq!(create.method, "captain.put");
+        assert_eq!(create.params["record"]["name"], "Studio captain");
+        assert!(create.params["threadId"].is_null());
+        assert!(local.try_recv().is_err());
+        state.captains = Captain::presets();
+        state.edit_captain(0);
+        state.retarget_captain("local");
+        assert_eq!(
+            state.machines.selected, "studio",
+            "editing cannot change the home server"
+        );
+        state.captain_editor = None;
+        state.open_picker(ProjectPicker::CaptainScope);
+        state.open_picker(ProjectPicker::AddProject);
+        state.browse_for_project();
+        state.open_picker(ProjectPicker::AddProject);
+        assert_eq!(
+            state.projects.return_picker,
+            Some(ProjectPicker::CaptainScope)
+        );
+        state.choose_project_machine("local");
+        assert_eq!(
+            state.machines.selected, "studio",
+            "scope browsing stays on the captain's server after Back"
+        );
+    }
+
+    #[test]
+    fn selecting_a_cached_machine_restores_tabs_before_the_next_projection() {
+        let (mut state, _, _, _) = paired_client_fixture();
+        state.select_machine("studio");
+        state.tabs = vec![1];
+        state.current_mut().draft.replace_text("Studio draft");
+        state.select_machine("local");
+        state.select_machine("studio");
+        assert_eq!(state.tabs, [1]);
+        assert_eq!(state.current().draft.text, "Studio draft");
+    }
+
+    #[test]
+    fn uncached_machines_show_connecting_without_the_previous_hosts_projects() {
+        let (mut state, _, _, _) = paired_client_fixture();
+        state.machines.views.remove("studio");
+        state.select_machine("studio");
+        assert_eq!(state.machines.selected, "studio");
+        assert!(state.projects.entries.is_empty());
+        assert_eq!(state.unreachable_selected().as_deref(), Some("studio"));
+    }
+
+    #[test]
+    fn asynchronous_project_adds_have_no_fake_id_and_clone_preview_matches_submit() {
+        let (mut state, mut local, mut remote, _) = paired_client_fixture();
+        assert_eq!(state.add_project(PathBuf::from("/srv/new")).unwrap(), None);
+        let project = local.try_recv().unwrap();
+        assert_eq!(project.method, "project.put");
+        state.select_machine("studio");
+        state.projects.clone_source.replace_text("owner/repo");
+        state.projects.clone_parent = PathBuf::from("/stale");
+        state
+            .projects
+            .clone_path
+            .replace_text(r"D:\Code With Spaces");
+        assert_eq!(
+            state.clone_target().unwrap().1.to_string_lossy(),
+            r"D:\Code With Spaces\repo"
+        );
+        state.start_clone();
+        let command = remote.try_recv().unwrap();
+        assert_eq!(command.method, "project.clone");
+        assert_eq!(command.params["parent"], r"D:\Code With Spaces");
+        assert_eq!(
+            state.projects.clone_parent.to_string_lossy(),
+            r"D:\Code With Spaces"
+        );
     }
 
     #[test]
@@ -2539,6 +3642,8 @@ mod tests {
             .views
             .insert("server-b".into(), projection.clone());
         state.apply_projection(projection).unwrap();
+        state.checkpoint_client();
+        state.machines.ui["server-b"] = state.machines.ui["local"].clone();
         state.current_mut().draft.replace_text("Local thread 1");
         state.select_machine("server-b");
         assert_eq!(state.current().id, 1);
