@@ -124,6 +124,9 @@ fn key_inner(
         return true;
     }
     if state.settings_menu && state.settings.shortcut_capture.is_some() {
+        if let Some(tx) = tx {
+            return ui::settings_ui::handle_shortcut_capture(state, event, tx);
+        }
         return false;
     }
     let undo_active = state.expire_undo();

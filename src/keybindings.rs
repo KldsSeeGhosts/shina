@@ -1024,6 +1024,7 @@ pub fn resolve_shortcut_command<'a>(
     None
 }
 
+#[cfg(test)]
 pub fn effective_shortcuts_for_command(
     keybindings: &[ResolvedKeybindingRule],
     command: &str,
@@ -1048,6 +1049,7 @@ pub fn effective_shortcuts_for_command(
     effective
 }
 
+#[cfg(test)]
 pub fn shortcut_label_for_command(
     keybindings: &[ResolvedKeybindingRule],
     command: &str,
@@ -1117,6 +1119,42 @@ pub fn format_shortcut_label(shortcut: &KeybindingShortcut, platform: Platform) 
         parts.push(&key_label);
         parts.join("+")
     }
+}
+
+pub fn keycap_parts(shortcut: &KeybindingShortcut, platform: Platform) -> Vec<String> {
+    let use_meta_for_mod = platform.is_mac();
+    let show_meta = shortcut.meta_key || (shortcut.mod_key && use_meta_for_mod);
+    let show_ctrl = shortcut.ctrl_key || (shortcut.mod_key && !use_meta_for_mod);
+    let mut parts = Vec::new();
+    if use_meta_for_mod {
+        if show_ctrl {
+            parts.push("\u{2303}".into());
+        }
+        if shortcut.alt_key {
+            parts.push("\u{2325}".into());
+        }
+        if shortcut.shift_key {
+            parts.push("\u{21e7}".into());
+        }
+        if show_meta {
+            parts.push("\u{2318}".into());
+        }
+    } else {
+        if show_ctrl {
+            parts.push("Ctrl".into());
+        }
+        if shortcut.alt_key {
+            parts.push("Alt".into());
+        }
+        if shortcut.shift_key {
+            parts.push("Shift".into());
+        }
+        if show_meta {
+            parts.push("Meta".into());
+        }
+    }
+    parts.push(format_shortcut_key_label(&shortcut.key));
+    parts
 }
 
 pub fn shortcut_to_keybinding_input(shortcut: &KeybindingShortcut) -> String {
@@ -1320,9 +1358,6 @@ const KEYBINDING_GROUPS: &[(&str, &str, &[&str])] = &[
             "filePicker",
             "projectSearch",
             "editor",
-            "workspace",
-            "navigation",
-            "view",
         ],
     ),
     ("threads", "Threads", &["thread", "chat", "pullRequest"]),
@@ -1336,6 +1371,29 @@ const KEYBINDING_GROUPS: &[(&str, &str, &[&str])] = &[
     ),
     ("scripts", "Project scripts", &["script"]),
 ];
+
+fn usage_command_rank(command: &str) -> Option<usize> {
+    const USAGE_ORDER: [&str; 8] = [
+        "usage.open",
+        "usage.cost",
+        "usage.tokens",
+        "usage.limits",
+        "usage.period.day",
+        "usage.period.week",
+        "usage.period.month",
+        "usage.period.quarter",
+    ];
+    USAGE_ORDER.iter().position(|&item| item == command)
+}
+
+fn compare_commands(left: &str, right: &str) -> std::cmp::Ordering {
+    match (usage_command_rank(left), usage_command_rank(right)) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        (Some(_), None) => "usage.cost".cmp(right),
+        (None, Some(_)) => left.cmp("usage.cost"),
+        (None, None) => left.cmp(right),
+    }
+}
 
 fn keybinding_group_for(command: &str) -> (&'static str, &'static str) {
     let prefix = command.split('.').next().unwrap_or("");
@@ -1531,11 +1589,31 @@ pub fn build_keybinding_rows(
             keybinding_conflict_labels(&snapshot, &row.id, &row.key, &row.when, platform);
     }
     rows.sort_by(|left, right| {
-        left.command
-            .cmp(&right.command)
-            .then_with(|| left.key.cmp(&right.key))
+        compare_commands(&left.command, &right.command).then_with(|| left.key.cmp(&right.key))
     });
     rows
+}
+
+pub fn filter_keybinding_rows(rows: Vec<KeybindingRow>, query: &str) -> Vec<KeybindingRow> {
+    let normalized = query.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|row| {
+            row.command.to_ascii_lowercase().contains(&normalized)
+                || command_label(&row.command)
+                    .to_ascii_lowercase()
+                    .contains(&normalized)
+                || row.key.to_ascii_lowercase().contains(&normalized)
+                || row.when.to_ascii_lowercase().contains(&normalized)
+                || row
+                    .source
+                    .label()
+                    .to_ascii_lowercase()
+                    .contains(&normalized)
+        })
+        .collect()
 }
 
 pub fn group_keybinding_rows(rows: Vec<KeybindingRow>) -> Vec<KeybindingGroup> {
@@ -1672,6 +1750,23 @@ pub fn remove_custom_rule(
             .map(|ast| when_ast_to_expression(Some(&ast)));
         !(entry.command == command && entry_key == target_key && entry_when == target_when)
     });
+}
+
+pub fn reset_custom_rule(
+    custom: &mut Vec<KeybindingRule>,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+    default_key: Option<&str>,
+    default_when: &str,
+) -> Result<(), String> {
+    remove_custom_rule(custom, command, key, when);
+    let has_other_custom = custom.iter().any(|entry| entry.command == command);
+    if has_other_custom && let Some(default_key) = default_key {
+        let default_when_opt = (!default_when.trim().is_empty()).then_some(default_when);
+        upsert_custom_rule(custom, command, default_key, default_when_opt, None)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1989,5 +2084,63 @@ mod tests {
             &mut tx
         ));
         assert_eq!(state.current().pinned(), !pinned_after_action);
+    }
+
+    #[test]
+    fn groups_filters_keycaps_and_resets_match_ksg_rules() {
+        let plus = parse_keybinding_shortcut("mod++").unwrap();
+        assert_eq!(keycap_parts(&plus, Platform::Mac), vec!["⌘", "+"]);
+        assert_eq!(keycap_parts(&plus, Platform::Windows), vec!["Ctrl", "+"]);
+
+        let model_toggle = parse_keybinding_shortcut("mod+shift+m").unwrap();
+        assert_eq!(
+            keycap_parts(&model_toggle, Platform::Mac),
+            vec!["⇧", "⌘", "M"]
+        );
+        assert_eq!(
+            keycap_parts(&model_toggle, Platform::Linux),
+            vec!["Ctrl", "Shift", "M"]
+        );
+
+        let rows = build_keybinding_rows(&default_resolved_keybindings(), Platform::Mac);
+        let groups = group_keybinding_rows(rows.clone());
+        let titles: Vec<&str> = groups.iter().map(|g| g.title).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Navigation",
+                "Threads",
+                "Composer",
+                "Terminal",
+                "Preview & diff",
+                "Appearance",
+                "Other",
+            ]
+        );
+
+        let filtered = filter_keybinding_rows(rows, "modelPicker.toggle");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].command, "modelPicker.toggle");
+
+        let mut custom = Vec::new();
+        upsert_custom_rule(
+            &mut custom,
+            "sidebar.toggle",
+            "mod+k",
+            None,
+            Some(("sidebar.toggle", "mod+b", None)),
+        )
+        .unwrap();
+        assert_eq!(custom.len(), 1);
+        reset_custom_rule(
+            &mut custom,
+            "sidebar.toggle",
+            "mod+k",
+            None,
+            Some("mod+b"),
+            "",
+        )
+        .unwrap();
+        assert!(custom.is_empty());
     }
 }
