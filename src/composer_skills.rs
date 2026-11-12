@@ -65,7 +65,9 @@ pub fn codex_commands(result: &Value, cwd: &Path) -> Vec<Value> {
     let matching = data
         .iter()
         .find(|entry| entry["cwd"].as_str().is_some_and(|p| Path::new(p) == cwd));
-    let entries: Vec<_> = matching.map_or_else(|| data.iter().collect(), |entry| vec![entry]);
+    // SkillsListEntry.cwd is required by the app-server schema. Never show a
+    // different project's skills when the requested directory returned no entry.
+    let entries: Vec<_> = matching.into_iter().collect();
     let mut seen = std::collections::HashSet::new();
     entries.into_iter().flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
         .filter(|skill| skill["enabled"] != false)
@@ -694,6 +696,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["name"], "$review");
         assert_eq!(commands[0]["description"], "Short");
+        assert!(codex_commands(&response, Path::new("/missing")).is_empty());
     }
 
     #[test]

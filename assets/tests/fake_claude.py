@@ -7,7 +7,8 @@ import uuid
 
 args = sys.argv[1:]
 log_path = args[args.index("--log") + 1]
-session = args[args.index("--resume") + 1] if "--resume" in args else args[args.index("--session-id") + 1]
+session = args[args.index("--resume") + 1] if "--resume" in args else (
+    args[args.index("--session-id") + 1] if "--session-id" in args else str(uuid.uuid4()))
 callbacks = {}
 holding = False
 project = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "fixture"

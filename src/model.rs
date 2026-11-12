@@ -719,6 +719,9 @@ impl Thread {
             return;
         }
         self.attachment_error = None;
+        if self.model_id != model_id && self.harness == "codex" {
+            self.harness_state["serviceTier"] = Value::Null;
+        }
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
             let known = self
@@ -821,6 +824,9 @@ impl Thread {
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
+        if kind == "prompt" && self.harness == "codex" {
+            data["serviceTier"] = self.harness_state["serviceTier"].clone();
+        }
         self.track_learned_turn(kind, &data);
         let context = if kind == "prompt" {
             self.prepare_memory_prompt(&mut data)
@@ -1684,6 +1690,7 @@ impl Thread {
                     "get_messages" if record["id"] == "history" => {
                         if self.server_owned
                             && self.harness != "pi"
+                            && record["data"]["replaceHistory"] != true
                             && record["data"]["messages"]
                                 .as_array()
                                 .is_some_and(|messages| {
@@ -2421,6 +2428,8 @@ pub struct State {
     /// Recent projects, the switcher menu, and the clone sheet.
     pub projects: crate::projects::Projects,
     pub catalog: Catalog,
+    pub codex_catalog: crate::session::NativeCatalog,
+    pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
     runtime_enabled: bool,
     ownership_denied: bool,
@@ -2582,6 +2591,8 @@ impl State {
             task_waiters: vec![],
             projects: Default::default(),
             catalog: Catalog::default(),
+            codex_catalog: Default::default(),
+            claude_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
             runtime_enabled: false,
             ownership_denied: false,
@@ -5379,6 +5390,35 @@ impl State {
                 }
                 return;
             }
+            Some(command @ ("/goal" | "/feedback")) if self.current().harness == "codex" => {
+                if self.current().harness_state["codexNativeExtensions"] != true {
+                    self.current_mut().error = Some("This Codex version has no verified native command protocol. Update Codex outside Shina.".into());
+                    return;
+                }
+                let arguments = words.next().unwrap_or("").trim().to_owned();
+                if self.current().status.busy()
+                    && command == "/goal"
+                    && !matches!(arguments.as_str(), "" | "pause" | "clear")
+                {
+                    self.current_mut().error = Some("Wait for Codex to finish before running this command. Your draft was kept.".into());
+                    return;
+                }
+                if !self.current().draft_images.is_empty() {
+                    self.current_mut().attachment_error = Some(
+                        "Native commands do not accept attachments. Your draft was kept.".into(),
+                    );
+                    return;
+                }
+                self.current_mut().native.pending_command =
+                    Some(json!({"name":command.trim_start_matches('/'),"arguments":arguments}));
+                self.current_mut().draft.replace_text("");
+                if self.current().pi.is_none() {
+                    self.connect_thread(self.active);
+                } else {
+                    self.current_mut().drive_session();
+                }
+                return;
+            }
             Some(command) if command.starts_with('/') => {
                 let name = command.trim_start_matches('/');
                 if !self
@@ -5447,14 +5487,13 @@ impl State {
             return;
         }
         self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(true);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
-            && self.current().pi.is_none()
-            && self.current().status != Status::Failed
-            && !self.current().archived()
-            && !self.demo
-            && self.runtime_enabled
+            && self.current().pi.is_some()
         {
-            self.connect_thread(self.active);
+            self.current_mut()
+                .command("get_available_models", json!({}));
+            self.current_mut().refresh_commands();
         }
         if !self.demo && self.runtime_enabled {
             self.catalog
@@ -5531,11 +5570,11 @@ impl State {
         thread.prewarm_attempted = false;
         if id == "pi" {
             self.apply_catalog();
+        } else {
+            self.apply_native_catalogs();
         }
         self.checkpoint();
-        if matches!(id, "codex" | "claude") && self.runtime_enabled && !self.demo {
-            self.connect_thread(self.active);
-        }
+        self.refresh_native_catalogs(false);
     }
 
     fn apply_catalog(&mut self) {
@@ -5988,6 +6027,9 @@ impl State {
                         thread.model = model.into();
                     }
                     thread.selected_thinking = record["thinking"].as_str().map(str::to_owned);
+                    if thread.harness == "codex" {
+                        thread.harness_state["serviceTier"] = record["serviceTier"].clone();
+                    }
                     if let Some(level) = &thread.selected_thinking {
                         thread.thinking = level.clone();
                     }
@@ -6449,7 +6491,8 @@ impl State {
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
-                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
+                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking,
+                "serviceTier":thread.harness_state["serviceTier"]
             })).collect::<Vec<_>>()
         });
         index["commandReceipts"] = json!(self.command_receipts);
@@ -6697,6 +6740,14 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     }
     if let Some(remaining) = state.catalog.remaining() {
         tx.wake_after(remaining);
+    }
+    state.refresh_native_catalogs(false);
+    if state.codex_catalog.poll("codex") | state.claude_catalog.poll("claude") {
+        state.apply_native_catalogs();
+        changed = true;
+    }
+    if state.codex_catalog.loading() || state.claude_catalog.loading() {
+        tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
     if state.runtime_enabled
@@ -8117,6 +8168,7 @@ mod tests {
             thinking_levels: vec!["high".into()],
             context_window: Some(100),
             supports_images: Some(true),
+            service_tiers: vec![],
         };
         state.current_mut().harness = "codex".into();
         state.current_mut().models = vec![model];

@@ -2,6 +2,27 @@
 use super::*;
 
 impl Thread {
+    pub fn set_service_tier(&mut self, tier: String) {
+        if self.forward("thread.configure", json!({"serviceTier":tier})) {
+            return;
+        }
+        if self.harness != "codex" || self.status.busy() || self.configuring {
+            return;
+        }
+        if self
+            .models
+            .iter()
+            .find(|model| model.id == self.model_id)
+            .is_some_and(|model| {
+                model
+                    .service_tiers
+                    .iter()
+                    .any(|option| option["id"] == tier)
+            })
+        {
+            self.harness_state["serviceTier"] = json!(tier);
+        }
+    }
     /// Native app-server usage is push-based, including refreshes after compaction.
     pub(super) fn apply_codex(&mut self, record: &Value) -> bool {
         if !matches!(self.harness.as_str(), "codex" | "claude") || record["type"] != "context_usage"
@@ -28,6 +49,128 @@ impl Thread {
 }
 
 impl State {
+    pub(crate) fn native_catalog_status(&self, harness: &str) -> (bool, Option<&str>) {
+        if self.client.is_some() {
+            let catalog = &self.client_views["nativeCatalogs"][harness];
+            return (catalog["loading"] == true, catalog["error"].as_str());
+        }
+        let catalog = match harness {
+            "codex" => &self.codex_catalog,
+            "claude" => &self.claude_catalog,
+            _ => return (false, None),
+        };
+        (catalog.loading(), catalog.error.as_deref())
+    }
+    pub(super) fn refresh_native_catalogs(&mut self, force: bool) {
+        if self.demo || !self.runtime_enabled || self.client.is_some() {
+            return;
+        }
+        let cwd = self.working_directory();
+        self.codex_catalog
+            .refresh("codex", cwd.clone(), self.wake.clone(), force);
+        self.claude_catalog
+            .refresh("claude", cwd, self.wake.clone(), force);
+        self.apply_native_catalogs();
+    }
+
+    pub(super) fn apply_native_catalogs(&mut self) {
+        if self.client.is_some() {
+            for harness in ["codex", "claude"] {
+                let catalog = &self.client_views["nativeCatalogs"][harness];
+                let models = self.harness_models(harness);
+                let projects = &self.projects.entries;
+                for thread in self
+                    .threads
+                    .iter_mut()
+                    .filter(|thread| thread.client_draft && thread.harness == harness)
+                {
+                    if !models.is_empty() {
+                        thread.models = models.clone();
+                    }
+                    thread.refresh_thinking_levels();
+                    thread.harness_state["codexNativeExtensions"] = catalog["extensions"].clone();
+                    if catalog["ready"] == true
+                        && projects
+                            .iter()
+                            .find(|project| Some(project.id) == thread.project)
+                            .is_some_and(|project| {
+                                catalog["cwd"]
+                                    .as_str()
+                                    .is_some_and(|cwd| std::path::Path::new(cwd) == project.path)
+                            })
+                    {
+                        let commands = catalog["commands"].as_array().cloned().unwrap_or_default();
+                        thread.native.skills = crate::composer_skills::from_commands(&commands);
+                        thread.native.commands = commands
+                            .iter()
+                            .filter_map(|command| {
+                                Some(pi_session::SlashCommand {
+                                    name: command["name"].as_str()?.into(),
+                                    description: command["description"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .into(),
+                                    source: command["source"].as_str().unwrap_or(harness).into(),
+                                })
+                            })
+                            .collect();
+                        thread.native.commands_loaded = true;
+                    }
+                }
+            }
+            return;
+        }
+        let directories: Vec<_> = (0..self.threads.len())
+            .map(|index| self.thread_directory(index).ok())
+            .collect();
+        for (index, thread) in self.threads.iter_mut().enumerate() {
+            let catalog = match thread.harness.as_str() {
+                "codex" => &self.codex_catalog,
+                "claude" => &self.claude_catalog,
+                _ => continue,
+            };
+            if thread.pi.is_some() {
+                continue;
+            }
+            if thread.harness_state["catalogRevision"].as_u64() == Some(catalog.revision) {
+                continue;
+            }
+            thread.harness_state["catalogRevision"] = json!(catalog.revision);
+            if let Some(error) = &catalog.error
+                && crate::usage_limits::authentication_error(error)
+            {
+                thread.error = Some(error.clone());
+                thread.status = Status::Failed;
+            }
+            if !catalog.commands_ready() {
+                thread.native.commands_loaded = false;
+                thread.native.commands.clear();
+                thread.native.skills.clear();
+            }
+            if !catalog.models.is_empty() {
+                thread.models = catalog.models.clone();
+                thread.refresh_thinking_levels();
+            }
+            if catalog.commands_ready() && directories[index] == catalog.cwd {
+                thread.native.skills = crate::composer_skills::from_commands(&catalog.commands);
+                thread.native.commands = catalog
+                    .commands
+                    .iter()
+                    .filter_map(|command| {
+                        Some(pi_session::SlashCommand {
+                            name: command["name"].as_str()?.into(),
+                            description: command["description"].as_str().unwrap_or("").into(),
+                            source: command["source"].as_str().unwrap_or(&thread.harness).into(),
+                        })
+                    })
+                    .collect();
+                thread.native.commands_loaded = true;
+                thread.native.commands_requested = false;
+                thread.harness_state["codexNativeExtensions"] = json!(catalog.extensions);
+            }
+        }
+    }
+
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
         if matches!(id, "pi" | "codex" | "claude") {
             Ok(())
@@ -39,6 +182,14 @@ impl State {
     pub(super) fn harness_models(&self, harness: &str) -> Vec<AgentModel> {
         let mut models = vec![];
         let provider = if harness == "pi" { "cpa" } else { harness };
+        if self.client.is_some() && matches!(harness, "codex" | "claude") {
+            models.extend(
+                serde_json::from_value::<Vec<AgentModel>>(
+                    self.client_views["nativeCatalogs"][harness]["models"].clone(),
+                )
+                .unwrap_or_default(),
+            );
+        }
         if harness == "pi" {
             models.extend(self.catalog.models.iter().cloned());
             if let Some(default) = &self.catalog.default_model
@@ -46,6 +197,11 @@ impl State {
             {
                 models.push(default.clone());
             }
+        }
+        if harness == "codex" {
+            models.extend(self.codex_catalog.models.iter().cloned());
+        } else if harness == "claude" {
+            models.extend(self.claude_catalog.models.iter().cloned());
         }
         for thread in self.threads.iter().filter(|t| t.harness == harness) {
             for model in &thread.models {
@@ -80,7 +236,7 @@ impl State {
             {
                 values.push(
                     json!({"harness":model.provider,"provider":model.provider,"id":model.id,
-                    "name":model.name,"reasoning_levels":model.thinking_levels}),
+                    "name":model.name,"reasoning_levels":model.thinking_levels,"service_tiers":model.service_tiers}),
                 );
             }
         }
@@ -124,6 +280,64 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_pickers_and_capabilities_share_prompt_free_native_models() {
+        let mut state = State::new(PathBuf::new(), false);
+        for harness in ["codex", "claude"] {
+            let model = AgentModel::from_harness_value(&json!({
+                "provider":harness,"id":"fixture","name":"Fixture","thinkingLevels":["low","high"]
+            }),harness).unwrap();
+            if harness == "codex" {
+                state.codex_catalog.models = vec![model];
+            } else {
+                state.claude_catalog.models = vec![model];
+            }
+            state.choose_harness(harness);
+            assert!(state.current().pi.is_none());
+            assert!(state.current().session.is_none());
+            assert_eq!(state.current().models[0].thinking_levels, ["low", "high"]);
+            let mut capabilities = json!({"models":[],"runtime":{}});
+            state.add_harness_capabilities(&mut capabilities);
+            assert!(
+                capabilities["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|model| model["harness"] == harness && model["id"] == "fixture")
+            );
+        }
+    }
+
+    #[test]
+    fn native_commands_wait_for_initialization_and_rewind_can_clear_server_history() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (session, commands, _) = Pi::test_connection();
+        let thread = state.current_mut();
+        thread.harness = "codex".into();
+        thread.harness_state["codexNativeExtensions"] = json!(true);
+        thread.pi = Some(session);
+        thread.initializing = true;
+        thread.draft.replace_text("/goal Build fixture");
+        state.send();
+        assert!(commands.try_recv().is_err());
+        let thread = state.current_mut();
+        thread.initializing = false;
+        thread.drive_session();
+        let native = commands
+            .try_iter()
+            .find(|record| record["type"] == "native_command")
+            .unwrap();
+        assert_eq!(native["name"], "goal");
+        assert_eq!(native["arguments"], "Build fixture");
+        thread.server_owned = true;
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Old"}]}}));
+        thread.apply(
+            json!({"type":"response","command":"get_messages","id":"history","success":true,
+            "data":{"messages":[],"replaceHistory":true}}),
+        );
+        assert!(thread.messages.is_empty());
+    }
 
     #[test]
     fn claude_delegation_capabilities_and_harness_inheritance() {

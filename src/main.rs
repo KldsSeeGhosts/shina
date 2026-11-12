@@ -42,6 +42,7 @@ mod store;
 mod tray;
 mod ui;
 mod update;
+mod usage_limits;
 mod visuals;
 mod work;
 
@@ -917,6 +918,33 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 }));
                 t.native.stats = serde_json::json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
                 t.context.details_open = true;
+            }),
+            ("usage-limits", |state| {
+                state.populate_demo();
+                let t = state.current_mut();
+                t.harness = "codex".into();
+                t.context_window = Some(200_000);
+                t.context.absorb(&serde_json::json!({"contextUsage":{"tokens":61_400,"contextWindow":200_000,"percent":30.7}}));
+                t.harness_state["usageLimits"] = serde_json::json!({"windows":[
+                    {"id":"codex:primary","name":"5 hour","usedPercent":92,"resetsAt":2100000000},
+                    {"id":"codex:secondary","name":"7 day","usedPercent":25,"resetsAt":null}
+                ]});
+                t.context.details_open = true;
+            }),
+            ("codex-service-tier", |state| {
+                state.populate_demo();
+                let t = state.current_mut();
+                t.harness = "codex".into();
+                t.model_provider = "codex".into();
+                t.model_id = "fixture".into();
+                t.model = "Fixture Codex".into();
+                t.models = vec![session::AgentModel::from_harness_value(&serde_json::json!({
+                    "provider":"codex","id":"fixture","name":"Fixture Codex","thinkingLevels":["low","high"],
+                    "serviceTiers":[{"id":"default","name":"Standard"},{"id":"fast","name":"Fast"}]
+                }),"codex").unwrap()];
+                t.thinking_levels = vec!["low".into(),"high".into()];
+                t.thinking = "high".into();
+                state.settings_picker = Some(model::SettingsPicker::Thinking);
             }),
             ("picker", |state| {
                 state.populate_demo();
