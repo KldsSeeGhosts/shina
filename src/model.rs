@@ -1071,7 +1071,17 @@ impl Thread {
         true
     }
 
+    #[cfg(test)]
     pub fn send(&mut self) {
+        self.send_with_peers(None, &[], &str::to_owned);
+    }
+
+    pub(crate) fn send_with_peers(
+        &mut self,
+        target_server_id: Option<&str>,
+        peers: &[crate::peer::Peer],
+        machine_name: &dyn Fn(&str) -> String,
+    ) {
         if self.offline_blocked || self.status == Status::Paused {
             return;
         }
@@ -1087,12 +1097,14 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_with_context(
+        let prompt = match crate::composer_tokens::prompt_for_target(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
             Some(&self.machine),
-            &str::to_owned,
+            target_server_id,
+            peers,
+            machine_name,
         ) {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -6396,7 +6408,24 @@ impl State {
             return;
         }
         if self.current().queued_edit.is_some() {
-            self.current_mut().save_queued_edit();
+            let target_server_id = self.machine_identity(&self.machines.selected);
+            let peers = self.peers.clone();
+            let labels: Vec<(String, String)> = peers
+                .iter()
+                .map(|p| (p.server_id.clone(), p.label.clone()))
+                .collect();
+            self.current_mut()
+                .save_queued_edit_with_peers(Some(&target_server_id), &peers, &|m| {
+                    if m == "local" {
+                        "Local".into()
+                    } else {
+                        labels
+                            .iter()
+                            .find(|(id, _)| id == m)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| m.to_owned())
+                    }
+                });
             self.checkpoint();
             return;
         }
@@ -6414,12 +6443,15 @@ impl State {
             }
             // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
-            let target_machine = self.current().machine.clone();
-            let prompt = match crate::composer_tokens::prompt_for_with_context(
+            let target_machine = self.machines.selected.clone();
+            let target_server_id = self.machine_identity(&target_machine);
+            let prompt = match crate::composer_tokens::prompt_for_target(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
                 Some(&target_machine),
+                Some(&target_server_id),
+                &self.peers,
                 &|machine| self.machine_label(machine),
             ) {
                 Ok(prompt) => prompt,
@@ -6562,9 +6594,14 @@ impl State {
         self.release_task_results(self.current().id);
         if self.current().status.busy() {
             if !self.headless {
-                if let Ok(prompt) = crate::composer_tokens::prompt(
+                if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
                     &self.current().draft,
                     &self.current().draft_images,
+                    &self.current().draft_context,
+                    Some(&self.current().machine),
+                    Some(&self.machine_identity(&self.machines.selected)),
+                    &self.peers,
+                    &|machine| self.machine_label(machine),
                 ) && let Some(error) = self.current().validate_prompt_length(&prompt)
                 {
                     self.current_mut().submission_error = Some(error);
@@ -6572,21 +6609,61 @@ impl State {
                 }
                 self.current_mut().submission_error = None;
             }
-            self.current_mut().send_during_run();
+            let local_server_id = self.machine_identity(&self.machines.selected);
+            let peers = self.peers.clone();
+            let labels: Vec<(String, String)> = peers
+                .iter()
+                .map(|p| (p.server_id.clone(), p.label.clone()))
+                .collect();
+            self.current_mut()
+                .send_during_run_with_peers(Some(&local_server_id), &peers, &|m| {
+                    if m == "local" {
+                        "Local".into()
+                    } else {
+                        labels
+                            .iter()
+                            .find(|(id, _)| id == m)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| m.to_owned())
+                    }
+                });
             self.checkpoint();
             return;
         }
         if !self.headless {
-            if let Ok(prompt) =
-                crate::composer_tokens::prompt(&self.current().draft, &self.current().draft_images)
-                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
+                &self.current().draft,
+                &self.current().draft_images,
+                &self.current().draft_context,
+                Some(&self.current().machine),
+                Some(&self.machine_identity(&self.machines.selected)),
+                &self.peers,
+                &|machine| self.machine_label(machine),
+            ) && let Some(error) = self.current().validate_prompt_length(&prompt)
             {
                 self.current_mut().submission_error = Some(error);
                 return;
             }
             self.current_mut().submission_error = None;
         }
-        self.current_mut().send();
+        let local_server_id = self.machine_identity(&self.machines.selected);
+        let peers = self.peers.clone();
+        let labels: Vec<(String, String)> = peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        self.current_mut()
+            .send_with_peers(Some(&local_server_id), &peers, &|m| {
+                if m == "local" {
+                    "Local".into()
+                } else {
+                    labels
+                        .iter()
+                        .find(|(id, _)| id == m)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| m.to_owned())
+                }
+            });
         let id = self.current().id;
         self.invalidate_undo(id);
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {

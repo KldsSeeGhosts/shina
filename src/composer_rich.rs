@@ -835,6 +835,36 @@ pub fn has_format(edit: &TextEdit) -> bool {
         || !edit.soft_breaks().is_empty()
 }
 
+/// Rebuilds a rich `TextEdit` from canonical Markdown containing `t3-context://v1/...`
+/// references when no editor snapshot was sent (e.g., headless RPC clients).
+pub fn draft_from_canonical(text: &str) -> TextEdit {
+    let refs = crate::composer_context::collect_composer_context_references(text);
+    if refs.is_empty() {
+        return draft(text);
+    }
+    let mut plain = String::with_capacity(text.len());
+    let mut pills = Vec::new();
+    let mut cursor = 0;
+    for occ in refs {
+        plain.push_str(&text[cursor..occ.start]);
+        let start = plain.len();
+        plain.push_str(&occ.label);
+        let end = plain.len();
+        pills.push((
+            start..end,
+            crate::composer_context::format_composer_context_href(&occ.kind, &occ.context_id),
+            occ.label,
+        ));
+        cursor = occ.end;
+    }
+    plain.push_str(&text[cursor..]);
+    let mut edit = draft(plain);
+    for (range, id, label) in pills.into_iter().rev() {
+        edit.replace_with_pill(range, id, &label);
+    }
+    edit
+}
+
 pub fn restore(text: &str, html: Option<&str>) -> TextEdit {
     match html {
         Some(html) => {

@@ -17910,4 +17910,82 @@ pub(crate) mod tests {
             );
         }
     }
+
+    #[test]
+    fn linked_machine_thread_pill_resolves_with_thread_read_v2_and_marks_invalid_otherwise() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let mut remote_thread = Thread::new(77);
+            remote_thread.machine = "server-b".into();
+            remote_thread.title = "UniqueRemoteTarget".into();
+            rt.state
+                .machines
+                .threads
+                .insert("server-b".into(), vec![remote_thread]);
+            rt.state.peers.push(crate::peer::Peer {
+                server_id: "server-b".into(),
+                host: "127.0.0.1:47329".into(),
+                label: "Studio".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": [crate::protocol::THREAD_READ]}),
+                last_reached_at: None,
+                last_error: None,
+            });
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("@UniqueRemote".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            assert!(rt.presented("mention-menu").is_some());
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
+            let pill_id = "t3-context://v1/thread/thread_77";
+            assert_eq!(
+                composer_menu::chip_status(&rt.state, pill_id),
+                composer_menu::ChipStatus::Resolved,
+                "pills={:?}, context={:?}",
+                rt.state
+                    .current()
+                    .draft
+                    .pills()
+                    .map(|(r, id)| (r, id.to_owned()))
+                    .collect::<Vec<_>>(),
+                rt.state.current().draft_context
+            );
+
+            // Without thread-read-v2, chip becomes invalid (danger color).
+            rt.state.peers[0].capabilities = json!({"contracts": []});
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(
+                composer_menu::chip_status(&rt.state, pill_id),
+                composer_menu::ChipStatus::Invalid
+            );
+            let p = palette(false);
+            let t = rt.state.current();
+            let (_, fg, _) = composer_menu::pill_appearance(
+                composer_menu::chip_status(&rt.state, pill_id),
+                pill_id,
+                &t.draft_context,
+                &t.draft_images,
+                &t.machine,
+                p,
+            );
+            assert_eq!(fg, p.danger);
+            let (composer_rect, _) = rt.presented("composer").unwrap();
+            let (input_rect, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input_rect[0] >= composer_rect[0] - 0.5
+                    && input_rect[0] + input_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5,
+                "{width}: {input_rect:?} in {composer_rect:?}"
+            );
+        }
+    }
 }

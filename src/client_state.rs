@@ -1607,7 +1607,14 @@ impl State {
         })
     }
     pub fn machine_label(&self, server: &str) -> String {
-        if server == "local" {
+        if server == "local"
+            || self
+                .machines
+                .views
+                .get("local")
+                .and_then(|v| v["serverId"].as_str())
+                == Some(server)
+        {
             "Local".into()
         } else {
             self.client
@@ -1973,6 +1980,31 @@ impl State {
             .as_ref()
             .and_then(|client| client.commands_for(server))
             .cloned();
+        let target_server_id = self.machine_identity(server);
+        let target_peers: Vec<crate::peer::Peer> = if server == self.machines.selected {
+            self.peers.clone()
+        } else {
+            self.machines
+                .views
+                .get(server)
+                .and_then(|v| serde_json::from_value(v["peers"].clone()).ok())
+                .unwrap_or_default()
+        };
+        let peer_labels: Vec<(String, String)> = target_peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        let linked_hosts: Vec<(String, String)> = self
+            .client
+            .as_ref()
+            .map(|client| {
+                client
+                    .linked
+                    .iter()
+                    .filter_map(|(k, c)| c.remote.as_ref().map(|l| (k.clone(), l.host.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let threads = if server == self.machines.selected {
             &mut self.threads
         } else {
@@ -2014,26 +2046,27 @@ impl State {
             if machine == "local" {
                 "Local".into()
             } else {
-                self.client
-                    .as_ref()
-                    .and_then(|client| client.linked.get(machine))
-                    .and_then(|client| client.remote.as_ref())
-                    .map(|link| link.host.clone())
+                linked_hosts
+                    .iter()
+                    .find(|(k, _)| k == machine)
+                    .map(|(_, h)| h.clone())
                     .or_else(|| {
-                        self.peers
+                        peer_labels
                             .iter()
-                            .find(|p| p.server_id == machine)
-                            .map(|p| p.label.clone())
+                            .find(|(id, _)| id == machine)
+                            .map(|(_, l)| l.clone())
                     })
                     .unwrap_or_else(|| machine.into())
             }
         };
         let edit = snapshot.editor();
-        let prompt = match crate::composer_tokens::prompt_for_with_context(
+        let prompt = match crate::composer_tokens::prompt_for_target(
             &edit,
             &snapshot.attachments,
             &snapshot.context,
             Some(server),
+            Some(&target_server_id),
+            &target_peers,
             &label,
         ) {
             Ok(prompt) => prompt,
@@ -2563,7 +2596,7 @@ impl State {
                     context,
                 )?;
                 self.current_mut().draft = prompt.draft.as_ref().map_or_else(
-                    || crate::composer_rich::draft(&prompt.text),
+                    || crate::composer_rich::draft_from_canonical(&prompt.text),
                     crate::composer_rich::Snapshot::editor,
                 );
                 self.current_mut().draft_images = prompt
@@ -4825,9 +4858,10 @@ mod tests {
         )
         .err()
         .expect("a thread on another machine blocks the send");
-        assert_eq!(
-            blocked,
-            "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
+        assert!(
+            blocked.contains("Attached thread is on another machine")
+                && blocked.contains("Local seven")
+                && blocked.contains("not linked")
         );
     }
 
@@ -4990,5 +5024,106 @@ mod tests {
         );
         assert_eq!(state.current().draft_context.len(), 1);
         assert_ne!(state.current().draft_context[0].context_id, "image_ok");
+    }
+
+    #[test]
+    fn linked_machine_thread_pill_allows_thread_read_v2_and_names_missing_link_or_capability() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote_client, _rx2) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("server-b".into(), remote_client);
+        state.client = Some(client);
+        state.peers = vec![
+            crate::peer::Peer {
+                server_id: "server-b".into(),
+                host: "studio.local".into(),
+                label: "Studio".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": [crate::protocol::THREAD_READ]}),
+                last_reached_at: None,
+                last_error: None,
+            },
+            crate::peer::Peer {
+                server_id: "server-old".into(),
+                host: "old.local".into(),
+                label: "OldBox".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": []}),
+                last_reached_at: None,
+                last_error: None,
+            },
+        ];
+
+        // 1. Linked peer WITH thread-read-v2 succeeds and expands machine + threadId.
+        let rec_b = crate::composer_context::thread_context_record("server-b", 7, "Remote seven");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href("thread", &rec_b.context_id),
+            "Remote seven",
+        );
+        state.current_mut().draft_context = vec![rec_b];
+        let prompt = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap();
+        let expanded = crate::attachments::provider_text(&prompt);
+        assert!(
+            expanded.contains(r#"read_thread({"machine":"server-b","threadId":7})"#)
+                || expanded.contains(r#"read_thread({"threadId":7,"machine":"server-b"})"#),
+            "{expanded}"
+        );
+
+        // 2. Linked peer WITHOUT thread-read-v2 blocks and names the missing capability.
+        let rec_old = crate::composer_context::thread_context_record("server-old", 8, "Old seven");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href("thread", &rec_old.context_id),
+            "Old seven",
+        );
+        state.current_mut().draft_context = vec![rec_old];
+        let err_cap = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap_err();
+        assert!(err_cap.contains("thread-read-v2"), "{err_cap}");
+
+        // 3. Unlinked machine blocks and says it is not linked.
+        let rec_unlinked =
+            crate::composer_context::thread_context_record("server-c", 9, "Stranger");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href(
+                "thread",
+                &rec_unlinked.context_id,
+            ),
+            "Stranger",
+        );
+        state.current_mut().draft_context = vec![rec_unlinked];
+        let err_unlinked = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap_err();
+        assert!(err_unlinked.contains("not linked"), "{err_unlinked}");
     }
 }

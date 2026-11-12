@@ -189,17 +189,36 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
         })
         .take(40)
     {
-        let record = crate::composer_context::thread_context_record(
-            &thread.machine,
-            thread.id,
-            &thread.title,
-        );
+        let env_id = s.machine_identity(&thread.machine);
+        let record =
+            crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
         items.push(Item {
             label: thread.title.clone(),
             description: format!("Thread {}", thread.id),
             source: "Thread".into(),
             action: Action::Context(record, thread.title.clone()),
         });
+    }
+    for (machine, remote_threads) in &s.machines.threads {
+        if machine == &s.machines.selected {
+            continue;
+        }
+        let env_id = s.machine_identity(machine);
+        let machine_name = s.machine_label(machine);
+        for thread in remote_threads
+            .iter()
+            .filter(|other| other.title.to_lowercase().contains(&query))
+            .take(40)
+        {
+            let record =
+                crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
+            items.push(Item {
+                label: thread.title.clone(),
+                description: format!("Thread {}", thread.id),
+                source: format!("Thread · {machine_name}"),
+                action: Action::Context(record, thread.title.clone()),
+            });
+        }
     }
     (items, notes)
 }
@@ -482,20 +501,34 @@ pub(super) fn chip_status(s: &State, id: &str) -> ChipStatus {
         if !record.is_known() {
             return ChipStatus::Unresolved;
         }
+        let target_server_id = s.machine_identity(&s.machines.selected);
         if let crate::composer_context::ComposerContextData::Thread { environment_id, .. } =
             &record.data
-            && environment_id != &t.machine
+            && crate::composer_context::outside_thread_reason(
+                environment_id,
+                &s.machines.selected,
+                Some(&target_server_id),
+                &s.peers,
+            )
+            .is_some()
         {
             return ChipStatus::Invalid;
         }
         return ChipStatus::Resolved;
     }
     if let Some(token) = Token::decode(id) {
+        let target_server_id = s.machine_identity(&s.machines.selected);
         if let Token::Thread {
             machine: Some(owner),
             ..
         } = token
-            && owner != t.machine
+            && crate::composer_context::outside_thread_reason(
+                &owner,
+                &s.machines.selected,
+                Some(&target_server_id),
+                &s.peers,
+            )
+            .is_some()
         {
             return ChipStatus::Invalid;
         }

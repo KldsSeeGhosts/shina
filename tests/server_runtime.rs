@@ -3127,3 +3127,132 @@ fn durable_credentials_survive_restart_and_revoked_sockets_cannot_mutate() {
     assert!(!matches!(victim.socket.read(), Ok(Message::Text(_))));
     profile.stop();
 }
+
+#[test]
+fn linked_machine_thread_pill_sends_and_agent_reads_remote_thread_via_read_thread() {
+    let mut machine_a = Profile::new();
+    let mut machine_b = Profile::new();
+    machine_a.launch(&["serve"]);
+    machine_b.launch(&["serve"]);
+    let a_discovery = machine_a.discovery();
+    let b_discovery = machine_b.discovery();
+    let mut a_client = machine_a.client(uuid::Uuid::new_v4());
+    let mut b_client = machine_b.client(uuid::Uuid::new_v4());
+
+    // Create thread 7 on machine B with a distinct transcript fact.
+    for id in 2..=7 {
+        let created = b_client.command(
+            "thread.create",
+            json!({"occupiedDrafts":[1,2,3,4,5,6,7]}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(created["result"]["result"]["threadId"], id, "{created}");
+    }
+    let sent_b = b_client.command(
+        "thread.send",
+        json!({"threadId":7,"text":"SECRET_FROM_MACHINE_B","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(sent_b["result"]["status"], "accepted", "{sent_b}");
+    b_client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == 7 && thread["status"] == "Completed")
+    });
+
+    // Link machine B to machine A.
+    let code = machine_b.cli(&["pair", "--peer"]);
+    assert!(code.status.success());
+    let output = String::from_utf8(code.stdout).unwrap();
+    let code = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let host_b = format!("127.0.0.1:{}", b_discovery["port"]);
+    let linked = machine_a.cli(&["peer", "link", &host_b, code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    a_client.rpc("workspace.subscribe", json!({}), json!("refresh-peers"));
+    a_client.until(|state| {
+        state["peers"]
+            .as_array()
+            .is_some_and(|peers| !peers.is_empty())
+    });
+
+    // Attach thread 7 from machine B in a composer targeting machine A and send.
+    let b_server_id = b_discovery["serverId"].as_str().unwrap();
+    let send_a = a_client.command(
+        "thread.send",
+        json!({
+            "threadId": 1,
+            "text": "Please inspect [Remote seven](t3-context://v1/thread/thread_7)",
+            "attachments": [],
+            "context": {
+                "version": 1,
+                "records": [{
+                    "version": 1,
+                    "contextId": "thread_7",
+                    "kind": "thread",
+                    "label": "Remote seven",
+                    "environmentId": b_server_id,
+                    "threadId": "7",
+                    "title": "Remote seven"
+                }]
+            },
+            "mode": "prompt"
+        }),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send_a["result"]["status"], "accepted", "{send_a}");
+    a_client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == 1 && thread["status"] == "Completed")
+    });
+
+    // Verify the prompt delivered to the agent on A contains the read_thread reference with
+    // machine B's server id and thread 7, and that calling read_thread with those exact
+    // arguments through A's MCP reads B's thread.
+    let a_thread_dir = machine_a.root.join("Shina/chats/1");
+    let prompts_raw = fs::read_to_string(a_thread_dir.join("fixture-prompts.jsonl")).unwrap();
+    let prompt_text: String = serde_json::from_str(prompts_raw.lines().next().unwrap()).unwrap();
+    assert!(
+        prompt_text.contains("[Thread: Remote seven; ref=thread_7]")
+            && prompt_text.contains("<t3_context version=\"1\">")
+            && prompt_text.contains(b_server_id),
+        "{prompt_text}"
+    );
+    let (_, after_call) = prompt_text
+        .split_once("read_thread(")
+        .expect("read_thread call in prompt");
+    let (args_json, _) = after_call.split_once(')').expect("closing paren");
+    let read_args: Value = serde_json::from_str(args_json).unwrap();
+    assert_eq!(read_args["machine"], b_server_id);
+    assert_eq!(read_args["threadId"], 7);
+
+    let read_result = read_fixture_thread(&a_thread_dir, read_args);
+    assert_eq!(read_result["thread"]["threadId"], 7);
+    assert_eq!(read_result["thread"]["machine"], b_server_id);
+    assert!(
+        read_result["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_FROM_MACHINE_B"),
+        "{read_result}"
+    );
+    let _ = a_discovery;
+
+    drop(a_client);
+    drop(b_client);
+    machine_a.stop();
+    machine_b.stop();
+}

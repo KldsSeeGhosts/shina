@@ -219,7 +219,17 @@ impl Thread {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save_queued_edit(&mut self) {
+        self.save_queued_edit_with_peers(None, &[], &str::to_owned);
+    }
+
+    pub(crate) fn save_queued_edit_with_peers(
+        &mut self,
+        target_server_id: Option<&str>,
+        peers: &[crate::peer::Peer],
+        machine_name: &dyn Fn(&str) -> String,
+    ) {
         if self.queued_save.is_some() || self.request.is_some() || !self.has_draft_content() {
             return;
         }
@@ -237,12 +247,14 @@ impl Thread {
             .find(|q| q.id == id)
             .map(|q| q.prompt.images.iter().map(|a| a.id.clone()).collect())
             .unwrap_or_default();
-        let prompt = match crate::composer_tokens::prompt_for_with_context(
+        let prompt = match crate::composer_tokens::prompt_for_target(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
             Some(&self.machine),
-            &str::to_owned,
+            target_server_id,
+            peers,
+            machine_name,
         ) {
             Ok(prompt) => prompt,
             Err(error) => {

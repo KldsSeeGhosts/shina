@@ -354,7 +354,17 @@ impl Thread {
     }
 
     /// Unlike the initial prompt, a steering submission must not reset the current run.
+    #[cfg(test)]
     pub fn send_during_run(&mut self) {
+        self.send_during_run_with_peers(None, &[], &str::to_owned);
+    }
+
+    pub(crate) fn send_during_run_with_peers(
+        &mut self,
+        target_server_id: Option<&str>,
+        peers: &[crate::peer::Peer],
+        machine_name: &dyn Fn(&str) -> String,
+    ) {
         if self.initializing
             || self.configuring
             || self.native.lifecycle_id.is_some()
@@ -371,12 +381,14 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_with_context(
+        let prompt = match crate::composer_tokens::prompt_for_target(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
             Some(&self.machine),
-            &str::to_owned,
+            target_server_id,
+            peers,
+            machine_name,
         ) {
             Ok(prompt) => prompt,
             Err(error) => {

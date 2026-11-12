@@ -42,7 +42,7 @@ impl Token {
     pub fn source_for(
         &self,
         target_machine: Option<&str>,
-        machine_name: &dyn Fn(&str) -> String,
+        _machine_name: &dyn Fn(&str) -> String,
     ) -> String {
         match self {
             Self::File { path, source, .. } => source
@@ -55,9 +55,9 @@ impl Token {
                     && owner != target
                 {
                     format!(
-                        "Shina thread {} on {} (not readable from this machine)",
+                        "Shina thread {}, read_thread({})",
                         serde_json::to_string(title).unwrap(),
-                        machine_name(owner)
+                        serde_json::json!({"machine":owner,"threadId":id})
                     )
                 } else {
                     format!(
@@ -109,10 +109,12 @@ pub fn stamp_thread_owner(edit: &mut TextEdit, owner: &str) {
     }
 }
 
+#[cfg(test)]
 pub fn prompt(edit: &TextEdit, images: &[Attachment]) -> Result<Prompt, String> {
     prompt_for(edit, images, None, &|machine| machine.to_owned())
 }
 
+#[cfg(test)]
 pub fn prompt_for(
     edit: &TextEdit,
     images: &[Attachment],
@@ -129,39 +131,74 @@ pub fn prompt_for_with_context(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> Result<Prompt, String> {
+    prompt_for_target(
+        edit,
+        images,
+        draft_context,
+        target_machine,
+        None,
+        &[],
+        machine_name,
+    )
+}
+
+pub fn prompt_for_target(
+    edit: &TextEdit,
+    images: &[Attachment],
+    draft_context: &[crate::composer_context::ComposerContextRecord],
+    target_machine: Option<&str>,
+    target_server_id: Option<&str>,
+    peers: &[crate::peer::Peer],
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
     validate_pill_kinds(edit)?;
     let mut attachments = images.to_vec();
     let referenced_ids = collect_inline_context_ids_from_edit(edit);
-    for record in draft_context {
-        if referenced_ids.contains(&record.context_id)
+    if let Some(target) = target_machine {
+        if let Some((record, reason)) =
+            crate::composer_context::thread_contexts_outside_environment(
+                &referenced_ids,
+                draft_context,
+                target,
+                target_server_id,
+                peers,
+            )
+            .into_iter()
+            .next()
             && let crate::composer_context::ComposerContextData::Thread {
                 environment_id,
                 title,
                 ..
-            } = &record.data
-            && let Some(target) = target_machine
-            && environment_id != target
+            } = record.data
         {
-            return Err(format!(
-                "Attached thread is on another machine. This machine's agent can't read \"{title}\". Remove it, or switch back to {} to send.",
-                machine_name(environment_id)
+            return Err(crate::composer_context::format_outside_thread_error(
+                &title,
+                &machine_name(&environment_id),
+                reason,
             ));
         }
     }
     for (_, id) in edit.pills() {
         // Ported from KSG Code's `threadContextsOutsideEnvironment` and its use in
-        // `useComposerSend.ts`: a thread the target machine's agent cannot read blocks the send.
+        // `useComposerSend.ts`: block only when the owner machine is unlinked or lacks
+        // `thread-read-v2`, naming which.
         if let Some(Token::Thread {
             title,
             machine: Some(owner),
             ..
         }) = Token::decode(id)
             && let Some(target) = target_machine
-            && owner != target
+            && let Some(reason) = crate::composer_context::outside_thread_reason(
+                &owner,
+                target,
+                target_server_id,
+                peers,
+            )
         {
-            return Err(format!(
-                "Attached thread is on another machine. This machine's agent can't read \"{title}\". Remove it, or switch back to {} to send.",
-                machine_name(&owner)
+            return Err(crate::composer_context::format_outside_thread_error(
+                &title,
+                &machine_name(&owner),
+                reason,
             ));
         }
         if let Some(Token::File { path, .. }) = Token::decode(id) {
@@ -349,7 +386,7 @@ mod tests {
             } else {
                 m.into()
             }),
-            "Shina thread \"Fix \\\"quoted\\\" title\" on Local (not readable from this machine)"
+            "Shina thread \"Fix \\\"quoted\\\" title\", read_thread({\"machine\":\"local\",\"threadId\":42})"
         );
 
         // Missing owner field is treated as owned by its draft's machine; unknown fields are kept.
