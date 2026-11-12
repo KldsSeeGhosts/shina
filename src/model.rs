@@ -87,7 +87,7 @@ impl Selection {
 }
 
 /// The validated fields of a `delegate_task.target` request.
-struct DelegationTarget {
+pub(crate) struct DelegationTarget {
     harness: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -7232,7 +7232,7 @@ fn next_counter(saved: &Value, maximum: usize) -> Result<usize, String> {
     Ok(next)
 }
 
-fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
+pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
     let Some(target) = args.get("target") else {
         return Ok(None);
     };

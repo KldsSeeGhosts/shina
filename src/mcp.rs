@@ -238,7 +238,7 @@ pub fn tools() -> Value {
         "description":"Optional selection from orchestrator_capabilities. Omit to inherit the caller's current or pinned model and reasoning. A given model or reasoning overrides the inherited value; unsupported combinations are rejected before a child starts.",
         "properties":{
             "harness":{"type":"string","description":"pi, codex, claude, or an installed ACP id. Defaults to the parent's harness."},
-            "machine":{"type":"string","description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work."},
+            "machine":{"type":"string","description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work. A machine-only target runs there with the inherited model and harness."},
             "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{
@@ -251,7 +251,7 @@ pub fn tools() -> Value {
                 "additionalProperties":false
             }
         },
-        "anyOf":[{"required":["model"]},{"required":["harness"]}],
+        "anyOf":[{"required":["model"]},{"required":["harness"]},{"required":["machine"]}],
         "additionalProperties":false
     });
     let mut tools = json!([
@@ -1016,7 +1016,7 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
         assert_eq!(target["additionalProperties"], false);
         assert_eq!(
             target["anyOf"],
-            json!([{"required":["model"]},{"required":["harness"]}])
+            json!([{"required":["model"]},{"required":["harness"]},{"required":["machine"]}])
         );
         assert!(target["properties"]["harness"].is_object());
         let options = &target["properties"]["options"];
@@ -1028,6 +1028,12 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
                 .contains("exact")
         );
         assert!(options["properties"]["thinking"].is_object());
+        assert!(
+            target["properties"]["machine"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("machine-only target")
+        );
         assert!(
             delegate["description"]
                 .as_str()
@@ -1046,6 +1052,66 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
                 INSTRUCTIONS.contains(phrase),
                 "INSTRUCTIONS must mention {phrase}"
             );
+        }
+    }
+
+    #[test]
+    fn example_target_shapes_match_parser_and_schema_any_of() {
+        let tools = tools();
+        let delegate = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "delegate_task")
+            .unwrap();
+        let any_of = delegate["inputSchema"]["properties"]["target"]["anyOf"]
+            .as_array()
+            .unwrap();
+        let required_keys: Vec<&str> = any_of
+            .iter()
+            .map(|branch| {
+                let req = branch["required"].as_array().unwrap();
+                assert_eq!(req.len(), 1);
+                req[0].as_str().unwrap()
+            })
+            .collect();
+
+        // Every example target shape described in INSTRUCTIONS and tool descriptions:
+        // 1. Harness + model + options.reasoning (from INSTRUCTIONS)
+        // 2. Harness-only (omit model to use harness default)
+        // 3. Model-only (with or without options.thinking alias)
+        // 4. Machine-only (run on peer with inherited model and harness)
+        // 5. Machine + harness + model + provider + options.reasoning
+        let examples = [
+            json!({
+                "harness": "codex",
+                "model": "gpt-5.3-codex",
+                "options": {"reasoning": "high"}
+            }),
+            json!({"harness": "claude"}),
+            json!({
+                "model": "claude-sonnet-4-6",
+                "options": {"thinking": "medium"}
+            }),
+            json!({"machine": "mac-studio"}),
+            json!({
+                "machine": "mac-studio",
+                "harness": "pi",
+                "provider": "cpa",
+                "model": "gpt-5.3-codex",
+                "options": {"reasoning": "high"}
+            }),
+        ];
+
+        for target in examples {
+            let obj = target.as_object().unwrap();
+            assert!(
+                required_keys.iter().any(|key| obj.contains_key(*key)),
+                "target {target} must satisfy schema anyOf {any_of:?}"
+            );
+            let parsed = crate::model::parse_delegation_target(&json!({ "target": target }))
+                .unwrap_or_else(|err| panic!("parser rejected {target}: {err}"));
+            assert!(parsed.is_some());
         }
     }
 }
