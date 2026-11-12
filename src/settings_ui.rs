@@ -187,12 +187,23 @@ impl ThreadDefaults {
         self.validate()
     }
 }
+#[derive(Clone, Debug, Default)]
+pub struct NewKeybindingDraft {
+    pub command: String,
+    pub command_menu: bool,
+    pub key_draft: String,
+    pub when_draft: String,
+    pub recording: bool,
+    pub validation: Option<String>,
+}
+
 pub struct Dialog {
     pub section: usize,
     pub search: rune::TextEdit,
     pub shortcut_search: rune::TextEdit,
     pub shortcut_capture: Option<String>,
     pub shortcut_notice: Option<String>,
+    pub new_keybinding: Option<NewKeybindingDraft>,
     pub machine: String,
     pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
@@ -216,6 +227,7 @@ impl Default for Dialog {
             shortcut_search: Default::default(),
             shortcut_capture: None,
             shortcut_notice: None,
+            new_keybinding: None,
             machine: "local".into(),
             profile_target: None,
             snooze: Default::default(),
@@ -239,6 +251,13 @@ pub(crate) fn handle_shortcut_capture(
     event: &rune::KeyEvent,
     tx: &rune::Tx,
 ) -> bool {
+    if s.settings
+        .new_keybinding
+        .as_ref()
+        .is_some_and(|d| d.recording)
+    {
+        return handle_new_keybinding_capture(s, event, tx);
+    }
     let Some(capture_id) = s.settings.shortcut_capture.clone() else {
         return false;
     };
@@ -284,6 +303,55 @@ pub(crate) fn handle_shortcut_capture(
     true
 }
 
+pub(crate) fn handle_new_keybinding_capture(
+    s: &mut State,
+    event: &rune::KeyEvent,
+    tx: &rune::Tx,
+) -> bool {
+    if s.settings
+        .new_keybinding
+        .as_ref()
+        .is_none_or(|d| !d.recording)
+    {
+        return false;
+    }
+    if matches!(event.key, rune::Key::Modifier { .. }) {
+        return true;
+    }
+    if event.key == rune::Key::Escape {
+        if let Some(draft) = &mut s.settings.new_keybinding {
+            draft.key_draft.clear();
+            draft.recording = false;
+            draft.validation = None;
+        }
+        return true;
+    }
+    let platform = crate::keybindings::Platform::current();
+    let Some(next_key) = crate::keybindings::keybinding_from_key_event(
+        event,
+        platform,
+        tx.physical_key(),
+        tx.key_base(),
+    ) else {
+        return true;
+    };
+    if let Some(draft) = &mut s.settings.new_keybinding {
+        draft.key_draft = next_key;
+        draft.recording = false;
+        draft.validation = if !draft.command.is_empty() {
+            crate::keybindings::validate_keybinding_draft(
+                &draft.command,
+                &draft.key_draft,
+                &draft.when_draft,
+            )
+            .err()
+        } else {
+            None
+        };
+    }
+    true
+}
+
 impl State {
     pub fn resolved_keybindings(&self) -> Vec<crate::keybindings::ResolvedKeybindingRule> {
         crate::keybindings::merge_with_default_keybindings(&self.preferences.keybindings)
@@ -300,12 +368,18 @@ impl State {
             || self.snooze_edit.focused
             || t.reply.focused
             || self.settings.search.focused
+            || self.settings.shortcut_search.focused
             || self.settings.snooze.focused
             || self.settings.add_project_base.focused
             || self.settings.model.focused
             || self.settings.provider.focused
             || self.settings.effort.focused
-            || self.settings.shortcut_capture.is_some();
+            || self.settings.shortcut_capture.is_some()
+            || self
+                .settings
+                .new_keybinding
+                .as_ref()
+                .is_some_and(|d| d.recording);
         let mut ctx = crate::keybindings::ShortcutContext::desktop();
         ctx.editable_focus = editable_focus;
         ctx.composer_focus = composer_focus;
@@ -325,6 +399,7 @@ impl State {
         self.settings.shortcut_search.replace_text("");
         self.settings.shortcut_capture = None;
         self.settings.shortcut_notice = None;
+        self.settings.new_keybinding = None;
         self.settings.notice = None;
         if !self.demo && !cfg!(test) && self.settings.version_probe.is_none() {
             let (send, receive) = std::sync::mpsc::channel();
@@ -750,6 +825,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                     s.settings.search.replace_text("");
                     s.settings.shortcut_capture = None;
                     s.settings.shortcut_notice = None;
+                    s.settings.new_keybinding = None;
                     if index == 3 && s.client.is_some() && !s.demo {
                         s.machine_action("devices", "");
                     }
@@ -766,6 +842,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                     s.settings.search.replace_text("");
                     s.settings.shortcut_capture = None;
                     s.settings.shortcut_notice = None;
+                    s.settings.new_keybinding = None;
                     false
                 }),
         );
@@ -849,6 +926,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                     |s| {
                         s.settings_menu = false;
                         s.settings.shortcut_capture = None;
+                        s.settings.new_keybinding = None;
                     },
                 ))
                 .child(search),
@@ -862,7 +940,8 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                 .child(el().w(1.0).h_full().fill(p.line))
                 .child(content),
         );
-    el().key("settings-backdrop")
+    let mut backdrop = el()
+        .key("settings-backdrop")
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
@@ -871,8 +950,96 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
         .modal(false, |s: &mut State| {
             s.settings_menu = false;
             s.settings.shortcut_capture = None;
+            s.settings.new_keybinding = None;
         })
-        .child(card)
+        .child(card);
+    if s.settings
+        .new_keybinding
+        .as_ref()
+        .is_some_and(|d| d.command_menu)
+    {
+        backdrop = backdrop.child(new_keybinding_command_menu(s, p));
+    }
+    backdrop
+}
+
+fn new_keybinding_command_menu(s: &State, p: Palette) -> El {
+    let merged = s.resolved_keybindings();
+    let options = crate::keybindings::build_keybinding_command_options(&merged);
+    let selected = s
+        .settings
+        .new_keybinding
+        .as_ref()
+        .map(|d| d.command.as_str())
+        .unwrap_or("");
+    let mut menu = col()
+        .key("new-keybinding-command-menu")
+        .role("listbox")
+        .focus_group()
+        .label("Command")
+        .w(280.0)
+        .max_h(260.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .padding(4.0)
+        .gap(1.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p));
+    for (idx, cmd) in options.into_iter().enumerate() {
+        let title = crate::keybindings::command_label(&cmd);
+        let is_selected = cmd == selected;
+        let chosen = cmd.clone();
+        menu = menu.child(
+            row()
+                .key(format!("new-keybinding-command-option-{idx}"))
+                .role("option")
+                .label(&title)
+                .checked(is_selected)
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .h(28.0)
+                .px(8.0)
+                .radius(4.0)
+                .center_y()
+                .fill(if is_selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    if let Some(draft) = &mut s.settings.new_keybinding {
+                        draft.command = chosen.clone();
+                        draft.command_menu = false;
+                        draft.validation = if !draft.key_draft.trim().is_empty() {
+                            crate::keybindings::validate_keybinding_draft(
+                                &draft.command,
+                                &draft.key_draft,
+                                &draft.when_draft,
+                            )
+                            .err()
+                        } else {
+                            None
+                        };
+                    }
+                })
+                .child(label(&title, TextStyle::new(13.0, 420.0), p.ink).truncate()),
+        );
+    }
+    menu.anchored_fit(
+        "new-keybinding-command",
+        rune::Side::Bottom,
+        rune::Align::Start,
+        4.0,
+    )
+    .modal(true, |s: &mut State| {
+        if let Some(draft) = &mut s.settings.new_keybinding {
+            draft.command_menu = false;
+        }
+    })
 }
 
 fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
@@ -1474,7 +1641,8 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
     use crate::keybindings::{
         KeybindingSource, Platform, build_keybinding_rows, command_label,
         conflict_warning_description, filter_keybinding_rows, format_shortcut_label,
-        group_keybinding_rows, keycap_parts, reset_custom_rule,
+        group_keybinding_rows, keybinding_conflict_labels, keycap_parts, parse_keybinding_shortcut,
+        reset_custom_rule, upsert_custom_rule, validate_keybinding_draft,
     };
 
     let platform = Platform::current();
@@ -1491,28 +1659,43 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
         .min_w(0.0)
         .gap(6.0);
     if global_query.is_empty() {
+        let search_field = text_input(&s.settings.shortcut_search, TextStyle::new(13.5, 400.0))
+            .key("keybindings-search")
+            .label("Search keybindings")
+            .placeholder("Search keybindings", p.muted)
+            .single_line()
+            .w(0.0)
+            .grow(1.0)
+            .min_w(160.0)
+            .h(32.0)
+            .padding(8.0)
+            .radius(4.0)
+            .color(p.ink)
+            .fill(field_fill(s, p))
+            .field_focus(&s.settings.shortcut_search, p)
+            .on_edit(|s: &mut State| &mut s.settings.shortcut_search)
+            .on_input_key(|s: &mut State, event, _| {
+                if event.key == rune::Key::Escape && !s.settings.shortcut_search.text.is_empty() {
+                    s.settings.shortcut_search.replace_text("");
+                    return true;
+                }
+                s.undo_key(event, true)
+            });
+        let add_button = settings_button("keybindings-add", "Add keybinding", p, |s| {
+            s.settings.shortcut_capture = None;
+            s.settings.shortcut_notice = None;
+            s.settings.new_keybinding = Some(NewKeybindingDraft::default());
+        })
+        .disabled(s.settings.new_keybinding.is_some());
         pane = pane.child(
-            text_input(&s.settings.shortcut_search, TextStyle::new(13.5, 400.0))
-                .key("keybindings-search")
-                .label("Search keybindings")
-                .placeholder("Search keybindings", p.muted)
-                .single_line()
+            row()
+                .key("keybindings-toolbar")
                 .w_full()
-                .h(32.0)
-                .padding(8.0)
-                .radius(4.0)
-                .color(p.ink)
-                .fill(field_fill(s, p))
-                .field_focus(&s.settings.shortcut_search, p)
-                .on_edit(|s: &mut State| &mut s.settings.shortcut_search)
-                .on_input_key(|s: &mut State, event, _| {
-                    if event.key == rune::Key::Escape && !s.settings.shortcut_search.text.is_empty()
-                    {
-                        s.settings.shortcut_search.replace_text("");
-                        return true;
-                    }
-                    s.undo_key(event, true)
-                }),
+                .gap(8.0)
+                .flex_wrap()
+                .center_y()
+                .child(search_field)
+                .child(add_button),
         );
     }
 
@@ -1521,6 +1704,189 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
     }
 
     let rows = build_keybinding_rows(&s.resolved_keybindings(), platform);
+
+    if global_query.is_empty()
+        && let Some(draft) = &s.settings.new_keybinding
+    {
+        let cmd_text = if draft.command.is_empty() {
+            "Command".to_owned()
+        } else {
+            command_label(&draft.command)
+        };
+        let command_button = settings_button("new-keybinding-command", &cmd_text, p, |s| {
+            if let Some(draft) = &mut s.settings.new_keybinding {
+                draft.command_menu = !draft.command_menu;
+            }
+        })
+        .label("Command")
+        .max_w(220.0);
+
+        let key_control = {
+            let border_color = if draft.recording { p.coral } else { p.frame };
+            let mut key_box = row()
+                .key("new-keybinding-key")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!(
+                    "Keybinding for {}",
+                    if draft.command.is_empty() {
+                        "new keybinding".to_owned()
+                    } else {
+                        command_label(&draft.command)
+                    }
+                ))
+                .focusable(true)
+                .h(28.0)
+                .min_w(120.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if draft.recording {
+                    p.selected
+                } else {
+                    field_fill(s, p)
+                })
+                .border(if draft.recording { 2.0 } else { 1.0 }, border_color)
+                .on_press_tx(|s: &mut State, tx| {
+                    if let Some(draft) = &mut s.settings.new_keybinding {
+                        draft.recording = true;
+                        draft.command_menu = false;
+                        tx.focus("new-keybinding-key", false);
+                    }
+                })
+                .on_key(|s: &mut State, event, tx| handle_new_keybinding_capture(s, event, tx));
+            if draft.recording {
+                key_box = key_box.child(pixel_text("Press shortcut", p.muted));
+            } else if draft.key_draft.trim().is_empty() {
+                key_box = key_box.child(pixel_text("Unassigned", p.muted));
+            } else if let Some(parsed) = parse_keybinding_shortcut(&draft.key_draft) {
+                for part in keycap_parts(&parsed, platform) {
+                    key_box = key_box.child(keycap_chip(&part, p));
+                }
+            } else {
+                key_box = key_box.child(pixel_text(&draft.key_draft, p.danger));
+            }
+            key_box
+        };
+
+        let validation_err = draft.validation.clone().or_else(|| {
+            if draft.command.is_empty()
+                && draft.key_draft.trim().is_empty()
+                && draft.when_draft.trim().is_empty()
+            {
+                None
+            } else if draft.key_draft.trim().is_empty() && draft.when_draft.trim().is_empty() {
+                None
+            } else {
+                validate_keybinding_draft(
+                    if draft.command.is_empty() {
+                        "sidebar.toggle"
+                    } else {
+                        &draft.command
+                    },
+                    if draft.key_draft.trim().is_empty() {
+                        "mod+k"
+                    } else {
+                        &draft.key_draft
+                    },
+                    &draft.when_draft,
+                )
+                .err()
+            }
+        });
+        let can_save = !draft.command.is_empty()
+            && !draft.key_draft.trim().is_empty()
+            && validate_keybinding_draft(&draft.command, &draft.key_draft, &draft.when_draft)
+                .is_ok();
+        let save_cmd = draft.command.clone();
+        let save_key = draft.key_draft.clone();
+        let save_when = draft.when_draft.clone();
+        let save_button = primary_button("new-keybinding-save", "Save", p, move |s| {
+            let when_opt = (!save_when.trim().is_empty()).then_some(save_when.as_str());
+            match upsert_custom_rule(
+                &mut s.preferences.keybindings,
+                &save_cmd,
+                &save_key,
+                when_opt,
+                None,
+            ) {
+                Ok(()) => {
+                    s.settings.new_keybinding = None;
+                    s.settings.shortcut_notice = None;
+                    s.checkpoint();
+                }
+                Err(error) => {
+                    if let Some(d) = &mut s.settings.new_keybinding {
+                        d.validation = Some(error);
+                    }
+                }
+            }
+        })
+        .disabled(!can_save);
+        let cancel_button = settings_button("new-keybinding-cancel", "Cancel", p, |s| {
+            s.settings.new_keybinding = None;
+        })
+        .label("Cancel new keybinding");
+
+        let conflicts =
+            keybinding_conflict_labels(&rows, "new", &draft.key_draft, &draft.when_draft, platform);
+
+        let when_desc = if draft.when_draft.trim().is_empty() {
+            "When Always".to_owned()
+        } else {
+            format!("When {}", draft.when_draft.trim())
+        };
+        let mut info_col = col()
+            .grow(1.0)
+            .min_w(140.0)
+            .gap(4.0)
+            .child(label("New keybinding", TextStyle::new(14.0, 500.0), p.ink))
+            .child(
+                label(&when_desc, TextStyle::new(12.5, 400.0).lh(17.0), p.muted).wrap_anywhere(),
+            );
+        if let Some(conflict_msg) = conflict_warning_description(&conflicts) {
+            info_col = info_col.child(
+                label(conflict_msg, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
+                    .key("new-keybinding-conflict")
+                    .wrap(),
+            );
+        }
+        if let Some(err) = validation_err {
+            info_col = info_col.child(
+                label(err, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
+                    .key("new-keybinding-validation")
+                    .wrap(),
+            );
+        }
+        let controls = row()
+            .gap(6.0)
+            .center_y()
+            .shrink()
+            .flex_wrap()
+            .child(command_button)
+            .child(key_control)
+            .child(save_button)
+            .child(cancel_button);
+        pane = pane.child(
+            col()
+                .key("new-keybinding-row")
+                .w_full()
+                .padding(8.0)
+                .radius(4.0)
+                .fill(p.selected)
+                .border(1.0, p.line)
+                .child(
+                    row()
+                        .gap(12.0)
+                        .flex_wrap()
+                        .items_start()
+                        .child(info_col)
+                        .child(controls),
+                ),
+        );
+    }
+
     let filtered = filter_keybinding_rows(rows, query);
     let found = !filtered.is_empty();
     let groups = group_keybinding_rows(filtered);
@@ -2214,5 +2580,161 @@ mod tests {
             rt.frame(0.0);
             assert!(rt.presented("keybindings-no-results").is_some());
         }
+    }
+
+    #[test]
+    fn add_keybinding_flow_validates_captures_and_fits_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.state.open_settings();
+            rt.frame(0.0);
+            crate::ui::tests::press(&mut rt, "settings-section-7");
+
+            let (add_rect, _) = rt
+                .presented("keybindings-add")
+                .unwrap_or_else(|| panic!("{width}: keybindings-add"));
+            assert!(add_rect[0] >= 0.0 && add_rect[0] + add_rect[2] <= width + 0.5);
+
+            // Open "Add keybinding" row.
+            crate::ui::tests::press(&mut rt, "keybindings-add");
+            for key in [
+                "new-keybinding-row",
+                "new-keybinding-command",
+                "new-keybinding-key",
+                "new-keybinding-save",
+                "new-keybinding-cancel",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width} {key}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width} {key}: {rect:?}"
+                );
+            }
+
+            // Open command chooser and pick an option.
+            crate::ui::tests::press(&mut rt, "new-keybinding-command");
+            assert!(rt.presented("new-keybinding-command-menu").is_some());
+            let (menu_rect, _) = rt.presented("new-keybinding-command-menu").unwrap();
+            assert!(menu_rect[0] >= 0.0 && menu_rect[0] + menu_rect[2] <= width + 0.5);
+            assert!(menu_rect[1] >= 0.0 && menu_rect[1] + menu_rect[3] <= 720.5);
+            crate::ui::tests::press(&mut rt, "new-keybinding-command-option-0");
+            assert!(rt.find("new-keybinding-command-menu").is_none());
+            let chosen_cmd = rt
+                .state
+                .settings
+                .new_keybinding
+                .as_ref()
+                .unwrap()
+                .command
+                .clone();
+            assert!(!chosen_cmd.is_empty());
+
+            // Validation messages & length limits.
+            {
+                let d = rt.state.settings.new_keybinding.as_mut().unwrap();
+                d.key_draft = "x".repeat(crate::keybindings::MAX_KEYBINDING_VALUE_LENGTH + 1);
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            let msg = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("new-keybinding-validation"))
+                .unwrap();
+            assert_eq!(
+                msg.text.as_deref(),
+                Some("Keybinding must be 64 characters or fewer.")
+            );
+
+            {
+                let d = rt.state.settings.new_keybinding.as_mut().unwrap();
+                d.key_draft = "mod+k".into();
+                d.when_draft = "terminalFocus &&".into();
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            let msg = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("new-keybinding-validation"))
+                .unwrap();
+            assert_eq!(
+                msg.text.as_deref(),
+                Some("Use variables with !, &&, ||, and parentheses.")
+            );
+
+            // Clear invalid when, test Escape during chord capture leaves Settings open.
+            {
+                let d = rt.state.settings.new_keybinding.as_mut().unwrap();
+                d.when_draft.clear();
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            crate::ui::tests::press(&mut rt, "new-keybinding-key");
+            assert!(rt.state.settings.new_keybinding.as_ref().unwrap().recording);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.state.settings_menu);
+            assert!(!rt.state.settings.new_keybinding.as_ref().unwrap().recording);
+            assert!(
+                rt.state
+                    .settings
+                    .new_keybinding
+                    .as_ref()
+                    .unwrap()
+                    .key_draft
+                    .is_empty()
+            );
+
+            // Capture Mod+K -> shows conflict warning, Save writes custom rule & closes row.
+            crate::ui::tests::press(&mut rt, "new-keybinding-key");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('k'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.settings.new_keybinding.as_ref().unwrap().key_draft,
+                "mod+k"
+            );
+            assert!(rt.presented("new-keybinding-conflict").is_some());
+
+            crate::ui::tests::press(&mut rt, "new-keybinding-save");
+            assert!(rt.state.settings.new_keybinding.is_none());
+            assert!(
+                rt.state
+                    .preferences
+                    .keybindings
+                    .iter()
+                    .any(|r| r.command == chosen_cmd && r.key == "mod+k")
+            );
+        }
+
+        // Enforces MAX_KEYBINDINGS_COUNT (256) limit when adding rules.
+        let mut custom = Vec::new();
+        for i in 0..=crate::keybindings::MAX_KEYBINDINGS_COUNT {
+            crate::keybindings::upsert_custom_rule(
+                &mut custom,
+                &format!("script.s-{i}.run"),
+                "mod+alt+f1",
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(custom.len(), crate::keybindings::MAX_KEYBINDINGS_COUNT);
     }
 }

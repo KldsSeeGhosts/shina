@@ -1678,6 +1678,73 @@ pub fn conflict_warning_description(labels: &[String]) -> Option<String> {
     }
 }
 
+pub fn build_keybinding_command_options(keybindings: &[ResolvedKeybindingRule]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut commands = Vec::new();
+    for &cmd in STATIC_COMMANDS {
+        if seen.insert(cmd.to_owned()) {
+            commands.push(cmd.to_owned());
+        }
+    }
+    for binding in keybindings {
+        if seen.insert(binding.command.clone()) {
+            commands.push(binding.command.clone());
+        }
+    }
+    commands.sort_by(|left, right| {
+        let left_rank = usage_command_rank(left);
+        let right_rank = usage_command_rank(right);
+        match (left_rank, right_rank) {
+            (Some(l), Some(r)) => l.cmp(&r),
+            _ => {
+                let lk = if left_rank.is_some() {
+                    command_label("usage.cost")
+                } else {
+                    command_label(left)
+                };
+                let rk = if right_rank.is_some() {
+                    command_label("usage.cost")
+                } else {
+                    command_label(right)
+                };
+                lk.cmp(&rk)
+            }
+        }
+    });
+    commands
+}
+
+pub fn validate_keybinding_draft(command: &str, key: &str, when: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("Select a command.".into());
+    }
+    if !is_valid_command(command) {
+        return Err("Unknown keybinding command.".into());
+    }
+    let trimmed_key = key.trim();
+    if trimmed_key.is_empty() {
+        return Err("Press shortcut".into());
+    }
+    if trimmed_key.len() > MAX_KEYBINDING_VALUE_LENGTH {
+        return Err(format!(
+            "Keybinding must be {MAX_KEYBINDING_VALUE_LENGTH} characters or fewer."
+        ));
+    }
+    if parse_keybinding_shortcut(trimmed_key).is_none() {
+        return Err("Invalid keybinding.".into());
+    }
+    let trimmed_when = when.trim();
+    if trimmed_when.len() > MAX_KEYBINDING_WHEN_LENGTH {
+        return Err(format!(
+            "When expression must be {MAX_KEYBINDING_WHEN_LENGTH} characters or fewer."
+        ));
+    }
+    if !trimmed_when.is_empty() && parse_keybinding_when_expression(trimmed_when).is_none() {
+        return Err("Use variables with !, &&, ||, and parentheses.".into());
+    }
+    Ok(())
+}
+
 pub fn upsert_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1685,16 +1752,15 @@ pub fn upsert_custom_rule(
     when: Option<&str>,
     replace: Option<(&str, &str, Option<&str>)>,
 ) -> Result<(), String> {
-    if !is_valid_command(command) {
-        return Err("Unknown keybinding command.".into());
-    }
+    validate_keybinding_draft(command, key, when.unwrap_or(""))?;
     let parsed = parse_keybinding_shortcut(key).ok_or("Invalid keybinding.")?;
     let normalized_key = shortcut_to_keybinding_input(&parsed);
     let normalized_when = when
         .map(str::trim)
         .filter(|w| !w.is_empty())
         .map(|w| {
-            let ast = parse_keybinding_when_expression(w).ok_or("Invalid when expression.")?;
+            let ast = parse_keybinding_when_expression(w)
+                .ok_or("Use variables with !, &&, ||, and parentheses.")?;
             Ok::<_, String>(when_ast_to_expression(Some(&ast)))
         })
         .transpose()?;

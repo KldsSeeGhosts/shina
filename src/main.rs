@@ -123,7 +123,14 @@ fn key_inner(
     if ui::questionnaire_key(state, event) {
         return true;
     }
-    if state.settings_menu && state.settings.shortcut_capture.is_some() {
+    if state.settings_menu
+        && (state.settings.shortcut_capture.is_some()
+            || state
+                .settings
+                .new_keybinding
+                .as_ref()
+                .is_some_and(|d| d.recording))
+    {
         if let Some(tx) = tx {
             return ui::settings_ui::handle_shortcut_capture(state, event, tx);
         }
