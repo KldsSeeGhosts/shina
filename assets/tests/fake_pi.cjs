@@ -41,6 +41,24 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   else if (request.type === "prompt") {
     messages.push({ role: "user", content: [{ type: "text", text: request.message }] }); save();
     running = true; response(request, {}); emit({ type: "agent_start" });
+    if (request.message === "history-stream-fixture") {
+      emit({ type: "message_start", message: { role: "assistant" } });
+      let text = "";
+      let tick = 0;
+      const timer = setInterval(() => {
+        const delta = `stream-${String(tick++).padStart(3, "0")} 😀\n`;
+        text += delta;
+        emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+        if (tick === 250) {
+          clearInterval(timer);
+          const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: Date.now() };
+          messages.push(message); save();
+          emit({ type: "message_end", message });
+          running = false; emit({ type: "agent_end", messages }); emit({ type: "agent_settled" });
+        }
+      }, 40);
+      return;
+    }
     if (request.message === "delegate-fixture") await delegate();
     setTimeout(() => {
       const message = { role: "assistant", content: [{ type: "text", text: "Fixture complete" }], stopReason: "stop", timestamp: Date.now() };

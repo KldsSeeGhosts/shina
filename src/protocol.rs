@@ -3,7 +3,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 6;
+pub const MINOR: u32 = 7;
+pub const HISTORY_ITEMS: &str = "history-items";
+pub const HISTORY_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to use scoped history and live items.";
+pub const HISTORY_LEASE_GONE: &str =
+    "History fragment lease expired or evicted. Reload the scoped snapshot.";
+pub const HISTORY_LEASE_GONE_CODE: i64 = -32010;
+pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
 pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
@@ -245,16 +252,21 @@ pub fn compact(state: &Value) -> Value {
     state
 }
 
-/// Cursor pins both identity and content. A changing transcript asks the reader to restart.
+/// Cursor pins both identity and content.
 /// JSON text is split only on UTF-8 boundaries, including a single oversized message.
 pub fn text_page(text: &str, identity: &str, params: &Value) -> Result<Value, String> {
     let revision = revision(&json!({"identity":identity,"text":text}));
+    text_page_revision(text, &revision, params)
+}
+
+/// The caller owns the immutable text associated with this revision.
+pub fn text_page_revision(text: &str, revision: &str, params: &Value) -> Result<Value, String> {
     let offset = match params["cursor"].as_str() {
         None => 0,
         Some(cursor) => {
             let (saved, offset) = cursor.split_once(':').ok_or("Invalid history cursor.")?;
             if saved != revision {
-                return Err("History changed. Restart paging without a cursor.".into());
+                return Err("Page cursor does not match immutable data.".into());
             }
             offset
                 .parse::<usize>()
@@ -358,7 +370,14 @@ pub enum ReceiptStatus {
 pub fn response(id: Value, result: Result<Value, String>) -> Value {
     match result {
         Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error}}),
+        Err(error) => {
+            let code = match error.as_str() {
+                HISTORY_LEASE_GONE => HISTORY_LEASE_GONE_CODE,
+                HISTORY_UPDATE_REQUIRED => HISTORY_UPDATE_REQUIRED_CODE,
+                _ => -32000,
+            };
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":error}})
+        }
     }
 }
 
@@ -496,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn history_pages_bound_large_unicode_messages_and_reject_stale_or_cross_thread_cursors() {
+    fn immutable_text_pages_bound_unicode_and_reject_wrong_data_or_identity() {
         let text = json!({"messages":[{"text":"😀 image transcript\n".repeat(10000)}]}).to_string();
         let mut cursor = Value::Null;
         let mut assembled = String::new();

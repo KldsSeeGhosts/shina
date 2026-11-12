@@ -1,5 +1,6 @@
 //! KSG DesktopBackendManager lifecycle: attach first, supervise only our own child.
 use crate::{
+    client_history::ProjectionCache,
     protocol::{self, Command},
     server_auth::Discovery,
 };
@@ -319,187 +320,6 @@ fn spawn() -> Result<Child, String> {
 pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-#[derive(Default)]
-struct ProjectionCache {
-    state: Value,
-    seq: Option<u64>,
-    epoch: Value,
-    snapshot_pages: String,
-    histories: std::collections::HashMap<u64, (String, Value, usize)>,
-    history_order: VecDeque<u64>,
-    desired_thread: Option<u64>,
-    inflight: Option<History>,
-    dirty: bool,
-    maintenance: Value,
-}
-
-struct History {
-    thread: u64,
-    revision: String,
-    cursor: Value,
-    text: String,
-    waiting: bool,
-}
-
-impl ProjectionCache {
-    fn receive(&mut self, value: &Value) -> Result<(), String> {
-        let params = &value["params"];
-        match value["method"].as_str() {
-            Some("subscription.snapshotPage") => {
-                self.snapshot_pages
-                    .push_str(params["data"].as_str().ok_or("Invalid snapshot page.")?);
-                if self.snapshot_pages.len() > protocol::MAX_SNAPSHOT_BYTES {
-                    return Err("Workspace metadata exceeded the client memory budget.".into());
-                }
-                if params["nextCursor"].is_null() {
-                    let snapshot: Value =
-                        serde_json::from_str(&std::mem::take(&mut self.snapshot_pages))
-                            .map_err(|e| e.to_string())?;
-                    self.receive(&protocol::notification("subscription.snapshot", snapshot))?;
-                }
-            }
-            Some("subscription.snapshot") => {
-                self.state = params["state"].clone();
-                self.seq = params["seq"].as_u64();
-                self.epoch = params["epoch"].clone();
-                self.dirty = true;
-                self.maintenance = params["maintenance"].clone();
-            }
-            Some("subscription.ready") if params.get("maintenance").is_some() => {
-                // Replay may contain no patches. Clear a stale drain after reconnect.
-                self.maintenance = params["maintenance"].clone();
-            }
-            Some("subscription.patch") => {
-                let seq = params["seq"].as_u64().ok_or("Invalid patch sequence.")?;
-                if self.seq.is_some_and(|previous| seq <= previous) {
-                    return Ok(());
-                }
-                if self.seq.and_then(|seq| seq.checked_add(1)) != Some(seq)
-                    || self.epoch != params["epoch"]
-                {
-                    return Err("Projection replay gap. Reconnecting for a snapshot.".into());
-                }
-                protocol::apply(&mut self.state, params["patch"].clone())?;
-                self.seq = Some(seq);
-                self.dirty = true;
-            }
-            _ if value["id"] == "history" => {
-                let Some(mut history) = self.inflight.take() else {
-                    return Ok(());
-                };
-                if self.desired_thread.is_some_and(|id| id != history.thread) {
-                    return Ok(());
-                }
-                if !value["error"].is_null() {
-                    return Ok(());
-                }
-                let page = &value["result"];
-                if history.text.is_empty()
-                    && let Some(revision) = page["historyRevision"].as_str()
-                {
-                    history.revision = revision.to_owned();
-                }
-                history
-                    .text
-                    .push_str(page["data"].as_str().ok_or("Invalid transcript page.")?);
-                if history.text.len() > protocol::MAX_SNAPSHOT_BYTES {
-                    return Err("Thread history exceeded the client memory budget.".into());
-                }
-                history.cursor = page["nextCursor"].clone();
-                if history.cursor.is_null() {
-                    let view = serde_json::from_str(&history.text).map_err(|e| e.to_string())?;
-                    self.histories
-                        .insert(history.thread, (history.revision, view, history.text.len()));
-                    self.history_order.retain(|id| *id != history.thread);
-                    self.history_order.push_back(history.thread);
-                    while self
-                        .histories
-                        .values()
-                        .map(|(_, _, bytes)| *bytes)
-                        .sum::<usize>()
-                        > protocol::MAX_SNAPSHOT_BYTES
-                    {
-                        let Some(oldest) = self.history_order.pop_front() else {
-                            break;
-                        };
-                        self.histories.remove(&oldest);
-                    }
-                    self.dirty = true;
-                } else {
-                    history.waiting = false;
-                    self.inflight = Some(history);
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn next_history(&mut self) -> Option<Value> {
-        if self.inflight.is_none() {
-            for thread in self.state["threads"].as_array()? {
-                let id = thread["id"].as_u64()?;
-                let desired = self
-                    .desired_thread
-                    .or_else(|| self.state["index"]["active"].as_u64());
-                if desired.is_some_and(|desired| desired != id) {
-                    continue;
-                }
-                let revision = thread["historyRevision"].as_str()?;
-                if self
-                    .histories
-                    .get(&id)
-                    .is_none_or(|(old, _, _)| old != revision)
-                {
-                    self.inflight = Some(History {
-                        thread: id,
-                        revision: revision.into(),
-                        cursor: Value::Null,
-                        text: String::new(),
-                        waiting: false,
-                    });
-                    break;
-                }
-            }
-        }
-        let history = self.inflight.as_mut()?;
-        if history.waiting {
-            return None;
-        }
-        history.waiting = true;
-        Some(
-            json!({"jsonrpc":"2.0","id":"history","method":"thread.history",
-            "params":{"threadId":history.thread,"cursor":history.cursor,"byteBudget":protocol::PAGE_BYTES}}),
-        )
-    }
-
-    fn projected(&mut self) -> Option<Value> {
-        if !self.dirty || self.seq.is_none() {
-            return None;
-        }
-        self.dirty = false;
-        if let Some(threads) = self.state["threads"].as_array() {
-            self.histories
-                .retain(|id, _| threads.iter().any(|thread| thread["id"] == *id));
-            self.history_order
-                .retain(|id| self.histories.contains_key(id));
-        }
-        let mut state = self.state.clone();
-        if let Some(threads) = state["threads"].as_array_mut() {
-            for thread in threads {
-                if let Some((_, history, _)) =
-                    thread["id"].as_u64().and_then(|id| self.histories.get(&id))
-                {
-                    for key in protocol::HISTORY_FIELDS {
-                        thread[key] = history[key].clone();
-                    }
-                }
-            }
-        }
-        Some(state)
-    }
-}
-
 async fn connect(
     discovery: &Discovery,
     device: &str,
@@ -715,8 +535,10 @@ async fn supervise(
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
                         wake();
-                        cache.inflight = None;
-                        cache.snapshot_pages.clear();
+                        if let Err(error) = cache.reconnect(&hello) {
+                            report(error);
+                            break;
+                        }
                         if child
                             .as_ref()
                             .is_some_and(|child| child.id() == discovery.pid)
@@ -820,6 +642,9 @@ async fn supervise(
                                 socket = None;
                                 report(error);
                                 continue;
+                            }
+                            for notice in cache.notices.drain(..) {
+                                report(notice);
                             }
                             if let Some(projected) = cache.projected() {
                                 let generation = image_generation.fetch_add(1,Ordering::AcqRel)+1;
@@ -1421,7 +1246,10 @@ mod tests {
             json!({"epoch":"epoch","seq":10,"state":{"threads":[{"id":1,"historyRevision":"a","messages":[]}]}}))).unwrap();
         let request = cache.next_history().unwrap();
         assert_eq!(request["params"]["threadId"], 1);
-        cache.receive(&json!({"id":"history","result":{"data":"{\"messages\":[{\"text\":\"retained\"}]}","nextCursor":null}})).unwrap();
+        cache.receive(&json!({"id":"history","result":{"kind":"snapshot","streamEpoch":"stream",
+            "data":json!({"threadId":1,"snapshotSequence":10,"historyRevision":"a","items":[{
+                "sourceThreadId":1,"sourceItemId":"message-1","field":"messages","ordinal":0,"position":0,"item":{"text":"retained"}
+            }],"fields":{"id":1},"nextCursor":null}).to_string(),"nextFragment":null}})).unwrap();
         assert_eq!(
             cache.projected().unwrap()["threads"][0]["messages"][0]["text"],
             "retained"
@@ -1444,11 +1272,9 @@ mod tests {
 
     #[test]
     fn replay_ready_refreshes_maintenance_even_without_projection_changes() {
-        let mut cache = ProjectionCache {
-            maintenance: json!({"phase":"draining"}),
-            seq: Some(42),
-            ..ProjectionCache::default()
-        };
+        let mut cache = ProjectionCache::default();
+        cache.maintenance = json!({"phase":"draining"});
+        cache.seq = Some(42);
         cache
             .receive(&protocol::notification(
                 "subscription.ready",
@@ -1461,12 +1287,10 @@ mod tests {
 
     #[test]
     fn native_history_fetch_is_lazy_and_follows_the_local_selection() {
-        let mut cache = ProjectionCache {
-            desired_thread: Some(2),
-            state: json!({"index":{"active":1},"threads":[
-                {"id":1,"historyRevision":"a"},{"id":2,"historyRevision":"b"}]}),
-            ..ProjectionCache::default()
-        };
+        let mut cache = ProjectionCache::default();
+        cache.desired_thread = Some(2);
+        cache.state = json!({"index":{"active":1},"threads":[
+            {"id":1,"historyRevision":"a"},{"id":2,"historyRevision":"b"}]});
         assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 2);
         cache.desired_thread = Some(1);
         cache
