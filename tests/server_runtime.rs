@@ -113,6 +113,12 @@ impl Profile {
         if let Some(fault) = fault {
             command.env("SHINA_TEST_CRASH_EFFECT", fault);
         }
+        if self.root.join("measure-storage").exists() {
+            command.env(
+                "SHINA_TEST_STORAGE_METRICS",
+                self.root.join("storage.jsonl"),
+            );
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -243,6 +249,18 @@ impl Client {
         Self::with_token(discovery, auth["token"].as_str().unwrap().to_owned())
     }
     fn with_token(discovery: &Value, token: String) -> Self {
+        let mut client = Self::unsubscribed(discovery, token);
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}),
+            json!("hello"),
+        );
+        assert!(hello["error"].is_null(), "{hello}");
+        client.rpc("workspace.subscribe", json!({}), json!("subscribe"));
+        assert!(!client.snapshot.is_null());
+        client
+    }
+    fn unsubscribed(discovery: &Value, token: String) -> Self {
         let port = discovery["port"].as_u64().unwrap() as u16;
         let mut request = format!("ws://127.0.0.1:{port}/v1/ws")
             .into_client_request()
@@ -256,7 +274,7 @@ impl Client {
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
         }
-        let mut client = Self {
+        Self {
             socket,
             snapshot: Value::Null,
             seq: 0,
@@ -264,16 +282,7 @@ impl Client {
             notifications: Vec::new(),
             token,
             history_cache: None,
-        };
-        let hello = client.rpc(
-            "hello",
-            json!({"protocolMajor":1,"protocolMinor":0,"projectionSchema":1}),
-            json!("hello"),
-        );
-        assert!(hello["error"].is_null(), "{hello}");
-        client.rpc("workspace.subscribe", json!({}), json!("subscribe"));
-        assert!(!client.snapshot.is_null());
-        client
+        }
     }
     fn rpc(&mut self, method: &str, params: Value, id: Value) -> Value {
         self.socket
@@ -310,6 +319,12 @@ impl Client {
                         self.snapshot = value["params"]["state"].clone();
                         self.seq = value["params"]["seq"].as_u64().unwrap();
                         self.epoch = value["params"]["epoch"].clone();
+                    }
+                    if value["method"] == "subscription.ready" {
+                        assert!(
+                            value["params"]["seq"].as_u64().unwrap() >= self.seq,
+                            "synchronization cursor precedes its installed snapshot"
+                        );
                     }
                     if value["method"] == "subscription.patch" {
                         for patch in value["params"]["patch"].as_array().unwrap() {
@@ -1362,15 +1377,18 @@ fn queued_edit_commits_in_place_and_rejects_stale_removed_and_started_items() {
         first.command("queue.update", edit, uuid::Uuid::new_v4())["result"]["status"],
         "rejected"
     );
-    first.command(
+    let queued = first.command(
         "thread.send",
         json!({"threadId":1,"text":"Next queued","attachments":[],"mode":"queue"}),
         uuid::Uuid::new_v4(),
     );
-    first.until(|state| {
+    assert_eq!(queued["result"]["status"], "accepted", "{queued}");
+    // The prior edited item also made this queue length one. Command replies can
+    // arrive before the subscription catches up, so wait for this commit too.
+    first.until_sequence(queued["result"]["seq"].as_u64().unwrap(), |state| {
         state["threads"][0]["queue"]
             .as_array()
-            .is_some_and(|queue| queue.len() == 1)
+            .is_some_and(|queue| queue.len() == 1 && queue[0][1] == "Next queued")
     });
     let thread = &first.snapshot["threads"][0];
     let id = thread["queue"][0][0].clone();
@@ -2429,6 +2447,161 @@ fn streaming_history_walk_finishes_before_settlement() {
 }
 
 #[test]
+fn streaming_storage_scaling() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let client = template.client(uuid::Uuid::new_v4());
+    let base = client.snapshot.clone();
+    drop(client);
+    template.stop();
+    let mut costs = Vec::new();
+    for count in [10, 100, 500] {
+        let mut profile = Profile::new();
+        let mut index = base["index"].clone();
+        let mut records = Vec::new();
+        let mut views = Vec::new();
+        for id in 1..=count {
+            let mut record = index["threads"][0].clone();
+            record["id"] = json!(id);
+            record["session"] = Value::Null;
+            records.push(record);
+            let mut view = base["threads"][0].clone();
+            view["id"] = json!(id);
+            view["status"] = json!("Completed");
+            view["messages"] = json!([{"role":"You","text":"x".repeat(if id == 1 {190_000} else {4096}),"images":[]}]);
+            views.push(view);
+        }
+        index["threads"] = json!(records);
+        index["threadViews"] = json!(views);
+        index["nextId"] = json!(count + 1);
+        fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
+        fs::write(profile.root.join("measure-storage"), "").unwrap();
+        profile.launch(&["serve"]);
+        let mut client = profile.client(uuid::Uuid::new_v4());
+        client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+            json!("measure-hello"),
+        );
+        client.rpc("workspace.subscribe", json!({}), json!("measure-subscribe"));
+        let db = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        let before_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
+            .unwrap()
+            .len();
+        std::thread::sleep(Duration::from_secs(3));
+        let after_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
+            .unwrap()
+            .len();
+        assert_eq!(before_idle, after_idle, "idle workspace wrote to WAL");
+        let receipt = client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"history-stream-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(receipt["result"]["status"], "accepted", "{receipt}");
+        std::thread::sleep(Duration::from_secs(3));
+        let observed = fs::read_to_string(profile.root.join("storage.jsonl")).unwrap();
+        // A writer may be in the middle of its last JSONL record.
+        let complete = observed
+            .rsplit_once('\n')
+            .map(|(complete, _)| complete)
+            .unwrap_or("");
+        let samples: Vec<Value> = complete
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let start = receipt["result"]["seq"].as_u64().unwrap();
+        let samples: Vec<_> = samples
+            .iter()
+            .filter(|s| s["seq"].as_u64().unwrap() > start)
+            .collect();
+        let serialized: u64 = samples
+            .iter()
+            .map(|s| s["serialized"].as_u64().unwrap())
+            .sum();
+        let storage: u64 = samples.iter().map(|s| s["storage"].as_u64().unwrap()).sum();
+        println!(
+            "STORAGE threads={count} updates={} serialized/update={} WAL/update={} sequence_advances={} idle_WAL={}",
+            samples.len(),
+            serialized / samples.len() as u64,
+            storage / samples.len() as u64,
+            samples.len(),
+            after_idle - before_idle
+        );
+        costs.push((
+            serialized / samples.len() as u64,
+            storage / samples.len() as u64,
+        ));
+        drop(db);
+        profile.stop();
+    }
+    assert!(costs[2].0 <= costs[0].0 * 2, "{costs:?}");
+    assert!(costs[2].1 <= costs[0].1 * 2, "{costs:?}");
+}
+
+#[test]
+fn scoped_history_resumes_after_server_restart() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("resume-hello"),
+    );
+    let receipt = client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"first","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |s| {
+        s["threads"][0]["status"] == "Completed"
+    });
+    let initial = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1}),
+        json!("initial-history"),
+    );
+    let page: Value = serde_json::from_str(initial["result"]["data"].as_str().unwrap()).unwrap();
+    let sequence = page["snapshotSequence"].clone();
+    let identity = page["items"][0]["sourceItemId"].clone();
+    let epoch = initial["result"]["streamEpoch"].clone();
+    let receipt = client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"second","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |s| {
+        s["threads"][0]["status"] == "Completed"
+    });
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("resume-hello"),
+    );
+    let resumed = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1,"afterSequence":sequence,"streamEpoch":epoch}),
+        json!("resumed-history"),
+    );
+    assert_eq!(resumed["result"]["kind"], "synchronized", "{resumed}");
+    assert_eq!(resumed["result"]["streamEpoch"], epoch);
+    let current = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1}),
+        json!("current-history"),
+    );
+    let page: Value = serde_json::from_str(current["result"]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(page["items"][0]["sourceItemId"], identity);
+    profile.stop();
+}
+
+#[test]
 fn streaming_history_two_mib_walk_finishes_before_settlement() {
     streaming_history_case(2 * 1024 * 1024, false);
 }
@@ -2436,6 +2609,97 @@ fn streaming_history_two_mib_walk_finishes_before_settlement() {
 #[test]
 fn streaming_history_resumes_after_disconnect() {
     streaming_history_case(200_000, true);
+}
+
+#[test]
+fn reconnect_attaches_the_retained_cache_before_any_workspace_subscription() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut actor = profile.client(uuid::Uuid::new_v4());
+    std::thread::sleep(Duration::from_secs(1));
+    actor.rpc("workspace.subscribe", json!({}), json!("base"));
+    let mut retained = client_history::ProjectionCache::default();
+    retained
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({
+                "state":protocol::compact(&actor.snapshot),"seq":actor.seq,"epoch":actor.epoch
+            }),
+        ))
+        .unwrap();
+    let retained_sequence = retained.seq.unwrap();
+    let missed = actor.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"missed base"}),
+        uuid::Uuid::new_v4(),
+    );
+    actor.until_sequence(missed["result"]["seq"].as_u64().unwrap(), |_| true);
+
+    // Reproduce the old fixture. Its convenience constructor consumes a newer
+    // snapshot without giving it to the retained cache.
+    let mut discarded = Client::with_token(&profile.discovery(), actor.token.clone());
+    let hello = discarded.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    let installed_sequence = discarded.seq;
+    assert!(installed_sequence > retained_sequence);
+    let receipt = actor.command(
+        "thread.rename",
+        json!({"threadId":1,"title":"contiguous server patch"}),
+        uuid::Uuid::new_v4(),
+    );
+    actor.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |_| true);
+    let wire = loop {
+        let value = discarded.read();
+        if value["method"] == "subscription.patch" {
+            break value;
+        }
+    };
+    assert_eq!(
+        wire["params"]["seq"],
+        installed_sequence + 1,
+        "the server must send the next sequence for the snapshot actually consumed"
+    );
+    assert!(
+        retained
+            .receive(&wire)
+            .unwrap_err()
+            .contains("Projection replay gap")
+    );
+    drop(discarded);
+
+    // Native reconnect installs the retained base before its one subscription,
+    // and requests replay from that base rather than discarding another snapshot.
+    let mut resumed = Client::unsubscribed(&profile.discovery(), actor.token.clone());
+    resumed.snapshot = retained.state.clone();
+    resumed.seq = retained_sequence;
+    resumed.epoch = retained.epoch.clone();
+    retained.reconnect(&hello["result"]).unwrap();
+    let cursor = json!({"lastSeq":retained.seq,"epoch":retained.epoch});
+    resumed.history_cache = Some(retained);
+    resumed.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("native-hello"),
+    );
+    resumed.rpc("workspace.subscribe", cursor, json!("native-subscribe"));
+    assert!(
+        resumed.history_cache.as_ref().unwrap().seq.unwrap()
+            >= receipt["result"]["seq"].as_u64().unwrap()
+    );
+    assert_eq!(
+        resumed.history_cache.as_ref().unwrap().state["index"]["threads"][0]["title"],
+        "contiguous server patch"
+    );
+    assert!(
+        !resumed
+            .notifications
+            .iter()
+            .any(|value| value["method"] == "subscription.snapshot")
+    );
+    profile.stop();
 }
 
 fn streaming_history_case(bytes: usize, disconnect: bool) {
@@ -2473,6 +2737,16 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
     client.until(|state| state["threads"][0]["status"] == "Running");
     let mut cache = client_history::ProjectionCache::default();
     cache.reconnect(&hello["result"]).unwrap();
+    // This fixture already subscribed before attaching its scoped-history cache.
+    // Seed that installed workspace so a queued live patch has a valid base.
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({
+                "state":protocol::compact(&client.snapshot),"seq":client.seq,"epoch":client.epoch
+            }),
+        ))
+        .unwrap();
     client.history_cache = Some(cache);
     client.rpc("workspace.subscribe", json!({}), json!("history-subscribe"));
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -2549,7 +2823,10 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             let cache = client.history_cache.take().unwrap();
             let token = client.token.clone();
             drop(client);
-            client = Client::with_token(&profile.discovery(), token);
+            client = Client::unsubscribed(&profile.discovery(), token);
+            client.snapshot = cache.state.clone();
+            client.seq = cache.seq.unwrap();
+            client.epoch = cache.epoch.clone();
             let hello = client.rpc(
                 "hello",
                 json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
@@ -2557,12 +2834,9 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             );
             let mut cache = cache;
             cache.reconnect(&hello["result"]).unwrap();
+            let cursor = json!({"lastSeq":cache.seq,"epoch":cache.epoch});
             client.history_cache = Some(cache);
-            client.rpc(
-                "workspace.subscribe",
-                json!({}),
-                json!("reconnect-subscribe"),
-            );
+            client.rpc("workspace.subscribe", cursor, json!("reconnect-subscribe"));
             reconnected = true;
             continue;
         }

@@ -85,7 +85,13 @@ pub async fn wait_for_peer_thread(
 ) -> Result<Value, String> {
     let read = |snapshot: &Value| -> Result<Value, String> {
         database.authorize(&device, "peer.thread.wait", &args)?;
-        let state = &snapshot["state"];
+        let scoped;
+        let state = if snapshot["state"].is_null() {
+            scoped = database.scoped_state(args["threadId"].as_u64().ok_or("Invalid thread.")?)?;
+            &scoped
+        } else {
+            &snapshot["state"]
+        };
         let record = state["index"]["threads"]
             .as_array()
             .and_then(|rows| rows.iter().find(|t| t["id"] == args["threadId"]))
@@ -594,6 +600,7 @@ mod tests {
         let child = state.threads[1].id;
         state.threads[1].peer_origin = Some(origin);
         state.threads[1].messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "Previous answer".into(),
             images: vec![],
@@ -639,6 +646,7 @@ mod tests {
         let mut state = fixture();
         let text = format!("START{}MIDDLE{}END", "界".repeat(5500), "x".repeat(5500));
         state.threads[0].messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: text.clone(),
             images: vec![],
@@ -671,6 +679,7 @@ mod tests {
         let mut thread = Thread::new(7);
         for _ in 0..12 {
             thread.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "Pi",
                 text: "界".repeat(10_000),
                 images: vec![],
@@ -2972,6 +2981,7 @@ impl State {
                         .is_none_or(|m| m.text != task.result_excerpt)
                 {
                     thread.messages.push(Message {
+                        id: uuid::Uuid::new_v4().to_string(),
                         role: "Pi",
                         text: task.result_excerpt.clone(),
                         images: vec![],

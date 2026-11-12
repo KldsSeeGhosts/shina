@@ -69,6 +69,8 @@ pub struct RuntimeState {
     pub database: Option<crate::database::Database>,
     failure: Option<String>,
     pending_effects: Vec<crate::outbox::Effect>,
+    committed_history: Vec<Value>,
+    document_revision: u64,
     preparing_calls: Vec<PreparingCall>,
 }
 
@@ -129,6 +131,8 @@ impl RuntimeState {
             database: None,
             failure: None,
             pending_effects: Vec::new(),
+            committed_history: Vec::new(),
+            document_revision: 0,
             preparing_calls: Vec::new(),
         }
     }
@@ -213,6 +217,7 @@ impl RuntimeState {
     }
 
     pub fn command(&mut self, device: &str, command: Command) -> Result<Value, String> {
+        self.state.persistence_scope = None;
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -426,15 +431,25 @@ impl RuntimeState {
             return false;
         }
         if let Some(database) = self.database.clone() {
+            let documents_changed = database.document_revision() != self.document_revision;
             if let Err(error) = database.begin() {
                 self.failure = Some(error);
                 return false;
             }
             let capture = crate::outbox::Capture::begin();
-            let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
-                | self.state.collect_recovered_inputs();
+            self.state.persistence_scope = Some(Default::default());
+            let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default());
+            let recovered = self.state.collect_recovered_inputs();
+            if recovered || update_changed {
+                self.state.persistence_scope = None;
+            }
+            let changed = changed | recovered;
             let effects = capture.finish();
-            if !changed && !update_changed && effects.is_empty() && self.pending_effects.is_empty()
+            if !changed
+                && !update_changed
+                && !documents_changed
+                && effects.is_empty()
+                && self.pending_effects.is_empty()
             {
                 match database.finish_if_unchanged() {
                     Ok(true) => return before != self.maintenance.status(),
@@ -475,16 +490,23 @@ impl RuntimeState {
     }
 
     pub fn snapshot(&self) -> Value {
-        let mut maintenance = self.maintenance.status();
-        if self.state.runtime_stop_requested && !self.maintenance.fenced() {
-            maintenance["phase"] = json!("stopping");
-        }
+        let mut value = self.notification();
+        let maintenance = value["maintenance"].clone();
         let mut state = self.last_projection.clone();
         state["updateStatus"] = self
             .updates
             .status(self.state.update_restart_blocker(), &maintenance);
         state["updateNotice"] = json!(self.updates.outcome);
-        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":state,"historyCursor":null,"maintenance":maintenance})
+        value["state"] = state;
+        value
+    }
+    /// Watchers need the committed cursor, not another copy of every transcript.
+    pub fn notification(&self) -> Value {
+        let mut maintenance = self.maintenance.status();
+        if self.state.runtime_stop_requested && !self.maintenance.fenced() {
+            maintenance["phase"] = json!("stopping");
+        }
+        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"historyCursor":null,"maintenance":maintenance})
     }
 
     fn maintenance_command(&mut self, command: &Command) -> Option<Result<Value, String>> {
@@ -572,6 +594,10 @@ impl RuntimeState {
             .or_else(|| self.database.as_ref().and_then(|db| db.failure()))
     }
 
+    pub fn take_committed_history(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.committed_history)
+    }
+
     fn persist(
         &mut self,
         receipt: Option<&Receipt>,
@@ -579,34 +605,93 @@ impl RuntimeState {
     ) -> Result<(), String> {
         let database = self.database.clone().ok_or("No runtime database.")?;
         let result = (|| {
-            self.state.checkpoint_and_flush()?;
-            let mut projection = self.state.projection();
-            projection["updateStatus"] = self.updates.status(
-                self.state.update_restart_blocker(),
-                &self.maintenance.status(),
-            );
-            projection["updateNotice"] = json!(self.updates.outcome);
-            if receipt.is_none()
-                && effects.is_empty()
-                && self.pending_effects.is_empty()
-                && projection == self.last_projection
-                && database.finish_if_unchanged()?
+            let document_revision = database.document_revision();
+            if effects.len() > 0
+                && self
+                    .state
+                    .persistence_scope
+                    .as_ref()
+                    .is_some_and(|s| s.is_empty())
             {
-                return Ok(());
+                self.state.persistence_scope = None;
             }
-            self.seq = self
+            let mut index = self
+                .state
+                .snapshot_scoped(self.state.persistence_scope.as_ref());
+            let next = self
                 .seq
                 .checked_add(1)
                 .filter(|seq| *seq <= i64::MAX as u64)
                 .ok_or("Server sequence exhausted.")?;
-            self.state.advance_server_sequence(self.seq);
-            self.state.checkpoint_and_flush()?;
-            let patch = crate::protocol::diff(
-                &crate::protocol::compact(&self.last_projection),
-                &crate::protocol::compact(&projection),
+            for view in index["threadViews"].as_array_mut().unwrap() {
+                let before = self.last_projection["threads"]
+                    .as_array()
+                    .and_then(|threads| threads.iter().find(|t| t["id"] == view["id"]))
+                    .unwrap_or(&Value::Null);
+                crate::history::stamp(before, view, next);
+            }
+            let mut projection = self.state.projection_from_snapshot(index.clone());
+            if projection["_partial"] == true && document_revision != self.document_revision {
+                projection.as_object_mut().unwrap().extend(
+                    self.state
+                        .document_projection()
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            {
+                projection["updateStatus"] = self.updates.status(
+                    self.state.update_restart_blocker(),
+                    &self.maintenance.status(),
+                );
+                projection["updateNotice"] = json!(self.updates.outcome);
+            }
+            let previous_threads = if projection["_partial"] == true {
+                json!(
+                    projection["threads"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|t| self.last_projection["threads"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|old| old["id"] == t["id"])
+                            .cloned())
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                self.last_projection["threads"].clone()
+            };
+            let previous = json!({"seq":self.seq,"state":{"threads":previous_threads}});
+            let history = crate::history::Streams::changes(
+                &previous,
+                &json!({"seq":next,"state":{"threads":projection["threads"]}}),
             );
+            database.stage_history(history.clone());
+            let patch = update_projection(&mut self.last_projection, &projection);
+            if receipt.is_none()
+                && effects.is_empty()
+                && self.pending_effects.is_empty()
+                && patch.as_array().is_some_and(Vec::is_empty)
+                && database.finish_if_unchanged()?
+            {
+                self.document_revision = document_revision;
+                return Ok(());
+            }
+            self.seq = next;
+            self.state.advance_server_sequence(self.seq);
+            index["serverSeq"] = json!(self.seq);
+            database.write("index.json", index)?;
+            database.write(
+                "server-inputs.json",
+                self.state
+                    .runtime_input_snapshot(self.state.persistence_scope.as_ref()),
+            )?;
             database.commit(self.seq, &projection, &patch, receipt, &effects)?;
-            self.last_projection = projection;
+            self.document_revision = document_revision;
+            self.committed_history.extend(history);
             self.pending_effects.extend(effects);
             if self.maintenance.fenced() || self.validation_hold {
                 return Ok(());
@@ -633,6 +718,8 @@ impl RuntimeState {
     }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
+        self.committed_history.clear();
+        self.state.persistence_scope = None;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -646,6 +733,7 @@ impl RuntimeState {
         self.state.begin_runtime_shutdown();
         if let Some(capture) = capture {
             self.persist(None, capture.finish())?;
+            self.committed_history.clear();
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
         loop {
@@ -659,6 +747,7 @@ impl RuntimeState {
             let running = self.state.drain_runtime_shutdown();
             if let Some(capture) = capture {
                 self.persist(None, capture.finish())?;
+                self.committed_history.clear();
             }
             if !running || std::time::Instant::now() >= deadline {
                 break;
@@ -679,10 +768,70 @@ impl RuntimeState {
             self.state.checkpoint_and_flush()
         };
         if result.is_ok() {
+            self.committed_history.clear();
             self.state.mark_clean_quit();
         }
         result
     }
+}
+
+/// Apply only changed scopes. Paths retain their workspace indices on the wire.
+fn update_projection(current: &mut Value, delta: &Value) -> Value {
+    if delta["_partial"] != true {
+        let patch = crate::protocol::diff(
+            &crate::protocol::compact(current),
+            &crate::protocol::compact(delta),
+        );
+        *current = delta.clone();
+        return patch;
+    }
+    let mut patches = Vec::new();
+    for (key, value) in delta.as_object().unwrap() {
+        if key == "_partial" {
+            continue;
+        }
+        if key == "index" {
+            let nested = update_projection(&mut current["index"], value);
+            for mut patch in nested.as_array().unwrap().clone() {
+                patch["path"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, json!("index"));
+                patches.push(patch);
+            }
+        } else if key == "threads" {
+            for thread in value.as_array().unwrap() {
+                let threads = current["threads"].as_array_mut().unwrap();
+                let index = threads
+                    .iter()
+                    .position(|t| t["id"] == thread["id"])
+                    .expect("dirty existing thread");
+                let compact = |t: &Value| {
+                    crate::protocol::compact(&json!({"threads":[t]}))["threads"][0].clone()
+                };
+                let change = if thread.get("messages").is_some() {
+                    crate::protocol::diff(&compact(&threads[index]), &compact(thread))
+                } else {
+                    crate::protocol::diff(&threads[index], thread)
+                };
+                for mut patch in change.as_array().unwrap().clone() {
+                    let path = patch["path"].as_array_mut().unwrap();
+                    path.insert(0, json!(index.to_string()));
+                    path.insert(0, json!("threads"));
+                    patches.push(patch);
+                }
+                threads[index] = thread.clone();
+            }
+        } else {
+            let change = crate::protocol::diff(&current[key], value);
+            for mut patch in change.as_array().unwrap().clone() {
+                patch["path"].as_array_mut().unwrap().insert(0, json!(key));
+                patches.push(patch);
+            }
+            current[key] = value.clone();
+        }
+    }
+    json!(patches)
 }
 
 pub const TICK: Duration = Duration::from_millis(25);
@@ -690,6 +839,48 @@ pub const TICK: Duration = Duration::from_millis(25);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn document_writes_refresh_global_fields_without_capturing_thread_views() {
+        for staged in [false, true] {
+            let directory = crate::store::directory()
+                .unwrap()
+                .join(uuid::Uuid::new_v4().to_string());
+            let mut runtime = RuntimeState::open(directory, std::sync::Arc::new(|| {})).unwrap();
+            let database = runtime.database.clone().unwrap();
+            let before = runtime.seq;
+            if staged {
+                database.begin().unwrap();
+            }
+            let mut profile = runtime.state.user_profile();
+            profile.name = if staged {
+                "Staged profile"
+            } else {
+                "Background profile"
+            }
+            .into();
+            runtime.state.set_user_profile(profile.clone()).unwrap();
+            if !staged {
+                database.begin().unwrap();
+            }
+            runtime.state.persistence_scope = Some(Default::default());
+            runtime.persist(None, vec![]).unwrap();
+            assert!(runtime.seq > before);
+            assert!(runtime.state.persistence_scope.as_ref().unwrap().is_empty());
+            assert_eq!(runtime.snapshot()["state"]["profile"]["name"], profile.name);
+            assert_eq!(
+                database.projection().unwrap().unwrap()["profile"]["name"],
+                profile.name
+            );
+            let committed = runtime.seq;
+            database.begin().unwrap();
+            runtime.persist(None, vec![]).unwrap();
+            assert_eq!(
+                runtime.seq, committed,
+                "an unchanged document must not keep advancing the sequence"
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
     fn runtime() -> RuntimeState {
         let mut state = State::headless(crate::store::directory().unwrap());
         state.load_global_for_test();

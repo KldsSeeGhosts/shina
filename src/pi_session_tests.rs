@@ -610,6 +610,7 @@ fn a_rewind_reapplies_the_pinned_selection_before_another_prompt_can_run() {
 fn cancelled_rewind_does_not_rebind_or_clear_the_original_conversation() {
     let (mut t, commands) = thread(Status::Ready);
     t.messages.push(Message {
+        id: uuid::Uuid::new_v4().to_string(),
         role: "You",
         text: "Keep".into(),
         images: vec![],
@@ -668,6 +669,7 @@ fn pi_compaction_replay_records_the_middle_of_the_transcript() {
 fn stop_records_a_durable_marker_before_the_provider_acknowledges_it() {
     let (mut t, commands) = thread(Status::Running);
     t.messages.push(Message {
+        id: uuid::Uuid::new_v4().to_string(),
         role: "You",
         text: "Work".into(),
         images: vec![],

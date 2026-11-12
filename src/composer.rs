@@ -802,6 +802,7 @@ mod tests {
     #[test]
     fn history_filters_generated_prompts_and_collapses_consecutive_duplicates() {
         let msg = |role: &'static str, text: &str| crate::model::Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role,
             text: text.to_owned(),
             images: vec![],

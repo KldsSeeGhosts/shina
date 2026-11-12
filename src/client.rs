@@ -20,6 +20,7 @@ use std::{
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 type Worker = Mutex<Option<std::thread::JoinHandle<()>>>;
+type AssetView = Option<(usize, Arc<Value>)>;
 type Registration = (std::sync::Weak<AtomicBool>, std::sync::Weak<Worker>);
 static SUPERVISORS: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
 
@@ -487,10 +488,34 @@ async fn supervise(
     let mut server_stopped = false;
     let mut cache = ProjectionCache::default();
     let image_generation = Arc::new(AtomicUsize::new(0));
-    let mut image_job: Option<tokio::task::JoinHandle<()>> = None;
+    let (asset_changed, asset_updates) = tokio::sync::watch::channel(None);
+    let image_job = remote.as_ref().map(|remote| {
+        let output = output.clone();
+        let error_wake = wake.clone();
+        tokio::spawn(fetch_assets(
+            remote.clone(),
+            directory.clone(),
+            snapshot.clone(),
+            image_generation.clone(),
+            asset_updates,
+            wake.clone(),
+            Arc::new(move |error| {
+                let _ = output.try_send(Event::Error(error));
+                error_wake();
+            }),
+        ))
+    });
+    let view_writer = remote.as_ref().map(|_| {
+        let output = output.clone();
+        let wake = wake.clone();
+        crate::cache_persistence::Writer::new(device_directory.join("view.json"), move |error| {
+            let _ = output.try_send(Event::Error(error));
+            wake();
+        })
+    });
     if remote.is_some() {
         match crate::store::load(&device_directory.join("view.json")) {
-            Ok(Some(saved)) => {
+            Ok(Some(saved)) if saved["schemaVersion"] == 1 => {
                 cache.state = saved["state"].clone();
                 cache.seq = saved["seq"].as_u64();
                 cache.epoch = saved["epoch"].clone();
@@ -503,7 +528,7 @@ async fn supervise(
                     wake();
                 }
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(error) => report(error),
         }
     }
@@ -667,30 +692,18 @@ async fn supervise(
                                 report(notice);
                             }
                             if let Some(projected) = cache.projected() {
-                                let generation = image_generation.fetch_add(1,Ordering::AcqRel)+1;
-                                if remote.is_some() {
-                                    let saved = json!({"state":projected,"seq":cache.seq,"epoch":cache.epoch});
-                                    if let Err(error) = crate::store::write_atomic(&device_directory.join("view.json"), saved.to_string().as_bytes()) {
-                                        report(format!("Could not cache the remote view: {error}"));
-                                    }
+                                if let Some(writer) = &view_writer {
+                                    writer.submit(json!({"schemaVersion":1,"state":projected,"seq":cache.seq,"epoch":cache.epoch}));
                                 }
-                                *snapshot.lock().expect("client snapshot") = Some(projected.clone());
-                                if let Some(remote) = &remote {
-                                    if let Some(job) = image_job.take() { job.abort(); }
-                                    let version = image_generation.clone();
-                                    let remote = remote.clone();
-                                    let profile = directory.clone();
-                                    let snapshot = snapshot.clone();
-                                    let wake = wake.clone();
-                                    image_job = Some(tokio::spawn(async move {
-                                        let mut projected = projected;
-                                        if cache_images(&remote,&profile,&mut projected,true).await.is_ok() {
-                                            let mut snapshot = snapshot.lock().expect("client snapshot");
-                                            if version.load(Ordering::Acquire) != generation { return; }
-                                            *snapshot=Some(projected);
-                                            wake();
-                                        }
-                                    }));
+                                let asset_view=image_job.as_ref().filter(|job|!job.is_finished()).map(|_|Arc::new(projected.clone()));
+                                let generation={
+                                    let mut snapshot=snapshot.lock().expect("client snapshot");
+                                    let generation=image_generation.fetch_add(1,Ordering::AcqRel)+1;
+                                    *snapshot=Some(projected);
+                                    generation
+                                };
+                                if let Some(view)=asset_view {
+                                    asset_changed.send_replace(Some((generation,view)));
                                 }
                             }
                             if value["method"] == "subscription.ready" || value["id"] == "subscribe" {
@@ -733,6 +746,7 @@ async fn supervise(
     if let Some(job) = image_job {
         job.abort();
     }
+    drop(view_writer);
     if !updating && let Some(mut process) = child {
         // Only a process handle we spawned, with an authenticated matching instance, may be stopped.
         if owned_instance.is_some()
@@ -752,6 +766,52 @@ async fn supervise(
             let _ = process.kill();
         }
         let _ = process.wait();
+    }
+}
+
+/// KSG assets.ts keys in-flight work by environment/resource, not projection.
+/// One consumer retains a fetch across projection updates. Completed blob IDs
+/// enter the existing content-addressed cache and hydrate the newest view only.
+async fn fetch_assets(
+    remote: crate::peer::Link,
+    profile: PathBuf,
+    snapshot: Arc<Mutex<Option<Value>>>,
+    generation: Arc<AtomicUsize>,
+    mut updates: tokio::sync::watch::Receiver<AssetView>,
+    wake: rune::Waker,
+    report: Arc<dyn Fn(String) + Send + Sync>,
+) {
+    while updates.changed().await.is_ok() {
+        let view = updates.borrow_and_update().clone();
+        let Some((_, view)) = view else {
+            continue;
+        };
+        let mut projected = (*view).clone();
+        if let Err(error) = cache_images(&remote, &profile, &mut projected, true).await {
+            if error.starts_with("Authentication denied.") {
+                report(error);
+                return;
+            }
+            // Asset failure does not fence state reception or create a tight retry loop.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // The UI consumes pending snapshots with take(). Keep the latest asset
+        // source independently so a completed fetch can still wake an idle UI.
+        let latest = updates.borrow().clone();
+        let Some((version, current)) = latest else {
+            continue;
+        };
+        let mut current = (*current).clone();
+        if cache_images(&remote, &profile, &mut current, false)
+            .await
+            .is_ok()
+        {
+            let mut snapshot = snapshot.lock().expect("client snapshot");
+            if generation.load(Ordering::Acquire) == version {
+                *snapshot = Some(current);
+                wake();
+            }
+        }
     }
 }
 
@@ -805,6 +865,9 @@ async fn cache_images(
     let http = crate::peer::http()?;
     for path in references {
         let reference = &projected.pointer(&path).ok_or("Missing image reference.")?;
+        if cached_image_valid(profile, reference) {
+            continue;
+        }
         let id = reference["id"].as_str().ok_or("Missing image id.")?;
         let length = reference["bytes"]
             .as_u64()
@@ -817,7 +880,7 @@ async fn cache_images(
         let cached = crate::store::load(&mapping)
             .ok()
             .flatten()
-            .and_then(|value| crate::attachments::Attachment::from_value(&value).map(|_| value));
+            .filter(|value| cached_image_valid(profile, value));
         let attachment = if let Some(cached) = cached {
             cached
         } else {
@@ -837,6 +900,9 @@ async fn cache_images(
                     .send()
                     .await
                     .map_err(|_| "Remote image unavailable.")?;
+                if matches!(response.status().as_u16(), 401 | 403) {
+                    return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
+                }
                 if !response.status().is_success()
                     || response
                         .content_length()
@@ -868,6 +934,27 @@ async fn cache_images(
             .ok_or("Missing image reference.")? = attachment;
     }
     Ok(())
+}
+
+fn cached_image_valid(profile: &std::path::Path, value: &Value) -> bool {
+    let Ok(attachment) = serde_json::from_value::<crate::attachments::Attachment>(value.clone())
+    else {
+        return false;
+    };
+    attachment.path.is_none()
+        && crate::attachments::safe_id(&attachment.id)
+        && matches!(
+            attachment.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        )
+        && attachment.width > 0
+        && attachment.height > 0
+        && u64::from(attachment.width) * u64::from(attachment.height)
+            <= crate::attachments::MAX_IMAGE_PIXELS
+        && attachment.bytes > 0
+        && attachment.bytes <= crate::attachments::MAX_IMAGE_BYTES
+        && std::fs::metadata(profile.join("attachments").join(&attachment.id))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == attachment.bytes)
 }
 
 pub(crate) async fn cache_html(
@@ -934,6 +1021,9 @@ pub(crate) async fn cache_html(
                     .send()
                     .await
                     .map_err(|_| "Remote HTML render unavailable.")?;
+                if matches!(response.status().as_u16(), 401 | 403) {
+                    return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
+                }
                 if !response.status().is_success()
                     || response
                         .content_length()
@@ -1257,6 +1347,90 @@ async fn stopped(stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_projections_do_not_cancel_or_repeat_an_inflight_blob() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut entropy=17_u32;
+            let image=image::RgbaImage::from_fn(256,256,|_,_| {
+                let mut pixel=[0;4];
+                for byte in &mut pixel {
+                    entropy ^= entropy << 13;
+                    entropy ^= entropy >> 17;
+                    entropy ^= entropy << 5;
+                    *byte=entropy as u8;
+                }
+                image::Rgba(pixel)
+            });
+            let mut png=std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png,image::ImageFormat::Png).unwrap();
+            let bytes=Arc::new(png.into_inner());
+            assert!(bytes.len()>protocol::PAGE_BYTES);
+            let starts=Arc::new(AtomicUsize::new(0));
+            let requests=Arc::new(AtomicUsize::new(0));
+            let started=Arc::new(tokio::sync::Notify::new());
+            let app=axum::Router::new().fallback(axum::routing::get({
+                let bytes=bytes.clone();
+                let starts=starts.clone();
+                let requests=requests.clone();
+                let started=started.clone();
+                move |axum::extract::Query(query):axum::extract::Query<std::collections::HashMap<String,usize>>| {
+                    let bytes=bytes.clone(); let starts=starts.clone(); let requests=requests.clone(); let started=started.clone();
+                    async move {
+                        requests.fetch_add(1,Ordering::Relaxed);
+                        let offset=query["offset"];
+                        if offset==0 {
+                            starts.fetch_add(1,Ordering::Relaxed);
+                            started.notify_one();
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        bytes[offset..(offset+protocol::PAGE_BYTES).min(bytes.len())].to_vec()
+                    }
+                }
+            }));
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host=listener.local_addr().unwrap();
+            let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+            let profile=crate::store::directory().unwrap().join("stable-blob-test");
+            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into()};
+            let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
+            let snapshot=Arc::new(Mutex::new(Some(view(1))));
+            let generation=Arc::new(AtomicUsize::new(1));
+            let (changed,updates)=tokio::sync::watch::channel(None);
+            let worker=tokio::spawn(fetch_assets(remote,profile,snapshot.clone(),generation.clone(),updates,Arc::new(||{}),Arc::new(|_|{})));
+            changed.send_replace(Some((1,Arc::new(view(1)))));
+            tokio::time::timeout(Duration::from_secs(2),started.notified()).await.unwrap();
+            let mut consumed=Value::Null;
+            for seq in 2..=30 {
+                {
+                    let mut snapshot=snapshot.lock().unwrap();
+                    generation.store(seq,Ordering::Release);
+                    *snapshot=Some(view(seq));
+                }
+                changed.send_replace(Some((seq,Arc::new(view(seq)))));
+                // Match Client::snapshot, which drains the UI's pending value.
+                if let Some(view)=snapshot.lock().unwrap().take() {consumed=view;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let deadline=Instant::now()+Duration::from_secs(5);
+            loop {
+                if consumed["seq"]==30 && consumed["attachment"]["width"]==256
+                    || snapshot.lock().unwrap().as_ref().is_some_and(|s|s["seq"]==30 && s["attachment"]["width"]==256) {break}
+                assert!(Instant::now()<deadline,"asset did not hydrate the newest projection");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(starts.load(Ordering::Relaxed),1,"projection updates restarted the blob");
+            assert_eq!(requests.load(Ordering::Relaxed),bytes.len().div_ceil(protocol::PAGE_BYTES));
+            worker.abort();
+            server.abort();
+        });
+    }
 
     #[test]
     fn restart_backoff_is_half_a_second_through_ten_seconds() {

@@ -257,7 +257,11 @@ pub fn compact(state: &Value) -> Value {
     let mut state = state.clone();
     if let Some(threads) = state["threads"].as_array_mut() {
         for thread in threads {
-            let revision = revision(&history_payload(thread));
+            let revision = thread["historyRevision"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| revision(&history_payload(thread)));
+            thread.as_object_mut().unwrap().remove("_history");
             for key in HISTORY_FIELDS {
                 thread[key] = if key == "stats" { json!({}) } else { json!([]) };
             }

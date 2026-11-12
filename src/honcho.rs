@@ -1448,6 +1448,7 @@ mod tests {
             &json!({"message":"Steer the same turn","streamingBehavior":"steer"}),
         );
         state.current_mut().messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "Final reply".into(),
             images: vec![],
@@ -1598,6 +1599,7 @@ mod tests {
         let (backend, _wakes) = fake.backend();
         let mut state = state_with_backend(backend.clone());
         state.current_mut().messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "An older answer".into(),
             images: vec![],

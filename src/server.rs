@@ -384,8 +384,24 @@ async fn send(socket: &mut WebSocket, value: Value) -> bool {
     )
 }
 
-async fn snapshot(socket: &mut WebSocket, value: &Value, paged: bool) -> bool {
+async fn snapshot(
+    socket: &mut WebSocket,
+    value: &Value,
+    paged: bool,
+    database: &crate::database::Database,
+) -> Option<u64> {
     let mut snapshot = value.clone();
+    if snapshot["state"].is_null() {
+        let database = database.clone();
+        let Ok(Ok(committed)) =
+            tokio::task::spawn_blocking(move || database.committed_snapshot()).await
+        else {
+            return None;
+        };
+        snapshot["state"] = committed["state"].clone();
+        snapshot["seq"] = committed["seq"].clone();
+    }
+    let sequence = snapshot["seq"].as_u64()?;
     snapshot["subscriptionId"] = json!("workspace");
     if paged {
         snapshot["state"] = protocol::compact(&snapshot["state"]);
@@ -403,10 +419,10 @@ async fn snapshot(socket: &mut WebSocket, value: &Value, paged: bool) -> bool {
                 )
                 .await
                 {
-                    return false;
+                    return None;
                 }
                 if cursor.is_null() {
-                    return true;
+                    return Some(sequence);
                 }
             }
         }
@@ -416,6 +432,7 @@ async fn snapshot(socket: &mut WebSocket, value: &Value, paged: bool) -> bool {
         protocol::notification("subscription.snapshot", snapshot),
     )
     .await
+    .then_some(sequence)
 }
 
 async fn synchronize(
@@ -424,7 +441,7 @@ async fn synchronize(
     current: &Value,
     after: Option<u64>,
     paged: bool,
-) -> bool {
+) -> Option<u64> {
     if paged
         && let Some(after) = after
         && let Ok(Some(events)) = shared
@@ -442,12 +459,12 @@ async fn synchronize(
             )
             .await
             {
-                return false;
+                return None;
             }
         }
-        return true;
+        return current["seq"].as_u64();
     }
-    snapshot(socket, current, paged).await
+    snapshot(socket, current, paged, &shared.database).await
 }
 
 // Ported from KSG ws.subscribeOrchestrationV2Thread. Data fragments are wire-only.
@@ -491,7 +508,7 @@ async fn replay_thread(
         let mut cursor = high;
         for event in events {
             cursor = cursor.max(event["sequence"].as_u64().unwrap_or(after));
-            if !thread_stream(socket, event, &shared.discovery.instance_id).await {
+            if !thread_stream(socket, event, &shared.discovery.epoch).await {
                 return None;
             }
         }
@@ -500,7 +517,7 @@ async fn replay_thread(
         thread_stream(
             socket,
             json!({"kind":"snapshot-required","threadId":thread,"sequence":high}),
-            &shared.discovery.instance_id,
+            &shared.discovery.epoch,
         )
         .await
         .then_some(high)
@@ -597,16 +614,16 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         let replay = {
                             let streams = shared.history_streams.lock().expect("history streams");
                             let events = params["afterSequence"].as_u64()
-                                .filter(|_| params["streamEpoch"] == shared.discovery.instance_id)
+                                .filter(|_| params["streamEpoch"] == shared.discovery.epoch)
                                 .and_then(|after| streams.replay(thread, after));
                             (events,streams.high_water(thread).unwrap_or(0))
                         };
                         if let (Some(events),high) = replay {
                             for event in events {
-                                if !thread_stream(&mut socket, event, &shared.discovery.instance_id).await { return; }
+                                if !thread_stream(&mut socket, event, &shared.discovery.epoch).await { return; }
                             }
                             active_thread = Some((thread,high));
-                            Ok(json!({"kind":"synchronized","threadId":thread,"snapshotSequence":high,"streamEpoch":shared.discovery.instance_id}))
+                            Ok(json!({"kind":"synchronized","threadId":thread,"snapshotSequence":high,"streamEpoch":shared.discovery.epoch}))
                         } else {
                             // Register from this exact snapshot sequence before reading later publishes.
                             let page = shared.history_streams.lock().expect("history streams")
@@ -614,7 +631,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             if let Ok(page) = &page { active_thread = Some((thread,page["snapshotSequence"].as_u64().unwrap_or(0))); }
                             history_leases.read(thread, &json!({"byteBudget":params["byteBudget"]}), Instant::now(), || page).map(|mut page| {
                                 page["kind"] = json!("snapshot");
-                                page["streamEpoch"] = json!(shared.discovery.instance_id);
+                                page["streamEpoch"] = json!(shared.discovery.epoch);
                                 page
                             })
                         }
@@ -623,9 +640,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     subscribed = true;
                     let current = snapshots.borrow_and_update().clone();
                     let after = params["lastSeq"].as_u64().filter(|_| params["epoch"] == current["epoch"]);
-                    if !synchronize(&mut socket, &shared, &current, after, paged).await { break; }
-                    cursor = current["seq"].as_u64();
-                    if !send(&mut socket, protocol::notification("subscription.ready", json!({"subscriptionId":"workspace","seq":current["seq"],"maintenance":current["maintenance"]}))).await { break; }
+                    let Some(sequence)=synchronize(&mut socket, &shared, &current, after, paged).await else { break; };
+                    cursor = Some(sequence);
+                    if !send(&mut socket, protocol::notification("subscription.ready", json!({"subscriptionId":"workspace","seq":sequence,"maintenance":current["maintenance"]}))).await { break; }
                     Ok(json!({"subscriptionId":"workspace"}))
                 } else if method == "subscription.cancel" {
                     subscribed = false;
@@ -755,9 +772,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     last_maintenance = current["maintenance"].clone();
                     if notify && !send(&mut socket, protocol::notification(method, last_maintenance.clone())).await { break; }
                 }
-                if subscribed {
-                    if !synchronize(&mut socket, &shared, &current, cursor, paged).await { break; }
-                    cursor = current["seq"].as_u64();
+                if subscribed && current["seq"].as_u64()>cursor {
+                    let Some(sequence)=synchronize(&mut socket, &shared, &current, cursor, paged).await else { break; };
+                    cursor = Some(sequence);
                 }
                 if let Some((thread, after)) = active_thread {
                     let Some(next) = replay_thread(&mut socket, &shared, thread, after).await else { break };
@@ -865,9 +882,14 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         .map_err(|e| e.to_string())?;
     let (calls, mut incoming) = mpsc::channel::<Call>(32);
     let (snapshots, receive) = watch::channel(Arc::new(runtime.snapshot()));
+    runtime.take_committed_history();
     let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
         &snapshots.borrow(),
     )));
+    history_streams
+        .lock()
+        .expect("history streams")
+        .restore(runtime.database.as_ref().unwrap().history_events()?);
     let (stop, mut stopping) = watch::channel(false);
     let stop_state = stopping.clone();
     let network = tokio::runtime::Builder::new_multi_thread()
@@ -979,11 +1001,11 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
             return Err(error);
         }
         if changed {
-            let snapshot = Arc::new(runtime.snapshot());
+            let snapshot = Arc::new(runtime.notification());
             history_streams
                 .lock()
                 .expect("history streams")
-                .publish(&snapshot);
+                .ingest(runtime.take_committed_history())?;
             snapshots.send_replace(snapshot);
         }
         let _ = wake_receive.recv_timeout(runtime::TICK);
@@ -1093,6 +1115,10 @@ mod tests {
             let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
                 &snapshots.borrow(),
             )));
+            history_streams
+                .lock()
+                .unwrap()
+                .restore(database.history_events().unwrap());
             let worker_streams = history_streams.clone();
             let (disconnect, shutdown) = watch::channel(false);
             let stop = Arc::new(AtomicBool::new(false));
@@ -1107,7 +1133,8 @@ mod tests {
                             worker_streams
                                 .lock()
                                 .expect("history streams")
-                                .publish(&snapshot);
+                                .ingest(runtime.take_committed_history())
+                                .unwrap();
                             snapshots.send_replace(snapshot);
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
@@ -1117,7 +1144,8 @@ mod tests {
                             worker_streams
                                 .lock()
                                 .expect("history streams")
-                                .publish(&snapshot);
+                                .ingest(runtime.take_committed_history())
+                                .unwrap();
                             snapshots.send_replace(snapshot);
                         }
                     }

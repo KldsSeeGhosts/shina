@@ -153,6 +153,7 @@ impl Status {
 }
 
 pub struct Message {
+    pub id: String,
     pub role: &'static str,
     pub text: String,
     /// Images shown with this message. Only the local reference is kept; Pi gets the typed
@@ -1026,6 +1027,7 @@ impl Thread {
             };
         }
         self.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
@@ -1246,6 +1248,7 @@ impl Thread {
         self.life.last_requested_at = Some(at);
         if !self.pending_injections[0].shown {
             self.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "Shina",
                 text,
                 images: Vec::new(),
@@ -1474,6 +1477,7 @@ impl Thread {
         self.ensure_work();
         let index = *self.assistant.get_or_insert_with(|| {
             self.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "Pi",
                 text: String::new(),
                 images: Vec::new(),
@@ -1627,6 +1631,7 @@ impl Thread {
                         .filter_map(Attachment::from_value),
                 );
                 self.messages.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
                     text: string(&record, "text").into(),
                     images,
@@ -1840,7 +1845,7 @@ impl Thread {
                                 .filter(|t| t.order > 0)
                                 .map(|t| (t.anchor, t.block, t.order))
                                 .collect();
-                            self.messages.clear();
+                            let saved_messages = std::mem::take(&mut self.messages);
                             self.tools.clear();
                             self.thoughts.clear();
                             self.work.clear();
@@ -1876,6 +1881,7 @@ impl Thread {
                                             self.ensure_work();
                                         }
                                         self.messages.push(Message {
+                                            id: uuid::Uuid::new_v4().to_string(),
                                             role: if role != "user" {
                                                 "Pi"
                                             } else if text.starts_with(INJECTION_PREFIX) {
@@ -1890,6 +1896,7 @@ impl Thread {
                                 }
                                 if role == "custom" && message["display"] != false {
                                     self.messages.push(Message {
+                                        id: uuid::Uuid::new_v4().to_string(),
                                         role: "Shina",
                                         text: content_text(&message["content"]),
                                         images: content_images(&message["content"]),
@@ -1913,6 +1920,36 @@ impl Thread {
                                     tool.failed = message["isError"] == true;
                                     tool.accept_result(message);
                                     tool.duration_ms = message["durationMs"].as_u64();
+                                }
+                            }
+                            // Provider history replaces arrays during recovery. Preserve
+                            // stored identities before publishing the reconstructed rows.
+                            let mut used = std::collections::HashSet::new();
+                            let mut identities = self
+                                .messages
+                                .iter()
+                                .map(|message| {
+                                    let found =
+                                        saved_messages.iter().enumerate().find(|(i, old)| {
+                                            !used.contains(i)
+                                                && old.role == message.role
+                                                && old.text == message.text
+                                        });
+                                    found.map(|(i, old)| {
+                                        used.insert(i);
+                                        old.id.clone()
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            for (i, message) in self.messages.iter_mut().enumerate() {
+                                if let Some(id) = identities[i].take() {
+                                    message.id = id;
+                                } else if let Some(old) = saved_messages
+                                    .get(i)
+                                    .filter(|old| old.role == message.role && !used.contains(&i))
+                                {
+                                    used.insert(i);
+                                    message.id = old.id.clone();
                                 }
                             }
                             self.anchor_compactions(messages.len());
@@ -1960,6 +1997,7 @@ impl Thread {
                         if let Some((prompt, index)) = &mut self.queued_prompt {
                             *index = self.messages.len();
                             self.messages.push(Message {
+                                id: uuid::Uuid::new_v4().to_string(),
                                 role: "You",
                                 text: prompt.text.clone(),
                                 images: prompt.images.to_vec(),
@@ -2467,6 +2505,8 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
 }
 
 pub struct State {
+    /// None means a command/global change. A poll records only changed threads.
+    pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
     pub peers: Vec<crate::peer::Peer>,
@@ -2671,6 +2711,7 @@ impl State {
             peers: Vec::new(),
             peer_runtime: Default::default(),
             headless: false,
+            persistence_scope: None,
             owner: None,
             command_receipts: Vec::new(),
             command_intents: Default::default(),
@@ -6721,6 +6762,22 @@ impl State {
             }).collect::<serde_json::Map<_,_>>(),
         })
     }
+    pub(crate) fn runtime_input_snapshot(
+        &self,
+        scope: Option<&std::collections::HashSet<usize>>,
+    ) -> Value {
+        let pending = self
+            .threads
+            .iter()
+            .filter(|t| scope.is_none_or(|s| s.contains(&t.id)))
+            .map(|t| (t.id.to_string(), t.pending_inputs_value()))
+            .collect::<serde_json::Map<_, _>>();
+        if scope.is_some() {
+            json!({"_partial":true,"pendingMessages":pending})
+        } else {
+            json!({"version":1,"pendingMessages":pending,"background":{"keep_awake":self.background_settings().keep_awake}})
+        }
+    }
     fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
@@ -6828,6 +6885,11 @@ impl State {
         }
         if self.client.is_some() {
             self.checkpoint_client();
+            return;
+        }
+        // The runtime checkpoints once, after the entire reducer batch and before
+        // dispatch. Reducer helpers must not serialize intermediate workspaces.
+        if self.headless && crate::database::for_path(&self.data_dir.join("index.json")).is_some() {
             return;
         }
         let snapshot = self.snapshot();
@@ -7000,6 +7062,19 @@ impl State {
     }
 
     pub(crate) fn snapshot(&self) -> Value {
+        self.snapshot_scoped(None)
+    }
+    pub(crate) fn snapshot_scoped(
+        &self,
+        scope: Option<&std::collections::HashSet<usize>>,
+    ) -> Value {
+        if let Some(scope) = scope {
+            return json!({"_partial":true,
+                "threads":self.threads.iter().filter(|t|scope.contains(&t.id)).map(Thread::stored_metadata).collect::<Vec<_>>(),
+                "threadViews":self.thread_views_scoped(Some(scope)),
+                "runtimeInputs":self.threads.iter().filter(|t|scope.contains(&t.id)).map(|t|(t.id.to_string(),t.runtime_inputs_value())).collect::<serde_json::Map<_,_>>()
+            });
+        }
         let mut index = json!({
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
@@ -7016,28 +7091,7 @@ impl State {
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
-            }).map(|thread| {
-                // Two literals: one this long exceeds the macro recursion limit.
-                let mut record = json!({
-                "id":thread.id, "title":thread.title, "renamed":thread.renamed, "session":thread.session, "lifecycle":thread.life,
-                "harness":thread.harness, "harnessContextSent":thread.harness_context_sent,
-                "runId":thread.run_id,"resumableRunId":thread.resumable_run_id,"continuationOfRunId":thread.continuation_of_run_id,
-                "memoryContext":thread.memory_context,
-                "scopeContextPending":thread.scope_context_pending,
-                "neverSent":thread.never_sent && thread.life.latest_user_message_at.is_none(),
-                "forkSource":thread.native.fork_source, "forkEntry":thread.native.fork_entry,
-                "previousSession":thread.native.previous_session,"accessMode":thread.native.access.id(),
-                "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
-                "parent":thread.parent,
-                });
-                record.as_object_mut().unwrap().extend(json!({
-                "peerOrigin":thread.peer_origin,"stopSerial":thread.stop_serial,
-                "project":thread.project, "machine":thread.machine, "updated":thread.updated,
-                "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking,
-                "serviceTier":thread.harness_state["serviceTier"]
-                }).as_object().unwrap().clone());
-                record
-            }).collect::<Vec<_>>()
+            }).map(Thread::stored_metadata).collect::<Vec<_>>()
         });
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
@@ -7074,10 +7128,10 @@ impl State {
             elapsed: Some(42),
         });
         thread.messages = vec![
-            Message { role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new() },
-            Message { role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into(), images: Vec::new() },
-            Message { role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into(), images: Vec::new() },
-            Message { role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into(), images: Vec::new() },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new() },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into(), images: Vec::new() },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into(), images: Vec::new() },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into(), images: Vec::new() },
         ];
         thread.tools = vec![
             Tool {
@@ -7241,9 +7295,31 @@ impl State {
     }
 }
 
+impl Thread {
+    fn stored_metadata(&self) -> Value {
+        let mut record = json!({
+            "id":self.id, "title":self.title, "renamed":self.renamed, "session":self.session, "lifecycle":self.life,
+            "harness":self.harness, "harnessContextSent":self.harness_context_sent,
+            "runId":self.run_id,"resumableRunId":self.resumable_run_id,"continuationOfRunId":self.continuation_of_run_id,
+            "memoryContext":self.memory_context, "scopeContextPending":self.scope_context_pending,
+            "neverSent":self.never_sent && self.life.latest_user_message_at.is_none(),
+            "forkSource":self.native.fork_source, "forkEntry":self.native.fork_entry,
+            "previousSession":self.native.previous_session,"accessMode":self.native.access.id(),
+            "captain":self.captain, "captainHome":self.captain_home, "delegated":self.delegated,"parent":self.parent
+        });
+        record.as_object_mut().unwrap().extend(json!({
+            "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
+            "project":self.project,"machine":self.machine,"updated":self.updated,
+            "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
+            "serviceTier":self.harness_state["serviceTier"]
+        }).as_object().unwrap().clone());
+        record
+    }
+}
+
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
-    let composer_changed =
-        state.composer_sources.take_changed() | crate::ui::composer_ui::tick(state, now, tx);
+    let composer_changed = state.composer_sources.take_changed()
+        | (!state.headless && crate::ui::composer_ui::tick(state, now, tx));
     let mut html_changed = false;
     while let Some(outcome) = state.html_windows.next() {
         html_changed = true;
@@ -7256,7 +7332,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
-    let keybindings_changed = state.poll_keybindings();
+    let keybindings_changed = !state.headless && state.poll_keybindings();
     let browsing =
         state.poll_folder_browser() | state.poll_settings() | html_changed | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
@@ -7331,6 +7407,9 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let mut run_ended = false;
     let mut crew_questions = Vec::new();
     let mut event_budget_exhausted = false;
+    if changed {
+        state.persistence_scope = None;
+    }
     let remote_children: std::collections::HashSet<_> = state
         .tasks
         .iter()
@@ -7341,7 +7420,8 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         if remote_children.contains(&thread.id) {
             continue;
         }
-        changed |= thread.poll_memory_command();
+        let effects_before = crate::outbox::captured_count();
+        let mut thread_changed = thread.poll_memory_command();
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
             let event = thread.pi.as_ref().and_then(|pi| pi.events.try_recv().ok());
@@ -7351,7 +7431,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 event_budget_exhausted = true;
                 tx.wake_after(Duration::ZERO);
             }
-            changed = true;
+            thread_changed = true;
             thread.updated = crate::projects::now();
             thread.life.updated_at = lifecycle::now();
             match event {
@@ -7404,8 +7484,8 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
         thread.drive_session();
-        changed |= thread.check_deadlines(Instant::now());
-        changed |= thread.native_tick(Instant::now());
+        thread_changed |= thread.check_deadlines(Instant::now());
+        thread_changed |= thread.native_tick(Instant::now());
         if let Some(deadline) = thread.native_deadline() {
             tx.wake_after(deadline.saturating_duration_since(Instant::now()));
         }
@@ -7418,13 +7498,22 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             thread.fail_session(
                 "Pi did not finish preparing the session. Retry to resume it.".into(),
             );
-            changed = true;
+            thread_changed = true;
         }
-        changed |= thread.reclaim_idle(Instant::now());
+        thread_changed |= thread.reclaim_idle(Instant::now());
         // A quiet RPC stream must not freeze the visible work/thinking clocks.
-        if index == state.active && thread.status.busy() {
+        if !state.headless && index == state.active && thread.status.busy() {
             tx.wake_after(Duration::from_secs(1));
             changed = true;
+        }
+        // A quiet session can become dispatchable without another provider record.
+        // Its intent must join this batch even when a different thread streamed.
+        thread_changed |= crate::outbox::captured_count() != effects_before;
+        if thread_changed {
+            changed = true;
+            if let Some(scope) = &mut state.persistence_scope {
+                scope.insert(thread.id);
+            }
         }
         if thread.pi.is_some() {
             if let Some((_, deadline)) = thread.operation_deadline {
@@ -7448,6 +7537,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     for (parent, question) in crew_questions {
+        state.persistence_scope = None;
         let parent = state.effective_home(parent);
         if let Some(i) = state.threads.iter().position(|t| t.id == parent) {
             state.threads[i].enqueue_injection(question);
@@ -7456,9 +7546,13 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    changed |= state.pause_offline_errors();
-    changed |= state.poll_tasks(Instant::now());
-    changed |= state.poll_background_end(tx);
+    let global_changed = state.pause_offline_errors()
+        | state.poll_tasks(Instant::now())
+        | state.poll_background_end(tx);
+    if global_changed {
+        state.persistence_scope = None;
+        changed = true;
+    }
     if !state.headless
         && let Some(wait) = crate::ui::tick_portraits(state, Instant::now())
     {
@@ -7503,12 +7597,17 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             .snoozed_until
             .is_some_and(|wake| wake > state.last_lifecycle_clock && wake <= at)
         {
-            changed = true;
+            if !state.headless {
+                changed = true;
+            }
         }
         if t.life.snoozed(at) && early_wake[i] {
             // Store the early edge once. Answering the request must not re-snooze it
             // or make the scheduled wake display a second Woke notification.
             t.life.last_snooze_wake_at = Some(at);
+            if let Some(scope) = &mut state.persistence_scope {
+                scope.insert(t.id);
+            }
             changed = true;
         }
         if let Some(wake) = t.life.snoozed_until.filter(|wake| *wake > at) {
@@ -7521,9 +7620,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     state.last_lifecycle_clock = at;
     if run_ended || at.saturating_sub(state.last_sweep) >= 60000 {
-        state.sweep_lifecycle(at);
+        if state.sweep_lifecycle(at) {
+            state.persistence_scope = None;
+            changed = true;
+        }
         // The minute clock also repaints wake countdowns and row ages.
-        changed = true;
+        changed |= !state.headless;
     }
     tx.wake_after(Duration::from_millis(
         60000 - at.saturating_sub(state.last_sweep).min(60000),
@@ -7850,6 +7952,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_quiet_threads_new_effect_joins_another_threads_streaming_checkpoint() {
+        let mut state = State::headless(crate::store::directory().unwrap());
+        state.demo = true;
+        poll(&mut state, 0.0, &mut Tx::default());
+        let (_a_commands, a_events) = fake_pi(&mut state.threads[0], Status::Running);
+        let first = state.threads[0].id;
+        let mut other = Thread::new(2);
+        let (b_commands, _b_events) = fake_pi(&mut other, Status::Ready);
+        other.queued_prompt = Some((Prompt::new("quiet dispatch".into(), vec![]), 0));
+        state.threads.push(other);
+        a_events.send(Event::Record(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"stream"}}))).unwrap();
+        state.persistence_scope = Some(Default::default());
+        let capture = crate::outbox::Capture::begin();
+        assert!(poll(&mut state, 0.0, &mut Tx::default()));
+        let effects = capture.finish();
+        assert!(!effects.is_empty());
+        assert!(
+            b_commands.try_recv().is_err(),
+            "effects must remain captured until commit"
+        );
+        let scope = state
+            .persistence_scope
+            .as_ref()
+            .expect("only changed threads");
+        assert!(scope.contains(&first));
+        assert!(scope.contains(&2));
+        assert!(state.threads[1].pending_prompt.is_some());
+    }
+
+    #[test]
     fn message_text_drops_terminal_escape_sequences() {
         let content = json!(
             "\u{1b}[38;2;144;144;144m✻ Worked for 6s\u{1b}[0m \u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{1b}\\ end"
@@ -8036,6 +8168,7 @@ mod tests {
         state.threads[0].parent = Some(7);
         state.threads[0].delegated = true;
         state.threads[0].messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "A unique worker transcript phrase".into(),
             images: vec![],
@@ -9746,6 +9879,7 @@ mod tests {
             let (commands, _events) = fake_pi(&mut state.threads[0], Status::Ready);
             let (index, _commands, events) = child(&mut state);
             state.threads[index].messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "Pi",
                 text: "界".repeat(6100),
                 images: Vec::new(),
@@ -10848,6 +10982,7 @@ mod tests {
         let mut thread = Thread::new(1);
         for prompt in ["First", "Second"] {
             thread.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "You",
                 text: prompt.into(),
                 images: Vec::new(),
@@ -10877,6 +11012,7 @@ mod tests {
     fn rejected_prompt_returns_to_the_draft_and_does_not_claim_it_was_sent() {
         let mut thread = Thread::new(1);
         thread.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "You",
             text: "Try this".into(),
             images: Vec::new(),
@@ -11436,6 +11572,7 @@ mod tests {
         thread.session = Some("saved.jsonl".into());
         thread.model_provider = "cpa".into();
         thread.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "Previous answer".into(),
             images: Vec::new(),
@@ -12670,6 +12807,7 @@ mod tests {
         let image = test_attachment("screen.png", 1);
         let prompt = Prompt::new("Try this".into(), vec![image.clone()]);
         thread.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),

@@ -53,7 +53,11 @@ impl RunMarker {
 
     pub fn tick(&mut self) -> Result<(), String> {
         self.clean = false;
-        if self.refreshed.elapsed() >= Duration::from_secs(60) {
+        // The durable server has an exclusive SQLite owner lock. Recovery only
+        // needs this marker's existence, not a periodically rewritten timestamp.
+        if self.refreshed.elapsed() >= Duration::from_secs(60)
+            && crate::database::for_path(&self.path.with_file_name("index.json")).is_none()
+        {
             self.write()?;
         }
         Ok(())
@@ -586,7 +590,7 @@ impl Store {
 
     pub fn save(&mut self, value: Value) {
         if let Some((database, name)) = &self.database {
-            let serialized = value.to_string();
+            let serialized = crate::database::encode(&value);
             if serialized == self.last {
                 return;
             }
@@ -999,5 +1003,22 @@ mod tests {
         events.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(store.healthy());
         assert_eq!(load(&file).unwrap().unwrap(), snapshot);
+    }
+}
+#[cfg(test)]
+mod idle_marker_tests {
+    use super::*;
+    #[test]
+    fn durable_owner_does_not_rewrite_an_idle_run_marker() {
+        let directory = directory().unwrap();
+        let _database = crate::database::Database::open(&directory).unwrap();
+        let mut marker = RunMarker::start(&directory).unwrap();
+        marker.refreshed = std::time::Instant::now() - Duration::from_secs(120);
+        marker.clean = true;
+        let before = fs::read(&marker.path).unwrap();
+        marker.tick().unwrap();
+        assert!(!marker.clean);
+        assert_eq!(fs::read(&marker.path).unwrap(), before);
+        assert!(marker.refreshed.elapsed() >= Duration::from_secs(120));
     }
 }

@@ -25,7 +25,7 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// The largest combined image payload in one draft.
 pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 /// Caps one decode at 32 megapixels, below Rune's 64 megapixel clipboard limit.
-const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const NAME_LIMIT: usize = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
