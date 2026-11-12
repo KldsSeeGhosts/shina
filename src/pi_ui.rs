@@ -283,6 +283,14 @@ pub(super) fn composer_pi_key(
         }
         return true;
     }
+    if matches!(
+        event.key,
+        rune::Key::Up | rune::Key::Down | rune::Key::Left | rune::Key::Right
+    ) && (event.mods.cmd || event.mods.ctrl || event.mods.alt)
+        && crate::dispatch_key_no_tx(s, event, tx.physical_key(), tx.key_base(), tx.key_repeat())
+    {
+        return true;
+    }
     let menu_open = composer_menu::trigger(s).is_some();
     let t = s.current_mut();
     let entries = crate::composer::build_history_entries(&t.messages);

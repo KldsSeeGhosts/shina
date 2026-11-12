@@ -91,7 +91,35 @@ fn init() -> State {
     state
 }
 
-fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+pub(crate) fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    key_inner(
+        state,
+        event,
+        tx.physical_key(),
+        tx.key_base(),
+        tx.key_repeat(),
+        Some(tx),
+    )
+}
+
+pub(crate) fn dispatch_key_no_tx(
+    state: &mut State,
+    event: &KeyEvent,
+    physical: Option<rune::PhysicalKeyCode>,
+    key_base: Option<char>,
+    key_repeat: bool,
+) -> bool {
+    key_inner(state, event, physical, key_base, key_repeat, None)
+}
+
+fn key_inner(
+    state: &mut State,
+    event: &KeyEvent,
+    physical: Option<rune::PhysicalKeyCode>,
+    key_base: Option<char>,
+    key_repeat: bool,
+    tx: Option<&mut Tx>,
+) -> bool {
     if ui::questionnaire_key(state, event) {
         return true;
     }
@@ -106,8 +134,8 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         &resolved,
         &ctx,
         crate::keybindings::Platform::current(),
-        tx.physical_key(),
-        tx.key_base(),
+        physical,
+        key_base,
     );
     if command != Some("thread.undo")
         && undo_active
@@ -119,14 +147,32 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     let Some(command) = command else {
         return false;
     };
-    dispatch_global_command(state, command, event, tx)
+    dispatch_global_command(state, command, event, key_repeat, tx)
+}
+
+fn composer_controls_blocked(state: &State) -> bool {
+    let t = state.current();
+    state.demo
+        || state.settings_menu
+        || state.project_picker.is_some()
+        || state.captain_picker
+        || state.captain_editor.is_some()
+        || state.projects.clone_open
+        || state.machines.dialog
+        || state.fleet.open
+        || state.settings.archive.is_some()
+        || state.rename_thread.is_some()
+        || state.delete_thread.is_some()
+        || t.native.conversation.is_some()
+        || t.native.questionnaire.is_some()
 }
 
 fn dispatch_global_command(
     state: &mut State,
     command: &str,
     _event: &KeyEvent,
-    tx: &mut Tx,
+    key_repeat: bool,
+    tx: Option<&mut Tx>,
 ) -> bool {
     match command {
         "thread.settle" => state.settle_thread(state.current().id),
@@ -177,7 +223,10 @@ fn dispatch_global_command(
             state.new_thread_in(None);
             state.current_mut().draft.focused = true;
         }
-        "editor.openFavorite" => projects::pick_folder(state, tx),
+        "editor.openFavorite" => {
+            let Some(tx) = tx else { return false };
+            projects::pick_folder(state, tx);
+        }
         "sidebar.toggle" => {
             if state.viewport_width < 760.0 {
                 state.compact_sidebar = !state.compact_sidebar;
@@ -210,7 +259,7 @@ fn dispatch_global_command(
             }
         }
         "thread.steerQueuedMessage" => {
-            if tx.key_repeat() {
+            if key_repeat {
                 return true;
             }
             if state.current().request.is_some() {
@@ -221,6 +270,160 @@ fn dispatch_global_command(
             };
             state.current_mut().steer_queued(id);
             state.checkpoint();
+        }
+        "modelPicker.toggle" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            let t = state.current();
+            if t.status.busy() || t.configuring || t.archived() {
+                return false;
+            }
+            state.machines.picker = false;
+            state.current_mut().native.access_picker = false;
+            if state.settings_picker == Some(model::SettingsPicker::Model) {
+                state.settings_picker = None;
+            } else {
+                state.model_search.replace_text("");
+                state.settings_picker = Some(model::SettingsPicker::Model);
+                state.thinking_drag = None;
+                state.refresh_catalog();
+            }
+        }
+        "composer.effort" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            let t = state.current();
+            if t.status.busy() || t.configuring || t.archived() {
+                return false;
+            }
+            state.machines.picker = false;
+            state.current_mut().native.access_picker = false;
+            if state.settings_picker == Some(model::SettingsPicker::Thinking) {
+                state.settings_picker = None;
+            } else {
+                state.settings_picker = Some(model::SettingsPicker::Thinking);
+                state.thinking_drag = None;
+                state.refresh_catalog();
+            }
+        }
+        "composer.increaseEffort" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            return ui::step_reasoning_effort(state, 1);
+        }
+        "composer.decreaseEffort" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            return ui::step_reasoning_effort(state, -1);
+        }
+        "composer.host" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state)
+                || state.client.is_none()
+                || !state.can_retarget_draft()
+            {
+                return false;
+            }
+            state.settings_picker = None;
+            state.current_mut().native.access_picker = false;
+            state.machines.picker = !state.machines.picker;
+        }
+        "composer.cycleHost" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state)
+                || state.client.is_none()
+                || !state.can_retarget_draft()
+            {
+                return false;
+            }
+            let options: Vec<String> = std::iter::once("local".to_owned())
+                .chain(
+                    state
+                        .client
+                        .iter()
+                        .flat_map(|client| client.linked.keys().cloned()),
+                )
+                .filter(|server| state.machine_connected(server))
+                .collect();
+            if options.is_empty() {
+                return false;
+            }
+            let index = options
+                .iter()
+                .position(|server| server == &state.machines.selected)
+                .unwrap_or(0);
+            let next = options[(index + 1) % options.len()].clone();
+            state.retarget_draft(&next);
+        }
+        "composer.mode" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            let t = state.current();
+            if t.status.busy() || t.configuring || t.archived() {
+                return false;
+            }
+            let open = !t.native.access_picker;
+            state.settings_picker = None;
+            state.machines.picker = false;
+            state.current_mut().native.access_picker = open;
+        }
+        "modelPicker.previousProvider" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            return ui::cycle_model_picker_harness(state, -1);
+        }
+        "modelPicker.nextProvider" => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            return ui::cycle_model_picker_harness(state, 1);
+        }
+        cmd if cmd.starts_with("modelPicker.jump.") => {
+            if key_repeat {
+                return true;
+            }
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            let Some(index) = cmd
+                .strip_prefix("modelPicker.jump.")
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1))
+            else {
+                return false;
+            };
+            return ui::jump_model_picker_index(state, index);
         }
         _ => return false,
     }
