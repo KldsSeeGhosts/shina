@@ -94,6 +94,8 @@ Stop sends `session/cancel`. An unresponsive stop triggers Shina's existing ten-
 
 Shina loads saved sessions with `session/load`, or `session/resume` when advertised instead. Load replay rebuilds the transcript. A resume implementation that does not replay history can continue the agent's context but cannot restore Shina's visible transcript. Agents without either capability cannot reconnect a saved thread, including after idle process reclamation. They show an error instead of starting a replacement session.
 
+The composer's `$` menu uses Pi's skill commands, Codex `skills/list`, or ACP's advertised `$` commands. Claude ACP agents also discover user, project, additional-directory and enabled plugin skills from their filesystem metadata. Claude skill dispatch follows KSG Code's native slash-command text blocks. Pi's bridge expands selected skills with Pi's frontmatter loader. Discovery does not read credential or account files. Shina reads synced Claude plugin skills only when one marked account bucket is unambiguous.
+
 Model selection supports advertised legacy `models` and model-category select config options. Native compaction, reasoning selection, conversation forks and rewinds are unavailable for ACP. Filesystem and terminal client capabilities are explicitly false. Requests for them receive method-not-found responses and a visible thread error. ACP v2, native ACP MCP transport and SSE-only MCP agents are unsupported.
 
 ## Shina awareness and process ownership

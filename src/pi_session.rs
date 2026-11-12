@@ -146,7 +146,9 @@ pub struct PiSession {
     pub access: AccessMode,
     pub access_picker: bool,
     pub commands: Vec<SlashCommand>,
+    pub skills: Vec<crate::composer_skills::Skill>,
     pub commands_loaded: bool,
+    pub commands_requested: bool,
     pub commands_error: Option<String>,
     pub slash_index: usize,
     pub slash_dismissed: Option<String>,
@@ -240,22 +242,24 @@ impl Tool {
 }
 
 impl Thread {
-    pub fn slash_matches(&self) -> Vec<SlashCommand> {
-        let text = &self.draft.text;
-        if !self.draft.focused
-            || self.native.slash_dismissed.as_ref() == Some(text)
-            || !text.starts_with('/')
-            || text.chars().any(char::is_whitespace)
-        {
-            return vec![];
+    pub fn slash_trigger(&self) -> Option<crate::composer::Trigger> {
+        if !self.draft.focused || self.native.slash_dismissed.as_ref() == Some(&self.draft.text) {
+            return None;
         }
-        let query = text[1..].to_lowercase();
+        crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')
+    }
+
+    pub fn slash_matches(&self) -> Vec<SlashCommand> {
+        let Some(trigger) = self.slash_trigger() else {
+            return vec![];
+        };
+        let query = trigger.query.to_lowercase();
         let mut commands = vec![SlashCommand {
             name: "model".into(),
             description: "Switch response model for this thread".into(),
             source: "Shina".into(),
         }];
-        if crate::harness::supports_compaction(&self.harness) {
+        if trigger.range.start == 0 && crate::harness::supports_compaction(&self.harness) {
             commands.push(SlashCommand {
                 name: "compact".into(),
                 description: if self.harness == "codex" {
@@ -279,6 +283,8 @@ impl Thread {
                 .iter()
                 .filter(|c| {
                     c.name != "model"
+                        && !c.name.starts_with('$')
+                        && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
                             || c.name != "compact")
                 })
@@ -345,7 +351,13 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
+        let prompt = match crate::composer_tokens::prompt(&self.draft, &self.draft_images) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.attachment_error = Some(error);
+                return;
+            }
+        };
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
         if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex" | "claude") {
@@ -363,6 +375,8 @@ impl Thread {
                 delivered: false,
             });
         }
+        self.prompt_history.reset();
+        self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
         self.life.user_sent(lifecycle::now());
@@ -988,9 +1002,11 @@ impl Thread {
                     }
                 }
                 if command == "get_commands" {
+                    self.native.commands_requested = false;
                     if record["success"] == false {
                         self.native.commands_error = Some(string(record, "error").into());
                     } else if let Some(commands) = record["data"]["commands"].as_array() {
+                        self.native.skills = crate::composer_skills::from_commands(commands);
                         let mut seen = std::collections::HashSet::new();
                         self.native.commands = commands
                             .iter()
@@ -1560,12 +1576,26 @@ impl State {
     }
 
     pub fn choose_slash(&mut self, name: String) {
-        if name == "model" {
-            self.current_mut().draft.replace_text("");
-            self.settings_picker = Some(SettingsPicker::Model);
+        let range = self.current().slash_trigger().map(|t| t.range).or_else(|| {
+            (name == "model" && self.current().draft.text.trim() == "/model")
+                .then(|| 0..self.current().draft.text.len())
+        });
+        let Some(range) = range else {
+            return;
+        };
+        let replacement = if name == "model" {
+            String::new()
         } else {
-            self.current_mut().draft.replace_text(format!("/{name} "));
-            self.current_mut().draft.focused = true;
+            format!("/{name} ")
+        };
+        let edit = &mut self.current_mut().draft;
+        edit.undo_group(|edit| {
+            edit.set_selection(range.start, range.end);
+            edit.insert(&replacement);
+        });
+        edit.focused = true;
+        if name == "model" {
+            self.settings_picker = Some(SettingsPicker::Model);
         }
     }
 

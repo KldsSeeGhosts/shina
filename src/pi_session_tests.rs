@@ -696,6 +696,30 @@ fn command_discovery_is_workspace_local_and_retains_a_previous_inventory_on_fail
 }
 
 #[test]
+fn slash_commands_use_the_caret_token_and_keep_provider_commands_at_prompt_start() {
+    let (mut t, _) = thread(Status::Ready);
+    t.apply(json!({"type":"response","command":"get_commands","success":true,
+        "data":{"commands":[{"name":"skill:review","source":"skill"},{"name":"provider-only","source":"ACP"}]}}));
+    t.draft.focused = true;
+    t.draft.replace_text("/");
+    assert!(t.slash_matches().iter().any(|c| c.name == "provider-only"));
+    t.draft.replace_text("please /");
+    let matches = t.slash_matches();
+    assert!(matches.iter().any(|c| c.name == "model"));
+    assert!(matches.iter().any(|c| c.name == "skill:review"));
+    assert!(
+        !matches
+            .iter()
+            .any(|c| c.name == "provider-only" || c.name == "compact")
+    );
+    t.draft.replace_text("please /review ");
+    assert!(t.slash_trigger().is_none());
+    t.draft.replace_text("please /nothing");
+    assert!(t.slash_trigger().is_some());
+    assert!(t.slash_matches().is_empty());
+}
+
+#[test]
 fn overlapping_dialogs_expire_without_losing_the_next_request_or_timing_out_startup() {
     let (mut t, commands) = thread(Status::Ready);
     t.initializing = true;

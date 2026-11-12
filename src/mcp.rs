@@ -813,6 +813,56 @@ mod tests {
     }
 
     #[test]
+    fn pi_skill_chips_expand_through_the_shipped_input_hook() {
+        let source = EXTENSION.replace("\r\n", "\n");
+        let body = source
+            .split_once("pi.on(\"input\", async (event, ctx) => {\n")
+            .unwrap()
+            .1
+            .split_once("\n  });")
+            .unwrap()
+            .0
+            .replace("new Set<string>", "new Set")
+            .replace("const blocks: string[]", "const blocks");
+        let script = format!(
+            r#"
+const assert = require("node:assert/strict");
+const {{ dirname }} = require("node:path");
+const commands = [{{name:"skill:review",source:"skill",sourceInfo:{{path:"/skills/review/SKILL.md"}}}}];
+const pi = {{ getCommands: () => commands }};
+let loads = 0;
+const readFile = async () => {{ loads++; return "---\nname: review\n---\nInstructions"; }};
+const stripFrontmatter = text => text.split("---\n").at(-1);
+const notices = [];
+const ctx = {{ model:{{provider:"cpa"}},ui:{{notify:(...args)=>notices.push(args)}} }};
+const hook = async (event, ctx) => {{
+{body}
+}};
+(async () => {{
+  const result = await hook({{text:"please $review and $review",images:[]}},ctx);
+  assert.equal(loads,1);
+  assert.equal(result.action,"transform");
+  assert.equal(result.text,"please $review and $review\n\n<skill name=\"review\" location=\"/skills/review/SKILL.md\">\nReferences are relative to /skills/review.\n\nInstructions\n</skill>");
+  assert.equal(await hook({{text:"/skill:review $review",images:[]}},ctx),undefined);
+  assert.equal(loads,1);
+  assert.equal(await hook({{text:"$unknown",images:[]}},ctx),undefined);
+  assert.equal(notices.length,0);
+}})().catch(error=>{{console.error(error);process.exitCode=1;}});
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn the_shipped_read_only_hook_policy_blocks_writes_without_approval() {
         // Execute the exact pure policy shipped in the bridge, not a Rust imitation.
         let source = EXTENSION.replace("\r\n", "\n");

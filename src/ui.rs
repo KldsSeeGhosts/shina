@@ -12,6 +12,8 @@ use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 #[path = "captain_ui.rs"]
 mod captain_ui;
+#[path = "composer_menu.rs"]
+mod composer_menu;
 #[path = "crew_ui.rs"]
 mod crew_ui;
 #[path = "markdown_ui.rs"]
@@ -874,6 +876,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(workspace.child(pane));
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
+    if context_popover_shown && composer_menu::trigger(s).is_some() {
+        root = root.child(composer_menu::overlay(s, p, cx, s.viewport_width));
+    }
     if context_popover_shown
         && context_ring_shown(s.current())
         && s.current().context.popover_open()
@@ -7916,7 +7921,6 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     {
         area = area.child(part);
     }
-    area = area.child(pi_ui::slash_menu(s, p));
     area = area.child(pi_ui::queued_messages(s, p));
     // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
@@ -7957,7 +7961,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     // the actions row always sits below the text and the card never grows past the cap. A bare
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
-    let field = text_input(&t.draft, COMPOSER)
+    let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let field = text_input(&t.draft, composer_style)
         .key("composer-input")
         .label("Message Pi")
         .placeholder(
@@ -7971,6 +7976,16 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             p.muted,
         )
         .color(p.ink)
+        .pill_colors(p.selected, Some(p.ink))
+        .pill_icon(composer_menu::pill_icon)
+        .rich_style(rune::RichStyle {
+            code_fg: Some(p.ink),
+            code_bg: p.code_bg,
+            code_block_bg: p.code_bg,
+            link: p.ink,
+            quote_bar: p.muted,
+            marker: Some(p.muted),
+        })
         .caret(p.coral, p.coral_bg)
         .w_full()
         .min_h(COMPOSER_FIELD_MIN)
@@ -7979,7 +7994,40 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             s.current_mut().native.slash_index = 0;
             &mut s.current_mut().draft
         })
-        .on_input_key(|s: &mut State, event, _| pi_ui::composer_pi_key(s, event))
+        .on_input_key(|s: &mut State, event, tx| {
+            if pi_ui::composer_pi_key(s, event) {
+                composer_menu::scroll_selected(s, tx);
+                return true;
+            }
+            if event.is_command('v') && event.mods.shift && !event.mods.alt {
+                let id = s.current().id;
+                let machine = s.machines.selected.clone();
+                tx.read_clipboard(move |s: &mut State, content, _| {
+                    if s.machines.selected != machine {
+                        return;
+                    }
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.draft.insert(content.text());
+                    }
+                    s.checkpoint();
+                });
+                return true;
+            }
+            let t = s.current_mut();
+            if t.paste_history
+                .key(&mut t.draft, &mut t.draft_images, event)
+            {
+                s.checkpoint();
+                return true;
+            }
+            let t = s.current_mut();
+            t.composer_rules.key(&mut t.draft, event)
+        })
+        .on_input_change(|s: &mut State, _| {
+            let t = s.current_mut();
+            t.composer_rules.changed(&mut t.draft);
+            s.ensure_composer_commands();
+        })
         .on_input_paste(|s: &mut State, content, _| {
             let has_image = content.image().is_some();
             if let Some(image) = content.image() {
@@ -7987,6 +8035,9 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             }
             if !content.files().is_empty() {
                 s.attach_paths(content.files());
+            }
+            if !content.text().is_empty() && !has_image && content.files().is_empty() {
+                return s.fold_paste(content.text());
             }
             (has_image || !content.files().is_empty()) && content.text().is_empty()
         })
@@ -10304,6 +10355,170 @@ pub(crate) mod tests {
             rt.frame(0.0);
             assert_eq!(rt.state.current().draft.text, "/skill:review ");
             assert!(rt.find("slash-menu").is_none());
+        }
+    }
+
+    #[test]
+    fn inline_slash_selection_preserves_the_rest_of_the_draft() {
+        let mut rt = runtime(960.0);
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        let t = rt.state.current_mut();
+        t.apply(
+            json!({"type":"response","command":"get_commands","success":true,
+            "data":{"commands":[{"name":"skill:review","source":"skill"}]}}),
+        );
+        t.draft.replace_text("please /skill:re after");
+        t.draft.set_caret(16);
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "please /skill:review  after");
+        rt.state
+            .current_mut()
+            .draft
+            .replace_text("please /does-not-exist");
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.find("slash-menu").is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        assert!(rt.find("slash-menu").is_none());
+    }
+
+    #[test]
+    fn caret_menu_stays_in_the_window_and_thread_pills_survive_undo() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let mut other = Thread::new(42);
+            other.title = "Mention target".into();
+            rt.state.threads.push(other);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("@Mention".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("mention-menu").unwrap();
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                menu[1] >= 8.0 && menu[1] + menu[3] <= 720.0 - 7.0,
+                "{width}: {menu:?}"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
+            assert!(
+                crate::composer_rich::markdown(&rt.state.current().draft)
+                    .contains("read_thread({\"thread_id\":42})")
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('z'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.text, "@Mention");
+            assert_eq!(rt.state.current().draft.pills().count(), 0);
+        }
+    }
+
+    #[test]
+    fn skill_menu_uses_the_same_rows_and_inserts_a_native_skill_pill_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().apply(json!({"type":"response","command":"get_commands","success":true,
+                "data":{"commands":[{"name":"skill:review","description":"Review changes","source":"skill"}]}}));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("please $rev".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("skill-menu").unwrap();
+            let (item, _) = rt.presented("skill-item-0").unwrap();
+            assert_eq!(item[3], 32.0);
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "please $review "
+            );
+            assert!(rt.find("skill-menu").is_none());
+        }
+    }
+
+    fn edge_caret_menu(s: &State, cx: &mut Cx<State>) -> El {
+        let p = palette(s.dark);
+        let width = s.viewport_width;
+        col()
+            .key("workspace-root")
+            .w_full()
+            .h_full()
+            .child(
+                text_input(&s.current().draft, COMPOSER)
+                    .key("composer-input")
+                    .absolute(width - 90.0, 8.0)
+                    .w(80.0)
+                    .on_edit(|s: &mut State| &mut s.current_mut().draft),
+            )
+            .child(composer_menu::overlay(s, p, cx, width))
+    }
+
+    #[test]
+    fn caret_menu_flips_below_a_top_right_caret_at_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut state = State::new(".".into(), false);
+            state.viewport_width = width;
+            state.current_mut().draft.replace_text("/");
+            state.current_mut().draft.focused = true;
+            let mut rt = Runtime::with_text(
+                state,
+                edge_caret_menu,
+                (width, 840.0),
+                Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            rt.frame(0.25);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("slash-menu").unwrap();
+            let (field, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                menu[1] >= field[1] + field[3],
+                "{width}: {menu:?}, field {field:?}"
+            );
+            assert!(menu[1] + menu[3] <= 833.0);
         }
     }
 
@@ -13971,6 +14186,35 @@ pub(crate) mod tests {
         assert!(rt.find("send-message").is_some());
         let id = rt.state.current().draft_images[0].id.clone();
         assert!(rt.find(&format!("attachment-{id}")).is_some());
+    }
+
+    #[test]
+    fn long_text_paste_uses_an_attachment_chip_and_undo_preserves_the_draft() {
+        let mut rt = runtime(960.0);
+        rt.frame(0.0);
+        rt.state.current_mut().draft.replace_text("unsent");
+        press(&mut rt, "composer-input");
+        let text = "猫".repeat(crate::composer_paste::THRESHOLD / 3 + 1);
+        rt.paste(text.clone());
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "unsent");
+        let attachment = &rt.state.current().draft_images[0];
+        assert_eq!(attachment.name, "pasted-text.txt");
+        assert_eq!(
+            std::fs::read_to_string(attachment.path.as_ref().unwrap()).unwrap(),
+            text
+        );
+        assert!(rt.find(&format!("attachment-{}", attachment.id)).is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('z'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.current().draft_images.is_empty());
+        assert_eq!(rt.state.current().draft.text, "unsent");
     }
 
     #[test]

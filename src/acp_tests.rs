@@ -38,6 +38,47 @@ fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
 }
 
 #[test]
+fn dollar_commands_are_skills_and_claude_dispatch_ends_with_the_native_invocation() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client.awareness_sent = true;
+    client.update(&json!({"sessionUpdate":"available_commands_update",
+        "availableCommands":[{"name":"$review","description":"Review changes"}]}));
+    assert_eq!(
+        crate::composer_skills::from_commands(&client.available_commands())[0].name,
+        "review"
+    );
+    client.claude_skills = vec![crate::composer_skills::Skill {
+        name: "review".into(),
+        description: String::new(),
+        path: Some("/skills/review/SKILL.md".into()),
+        user_only: false,
+    }];
+    let path = crate::store::directory().unwrap().join("notes.txt");
+    std::fs::write(&path, "notes").unwrap();
+    let attachment = crate::attachments::reference_file(&path).unwrap();
+    client
+        .prompt(json!({"type":"prompt","message":"please $review these",
+        "attachments":[attachment.to_value()]}))
+        .unwrap();
+    let request = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "session/prompt")
+        .unwrap();
+    let blocks = request["params"]["prompt"].as_array().unwrap();
+    assert_eq!(blocks[0]["text"], "please /review these");
+    assert!(
+        blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Attached file")
+    );
+    assert_eq!(blocks.last().unwrap()["text"], "/review these");
+}
+
+#[test]
 fn file_prompts_use_negotiated_resources_or_path_text() {
     let directory = crate::store::directory().unwrap();
     let path = directory.join("resource.txt");

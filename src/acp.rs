@@ -28,6 +28,13 @@ pub fn start(agent: Agent, start: Start, wake: Waker) -> Result<Pi, String> {
         return Err("ACP requires Shina's MCP bridge. Retry after the bridge is available.".into());
     }
     let command = agent.process()?;
+    let claude = crate::composer_skills::is_claude(&agent);
+    let skill_args = agent.args.clone();
+    let inherit_config = agent.env.iter().any(|name| name == "CLAUDE_CONFIG_DIR");
+    let inherit_plugins = agent
+        .env
+        .iter()
+        .any(|name| name == "CLAUDE_CODE_PLUGIN_CACHE_DIR");
     let session_key = match &start.source {
         SessionSource::Resume(id) => Some(PathBuf::from(format!("acp:{}:{id}", agent.id))),
         _ => None,
@@ -40,7 +47,33 @@ pub fn start(agent: Agent, start: Start, wake: Waker) -> Result<Pi, String> {
         owner,
         session_key,
         move |input, events, wake, stopped, owner| {
-            let action = || run(command, start, input, events, wake, stopped, owner);
+            let action = || {
+                let skills = if claude {
+                    crate::composer_skills::claude_config(inherit_config)
+                        .map(|config| {
+                            let config =
+                                crate::composer_skills::directory_path(config, &start.workspace);
+                            let plugins = inherit_plugins
+                                .then(|| std::env::var_os("CLAUDE_CODE_PLUGIN_CACHE_DIR"))
+                                .flatten()
+                                .map(PathBuf::from)
+                                .map(|path| {
+                                    crate::composer_skills::directory_path(path, &start.workspace)
+                                })
+                                .unwrap_or_else(|| config.join("plugins"));
+                            crate::composer_skills::claude_skills(
+                                &config,
+                                &start.workspace,
+                                &skill_args,
+                                &plugins,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                run(command, start, input, events, wake, stopped, owner, skills)
+            };
             #[cfg(test)]
             {
                 crate::store::with_directory(profile, action)
@@ -78,6 +111,7 @@ struct Client {
     awareness_sent: bool,
     history: Vec<Value>,
     commands: Vec<Value>,
+    claude_skills: Vec<crate::composer_skills::Skill>,
     models: Vec<Value>,
     model: Value,
     model_option: Option<String>,
@@ -104,6 +138,7 @@ impl Client {
             awareness_sent,
             history: vec![],
             commands: vec![],
+            claude_skills: vec![],
             models: vec![],
             model: Value::Null,
             model_option: None,
@@ -113,6 +148,16 @@ impl Client {
             wire: vec![],
             events: vec![],
         }
+    }
+
+    fn available_commands(&self) -> Vec<Value> {
+        let mut commands = self.commands.clone();
+        for command in crate::composer_skills::command_values(&self.claude_skills) {
+            if !commands.iter().any(|c| c["name"] == command["name"]) {
+                commands.push(command);
+            }
+        }
+        commands
     }
 
     fn request(&mut self, method: &str, params: Value, request: Value) {
@@ -321,7 +366,7 @@ impl Client {
                 );
                 self.reply(
                     &json!({"id":"commands","type":"get_commands"}),
-                    json!({"commands":self.commands}),
+                    json!({"commands":self.available_commands()}),
                 );
                 if let Some(modes) = result.get("modes") {
                     self.events
@@ -435,7 +480,7 @@ impl Client {
             }
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":[]})),
-            "get_commands" => self.reply(&record, json!({"commands":self.commands})),
+            "get_commands" => self.reply(&record, json!({"commands":self.available_commands()})),
             "get_session_stats" => self.reply(&record, json!({"contextUsage":null})),
             "set_session_name" => {
                 // Shina owns the title. ACP v1 has no standard rename method.
@@ -496,8 +541,17 @@ impl Client {
                 crate::mcp::INSTRUCTIONS, self.start.instructions.as_deref().unwrap_or("")
             )}));
         }
+        let dispatch = crate::composer_skills::claude_dispatch(text, &self.claude_skills);
+        let mut command_text = None;
         if !text.is_empty() {
-            content.push(json!({"type":"text","text":text}));
+            if dispatch.len() > 1 || dispatch[0] != text {
+                if dispatch.len() > 1 {
+                    content.push(json!({"type":"text","text":dispatch[0]}));
+                }
+                command_text = dispatch.last().cloned();
+            } else {
+                content.push(json!({"type":"text","text":dispatch[0]}));
+            }
         }
         let files: Vec<_> = record["attachments"]
             .as_array()
@@ -512,6 +566,9 @@ impl Client {
             crate::attachments::acp_parts(&files, &self.capabilities["promptCapabilities"])?;
         content.extend(parts.clone());
         content.extend(images.clone());
+        if let Some(command) = command_text {
+            content.push(json!({"type":"text","text":command}));
+        }
         self.awareness_sent = true;
         self.events
             .push(json!({"type":"harness_update","field":"awareness","value":true}));
@@ -792,7 +849,7 @@ impl Client {
                 if emit {
                     self.reply(
                         &json!({"type":"get_commands","id":"commands"}),
-                        json!({"commands":self.commands}),
+                        json!({"commands":self.available_commands()}),
                     );
                 }
             }
@@ -912,6 +969,7 @@ fn run(
     wake: &Waker,
     stopped: &AtomicBool,
     owner: &SessionOwner,
+    claude_skills: Vec<crate::composer_skills::Skill>,
 ) -> Result<(), String> {
     command
         .current_dir(&start.workspace)
@@ -982,6 +1040,7 @@ fn run(
         let _ = write_result.send(result);
     });
     let mut client = Client::new(start);
+    client.claude_skills = claude_skills;
     client.initialize();
     let result = (|| {
         let mut started = Instant::now();
