@@ -332,7 +332,10 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
+        let prompt = Prompt::new(
+            crate::composer_rich::markdown(&self.draft),
+            self.draft_images.clone(),
+        );
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
         if self.native.follow_up || !matches!(self.harness.as_str(), "pi" | "codex") {

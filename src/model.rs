@@ -314,6 +314,7 @@ pub struct Thread {
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
     pub paste_history: crate::composer_paste::PasteHistory,
+    pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
     pub pi: Option<Pi>,
@@ -525,9 +526,10 @@ impl Thread {
             tools: vec![],
             thoughts: vec![],
             work: vec![],
-            draft: TextEdit::default(),
+            draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             paste_history: crate::composer_paste::PasteHistory::default(),
+            composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
             attachment_error: None,
             pi: None,
@@ -866,7 +868,10 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
+        let prompt = Prompt::new(
+            crate::composer_rich::markdown(&self.draft),
+            self.draft_images.clone(),
+        );
         self.prompt_history.reset();
         self.draft.replace_text("");
         self.draft_images.clear();
@@ -4685,7 +4690,7 @@ impl State {
             }
             // Do not clear until its receipt arrives and this exact editor content still matches.
             let revision = uuid::Uuid::new_v4();
-            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":self.current().draft.text,
+            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":crate::composer_rich::markdown(&self.current().draft),
                 "attachments":self.current().draft_images,"editorRevision":revision,"mode":if self.current().native.follow_up { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
@@ -4716,7 +4721,9 @@ impl State {
         {
             return;
         }
-        let text = self.current().draft.text.trim().to_owned();
+        let text = crate::composer_rich::markdown(&self.current().draft)
+            .trim()
+            .to_owned();
         let mut words = text.splitn(2, char::is_whitespace);
         match words.next() {
             Some("/model") => {
@@ -5470,11 +5477,12 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let value = if t.draft_images.is_empty() {
+                let value = if t.draft_images.is_empty() && !crate::composer_rich::has_format(&t.draft) {
                     json!(t.draft.text)
                 } else {
                     json!({
                         "text": t.draft.text,
+                        "richHtml": t.draft.to_html(),
                         "images": t.draft_images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                     })
                 };
@@ -5556,7 +5564,7 @@ impl State {
                 .ok()
                 .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
             {
-                t.draft.replace_text(text);
+                t.draft = crate::composer_rich::restore(text, draft["richHtml"].as_str());
                 t.draft_images = images;
                 t.attachment_error = if missing_images {
                     Some("Some saved draft images are missing or invalid. Attach those images again.".into())
@@ -9198,6 +9206,39 @@ mod tests {
         assert_eq!(thread.status, Status::Completed);
         assert!(thread.error.is_none());
     }
+    #[test]
+    fn rich_draft_survives_ui_restore_and_sends_exact_markdown() {
+        let mut state = State::new(".".into(), false);
+        let edit = &mut state.current_mut().draft;
+        edit.replace_text("bold\none\ntwo\nquote\ncode");
+        edit.set_selection(0, 4);
+        edit.toggle_mark(rune::Mark::Bold);
+        edit.set_blocks(vec![
+            rune::Block::Paragraph,
+            rune::Block::Numbered(0),
+            rune::Block::Numbered(0),
+            rune::Block::Quote,
+            rune::Block::Code,
+        ]);
+        let ui = state.ui_snapshot();
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&ui).unwrap();
+        let expected = "**bold**\n1. one\n2. two\n> quote\n\n```\ncode\n```";
+        assert_eq!(
+            crate::composer_rich::markdown(&restored.current().draft),
+            expected
+        );
+        assert!(restored.current().draft.is_rich());
+        restored.current_mut().send();
+        assert_eq!(restored.current().messages[0].text, expected);
+        assert!(restored.current().draft.is_rich());
+        let mut legacy = ui;
+        legacy["drafts"][state.current().id.to_string()] = json!("plain old draft");
+        state.restore_ui(&legacy).unwrap();
+        assert!(state.current().draft.is_rich());
+        assert_eq!(state.current().draft.text, "plain old draft");
+    }
+
     #[test]
     fn send_without_a_connection_is_immediate_and_dispatches_the_submitted_draft_once() {
         let mut state = State::new(".".into(), false);

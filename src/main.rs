@@ -9,6 +9,7 @@ mod client;
 mod codex;
 mod composer;
 mod composer_paste;
+mod composer_rich;
 mod context;
 mod crisp;
 mod database;

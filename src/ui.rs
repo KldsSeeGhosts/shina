@@ -7903,6 +7903,14 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             p.muted,
         )
         .color(p.ink)
+        .rich_style(rune::RichStyle {
+            code_fg: Some(p.ink),
+            code_bg: p.code_bg,
+            code_block_bg: p.code_bg,
+            link: p.ink,
+            quote_bar: p.muted,
+            marker: Some(p.muted),
+        })
         .caret(p.coral, p.coral_bg)
         .w_full()
         .min_h(COMPOSER_FIELD_MIN)
@@ -7929,7 +7937,15 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 s.checkpoint();
                 return true;
             }
-            pi_ui::composer_pi_key(s, event)
+            if pi_ui::composer_pi_key(s, event) {
+                return true;
+            }
+            let t = s.current_mut();
+            t.composer_rules.key(&mut t.draft, event)
+        })
+        .on_input_change(|s: &mut State, _| {
+            let t = s.current_mut();
+            t.composer_rules.changed(&mut t.draft);
         })
         .on_input_paste(|s: &mut State, content, _| {
             let has_image = content.image().is_some();
