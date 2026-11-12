@@ -52,6 +52,7 @@ mod session;
 mod shell_env;
 mod store;
 mod thread_find;
+mod thread_search;
 mod tray;
 mod ui;
 mod update;

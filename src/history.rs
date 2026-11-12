@@ -642,6 +642,118 @@ impl Streams {
         serde_json::to_value(result).map_err(|e| e.to_string())
     }
 
+    /// Ported from KSG `ThreadSearch.search` over all stored conversation transcripts.
+    pub fn search_threads(&self, params: &Value, index_threads: &[Value]) -> Result<Value, String> {
+        let query = params["query"]
+            .as_str()
+            .ok_or("Search query is required.")?;
+        let trimmed: String = query
+            .trim()
+            .chars()
+            .take(crate::thread_search::THREAD_SEARCH_QUERY_MAX_LENGTH)
+            .collect();
+        let tokens = crate::thread_search::message_search_tokens(&trimmed);
+        if tokens.long.is_empty() {
+            return Ok(json!({"matches": []}));
+        }
+        let limit = params["limit"].as_u64().unwrap_or(50).min(200) as usize;
+        let project_filter = params.get("projectId").and_then(Value::as_u64);
+
+        let mut results = Vec::new();
+        for record in index_threads {
+            let Some(thread_id) = record["id"].as_u64() else {
+                continue;
+            };
+            if !record["lifecycle"]["archivedAt"].is_null() || record["delegated"] == true {
+                continue;
+            }
+            let project_id = record["project"].as_u64();
+            if let Some(filter) = project_filter
+                && project_id != Some(filter)
+            {
+                continue;
+            }
+            let Some(projection) = self.threads.get(&thread_id) else {
+                continue;
+            };
+            let updated = record["updated"].as_u64().unwrap_or(0);
+            let mut best: Option<(crate::thread_search::ThreadSearchHit, usize)> = None;
+            let mut hit_count = 0usize;
+
+            let mut msg_rows: Vec<&Row> = projection
+                .rows
+                .iter()
+                .filter(|row| row.field == "messages")
+                .collect();
+            msg_rows.sort_by_key(|row| std::cmp::Reverse((row.ordinal, row.position)));
+
+            for row in msg_rows {
+                let role = row.item["role"].as_str().unwrap_or("");
+                if !matches!(role, "You" | "user" | "Pi" | "assistant") {
+                    continue;
+                }
+                let raw = row.item["text"].as_str().unwrap_or("");
+                let stripped = crate::thread_search::strip_markdown_links(raw);
+                let Some(grade) = crate::thread_search::grade_message(&stripped, &tokens) else {
+                    continue;
+                };
+                let entry_id = row.item["id"]
+                    .as_str()
+                    .unwrap_or(&row.source_item_id)
+                    .to_owned();
+                let source = if matches!(role, "You" | "user") {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let candidate = crate::thread_search::ThreadSearchHit {
+                    thread_id: thread_id as usize,
+                    project_id: project_id.map(|id| id as usize),
+                    entry_id,
+                    source: source.to_owned(),
+                    snippet: crate::thread_search::build_search_snippet(&stripped, grade.offset),
+                    quality: grade.quality,
+                    hits: 1,
+                    updated,
+                };
+                match &mut best {
+                    None => {
+                        hit_count = 1;
+                        best = Some((candidate, row.ordinal));
+                    }
+                    Some((current, current_ord)) => {
+                        if (candidate.quality - current.quality).abs() < f64::EPSILON {
+                            hit_count += 1;
+                            let better_source =
+                                candidate.source == "user" && current.source != "user";
+                            if better_source
+                                || (candidate.source == current.source
+                                    && row.ordinal > *current_ord)
+                            {
+                                *current = candidate;
+                                *current_ord = row.ordinal;
+                            }
+                        } else if candidate.quality > current.quality {
+                            hit_count = 1;
+                            *current = candidate;
+                            *current_ord = row.ordinal;
+                        }
+                    }
+                }
+                if hit_count >= crate::thread_search::MESSAGE_HIT_LIMIT {
+                    break;
+                }
+            }
+            if let Some((mut hit, _)) = best {
+                hit.hits = hit_count;
+                results.push(hit);
+            }
+        }
+        crate::thread_search::rank_message_matches(&mut results);
+        results.truncate(limit);
+        Ok(json!({"matches": results}))
+    }
+
     /// Ported from KSG ProjectionStore.getThreadHistoryPage and threadHistoryPaging.
     /// Page backwards by source identity. A content revision never invalidates the anchor.
     pub fn page(&self, thread: u64, cursor: Option<&str>, budget: usize) -> Result<Value, String> {

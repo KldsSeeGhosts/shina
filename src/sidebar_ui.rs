@@ -15,14 +15,26 @@ pub(super) struct Entry<'a> {
     view: &'a Value,
     children: Vec<(&'a Value, &'a Value)>,
     pub visible: bool,
+    pub title_match: bool,
+    pub search_hit: Option<crate::thread_search::ThreadSearchHit>,
 }
 
 pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
     let mut entries = Vec::new();
+    let searching = !s.search.text.is_empty();
     let visible = s.visible_sidebar_threads();
     for (captain, indices) in [(true, s.sidebar_captains()), (false, s.sidebar_threads())] {
         for index in indices {
             let thread = &s.threads[index];
+            let title_match = !searching || s.thread_title_search_matches(thread);
+            let search_hit = if searching && !title_match {
+                s.sidebar_search
+                    .visible_matches
+                    .get(&(s.machines.selected.clone(), thread.id))
+                    .cloned()
+            } else {
+                None
+            };
             entries.push(Entry {
                 server: &s.machines.selected,
                 id: thread.id,
@@ -34,7 +46,9 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 projection: None,
                 view: &Value::Null,
                 children: Vec::new(),
-                visible: captain || visible.contains(&index),
+                visible: captain || searching || visible.contains(&index),
+                title_match,
+                search_hit,
             });
         }
     }
@@ -120,22 +134,36 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 .and_then(|captain| captain["name"].as_str())
                 .unwrap_or("");
             let title = record["title"].as_str().unwrap_or("Thread");
-            if !query.is_empty()
-                && !title.to_lowercase().contains(&query)
-                && !name.to_lowercase().contains(&query)
-                && !draft_text.to_lowercase().contains(&query)
-                && !view["messages"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|message| {
-                        message["text"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&query)
-                    })
-            {
+            let server_supports = s
+                .client
+                .as_ref()
+                .and_then(|c| c.linked.get(server))
+                .is_some_and(|c| c.has_capability(crate::protocol::THREAD_SEARCH));
+            let title_match = query.is_empty()
+                || title.to_lowercase().contains(&query)
+                || name.to_lowercase().contains(&query)
+                || draft_text.to_lowercase().contains(&query)
+                || (!server_supports
+                    && view["messages"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|message| {
+                            message["text"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&query)
+                        }));
+            let search_hit = if !query.is_empty() && !title_match {
+                s.sidebar_search
+                    .visible_matches
+                    .get(&(server.to_string(), id))
+                    .cloned()
+            } else {
+                None
+            };
+            if !query.is_empty() && !title_match && search_hit.is_none() {
                 continue;
             }
             let draft = !captain
@@ -159,10 +187,14 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             {
                 continue;
             }
-            let visible = match lifecycle::section(&life, lifecycle::now()) {
-                Section::Snoozed => s.shelves[0],
-                Section::Settled => s.shelves[1],
-                _ => true,
+            let visible = if !query.is_empty() {
+                true
+            } else {
+                match lifecycle::section(&life, lifecycle::now()) {
+                    Section::Snoozed => s.shelves[0],
+                    Section::Settled => s.shelves[1],
+                    _ => true,
+                }
             };
             entries.push(Entry {
                 server,
@@ -176,15 +208,49 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 view,
                 children: children.remove(&id).unwrap_or_default(),
                 visible,
+                title_match,
+                search_hit,
             });
         }
     }
     let now = lifecycle::now();
+    let order_pos = |server: &str, id: usize| -> usize {
+        s.sidebar_search
+            .shown_order
+            .iter()
+            .position(|(srv, tid)| srv == server && *tid == id)
+            .unwrap_or(usize::MAX)
+    };
     entries.sort_by(|a, b| {
         b.captain.cmp(&a.captain).then_with(|| {
             if a.captain && b.captain {
                 // Selecting a captain must not move the other machines' captains.
                 a.server.cmp(b.server).then(a.id.cmp(&b.id))
+            } else if searching {
+                b.title_match.cmp(&a.title_match).then_with(|| {
+                    if !a.title_match && !b.title_match {
+                        order_pos(a.server, a.id)
+                            .cmp(&order_pos(b.server, b.id))
+                            .then(a.server.cmp(b.server))
+                            .then(a.id.cmp(&b.id))
+                    } else {
+                        b.draft
+                            .cmp(&a.draft)
+                            .then(
+                                lifecycle::section(&a.life, now)
+                                    .cmp(&lifecycle::section(&b.life, now)),
+                            )
+                            .then_with(|| {
+                                lifecycle::compare(
+                                    lifecycle::section(&a.life, now),
+                                    &a.life,
+                                    &b.life,
+                                )
+                            })
+                            .then(a.server.cmp(b.server))
+                            .then(a.id.cmp(&b.id))
+                    }
+                })
             } else {
                 b.draft
                     .cmp(&a.draft)
@@ -247,6 +313,8 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     let machine_line = machine_caption(s, &server);
     let project_tile_data =
         project.and_then(|project| crate::projects::Project::from_record(project, false));
+    let has_hit = entry.search_hit.is_some();
+    let press_server = server.clone();
     let item = rune::row()
         .key(format!("machine-thread-{server}-{id}"))
         .role("button")
@@ -257,7 +325,13 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .min_w(0.0)
         .radius(4.0)
         .hover(p.selected)
-        .on_press(move |s: &mut State| s.open_machine_thread(&server, id));
+        .on_press(move |s: &mut State| {
+            if has_hit {
+                s.open_thread_at_search_match(&press_server, id);
+            } else {
+                s.open_machine_thread(&press_server, id);
+            }
+        });
     if entry.captain {
         let captain = record["captain"]
             .as_u64()
@@ -557,16 +631,25 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 )),
         )
     } else {
-        item.child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .px(ROW_INSET)
-                .pt(9.0)
-                .pb(10.0)
-                .gap(5.0)
-                .child(meta)
-                .child(title),
-        )
+        let mut body = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .px(ROW_INSET)
+            .pt(9.0)
+            .pb(10.0)
+            .gap(5.0)
+            .child(meta)
+            .child(title);
+        if let Some(hit) = &entry.search_hit {
+            body = body.child(search_snippet_el(
+                &server,
+                id,
+                &hit.snippet,
+                &s.search.text,
+                p.muted,
+                p.brass,
+            ));
+        }
+        item.child(body)
     }
 }

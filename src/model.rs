@@ -297,6 +297,21 @@ pub struct ThreadFindState {
     pub request_id: u64,
 }
 
+#[derive(Default)]
+pub struct SidebarSearchState {
+    pub last_typed: String,
+    pub debounce_until: Option<Instant>,
+    pub request_seq: u64,
+    pub settled_query: String,
+    pub matches: std::collections::HashMap<String, Vec<crate::thread_search::ThreadSearchHit>>,
+    pub pending_servers: std::collections::HashSet<String>,
+    pub unsupported_servers: Vec<String>,
+    pub visible_query: String,
+    pub visible_matches:
+        std::collections::HashMap<(String, usize), crate::thread_search::ThreadSearchHit>,
+    pub shown_order: Vec<(String, usize)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPicker {
     Model,
@@ -2655,6 +2670,7 @@ pub struct State {
     pub thinking_drag: Option<f32>,
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
+    pub sidebar_search: SidebarSearchState,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub updater: crate::update::Updater,
@@ -2849,6 +2865,7 @@ impl State {
             thinking_drag: None,
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
+            sidebar_search: SidebarSearchState::default(),
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
             updater: Default::default(),
@@ -3033,7 +3050,6 @@ impl State {
             self.run_thread_find(None, 0);
         }
     }
-    #[allow(dead_code)]
     pub fn open_thread_find_on_query(
         &mut self,
         query: String,
@@ -3419,18 +3435,238 @@ impl State {
             .map(|(index, _)| index)
             .collect()
     }
-    pub fn thread_search_matches(&self, thread: &Thread) -> bool {
-        let search = self.search.text.to_lowercase();
-        thread.title.to_lowercase().contains(&search)
-            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
-            || thread
-                .messages
+    pub fn sync_sidebar_search_input(&mut self) -> bool {
+        let clipped: String = self
+            .search
+            .text
+            .trim()
+            .chars()
+            .take(crate::thread_search::THREAD_SEARCH_QUERY_MAX_LENGTH)
+            .collect();
+        let trimmed = clipped.trim().to_owned();
+        if trimmed == self.sidebar_search.last_typed {
+            return false;
+        }
+        self.sidebar_search.last_typed = trimmed.clone();
+        let tokens = crate::thread_search::message_search_tokens(&trimmed);
+        if tokens.long.is_empty() {
+            self.sidebar_search.debounce_until = None;
+            self.sidebar_search.pending_servers.clear();
+            self.sidebar_search.unsupported_servers.clear();
+            self.sidebar_search.matches.clear();
+            self.sidebar_search.settled_query.clear();
+            self.sidebar_search.visible_query.clear();
+            self.sidebar_search.visible_matches.clear();
+            self.sidebar_search.shown_order.clear();
+            return true;
+        }
+        if self.client.is_some() {
+            self.sidebar_search.debounce_until = Some(
+                Instant::now()
+                    + Duration::from_millis(crate::thread_search::THREAD_SEARCH_DEBOUNCE_MS),
+            );
+        } else {
+            self.sidebar_search.debounce_until = None;
+            self.run_sidebar_search(&trimmed);
+        }
+        true
+    }
+    pub fn poll_sidebar_search(&mut self, tx: &mut Tx) -> bool {
+        let mut changed = self.sync_sidebar_search_input();
+        if let Some(until) = self.sidebar_search.debounce_until {
+            let now = Instant::now();
+            if now >= until {
+                self.sidebar_search.debounce_until = None;
+                let q = self.sidebar_search.last_typed.clone();
+                self.run_sidebar_search(&q);
+                changed = true;
+            } else {
+                tx.wake_after(until.saturating_duration_since(now));
+            }
+        }
+        changed
+    }
+    fn run_sidebar_search(&mut self, query: &str) {
+        let tokens = crate::thread_search::message_search_tokens(query);
+        if tokens.long.is_empty() {
+            return;
+        }
+        self.sidebar_search.request_seq += 1;
+        let seq = self.sidebar_search.request_seq;
+        self.sidebar_search.settled_query = query.to_owned();
+        self.sidebar_search.matches.clear();
+        self.sidebar_search.pending_servers.clear();
+        self.sidebar_search.unsupported_servers.clear();
+        let Some(client) = &self.client else {
+            // Keep visible_query/visible_matches in non-server mode if manually seeded in tests;
+            // local message matching runs in thread_title_search_matches.
+            return;
+        };
+        let mut targets: Vec<(String, &crate::client::Client)> = vec![("local".into(), client)];
+        for (id, linked) in &client.linked {
+            targets.push((id.clone(), linked));
+        }
+        for (server, target) in targets {
+            if !target.connected_ready() {
+                continue;
+            }
+            if !target.has_capability(crate::protocol::THREAD_SEARCH) {
+                self.sidebar_search
+                    .unsupported_servers
+                    .push(self.machine_label(&server));
+                continue;
+            }
+            self.sidebar_search.pending_servers.insert(server.clone());
+            target.call_rpc(
+                format!("search:{seq}:{server}"),
+                "threads.search",
+                json!({"query": query, "limit": 50}),
+            );
+        }
+        // Clear unrelated cached matches if query neither refines nor widens prior query.
+        let cur = crate::thread_search::fold_for_title(query);
+        let prev = crate::thread_search::fold_for_title(&self.sidebar_search.visible_query);
+        if !(!cur.is_empty()
+            && !prev.is_empty()
+            && (cur.starts_with(&prev) || prev.starts_with(&cur)))
+        {
+            self.sidebar_search.visible_query.clear();
+            self.sidebar_search.visible_matches.clear();
+            self.sidebar_search.shown_order.clear();
+        }
+    }
+    pub fn apply_sidebar_search_result(
+        &mut self,
+        seq: u64,
+        server: &str,
+        result: Result<Vec<crate::thread_search::ThreadSearchHit>, String>,
+    ) {
+        if seq != self.sidebar_search.request_seq {
+            return;
+        }
+        self.sidebar_search.pending_servers.remove(server);
+        if let Ok(hits) = result {
+            self.sidebar_search.matches.insert(server.to_owned(), hits);
+            // Rank across all responding environments and preserve shown order (KSG nextShownOrder).
+            let mut combined: Vec<(String, crate::thread_search::ThreadSearchHit)> = self
+                .sidebar_search
+                .matches
                 .iter()
-                .any(|message| message.text.to_lowercase().contains(&search))
+                .flat_map(|(srv, list)| list.iter().map(move |h| (srv.clone(), h.clone())))
+                .collect();
+            let weight = |hits: usize| 1.0 + (1.0 + hits as f64).log2();
+            combined.sort_by(|(_, left), (_, right)| {
+                let lw = left.quality >= crate::thread_search::MESSAGE_PREFIX;
+                let rw = right.quality >= crate::thread_search::MESSAGE_PREFIX;
+                rw.cmp(&lw)
+                    .then_with(|| {
+                        right
+                            .quality
+                            .partial_cmp(&left.quality)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        weight(right.hits)
+                            .partial_cmp(&weight(left.hits))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| right.updated.cmp(&left.updated))
+            });
+            let ranked_keys: Vec<(String, usize)> = combined
+                .iter()
+                .map(|(srv, hit)| (srv.clone(), hit.thread_id))
+                .collect();
+            let ranked_set: std::collections::HashSet<(String, usize)> =
+                ranked_keys.iter().cloned().collect();
+            let same_query = self.sidebar_search.visible_query == self.sidebar_search.settled_query;
+            let mut next_order: Vec<(String, usize)> = if same_query {
+                self.sidebar_search
+                    .shown_order
+                    .iter()
+                    .filter(|k| ranked_set.contains(*k))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let held: std::collections::HashSet<(String, usize)> =
+                next_order.iter().cloned().collect();
+            for key in ranked_keys {
+                if !held.contains(&key) {
+                    next_order.push(key);
+                }
+            }
+            self.sidebar_search.shown_order = next_order;
+            self.sidebar_search.visible_query = self.sidebar_search.settled_query.clone();
+            self.sidebar_search.visible_matches = combined
+                .into_iter()
+                .map(|(srv, hit)| ((srv, hit.thread_id), hit))
+                .collect();
+        }
+    }
+    pub fn open_thread_at_search_match(&mut self, server: &str, id: usize) {
+        let hit = self
+            .sidebar_search
+            .visible_matches
+            .get(&(server.to_owned(), id))
+            .cloned();
+        let query = if self.sidebar_search.visible_query.is_empty() {
+            self.search.text.trim().to_owned()
+        } else {
+            self.sidebar_search.visible_query.clone()
+        };
+        if self.client.is_some() {
+            self.open_machine_thread(server, id);
+        } else if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+            self.select_thread(index);
+        }
+        if let Some(hit) = hit
+            && self.current().id == id
+        {
+            let (find_query, start) =
+                crate::thread_search::find_for_message_match(&hit.snippet, &hit.entry_id, &query);
+            self.open_thread_find_on_query(find_query, start);
+        }
+    }
+    pub fn thread_title_search_matches(&self, thread: &Thread) -> bool {
+        let search = self.search.text.to_lowercase();
+        if search.is_empty() {
+            return true;
+        }
+        let title_or_draft = thread.title.to_lowercase().contains(&search)
+            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
             || self.is_captain_home(thread)
                 && thread.captain.is_some_and(|captain| {
                     self.captains[captain].name.to_lowercase().contains(&search)
-                })
+                });
+        if title_or_draft {
+            return true;
+        }
+        let server_supports = self.client.as_ref().is_some_and(|c| {
+            let target = if self.machines.selected == "local" {
+                Some(c)
+            } else {
+                c.linked.get(&self.machines.selected)
+            };
+            target.is_some_and(|t| t.has_capability(crate::protocol::THREAD_SEARCH))
+        });
+        if !server_supports {
+            return thread
+                .messages
+                .iter()
+                .any(|message| message.text.to_lowercase().contains(&search));
+        }
+        false
+    }
+    pub fn thread_search_matches(&self, thread: &Thread) -> bool {
+        if self.search.text.is_empty() {
+            return true;
+        }
+        self.thread_title_search_matches(thread)
+            || self
+                .sidebar_search
+                .visible_matches
+                .contains_key(&(self.machines.selected.clone(), thread.id))
     }
     /// Whether a captain shows its whole crew: while it or one of its workers is open, while
     /// searching, and in the archive.
@@ -7670,6 +7906,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let browsing = state.poll_folder_browser()
         | state.poll_settings()
         | state.poll_thread_find(tx)
+        | state.poll_sidebar_search(tx)
         | html_changed
         | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but

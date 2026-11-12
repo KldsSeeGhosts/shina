@@ -263,6 +263,9 @@ impl Client {
             params,
         ));
     }
+    pub fn connected_ready(&self) -> bool {
+        self.commands.connected()
+    }
     pub fn has_capability(&self, capability: &str) -> bool {
         self.info.lock().expect("connection info")["capabilities"]
             .as_array()

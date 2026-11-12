@@ -11,6 +11,9 @@ mod protocol;
 #[allow(dead_code)]
 #[path = "../src/thread_find.rs"]
 mod thread_find;
+#[allow(dead_code)]
+#[path = "../src/thread_search.rs"]
+mod thread_search;
 
 use serde_json::{Value, json};
 use std::{
@@ -3478,6 +3481,158 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
             .unwrap()
             .iter()
             .any(|cap| cap == "thread-find")
+    );
+
+    host_a.stop();
+    host_b.stop();
+}
+
+#[test]
+fn sidebar_search_queries_full_transcripts_across_local_and_linked_servers_and_notes_old_peer() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut host_a = Profile::new();
+    let mut host_b = Profile::new();
+
+    // Seed unvisited thread 2 on host_a with hidden early message, and unvisited thread 2 on host_b.
+    let make_index = |phrase: &str| {
+        let mut messages = Vec::new();
+        for turn in 0..80usize {
+            let prompt = if turn == 4 {
+                format!("Early turn with {phrase} inside")
+            } else {
+                format!("Normal turn {turn}")
+            };
+            messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":prompt,"images":[]}));
+            messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Reply {turn}"),"images":[]}));
+        }
+        let mut index = base["index"].clone();
+        let mut t2 = index["threads"][0].clone();
+        t2["id"] = json!(2);
+        t2["title"] = json!("Unrelated title");
+        t2["renamed"] = json!(true);
+        t2["session"] = Value::Null;
+        index["threads"] = json!([index["threads"][0], t2]);
+        index["nextId"] = json!(3);
+        let mut v1 = base["threads"][0].clone();
+        v1["status"] = json!("Completed");
+        let mut v2 = base["threads"][0].clone();
+        v2["id"] = json!(2);
+        v2["status"] = json!("Completed");
+        v2["messages"] = json!(messages);
+        index["threadViews"] = json!([v1, v2]);
+        index
+    };
+    fs::write(
+        host_a.root.join("Shina/index.json"),
+        make_index("periwinkle-compass").to_string(),
+    )
+    .unwrap();
+    fs::write(
+        host_b.root.join("Shina/index.json"),
+        make_index("cobalt-astrolabe").to_string(),
+    )
+    .unwrap();
+
+    host_a.launch(&["serve"]);
+    host_b.launch(&["serve"]);
+    let discovery_b = host_b.discovery();
+    let paired = host_b.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", discovery_b["port"].as_u64().unwrap());
+    assert!(host_a.cli(&["link", &host, &code]).status.success());
+
+    let mut client_a = host_a.client(uuid::Uuid::new_v4());
+    let hello_a = client_a.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello-a"),
+    );
+    assert!(
+        hello_a["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-search")
+    );
+    client_a.rpc("workspace.subscribe", json!({}), json!("sub-a"));
+    // Unvisited thread 2 has empty messages in compact workspace snapshot.
+    assert!(
+        client_a.snapshot["threads"][1]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let hits_a = client_a.rpc(
+        "threads.search",
+        json!({"query":"periwinkle-compass"}),
+        json!("search-a"),
+    );
+    assert!(hits_a["error"].is_null(), "{hits_a}");
+    let matches_a = hits_a["result"]["matches"].as_array().unwrap();
+    assert_eq!(matches_a.len(), 1);
+    assert_eq!(matches_a[0]["threadId"], 2);
+    assert_eq!(matches_a[0]["entryId"], "u-4");
+    assert!(
+        matches_a[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("periwinkle-compass")
+    );
+
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            host_a
+                .root
+                .join("Shina/linked")
+                .join(discovery_b["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut client_b =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    client_b.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello-b"),
+    );
+    let hits_b = client_b.rpc(
+        "threads.search",
+        json!({"query":"cobalt-astrolabe"}),
+        json!("search-b"),
+    );
+    assert!(hits_b["error"].is_null(), "{hits_b}");
+    let matches_b = hits_b["result"]["matches"].as_array().unwrap();
+    assert_eq!(matches_b.len(), 1);
+    assert_eq!(matches_b[0]["threadId"], 2);
+
+    // Peer lacking thread-search (protocolMinor 9) does not advertise capability.
+    let mut old_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let old_hello = old_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":9,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert!(
+        !old_hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-search")
     );
 
     host_a.stop();

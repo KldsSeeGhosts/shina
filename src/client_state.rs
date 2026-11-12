@@ -1158,6 +1158,17 @@ impl State {
                                 .map_err(|e| e.to_string())
                         });
                         self.apply_thread_find_result(req_id, parsed);
+                    } else if let Some(rest) = tag.strip_prefix("search:")
+                        && let Some((seq_str, target_srv)) = rest.split_once(':')
+                        && let Ok(seq) = seq_str.parse::<u64>()
+                    {
+                        let parsed = result.and_then(|val| {
+                            serde_json::from_value::<Vec<crate::thread_search::ThreadSearchHit>>(
+                                val["matches"].clone(),
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                        self.apply_sidebar_search_result(seq, target_srv, parsed);
                     }
                 }
                 crate::client::Event::Error(error) => {

@@ -2205,6 +2205,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
                     .field_focus(&s.search, p)
                     .hover(p.selected)
+                    .on_layout_tx(|s: &mut State, _rect, tx| {
+                        if !s.sync_sidebar_search_input() {
+                            tx.live_only();
+                        }
+                    })
                     .child(icon("search", p.muted))
                     .child(
                         text_input(&s.search, LABEL)
@@ -2240,6 +2245,23 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     }),
             ),
     );
+    if !s.search.text.is_empty() && !s.sidebar_search.unsupported_servers.is_empty() {
+        side = side.child(
+            label(
+                format!(
+                    "Titles only on {} (update required)",
+                    s.sidebar_search.unsupported_servers.join(", ")
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key("sidebar-search-unsupported")
+            .help(crate::protocol::THREAD_SEARCH_UPDATE_REQUIRED)
+            .px(ROW_INSET)
+            .pb(4.0)
+            .truncate(),
+        );
+    }
     // A workspace filter names itself and clears in one click.
     if scoped {
         side = side.child(
@@ -2387,120 +2409,131 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         }
     }
     let mut first_shelf = true;
-    for section in [
-        Section::Pinned,
-        Section::Active,
-        Section::Snoozed,
-        Section::Settled,
-    ] {
-        let rows: Vec<_> = all
+    if !s.search.text.is_empty() {
+        for entry in all
             .iter()
             .copied()
-            .filter(|entry| {
-                !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
-            })
-            .collect();
-        let shelf = match section {
-            Section::Snoozed => Some(0),
-            Section::Settled => Some(1),
-            _ => None,
-        };
-        if let Some(shelf) = shelf {
-            // Settled stays visible as a drop target while dragging, even when empty.
-            if rows.is_empty() && !(section == Section::Settled && dragging) {
-                continue;
-            }
-            // The first shelf takes the remaining height above it, so the shelves sit at the
-            // bottom of the sidebar as in T3 Code.
-            if first_shelf {
-                content = content.child(spacer().min_h(12.0));
-                first_shelf = false;
-            }
-            let key = format!("shelf-{section:?}");
-            let title = format!("{section:?}");
-            let marker = format!("drop-{section:?}");
-            let open = s.shelves[shelf];
-            // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
-            // above Settled, so both stay whole above the footer when the list is longer than
-            // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
-            // The block carries its rule and the sidebar fill, so rows never show through.
-            let settled_below = section == Section::Snoozed
-                && (dragging
-                    || all.iter().any(|entry| {
-                        !entry.draft
-                            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
-                    }));
-            let inset = if settled_below { SHELF_HEADING } else { 0.0 };
-            content = content.child(
-                col()
-                    .key(format!("shelf-block-{section:?}"))
-                    .h(SHELF_HEADING)
-                    .fill(p.bg)
-                    .sticky_bottom(inset)
-                    .child(dotted_rule(p))
-                    .child(
-                        row()
-                            .key(&key)
-                            .role("button")
-                            .cursor(rune::Cursor::Pointer)
-                            .label(format!("{title}, {} threads", rows.len()))
-                            .focusable(true)
-                            .h(32.0)
-                            .pl(ROW_INSET)
-                            .pr(8.0)
-                            .gap(6.0)
-                            .center_y()
-                            .radius(4.0)
-                            .hover(p.selected)
-                            .on_drawn_layout(move |s: &mut State, rect| {
-                                s.drop_rects.insert(marker.clone(), rect);
-                            })
-                            .on_press(move |s: &mut State| {
-                                s.shelves[shelf] = !s.shelves[shelf];
-                                s.checkpoint();
-                            })
-                            .child(pixel_label(&title, p.muted))
-                            .child(spacer())
-                            .child(pixel_text(rows.len().to_string(), p.muted))
-                            .child(icon(if open { "chevron" } else { "open" }, p.muted)),
-                    ),
-            );
-        } else if dragging {
-            let marker = format!("drop-{section:?}");
-            let selected = s.drag_target.is_some_and(|(to, _)| to == section);
-            content = content.child(
-                row()
-                    .key(&marker)
-                    .h(28.0)
-                    .px(8.0)
-                    .center_y()
-                    .fill(if selected { p.coral_bg } else { p.selected })
-                    .on_drawn_layout(move |s: &mut State, rect| {
-                        s.drop_rects.insert(marker.clone(), rect);
-                    })
-                    .child(pixel_label(&format!("{section:?}"), p.muted)),
-            );
-        }
-        let limit = if section == Section::Settled && s.search.text.is_empty() {
-            s.settled_visible
-        } else {
-            usize::MAX
-        };
-        for entry in rows
-            .iter()
-            .copied()
-            .filter(|entry| entry.visible)
-            .take(limit)
+            .filter(|entry| !entry.draft && entry.visible)
         {
             content = content.child(sidebar_ui::row(s, p, entry));
         }
-        if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
-            content = content.child(button(
-                "settled-more",
-                &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
-                p,
-                |s| s.settled_visible += 25,
-            ));
+    } else {
+        for section in [
+            Section::Pinned,
+            Section::Active,
+            Section::Snoozed,
+            Section::Settled,
+        ] {
+            let rows: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
+                })
+                .collect();
+            let shelf = match section {
+                Section::Snoozed => Some(0),
+                Section::Settled => Some(1),
+                _ => None,
+            };
+            if let Some(shelf) = shelf {
+                // Settled stays visible as a drop target while dragging, even when empty.
+                if rows.is_empty() && !(section == Section::Settled && dragging) {
+                    continue;
+                }
+                // The first shelf takes the remaining height above it, so the shelves sit at the
+                // bottom of the sidebar as in T3 Code.
+                if first_shelf {
+                    content = content.child(spacer().min_h(12.0));
+                    first_shelf = false;
+                }
+                let key = format!("shelf-{section:?}");
+                let title = format!("{section:?}");
+                let marker = format!("drop-{section:?}");
+                let open = s.shelves[shelf];
+                // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
+                // above Settled, so both stay whole above the footer when the list is longer than
+                // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
+                // The block carries its rule and the sidebar fill, so rows never show through.
+                let settled_below = section == Section::Snoozed
+                    && (dragging
+                        || all.iter().any(|entry| {
+                            !entry.draft
+                                && lifecycle::section(&entry.life, lifecycle::now())
+                                    == Section::Settled
+                        }));
+                let inset = if settled_below { SHELF_HEADING } else { 0.0 };
+                content = content.child(
+                    col()
+                        .key(format!("shelf-block-{section:?}"))
+                        .h(SHELF_HEADING)
+                        .fill(p.bg)
+                        .sticky_bottom(inset)
+                        .child(dotted_rule(p))
+                        .child(
+                            row()
+                                .key(&key)
+                                .role("button")
+                                .cursor(rune::Cursor::Pointer)
+                                .label(format!("{title}, {} threads", rows.len()))
+                                .focusable(true)
+                                .h(32.0)
+                                .pl(ROW_INSET)
+                                .pr(8.0)
+                                .gap(6.0)
+                                .center_y()
+                                .radius(4.0)
+                                .hover(p.selected)
+                                .on_drawn_layout(move |s: &mut State, rect| {
+                                    s.drop_rects.insert(marker.clone(), rect);
+                                })
+                                .on_press(move |s: &mut State| {
+                                    s.shelves[shelf] = !s.shelves[shelf];
+                                    s.checkpoint();
+                                })
+                                .child(pixel_label(&title, p.muted))
+                                .child(spacer())
+                                .child(pixel_text(rows.len().to_string(), p.muted))
+                                .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                        ),
+                );
+            } else if dragging {
+                let marker = format!("drop-{section:?}");
+                let selected = s.drag_target.is_some_and(|(to, _)| to == section);
+                content = content.child(
+                    row()
+                        .key(&marker)
+                        .h(28.0)
+                        .px(8.0)
+                        .center_y()
+                        .fill(if selected { p.coral_bg } else { p.selected })
+                        .on_drawn_layout(move |s: &mut State, rect| {
+                            s.drop_rects.insert(marker.clone(), rect);
+                        })
+                        .child(pixel_label(&format!("{section:?}"), p.muted)),
+                );
+            }
+            let limit = if section == Section::Settled && s.search.text.is_empty() {
+                s.settled_visible
+            } else {
+                usize::MAX
+            };
+            for entry in rows
+                .iter()
+                .copied()
+                .filter(|entry| entry.visible)
+                .take(limit)
+            {
+                content = content.child(sidebar_ui::row(s, p, entry));
+            }
+            if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
+                content = content.child(button(
+                    "settled-more",
+                    &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
+                    p,
+                    |s| s.settled_visible += 25,
+                ));
+            }
         }
     }
     if captains.is_empty() && (all.is_empty() || !s.search.text.is_empty() && visible.is_empty()) {
@@ -3548,8 +3581,20 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .radius(4.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
-        .on_press_tx(move |s: &mut State, tx| {
-            s.click_thread(index, tx.mods());
+        .on_press_tx({
+            let content_match = !s.search.text.is_empty()
+                && !s.thread_title_search_matches(thread)
+                && s.sidebar_search
+                    .visible_matches
+                    .contains_key(&(s.machines.selected.clone(), id));
+            let server = s.machines.selected.clone();
+            move |s: &mut State, tx| {
+                if content_match {
+                    s.open_thread_at_search_match(&server, id);
+                } else {
+                    s.click_thread(index, tx.mods());
+                }
+            }
         })
         .on_double_press(move |s: &mut State| s.begin_rename(id))
         .on_key(move |s: &mut State, ev, _| {
@@ -3847,17 +3892,56 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .child(spacer()),
         )
         .child(slot);
-    item.child(
-        col()
-            .grow(1.0)
-            .min_w(0.0)
-            .px(ROW_INSET)
-            .pt(9.0)
-            .pb(10.0)
-            .gap(5.0)
-            .child(top)
-            .child(row().child(title)),
-    )
+    let mut card = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .px(ROW_INSET)
+        .pt(9.0)
+        .pb(10.0)
+        .gap(5.0)
+        .child(top)
+        .child(row().child(title));
+    if !shelved
+        && !s.search.text.is_empty()
+        && !s.thread_title_search_matches(thread)
+        && let Some(hit) = s
+            .sidebar_search
+            .visible_matches
+            .get(&(s.machines.selected.clone(), id))
+    {
+        card = card.child(search_snippet_el(
+            &s.machines.selected,
+            id,
+            &hit.snippet,
+            &s.search.text,
+            p.muted,
+            p.brass,
+        ));
+    }
+    item.child(card)
+}
+
+pub(super) fn search_snippet_el(
+    server: &str,
+    id: usize,
+    snippet: &str,
+    query: &str,
+    muted: Color,
+    brass: Color,
+) -> El {
+    let ranges = crate::thread_search::find_snippet_token_ranges(snippet, query);
+    let mut lbl = label(snippet, SMALL, muted)
+        .key(format!("sidebar-search-snippet-{server}-{id}"))
+        .truncate()
+        .min_w(0.0);
+    if !ranges.is_empty() {
+        lbl = lbl.text_highlights(
+            ranges
+                .into_iter()
+                .map(|r| rune::TextHighlight::new(r, brass.alpha(0.32))),
+        );
+    }
+    lbl
 }
 
 /// The least width of a shelved row's status slot: room for "10m" and "1d".
@@ -13627,6 +13711,64 @@ pub(crate) mod tests {
                 "{width}: unsupported peer state"
             );
             rt.state.close_thread_find();
+        }
+    }
+
+    #[test]
+    fn sidebar_search_shows_title_matches_before_message_matches_with_snippets_and_jumps_to_match()
+    {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.threads.push(Thread::new(2));
+            rt.state.threads[0].title = "Alpha workspace task".into();
+            rt.state.threads[0].renamed = true;
+            rt.state.threads[1].title = "Unrelated thread".into();
+            rt.state.threads[1].renamed = true;
+            // Thread 2 is unvisited (no messages loaded locally), matched via server search!
+            rt.state.search.replace_text("alpha");
+            rt.state.sidebar_search.visible_query = "alpha".into();
+            rt.state.sidebar_search.visible_matches.insert(
+                ("local".into(), 2),
+                crate::thread_search::ThreadSearchHit {
+                    thread_id: 2,
+                    project_id: None,
+                    entry_id: "u-4".into(),
+                    source: "user".into(),
+                    snippet: "…matched alpha inside unvisited history…".into(),
+                    quality: 1.0,
+                    hits: 1,
+                    updated: 10,
+                },
+            );
+            rt.state.sidebar_search.shown_order = vec![("local".into(), 2)];
+            rt.state.sidebar_search.unsupported_servers = vec!["Studio".into()];
+            rt.frame(0.0);
+
+            let (row1, _) = rt.presented("thread-1").expect("title match shown");
+            let (row2, _) = rt.presented("thread-2").expect("message match shown");
+            assert!(
+                row1[1] < row2[1],
+                "{width}: title match must appear before message match"
+            );
+            assert!(
+                rt.presented("sidebar-search-snippet-local-2").is_some(),
+                "{width}: snippet shown for message-matched row"
+            );
+            assert!(
+                rt.presented("sidebar-search-unsupported").is_some(),
+                "{width}: unsupported server notice shown"
+            );
+
+            // Clicking the message-matched row opens thread 2 and opens find on the matched query.
+            press(&mut rt, "thread-2");
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().id, 2, "{width}: opened thread 2");
+            assert!(rt.state.thread_find.open, "{width}: find bar opened");
+            assert_eq!(
+                rt.state.thread_find.query.text, "alpha",
+                "{width}: query set"
+            );
         }
     }
 
