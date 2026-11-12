@@ -1442,3 +1442,26 @@ fn real_codex_pong_smoke() {
         }
     }
 }
+
+#[test]
+fn codex_model_value_includes_descriptor_capabilities() {
+    let model = model_value(&json!({
+        "model": "gpt-6-astra",
+        "displayName": "gpt-6-astra",
+        "isDefault": false,
+        "defaultReasoningEffort": "high",
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": "low"},
+            {"reasoningEffort": "medium"},
+            {"reasoningEffort": "high"}
+        ],
+        "serviceTiers": [{"id": "priority", "name": "Fast"}]
+    }))
+    .unwrap();
+    let descriptors = model["capabilities"]["optionDescriptors"]
+        .as_array()
+        .unwrap();
+    assert_eq!(descriptors[0]["id"], "reasoningEffort");
+    assert_eq!(descriptors[0]["currentValue"], "medium");
+    assert_eq!(descriptors[1]["id"], "serviceTier");
+}

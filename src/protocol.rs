@@ -5,6 +5,15 @@ use serde_json::{Value, json};
 pub const MAJOR: u32 = 1;
 pub const MINOR: u32 = 10;
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
+pub const MODEL_FAVORITES: &str = "model-favorites";
+pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
+pub const MODEL_OPTIONS: &str = "model-options";
+pub const THREAD_FIND: &str = "thread-find";
+pub const THREAD_FIND_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to search within a thread.";
+pub const THREAD_SEARCH: &str = "thread-search";
+pub const THREAD_SEARCH_UPDATE_REQUIRED: &str =
+    "Server update required for full transcript search.";
 pub const RUN_CONTROL: &str = "run-control";
 pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to stop or resume a specific run.";
@@ -52,6 +61,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.subscribe"
         | "subscription.cancel"
         | "thread.history"
+        | "thread.find"
+        | "threads.search"
         | "command.get"
         | "server.status"
         | "blobs.read"
@@ -95,6 +106,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "settings.autoSettle"
         | "settings.defaultHarness"
         | "settings.threadDefaults"
+        | "settings.modelFavorites"
         | "background.keepAwake"
         | "queue.remove"
         | "queue.sendNow"
@@ -483,6 +495,8 @@ mod tests {
                 | "thread.subscribe"
                 | "subscription.cancel"
                 | "thread.history"
+                | "thread.find"
+                | "threads.search"
                 | "command.get"
                 | "server.status"
                 | "blobs.read"

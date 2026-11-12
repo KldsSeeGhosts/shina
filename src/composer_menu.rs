@@ -418,7 +418,7 @@ pub(super) fn key(s: &mut State, event: &rune::KeyEvent) -> bool {
         rune::Key::Home => s.current_mut().native.slash_index = 0,
         rune::Key::End => s.current_mut().native.slash_index = items.len() - 1,
         rune::Key::Tab | rune::Key::Enter
-            if !event.mods.shift && !event.mods.ctrl && !event.mods.cmd =>
+            if !event.mods.shift && !event.mods.ctrl && !event.mods.cmd && !event.mods.alt =>
         {
             select(s, items[at].action.clone());
         }

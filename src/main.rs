@@ -20,6 +20,7 @@ mod composer_tokens;
 mod context;
 mod crisp;
 mod database;
+mod descriptors;
 mod fleet_update;
 mod harness;
 mod history;
@@ -35,6 +36,8 @@ mod lifecycle;
 mod maintenance;
 mod mcp;
 mod model;
+mod model_picker;
+mod model_selection;
 mod outbox;
 mod peer;
 mod portraits;
@@ -52,6 +55,8 @@ mod service;
 mod session;
 mod shell_env;
 mod store;
+mod thread_find;
+mod thread_search;
 mod tray;
 mod ui;
 mod update;
@@ -156,6 +161,11 @@ fn key_inner(
         && let Some(notice) = &mut state.undo
     {
         notice.owns_text_key = false;
+    }
+    if state.thread_find.open && event.key == rune::Key::Escape {
+        state.close_thread_find();
+        state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
+        return true;
     }
     let Some(command) = command else {
         // No shortcut matched: KSG redirects plain typing to the composer.
@@ -272,6 +282,15 @@ fn dispatch_global_command(
         "composer.focus" => {
             state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
+        "chat.find" => {
+            if composer_controls_blocked(state) {
+                return false;
+            }
+            state.open_thread_find();
+            if let Some(tx) = tx {
+                tx.focus("thread-find-input", false);
+            }
+        }
         "commandPalette.toggle" => {
             state.search.focused = true;
         }
@@ -321,10 +340,7 @@ fn dispatch_global_command(
             if state.settings_picker == Some(model::SettingsPicker::Model) {
                 state.settings_picker = None;
             } else {
-                state.model_search.replace_text("");
-                state.settings_picker = Some(model::SettingsPicker::Model);
-                state.thinking_drag = None;
-                state.refresh_catalog();
+                state.open_model_picker(model::SettingsPicker::Model);
             }
         }
         "composer.effort" => {
@@ -343,9 +359,7 @@ fn dispatch_global_command(
             if state.settings_picker == Some(model::SettingsPicker::Thinking) {
                 state.settings_picker = None;
             } else {
-                state.settings_picker = Some(model::SettingsPicker::Thinking);
-                state.thinking_drag = None;
-                state.refresh_catalog();
+                state.open_model_picker(model::SettingsPicker::Thinking);
             }
         }
         "composer.increaseEffort" => {

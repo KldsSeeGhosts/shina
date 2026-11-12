@@ -174,6 +174,25 @@ export default async function shinaExtension(pi: ExtensionAPI) {
       images: event.images,
     };
   });
+  let serviceTier: string | undefined;
+  pi.registerCommand("shina-service-tier", {
+    description: "Set the service tier Shina sends with provider requests",
+    handler: async (args) => {
+      serviceTier = args.trim() || undefined;
+    },
+  });
+  pi.on("before_provider_request", (event, ctx) => {
+    const payload = event.payload;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return;
+    const tiers = (ctx.model as { serviceTiers?: unknown } | undefined)?.serviceTiers;
+    if (
+      serviceTier !== undefined &&
+      Array.isArray(tiers) &&
+      tiers.some((tier) => (tier as { id?: unknown })?.id === serviceTier)
+    ) {
+      return { ...(payload as Record<string, unknown>), service_tier: serviceTier };
+    }
+  });
   const endpoint = process.env.SHINA_MCP_URL;
   const token = process.env.SHINA_MCP_TOKEN;
   if (!endpoint || !token) return;

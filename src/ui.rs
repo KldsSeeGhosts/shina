@@ -913,6 +913,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         } else if s.current().messages.is_empty()
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
+            && !s.current().history_has_more
+            && s.current().history_error.is_none()
         {
             // Sizes from the last layout: the hero keeps its height only while the composer
             // and its crew tray still fit under it.
@@ -1051,6 +1053,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(pill) = crew_ui::attention_row(s, p) {
         root = root.child(pill);
     }
+    if !s.toasts.is_empty() {
+        root = root.child(toast_stack(s, p, chrome.height.max(40.0 * zoom) / zoom));
+    }
     if s.attention_menu && !s.attention().is_empty() {
         // The pane's top left corner, worked out rather than read from the last layout, so the
         // popover is in place on its first frame: the workspace's 8 pt inset, the sidebar and
@@ -1157,12 +1162,75 @@ fn effort_name(level: &str) -> String {
 }
 
 /// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
-/// provider's mark, the model's name without its route, and the effort level.
+/// provider's mark, the model's name without its route, and descriptor-driven traits.
 fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
     let t = s.current();
+    let (resolved_instance, resolved_model_id, resolved_opts) =
+        s.resolved_composer_model_selection();
+    let entries = s.provider_instance_entries();
+    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
+    let active_model_option = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
+        .or_else(|| {
+            crate::model_picker::retained_model_while_provider_locked(
+                active_entry,
+                &[],
+                &resolved_model_id,
+            )
+        });
     let (name, _) = split_model_label(&t.model);
-    let effort = effort_name(&t.thinking);
-    let both_default = name == crate::model::DEFAULT_MODEL && t.thinking.is_empty();
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let primary_is_prompt_controlled = descriptors
+        .iter()
+        .find(|d| {
+            matches!(
+                d,
+                crate::descriptors::ProviderOptionDescriptor::Select { .. }
+            )
+        })
+        .is_some_and(|d| match d {
+            crate::descriptors::ProviderOptionDescriptor::Select {
+                prompt_injected_values,
+                ..
+            } => !prompt_injected_values.is_empty(),
+            _ => false,
+        })
+        && prompt_ultrathink != crate::descriptors::PromptUltrathink::None;
+    let selection = crate::model_selection::ModelSelection {
+        instance_id: resolved_instance.clone(),
+        model: resolved_model_id.clone(),
+        options: resolved_opts.clone(),
+    };
+    let display = crate::descriptors::build_traits_trigger_display(
+        &descriptors,
+        primary_is_prompt_controlled,
+        Some(&selection),
+        None,
+    );
+    let fallback_thinking = resolved_opts
+        .iter()
+        .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
+        .and_then(|o| o.value.as_str())
+        .unwrap_or(&t.thinking);
+    let effort = if !display.label.is_empty() && controls.effort.is_some() {
+        display
+            .effort_label
+            .clone()
+            .unwrap_or_else(|| effort_name(fallback_thinking))
+    } else if primary_is_prompt_controlled {
+        "Ultrathink".into()
+    } else {
+        effort_name(fallback_thinking)
+    };
+    let both_default = name == crate::model::DEFAULT_MODEL
+        && fallback_thinking.is_empty()
+        && display.speed_label.is_none()
+        && !display.ultracode
+        && display.context_window.is_none();
     let mut trigger = row()
         .key("model-effort")
         .role("button")
@@ -1187,12 +1255,24 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
     if !locked {
         trigger = trigger.on_press(|s: &mut State| {
             s.begin_composer_menu();
-            s.settings_picker = Some(SettingsPicker::Thinking);
-            s.thinking_drag = None;
-            s.refresh_catalog();
+            s.open_model_picker(SettingsPicker::Thinking);
         });
     }
-    trigger
+    let trigger_unavailable = active_model_option
+        .as_ref()
+        .is_some_and(|m| m.is_unavailable);
+    let display_name = active_model_option
+        .as_ref()
+        .map(|m| {
+            crate::model_picker::get_display_model_name(
+                &m.name,
+                m.short_name.as_deref(),
+                m.sub_provider.as_deref(),
+                true,
+            )
+        })
+        .unwrap_or_else(|| name.to_owned());
+    let mut trigger = trigger
         .child(provider_icon(
             s,
             p,
@@ -1200,27 +1280,94 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             14.0,
         ))
         .child(
-            label(name, TextStyle::new(13.0, 600.0), p.ink)
+            label(&display_name, TextStyle::new(13.0, 600.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
-        )
-        // "Default model" and a "Default" level say the same thing twice, so the level drops out.
-        .child(if both_default {
-            el()
-        } else {
-            pixel_text(effort, p.muted).truncate().shrink().min_w(0.0)
-        })
+        );
+    if !both_default {
+        trigger = trigger.child(pixel_text(effort, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if display.speed_label.is_some() {
+        trigger = trigger.child(icon("bolt", p.brass));
+    }
+    if display.ultracode {
+        trigger = trigger.child(icon("workflow", p.sea));
+    }
+    if let Some(cw) = &display.context_window {
+        trigger = trigger.child(pixel_text(cw, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if trigger_unavailable {
+        trigger = trigger.child(outlined(
+            pixel_text("Unavailable", p.muted)
+                .px(4.0)
+                .py(1.0)
+                .radius(4.0),
+            p,
+        ));
+    }
+    trigger
 }
 
 const PICKER_WIDTH: f32 = 320.0;
 
-/// The model and reasoning popover. Its effort half is Codex's slider in Shina's colours; its
-/// model half drills into KSG Code's searchable, provider-grouped list in place.
+/// Ported from KSG Code's `ProviderModelPicker` + `ComposerModelEffort`: docked model list on
+/// the left, effort slider and descriptor options on the right, and speed/ultracode/permissions
+/// in the footer. Stacks vertically below 640 px.
 fn settings_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let is_model = s.settings_picker == Some(SettingsPicker::Model);
     let can_choose = !t.status.busy() && !t.configuring;
+    let stacked = s.viewport_width <= 640.0;
+    let width = if stacked {
+        (s.viewport_width - 16.0).clamp(280.0, 380.0)
+    } else {
+        544.0_f32.min((s.viewport_width - 16.0).max(320.0))
+    };
+    let list_max_h = if stacked { 180.0 } else { 296.0 };
+
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
+    let model_label = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
+        .map(|m| {
+            crate::model_picker::get_display_model_name(
+                &m.name,
+                m.short_name.as_deref(),
+                m.sub_provider.as_deref(),
+                true,
+            )
+        })
+        .unwrap_or_else(|| split_model_label(&t.model).0.to_owned());
+
+    let left_col = model_list(
+        s,
+        p,
+        can_choose,
+        list_max_h,
+        col().key("model-picker-list-col").grow(1.0).min_w(0.0),
+        is_model,
+    );
+    let right_col = effort_column(s, p, can_choose, stacked, &model_label, &controls);
+
+    let body = if stacked {
+        col()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(rule(p))
+            .child(right_col)
+    } else {
+        row()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(el().w(1.0).h_full().fill(p.line))
+            .child(right_col)
+    };
     let mut card = col()
         .key("pi-settings-picker")
         .role("dialog")
@@ -1229,20 +1376,13 @@ fn settings_picker(s: &State, p: Palette) -> El {
         } else {
             "Model and reasoning"
         })
-        .w(PICKER_WIDTH)
+        .w(width)
         .radius(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
-        .on_press(|_: &mut State| {});
-    card = if is_model {
-        model_list(s, p, can_choose, 320.0, card)
-    } else {
-        card.child(effort_slider(t, s.thinking_drag, p, can_choose))
-            .child(service_tier_picker(t, p, can_choose))
-            .child(rule(p))
-            .child(model_row(s, p))
-    };
+        .on_press(|_: &mut State| {})
+        .child(body);
     if let Some(error) = &t.error {
         card = card.child(
             label(error, SMALL, p.danger)
@@ -1251,33 +1391,594 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 .pb(10.0),
         );
     }
-    if t.harness == "pi"
-        && let Some(error) = &s.catalog.error
-    {
-        if !is_model {
-            card = card.child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0));
-        }
-        card = card.child(
-            button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
-                .ml(10.0)
-                .mb(8.0),
-        );
-    }
-    if let (_, Some(error)) = s.native_catalog_status(&t.harness) {
-        card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
-            SMALL, p.muted).key("native-catalog-error").wrap_anywhere().px(16.0).py(8.0));
-    }
     card = card
         .child(rule(p))
-        .child(composer_ui::permissions_section(s, p));
+        .child(composer_picker_footer(s, p, can_choose, &controls));
+    if let Some(open_id) = &s.open_option_menu
+        && let Some(
+            desc @ crate::descriptors::ProviderOptionDescriptor::Select {
+                id,
+                options,
+                current_value,
+                ..
+            },
+        ) = controls.others.iter().find(|d| d.id() == open_id)
+    {
+        let choices = crate::descriptors::selectable_provider_option_choices(desc);
+        let current_id = current_value
+            .as_deref()
+            .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+            .unwrap_or("");
+        let mut choice_col = col()
+            .key(format!("option-popup-{id}"))
+            .w(220.0)
+            .padding(4.0)
+            .gap(2.0)
+            .radius(6.0)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .box_shadow(hard_shadow(p));
+        for choice in choices {
+            let selected = choice.id == current_id;
+            let oid = id.clone();
+            let cid = choice.id.clone();
+            let mut crow = row()
+                .key(format!("option-choice-{id}-{}", choice.id))
+                .role("menuitemradio")
+                .checked(selected)
+                .focusable(can_choose)
+                .px(8.0)
+                .py(5.0)
+                .gap(6.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Str(cid.clone()),
+                    );
+                    s.open_option_menu = None;
+                })
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(label(&choice.label, SMALL, p.ink).truncate())
+                        .child(if let Some(d) = &choice.description {
+                            label(d, TextStyle::new(11.0, 400.0), p.muted).wrap()
+                        } else {
+                            el()
+                        }),
+                );
+            if choice.is_default {
+                crow = crow.child(pixel_text("Default", p.muted));
+            }
+            if selected {
+                crow = crow.child(icon("check", p.sea));
+            }
+            choice_col = choice_col.child(crow);
+        }
+        card = card.child(choice_col.anchored_fit(
+            format!("option-menu-{id}"),
+            if stacked {
+                rune::Side::Bottom
+            } else {
+                rune::Side::Right
+            },
+            rune::Align::Start,
+            6.0,
+        ));
+    }
     // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
     // layer draws over the page and shifts the card to stay inside the window.
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
             s.settings_picker = None;
+            s.open_option_menu = None;
             s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
         })
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerEffortColumn`).
+fn effort_column(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    stacked: bool,
+    model_label: &str,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let header_title = controls
+        .effort
+        .as_ref()
+        .map(|d| d.label().to_owned())
+        .unwrap_or_else(|| {
+            if controls.others.is_empty() {
+                "Effort".into()
+            } else {
+                "Options".into()
+            }
+        });
+
+    let mut column = col()
+        .key("model-picker-effort")
+        .w(if stacked { f32::NAN } else { 196.0 })
+        .w_full()
+        .shrink()
+        .min_w(0.0);
+    if !stacked {
+        column = column.w(196.0);
+    }
+    column = column
+        .child(
+            row()
+                .center_y()
+                .gap(8.0)
+                .px(12.0)
+                .py(10.0)
+                .child(label(&header_title, SMALL, p.muted))
+                .child(spacer())
+                .child(
+                    label(model_label, SMALL, p.muted)
+                        .key("effort-model-label")
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        )
+        .child(rule(p));
+
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let ultrathink_in_body = controls.effort.as_ref().is_some_and(|d| match d {
+        crate::descriptors::ProviderOptionDescriptor::Select {
+            prompt_injected_values,
+            ..
+        } => !prompt_injected_values.is_empty(),
+        _ => false,
+    }) && prompt_ultrathink == crate::descriptors::PromptUltrathink::Body;
+
+    let mut body = col()
+        .w_full()
+        .gap(4.0)
+        .pb(8.0)
+        .max_h(if stacked { 256.0 } else { 300.0 })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+
+    let mut rendered_effort = false;
+    match &controls.effort {
+        Some(crate::descriptors::ProviderOptionDescriptor::Select {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let choices = crate::descriptors::selectable_provider_option_choices(
+                controls.effort.as_ref().unwrap(),
+            );
+            let levels: Vec<String> = if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            };
+            let current = current_value
+                .clone()
+                .filter(|v| levels.iter().any(|l| l == v))
+                .unwrap_or_else(|| t.thinking.clone());
+            if ultrathink_in_body {
+                body = body.child(
+                    label(crate::descriptors::ULTRATHINK_IN_BODY_NOTE, SMALL, p.muted)
+                        .key("ultrathink-lock-note")
+                        .wrap()
+                        .px(12.0)
+                        .pt(8.0),
+                );
+            }
+            body = body.child(effort_slider_with_levels(
+                &levels,
+                &current,
+                s.thinking_drag,
+                p,
+                can_choose && !ultrathink_in_body,
+                desc_id,
+            ));
+            rendered_effort = true;
+        }
+        Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let on = *current_value == Some(true);
+            for (label_text, val) in [("On", true), ("Off", false)] {
+                let checked = on == val;
+                let oid = desc_id.clone();
+                body = body.child(
+                    row()
+                        .key(format!("effort-bool-{desc_id}-{val}"))
+                        .role("radio")
+                        .checked(checked)
+                        .focusable(can_choose)
+                        .disabled(!can_choose)
+                        .h(30.0)
+                        .mx(6.0)
+                        .px(8.0)
+                        .center_y()
+                        .radius(4.0)
+                        .fill(if checked {
+                            p.selected
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .hover(p.selected)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_press(move |s: &mut State| {
+                            s.set_composer_option_sticky(
+                                oid.clone(),
+                                crate::model_selection::OptionValue::Bool(val),
+                            );
+                        })
+                        .child(label(label_text, SMALL, p.ink).grow(1.0))
+                        .child(if checked { icon("check", p.sea) } else { el() }),
+                );
+            }
+            rendered_effort = true;
+        }
+        None if !t.thinking_levels.is_empty() => {
+            let fallback_id = match t.harness.as_str() {
+                "pi" => "thinking",
+                "codex" => "reasoningEffort",
+                _ => "effort",
+            };
+            body = body.child(effort_slider_with_levels(
+                &t.thinking_levels,
+                &t.thinking,
+                s.thinking_drag,
+                p,
+                can_choose,
+                fallback_id.into(),
+            ));
+            rendered_effort = true;
+        }
+        None => {}
+    }
+
+    if !rendered_effort && controls.others.is_empty() {
+        body = body.child(
+            label("No effort levels", SMALL, p.muted)
+                .key("no-effort-levels")
+                .px(12.0)
+                .py(10.0),
+        );
+    }
+
+    if !controls.others.is_empty() {
+        if rendered_effort {
+            body = body.child(rule(p).mx(8.0));
+        }
+        for desc in &controls.others {
+            match desc {
+                crate::descriptors::ProviderOptionDescriptor::Boolean {
+                    id,
+                    label: opt_label,
+                    current_value,
+                    ..
+                } => {
+                    let on = *current_value == Some(true);
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-switch-{id}"))
+                            .role("switch")
+                            .checked(on)
+                            .label(format!("{opt_label}: {}", if on { "On" } else { "Off" }))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(8.0)
+                            .center_y()
+                            .radius(4.0)
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                s.set_composer_option_sticky(
+                                    oid.clone(),
+                                    crate::model_selection::OptionValue::Bool(!on),
+                                );
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(label(
+                                        if on { "On" } else { "Off" },
+                                        TextStyle::new(13.0, 450.0),
+                                        p.ink,
+                                    )),
+                            )
+                            .child({
+                                let mut track = row()
+                                    .w(28.0)
+                                    .h(16.0)
+                                    .radius(8.0)
+                                    .padding(2.0)
+                                    .center_y()
+                                    .fill(if on { p.coral } else { p.line });
+                                if on {
+                                    track = track.justify_end();
+                                }
+                                track.child(el().size(12.0, 12.0).radius(6.0).fill(p.card))
+                            }),
+                    );
+                }
+                crate::descriptors::ProviderOptionDescriptor::Select {
+                    id,
+                    label: opt_label,
+                    options,
+                    current_value,
+                    ..
+                } => {
+                    let choices = crate::descriptors::selectable_provider_option_choices(desc);
+                    let current_id = current_value
+                        .as_deref()
+                        .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+                        .unwrap_or("");
+                    let current_label = choices
+                        .iter()
+                        .find(|c| c.id == current_id)
+                        .map(|c| c.label.as_str())
+                        .unwrap_or(current_id);
+                    let is_open = s.open_option_menu.as_deref() == Some(id.as_str());
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-menu-{id}"))
+                            .role("button")
+                            .label(format!("{opt_label}: {current_label}"))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(6.0)
+                            .center_y()
+                            .radius(4.0)
+                            .fill(if is_open {
+                                p.selected
+                            } else {
+                                Color::TRANSPARENT
+                            })
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                if s.open_option_menu.as_deref() == Some(oid.as_str()) {
+                                    s.open_option_menu = None;
+                                } else {
+                                    s.open_option_menu = Some(oid.clone());
+                                }
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(
+                                        label(current_label, TextStyle::new(13.0, 450.0), p.ink)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(icon(if is_open { "chevron" } else { "open" }, p.muted)),
+                    );
+                }
+            }
+        }
+    }
+
+    column.child(body)
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerPickerFooter`, `SpeedControl`, `UltracodeControl`).
+fn composer_picker_footer(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let mut footer = row()
+        .key("picker-footer")
+        .w_full()
+        .center_y()
+        .flex_wrap()
+        .gap(8.0)
+        .px(12.0)
+        .py(8.0);
+
+    // SpeedControl: serviceTier select descriptor, legacy model.service_tiers, or fastMode boolean
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Select {
+        options,
+        current_value,
+        ..
+    }) = &controls.speed_select
+    {
+        let selected = t.harness_state["serviceTier"]
+            .as_str()
+            .or_else(|| current_value.as_deref())
+            .unwrap_or("default");
+        let mut group = row()
+            .key("service-tier-picker")
+            .role("radiogroup")
+            .label("Service Tier")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line);
+        for (index, opt) in options.iter().enumerate() {
+            let on = selected == opt.id;
+            let oid = opt.id.clone();
+            let mut seg = row()
+                .key(format!("service-tier-{index}"))
+                .role("radio")
+                .label(&opt.label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(24.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if on { p.selected } else { Color::TRANSPARENT })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_service_tier_sticky(oid.clone());
+                });
+            if let Some(desc) = &opt.description {
+                seg = seg.help(desc);
+            }
+            if opt.label == "Fast" || opt.label == "Ultrafast" {
+                seg = seg.child(icon("bolt", if on { p.brass } else { p.muted }));
+            }
+            seg = seg.child(label(&opt.label, SMALL, if on { p.ink } else { p.muted }));
+            group = group.child(seg);
+        }
+        footer = footer.child(group);
+    } else if !t
+        .models
+        .iter()
+        .find(|m| m.id == t.model_id && m.provider == "codex")
+        .is_none_or(|m| m.service_tiers.is_empty())
+    {
+        footer = footer.child(service_tier_picker(t, p, can_choose));
+    } else if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        current_value,
+        ..
+    }) = &controls.fast_toggle
+    {
+        let is_fast = *current_value == Some(true);
+        let group = row()
+            .key("fast-mode-picker")
+            .role("radiogroup")
+            .label("Fast Mode")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line)
+            .child(
+                row()
+                    .key("fast-mode-off")
+                    .role("radio")
+                    .label("Standard")
+                    .checked(!is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if !is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(false),
+                        );
+                    })
+                    .child(label(
+                        "Standard",
+                        SMALL,
+                        if !is_fast { p.ink } else { p.muted },
+                    )),
+            )
+            .child(
+                row()
+                    .key("fast-mode-on")
+                    .role("radio")
+                    .label("Fast")
+                    .checked(is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(true),
+                        );
+                    })
+                    .child(icon("bolt", if is_fast { p.brass } else { p.muted }))
+                    .child(label("Fast", SMALL, if is_fast { p.ink } else { p.muted })),
+            );
+        footer = footer.child(group);
+    }
+
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        id,
+        label: ultra_label,
+        current_value,
+        ..
+    }) = &controls.ultracode_toggle
+    {
+        let on = *current_value == Some(true);
+        let oid = id.clone();
+        footer = footer.child(
+            row()
+                .key("ultracode-toggle")
+                .role("button")
+                .label(ultra_label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(28.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(6.0)
+                .fill(if on { p.selected } else { p.bg })
+                .border(1.0, p.line)
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Bool(!on),
+                    );
+                })
+                .child(icon("workflow", if on { p.sea } else { p.muted }))
+                .child(label(ultra_label, SMALL, if on { p.ink } else { p.muted })),
+        );
+    }
+
+    footer = footer.child(composer_ui::permissions_section(s, p));
+    footer
 }
 
 /// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
@@ -1338,8 +2039,7 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .child(label(name, SMALL, if on { p.ink } else { p.muted }).truncate())
                 .on_press(move |s: &mut State| {
-                    s.current_mut().set_service_tier(id.clone());
-                    s.checkpoint();
+                    s.set_composer_service_tier_sticky(id.clone());
                 }),
         );
     }
@@ -1412,10 +2112,17 @@ fn slider_curve(dragging: bool) -> rune::Curve {
     )
 }
 
-fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool) -> El {
-    let levels = t.thinking_levels.clone();
+fn effort_slider_with_levels(
+    levels: &[String],
+    active_level: &str,
+    dragging: Option<f32>,
+    p: Palette,
+    can_choose: bool,
+    option_id: String,
+) -> El {
+    let levels = levels.to_vec();
     let count = levels.len();
-    let current = levels.iter().position(|level| *level == t.thinking);
+    let current = levels.iter().position(|level| *level == active_level);
     // While held, the thumb follows the pointer and the title names the nearest level.
     let held = dragging.filter(|_| count > 1).map(|f| f.clamp(0.0, 1.0));
     let shown = held
@@ -1423,7 +2130,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .or(current);
     let title = shown
         .and_then(|index| levels.get(index))
-        .map_or_else(|| effort_name(&t.thinking), |level| effort_name(level));
+        .map_or_else(|| effort_name(active_level), |level| effort_name(level));
     let mut section = col()
         .key("effort-section")
         .px(16.0)
@@ -1465,7 +2172,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .key("effort-slider")
         .role("slider")
         .label("Reasoning effort")
-        .a11y_value(effort_name(&t.thinking))
+        .a11y_value(effort_name(active_level))
         .h(SLIDER_H)
         .w_full()
         .motion(rune::Spring::new(0.3, 0.0))
@@ -1561,6 +2268,9 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         let keyed = levels.clone();
         let dragged = levels.clone();
         let ends = levels.clone();
+        let oid_step = option_id.clone();
+        let oid_limit = option_id.clone();
+        let oid_drag = option_id;
         slider = slider
             // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
             .on_step(move |s: &mut State, delta, tx| {
@@ -1572,8 +2282,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 let next = (at + delta).clamp(0, last) as usize;
                 if next as i32 != at {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(keyed[next].clone());
-                    s.checkpoint();
+                    s.set_composer_option_sticky(
+                        oid_step.clone(),
+                        crate::model_selection::OptionValue::Str(keyed[next].clone()),
+                    );
                 }
             })
             .on_step_limit(move |s: &mut State, max, tx| {
@@ -1582,8 +2294,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     && level != s.current().thinking
                 {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(level);
-                    s.checkpoint();
+                    s.set_composer_option_sticky(
+                        oid_limit.clone(),
+                        crate::model_selection::OptionValue::Str(level),
+                    );
                 }
             })
             .on_drag(move |s: &mut State, drag, tx| {
@@ -1599,8 +2313,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     tx.motion_curve(slider_curve(false));
                     s.thinking_drag = None;
                     if dragged[index] != s.current().thinking {
-                        s.current_mut().set_thinking(dragged[index].clone());
-                        s.checkpoint();
+                        s.set_composer_option_sticky(
+                            oid_drag.clone(),
+                            crate::model_selection::OptionValue::Str(dragged[index].clone()),
+                        );
                     }
                 } else {
                     // A press glides to the pointer; a drag follows it closely.
@@ -1625,110 +2341,457 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
     )
 }
 
-fn model_row(s: &State, p: Palette) -> El {
-    let t = s.current();
-    let (name, route) = split_model_label(&t.model);
-    let mut text = col().gap(1.0).grow(1.0).min_w(0.0).child(
-        label(name, TextStyle::new(13.5, 500.0), p.ink)
-            .truncate()
-            .min_w(0.0),
-    );
-    if let Some(route) = route {
-        text = text.child(label(route, SMALL, p.muted).truncate().min_w(0.0));
-    }
-    row()
-        .key("open-model-list")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("Model: {}. Choose another model", t.model))
-        .focusable(true)
-        .center_y()
-        .gap(10.0)
-        .pl(16.0)
-        .pr(12.0)
-        .py(10.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(|s: &mut State| {
-            s.model_search.replace_text("");
-            s.settings_picker = Some(SettingsPicker::Model);
-        })
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&t.model_id, &t.model),
-            18.0,
-        ))
-        .child(text)
-        .child(icon("open", p.muted))
+struct PickerSnapshot {
+    entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    sidebar_entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    selected_tab: crate::model_picker::ModelPickerTab,
+    is_searching: bool,
+    locked_disabled_ids: std::collections::HashSet<String>,
+    selectable_unavailable_ids: std::collections::HashSet<String>,
+    favorites_set: std::collections::HashSet<String>,
+    visible_models: Vec<crate::model_picker::ModelPickerItem>,
+    legacy_section: Option<(String, bool)>,
+    setup_entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    update_required_notices: Vec<(String, String)>,
 }
 
-/// Harness rows reuse KSG Code's ModelPickerContent groups and ModelListRow proportions.
-fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> El {
+fn picker_snapshot(s: &State) -> PickerSnapshot {
+    use crate::model_picker::{
+        ModelPickerItem, ModelPickerSearchableModel, ModelPickerTab,
+        is_provider_instance_picker_ready, is_provider_instance_picker_visible,
+        matches_locked_provider, provider_model_key, rank_model_picker_search,
+        should_include_model_picker_option, should_offer_model_picker_setup,
+        sort_provider_model_items, split_legacy_models,
+    };
+
     let t = s.current();
-    let header = row()
-        .center_y()
-        .gap(8.0)
-        .px(12.0)
-        .py(10.0)
-        .child(icon_button(
-            "back-to-effort",
-            "Back to reasoning",
-            "back",
-            p,
-            |s| s.settings_picker = Some(SettingsPicker::Thinking),
-        ))
+    let entries = s.provider_instance_entries();
+    let options_by_instance = s.picker_models_by_instance();
+    let favorites = s.effective_model_favorites();
+    let favorites_set: std::collections::HashSet<String> = favorites
+        .iter()
+        .map(|f| provider_model_key(&f.provider, &f.model))
+        .collect();
+    let locked_provider = s.locked_provider_for_current();
+    let is_searching = !s.model_search.text.trim().is_empty();
+
+    let selected_tab = s
+        .model_picker_tab
+        .clone()
+        .unwrap_or_else(|| ModelPickerTab::Instance(t.harness.clone()));
+
+    let mut locked_disabled_ids = std::collections::HashSet::new();
+    if locked_provider.is_some() {
+        for entry in &entries {
+            if !matches_locked_provider(entry, locked_provider.as_deref(), None) {
+                locked_disabled_ids.insert(entry.instance_id.clone());
+            }
+        }
+    }
+
+    let mut selectable_unavailable_ids = std::collections::HashSet::new();
+    if let Some(active_entry) = entries.iter().find(|e| e.instance_id == t.harness)
+        && !is_provider_instance_picker_ready(active_entry)
+        && options_by_instance.get(&t.harness).is_some_and(|opts| {
+            opts.iter().any(|opt| {
+                should_include_model_picker_option(active_entry, opt, &t.harness, &t.model_id)
+            })
+        })
+    {
+        selectable_unavailable_ids.insert(t.harness.clone());
+    }
+    for entry in &entries {
+        let opts = options_by_instance
+            .get(&entry.instance_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if should_offer_model_picker_setup(entry, opts) {
+            selectable_unavailable_ids.insert(entry.instance_id.clone());
+        }
+    }
+
+    let sidebar_entries = {
+        let visible: Vec<_> = entries
+            .iter()
+            .filter(|e| is_provider_instance_picker_visible(e))
+            .cloned()
+            .collect();
+        if locked_provider.is_none() {
+            visible
+        } else {
+            let mut available = Vec::new();
+            let mut disabled = Vec::new();
+            for entry in visible {
+                if matches_locked_provider(&entry, locked_provider.as_deref(), None) {
+                    available.push(entry);
+                } else {
+                    disabled.push(entry);
+                }
+            }
+            available.extend(disabled);
+            available
+        }
+    };
+
+    let mut flat_models = Vec::new();
+    for entry in &entries {
+        let opts = options_by_instance
+            .get(&entry.instance_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (catalog_index, model) in opts.iter().enumerate() {
+            if !should_include_model_picker_option(entry, model, &t.harness, &t.model_id) {
+                continue;
+            }
+            flat_models.push(ModelPickerItem {
+                slug: model.slug.clone(),
+                name: model.name.clone(),
+                short_name: model.short_name.clone(),
+                sub_provider: model.sub_provider.clone(),
+                badge: model.badge.clone(),
+                is_legacy: model.is_legacy,
+                is_unavailable: model.is_unavailable,
+                instance_id: entry.instance_id.clone(),
+                driver_kind: entry.driver_kind.clone(),
+                instance_display_name: entry.display_name.clone(),
+                continuation_group_key: entry.continuation_group_key.clone(),
+                catalog_index,
+            });
+        }
+    }
+
+    let instance_order: Vec<String> = entries.iter().map(|e| e.instance_id.clone()).collect();
+    let entry_by_id: std::collections::HashMap<&str, &crate::model_picker::ProviderInstanceEntry> =
+        entries
+            .iter()
+            .map(|e| (e.instance_id.as_str(), e))
+            .collect();
+
+    let filtered_models: Vec<ModelPickerItem> = if is_searching {
+        let candidates: Vec<ModelPickerItem> = if locked_provider.is_some() {
+            flat_models
+                .into_iter()
+                .filter(|m| {
+                    entry_by_id.get(m.instance_id.as_str()).is_some_and(|e| {
+                        matches_locked_provider(e, locked_provider.as_deref(), None)
+                    })
+                })
+                .collect()
+        } else {
+            flat_models
+        };
+        rank_model_picker_search(&candidates, &s.model_search.text, |m| {
+            ModelPickerSearchableModel {
+                driver_kind: &m.driver_kind,
+                provider_display_name: &m.instance_display_name,
+                name: &m.name,
+                short_name: m.short_name.as_deref(),
+                sub_provider: m.sub_provider.as_deref(),
+                is_favorite: favorites_set.contains(&provider_model_key(&m.instance_id, &m.slug)),
+            }
+        })
+        .into_iter()
+        .cloned()
+        .collect()
+    } else {
+        let scoped: Vec<ModelPickerItem> = flat_models
+            .into_iter()
+            .filter(|m| {
+                if locked_provider.is_some()
+                    && !entry_by_id.get(m.instance_id.as_str()).is_some_and(|e| {
+                        matches_locked_provider(e, locked_provider.as_deref(), None)
+                    })
+                {
+                    return false;
+                }
+                match &selected_tab {
+                    ModelPickerTab::Favorites => {
+                        favorites_set.contains(&provider_model_key(&m.instance_id, &m.slug))
+                    }
+                    ModelPickerTab::Instance(id) => &m.instance_id == id,
+                }
+            })
+            .collect();
+        let is_fav_tab = matches!(selected_tab, ModelPickerTab::Favorites);
+        sort_provider_model_items(
+            &scoped,
+            |m| &m.instance_id,
+            |m| &m.slug,
+            &favorites_set,
+            !is_fav_tab,
+            if is_fav_tab { &instance_order } else { &[] },
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    };
+
+    let is_fav_tab = matches!(selected_tab, ModelPickerTab::Favorites);
+    let (current_models, legacy_models) =
+        split_legacy_models(filtered_models, is_searching, is_fav_tab, &favorites_set);
+    let legacy_section = match &selected_tab {
+        ModelPickerTab::Instance(id) if !legacy_models.is_empty() => {
+            Some((id.clone(), s.expanded_legacy_instances.contains(id)))
+        }
+        _ => None,
+    };
+    let mut visible_models = current_models;
+    if let Some((_, true)) = legacy_section {
+        visible_models.extend(legacy_models);
+    }
+
+    let selected_instance_id = match &selected_tab {
+        ModelPickerTab::Instance(id) => Some(id.as_str()),
+        ModelPickerTab::Favorites => None,
+    };
+    let setup_entries: Vec<_> = if !is_searching {
+        entries
+            .iter()
+            .filter(|entry| {
+                let opts = options_by_instance
+                    .get(&entry.instance_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                matches_locked_provider(entry, locked_provider.as_deref(), None)
+                    && should_offer_model_picker_setup(entry, opts)
+                    && selected_instance_id.is_none_or(|id| entry.instance_id == id)
+                    && (selected_instance_id.is_some() || visible_models.is_empty())
+            })
+            .cloned()
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let mut update_required_notices = Vec::new();
+    for entry in &entries {
+        let shown = if is_searching {
+            matches_locked_provider(entry, locked_provider.as_deref(), None)
+        } else {
+            selected_instance_id == Some(entry.instance_id.as_str())
+        };
+        if shown
+            && let Some(notice) = crate::model_picker::format_provider_update_required_notice(
+                &entry.driver_kind,
+                &entry.display_name,
+                &entry.update_required_models,
+                &s.model_search.text,
+            )
+        {
+            update_required_notices.push((entry.instance_id.clone(), notice));
+        }
+    }
+
+    PickerSnapshot {
+        entries,
+        sidebar_entries,
+        selected_tab,
+        is_searching,
+        locked_disabled_ids,
+        selectable_unavailable_ids,
+        favorites_set,
+        visible_models,
+        legacy_section,
+        setup_entries,
+        update_required_notices,
+    }
+}
+
+/// Ported from KSG Code's `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`, and `ModelListRow.tsx`.
+fn model_list(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    max_h: f32,
+    card: El,
+    autofocus_search: bool,
+) -> El {
+    use crate::model_picker::{
+        ModelPickerTab, describe_unavailable_instance, get_display_model_name,
+        get_provider_status_message, is_provider_instance_picker_ready, provider_model_key,
+    };
+
+    let t = s.current();
+    let snap = picker_snapshot(s);
+    let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
+
+    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+        .key("model-search")
+        .label("Search models")
+        .placeholder("Search models...", p.muted)
+        .color(p.ink)
+        .caret(p.coral, p.coral_bg)
+        .grow(1.0)
+        .min_w(0.0)
+        .on_edit(|s: &mut State| &mut s.model_search)
+        // Down from the search field goes into the list, as in KSG Code's
+        // combobox; the list's own group takes the arrows from there.
+        .on_input_key(|s: &mut State, event, tx| {
+            if (event.mods.cmd || event.mods.ctrl || event.mods.alt) && crate::key(s, event, tx) {
+                return true;
+            }
+            if matches!(event.key, rune::Key::Down)
+                && !event.mods.cmd
+                && !event.mods.ctrl
+                && !event.mods.alt
+                && !event.mods.shift
+            {
+                // The field's own focus flag would win over `tx.focus`.
+                s.model_search.focused = false;
+                tx.focus("model-list", true);
+                return true;
+            }
+            false
+        });
+    if autofocus_search {
+        search_field = search_field.autofocus();
+    }
+
+    let header = row().center_y().gap(8.0).px(12.0).py(10.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.model_search, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(search_field),
+    );
+
+    let mut sidebar = col()
+        .key("harness-group")
+        .role("toolbar")
+        .label("Providers")
+        .w(44.0)
+        .shrink()
+        .padding(4.0)
+        .gap(4.0)
+        .border(0.0, Color::TRANSPARENT);
+    let fav_selected = snap.selected_tab == ModelPickerTab::Favorites;
+    sidebar = sidebar
         .child(
             row()
-                .center_y()
-                .gap(6.0)
-                .h(30.0)
-                .px(10.0)
+                .key("choose-harness-favorites")
+                .role("button")
+                .label("Favorites")
+                .help("Favorites")
+                .cursor(rune::Cursor::Pointer)
+                .w_full()
+                .h(36.0)
+                .center()
                 .radius(4.0)
-                .fill(p.selected)
-                .field_focus(&s.model_search, p)
-                .grow(1.0)
-                .min_w(0.0)
-                .child(icon("search", p.muted))
-                .child(
-                    text_input(&s.model_search, TextStyle::new(13.0, 420.0))
-                        .key("model-search")
-                        .label("Search models")
-                        .placeholder("Search models", p.muted)
-                        .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .on_edit(|s: &mut State| &mut s.model_search)
-                        // Down from the search field goes into the list, as in KSG Code's
-                        // combobox; the list's own group takes the arrows from there.
-                        .on_input_key(|s: &mut State, event, tx| {
-                            if (event.mods.cmd || event.mods.ctrl || event.mods.alt)
-                                && crate::key(s, event, tx)
-                            {
-                                return true;
-                            }
-                            if matches!(event.key, rune::Key::Down)
-                                && !event.mods.cmd
-                                && !event.mods.ctrl
-                                && !event.mods.alt
-                                && !event.mods.shift
-                            {
-                                // The field's own focus flag would win over `tx.focus`.
-                                s.model_search.focused = false;
-                                tx.focus("model-list", true);
-                                return true;
-                            }
-                            false
-                        }),
-                ),
-        );
-    let query = s.model_search.text.to_lowercase();
+                .fill(if fav_selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .on_press(|s: &mut State| {
+                    s.model_picker_tab = Some(ModelPickerTab::Favorites);
+                })
+                .child(icon("star", if fav_selected { p.brass } else { p.muted }))
+                .child(el().w(2.0).h(18.0).fill(if fav_selected {
+                    p.coral
+                } else {
+                    Color::TRANSPARENT
+                })),
+        )
+        .child(rule(p));
+
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for entry in &snap.sidebar_entries {
+        if seen.iter().any(|(earlier_id, earlier_name)| {
+            earlier_id == &entry.instance_id && earlier_name == &entry.display_name
+        }) {
+            continue;
+        }
+        let repeats = seen
+            .iter()
+            .filter(|(earlier_id, _)| earlier_id == &entry.instance_id)
+            .count();
+        seen.push((entry.instance_id.clone(), entry.display_name.clone()));
+        let key = if repeats == 0 {
+            format!("choose-harness-{}", entry.instance_id)
+        } else {
+            format!("choose-harness-{}-{}", entry.instance_id, repeats + 1)
+        };
+
+        let is_unavailable = !is_provider_instance_picker_ready(entry);
+        let is_context_disabled = snap.locked_disabled_ids.contains(&entry.instance_id);
+        let unavailable_reachable = snap.selectable_unavailable_ids.contains(&entry.instance_id);
+        let is_disabled = (is_unavailable && !unavailable_reachable) || is_context_disabled;
+        let is_selected = snap.selected_tab == ModelPickerTab::Instance(entry.instance_id.clone());
+        let tooltip = if is_unavailable {
+            describe_unavailable_instance(entry)
+        } else if is_context_disabled {
+            format!(
+                "{} is unavailable in this thread. Start a new thread to switch providers.",
+                entry.display_name
+            )
+        } else {
+            entry.display_name.clone()
+        };
+
+        let mut btn_content = col()
+            .items_center()
+            .justify_center()
+            .gap(1.0)
+            .grow(1.0)
+            .child(harness_icon(s, p, &entry.instance_id, &entry.display_name));
+        if entry.is_acp {
+            btn_content = btn_content.child(outlined(
+                pixel_text("ACP", p.muted)
+                    .key(format!("harness-tag-{}", entry.instance_id))
+                    .px(2.0)
+                    .radius(2.0),
+                p,
+            ));
+        }
+
+        let mut item = row()
+            .key(key)
+            .role("button")
+            .label(&tooltip)
+            .help(&tooltip)
+            .checked(is_selected)
+            .disabled(is_disabled)
+            .opacity(if is_disabled { 0.5 } else { 1.0 })
+            .w_full()
+            .h(if entry.is_acp { 42.0 } else { 36.0 })
+            .center_y()
+            .radius(4.0)
+            .fill(if is_selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            });
+        if !is_disabled {
+            let target_id = entry.instance_id.clone();
+            item = item
+                .cursor(rune::Cursor::Pointer)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    s.model_picker_tab = Some(ModelPickerTab::Instance(target_id.clone()));
+                });
+        }
+        item = item
+            .child(btn_content)
+            .child(el().w(2.0).h(18.0).fill(if is_selected {
+                p.coral
+            } else {
+                Color::TRANSPARENT
+            }));
+        sidebar = sidebar.child(item);
+    }
+
     let mut list = col()
         .key("model-list")
         .role("listbox")
         .label("Models")
-        // Up, Down, Home and End move through the harnesses and models, Return chooses.
         .focus_group()
         .w_full()
         .max_h(max_h)
@@ -1736,143 +2799,117 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    let mut group: Option<String> = None;
-    let mut count = 0;
-    list = list.child(
-        pixel_label("Harness", p.muted)
-            .key("harness-group")
-            .px(16.0)
-            .pt(8.0)
-            .pb(4.0),
-    );
-    let harnesses = [
-        ("pi", "Pi", false),
-        ("codex", "Codex", false),
-        ("claude", "Claude", false),
-    ]
-    .into_iter()
-    .chain(
-        s.harnesses
-            .agents
-            .iter()
-            .map(|agent| (agent.id.as_str(), agent.name.as_str(), true)),
-    );
-    let mut seen: Vec<(&str, &str)> = Vec::new();
-    for (id, name, acp) in harnesses {
-        let selected = t.harness == id;
-        let available = id != "claude" || acp || crate::claude::process().is_ok();
-        let enabled = t.can_choose_harness() && available;
-        let chosen = id.to_owned();
-        // An ACP agent can share an id with a built-in harness. One with the same name too is
-        // the same entry and is not listed twice. One with another name is listed with its
-        // ACP tag, and its key gets a suffix so keys stay unique.
-        if seen.contains(&(id, name)) {
-            continue;
-        }
-        let repeats = seen.iter().filter(|&&(earlier, _)| earlier == id).count();
-        seen.push((id, name));
-        let key = if repeats == 0 {
-            format!("choose-harness-{id}")
+
+    if let Some(error) = &s.harnesses.error {
+        list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
+    }
+
+    let mut jump_num = 0usize;
+    for (index, model) in snap.visible_models.iter().enumerate() {
+        let disabled_reason = if !can_choose {
+            Some("Model picker is disabled".to_owned())
         } else {
-            format!("choose-harness-{id}-{}", repeats + 1)
+            s.model_disabled_reason_for(&model.instance_id, &model.slug)
         };
-        let mut item = row()
-            .key(key)
-            .role("option")
-            .label(name)
-            .checked(selected)
-            .focusable(enabled)
-            .center_y()
-            .gap(10.0)
-            .h(34.0)
-            // Inset 4 px from the frame, with the same 16 px text edge as the headings.
-            .mx(4.0)
-            .pl(12.0)
-            .pr(8.0)
-            .radius(4.0)
-            .fill(if selected {
-                p.coral_bg
-            } else {
-                Color::TRANSPARENT
-            })
-            .hover(if selected { p.coral_bg } else { p.selected })
-            // Arrow keys show where they are with the hover wash.
-            .focus_fill(p.selected)
-            .focus_selected(selected)
-            .disabled(!enabled)
-            .child(harness_icon(s, p, id, name))
-            .child(
-                label(name, TextStyle::new(13.5, 450.0), p.ink)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            );
-        if acp {
-            // KSG Code's `ModelListRow` "New" tag, here naming the protocol the agent speaks.
-            item = item.child(outlined(
-                pixel_text("ACP", p.muted)
-                    .key(format!("harness-tag-{id}"))
+        let enabled = disabled_reason.is_none();
+        let jump_label = if enabled && jump_num < 9 {
+            jump_num += 1;
+            Some(format!("⌘{jump_num}"))
+        } else {
+            None
+        };
+        let is_favorite = snap
+            .favorites_set
+            .contains(&provider_model_key(&model.instance_id, &model.slug));
+        let selected = t.harness == model.instance_id && t.model_id == model.slug;
+        let display_name = get_display_model_name(
+            &model.name,
+            model.short_name.as_deref(),
+            model.sub_provider.as_deref(),
+            false,
+        );
+
+        let mut name_row = row().center_y().gap(6.0).grow(1.0).min_w(0.0).child(
+            label(&display_name, TextStyle::new(13.5, 450.0), p.ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+        if selected {
+            name_row = name_row.child(icon("check", p.sea));
+        }
+        if let Some(sub) = &model.sub_provider {
+            name_row = name_row.child(label(sub, SMALL, p.muted).truncate().shrink().min_w(0.0));
+        }
+        if model.badge.as_deref() == Some("new") {
+            name_row = name_row.child(outlined(
+                pixel_text("New", p.coral)
+                    .label("New model")
                     .px(4.0)
                     .py(1.0)
                     .radius(4.0),
                 p,
             ));
         }
-        item = item.child(spacer());
-        if selected {
-            item = item.child(icon("check", p.sea));
+        if model.is_unavailable {
+            name_row = name_row.child(outlined(
+                pixel_text("Unavailable", p.muted)
+                    .px(4.0)
+                    .py(1.0)
+                    .radius(4.0),
+                p,
+            ));
         }
+
+        let fav_provider = model.instance_id.clone();
+        let fav_slug = model.slug.clone();
+        let mut star_btn = row()
+            .key(format!("toggle-favorite-{index}"))
+            .role("button")
+            .label(if is_favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            })
+            .help(if is_favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            })
+            .focusable(false)
+            .size(22.0, 22.0)
+            .center()
+            .radius(4.0)
+            .disabled(!enabled)
+            .child(icon(
+                if is_favorite { "star" } else { "star-off" },
+                if is_favorite { p.brass } else { p.muted },
+            ));
         if enabled {
-            item = item
+            star_btn = star_btn
                 .cursor(rune::Cursor::Pointer)
+                .hover(p.selected)
                 .on_press(move |s: &mut State| {
-                    s.choose_harness(&chosen);
+                    s.toggle_model_favorite(&fav_provider, &fav_slug);
                 });
         }
-        list = list.child(item);
-        if !available {
-            list = list.child(
-                label(crate::claude::MISSING, SMALL, p.muted)
-                    .key("claude-unavailable")
-                    .wrap()
-                    .px(16.0)
-                    .py(4.0),
-            );
+
+        let mut trailing = row().center_y().gap(6.0).shrink().child(star_btn);
+        if let Some(jump) = jump_label {
+            trailing = trailing.child(keycap_chip(&jump, p));
         }
-    }
-    if let Some(error) = &s.harnesses.error {
-        list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
-    }
-    for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
-        format!("{} {} {}", m.provider, m.id, m.name)
-            .to_lowercase()
-            .contains(&query)
-    }) {
-        count += 1;
-        let (name, route) = split_model_label(&model.name);
-        let heading = route.map_or_else(|| model.provider.to_uppercase(), str::to_string);
-        if group.as_deref() != Some(heading.as_str()) {
-            list = list.child(
-                label(&heading, TextStyle::new(11.5, 600.0), p.muted)
-                    .px(16.0)
-                    .pt(8.0)
-                    .pb(4.0),
-            );
-            group = Some(heading);
-        }
-        let provider = model.provider.clone();
-        let id = model.id.clone();
-        let selected = t.model_provider == model.provider && t.model_id == model.id;
+
         let mut item = row()
             .key(format!("choose-model-{index}"))
             .role("option")
-            .label(&model.name)
+            .label(format!("{display_name}, {}", model.instance_display_name))
             .checked(selected)
-            .focusable(can_choose)
+            .focusable(enabled)
+            .disabled(!enabled)
+            .opacity(if enabled { 1.0 } else { 0.55 })
             .center_y()
-            .gap(10.0)
+            .gap(8.0)
             .h(34.0)
-            // Inset 4 px from the frame, with the same 16 px text edge as the headings.
             .mx(4.0)
             .pl(12.0)
             .pr(8.0)
@@ -1885,39 +2922,115 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .hover(if selected { p.coral_bg } else { p.selected })
             .focus_fill(p.selected)
             .focus_selected(selected)
-            .disabled(!can_choose)
             .child(provider_icon(
                 s,
                 p,
-                model_vendor(&model.id, &model.name),
+                model_vendor(&model.slug, &model.name),
                 16.0,
             ))
-            .child(
-                label(name, TextStyle::new(13.5, 450.0), p.ink)
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            );
-        if selected {
-            item = item.child(icon("check", p.sea));
+            .child(name_row)
+            .child(trailing);
+        if let Some(reason) = &disabled_reason {
+            item = item.help(reason);
         }
-        if can_choose {
+        if enabled {
+            let instance_id = model.instance_id.clone();
+            let id = model.slug.clone();
             item = item
                 .cursor(rune::Cursor::Pointer)
                 .on_press(move |s: &mut State| {
-                    s.current_mut().set_model(provider.clone(), id.clone());
+                    s.select_model_from_picker(&instance_id, &id);
                     s.settings_picker = Some(SettingsPicker::Thinking);
-                    s.checkpoint();
                 });
         }
         list = list.child(item);
     }
-    if count == 0 {
-        let pi_error = (t.harness == "pi" && t.models.is_empty())
-            .then_some(s.catalog.error.as_deref())
-            .flatten();
-        // The harnesses end here and the models begin: a rule and a heading, so the note is
-        // plainly about models and not about the last harness.
+
+    if let Some((instance_id, expanded)) = &snap.legacy_section {
+        let toggle_id = instance_id.clone();
+        list = list.child(
+            row()
+                .key(format!("legacy-models-{instance_id}"))
+                .role("option")
+                .label(if *expanded { "Show less" } else { "Show more" })
+                .focusable(true)
+                .center_y()
+                .h(32.0)
+                .mx(4.0)
+                .px(12.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .focus_fill(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    if !s.expanded_legacy_instances.remove(&toggle_id) {
+                        s.expanded_legacy_instances.insert(toggle_id.clone());
+                    }
+                })
+                .child(label(
+                    if *expanded { "Show less" } else { "Show more" },
+                    TextStyle::new(13.0, 450.0),
+                    p.muted,
+                )),
+        );
+    }
+
+    let selected_id = match &snap.selected_tab {
+        ModelPickerTab::Instance(id) => Some(id.as_str()),
+        ModelPickerTab::Favorites => None,
+    };
+    let active_harness = selected_id.unwrap_or(&t.harness);
+    let (pi_loading, pi_error) = if active_harness == "pi" {
+        s.pi_catalog_status()
+    } else {
+        (false, None)
+    };
+    let (native_loading, native_error) = s.native_catalog_status(active_harness);
+    let catalog_loading =
+        pi_loading || (matches!(active_harness, "codex" | "claude") && native_loading);
+    let catalog_error = pi_error.or(native_error);
+
+    if snap.visible_models.is_empty() && snap.setup_entries.is_empty() {
+        let empty_text = if snap.is_searching {
+            "No models found"
+        } else if snap.selected_tab == ModelPickerTab::Favorites {
+            "No favorites yet"
+        } else if active_harness == "claude"
+            && snap
+                .entries
+                .iter()
+                .find(|e| e.instance_id == "claude")
+                .is_some_and(|e| !e.installed)
+        {
+            crate::claude::MISSING
+        } else if matches!(active_harness, "codex" | "claude") {
+            if native_loading {
+                "Reading the harness catalog..."
+            } else if let Some(err) = native_error {
+                err
+            } else {
+                "Catalog not available. Models will be read when a session starts."
+            }
+        } else if active_harness != "pi" {
+            "This harness uses its configured model until it reports available models."
+        } else if let Some(error) = pi_error {
+            error
+        } else if s.catalog.remaining().is_some() {
+            "Reading the CPA catalog..."
+        } else {
+            "No CPA models are available."
+        };
+        let note_key = if active_harness == "claude"
+            && snap
+                .entries
+                .iter()
+                .find(|e| e.instance_id == "claude")
+                .is_some_and(|e| !e.installed)
+        {
+            "claude-unavailable"
+        } else {
+            "models-empty-note"
+        };
         list = list
             .child(rule(p).mt(6.0))
             .child(
@@ -1929,37 +3042,117 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             )
             .child(
                 label(
-                    if matches!(t.harness.as_str(), "codex" | "claude") && t.models.is_empty() {
-                        if s.native_catalog_status(&t.harness).0 {
-                            "Reading the harness catalog..."
-                        } else {
-                            "Catalog not available. Models will be read when a session starts."
-                        }
-                    } else if t.harness != "pi" && t.models.is_empty() {
-                        "This harness uses its configured model until it reports available models."
-                    } else if let Some(error) = pi_error {
-                        error
-                    } else if t.models.is_empty() && s.catalog.remaining().is_some() {
-                        "Reading the CPA catalog..."
-                    } else if t.models.is_empty() {
-                        "No CPA models are available."
-                    } else {
-                        "No matching models."
-                    },
+                    empty_text,
                     SMALL,
-                    if pi_error.is_some() {
+                    if catalog_error.is_some() {
                         p.danger
                     } else {
                         p.muted
                     },
                 )
-                .key("models-empty-note")
+                .key(note_key)
                 .wrap()
                 .px(16.0)
                 .py(10.0),
             );
+        if catalog_error.is_some() {
+            list = list.child(
+                button("retry-catalog", "Retry", p, |s| s.force_refresh_catalog())
+                    .ml(12.0)
+                    .mb(8.0),
+            );
+        }
     }
-    card.child(header).child(rule(p)).child(list)
+
+    let mut right_col = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .child(header)
+        .child(rule(p))
+        .child(list);
+
+    if catalog_loading && !snap.visible_models.is_empty() {
+        right_col = right_col.child(rule(p)).child(
+            label("Refreshing models...", SMALL, p.muted)
+                .key("catalog-loading")
+                .px(12.0)
+                .py(6.0),
+        );
+    }
+    if let Some(error) = catalog_error
+        && !snap.visible_models.is_empty()
+    {
+        right_col = right_col.child(rule(p)).child(
+            col()
+                .gap(4.0)
+                .px(12.0)
+                .py(6.0)
+                .child(label(error, SMALL, p.danger).wrap_anywhere())
+                .child(button("retry-catalog", "Retry", p, |s| {
+                    s.force_refresh_catalog()
+                })),
+        );
+    }
+
+    if !snap.setup_entries.is_empty() {
+        let mut setup_box = col()
+            .gap(6.0)
+            .px(12.0)
+            .py(8.0)
+            .border(0.0, Color::TRANSPARENT);
+        let multi = snap.setup_entries.len() > 1;
+        for entry in &snap.setup_entries {
+            let btn_label = if multi {
+                format!("Set up {}", entry.display_name)
+            } else {
+                "Open provider setup".to_owned()
+            };
+            setup_box = setup_box.child(
+                col()
+                    .gap(4.0)
+                    .child(label(get_provider_status_message(entry), SMALL, p.muted).wrap())
+                    .child(button(
+                        &format!("open-provider-setup-{}", entry.instance_id),
+                        &btn_label,
+                        p,
+                        |s| {
+                            s.settings_picker = None;
+                            s.open_settings();
+                            s.settings.section = 2;
+                        },
+                    )),
+            );
+        }
+        right_col = right_col.child(rule(p)).child(setup_box);
+    }
+
+    for (instance_id, notice) in &snap.update_required_notices {
+        right_col = right_col.child(rule(p)).child(
+            col()
+                .key(format!("update-required-notice-{instance_id}"))
+                .gap(4.0)
+                .px(12.0)
+                .py(8.0)
+                .child(label(notice, SMALL, p.muted).wrap())
+                .child(button(
+                    &format!("provider-settings-{instance_id}"),
+                    "Provider settings",
+                    p,
+                    |s| {
+                        s.settings_picker = None;
+                        s.open_settings();
+                        s.settings.section = 2;
+                    },
+                )),
+        );
+    }
+
+    let mut body = row().w_full().min_w(0.0);
+    if show_sidebar {
+        body = body.child(sidebar).child(el().w(1.0).h_full().fill(p.line));
+    }
+    body = body.child(right_col);
+    card.child(body)
 }
 
 /// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
@@ -2205,6 +3398,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
                     .field_focus(&s.search, p)
                     .hover(p.selected)
+                    .on_layout_tx(|s: &mut State, _rect, tx| {
+                        if !s.sync_sidebar_search_input() {
+                            tx.live_only();
+                        }
+                    })
                     .child(icon("search", p.muted))
                     .child(
                         text_input(&s.search, LABEL)
@@ -2240,6 +3438,23 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     }),
             ),
     );
+    if !s.search.text.is_empty() && !s.sidebar_search.unsupported_servers.is_empty() {
+        side = side.child(
+            label(
+                format!(
+                    "Titles only on {} (update required)",
+                    s.sidebar_search.unsupported_servers.join(", ")
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key("sidebar-search-unsupported")
+            .help(crate::protocol::THREAD_SEARCH_UPDATE_REQUIRED)
+            .px(ROW_INSET)
+            .pb(4.0)
+            .truncate(),
+        );
+    }
     // A workspace filter names itself and clears in one click.
     if scoped {
         side = side.child(
@@ -2387,120 +3602,131 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         }
     }
     let mut first_shelf = true;
-    for section in [
-        Section::Pinned,
-        Section::Active,
-        Section::Snoozed,
-        Section::Settled,
-    ] {
-        let rows: Vec<_> = all
+    if !s.search.text.is_empty() {
+        for entry in all
             .iter()
             .copied()
-            .filter(|entry| {
-                !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
-            })
-            .collect();
-        let shelf = match section {
-            Section::Snoozed => Some(0),
-            Section::Settled => Some(1),
-            _ => None,
-        };
-        if let Some(shelf) = shelf {
-            // Settled stays visible as a drop target while dragging, even when empty.
-            if rows.is_empty() && !(section == Section::Settled && dragging) {
-                continue;
-            }
-            // The first shelf takes the remaining height above it, so the shelves sit at the
-            // bottom of the sidebar as in T3 Code.
-            if first_shelf {
-                content = content.child(spacer().min_h(12.0));
-                first_shelf = false;
-            }
-            let key = format!("shelf-{section:?}");
-            let title = format!("{section:?}");
-            let marker = format!("drop-{section:?}");
-            let open = s.shelves[shelf];
-            // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
-            // above Settled, so both stay whole above the footer when the list is longer than
-            // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
-            // The block carries its rule and the sidebar fill, so rows never show through.
-            let settled_below = section == Section::Snoozed
-                && (dragging
-                    || all.iter().any(|entry| {
-                        !entry.draft
-                            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
-                    }));
-            let inset = if settled_below { SHELF_HEADING } else { 0.0 };
-            content = content.child(
-                col()
-                    .key(format!("shelf-block-{section:?}"))
-                    .h(SHELF_HEADING)
-                    .fill(p.bg)
-                    .sticky_bottom(inset)
-                    .child(dotted_rule(p))
-                    .child(
-                        row()
-                            .key(&key)
-                            .role("button")
-                            .cursor(rune::Cursor::Pointer)
-                            .label(format!("{title}, {} threads", rows.len()))
-                            .focusable(true)
-                            .h(32.0)
-                            .pl(ROW_INSET)
-                            .pr(8.0)
-                            .gap(6.0)
-                            .center_y()
-                            .radius(4.0)
-                            .hover(p.selected)
-                            .on_drawn_layout(move |s: &mut State, rect| {
-                                s.drop_rects.insert(marker.clone(), rect);
-                            })
-                            .on_press(move |s: &mut State| {
-                                s.shelves[shelf] = !s.shelves[shelf];
-                                s.checkpoint();
-                            })
-                            .child(pixel_label(&title, p.muted))
-                            .child(spacer())
-                            .child(pixel_text(rows.len().to_string(), p.muted))
-                            .child(icon(if open { "chevron" } else { "open" }, p.muted)),
-                    ),
-            );
-        } else if dragging {
-            let marker = format!("drop-{section:?}");
-            let selected = s.drag_target.is_some_and(|(to, _)| to == section);
-            content = content.child(
-                row()
-                    .key(&marker)
-                    .h(28.0)
-                    .px(8.0)
-                    .center_y()
-                    .fill(if selected { p.coral_bg } else { p.selected })
-                    .on_drawn_layout(move |s: &mut State, rect| {
-                        s.drop_rects.insert(marker.clone(), rect);
-                    })
-                    .child(pixel_label(&format!("{section:?}"), p.muted)),
-            );
-        }
-        let limit = if section == Section::Settled && s.search.text.is_empty() {
-            s.settled_visible
-        } else {
-            usize::MAX
-        };
-        for entry in rows
-            .iter()
-            .copied()
-            .filter(|entry| entry.visible)
-            .take(limit)
+            .filter(|entry| !entry.draft && entry.visible)
         {
             content = content.child(sidebar_ui::row(s, p, entry));
         }
-        if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
-            content = content.child(button(
-                "settled-more",
-                &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
-                p,
-                |s| s.settled_visible += 25,
-            ));
+    } else {
+        for section in [
+            Section::Pinned,
+            Section::Active,
+            Section::Snoozed,
+            Section::Settled,
+        ] {
+            let rows: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
+                })
+                .collect();
+            let shelf = match section {
+                Section::Snoozed => Some(0),
+                Section::Settled => Some(1),
+                _ => None,
+            };
+            if let Some(shelf) = shelf {
+                // Settled stays visible as a drop target while dragging, even when empty.
+                if rows.is_empty() && !(section == Section::Settled && dragging) {
+                    continue;
+                }
+                // The first shelf takes the remaining height above it, so the shelves sit at the
+                // bottom of the sidebar as in T3 Code.
+                if first_shelf {
+                    content = content.child(spacer().min_h(12.0));
+                    first_shelf = false;
+                }
+                let key = format!("shelf-{section:?}");
+                let title = format!("{section:?}");
+                let marker = format!("drop-{section:?}");
+                let open = s.shelves[shelf];
+                // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
+                // above Settled, so both stay whole above the footer when the list is longer than
+                // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
+                // The block carries its rule and the sidebar fill, so rows never show through.
+                let settled_below = section == Section::Snoozed
+                    && (dragging
+                        || all.iter().any(|entry| {
+                            !entry.draft
+                                && lifecycle::section(&entry.life, lifecycle::now())
+                                    == Section::Settled
+                        }));
+                let inset = if settled_below { SHELF_HEADING } else { 0.0 };
+                content = content.child(
+                    col()
+                        .key(format!("shelf-block-{section:?}"))
+                        .h(SHELF_HEADING)
+                        .fill(p.bg)
+                        .sticky_bottom(inset)
+                        .child(dotted_rule(p))
+                        .child(
+                            row()
+                                .key(&key)
+                                .role("button")
+                                .cursor(rune::Cursor::Pointer)
+                                .label(format!("{title}, {} threads", rows.len()))
+                                .focusable(true)
+                                .h(32.0)
+                                .pl(ROW_INSET)
+                                .pr(8.0)
+                                .gap(6.0)
+                                .center_y()
+                                .radius(4.0)
+                                .hover(p.selected)
+                                .on_drawn_layout(move |s: &mut State, rect| {
+                                    s.drop_rects.insert(marker.clone(), rect);
+                                })
+                                .on_press(move |s: &mut State| {
+                                    s.shelves[shelf] = !s.shelves[shelf];
+                                    s.checkpoint();
+                                })
+                                .child(pixel_label(&title, p.muted))
+                                .child(spacer())
+                                .child(pixel_text(rows.len().to_string(), p.muted))
+                                .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                        ),
+                );
+            } else if dragging {
+                let marker = format!("drop-{section:?}");
+                let selected = s.drag_target.is_some_and(|(to, _)| to == section);
+                content = content.child(
+                    row()
+                        .key(&marker)
+                        .h(28.0)
+                        .px(8.0)
+                        .center_y()
+                        .fill(if selected { p.coral_bg } else { p.selected })
+                        .on_drawn_layout(move |s: &mut State, rect| {
+                            s.drop_rects.insert(marker.clone(), rect);
+                        })
+                        .child(pixel_label(&format!("{section:?}"), p.muted)),
+                );
+            }
+            let limit = if section == Section::Settled && s.search.text.is_empty() {
+                s.settled_visible
+            } else {
+                usize::MAX
+            };
+            for entry in rows
+                .iter()
+                .copied()
+                .filter(|entry| entry.visible)
+                .take(limit)
+            {
+                content = content.child(sidebar_ui::row(s, p, entry));
+            }
+            if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
+                content = content.child(button(
+                    "settled-more",
+                    &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
+                    p,
+                    |s| s.settled_visible += 25,
+                ));
+            }
         }
     }
     if captains.is_empty() && (all.is_empty() || !s.search.text.is_empty() && visible.is_empty()) {
@@ -3429,10 +4655,80 @@ fn row_status(s: &State, thread: &Thread) -> (Status, bool) {
         Status::Waiting
     } else if s.is_captain_home(thread) {
         s.home_status(id)
+    } else if thread.status == Status::Ready
+        && (thread.client_creating.is_some()
+            || thread.remote_send.is_some()
+            || thread.client_promoted.is_some())
+    {
+        Status::Running
     } else {
         thread.status
     };
     (status, approval)
+}
+
+/// Ported from KSG Code's `Toasts` (`components/ui/toast.tsx`) and `stackedThreadToast`,
+/// styled with Shina's Pixel Voyage framed card.
+fn toast_stack(s: &State, p: Palette, top: f32) -> El {
+    let mut stack = col()
+        .key("toast-stack")
+        .pin(Some(top + 8.0), Some(16.0), None, None)
+        .w((s.viewport_width - 32.0).clamp(240.0, 360.0))
+        .gap(8.0);
+    for toast in s.toasts.iter().rev() {
+        let id = toast.id;
+        let (glyph_name, ink) = match toast.kind {
+            crate::model::ToastKind::Success => ("check", p.sea),
+            crate::model::ToastKind::Warning => ("alert", p.brass),
+            crate::model::ToastKind::Error => ("alert", p.danger),
+        };
+        let mut card = col()
+            .key(format!("toast-{id}"))
+            .role("status")
+            .label(toast.title.clone())
+            .w_full()
+            .padding(12.0)
+            .gap(6.0)
+            .radius(6.0)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .box_shadow(hard_shadow(p))
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(icon(glyph_name, ink))
+                    .child(
+                        label(&toast.title, TextStyle::new(13.0, 600.0), p.ink)
+                            .wrap()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(icon_button(
+                        &format!("toast-close-{id}"),
+                        "Dismiss",
+                        "close",
+                        p,
+                        move |s| {
+                            s.dismiss_toast(id);
+                        },
+                    )),
+            );
+        if let Some(description) = &toast.description {
+            card = card.child(label(description, SMALL, p.muted).wrap().selectable(true));
+        }
+        if let Some(action_label) = &toast.action_label {
+            card = card.child(row().w_full().justify_end().child(button(
+                &format!("toast-action-{id}"),
+                action_label,
+                p,
+                move |s| s.activate_toast(id),
+            )));
+        }
+        stack = stack.child(card);
+    }
+    stack
 }
 
 /// The portrait a captain wears; threads without a profile wear the first.
@@ -3548,8 +4844,20 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .radius(4.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
-        .on_press_tx(move |s: &mut State, tx| {
-            s.click_thread(index, tx.mods());
+        .on_press_tx({
+            let content_match = !s.search.text.is_empty()
+                && !s.thread_title_search_matches(thread)
+                && s.sidebar_search
+                    .visible_matches
+                    .contains_key(&(s.machines.selected.clone(), id));
+            let server = s.machines.selected.clone();
+            move |s: &mut State, tx| {
+                if content_match {
+                    s.open_thread_at_search_match(&server, id);
+                } else {
+                    s.click_thread(index, tx.mods());
+                }
+            }
         })
         .on_double_press(move |s: &mut State| s.begin_rename(id))
         .on_key(move |s: &mut State, ev, _| {
@@ -3847,17 +5155,56 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .child(spacer()),
         )
         .child(slot);
-    item.child(
-        col()
-            .grow(1.0)
-            .min_w(0.0)
-            .px(ROW_INSET)
-            .pt(9.0)
-            .pb(10.0)
-            .gap(5.0)
-            .child(top)
-            .child(row().child(title)),
-    )
+    let mut card = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .px(ROW_INSET)
+        .pt(9.0)
+        .pb(10.0)
+        .gap(5.0)
+        .child(top)
+        .child(row().child(title));
+    if !shelved
+        && !s.search.text.is_empty()
+        && !s.thread_title_search_matches(thread)
+        && let Some(hit) = s
+            .sidebar_search
+            .visible_matches
+            .get(&(s.machines.selected.clone(), id))
+    {
+        card = card.child(search_snippet_el(
+            &s.machines.selected,
+            id,
+            &hit.snippet,
+            &s.search.text,
+            p.muted,
+            p.brass,
+        ));
+    }
+    item.child(card)
+}
+
+pub(super) fn search_snippet_el(
+    server: &str,
+    id: usize,
+    snippet: &str,
+    query: &str,
+    muted: Color,
+    brass: Color,
+) -> El {
+    let ranges = crate::thread_search::find_snippet_token_ranges(snippet, query);
+    let mut lbl = label(snippet, SMALL, muted)
+        .key(format!("sidebar-search-snippet-{server}-{id}"))
+        .truncate()
+        .min_w(0.0);
+    if !ranges.is_empty() {
+        lbl = lbl.text_highlights(
+            ranges
+                .into_iter()
+                .map(|r| rune::TextHighlight::new(r, brass.alpha(0.32))),
+        );
+    }
+    lbl
 }
 
 /// The least width of a shelved row's status slot: room for "10m" and "1d".
@@ -7007,9 +8354,12 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         return work_ui::plan_card(s, p, index);
     }
     let title = tool_title(tool);
+    let tool_id = tool.id.clone();
+    let line_key = format!("inline-tool-{}-{index}", t.id);
+    let press_key = line_key.clone();
     let mut content = col().gap(4.0).child(
         activity_line(
-            format!("inline-tool-{}-{index}", t.id),
+            line_key,
             format!(
                 "{} output for {title}",
                 if tool.expanded { "Hide" } else { "Show" }
@@ -7020,9 +8370,16 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             work_ui::kind_icon(tool.resolved_kind()),
             p,
         )
-        .on_press(move |s: &mut State| {
-            let tool = &mut s.current_mut().tools[index];
-            tool.expanded = !tool.expanded;
+        .on_press_tx(move |s: &mut State, tx| {
+            tx.keep_on_screen(press_key.clone());
+            if let Some(tool) = s
+                .current_mut()
+                .tools
+                .iter_mut()
+                .find(|tool| tool.id == tool_id)
+            {
+                tool.expanded = !tool.expanded;
+            }
         }),
     );
     if !tool.subagents.is_empty() {
@@ -7041,15 +8398,18 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     let t = s.current();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
+    let first_id = tools[0].id.clone();
     let expanded = tools[0].group_expanded;
     let failed = tools.iter().filter(|tool| tool.failed).count();
     let summary = tool_summary(&tools);
+    let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
+    let press_key = toggle_key.clone();
     let mut group = col()
         .key(format!("tool-group-{}-{first}", t.id))
         .gap(2.0)
         .child(
             activity_line(
-                format!("toggle-tool-group-{}-{first}", t.id),
+                toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
                 (summary.clone(), ""),
                 failed > 0,
@@ -7057,9 +8417,16 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
                 "list",
                 p,
             )
-            .on_press(move |s: &mut State| {
-                let tool = &mut s.current_mut().tools[first];
-                tool.group_expanded = !tool.group_expanded;
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.keep_on_screen(press_key.clone());
+                if let Some(tool) = s
+                    .current_mut()
+                    .tools
+                    .iter_mut()
+                    .find(|tool| tool.id == first_id)
+                {
+                    tool.group_expanded = !tool.group_expanded;
+                }
             }),
         );
     if expanded {
@@ -7072,7 +8439,13 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
-fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
+fn transcript_part(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    part: &TranscriptPart,
+    occ_base: &mut usize,
+) -> El {
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
@@ -7082,14 +8455,34 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
+            let message_id = &t.messages[*message].id;
             let offset = *from;
             let thread_id = t.id;
             let streaming = t.status == Status::Running && message + 1 == t.messages.len();
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let mut active_occ = None;
+            let find_param = find_query.map(|query| {
+                let hits = crate::thread_find::find_markdown_occurrences(chunk, query).len();
+                active_occ = s
+                    .thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == *message_id)
+                    .and_then(|m| {
+                        (m.occurrence >= *occ_base && m.occurrence < *occ_base + hits)
+                            .then_some(m.occurrence - *occ_base)
+                    });
+                *occ_base += hits;
+                (query, active_occ)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
             memo(
                 format!("message-{}-{message}-body-{from}", t.id),
-                (chunk, s.dark, streaming, wide),
+                (chunk, s.dark, streaming, wide, memo_find),
                 || {
-                    markdown_ui::render(
+                    markdown_ui::render_with_find(
                         chunk,
                         p,
                         s.dark,
@@ -7097,6 +8490,7 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
                         false,
                         streaming,
                         &format!("{thread_id}-{message_index}-{offset}"),
+                        find_param,
                     )
                 },
             )
@@ -7174,19 +8568,43 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 )),
         );
     }
+    let mut occ_base = 0usize;
+    let mut part_occs = vec![0usize; parts.len()];
+    if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+        let query = s.thread_find.query.text.trim();
+        let mut last_msg = None;
+        for (i, part) in parts.iter().enumerate() {
+            if let TranscriptPart::Text { message, from, to } = part {
+                if last_msg != Some(*message) {
+                    occ_base = 0;
+                    last_msg = Some(*message);
+                }
+                part_occs[i] = occ_base;
+                occ_base += crate::thread_find::find_markdown_occurrences(
+                    &t.messages[*message].text[*from..*to],
+                    query,
+                )
+                .len();
+            }
+        }
+    }
+    let render_part = |part_index: usize| {
+        let mut base = part_occs[part_index];
+        transcript_part(s, p, wide, &parts[part_index], &mut base)
+    };
     if let Some(index) = preamble {
-        response = response.child(transcript_part(s, p, wide, &parts[index]));
+        response = response.child(render_part(index));
     } else if live && last_work.is_none() {
         // Until Pi emits work, streamed text is the preamble.
-        for part in &parts {
-            response = response.child(transcript_part(s, p, wide, part));
+        for index in 0..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     let work_rows = |mut rows: El, lift_cards: bool| {
         if let Some(last) = last_work {
             for (index, part) in parts[..=last].iter().enumerate() {
                 if Some(index) != preamble && !(lift_cards && card(part)) {
-                    let row = transcript_part(s, p, wide, part);
+                    let row = render_part(index);
                     // Prose between tool rows keeps its paragraph rhythm and the lane's one
                     // left margin. Tool rows are indented as a group by the same amount while
                     // the turn runs and after it ends, so nothing jumps when it finishes.
@@ -7253,12 +8671,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
             (false, None) => "Worked".into(),
         };
+        let toggle_key = format!("toggle-work-{}-{start}", t.id);
+        let press_key = toggle_key.clone();
+        let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
             .gap(4.0)
             .child(
                 activity_line(
-                    format!("toggle-work-{}-{start}", t.id),
+                    toggle_key,
                     format!(
                         "{} work section. {title}",
                         if expanded { "Collapse" } else { "Expand" }
@@ -7269,14 +8690,19 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     "clock",
                     p,
                 )
-                .on_press(move |s: &mut State| {
+                .on_press_tx(move |s: &mut State, tx| {
+                    tx.keep_on_screen(press_key.clone());
                     let t = s.current_mut();
-                    match t.work.iter_mut().find(|work| work.start == start) {
+                    let current_start = turn_msg_id
+                        .as_deref()
+                        .and_then(|id| t.messages.iter().position(|m| m.id == id))
+                        .unwrap_or(start);
+                    match t.work.iter_mut().find(|work| work.start == current_start) {
                         Some(work) => work.expanded = !work.expanded,
                         // Turns from before work records existed fold too; opening one
                         // records it.
                         None => t.work.push(crate::model::AssistantWork {
-                            start,
+                            start: current_start,
                             stopped: false,
                             stopped_order: 0,
                             expanded: true,
@@ -7294,37 +8720,443 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         }
         response = response.child(section);
         if let Some(last) = last_work {
-            for part in parts[..=last].iter().filter(|part| card(part)) {
-                response = response.child(transcript_part(s, p, wide, part));
+            for (index, part) in parts[..=last].iter().enumerate() {
+                if card(part) {
+                    response = response.child(render_part(index));
+                }
             }
         }
     }
     if !live || last_work.is_some() {
-        for part in &parts[last_work.map_or(0, |index| index + 1)..] {
-            response = response.child(transcript_part(s, p, wide, part));
+        let from = last_work.map_or(0, |index| index + 1);
+        for index in from..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     response
 }
 
-/// The transcript, laid out in KSG Code's chat lane (`MessagesTimeline`'s
-/// `.chat-content-lane` inside `.messages-timeline-scroll`): 46 rem of content, centred, with
-/// 0.75 rem gutters below 640 px and 3 rem from there up. `pane_width` is the chat column's.
+/// Ported from KSG Code's `TimelineHistoryControl` (`MessagesTimeline.tsx`).
+fn history_control(s: &State, p: Palette) -> Option<El> {
+    let t = s.current();
+    if !t.history_has_more && t.history_error.is_none() {
+        return None;
+    }
+    let thread_id = t.id;
+    let mut section = col()
+        .key(format!("history-control-{thread_id}"))
+        .w_full()
+        .gap(6.0)
+        .pb(8.0);
+    if t.history_has_more {
+        let loading = t.history_loading;
+        let text = if loading {
+            "Loading earlier turns…"
+        } else {
+            "Load earlier turns"
+        };
+        let mut btn = row()
+            .key("history-load-earlier")
+            .role("button")
+            .label("Load earlier turns")
+            .w_full()
+            .py(6.0)
+            .gap(12.0)
+            .center_y()
+            .disabled(loading)
+            .child(el().h(1.0).grow(1.0).fill(p.line))
+            .child(label(text, SMALL, p.muted))
+            .child(el().h(1.0).grow(1.0).fill(p.line));
+        if !loading {
+            btn = btn
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| s.load_earlier_history(thread_id, None));
+        }
+        section = section.child(btn);
+    }
+    if let Some(err) = &t.history_error {
+        section = section.child(
+            label(err, SMALL, p.muted)
+                .key("history-load-error")
+                .role("status")
+                .align(rune::Align::Center)
+                .wrap()
+                .w_full(),
+        );
+    }
+    Some(section)
+}
+
+#[derive(Clone)]
+enum TimelineRow {
+    HistoryControl {
+        key: String,
+    },
+    Boundary {
+        message_index: usize,
+        key: String,
+    },
+    UserOrSystem {
+        index: usize,
+        message_id: String,
+        key: String,
+    },
+    AssistantTurn {
+        start: usize,
+        end: usize,
+        key: String,
+    },
+    LiveTurn {
+        start: usize,
+        key: String,
+    },
+}
+
+impl TimelineRow {
+    fn key(&self) -> &str {
+        match self {
+            Self::HistoryControl { key }
+            | Self::Boundary { key, .. }
+            | Self::UserOrSystem { key, .. }
+            | Self::AssistantTurn { key, .. }
+            | Self::LiveTurn { key, .. } => key,
+        }
+    }
+}
+
+fn push_unique_row_key(seen: &mut std::collections::HashSet<String>, base: String) -> String {
+    if seen.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if t.history_has_more || t.history_error.is_some() {
+        rows.push(TimelineRow::HistoryControl {
+            key: push_unique_row_key(&mut seen, format!("history-control-{}", t.id)),
+        });
+    }
+    let mut index = 0usize;
+    while index < t.messages.len() {
+        let message = &t.messages[index];
+        if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
+            rows.push(TimelineRow::Boundary {
+                message_index: index,
+                key: push_unique_row_key(&mut seen, format!("boundary-{}-{}", t.id, message.id)),
+            });
+        }
+        if message.role == "Pi" {
+            let end = t.messages[index..]
+                .iter()
+                .position(|message| message.role != "Pi")
+                .map_or(t.messages.len(), |offset| index + offset);
+            rows.push(TimelineRow::AssistantTurn {
+                start: index,
+                end,
+                key: push_unique_row_key(&mut seen, format!("turn-{}-{}", t.id, message.id)),
+            });
+            index = end;
+            continue;
+        }
+        rows.push(TimelineRow::UserOrSystem {
+            index,
+            message_id: message.id.clone(),
+            key: push_unique_row_key(&mut seen, format!("row-{}-{}", t.id, message.id)),
+        });
+        index += 1;
+    }
+    if work_ui::has_boundary_events(t, t.messages.len()) {
+        rows.push(TimelineRow::Boundary {
+            message_index: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("boundary-end-{}", t.id)),
+        });
+    }
+    if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
+        rows.push(TimelineRow::LiveTurn {
+            start: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("turn-live-{}", t.id)),
+        });
+    }
+    rows
+}
+
+fn build_user_or_system_row(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    pane_width: f32,
+    index: usize,
+    message_id: &str,
+) -> El {
+    let t = s.current();
+    let message = &t.messages[index];
+    let key = format!("message-{}-{index}", t.id);
+    let body = if message.role == "You" {
+        // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
+        let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
+        let mut user = col()
+            .items_end()
+            .gap(6.0)
+            .max_w(max_width)
+            .shrink()
+            .min_w(0.0);
+        if !message.images.is_empty() {
+            user = user.child(message_images(s, p, &message.images, &key));
+        }
+        if !message.text.trim().is_empty() {
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let active_occ = find_query.and_then(|_| {
+                s.thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == message_id)
+                    .map(|m| m.occurrence)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
+            user = user.child(
+                memo(
+                    format!("msg-md-{}-{message_id}", t.id),
+                    (&message.text, s.dark, wide, memo_find),
+                    || {
+                        markdown_ui::render_with_find(
+                            &message.text,
+                            p,
+                            s.dark,
+                            wide,
+                            true,
+                            false,
+                            &format!("user-{}-{index}", t.id),
+                            find_query.map(|q| (q, active_occ)),
+                        )
+                    },
+                )
+                .key(format!("{key}-text"))
+                .max_w(max_width)
+                .min_w(0.0)
+                .padding(12.0)
+                .radius(6.0)
+                .fill(p.message_bg)
+                // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
+                // `line` colour disappeared on the `message_bg` fill). No shadow.
+                .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
+            );
+        }
+        row().justify_end().child(user)
+    } else if let Some(completion) = s
+        .is_captain_home(t)
+        .then(|| crew_ui::parse_completion(message.display_text()))
+        .flatten()
+    {
+        crew_ui::result_block(s, p, wide, &completion)
+    } else if let Some(brief) = (message.role == "Shina" && t.delegated)
+        .then(|| crew_ui::parse_brief(message.display_text()))
+        .flatten()
+    {
+        crew_ui::brief_block(s, p, wide, brief)
+    } else {
+        let display = message.display_text();
+        let mut lbl = label(display, body_style(wide), p.ink)
+            .wrap_anywhere()
+            .selectable(true);
+        if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+            let query = s.thread_find.query.text.trim();
+            let active_occ = s
+                .thread_find
+                .active_match
+                .as_ref()
+                .filter(|m| m.entry_id == message_id)
+                .map(|m| m.occurrence);
+            let ranges = crate::thread_find::find_plain_occurrences(display, query);
+            if !ranges.is_empty() {
+                lbl = lbl.text_highlights(ranges.into_iter().enumerate().map(|(i, range)| {
+                    let is_active = Some(i) == active_occ;
+                    let bg = if is_active {
+                        p.coral.alpha(0.42)
+                    } else {
+                        p.brass.alpha(0.32)
+                    };
+                    let mut hl = rune::TextHighlight::new(range, bg);
+                    if is_active {
+                        hl = hl.key("thread-find-active");
+                    }
+                    hl
+                }));
+            }
+        }
+        col()
+            .gap(4.0)
+            .px(12.0)
+            .py(8.0)
+            .radius(6.0)
+            .fill(p.coral_bg)
+            .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
+            .child(lbl)
+    };
+    col().w_full().child(body.key(key))
+}
+
+/// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
+fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
+    let find = &s.thread_find;
+    let trimmed = find.query.text.trim();
+    let has_query = !trimmed.is_empty();
+    let no_results = has_query
+        && !find.loading
+        && find.error.is_none()
+        && !find.unsupported
+        && find.total_matches == 0;
+    let status_text = if find.unsupported {
+        "Update required".to_owned()
+    } else if find.loading && find.total_matches == 0 {
+        "Searching…".to_owned()
+    } else if find.error.is_some() {
+        "Search failed".to_owned()
+    } else if has_query {
+        if find.total_matches == 0 {
+            "0/0".to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                find.active_index.min(find.total_matches - 1) + 1,
+                find.total_matches
+            )
+        }
+    } else {
+        String::new()
+    };
+    let nav_disabled = find.total_matches == 0 || find.loading || find.unsupported;
+    let bar_width = (pane_width - 24.0).clamp(200.0, 340.0);
+    let mut bar = row()
+        .key("thread-find-bar")
+        .role("search")
+        .label("Find in thread")
+        .w(bar_width)
+        .h(36.0)
+        .px(10.0)
+        .gap(4.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.card)
+        .on_layout_tx(|s: &mut State, _rect, tx| {
+            let changed = s.sync_thread_find_input();
+            let revealed = s.consume_pending_find_reveal(tx);
+            if !changed && !revealed {
+                tx.live_only();
+            }
+        })
+        .child(
+            text_input(&find.query, LABEL)
+                .key("thread-find-input")
+                .label("Find in thread")
+                .placeholder("Find in thread", p.muted)
+                .color(p.ink)
+                .single_line()
+                .grow(1.0)
+                .min_w(0.0)
+                .on_edit(|s: &mut State| &mut s.thread_find.query)
+                .on_input_key(|s: &mut State, event, tx| {
+                    if event.key == rune::Key::Enter {
+                        if event.mods.shift {
+                            s.step_thread_find(-1);
+                        } else {
+                            s.step_thread_find(1);
+                        }
+                        s.consume_pending_find_reveal(tx);
+                        true
+                    } else if event.key == rune::Key::Escape {
+                        s.close_thread_find();
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                        true
+                    } else {
+                        false
+                    }
+                }),
+        );
+    if !status_text.is_empty() {
+        bar = bar.child(
+            label(
+                status_text,
+                SMALL.features(TABULAR),
+                if no_results || find.error.is_some() || find.unsupported {
+                    p.danger
+                } else {
+                    p.muted
+                },
+            )
+            .key("thread-find-count")
+            .min_w(36.0)
+            .align(rune::Align::Center),
+        );
+    }
+    if find.error.is_some() && !find.unsupported {
+        bar = bar.child(
+            label("Retry", SMALL, p.ink)
+                .key("thread-find-retry")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .px(4.0)
+                .py(2.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .on_press(|s: &mut State| s.retry_thread_find()),
+        );
+    }
+    bar = bar
+        .child(
+            icon_button(
+                "thread-find-prev",
+                "Previous match",
+                "chevron-up",
+                p,
+                |_| {},
+            )
+            .disabled(nav_disabled)
+            .on_press_tx(|s: &mut State, tx| {
+                s.step_thread_find(-1);
+                s.consume_pending_find_reveal(tx);
+            }),
+        )
+        .child(
+            icon_button("thread-find-next", "Next match", "chevron", p, |_| {})
+                .disabled(nav_disabled)
+                .on_press_tx(|s: &mut State, tx| {
+                    s.step_thread_find(1);
+                    s.consume_pending_find_reveal(tx);
+                }),
+        )
+        .child(icon_button(
+            "thread-find-close",
+            "Close find",
+            "close",
+            p,
+            |s: &mut State| {
+                s.close_thread_find();
+                s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+            },
+        ));
+    framed(bar, p).pin(None, Some(12.0), Some(12.0), None)
+}
+
+/// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
+/// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let gutter = lane_gutter(pane_width);
-    let mut messages = col()
-        .key("chat-lane")
-        .on_layout_tx(|s: &mut State, rect, tx| {
-            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
-            tx.live_only();
-        })
-        .w_full()
-        .max_w(measure(wide))
-        // 24 pt above the first message, counting the cap.
-        .pt(24.0 - TRANSCRIPT_CAP)
-        .pb(24.0)
-        .gap(20.0);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
     let visible_tools = t
@@ -7335,6 +9167,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         && !visible_tools
         && !t.status.busy()
         && t.native.compactions.is_empty()
+        && !t.history_has_more
+        && t.history_error.is_none()
     {
         let mut introduction = col()
             .key("empty-state")
@@ -7367,137 +9201,59 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             introduction = introduction.child(label("Restoring conversation...", SMALL, p.muted));
         }
         return introduction;
-    } else {
-        let cutoff = t.messages.len().saturating_sub(100);
-        // Do not cut through an assistant turn and hide the tools that led to its answer.
-        let start = t.messages[..cutoff]
-            .iter()
-            .rposition(|message| message.role != "Pi")
-            .unwrap_or(0);
-        if start > 0 {
-            messages = messages.child(label("Showing recent turns.", SMALL, p.muted));
-        }
-        let mut index = start;
-        let mut hidden_images = t.messages[start..]
-            .iter()
-            .map(|message| message.images.len())
-            .sum::<usize>()
-            .saturating_sub(32);
-        while index < t.messages.len() {
-            let message = &t.messages[index];
-            if message.role != "Pi" {
-                if let Some(events) = work_ui::boundary_events(s, p, wide, index) {
-                    messages = messages.child(events);
-                }
-            }
-            if message.role == "Pi" {
-                let end = t.messages[index..]
-                    .iter()
-                    .position(|message| message.role != "Pi")
-                    .map_or(t.messages.len(), |offset| index + offset);
-                messages = messages.child(assistant_turn(s, p, wide, index, end));
-                index = end;
-                continue;
-            }
-            let key = format!("message-{}-{index}", t.id);
-            let body = if message.role == "You" {
-                // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
-                let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
-                let mut user = col()
-                    .items_end()
-                    .gap(6.0)
-                    .max_w(max_width)
-                    .shrink()
-                    .min_w(0.0);
-                if !message.images.is_empty() {
-                    let skip = hidden_images.min(message.images.len());
-                    hidden_images -= skip;
-                    if skip > 0 {
-                        user = user.child(label(
-                            format!("{skip} older image previews omitted."),
-                            SMALL,
-                            p.muted,
-                        ));
-                    }
-                    user = user.child(message_images(s, p, &message.images[skip..], &key));
-                }
-                if !message.text.trim().is_empty() {
-                    user = user.child(
-                        memo(
-                            format!("{key}-markdown"),
-                            (&message.text, s.dark, wide),
-                            || {
-                                markdown_ui::render(
-                                    &message.text,
-                                    p,
-                                    s.dark,
-                                    wide,
-                                    true,
-                                    false,
-                                    &format!("user-{}-{index}", t.id),
-                                )
-                            },
-                        )
-                        .key(format!("{key}-text"))
-                        .max_w(max_width)
-                        .min_w(0.0)
-                        .padding(12.0)
-                        .radius(6.0)
-                        .fill(p.message_bg)
-                        // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
-                        // `line` colour disappeared on the `message_bg` fill). No shadow.
-                        .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
-                    );
-                }
-                row().justify_end().child(user)
-            } else if let Some(completion) = s
-                .is_captain_home(t)
-                .then(|| crew_ui::parse_completion(message.display_text()))
-                .flatten()
-            {
-                crew_ui::result_block(s, p, wide, &completion)
-            } else if let Some(brief) = (message.role == "Shina" && t.delegated)
-                .then(|| crew_ui::parse_brief(message.display_text()))
-                .flatten()
-            {
-                crew_ui::brief_block(s, p, wide, brief)
-            } else {
-                col()
-                    .gap(4.0)
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(6.0)
-                    .fill(p.coral_bg)
-                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
-                    .child(
-                        label(message.display_text(), body_style(wide), p.ink)
-                            .wrap_anywhere()
-                            .selectable(true),
-                    )
-            };
-            messages = messages.child(body.key(key));
-            index += 1;
-        }
-        if let Some(events) = work_ui::boundary_events(s, p, wide, t.messages.len()) {
-            messages = messages.child(events);
-        }
-        if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
-            messages = messages.child(assistant_turn(
-                s,
-                p,
-                wide,
-                t.messages.len(),
-                t.messages.len(),
-            ));
-        }
     }
-    col()
-        .key(format!("conversation-{}", t.id))
+
+    let thread_id = t.id;
+    let rows = std::rc::Rc::new(build_timeline_rows(t));
+    let key_rows = rows.clone();
+    let build_rows = rows.clone();
+    let lane = col()
+        .key("chat-lane")
+        .on_layout_tx(|s: &mut State, rect, tx| {
+            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
+            tx.live_only();
+        })
+        .w_full()
+        .max_w(measure(wide))
+        // 24 pt above the first message, counting the cap.
+        .pt(24.0 - TRANSCRIPT_CAP)
+        .pb(24.0)
+        .gap(20.0)
+        .growth(rune::GrowthSpec::default())
+        .virtual_rows(
+            rows.len(),
+            90.0,
+            move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
+            move |s: &State, index| match &build_rows[index] {
+                TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                TimelineRow::Boundary { message_index, .. } => {
+                    work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
+                }
+                TimelineRow::UserOrSystem {
+                    index: msg_idx,
+                    message_id,
+                    ..
+                } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                TimelineRow::AssistantTurn { start, end, .. } => {
+                    assistant_turn(s, p, wide, *start, *end)
+                }
+                TimelineRow::LiveTurn { start, .. } => assistant_turn(s, p, wide, *start, *start),
+            },
+        );
+
+    let find_open = s.thread_find_active();
+    let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
+    let scroller = col()
+        .key(format!("conversation-{thread_id}"))
         .animated_changes()
         .grow(1.0)
         .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
+        .scroll(ScrollSpec { stick_bottom })
+        .on_far_from_bottom(40.0, move |s: &mut State, far| {
+            s.set_timeline_far_from_bottom(thread_id, far);
+        })
+        .on_at_bottom(move |s: &mut State, at| {
+            s.set_timeline_at_bottom(thread_id, at);
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
         // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
@@ -7514,7 +9270,50 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 .sticky_top(0.0)
                 .a11y_hidden(),
         )
-        .child(messages)
+        .child(lane);
+
+    let mut wrapper = col()
+        .key(format!("conversation-wrap-{thread_id}"))
+        .grow(1.0)
+        .min_h(0.0)
+        .child(scroller);
+
+    if s.timeline_is_far_from_bottom(thread_id) && !find_open {
+        let pill = framed(
+            row()
+                .key("scroll-to-end")
+                .role("button")
+                .label("Scroll to end")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .radius(6.0)
+                .fill(p.card)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press_tx(move |s: &mut State, tx| {
+                    s.set_timeline_far_from_bottom(thread_id, false);
+                    tx.scroll_to_bottom(format!("conversation-{thread_id}"));
+                })
+                .child(icon("chevron", p.muted))
+                .child(label("Scroll to end", SMALL, p.ink)),
+            p,
+        );
+        wrapper = wrapper.child(
+            row()
+                .pin(Some(0.0), None, Some(0.0), Some(12.0))
+                .justify_center()
+                .child(pill),
+        );
+    }
+    if find_open {
+        wrapper = wrapper.child(thread_find_bar(s, p, pane_width));
+    }
+
+    wrapper
 }
 
 /// The opaque strip under the chat header's rule, inside the transcript viewport.
@@ -9172,11 +10971,27 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
         || t.configuring
         || t.archived()
         || t.request.is_some()
-        || t.thinking_levels.is_empty()
+        || crate::descriptors::read_prompt_ultrathink(&t.draft.text)
+            == crate::descriptors::PromptUltrathink::Body
     {
         return false;
     }
-    let levels = &t.thinking_levels;
+    let descriptors = state.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let levels = match &controls.effort {
+        Some(desc @ crate::descriptors::ProviderOptionDescriptor::Select { .. }) => {
+            let choices = crate::descriptors::selectable_provider_option_choices(desc);
+            if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            }
+        }
+        _ => t.thinking_levels.clone(),
+    };
+    if levels.is_empty() {
+        return false;
+    }
     let current = levels
         .iter()
         .position(|level| level == &t.thinking)
@@ -9184,43 +10999,24 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
     let next =
         (current as isize + direction).clamp(0, levels.len().saturating_sub(1) as isize) as usize;
     let level = levels[next].clone();
-    state.current_mut().set_thinking(level);
-    state.checkpoint();
+    state.set_composer_thinking_sticky(level);
     true
 }
 
 pub(crate) fn cycle_model_picker_harness(state: &mut State, direction: isize) -> bool {
-    let t = state.current();
-    if !t.can_choose_harness() {
+    let snap = picker_snapshot(state);
+    if snap.sidebar_entries.is_empty() {
         return false;
     }
-    let mut available_ids: Vec<String> = Vec::new();
-    for (id, acp) in [("pi", false), ("codex", false), ("claude", false)]
-        .into_iter()
-        .chain(
-            state
-                .harnesses
-                .agents
-                .iter()
-                .map(|agent| (agent.id.as_str(), true)),
-        )
-    {
-        let available = id != "claude" || acp || crate::claude::process().is_ok();
-        if available && !available_ids.iter().any(|existing| existing == id) {
-            available_ids.push(id.to_owned());
-        }
-    }
-    if available_ids.is_empty() {
-        return false;
-    }
-    let current = available_ids
-        .iter()
-        .position(|id| id == &t.harness)
-        .unwrap_or(0);
-    let len = available_ids.len() as isize;
-    let next = (current as isize + direction).rem_euclid(len) as usize;
-    let chosen = available_ids[next].clone();
-    state.choose_harness(&chosen);
+    let next = crate::model_picker::adjacent_model_picker_provider(
+        &snap.sidebar_entries,
+        &snap.selected_tab,
+        direction,
+        &snap.locked_disabled_ids,
+        &snap.selectable_unavailable_ids,
+    );
+    state.model_search.replace_text("");
+    state.model_picker_tab = Some(next);
     true
 }
 
@@ -9229,23 +11025,21 @@ pub(crate) fn jump_model_picker_index(state: &mut State, index: usize) -> bool {
     if t.status.busy() || t.configuring {
         return false;
     }
-    let query = state.model_search.text.to_lowercase();
-    let chosen = t
-        .models
-        .iter()
+    let snap = picker_snapshot(state);
+    let Some(chosen) = snap
+        .visible_models
+        .into_iter()
         .filter(|m| {
-            format!("{} {} {}", m.provider, m.id, m.name)
-                .to_lowercase()
-                .contains(&query)
+            state
+                .model_disabled_reason_for(&m.instance_id, &m.slug)
+                .is_none()
         })
         .nth(index)
-        .map(|m| (m.provider.clone(), m.id.clone()));
-    let Some((provider, id)) = chosen else {
+    else {
         return false;
     };
-    state.current_mut().set_model(provider, id);
+    state.select_model_from_picker(&chosen.instance_id, &chosen.slug);
     state.settings_picker = Some(SettingsPicker::Thinking);
-    state.checkpoint();
     true
 }
 
@@ -11964,14 +13758,37 @@ pub(crate) mod tests {
             assert!(rt.presented("harness-tag-claude").is_none());
             if crate::claude::process().is_ok() {
                 press(&mut rt, "choose-harness-claude");
-                assert_eq!(rt.state.current().harness, "claude");
+                assert_eq!(
+                    rt.state.model_picker_tab,
+                    Some(crate::model_picker::ModelPickerTab::Instance(
+                        "claude".into()
+                    ))
+                );
             } else {
+                assert!(
+                    find(&rt.accessibility_json(), "choose-harness-claude")
+                        .and_then(|node| node["states"].as_array().cloned())
+                        .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                    "{width}: claude should be disabled when missing"
+                );
+                rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
+                    "claude".into(),
+                ));
+                rt.invalidate();
+                rt.frame(0.0);
                 assert!(rt.presented("claude-unavailable").is_some());
             }
             press(&mut rt, "choose-harness-fixture");
+            assert_eq!(
+                rt.state.model_picker_tab,
+                Some(crate::model_picker::ModelPickerTab::Instance(
+                    "fixture".into()
+                ))
+            );
+            press(&mut rt, "choose-model-0");
             assert_eq!(rt.state.current().harness, "fixture");
-            assert!(rt.state.current().selected_model.is_none());
             rt.state.current_mut().life.latest_user_message_at = Some(1);
+            rt.state.open_model_picker(SettingsPicker::Model);
             rt.invalidate();
             rt.frame(0.0);
             press(&mut rt, "choose-harness-pi");
@@ -11979,6 +13796,12 @@ pub(crate) mod tests {
                 rt.state.current().harness,
                 "fixture",
                 "harness is fixed after first send"
+            );
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-pi")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: pi is disabled after first send"
             );
         }
     }
@@ -12730,8 +14553,632 @@ pub(crate) mod tests {
         }
         rt.frame(0.0);
         let tree = rt.accessibility_json().to_string();
-        assert_eq!(tree.matches("Attached image:").count(), 32);
-        assert!(tree.contains("older image previews omitted"));
+        assert_eq!(tree.matches("Attached image:").count(), 48);
+        assert!(!tree.contains("older image previews omitted"));
+    }
+
+    #[test]
+    fn older_history_controls_show_load_loading_error_and_end_states_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.messages.push(crate::model::Message {
+                    id: "u1".into(),
+                    role: "You",
+                    text: "Recent message".into(),
+                    images: vec![],
+                    context: None,
+                });
+                t.history_has_more = true;
+                t.history_loading = false;
+                t.history_error = None;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-earlier").is_some(),
+                "{width}: load button"
+            );
+            assert!(
+                !rt.accessibility_json()
+                    .to_string()
+                    .contains("Showing recent turns."),
+                "{width}: old cutoff notice must be gone"
+            );
+
+            // Loading state.
+            rt.state.current_mut().history_loading = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("Loading earlier turns…")),
+                "{width}: loading label"
+            );
+
+            // Error state.
+            {
+                let t = rt.state.current_mut();
+                t.history_loading = false;
+                t.history_error = Some("History failed".into());
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-error").is_some(),
+                "{width}: error label"
+            );
+
+            // End-of-history state: button and error disappear.
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = false;
+                t.history_error = None;
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.find("history-load-earlier").is_none(),
+                "{width}: hidden at end"
+            );
+            assert!(
+                rt.find("history-load-error").is_none(),
+                "{width}: error cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn virtualised_timeline_mounts_only_viewport_window_and_overscan_for_long_threads() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..500usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt number {turn} with some wrapping prose."),
+                        images: vec![],
+                        context: None,
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply number {turn} with detailed explanation."),
+                        images: vec![],
+                        context: None,
+                    });
+                }
+            }
+            rt.frame(0.0);
+            let mounted_rows: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|e| {
+                    e.key
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("row-") || k.starts_with("turn-"))
+                })
+                .collect();
+            assert!(
+                !mounted_rows.is_empty() && mounted_rows.len() < 80,
+                "{width}: expected virtualised window, mounted {} rows",
+                mounted_rows.len()
+            );
+            assert!(
+                rt.find("row-1-u-0").is_none(),
+                "{width}: oldest row must be unmounted when pinned at bottom"
+            );
+            assert!(
+                rt.presented("turn-1-a-499").is_some(),
+                "{width}: newest row must be presented"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_anchor_preserves_visible_row_on_prepend_expand_image_load_and_width_change() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = true;
+                for turn in 0..80usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Question {turn}: keeping anchor steady."),
+                        images: if turn == 35 {
+                            vec![Attachment {
+                                id: "img-35.png".into(),
+                                name: "img-35.png".into(),
+                                mime: "image/png".into(),
+                                width: 400,
+                                height: 120,
+                                bytes: 1,
+                                path: None,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        context: None,
+                    });
+                    let a_idx = t.messages.len();
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Answer {turn}: extra text to take vertical space."),
+                        images: vec![],
+                        context: None,
+                    });
+                    if turn == 45 {
+                        t.tools.push(crate::model::Tool {
+                            id: "tool-45".into(),
+                            name: "read".into(),
+                            kind: Some(crate::work::ToolKind::Read),
+                            changes: vec![],
+                            input: serde_json::json!({"path": "src/ui.rs"}),
+                            detail: "src/ui.rs".into(),
+                            done: true,
+                            failed: false,
+                            output: "line 1\nline 2\nline 3\nline 4".into(),
+                            images: vec![],
+                            structured: serde_json::Value::Null,
+                            parent_call: None,
+                            exit_code: Some(0),
+                            subagents: vec![],
+                            anchor: crate::model::ToolAnchor {
+                                message: a_idx,
+                                offset: 0,
+                            },
+                            block: 0,
+                            order: 1,
+                            expanded: false,
+                            raw_expanded: false,
+                            group_expanded: false,
+                            started: None,
+                            duration_ms: Some(10),
+                        });
+                        t.work.push(crate::model::AssistantWork {
+                            start: a_idx,
+                            stopped: false,
+                            stopped_order: 0,
+                            expanded: false,
+                            elapsed: Some(3),
+                        });
+                    }
+                }
+            }
+            rt.frame(0.0);
+            // Scroll into the middle around turn 45 (scroll_center_in_instant mounts unrealized rows).
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-u-45"));
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let anchor_before = rt.presented("row-1-u-45").expect("u-45 visible").0;
+
+            // (a) Prepending older turns + clearing history_has_more preserves visible row y.
+            {
+                let t = rt.state.current_mut();
+                let mut prepended = Vec::new();
+                for older in 0..20usize {
+                    prepended.push(crate::model::Message {
+                        id: format!("old-u-{older}"),
+                        role: "You",
+                        text: format!("Older question {older}."),
+                        images: vec![],
+                        context: None,
+                    });
+                    prepended.push(crate::model::Message {
+                        id: format!("old-a-{older}"),
+                        role: "Pi",
+                        text: format!("Older answer {older}."),
+                        images: vec![],
+                        context: None,
+                    });
+                }
+                let shift = prepended.len();
+                prepended.append(&mut t.messages);
+                t.messages = prepended;
+                for tool in &mut t.tools {
+                    tool.anchor.message += shift;
+                }
+                for work in &mut t.work {
+                    work.start += shift;
+                }
+                t.history_has_more = false;
+            }
+            rt.invalidate();
+            rt.frame(1.0 / 60.0);
+            let anchor_after_prepend = rt.presented("row-1-u-45").expect("u-45 still visible").0;
+            assert!(
+                (anchor_after_prepend[1] - anchor_before[1]).abs() < 1.0,
+                "{width}: prepend moved anchor from {} to {}",
+                anchor_before[1],
+                anchor_after_prepend[1]
+            );
+
+            // (b) Expanding a work section preserves its toggle row's position.
+            let toggle_key = rt
+                .elements()
+                .into_iter()
+                .find_map(|e| {
+                    e.key
+                        .filter(|k| k.starts_with("toggle-work-"))
+                        .filter(|k| rt.presented(k).is_some())
+                })
+                .expect("toggle-work visible");
+            let toggle_before = rt.presented(&toggle_key).unwrap().0[1];
+            press(&mut rt, &toggle_key);
+            rt.frame(1.0);
+            let toggle_after = rt.presented(&toggle_key).unwrap().0[1];
+            assert!(
+                (toggle_after - toggle_before).abs() < 1.0,
+                "{width}: work expand moved toggle from {toggle_before} to {toggle_after}"
+            );
+
+            // (c) Image height change above the visible anchor preserves the visible anchor.
+            let before_img = rt.presented("row-1-u-45").unwrap().0[1];
+            {
+                let t = rt.state.current_mut();
+                let u35 = t.messages.iter_mut().find(|m| m.id == "u-35").unwrap();
+                u35.images[0].height = 600;
+            }
+            rt.invalidate();
+            rt.frame(1.0);
+            let after_img = rt.presented("row-1-u-45").unwrap().0[1];
+            assert!(
+                (after_img - before_img).abs() < 1.0,
+                "{width}: image load moved anchor from {before_img} to {after_img}"
+            );
+
+            // (d) Width change keeps the visible anchor in view at the same offset.
+            let before_resize = rt.presented("row-1-u-45").unwrap().0[1];
+            rt.set_viewport((width + 160.0, 720.0), 1.0);
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let after_resize = rt
+                .presented("row-1-u-45")
+                .expect("u-45 still presented after resize")
+                .0[1];
+            assert!(
+                (after_resize - before_resize).abs() < 2.0,
+                "{width}: resize moved anchor from {before_resize} to {after_resize}"
+            );
+        }
+    }
+
+    #[test]
+    fn stick_to_bottom_follows_streaming_and_unpins_when_user_scrolls_up() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt {turn}"),
+                        images: vec![],
+                        context: None,
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                        context: None,
+                    });
+                }
+                t.status = Status::Running;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: starts at bottom"
+            );
+
+            // Streaming growth while pinned keeps bottom in view.
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nMore streamed lines\n\nEven more");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: stays pinned while streaming"
+            );
+
+            // Scrolling up unpins and shows Scroll to end; further streaming does NOT yank back down.
+            let (conv, _) = rt.presented("conversation-1").unwrap();
+            for _ in 0..20 {
+                rt.wheel(conv[0] + conv[2] * 0.5, conv[1] + conv[3] * 0.5, 400.0);
+                rt.frame(1.0 / 60.0);
+            }
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39")
+                    .is_none_or(|(r, _)| r[1] >= conv[1] + conv[3]),
+                "{width}: scrolled away from bottom: {:?} vs conv {:?}",
+                rt.presented("turn-1-a-39"),
+                conv
+            );
+            assert!(
+                rt.presented("scroll-to-end").is_some(),
+                "{width}: scroll-to-end pill visible"
+            );
+            let scrolled_row = rt
+                .elements()
+                .into_iter()
+                .find(|e| {
+                    e.key.as_deref().is_some_and(|k| k.starts_with("row-1-u-"))
+                        && rt.presented(e.key.as_deref().unwrap()).is_some()
+                })
+                .map(|e| (e.key.unwrap(), e.rect[1]))
+                .unwrap();
+
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nTail chunk while reading history");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                (rt.presented(&scrolled_row.0).unwrap().0[1] - scrolled_row.1).abs() < 1.0,
+                "{width}: streaming must not pull scrolled-up reader back down"
+            );
+
+            // Clicking scroll-to-end jumps back to bottom and hides the pill.
+            press(&mut rt, "scroll-to-end");
+            for _ in 0..240 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: returned to bottom"
+            );
+            assert!(
+                rt.find("scroll-to-end").is_none(),
+                "{width}: pill hides at bottom"
+            );
+        }
+    }
+
+    #[test]
+    fn find_bar_opens_via_chat_find_displays_counts_steps_matches_highlights_and_jumps_to_match() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.poll = Some(|s, _, tx| s.poll_thread_find(tx));
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    let prompt = if turn == 2 {
+                        "Early message with target-canary-word here".to_owned()
+                    } else if turn == 38 {
+                        "Late message with target-canary-word too".to_owned()
+                    } else {
+                        format!("Ordinary message {turn}")
+                    };
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: prompt,
+                        images: vec![],
+                        context: None,
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                        context: None,
+                    });
+                }
+            }
+            rt.frame(0.0);
+
+            // Wire chat.find shortcut (Ctrl+F / Cmd+F).
+            let mod_key = if cfg!(target_os = "macos") {
+                rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            } else {
+                rune::Mods {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            };
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("f".into()),
+                mods: mod_key,
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-find-bar").is_some(),
+                "{width}: bar opens"
+            );
+            assert!(
+                rt.presented("thread-find-input").is_some(),
+                "{width}: input shown"
+            );
+            assert!(
+                rt.presented("thread-find-prev").is_some(),
+                "{width}: prev shown"
+            );
+            assert!(
+                rt.presented("thread-find-next").is_some(),
+                "{width}: next shown"
+            );
+            assert!(
+                rt.presented("thread-find-close").is_some(),
+                "{width}: close shown"
+            );
+
+            // Bar stays inside the pane without clipping or overflowing.
+            let (bar, _) = rt.presented("thread-find-bar").unwrap();
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            assert!(
+                bar[0] >= pane[0] && bar[0] + bar[2] <= pane[0] + pane[2] + 0.5,
+                "{width}: bar {bar:?} outside pane {pane:?}"
+            );
+
+            // Typing a missing query reports 0/0.
+            rt.paste("missing-query-xyz");
+            rt.frame(0.2);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("0/0"),
+                "{width}"
+            );
+
+            // Replace with matching query -> shows 1/2, highlights match, and jumps to u-2!
+            rt.state.set_thread_find_query("target-canary-word".into());
+            rt.invalidate();
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-2").is_some(),
+                "{width}: jumped to match u-2"
+            );
+            assert!(
+                rt.elements().iter().any(|e| e.role == "mark"),
+                "{width}: highlight mark rendered"
+            );
+
+            // Next -> jumps to 2/2 (u-38); Next again wraps to 1/2 (u-2).
+            press(&mut rt, "thread-find-next");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("2/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-38").is_some(),
+                "{width}: jumped to match u-38"
+            );
+
+            press(&mut rt, "thread-find-prev");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+
+            // Close via close button restores composer focus.
+            press(&mut rt, "thread-find-close");
+            rt.frame(0.0);
+            assert!(rt.find("thread-find-bar").is_none(), "{width}: bar closed");
+            assert!(
+                rt.state.current().draft.focused,
+                "{width}: composer refocused"
+            );
+
+            // Explicit unsupported state for a peer without thread-find.
+            rt.state.open_thread_find();
+            rt.state.thread_find.unsupported = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("Update required"),
+                "{width}: unsupported peer state"
+            );
+            rt.state.close_thread_find();
+        }
+    }
+
+    #[test]
+    fn sidebar_search_shows_title_matches_before_message_matches_with_snippets_and_jumps_to_match()
+    {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.threads.push(Thread::new(2));
+            rt.state.threads[0].title = "Alpha workspace task".into();
+            rt.state.threads[0].renamed = true;
+            rt.state.threads[1].title = "Unrelated thread".into();
+            rt.state.threads[1].renamed = true;
+            // Thread 2 is unvisited (no messages loaded locally), matched via server search!
+            rt.state.search.replace_text("alpha");
+            rt.state.sidebar_search.visible_query = "alpha".into();
+            rt.state.sidebar_search.visible_matches.insert(
+                ("local".into(), 2),
+                crate::thread_search::ThreadSearchHit {
+                    thread_id: 2,
+                    project_id: None,
+                    entry_id: "u-4".into(),
+                    source: "user".into(),
+                    snippet: "…matched alpha inside unvisited history…".into(),
+                    quality: 1.0,
+                    hits: 1,
+                    updated: 10,
+                },
+            );
+            rt.state.sidebar_search.shown_order = vec![("local".into(), 2)];
+            rt.state.sidebar_search.unsupported_servers = vec!["Studio".into()];
+            rt.frame(0.0);
+
+            let (row1, _) = rt.presented("thread-1").expect("title match shown");
+            let (row2, _) = rt.presented("thread-2").expect("message match shown");
+            assert!(
+                row1[1] < row2[1],
+                "{width}: title match must appear before message match"
+            );
+            assert!(
+                rt.presented("sidebar-search-snippet-local-2").is_some(),
+                "{width}: snippet shown for message-matched row"
+            );
+            assert!(
+                rt.presented("sidebar-search-unsupported").is_some(),
+                "{width}: unsupported server notice shown"
+            );
+
+            // Clicking the message-matched row opens thread 2 and opens find on the matched query.
+            press(&mut rt, "thread-2");
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().id, 2, "{width}: opened thread 2");
+            assert!(rt.state.thread_find.open, "{width}: find bar opened");
+            assert_eq!(
+                rt.state.thread_find.query.text, "alpha",
+                "{width}: query set"
+            );
+        }
     }
 
     #[test]
@@ -16040,8 +18487,6 @@ pub(crate) mod tests {
         assert!(rt.find("disconnect-pi").is_none());
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         assert!(rt.state.current().pi.is_none());
         assert_eq!(
@@ -16075,8 +18520,6 @@ pub(crate) mod tests {
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("pi-settings-picker").is_some());
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         let model = commands.try_recv().unwrap();
         assert_eq!(model["type"], "set_model");
@@ -16135,13 +18578,7 @@ pub(crate) mod tests {
                 card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
                 "popover leaves the window at {width}: {card:?}"
             );
-            press(&mut rt, "open-model-list");
-            rt.frame(2.0);
-            let (list, _) = rt.presented("pi-settings-picker").unwrap();
-            assert!(
-                list[1] >= 0.0,
-                "model list leaves the window at {width}: {list:?}"
-            );
+            assert!(rt.presented("model-list").is_some(), "{width}");
         }
     }
 
@@ -16153,8 +18590,6 @@ pub(crate) mod tests {
         rt.state.current_mut().models.clear();
         rt.frame(0.0);
         press(&mut rt, "model-effort");
-        rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("models-group").is_some());
         assert!(rt.find("models-empty-note").is_some());
@@ -16168,6 +18603,474 @@ pub(crate) mod tests {
             "generic fallback should not appear when catalog.error is set: {tree}"
         );
         assert!(rt.find("retry-catalog").is_some());
+    }
+
+    #[test]
+    fn model_picker_supports_favorites_legacy_collapse_unavailable_continuation_and_notices_at_all_widths()
+     {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "claude-opus-5-5".into(),
+                    name: "Anthropic / Claude Opus 5.5".into(),
+                    sub_provider: Some("Anthropic".into()),
+                    badge: Some("new".into()),
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "claude-opus-4-5".into(),
+                    name: "Claude Opus 4.5".into(),
+                    is_legacy: true,
+                    ..Default::default()
+                },
+            ];
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6-astra".into(),
+                    name: "GPT-6 Astra".into(),
+                    is_default: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.4".into(),
+                    name: "GPT-5.4".into(),
+                    is_legacy: true,
+                    ..Default::default()
+                },
+            ];
+            rt.state.codex_catalog.update_required_models =
+                vec![crate::model_picker::UpdateRequiredModel {
+                    slug: "gpt-6-luna".into(),
+                    name: "GPT-6 Luna".into(),
+                    badge: None,
+                    min_version: "0.155.0".into(),
+                }];
+            rt.state.current_mut().harness = "pi".into();
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.state.current_mut().model_provider = "cpa".into();
+            rt.state.current_mut().model_id = "missing-dynamic".into();
+            rt.state.current_mut().model = "missing-dynamic".into();
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Card fits inside viewport
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+
+            // Favorites tab exists, legacy section collapses behind "Show more", unavailable row badge shows
+            assert!(
+                rt.presented("choose-harness-favorites").is_some(),
+                "{width}"
+            );
+            assert!(rt.presented("legacy-models-pi").is_some(), "{width}");
+            assert!(rt.find("toggle-favorite-0").is_some(), "{width}");
+            let tree = rt.accessibility_json().to_string();
+            assert!(tree.contains("Unavailable"), "{width}: {tree}");
+            assert!(tree.contains("New"), "{width}: {tree}");
+            assert!(tree.contains("Show more"), "{width}: {tree}");
+
+            // Expanding legacy shows the legacy model and flips to "Show less"
+            press(&mut rt, "legacy-models-pi");
+            rt.invalidate();
+            rt.frame(0.1);
+            let expanded_tree = rt.accessibility_json().to_string();
+            assert!(expanded_tree.contains("Claude Opus 4.5"), "{width}");
+            assert!(expanded_tree.contains("Show less"), "{width}");
+
+            // Toggling favorite switches and puts model in Favorites tab
+            press(&mut rt, "toggle-favorite-0");
+            rt.invalidate();
+            rt.frame(0.2);
+            assert_eq!(rt.state.effective_model_favorites().len(), 1);
+            press(&mut rt, "choose-harness-favorites");
+            rt.invalidate();
+            rt.frame(0.3);
+            let fav_tree = rt.accessibility_json().to_string();
+            assert!(fav_tree.contains("Claude Opus 5.5"), "{width}: {fav_tree}");
+
+            // Switching to Codex shows update-required notice
+            press(&mut rt, "choose-harness-codex");
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(
+                rt.presented("update-required-notice-codex").is_some(),
+                "{width}"
+            );
+            let codex_tree = rt.accessibility_json().to_string();
+            assert!(
+                codex_tree.contains("Update the Codex CLI to v0.155.0 or newer to use GPT-6 Luna."),
+                "{width}: {codex_tree}"
+            );
+
+            // Pick GPT-6 Astra on Codex, then mark thread as started and verify continuation restriction
+            press(&mut rt, "choose-model-0");
+            assert_eq!(rt.state.current().harness, "codex");
+            assert_eq!(rt.state.current().model_id, "gpt-6-astra");
+            rt.state.current_mut().life.latest_user_message_at = Some(1);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.5);
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-pi")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: pi should be disabled on started codex thread"
+            );
+            // Searching across providers respects continuation lock on a started thread
+            rt.state.model_search.replace_text("opus");
+            rt.invalidate();
+            rt.frame(0.6);
+            let locked_search_tree = rt.accessibility_json().to_string();
+            assert!(!locked_search_tree.contains("Claude Opus 5.5"), "{width}");
+            assert!(locked_search_tree.contains("No models found"), "{width}");
+
+            // On an unstarted thread, searching across providers ranks matches globally
+            rt.state.current_mut().life.latest_user_message_at = None;
+            rt.invalidate();
+            rt.frame(0.7);
+            let search_tree = rt.accessibility_json().to_string();
+            assert!(search_tree.contains("Claude Opus 5.5"), "{width}");
+        }
+    }
+
+    #[test]
+    fn sticky_options_restore_per_model_and_survive_ui_snapshot_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6-astra".into(),
+                    name: "GPT-6 Astra".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    is_default: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.6-sol".into(),
+                    name: "GPT-5.6 Sol".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    ..Default::default()
+                },
+            ];
+            rt.state.choose_harness("codex");
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Pick gpt-6-astra and set effort=high + serviceTier=fast
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.1);
+            press(&mut rt, "choose-thinking-2");
+            press(&mut rt, "service-tier-1");
+            assert_eq!(rt.state.current().thinking, "high");
+            assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
+
+            // Switch to gpt-5.6-sol and set effort=low
+            rt.invalidate();
+            rt.frame(0.2);
+            press(&mut rt, "choose-model-1");
+            rt.invalidate();
+            rt.frame(0.3);
+            press(&mut rt, "choose-thinking-0");
+            assert_eq!(rt.state.current().thinking, "low");
+
+            // Switch back to gpt-6-astra: remembered sticky options (high + fast) restore!
+            rt.invalidate();
+            rt.frame(0.4);
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.5);
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
+
+            // Trigger reflects resolved model & effort cleanly inside viewport
+            let (trigger, _) = rt.presented("model-effort").unwrap();
+            assert!(
+                trigger[0] >= 0.0 && trigger[0] + trigger[2] <= width + 0.5,
+                "{width}: {trigger:?}"
+            );
+
+            // Sticky composer preferences survive ui_snapshot -> restore_ui
+            let ui = rt.state.ui_snapshot();
+            let mut restored = State::new(std::path::PathBuf::new(), false);
+            restored.restore_ui(&ui).unwrap();
+            assert_eq!(
+                restored
+                    .preferences
+                    .sticky_composer
+                    .sticky_options_by_model_by_provider
+                    .get("codex")
+                    .and_then(|m| m.get("gpt-6-astra"))
+                    .map(|opts| opts.len()),
+                Some(2)
+            );
+
+            // Creating a new thread applies the sticky model and options
+            rt.state.new_thread_in(None);
+            assert_eq!(rt.state.current().harness, "codex", "{width}");
+            assert_eq!(rt.state.current().model_id, "gpt-6-astra", "{width}");
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_picker_refresh_on_open_loading_error_and_retry_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            // Loading state while cached models exist shows refreshing indicator inside card
+            rt.state.catalog.models = vec![crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "gpt-6-astra".into(),
+                name: "GPT-6 Astra".into(),
+                ..Default::default()
+            }];
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.state.catalog.set_loading_for_test(true);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (loading, _) = rt
+                .presented("catalog-loading")
+                .expect("catalog-loading shown while refreshing");
+            assert!(
+                loading[0] >= card[0] && loading[0] + loading[2] <= card[0] + card[2] + 0.5,
+                "{width}: {loading:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Refreshing models...")
+            );
+
+            // Error state alongside cached models still exposes retry-catalog and error message
+            rt.state.catalog.set_loading_for_test(false);
+            rt.state.catalog.error = Some("CPA gateway unreachable.".into());
+            rt.invalidate();
+            rt.frame(0.1);
+            let (retry, _) = rt
+                .presented("retry-catalog")
+                .expect("retry-catalog shown on error");
+            assert!(
+                retry[0] >= card[0] && retry[0] + retry[2] <= card[0] + card[2] + 0.5,
+                "{width}: {retry:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("CPA gateway unreachable.")
+            );
+
+            // Clicking retry-catalog clears error and invokes force refresh
+            press(&mut rt, "retry-catalog");
+            assert!(rt.state.catalog.error.is_none());
+        }
+    }
+
+    #[test]
+    fn descriptor_driven_docked_picker_options_ultrathink_lock_and_footer_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            let opus_caps = crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .unwrap()
+                .capabilities;
+            let acp_caps = crate::descriptors::ModelCapabilities {
+                option_descriptors: crate::descriptors::acp_provider_option_descriptors(
+                    Some(&[
+                        json!({"id": "thought_level", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": "medium", "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
+                        json!({"id": "auto_approve", "name": "Auto-approve", "type": "boolean", "currentValue": false}),
+                    ]),
+                    Some(&json!({
+                        "currentModeId": "code",
+                        "availableModes": [
+                            {"id": "code", "name": "Code"},
+                            {"id": "plan", "name": "Plan"}
+                        ]
+                    })),
+                ),
+            };
+            rt.state.claude_catalog.models = vec![crate::session::AgentModel {
+                provider: "claude".into(),
+                id: "claude-opus-5-5".into(),
+                name: "Claude Opus 5.5".into(),
+                thinking_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                capabilities: opus_caps,
+                ..Default::default()
+            }];
+            rt.state.choose_harness("claude");
+            rt.state
+                .current_mut()
+                .set_model("claude".into(), "claude-opus-5-5".into());
+            rt.frame(0.0);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.05);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (list, _) = rt.presented("model-list").unwrap();
+            let (effort_col, _) = rt.presented("model-picker-effort").unwrap();
+            let (footer, _) = rt.presented("picker-footer").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+            if width > 640.0 {
+                assert!(
+                    effort_col[0] >= list[0] + list[2] - 1.0,
+                    "{width}: effort column sits beside list: {list:?} {effort_col:?}"
+                );
+            } else {
+                assert!(
+                    effort_col[1] >= list[1] + list[3] - 1.0,
+                    "{width}: effort column stacks below list: {list:?} {effort_col:?}"
+                );
+            }
+            assert!(
+                footer[1] >= effort_col[1] + effort_col[3] - 1.0,
+                "{width}: footer sits at bottom: {effort_col:?} {footer:?}"
+            );
+
+            // Fast/Standard and Ultracode controls exist in footer and toggle
+            assert!(rt.presented("fast-mode-picker").is_some(), "{width}");
+            assert!(rt.presented("ultracode-toggle").is_some(), "{width}");
+            press(&mut rt, "fast-mode-on");
+            press(&mut rt, "ultracode-toggle");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "fastMode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: fastMode enabled"
+            );
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "ultracode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: ultracode enabled"
+            );
+
+            // Typing "ultrathink" in prompt body locks effort slider and shows note
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("Please ultrathink about this");
+            rt.invalidate();
+            rt.frame(0.2);
+            assert!(rt.presented("ultrathink-lock-note").is_some(), "{width}");
+            assert_eq!(
+                find(&rt.accessibility_json(), "ultrathink-lock-note")
+                    .and_then(|n| n["name"].as_str()),
+                Some(crate::descriptors::ULTRATHINK_IN_BODY_NOTE),
+                "{width}"
+            );
+
+            // ACP model shows select and boolean option rows in effort column
+            rt.state.current_mut().draft.replace_text("");
+            rt.state.harnesses.agents = vec![crate::harness::Agent {
+                id: "devin".into(),
+                name: "Devin".into(),
+                command: "devin".into(),
+                args: vec![],
+                env: vec![],
+            }];
+            rt.state.choose_harness("devin");
+            rt.state.current_mut().draft_model_state = Default::default();
+            rt.state.current_mut().models = vec![crate::session::AgentModel {
+                provider: "devin".into(),
+                id: "fusion".into(),
+                name: "Fusion".into(),
+                thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                capabilities: acp_caps,
+                ..Default::default()
+            }];
+            rt.state
+                .current_mut()
+                .set_model("devin".into(), "fusion".into());
+            rt.invalidate();
+            rt.frame(0.3);
+            assert!(
+                rt.presented("option-menu-_t3/session-mode").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("option-switch-auto_approve").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "option-switch-auto_approve");
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "auto_approve"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}"
+            );
+            press(&mut rt, "option-menu-_t3/session-mode");
+            rt.invalidate();
+            rt.frame(0.5);
+            press(&mut rt, "option-choice-_t3/session-mode-plan");
+            rt.invalidate();
+            rt.frame(0.6);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "_t3/session-mode"
+                        && o.value == crate::model_selection::OptionValue::Str("plan".into())),
+                "{width}"
+            );
+        }
     }
 
     #[test]
@@ -17086,6 +19989,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
                 crate::session::AgentModel {
                     provider: "cpa".into(),
@@ -17095,6 +19999,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
             ];
             t.model_provider = "cpa".into();
@@ -17119,7 +20024,7 @@ pub(crate) mod tests {
         assert!(rt.presented("pi-settings-picker").is_some());
         assert!(rt.presented("model-list").is_some());
 
-        // Mod+Shift+ArrowDown steps harness in the open model picker.
+        // Mod+Shift+ArrowDown steps provider tab in the open model picker.
         rt.key(rune::KeyEvent {
             key: rune::Key::Down,
             mods: rune::Mods {
@@ -17129,9 +20034,14 @@ pub(crate) mod tests {
             },
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.current().harness, "codex");
+        assert_eq!(
+            rt.state.model_picker_tab,
+            Some(crate::model_picker::ModelPickerTab::Instance(
+                "codex".into()
+            ))
+        );
 
-        // Mod+Shift+ArrowUp steps harness back.
+        // Mod+Shift+ArrowUp steps provider tab back.
         rt.key(rune::KeyEvent {
             key: rune::Key::Up,
             mods: rune::Mods {
@@ -17141,7 +20051,10 @@ pub(crate) mod tests {
             },
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.current().harness, "pi");
+        assert_eq!(
+            rt.state.model_picker_tab,
+            Some(crate::model_picker::ModelPickerTab::Instance("pi".into()))
+        );
 
         // Re-populate models after harness switch and jump to the 2nd model with Mod+2.
         {
@@ -17155,6 +20068,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
                 crate::session::AgentModel {
                     provider: "cpa".into(),
@@ -17164,6 +20078,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
             ];
         }
@@ -17352,12 +20267,13 @@ pub(crate) mod tests {
         assert!(rt.state.current().native.queue.is_empty());
 
         // Under SendShortcut::ModEnter on a draft thread, Mod+Enter routes through
-        // composer.sendBackground and submits.
+        // composer.sendBackground, starts the thread in background, and opens a fresh composer.
         let mut draft_rt = runtime(1280.0);
         draft_rt.on_key = Some(crate::key);
         draft_rt.state.preferences.send_shortcut = crate::composer::SendShortcut::ModEnter;
         draft_rt.frame(0.0);
         press(&mut draft_rt, "composer-input");
+        let first_id = draft_rt.state.current().id;
         draft_rt.state.current_mut().draft.replace_text("Ship it");
         draft_rt.key(rune::KeyEvent {
             key: rune::Key::Enter,
@@ -17367,8 +20283,10 @@ pub(crate) mod tests {
             },
         });
         draft_rt.frame(0.0);
+        assert_ne!(draft_rt.state.current().id, first_id);
+        assert!(draft_rt.state.current().is_draft());
         assert!(draft_rt.state.current().draft.text.is_empty());
-        assert_eq!(draft_rt.state.current().messages.len(), 1);
+        assert_eq!(draft_rt.state.threads[0].messages.len(), 1);
     }
 
     #[test]
@@ -17986,6 +20904,234 @@ pub(crate) mod tests {
                     && input_rect[0] + input_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5,
                 "{width}: {input_rect:?} in {composer_rect:?}"
             );
+        }
+    }
+
+    #[test]
+    fn background_send_and_new_thread_chords_work_and_render_toasts_at_all_widths() {
+        let enter_chord = |alt: bool| rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: rune::Mods {
+                cmd: true,
+                alt,
+                ..Default::default()
+            },
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            // 1. Draft thread: Mod+Enter and Mod+Alt+Enter start in background and open a fresh focused composer.
+            for alt in [false, true] {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                rt.state.current_mut().pi = Some(pi);
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("Draft background");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let first_id = rt.state.current().id;
+
+                rt.key(enter_chord(alt));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, first_id, "{width} alt={alt}");
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert!(rt.state.current().draft.text.is_empty());
+                assert_eq!(rt.state.threads[0].messages.len(), 1);
+                assert_eq!(rt.state.threads[0].status, Status::Running);
+
+                let (stack, _) = rt.presented("toast-stack").expect("toast stack");
+                assert!(
+                    stack[0] >= 0.0 && stack[0] + stack[2] <= width + 1.0,
+                    "{width}: {stack:?}"
+                );
+                let toast_action = format!("toast-action-{}", rt.state.toasts[0].id);
+                let (btn, _) = rt.presented(&toast_action).expect("Open action");
+                assert!(btn[0] >= 0.0 && btn[0] + btn[2] <= width + 1.0);
+                press(&mut rt, &toast_action);
+                assert_eq!(rt.state.current().id, first_id);
+                assert!(rt.state.toasts.is_empty());
+            }
+
+            // 2. Existing idle thread: Mod+Alt+Enter sends and opens a fresh focused draft composer.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                {
+                    let t = rt.state.current_mut();
+                    t.pi = Some(pi);
+                    t.model_provider = "cpa".into();
+                    t.messages.push(crate::model::Message {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role: "You",
+                        text: "Prior turn".into(),
+                        images: vec![],
+                        context: None,
+                    });
+                    t.draft.replace_text("Follow-up idle");
+                }
+                let existing_id = rt.state.current().id;
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, existing_id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert!(rt.state.current().draft.text.is_empty());
+                assert!(rt.state.toasts.is_empty());
+                assert_eq!(rt.state.threads[0].messages.len(), 2);
+            }
+
+            // 3. Existing running thread: Mod+Alt+Enter queues/steers and opens a fresh focused draft composer.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                {
+                    let t = rt.state.current_mut();
+                    t.pi = Some(pi);
+                    t.model_provider = "cpa".into();
+                    t.status = Status::Running;
+                    t.native.follow_up = true;
+                    t.draft.replace_text("Follow-up while running");
+                }
+                let running_id = rt.state.current().id;
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, running_id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+                assert_eq!(rt.state.threads[0].native.queue.len(), 1);
+            }
+
+            // 4. Failing background send: shows "Background task failed" toast with "Open draft" and recovers draft.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                rt.state.runtime_enabled = true;
+                let failed_id = rt.state.current().id;
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.state.current_mut().machine = "missing-host".into();
+                rt.state.current_mut().draft.replace_text("Recover me");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+
+                assert_ne!(rt.state.current().id, failed_id);
+                let (stack, _) = rt.presented("toast-stack").expect("failure toast");
+                assert!(stack[0] >= 0.0 && stack[0] + stack[2] <= width + 1.0);
+                let toast_action = format!("toast-action-{}", rt.state.toasts[0].id);
+                press(&mut rt, &toast_action);
+                assert_eq!(rt.state.current().id, failed_id);
+                assert_eq!(rt.state.current().draft.text, "Recover me");
+                assert!(rt.state.current().error.is_some());
+            }
+
+            // 5. Guards: empty prompt, submission_error, pending request, archived, unfocused, repeat, IME composition.
+            {
+                let mut rt = runtime(width);
+                rt.on_key = Some(crate::key);
+                let (pi, _cmds, _evs) = crate::backend::Pi::test_connection();
+                rt.state.current_mut().pi = Some(pi);
+                rt.state.current_mut().model_provider = "cpa".into();
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let id = rt.state.current().id;
+
+                // Empty prompt
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert!(rt.state.toasts.is_empty());
+
+                // Unfocused composer does not trigger sendBackground
+                rt.state.current_mut().draft.replace_text("Unfocused");
+                rt.state.current_mut().draft.focused = false;
+                rt.invalidate();
+                rt.frame(0.0);
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+
+                // Archived thread does not send
+                press(&mut rt, "composer-input");
+                rt.state.current_mut().life.archived_at = Some(1);
+                rt.key(enter_chord(false));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+                rt.state.current_mut().life.archived_at = None;
+
+                // Pending request blocks sendAndNewThread
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "You",
+                    text: "Turn 1".into(),
+                    images: vec![],
+                    context: None,
+                });
+                rt.state.current_mut().request = Some(json!({"id":"r1","method":"confirm"}));
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Unfocused");
+                rt.state.current_mut().request = None;
+
+                // Over-limit prompt sets submission_error and does not open a new thread
+                rt.state.current_mut().draft.replace_text(
+                    &"x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1),
+                );
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert!(rt.state.current().submission_error.is_some());
+
+                // Key repeat and IME composition never submit
+                rt.state.current_mut().submission_error = None;
+                rt.state.current_mut().draft.replace_text("Repeat/IME");
+                rt.frame(0.0);
+                rt.repeat_key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Repeat/IME");
+                rt.ime(rune::Ime::Preedit("あ".into(), None));
+                rt.frame(0.0);
+                assert!(rt.state.current().draft.is_composing());
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_eq!(rt.state.current().id, id);
+                assert_eq!(rt.state.current().draft.text, "Repeat/IME");
+                rt.state.current_mut().draft.cancel_composition();
+                rt.frame(0.0);
+
+                // Open slash menu does not intercept Mod+Alt+Enter (sendAndNewThread)
+                rt.state.current_mut().draft.replace_text("/review");
+                rt.state.current_mut().native.commands.push(
+                    crate::model::pi_session::SlashCommand {
+                        name: "review".into(),
+                        description: "Review".into(),
+                        source: "ACP".into(),
+                    },
+                );
+                rt.frame(0.0);
+                rt.key(enter_chord(true));
+                rt.frame(0.0);
+                assert_ne!(rt.state.current().id, id);
+                assert!(rt.state.current().is_draft());
+                assert!(rt.state.current().draft.focused);
+            }
         }
     }
 }

@@ -111,6 +111,8 @@ struct ThreadView {
     model_provider: String,
     model_id: String,
     thinking: String,
+    #[serde(default)]
+    model_options: Vec<crate::model_selection::ProviderOptionSelection>,
     models: Vec<AgentModel>,
     thinking_levels: Vec<String>,
     supports_images: Option<bool>,
@@ -217,6 +219,7 @@ impl ThreadView {
             model_provider: thread.model_provider.clone(),
             model_id: thread.model_id.clone(),
             thinking: thread.thinking.clone(),
+            model_options: thread.model_options.clone(),
             models: thread.models.clone(),
             thinking_levels: thread.thinking_levels.clone(),
             supports_images: thread.supports_images,
@@ -300,6 +303,7 @@ impl ThreadView {
         thread.resumable_run_id = self.resumable_run_id;
         thread.continuation_of_run_id = self.continuation_of_run_id;
         thread.run_control_supported = self.run_control_supported;
+        let old_messages = std::mem::take(&mut thread.messages);
         thread.messages = self
             .messages
             .into_iter()
@@ -362,11 +366,16 @@ impl ThreadView {
         thread.thoughts = thoughts;
         let mut work = self.work;
         for item in &mut work {
-            item.expanded = thread
-                .work
-                .iter()
-                .find(|old| old.start == item.start)
-                .is_none_or(|old| old.expanded);
+            let message_id = thread.messages.get(item.start).map(|m| m.id.as_str());
+            let matched = message_id
+                .and_then(|id| {
+                    thread
+                        .work
+                        .iter()
+                        .find(|old| old_messages.get(old.start).map(|m| m.id.as_str()) == Some(id))
+                })
+                .or_else(|| thread.work.iter().find(|old| old.start == item.start));
+            item.expanded = matched.is_none_or(|old| old.expanded);
         }
         thread.work = work;
         thread.harness_state = self.harness_state;
@@ -377,6 +386,7 @@ impl ThreadView {
         thread.model_provider = self.model_provider;
         thread.model_id = self.model_id;
         thread.thinking = self.thinking;
+        thread.model_options = self.model_options;
         thread.models = self.models;
         thread.thinking_levels = self.thinking_levels;
         thread.supports_images = self.supports_images;
@@ -719,15 +729,8 @@ impl State {
         for thread in &mut self.threads {
             thread.disconnect();
             thread.recover_native_inputs();
-            if thread.has_draft_content() {
-                self.recovered_inputs.insert(
-                    thread.id,
-                    json!({"text":thread.draft.text,"attachments":thread.draft_images}),
-                );
-                thread.draft.replace_text("");
-                thread.draft_images.clear();
-            }
         }
+        self.collect_recovered_inputs();
     }
     pub fn begin_runtime_shutdown(&mut self) {
         self.runtime_enabled = false;
@@ -893,6 +896,7 @@ impl State {
         }
         let mut projection = json!({
             "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
+            "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error},
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
@@ -1060,23 +1064,70 @@ impl State {
             if let crate::client::Event::Receipt(command, value) = &event
                 && command.method == "thread.send"
             {
-                let threads = if server == self.machines.selected {
-                    Some(&mut self.threads)
-                } else {
-                    self.machines.threads.get_mut(&server)
-                };
-                if let Some(thread) = threads.and_then(|threads| {
-                    threads.iter_mut().find(|thread| {
-                        thread
-                            .remote_send
-                            .as_ref()
-                            .is_some_and(|(id, _)| *id == command.command_id)
-                    })
-                }) {
-                    thread.finish_remote_send(
-                        command.command_id,
-                        value["result"]["status"] == "accepted",
-                    );
+                let accepted = value["result"]["status"] == "accepted";
+                let mut bg_started: Option<(String, usize)> = None;
+                let mut bg_failed: Option<(String, usize, String)> = None;
+                let mut open_new_after: Option<(usize, String)> = None;
+                let mut handled_background = false;
+                {
+                    let threads = if server == self.machines.selected {
+                        Some(&mut self.threads)
+                    } else {
+                        self.machines.threads.get_mut(&server)
+                    };
+                    if let Some(thread) = threads.and_then(|threads| {
+                        threads.iter_mut().find(|thread| {
+                            thread
+                                .remote_send
+                                .as_ref()
+                                .is_some_and(|(id, _)| *id == command.command_id)
+                        })
+                    }) {
+                        thread.finish_remote_send(command.command_id, accepted);
+                        let bg = thread.background_send.take();
+                        let send_new = thread.pending_send_and_new_thread.take();
+                        handled_background = bg.is_some() || send_new.is_some();
+                        if !accepted {
+                            let error = value["error"]["message"]
+                                .as_str()
+                                .or(value["result"]["result"]["error"].as_str())
+                                .unwrap_or("Failed to send message.")
+                                .to_string();
+                            thread.error = Some(error.clone());
+                            if let Some(bg_server) = bg {
+                                bg_failed = Some((bg_server, thread.id, error));
+                            }
+                        } else if let Some(bg_server) = bg {
+                            bg_started = Some((bg_server, thread.id));
+                        } else if let Some((pending_cmd, pending_server)) = send_new
+                            && pending_cmd == command.command_id
+                        {
+                            open_new_after = Some((thread.id, pending_server));
+                        }
+                    }
+                }
+                if let Some((bg_server, thread_id)) = bg_started {
+                    self.notify_background_started(&bg_server, thread_id);
+                }
+                if let Some((bg_server, thread_id, error)) = bg_failed {
+                    self.notify_background_failure(&bg_server, thread_id, error);
+                }
+                if let Some((thread_id, pending_server)) = open_new_after
+                    && self.machines.selected == pending_server
+                    && self.current().id == thread_id
+                {
+                    let project = self.current().project;
+                    let seed = self.composer_seed();
+                    self.new_client_draft_with_seed(project, &seed);
+                    if !self.headless {
+                        self.restore_composer_focus(
+                            crate::ui::composer_ui::FocusReason::ThreadOpened,
+                        );
+                    }
+                    self.checkpoint_client();
+                }
+                if handled_background {
+                    continue;
                 }
             }
             if let crate::client::Event::Receipt(command, value) = &event
@@ -1173,6 +1224,30 @@ impl State {
                     } else {
                         self.restart_notice =
                             Some("Update drain cancelled. Normal operation resumed.".into());
+                    }
+                }
+                crate::client::Event::Rpc { tag, result } => {
+                    if let Some(req_id) = tag
+                        .strip_prefix("find:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        && server == self.thread_find.server
+                    {
+                        let parsed = result.and_then(|val| {
+                            serde_json::from_value::<crate::thread_find::ThreadFindResult>(val)
+                                .map_err(|e| e.to_string())
+                        });
+                        self.apply_thread_find_result(req_id, parsed);
+                    } else if let Some(rest) = tag.strip_prefix("search:")
+                        && let Some((seq_str, target_srv)) = rest.split_once(':')
+                        && let Ok(seq) = seq_str.parse::<u64>()
+                    {
+                        let parsed = result.and_then(|val| {
+                            serde_json::from_value::<Vec<crate::thread_search::ThreadSearchHit>>(
+                                val["matches"].clone(),
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                        self.apply_sidebar_search_result(seq, target_srv, parsed);
                     }
                 }
                 crate::client::Event::Error(error) => {
@@ -1366,6 +1441,14 @@ impl State {
                 tx.wake_after(Duration::from_millis(notice.expires - at));
             }
         }
+        changed |= self.expire_toasts();
+        for toast in &self.toasts {
+            if let Some(expires) = toast.expires_at
+                && expires > at
+            {
+                tx.wake_after(Duration::from_millis(expires - at));
+            }
+        }
         if let Some(wait) = crate::ui::tick_portraits(self, Instant::now()) {
             tx.wake_after(wait);
         }
@@ -1489,9 +1572,17 @@ impl State {
         }
         let views: Vec<ThreadView> =
             serde_json::from_value(projection["threads"].clone()).map_err(|e| e.to_string())?;
-        for view in views {
+        for (view, raw) in views
+            .into_iter()
+            .zip(projection["threads"].as_array().into_iter().flatten())
+        {
             if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == view.id) {
                 view.apply(thread)?;
+                if let Some(meta) = raw.get("historyMeta").filter(|m| m.is_object()) {
+                    thread.history_has_more = meta["hasMoreHistory"] == true;
+                    thread.history_loading = meta["loading"] == true;
+                    thread.history_error = meta["error"].as_str().map(str::to_owned);
+                }
             }
         }
         self.active = self
@@ -1584,6 +1675,18 @@ impl State {
         }
         self.client_recover
             .retain(|id, _| self.threads.iter().any(|thread| thread.id == *id));
+        if !self.demo
+            && self.supports_model_favorites()
+            && !self.model_favorites_migrated
+            && self.model_favorites.is_none()
+            && !self.preferences.model_favorites.is_empty()
+        {
+            self.model_favorites_migrated = true;
+            self.forward(
+                "settings.modelFavorites",
+                json!({"migrateFavorites": self.preferences.model_favorites}),
+            );
+        }
         self.capture_opened_draft();
         self.storage_error = None;
         if let Some(path) = self.launch_project.take()
@@ -1605,6 +1708,24 @@ impl State {
                 .ok_or_else(|| "This machine is not linked.".to_string())?
                 .send(method, params)
         })
+    }
+
+    pub fn load_earlier_history(&mut self, thread_id: usize, through_entry_id: Option<String>) {
+        let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) else {
+            return;
+        };
+        if !thread.history_has_more || thread.history_loading {
+            return;
+        }
+        thread.history_loading = true;
+        thread.history_error = None;
+        if let Some(client) = &self.client {
+            if self.machines.selected == "local" {
+                client.load_earlier_history(thread_id, through_entry_id);
+            } else if let Some(linked) = client.linked.get(&self.machines.selected) {
+                linked.load_earlier_history(thread_id, through_entry_id);
+            }
+        }
     }
     pub fn machine_label(&self, server: &str) -> String {
         if server == "local"
@@ -1739,6 +1860,7 @@ impl State {
         self.tab_epoch += 1;
         self.requested_tab = None;
         self.requested_tab_restore = None;
+        self.close_thread_find();
         self.machines.selected = server.into();
         let cached = self.machines.threads.remove(server);
         let cached_editors = cached.is_some();
@@ -1964,6 +2086,7 @@ impl State {
                 let thread = self.current_mut();
                 thread.client_creating = Some(command);
                 thread.remote_send = Some((command, snapshot));
+                thread.life.last_requested_at = Some(lifecycle::now());
                 thread.draft.replace_text("");
                 thread.draft_images.clear();
                 thread.draft_context.clear();
@@ -2005,44 +2128,7 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
-        let threads = if server == self.machines.selected {
-            &mut self.threads
-        } else {
-            let Some(threads) = self.machines.threads.get_mut(server) else {
-                return;
-            };
-            threads
-        };
-        let Some(draft) = threads.iter_mut().find(|thread| {
-            thread.client_draft
-                && json!(thread.id) == command.params["clientDraft"]
-                && thread.client_creating == Some(command.command_id)
-        }) else {
-            return;
-        };
-        draft.client_creating = None;
-        let submitted = draft.remote_send.take();
-        if value["result"]["status"] != "accepted" {
-            if let Some((_, snapshot)) = submitted {
-                draft.restore_snapshot(&snapshot);
-            }
-            let error = value["error"]["message"]
-                .as_str()
-                .or(value["result"]["result"]["error"].as_str())
-                .unwrap_or("Thread creation was not confirmed. Your draft was kept.")
-                .to_string();
-            draft.error = Some(error.clone());
-            self.machines.notice = Some(error);
-            return;
-        }
-        let Some(id) = value["result"]["result"]["threadId"].as_u64() else {
-            return;
-        };
-        draft.client_promoted = Some(id as usize);
-        let Some((_, snapshot)) = submitted else {
-            return;
-        };
-        let label = |machine: &str| -> String {
+        let peer_label = |machine: &str| -> String {
             if machine == "local" {
                 "Local".into()
             } else {
@@ -2059,34 +2145,88 @@ impl State {
                     .unwrap_or_else(|| machine.into())
             }
         };
-        let edit = snapshot.editor();
-        let prompt = match crate::composer_tokens::prompt_for_target(
-            &edit,
-            &snapshot.attachments,
-            &snapshot.context,
-            Some(server),
-            Some(&target_server_id),
-            &target_peers,
-            &label,
-        ) {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                draft.restore_snapshot(&snapshot);
-                draft.attachment_error = Some(error.clone());
-                self.machines.notice = Some(error);
+        enum Outcome {
+            None,
+            Failed(Option<String>, usize, String),
+        }
+        let outcome = {
+            let threads = if server == self.machines.selected {
+                &mut self.threads
+            } else {
+                let Some(threads) = self.machines.threads.get_mut(server) else {
+                    return;
+                };
+                threads
+            };
+            let Some(draft) = threads.iter_mut().find(|thread| {
+                thread.client_draft
+                    && json!(thread.id) == command.params["clientDraft"]
+                    && thread.client_creating == Some(command.command_id)
+            }) else {
                 return;
+            };
+            draft.client_creating = None;
+            let submitted = draft.remote_send.take();
+            if value["result"]["status"] != "accepted" {
+                if let Some((_, snapshot)) = submitted {
+                    draft.restore_snapshot(&snapshot);
+                }
+                let error = value["error"]["message"]
+                    .as_str()
+                    .or(value["result"]["result"]["error"].as_str())
+                    .unwrap_or("Thread creation was not confirmed. Your draft was kept.")
+                    .to_string();
+                draft.error = Some(error.clone());
+                Outcome::Failed(draft.background_send.take(), draft.id, error)
+            } else if let Some(id) = value["result"]["result"]["threadId"].as_u64() {
+                draft.client_promoted = Some(id as usize);
+                if let Some((_, snapshot)) = submitted {
+                    match crate::composer_tokens::prompt_for_target(
+                        &snapshot.editor(),
+                        &snapshot.attachments,
+                        &snapshot.context,
+                        Some(server),
+                        Some(&target_server_id),
+                        &target_peers,
+                        &peer_label,
+                    ) {
+                        Ok(prompt) => {
+                            let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
+                                "context":prompt.context,"draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+                            let result = commands
+                                .ok_or_else(|| {
+                                    "This machine is not linked. Your draft was kept.".to_string()
+                                })
+                                .and_then(|commands| commands.send("thread.send", params));
+                            match result {
+                                Ok(cmd_id) => {
+                                    draft.remote_send = Some((cmd_id, snapshot));
+                                    Outcome::None
+                                }
+                                Err(error) => {
+                                    draft.restore_snapshot(&snapshot);
+                                    draft.error = Some(error.clone());
+                                    Outcome::Failed(draft.background_send.take(), draft.id, error)
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            draft.restore_snapshot(&snapshot);
+                            draft.attachment_error = Some(error.clone());
+                            Outcome::Failed(draft.background_send.take(), draft.id, error)
+                        }
+                    }
+                } else {
+                    Outcome::None
+                }
+            } else {
+                Outcome::None
             }
         };
-        let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-            "context":prompt.context,"draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
-        let result = commands
-            .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
-            .and_then(|commands| commands.send("thread.send", params));
-        match result {
-            Ok(id) => draft.remote_send = Some((id, snapshot)),
-            Err(error) => {
-                draft.restore_snapshot(&snapshot);
-                draft.error = Some(error.clone());
+        if let Outcome::Failed(bg, draft_id, error) = outcome {
+            if let Some(bg_server) = bg {
+                self.notify_background_failure(&bg_server, draft_id, error);
+            } else {
                 self.machines.notice = Some(error);
             }
         }
@@ -2110,11 +2250,15 @@ impl State {
             let context = std::mem::take(&mut self.threads[draft_index].draft_context);
             let retained = std::mem::take(&mut self.threads[draft_index].retained_context);
             let sending = self.threads[draft_index].remote_send.take();
+            let background_send = self.threads[draft_index].background_send.take();
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
             self.threads[index].draft_context = context;
             self.threads[index].retained_context = retained;
             self.threads[index].remote_send = sending;
+            if background_send.is_some() {
+                self.threads[index].background_send = background_send;
+            }
             let active = self.current().id;
             if self.tabs.contains(&draft_id) {
                 self.tabs.retain(|tab| *tab != id);
@@ -2686,6 +2830,14 @@ impl State {
                 if let Some(tier) = args["serviceTier"].as_str() {
                     self.current_mut().set_service_tier(tier.into());
                 }
+                if !args["options"].is_null() {
+                    let opts: Vec<crate::model_selection::ProviderOptionSelection> =
+                        serde_json::from_value(args["options"].clone())
+                            .map_err(|e| format!("Invalid options: {e}"))?;
+                    for opt in opts {
+                        self.current_mut().set_option(opt.id, opt.value);
+                    }
+                }
                 if let Some(access) = args["access"].as_str() {
                     self.set_access_mode(AccessMode::parse(access).ok_or("Unknown access mode.")?);
                 }
@@ -2826,6 +2978,35 @@ impl State {
                 self.default_harness = harness;
                 self.checkpoint();
             }
+            "settings.modelFavorites" => {
+                if let Some(migrated) = args.get("migrateFavorites").and_then(|v| v.as_array()) {
+                    if self.model_favorites.is_none() {
+                        let parsed: Vec<crate::model_picker::ModelFavorite> =
+                            serde_json::from_value(Value::Array(migrated.clone()))
+                                .map_err(|_| "Invalid model favorites.")?;
+                        self.model_favorites = Some(parsed);
+                        self.checkpoint();
+                    }
+                    return Ok(json!({"threadId":self.current().id}));
+                }
+                let provider = text("provider")?;
+                let model = text("model")?;
+                let favorite = args["favorite"]
+                    .as_bool()
+                    .ok_or("favorite must be a boolean.")?;
+                let list = self.model_favorites.get_or_insert_with(Vec::new);
+                let exists = list
+                    .iter()
+                    .any(|item| item.provider == provider && item.model == model);
+                if favorite {
+                    if !exists {
+                        list.push(crate::model_picker::ModelFavorite { provider, model });
+                    }
+                } else {
+                    list.retain(|item| item.provider != provider || item.model != model);
+                }
+                self.checkpoint();
+            }
             "background.keepAwake" => self.set_keep_awake(
                 serde_json::from_value(args["policy"].clone()).map_err(|e| e.to_string())?,
             ),
@@ -2947,7 +3128,15 @@ impl State {
                 }
             }
             "project.cancelClone" => self.close_clone_dialog(),
-            "catalog.refresh" => self.refresh_catalog(),
+            "catalog.refresh" => {
+                if args["modelCatalogOnly"] == true {
+                    self.refresh_catalog_on_open();
+                } else if args["force"] == true {
+                    self.force_refresh_catalog();
+                } else {
+                    self.refresh_catalog();
+                }
+            }
             "commands.refresh" => {
                 if self.current().pi.is_none()
                     && self.current().error.is_none()
@@ -5125,5 +5314,381 @@ mod tests {
         )
         .unwrap_err();
         assert!(err_unlinked.contains("not linked"), "{err_unlinked}");
+    }
+
+    #[test]
+    fn foreground_and_background_sends_guard_context_and_restore_full_snapshots() {
+        for background in [false, true] {
+            for new_thread in [false, true] {
+                let (mut state, server, mut commands) = tab_client();
+                state.apply_projection(server.projection()).unwrap();
+                if new_thread {
+                    state.new_thread_in(Some(1));
+                }
+                let source_id = state.current().id;
+                let record =
+                    crate::composer_context::thread_context_record("local", 1, "Reference");
+                let text = format!(
+                    "Read [Reference]({})",
+                    crate::composer_context::format_composer_context_href(
+                        "thread",
+                        &record.context_id
+                    )
+                );
+                state.current_mut().draft = crate::composer_rich::draft_from_canonical(&text);
+                state.current_mut().draft_context = vec![record.clone()];
+                let send = |state: &mut State| {
+                    if background {
+                        state.send_background()
+                    } else {
+                        state.send()
+                    }
+                };
+                // A pending import blocks both dispatch paths before promotion/navigation.
+                state
+                    .pending_context_imports
+                    .push(("local".into(), source_id, "pending".into()));
+                send(&mut state);
+                assert_eq!(state.current().id, source_id);
+                assert!(commands.try_recv().is_err());
+                state.pending_context_imports.clear();
+                // An unlinked thread blocks both paths before thread.create as well.
+                state.current_mut().draft_context[0] =
+                    crate::composer_context::thread_context_record("unlinked", 1, "Reference");
+                send(&mut state);
+                assert_eq!(state.current().id, source_id);
+                assert!(commands.try_recv().is_err());
+                assert!(
+                    state
+                        .current()
+                        .attachment_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("not linked")
+                );
+                state.current_mut().draft_context = vec![record.clone()];
+                send(&mut state);
+                let command = commands.try_recv().unwrap();
+                let rejected = json!({"result":{"status":"rejected","result":{"error":"Refused"}}});
+                if new_thread {
+                    assert_eq!(command.method, "thread.create");
+                    state.complete_client_creation("local", &command, &rejected);
+                } else {
+                    assert_eq!(command.method, "thread.send");
+                    state.machines.receipts.insert(
+                        "local".into(),
+                        vec![crate::client::Event::Receipt(command, rejected)],
+                    );
+                    state.poll_client(&mut Tx::default());
+                }
+                let source = state.threads.iter().find(|t| t.id == source_id).unwrap();
+                assert_eq!(crate::composer_rich::markdown(&source.draft), text);
+                assert_eq!(source.draft_context, vec![record]);
+                assert!(source.remote_send.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_send_background_promotes_opens_fresh_draft_and_handles_success_failure_and_offline() {
+        // 1. Offline machine shows warning toast and does not send or open a new draft.
+        {
+            let mut state = State::new(PathBuf::new(), false);
+            let mut client = crate::client::Client::new(state.data_dir.clone());
+            client.linked.insert(
+                "offline".into(),
+                crate::client::Client::new(state.data_dir.clone()),
+            );
+            state.client = Some(client);
+            state.machines.selected = "offline".into();
+            state.current_mut().client_draft = true;
+            state.current_mut().draft.replace_text("Should not send");
+            let id = state.current().id;
+            state.send_background();
+            assert_eq!(state.current().id, id);
+            assert_eq!(state.current().draft.text, "Should not send");
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Warning);
+            assert_eq!(state.toasts[0].title, "Not connected: message not sent");
+            assert_eq!(
+                state.toasts[0].description.as_deref(),
+                Some("Reconnecting to the environment. Try again once it is connected.")
+            );
+        }
+
+        // 2. Remote draft sendBackground: promotes in background, stays visible in sidebar while launching,
+        // opens fresh draft immediately, and shows "Started in background" once accepted.
+        {
+            let (mut state, mut server, mut commands) = tab_client();
+            state.apply_projection(server.projection()).unwrap();
+            state.new_thread_in(Some(1));
+            let draft_id = state.current().id;
+            state.current_mut().draft.replace_text("Remote bg task");
+            state.send_background();
+
+            let fresh_id = state.current().id;
+            assert_ne!(fresh_id, draft_id);
+            assert!(state.current().client_draft);
+            assert!(state.current().draft.text.is_empty());
+            assert!(
+                state
+                    .sidebar_threads()
+                    .iter()
+                    .any(|&i| state.threads[i].id == draft_id),
+                "launching background draft remains in sidebar"
+            );
+
+            let create = commands.try_recv().unwrap();
+            assert_eq!(create.method, "thread.create");
+            let created = server.execute_command(&create).unwrap();
+            let server_id = created["threadId"].as_u64().unwrap() as usize;
+            state.complete_client_creation("local", &create, &accepted(created));
+            let send = commands.try_recv().unwrap();
+            assert_eq!(send.method, "thread.send");
+            state.apply_projection(server.projection()).unwrap();
+            state.finish_client_promotions();
+            assert_eq!(state.current().id, fresh_id, "stays on fresh composer");
+
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send,
+                    json!({"result":{"status":"accepted","result":{}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_eq!(state.current().id, fresh_id);
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Success);
+            assert_eq!(state.toasts[0].title, "Started in background");
+            assert_eq!(state.toasts[0].action_label.as_deref(), Some("Open"));
+
+            let toast_id = state.toasts[0].id;
+            state.activate_toast(toast_id);
+            assert_eq!(state.current().id, server_id);
+        }
+
+        // 3. Remote background send failure on thread.create restores draft and shows "Background task failed".
+        {
+            let (mut state, server, mut commands) = tab_client();
+            state.apply_projection(server.projection()).unwrap();
+            state.new_thread_in(Some(1));
+            let draft_id = state.current().id;
+            state.current_mut().draft.replace_text("Will fail create");
+            state.send_background();
+            let fresh_id = state.current().id;
+            assert_ne!(fresh_id, draft_id);
+
+            let create = commands.try_recv().unwrap();
+            state.complete_client_creation(
+                "local",
+                &create,
+                &json!({"result":{"status":"rejected","result":{"error":"Create refused"}}}),
+            );
+            assert_eq!(state.current().id, fresh_id);
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Error);
+            assert_eq!(state.toasts[0].title, "Background task failed");
+            assert_eq!(
+                state.toasts[0].description.as_deref(),
+                Some("Create refused")
+            );
+            assert_eq!(state.toasts[0].action_label.as_deref(), Some("Open draft"));
+            let toast_id = state.toasts[0].id;
+            state.activate_toast(toast_id);
+            assert_eq!(state.current().id, draft_id);
+            assert_eq!(state.current().draft.text, "Will fail create");
+            assert_eq!(state.current().error.as_deref(), Some("Create refused"));
+        }
+
+        // 4. Remote sendAndNewThread on existing thread waits for accepted receipt, and refuses to switch on failure.
+        {
+            let (mut state, mut server, mut commands) = tab_client();
+            server.threads[0].messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: "You",
+                text: "Prior turn".into(),
+                images: vec![],
+                context: None,
+            });
+            state.apply_projection(server.projection()).unwrap();
+            state.select_thread(0);
+            while commands.try_recv().is_ok() {}
+            let existing_id = state.current().id;
+            assert!(!state.current().is_draft());
+            state
+                .current_mut()
+                .draft
+                .replace_text("Existing remote send");
+            state.send_background();
+            // Still on existing thread while receipt is pending.
+            assert_eq!(state.current().id, existing_id);
+            let send = commands.try_recv().unwrap();
+            assert_eq!(send.method, "thread.send");
+
+            // Rejected receipt restores draft and stays on existing thread.
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send,
+                    json!({"result":{"status":"rejected","result":{"error":"Send refused"}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_eq!(state.current().id, existing_id);
+            assert_eq!(state.current().draft.text, "Existing remote send");
+            assert_eq!(state.current().error.as_deref(), Some("Send refused"));
+
+            // Accepted receipt opens a fresh draft in the same project.
+            state.send_background();
+            let send2 = commands.try_recv().unwrap();
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send2,
+                    json!({"result":{"status":"accepted","result":{}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_ne!(state.current().id, existing_id);
+            assert!(state.current().client_draft);
+            assert!(state.toasts.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_favorites_negotiates_capability_and_falls_back_to_client_preferences_when_peer_lacks_it()
+     {
+        let (mut state, mut server, mut commands) = tab_client();
+        // When peer lacks MODEL_FAVORITES capability, favorites live locally in Preferences.
+        assert!(!state.supports_model_favorites());
+        state.toggle_model_favorite("codex", "gpt-5.6-sol");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            state.effective_model_favorites(),
+            &[crate::model_picker::ModelFavorite {
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+            }]
+        );
+        // Persistence roundtrip in Preferences (ui_snapshot)
+        let ui = state.ui_snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_ui(&ui).unwrap();
+        assert_eq!(restored.preferences.model_favorites.len(), 1);
+
+        // When peer advertises MODEL_FAVORITES capability, favorites migrate and sync via settings.modelFavorites.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_FAVORITES]});
+        assert!(state.supports_model_favorites());
+        state.apply_projection(server.projection()).unwrap();
+        let migrate = commands.try_recv().unwrap();
+        assert_eq!(migrate.method, "settings.modelFavorites");
+        server.execute_command(&migrate).unwrap();
+        assert_eq!(server.model_favorites.as_ref().unwrap().len(), 1);
+
+        state.toggle_model_favorite("pi", "cpa/opus");
+        let add_cmd = commands.try_recv().unwrap();
+        assert_eq!(add_cmd.method, "settings.modelFavorites");
+        assert_eq!(add_cmd.params["provider"], "pi");
+        assert_eq!(add_cmd.params["model"], "cpa/opus");
+        assert_eq!(add_cmd.params["favorite"], true);
+        server.execute_command(&add_cmd).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.effective_model_favorites().len(), 2);
+    }
+
+    #[test]
+    fn catalog_refresh_on_open_gates_on_capability_and_sends_model_catalog_only() {
+        let (mut state, mut server, mut commands) = tab_client();
+        // Older peer without MODEL_CATALOG_REFRESH: opening picker skips modelCatalogOnly RPC.
+        assert!(!state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        assert!(commands.try_recv().is_err());
+
+        // Capable peer: opening picker sends catalog.refresh { modelCatalogOnly: true }.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_CATALOG_REFRESH]});
+        assert!(state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        let on_open = commands.try_recv().unwrap();
+        assert_eq!(on_open.method, "catalog.refresh");
+        assert_eq!(on_open.params["modelCatalogOnly"], true);
+        server.execute_command(&on_open).unwrap();
+
+        // Explicit retry-catalog sends catalog.refresh { force: true } (not modelCatalogOnly).
+        state.force_refresh_catalog();
+        let retry = commands.try_recv().unwrap();
+        assert_eq!(retry.method, "catalog.refresh");
+        assert_eq!(retry.params["force"], true);
+        assert!(retry.params.get("modelCatalogOnly").is_none());
+    }
+
+    #[test]
+    fn model_options_gate_on_capability_and_fall_back_for_older_peers() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.select_thread(0);
+        while commands.try_recv().is_ok() {}
+        server.threads[0].harness = "claude".into();
+        server.threads[0].models = vec![crate::session::AgentModel {
+            provider: "claude".into(),
+            id: "claude-opus-5-5".into(),
+            name: "Claude Opus 5.5".into(),
+            thinking_levels: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+            capabilities: crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .map(|m| m.capabilities)
+                .unwrap_or_default(),
+            ..Default::default()
+        }];
+        server.threads[0].set_model("claude".into(), "claude-opus-5-5".into());
+        state.apply_projection(server.projection()).unwrap();
+
+        // Older peer without MODEL_OPTIONS falls back to `thinking` / `serviceTier` and refuses descriptor-only options.
+        assert!(!state.supports_model_options());
+        state.set_composer_option_sticky(
+            "effort".into(),
+            crate::model_selection::OptionValue::Str("high".into()),
+        );
+        let fallback_effort = commands.try_recv().unwrap();
+        assert_eq!(fallback_effort.method, "thread.configure");
+        assert_eq!(fallback_effort.params["thinking"], "high");
+        assert!(fallback_effort.params.get("options").is_none());
+
+        state.set_composer_option_sticky(
+            "serviceTier".into(),
+            crate::model_selection::OptionValue::Str("fast".into()),
+        );
+        let fallback_tier = commands.try_recv().unwrap();
+        assert_eq!(fallback_tier.method, "thread.configure");
+        assert_eq!(fallback_tier.params["serviceTier"], "fast");
+
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().error.is_some());
+
+        // Capable peer advertising MODEL_OPTIONS forwards descriptor `options` via thread.configure.
+        state.current_mut().error = None;
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_OPTIONS]});
+        assert!(state.supports_model_options());
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        let cmd = commands.try_recv().unwrap();
+        assert_eq!(cmd.method, "thread.configure");
+        assert_eq!(cmd.params["options"][0]["id"], "fastMode");
+        assert_eq!(cmd.params["options"][0]["value"], true);
+        server.execute_command(&cmd).unwrap();
+        assert_eq!(
+            server.threads[0].model_options,
+            vec![crate::model_selection::ProviderOptionSelection {
+                id: "fastMode".into(),
+                value: crate::model_selection::OptionValue::Bool(true),
+            }]
+        );
     }
 }

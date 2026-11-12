@@ -127,6 +127,7 @@ struct Client {
     models: Vec<Value>,
     model: Value,
     model_option: Option<String>,
+    option_descriptors: Vec<crate::descriptors::ProviderOptionDescriptor>,
     stdio_fallback: bool,
     tools: HashMap<String, Value>,
     queued: VecDeque<Value>,
@@ -159,6 +160,7 @@ impl Client {
             models: vec![],
             model: Value::Null,
             model_option: None,
+            option_descriptors: vec![],
             stdio_fallback: false,
             tools: HashMap::new(),
             queued: VecDeque::new(),
@@ -450,6 +452,12 @@ impl Client {
                 }
                 self.reply(&request, self.model.clone());
             }
+            "set_option" | "set_thinking_level" => {
+                if result["configOptions"].is_array() {
+                    self.configure_models(result);
+                }
+                self.reply(&request, result.clone());
+            }
             _ => self.reply(&request, result.clone()),
         }
         Ok(())
@@ -461,10 +469,32 @@ impl Client {
         } else {
             vec!["text"]
         };
-        json!({"id":id,"name":name.unwrap_or(id),"provider":self.start.id,"input":input})
+        let thinking_levels: Vec<String> = self
+            .option_descriptors
+            .iter()
+            .find(|d| crate::descriptors::is_reasoning_control(d))
+            .map(|d| {
+                crate::descriptors::selectable_provider_option_choices(d)
+                    .into_iter()
+                    .map(|c| c.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({
+            "id": id,
+            "name": name.unwrap_or(id),
+            "provider": self.start.id,
+            "input": input,
+            "thinkingLevels": thinking_levels,
+            "capabilities": { "optionDescriptors": self.option_descriptors }
+        })
     }
 
     fn configure_models(&mut self, result: &Value) {
+        self.option_descriptors = crate::descriptors::acp_provider_option_descriptors(
+            result["configOptions"].as_array().map(Vec::as_slice),
+            result.get("modes"),
+        );
         if let Some(options) = result["configOptions"].as_array()
             && let Some(option) = options
                 .iter()
@@ -582,6 +612,57 @@ impl Client {
                     self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":record["modelId"]}), record);
                 } else {
                     self.request("session/set_model", json!({"sessionId":self.session,"modelId":record["modelId"]}), record);
+                }
+            }
+            "set_thinking_level" => {
+                if self.running {
+                    self.reject(&record, "Wait for the ACP run to finish before changing reasoning.");
+                } else if let Some(reasoning) = self
+                    .option_descriptors
+                    .iter()
+                    .find(|d| crate::descriptors::is_reasoning_control(d))
+                {
+                    let config_id = reasoning.id().to_owned();
+                    let raw = record["level"].as_str().unwrap_or("");
+                    let value = if raw == crate::descriptors::ACP_EMPTY_OPTION_VALUE {
+                        ""
+                    } else {
+                        raw
+                    };
+                    self.request(
+                        "session/set_config_option",
+                        json!({"sessionId":self.session,"configId":config_id,"value":value}),
+                        record,
+                    );
+                } else {
+                    self.reject(&record, format!("ACP does not support the {kind} operation in Shina. Native compaction, reasoning selection and conversation forks are unavailable for ACP."));
+                }
+            }
+            "set_option" => {
+                if self.running {
+                    self.reject(&record, "Wait for the ACP run to finish before changing options.");
+                } else if let Some(option_id) = record["optionId"].as_str() {
+                    if option_id == crate::descriptors::ACP_SESSION_MODE_OPTION_ID {
+                        let mode_id = record["value"]
+                            .as_str()
+                            .map(|v| if v == crate::descriptors::ACP_EMPTY_OPTION_VALUE { "" } else { v })
+                            .unwrap_or("");
+                        self.request(
+                            "session/set_mode",
+                            json!({"sessionId":self.session,"modeId":mode_id}),
+                            record,
+                        );
+                    } else {
+                        let value = match record["value"].as_str() {
+                            Some(v) if v == crate::descriptors::ACP_EMPTY_OPTION_VALUE => json!(""),
+                            _ => record["value"].clone(),
+                        };
+                        self.request(
+                            "session/set_config_option",
+                            json!({"sessionId":self.session,"configId":option_id,"value":value}),
+                            record,
+                        );
+                    }
                 }
             }
             _ => self.reject(&record, format!("ACP does not support the {kind} operation in Shina. Native compaction, reasoning selection and conversation forks are unavailable for ACP.")),
@@ -981,6 +1062,17 @@ impl Client {
                 crate::work::save_plan(&mut self.history, &id, &value);
                 self.events
                     .push(json!({"type":"harness_update","field":"plan","value":value}));
+            }
+            "config_option_update" => {
+                self.option_descriptors = crate::descriptors::acp_provider_option_descriptors(
+                    update["configOptions"].as_array().map(Vec::as_slice),
+                    None,
+                );
+                self.events.push(json!({
+                    "type": "harness_update",
+                    "field": "optionDescriptors",
+                    "value": self.option_descriptors
+                }));
             }
             "current_mode_update" => {
                 self.events.push(

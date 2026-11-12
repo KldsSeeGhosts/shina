@@ -161,6 +161,29 @@ impl Selection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToastAction {
+    OpenThread { server: String, thread_id: usize },
+}
+
+#[derive(Clone, Debug)]
+pub struct ToastNotice {
+    pub id: u64,
+    pub kind: ToastKind,
+    pub title: String,
+    pub description: Option<String>,
+    pub action_label: Option<String>,
+    pub action: Option<ToastAction>,
+    pub expires_at: Option<u64>,
+}
+
 /// The validated fields of a `delegate_task.target` request.
 pub(crate) struct DelegationTarget {
     harness: Option<String>,
@@ -334,6 +357,40 @@ pub struct AssistantWork {
     pub elapsed: Option<u64>,
 }
 
+#[derive(Default)]
+pub struct ThreadFindState {
+    pub open: bool,
+    pub server: String,
+    pub thread_id: usize,
+    pub query: TextEdit,
+    pub last_typed: String,
+    pub debounce_until: Option<Instant>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub unsupported: bool,
+    pub total_matches: usize,
+    pub active_index: usize,
+    pub active_match: Option<crate::thread_find::ThreadFindMatch>,
+    pub navigation: Vec<crate::thread_find::ThreadFindNavEntry>,
+    pub pending_reveal: Option<crate::thread_find::ThreadFindMatch>,
+    pub request_id: u64,
+}
+
+#[derive(Default)]
+pub struct SidebarSearchState {
+    pub last_typed: String,
+    pub debounce_until: Option<Instant>,
+    pub request_seq: u64,
+    pub settled_query: String,
+    pub matches: std::collections::HashMap<String, Vec<crate::thread_search::ThreadSearchHit>>,
+    pub pending_servers: std::collections::HashSet<String>,
+    pub unsupported_servers: Vec<String>,
+    pub visible_query: String,
+    pub visible_matches:
+        std::collections::HashMap<(String, usize), crate::thread_search::ThreadSearchHit>,
+    pub shown_order: Vec<(String, usize)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPicker {
     Model,
@@ -397,11 +454,14 @@ pub struct Thread {
     resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
-    client_creating: Option<uuid::Uuid>,
-    client_promoted: Option<usize>,
+    pub(crate) client_creating: Option<uuid::Uuid>,
+    pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
-    remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
+    pub(crate) remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
     pub composer_context_supported: bool,
+    pub(crate) background_start_pending: bool,
+    pub(crate) background_send: Option<String>,
+    pub(crate) pending_send_and_new_thread: Option<(uuid::Uuid, String)>,
     request_generation: String,
     server_owned: bool,
     recovery_command: Option<uuid::Uuid>,
@@ -477,12 +537,17 @@ pub struct Thread {
     serial: usize,
     state_loaded: bool,
     history_loaded: bool,
+    pub history_has_more: bool,
+    pub history_loading: bool,
+    pub history_error: Option<String>,
     pub(crate) initializing: bool,
     session_started: Option<Instant>,
     last_activity: Instant,
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
     pub selected_thinking: Option<String>,
+    pub model_options: Vec<crate::model_selection::ProviderOptionSelection>,
+    pub draft_model_state: crate::model_selection::DraftModelState,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
     startup_selection_check: Option<String>,
@@ -548,6 +613,9 @@ impl Thread {
             && self.messages.is_empty()
             && self.life.latest_user_message_at.is_none()
             && self.life.last_completed_at.is_none()
+            && self.client_creating.is_none()
+            && self.remote_send.is_none()
+            && self.client_promoted.is_none()
     }
     /// No session, or one that was only warmed for a thread nothing has been sent in.
     fn unused_session(&self) -> bool {
@@ -701,6 +769,9 @@ impl Thread {
             remote: None,
             remote_send: None,
             composer_context_supported: true,
+            background_start_pending: false,
+            background_send: None,
+            pending_send_and_new_thread: None,
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
@@ -776,12 +847,17 @@ impl Thread {
             serial: 0,
             state_loaded: false,
             history_loaded: false,
+            history_has_more: false,
+            history_loading: false,
+            history_error: None,
             initializing: false,
             session_started: None,
             last_activity: Instant::now(),
             prewarm_attempted: false,
             selected_model: None,
             selected_thinking: None,
+            model_options: vec![],
+            draft_model_state: Default::default(),
             startup_model_applied: false,
             startup_thinking_applied: false,
             startup_selection_check: None,
@@ -904,8 +980,11 @@ impl Thread {
             return;
         }
         self.attachment_error = None;
-        if self.model_id != model_id && self.harness == "codex" {
-            self.harness_state["serviceTier"] = Value::Null;
+        if self.model_id != model_id {
+            self.model_options.clear();
+            if self.harness == "codex" {
+                self.harness_state["serviceTier"] = Value::Null;
+            }
         }
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
@@ -1582,6 +1661,38 @@ impl Thread {
             self.reject_images(&prompt, index, error);
             return;
         }
+        let mut prompt = prompt;
+        if self.harness == "claude" {
+            let effort = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "effort")
+                .and_then(|o| o.value.as_str());
+            let caps = self
+                .models
+                .iter()
+                .find(|m| m.provider == self.model_provider && m.id == self.model_id)
+                .map(|m| m.capabilities.clone())
+                .unwrap_or_default();
+            let injected = crate::descriptors::resolve_prompt_injected_effort(&caps, effort);
+            prompt.text = crate::descriptors::apply_claude_prompt_effort_prefix(
+                &prompt.text,
+                injected.as_deref().or(effort),
+            );
+        }
+        if self.harness == "pi"
+            && let Some(tier) = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "serviceTier")
+                .and_then(|o| o.value.as_str())
+                .filter(|&t| t != "default" && !t.is_empty())
+        {
+            let _ = self.command(
+                "prompt",
+                json!({"message": format!("/shina-service-tier {tier}")}),
+            );
+        }
         let record = match attachments::prompt_record(&prompt, self.harness == "pi") {
             Ok(record) => record,
             Err(error) => {
@@ -1607,6 +1718,18 @@ impl Thread {
             .iter()
             .find(|m| m.provider == self.model_provider && m.id == self.model_id)
         {
+            if let Some(reasoning) = model
+                .capabilities
+                .option_descriptors
+                .iter()
+                .find(|d| crate::descriptors::is_reasoning_control(d))
+            {
+                let choices = crate::descriptors::selectable_provider_option_choices(reasoning);
+                if !choices.is_empty() {
+                    self.thinking_levels = choices.into_iter().map(|c| c.id).collect();
+                    return;
+                }
+            }
             self.thinking_levels = model.thinking_levels.clone();
         }
     }
@@ -1806,6 +1929,16 @@ impl Thread {
                     self.harness_context_sent = record["value"] == true;
                 } else if let Some(field) = record["field"].as_str() {
                     self.harness_state[field] = record["value"].clone();
+                    if field == "optionDescriptors"
+                        && let Ok(descriptors) = serde_json::from_value::<
+                            Vec<crate::descriptors::ProviderOptionDescriptor>,
+                        >(record["value"].clone())
+                    {
+                        for model in &mut self.models {
+                            model.capabilities.option_descriptors = descriptors.clone();
+                        }
+                        self.refresh_thinking_levels();
+                    }
                     if matches!(field, "plan" | "plan_update") {
                         self.record_plan(&record["value"]);
                     }
@@ -1967,6 +2100,12 @@ impl Thread {
                         self.configuring = false;
                         // Capacity and the previous percentage belonged to the old model.
                         self.refresh_context_usage();
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "set_thinking_level" => {
                         if let Some(level) = self.pending_thinking.take() {
@@ -1974,6 +2113,12 @@ impl Thread {
                         }
                         self.command("get_state", json!({}));
                         self.configuring = false;
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "get_messages" if record["id"] == "history" => {
                         if self.server_owned
@@ -2598,18 +2743,19 @@ impl Thread {
         }
     }
 
-    fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) {
+    pub(crate) fn finish_remote_send(&mut self, command: uuid::Uuid, accepted: bool) -> bool {
         if !self
             .remote_send
             .as_ref()
             .is_some_and(|(id, _)| *id == command)
         {
-            return;
+            return false;
         }
         let (_, snapshot) = self.remote_send.take().unwrap();
         if !accepted {
             self.restore_snapshot(&snapshot);
         }
+        true
     }
 
     fn finish_run(&mut self) {
@@ -2757,6 +2903,8 @@ pub struct State {
     pub shelves: [bool; 2],
     pub settled_visible: usize,
     pub undo: Option<UndoNotice>,
+    pub toasts: Vec<ToastNotice>,
+    next_toast_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
@@ -2811,10 +2959,19 @@ pub struct State {
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
     pub settings_picker: Option<SettingsPicker>,
+    pub open_option_menu: Option<String>,
+    pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
+    pub expanded_legacy_instances: std::collections::HashSet<String>,
+    pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
+    model_favorites_migrated: bool,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
     /// (highest). The level is chosen on release.
     pub thinking_drag: Option<f32>,
     pub model_search: TextEdit,
+    pub thread_find: ThreadFindState,
+    pub sidebar_search: SidebarSearchState,
+    pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
+    pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub updater: crate::update::Updater,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
@@ -2832,7 +2989,7 @@ pub struct State {
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
-    runtime_enabled: bool,
+    pub(crate) runtime_enabled: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
     // Drop the owner only after every store has flushed and stopped its writer.
@@ -2953,6 +3110,8 @@ impl State {
             shelves: [false; 2],
             settled_visible: 10,
             undo: None,
+            toasts: Vec::new(),
+            next_toast_id: 1,
             opened_draft: None,
             composer_sources: crate::composer_sources::Sources::default(),
             snooze_menu: None,
@@ -3007,8 +3166,17 @@ impl State {
             captain_editor: None,
             brief: BriefUi::default(),
             settings_picker: None,
+            open_option_menu: None,
+            model_picker_tab: None,
+            expanded_legacy_instances: Default::default(),
+            model_favorites: None,
+            model_favorites_migrated: false,
             thinking_drag: None,
             model_search: TextEdit::default(),
+            thread_find: ThreadFindState::default(),
+            sidebar_search: SidebarSearchState::default(),
+            timeline_far_from_bottom: std::collections::HashMap::new(),
+            timeline_at_bottom: std::collections::HashMap::new(),
             updater: Default::default(),
             restart_for_update: false,
             restart_approved: false,
@@ -3092,14 +3260,24 @@ impl State {
     fn focus_thread(&mut self, index: usize) {
         self.focus_tab(index, true);
     }
-    fn focus_tab(&mut self, index: usize, visit: bool) {
+    pub(crate) fn focus_tab(&mut self, index: usize, visit: bool) {
         debug_assert!(self.tabs.contains(&self.threads[index].id));
+        let previous = self.active;
+        if previous != index && previous < self.threads.len() {
+            self.threads[previous].draft.focused = false;
+        }
         self.active = index;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
         self.selected_threads.clear();
         let id = self.current().id;
+        if self.thread_find.open
+            && (self.thread_find.server != self.machines.selected
+                || self.thread_find.thread_id != id)
+        {
+            self.close_thread_find();
+        }
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
         }
@@ -3140,6 +3318,302 @@ impl State {
     }
     pub fn project(&self, id: Option<ProjectId>) -> Option<&Project> {
         self.projects.entries.iter().find(|p| Some(p.id) == id)
+    }
+    pub fn set_timeline_far_from_bottom(&mut self, thread_id: usize, far: bool) {
+        let key = (self.machines.selected.clone(), thread_id);
+        if far {
+            self.timeline_far_from_bottom.insert(key, true);
+        } else {
+            self.timeline_far_from_bottom.remove(&key);
+        }
+    }
+    pub fn timeline_is_far_from_bottom(&self, thread_id: usize) -> bool {
+        self.timeline_far_from_bottom
+            .get(&(self.machines.selected.clone(), thread_id))
+            .copied()
+            .unwrap_or(false)
+    }
+    pub fn set_timeline_at_bottom(&mut self, thread_id: usize, at: bool) {
+        self.timeline_at_bottom
+            .insert((self.machines.selected.clone(), thread_id), at);
+    }
+    pub fn thread_find_active(&self) -> bool {
+        self.thread_find.open
+            && self.thread_find.server == self.machines.selected
+            && self.thread_find.thread_id == self.current().id
+    }
+    pub fn open_thread_find(&mut self) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        let same = self.thread_find.open
+            && self.thread_find.server == server
+            && self.thread_find.thread_id == thread_id;
+        if !same {
+            self.thread_find = ThreadFindState {
+                open: true,
+                server,
+                thread_id,
+                ..ThreadFindState::default()
+            };
+        }
+        self.thread_find.query.focused = true;
+        self.thread_find.query.anchor = 0;
+        self.thread_find.query.focus = self.thread_find.query.text.len();
+        if !self.thread_find.query.text.trim().is_empty() {
+            self.run_thread_find(None, 0);
+        }
+    }
+    pub fn open_thread_find_on_query(
+        &mut self,
+        query: String,
+        start: Option<crate::thread_find::ThreadFindStart>,
+    ) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        self.thread_find = ThreadFindState {
+            open: true,
+            server,
+            thread_id,
+            ..ThreadFindState::default()
+        };
+        let query: String = query
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        self.thread_find.query.replace_text(&query);
+        self.thread_find.query.focused = true;
+        self.thread_find.query.anchor = 0;
+        self.thread_find.query.focus = self.thread_find.query.text.len();
+        self.thread_find.last_typed = self.thread_find.query.text.clone();
+        if !query.trim().is_empty() {
+            self.run_thread_find(start.as_ref(), 0);
+        }
+    }
+    pub fn close_thread_find(&mut self) {
+        self.thread_find = ThreadFindState::default();
+    }
+    #[cfg(test)]
+    pub fn set_thread_find_query(&mut self, query: String) {
+        let query: String = query
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        self.thread_find.query.replace_text(&query);
+        self.thread_find.last_typed = query;
+        self.thread_find.debounce_until = None;
+        self.run_thread_find(None, 0);
+    }
+    pub fn retry_thread_find(&mut self) {
+        if !self.thread_find.open {
+            return;
+        }
+        self.run_thread_find(None, 0);
+    }
+    pub fn step_thread_find(&mut self, delta: i64) {
+        if !self.thread_find.open
+            || self.thread_find.total_matches == 0
+            || self.thread_find.loading
+            || self.thread_find.unsupported
+        {
+            return;
+        }
+        let total = self.thread_find.total_matches;
+        let next_index =
+            ((self.thread_find.active_index as i64 + delta).rem_euclid(total as i64)) as usize;
+        if let Some(entry) = self.thread_find.navigation.iter().find(|entry| {
+            next_index >= entry.start_index && next_index < entry.start_index + entry.count
+        }) {
+            let matched = crate::thread_find::ThreadFindMatch {
+                entry_id: entry.entry_id.clone(),
+                occurrence: next_index - entry.start_index,
+            };
+            self.thread_find.active_index = next_index;
+            self.thread_find.active_match = Some(matched.clone());
+            self.thread_find.pending_reveal = Some(matched);
+            return;
+        }
+        let start =
+            self.thread_find
+                .active_match
+                .as_ref()
+                .map(|m| crate::thread_find::ThreadFindStart {
+                    entry_id: m.entry_id.clone(),
+                    occurrence: m.occurrence,
+                });
+        self.run_thread_find(start.as_ref(), delta);
+    }
+    pub fn sync_thread_find_input(&mut self) -> bool {
+        if !self.thread_find.open {
+            return false;
+        }
+        let clipped: String = self
+            .thread_find
+            .query
+            .text
+            .chars()
+            .take(crate::thread_find::THREAD_FIND_QUERY_MAX_LENGTH)
+            .collect();
+        if clipped != self.thread_find.query.text {
+            self.thread_find.query.replace_text(&clipped);
+        }
+        if self.thread_find.query.text == self.thread_find.last_typed {
+            return false;
+        }
+        self.thread_find.last_typed = self.thread_find.query.text.clone();
+        if self.client.is_some() {
+            self.thread_find.debounce_until = Some(Instant::now() + Duration::from_millis(100));
+        } else {
+            self.thread_find.debounce_until = None;
+            self.run_thread_find(None, 0);
+        }
+        true
+    }
+    pub fn poll_thread_find(&mut self, tx: &mut Tx) -> bool {
+        let mut changed = self.sync_thread_find_input();
+        if let Some(until) = self.thread_find.debounce_until {
+            let now = Instant::now();
+            if now >= until {
+                self.thread_find.debounce_until = None;
+                self.run_thread_find(None, 0);
+                changed = true;
+            } else {
+                tx.wake_after(until.saturating_duration_since(now));
+            }
+        }
+        changed |= self.consume_pending_find_reveal(tx);
+        changed
+    }
+    fn run_thread_find(
+        &mut self,
+        start: Option<&crate::thread_find::ThreadFindStart>,
+        offset: i64,
+    ) {
+        if !self.thread_find.open {
+            return;
+        }
+        let query = self.thread_find.query.text.trim().to_owned();
+        if query.is_empty() {
+            self.thread_find.loading = false;
+            self.thread_find.error = None;
+            self.thread_find.unsupported = false;
+            self.thread_find.total_matches = 0;
+            self.thread_find.active_index = 0;
+            self.thread_find.active_match = None;
+            self.thread_find.navigation.clear();
+            self.thread_find.pending_reveal = None;
+            return;
+        }
+        self.thread_find.request_id += 1;
+        let req_id = self.thread_find.request_id;
+        let thread_id = self.thread_find.thread_id;
+        if let Some(client) = &self.client {
+            let target = if self.thread_find.server == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&self.thread_find.server)
+            };
+            let Some(target) = target else {
+                self.thread_find.loading = false;
+                self.thread_find.error = Some("Machine unavailable.".into());
+                return;
+            };
+            if !target.has_capability(crate::protocol::THREAD_FIND) {
+                self.thread_find.loading = false;
+                self.thread_find.unsupported = true;
+                self.thread_find.error = Some(crate::protocol::THREAD_FIND_UPDATE_REQUIRED.into());
+                return;
+            }
+            self.thread_find.unsupported = false;
+            self.thread_find.error = None;
+            self.thread_find.loading = true;
+            let mut params = json!({"threadId": thread_id, "query": query});
+            if let Some(start) = start {
+                params["start"] = json!(start);
+            }
+            if offset != 0 {
+                params["offset"] = json!(offset);
+            }
+            target.call_rpc(format!("find:{req_id}"), "thread.find", params);
+            return;
+        }
+        let t = self.current();
+        let docs_owned: Vec<(&str, &str, &str)> = t
+            .messages
+            .iter()
+            .map(|m| (m.id.as_str(), m.role, m.display_text()))
+            .collect();
+        let docs: Vec<crate::thread_find::SearchDocument<'_>> = docs_owned
+            .iter()
+            .map(
+                |(entry_id, role, text)| crate::thread_find::SearchDocument {
+                    entry_id,
+                    role,
+                    text,
+                },
+            )
+            .collect();
+        let result = crate::thread_find::search_documents(&docs, &query, start, offset, None, 0);
+        self.apply_thread_find_result(req_id, Ok(result));
+    }
+    pub fn apply_thread_find_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::thread_find::ThreadFindResult, String>,
+    ) {
+        if !self.thread_find.open || req_id != self.thread_find.request_id {
+            return;
+        }
+        self.thread_find.loading = false;
+        match result {
+            Ok(res) => {
+                self.thread_find.error = None;
+                self.thread_find.unsupported = false;
+                self.thread_find.total_matches = res.total_matches;
+                self.thread_find.active_index = res.active_index;
+                self.thread_find.navigation = res.navigation;
+                self.thread_find.active_match = res.active_match.clone();
+                self.thread_find.pending_reveal = res.active_match;
+            }
+            Err(err) => {
+                self.thread_find.error = Some(err);
+            }
+        }
+    }
+    pub fn consume_pending_find_reveal(&mut self, tx: &mut Tx) -> bool {
+        if !self.thread_find_active() {
+            return false;
+        }
+        let Some(matched) = self.thread_find.pending_reveal.clone() else {
+            return false;
+        };
+        let t = self.current_mut();
+        let Some(msg_idx) = t.messages.iter().position(|m| m.id == matched.entry_id) else {
+            if t.history_has_more && !t.history_loading && t.history_error.is_none() {
+                let tid = t.id;
+                self.load_earlier_history(tid, Some(matched.entry_id));
+                return true;
+            }
+            return false;
+        };
+        let tid = t.id;
+        let row_key = if t.messages[msg_idx].role == "Pi" {
+            let start = t.messages[..=msg_idx]
+                .iter()
+                .rposition(|m| m.role != "Pi")
+                .map_or(0, |i| i + 1);
+            if let Some(work) = t.work.iter_mut().find(|w| w.start == start) {
+                work.expanded = true;
+            }
+            format!("turn-{tid}-{}", t.messages[start].id)
+        } else {
+            format!("row-{tid}-{}", t.messages[msg_idx].id)
+        };
+        self.thread_find.pending_reveal = None;
+        tx.scroll_center_in_instant(
+            format!("conversation-{tid}"),
+            format!("{row_key}/thread-find-active"),
+        );
+        true
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
         thread.captain_home && !thread.delegated
@@ -3274,18 +3748,238 @@ impl State {
             .map(|(index, _)| index)
             .collect()
     }
-    pub fn thread_search_matches(&self, thread: &Thread) -> bool {
-        let search = self.search.text.to_lowercase();
-        thread.title.to_lowercase().contains(&search)
-            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
-            || thread
-                .messages
+    pub fn sync_sidebar_search_input(&mut self) -> bool {
+        let clipped: String = self
+            .search
+            .text
+            .trim()
+            .chars()
+            .take(crate::thread_search::THREAD_SEARCH_QUERY_MAX_LENGTH)
+            .collect();
+        let trimmed = clipped.trim().to_owned();
+        if trimmed == self.sidebar_search.last_typed {
+            return false;
+        }
+        self.sidebar_search.last_typed = trimmed.clone();
+        let tokens = crate::thread_search::message_search_tokens(&trimmed);
+        if tokens.long.is_empty() {
+            self.sidebar_search.debounce_until = None;
+            self.sidebar_search.pending_servers.clear();
+            self.sidebar_search.unsupported_servers.clear();
+            self.sidebar_search.matches.clear();
+            self.sidebar_search.settled_query.clear();
+            self.sidebar_search.visible_query.clear();
+            self.sidebar_search.visible_matches.clear();
+            self.sidebar_search.shown_order.clear();
+            return true;
+        }
+        if self.client.is_some() {
+            self.sidebar_search.debounce_until = Some(
+                Instant::now()
+                    + Duration::from_millis(crate::thread_search::THREAD_SEARCH_DEBOUNCE_MS),
+            );
+        } else {
+            self.sidebar_search.debounce_until = None;
+            self.run_sidebar_search(&trimmed);
+        }
+        true
+    }
+    pub fn poll_sidebar_search(&mut self, tx: &mut Tx) -> bool {
+        let mut changed = self.sync_sidebar_search_input();
+        if let Some(until) = self.sidebar_search.debounce_until {
+            let now = Instant::now();
+            if now >= until {
+                self.sidebar_search.debounce_until = None;
+                let q = self.sidebar_search.last_typed.clone();
+                self.run_sidebar_search(&q);
+                changed = true;
+            } else {
+                tx.wake_after(until.saturating_duration_since(now));
+            }
+        }
+        changed
+    }
+    fn run_sidebar_search(&mut self, query: &str) {
+        let tokens = crate::thread_search::message_search_tokens(query);
+        if tokens.long.is_empty() {
+            return;
+        }
+        self.sidebar_search.request_seq += 1;
+        let seq = self.sidebar_search.request_seq;
+        self.sidebar_search.settled_query = query.to_owned();
+        self.sidebar_search.matches.clear();
+        self.sidebar_search.pending_servers.clear();
+        self.sidebar_search.unsupported_servers.clear();
+        let Some(client) = &self.client else {
+            // Keep visible_query/visible_matches in non-server mode if manually seeded in tests;
+            // local message matching runs in thread_title_search_matches.
+            return;
+        };
+        let mut targets: Vec<(String, &crate::client::Client)> = vec![("local".into(), client)];
+        for (id, linked) in &client.linked {
+            targets.push((id.clone(), linked));
+        }
+        for (server, target) in targets {
+            if !target.connected_ready() {
+                continue;
+            }
+            if !target.has_capability(crate::protocol::THREAD_SEARCH) {
+                self.sidebar_search
+                    .unsupported_servers
+                    .push(self.machine_label(&server));
+                continue;
+            }
+            self.sidebar_search.pending_servers.insert(server.clone());
+            target.call_rpc(
+                format!("search:{seq}:{server}"),
+                "threads.search",
+                json!({"query": query, "limit": 50}),
+            );
+        }
+        // Clear unrelated cached matches if query neither refines nor widens prior query.
+        let cur = crate::thread_search::fold_for_title(query);
+        let prev = crate::thread_search::fold_for_title(&self.sidebar_search.visible_query);
+        if !(!cur.is_empty()
+            && !prev.is_empty()
+            && (cur.starts_with(&prev) || prev.starts_with(&cur)))
+        {
+            self.sidebar_search.visible_query.clear();
+            self.sidebar_search.visible_matches.clear();
+            self.sidebar_search.shown_order.clear();
+        }
+    }
+    pub fn apply_sidebar_search_result(
+        &mut self,
+        seq: u64,
+        server: &str,
+        result: Result<Vec<crate::thread_search::ThreadSearchHit>, String>,
+    ) {
+        if seq != self.sidebar_search.request_seq {
+            return;
+        }
+        self.sidebar_search.pending_servers.remove(server);
+        if let Ok(hits) = result {
+            self.sidebar_search.matches.insert(server.to_owned(), hits);
+            // Rank across all responding environments and preserve shown order (KSG nextShownOrder).
+            let mut combined: Vec<(String, crate::thread_search::ThreadSearchHit)> = self
+                .sidebar_search
+                .matches
                 .iter()
-                .any(|message| message.text.to_lowercase().contains(&search))
+                .flat_map(|(srv, list)| list.iter().map(move |h| (srv.clone(), h.clone())))
+                .collect();
+            let weight = |hits: usize| 1.0 + (1.0 + hits as f64).log2();
+            combined.sort_by(|(_, left), (_, right)| {
+                let lw = left.quality >= crate::thread_search::MESSAGE_PREFIX;
+                let rw = right.quality >= crate::thread_search::MESSAGE_PREFIX;
+                rw.cmp(&lw)
+                    .then_with(|| {
+                        right
+                            .quality
+                            .partial_cmp(&left.quality)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        weight(right.hits)
+                            .partial_cmp(&weight(left.hits))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| right.updated.cmp(&left.updated))
+            });
+            let ranked_keys: Vec<(String, usize)> = combined
+                .iter()
+                .map(|(srv, hit)| (srv.clone(), hit.thread_id))
+                .collect();
+            let ranked_set: std::collections::HashSet<(String, usize)> =
+                ranked_keys.iter().cloned().collect();
+            let same_query = self.sidebar_search.visible_query == self.sidebar_search.settled_query;
+            let mut next_order: Vec<(String, usize)> = if same_query {
+                self.sidebar_search
+                    .shown_order
+                    .iter()
+                    .filter(|k| ranked_set.contains(*k))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let held: std::collections::HashSet<(String, usize)> =
+                next_order.iter().cloned().collect();
+            for key in ranked_keys {
+                if !held.contains(&key) {
+                    next_order.push(key);
+                }
+            }
+            self.sidebar_search.shown_order = next_order;
+            self.sidebar_search.visible_query = self.sidebar_search.settled_query.clone();
+            self.sidebar_search.visible_matches = combined
+                .into_iter()
+                .map(|(srv, hit)| ((srv, hit.thread_id), hit))
+                .collect();
+        }
+    }
+    pub fn open_thread_at_search_match(&mut self, server: &str, id: usize) {
+        let hit = self
+            .sidebar_search
+            .visible_matches
+            .get(&(server.to_owned(), id))
+            .cloned();
+        let query = if self.sidebar_search.visible_query.is_empty() {
+            self.search.text.trim().to_owned()
+        } else {
+            self.sidebar_search.visible_query.clone()
+        };
+        if self.client.is_some() {
+            self.open_machine_thread(server, id);
+        } else if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+            self.select_thread(index);
+        }
+        if let Some(hit) = hit
+            && self.current().id == id
+        {
+            let (find_query, start) =
+                crate::thread_search::find_for_message_match(&hit.snippet, &hit.entry_id, &query);
+            self.open_thread_find_on_query(find_query, start);
+        }
+    }
+    pub fn thread_title_search_matches(&self, thread: &Thread) -> bool {
+        let search = self.search.text.to_lowercase();
+        if search.is_empty() {
+            return true;
+        }
+        let title_or_draft = thread.title.to_lowercase().contains(&search)
+            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
             || self.is_captain_home(thread)
                 && thread.captain.is_some_and(|captain| {
                     self.captains[captain].name.to_lowercase().contains(&search)
-                })
+                });
+        if title_or_draft {
+            return true;
+        }
+        let server_supports = self.client.as_ref().is_some_and(|c| {
+            let target = if self.machines.selected == "local" {
+                Some(c)
+            } else {
+                c.linked.get(&self.machines.selected)
+            };
+            target.is_some_and(|t| t.has_capability(crate::protocol::THREAD_SEARCH))
+        });
+        if !server_supports {
+            return thread
+                .messages
+                .iter()
+                .any(|message| message.text.to_lowercase().contains(&search));
+        }
+        false
+    }
+    pub fn thread_search_matches(&self, thread: &Thread) -> bool {
+        if self.search.text.is_empty() {
+            return true;
+        }
+        self.thread_title_search_matches(thread)
+            || self
+                .sidebar_search
+                .visible_matches
+                .contains_key(&(self.machines.selected.clone(), thread.id))
     }
     /// Whether a captain shows its whole crew: while it or one of its workers is open, while
     /// searching, and in the archive.
@@ -4642,13 +5336,14 @@ impl State {
         self.create_thread_in(project, &[], &seed);
     }
     // Ported from KSG Code's useHandleNewThread composer model override.
-    fn composer_seed(&self) -> Value {
+    pub(crate) fn composer_seed(&self) -> Value {
         self.threads.get(self.active).map_or(Value::Null, |thread| {
             json!({"harness":thread.harness,"model":thread.selected_or_effective_model(),
-                "thinking":thread.selected_or_effective_reasoning(),"access":thread.native.access.id()})
+                "thinking":thread.selected_or_effective_reasoning(),"access":thread.native.access.id(),
+                "serviceTier":thread.harness_state["serviceTier"]})
         })
     }
-    fn inherit_composer(&mut self, index: usize, seed: &Value) {
+    pub(crate) fn inherit_composer(&mut self, index: usize, seed: &Value) {
         if seed.is_null() {
             let harness = self.default_harness.clone();
             self.threads[index].harness = harness.clone();
@@ -4714,6 +5409,16 @@ impl State {
             thread.selected_thinking = None;
             thread.thinking.clear();
         }
+        if harness == "codex"
+            && let Some(tier) = seed["serviceTier"].as_str().filter(|tier| {
+                model
+                    .service_tiers
+                    .iter()
+                    .any(|option| option["id"] == *tier)
+            })
+        {
+            thread.harness_state["serviceTier"] = json!(tier);
+        }
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
@@ -4753,6 +5458,9 @@ impl State {
         }
         if reuse.is_none() || self.threads[index].selected_model.is_none() {
             self.inherit_composer(index, seed);
+            if reuse.is_none() {
+                self.apply_sticky_composer_to_draft(index);
+            }
         }
         self.select_thread(index);
     }
@@ -6393,19 +7101,222 @@ impl State {
         self.current_mut().remove_attachment(id);
         self.checkpoint();
     }
-    pub fn send(&mut self) {
-        if self.ownership_denied {
+    pub(crate) fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        description: Option<String>,
+        action: Option<(String, ToastAction)>,
+        timeout_ms: Option<u64>,
+    ) {
+        let title = title.into();
+        if title == "Not connected: message not sent" {
+            self.toasts.retain(|t| t.title != title);
+        }
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        let (action_label, action) = match action {
+            Some((label, action)) => (Some(label), Some(action)),
+            None => (None, None),
+        };
+        let expires_at = timeout_ms.map(|ms| lifecycle::now().saturating_add(ms));
+        self.toasts.push(ToastNotice {
+            id,
+            kind,
+            title,
+            description,
+            action_label,
+            action,
+            expires_at,
+        });
+        while self.toasts.len() > 5 {
+            self.toasts.remove(0);
+        }
+    }
+
+    pub fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.retain(|t| t.id != id);
+    }
+
+    pub fn activate_toast(&mut self, id: u64) {
+        let Some(pos) = self.toasts.iter().position(|t| t.id == id) else {
             return;
+        };
+        let toast = self.toasts.remove(pos);
+        let Some(action) = toast.action else {
+            return;
+        };
+        match action {
+            ToastAction::OpenThread { server, thread_id } => {
+                if self.client.is_some() {
+                    if server != self.machines.selected {
+                        self.select_machine(&server);
+                    }
+                    if self.machines.selected == server
+                        && let Some(index) = self.threads.iter().position(|t| t.id == thread_id)
+                    {
+                        self.select_thread(index);
+                    }
+                } else if let Some(index) = self.threads.iter().position(|t| t.id == thread_id) {
+                    self.select_thread(index);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn expire_toasts(&mut self) -> bool {
+        let at = lifecycle::now();
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|toast| toast.expires_at.is_none_or(|exp| exp > at));
+        self.toasts.len() != before
+    }
+
+    pub(crate) fn notify_background_started(&mut self, server: &str, thread_id: usize) {
+        self.push_toast(
+            ToastKind::Success,
+            "Started in background",
+            None,
+            Some((
+                "Open".into(),
+                ToastAction::OpenThread {
+                    server: server.to_owned(),
+                    thread_id,
+                },
+            )),
+            Some(5_000),
+        );
+    }
+
+    pub(crate) fn notify_background_failure(
+        &mut self,
+        server: &str,
+        thread_id: usize,
+        error: String,
+    ) {
+        self.toasts.retain(|toast| {
+            !(toast.title == "Started in background"
+                && toast.action.as_ref().is_some_and(|action| {
+                    matches!(
+                        action,
+                        ToastAction::OpenThread {
+                            server: s,
+                            thread_id: tid
+                        } if s == server && *tid == thread_id
+                    )
+                }))
+        });
+        self.push_toast(
+            ToastKind::Error,
+            "Background task failed",
+            Some(error),
+            Some((
+                "Open draft".into(),
+                ToastAction::OpenThread {
+                    server: server.to_owned(),
+                    thread_id,
+                },
+            )),
+            Some(5_000),
+        );
+    }
+
+    pub fn send(&mut self) {
+        let _ = self.dispatch_send();
+    }
+
+    /// Ported from KSG Code's `useComposerSend` (`onSend` with `submissionIntent: "background"`):
+    /// on a draft thread, starts in the background and opens a fresh composer; on an existing
+    /// thread, dispatches the turn and opens a new draft once accepted.
+    pub fn send_background(&mut self) {
+        let source_index = self.active;
+        let source_id = self.current().id;
+        let was_draft = self.current().is_draft();
+        let project = self.current().project;
+        let seed = self.composer_seed();
+        let server = self.machines.selected.clone();
+
+        if !self.dispatch_send() {
+            return;
+        }
+        if self.client.is_some() {
+            if was_draft {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.background_send = Some(server);
+                }
+                self.new_client_draft_with_seed(project, &seed);
+                if !self.headless {
+                    self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+                }
+                self.checkpoint();
+            } else if let Some((command_id, _)) = self
+                .threads
+                .iter()
+                .find(|t| t.id == source_id)
+                .and_then(|t| t.remote_send.as_ref())
+            {
+                let command_id = *command_id;
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.pending_send_and_new_thread = Some((command_id, server));
+                }
+            }
+            return;
+        }
+
+        if was_draft {
+            self.create_thread_in(project, &[source_id], &seed);
+            if !self.headless {
+                self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+            }
+            let failed = self
+                .threads
+                .iter()
+                .find(|t| t.id == source_id)
+                .is_some_and(|t| t.status == Status::Failed);
+            if failed {
+                let error = self
+                    .threads
+                    .iter()
+                    .find(|t| t.id == source_id)
+                    .and_then(|t| t.error.clone())
+                    .unwrap_or_else(|| "Failed to send message.".into());
+                self.notify_background_failure("local", source_id, error);
+            } else {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == source_id) {
+                    thread.background_start_pending =
+                        thread.pending_prompt.is_some() || thread.queued_prompt.is_some();
+                }
+                self.notify_background_started("local", source_id);
+            }
+            self.checkpoint();
+        } else {
+            let failed = self
+                .threads
+                .get(source_index)
+                .is_some_and(|t| t.id == source_id && t.status == Status::Failed);
+            if !failed {
+                self.create_thread_in(project, &[source_id], &seed);
+                if !self.headless {
+                    self.restore_composer_focus(crate::ui::composer_ui::FocusReason::ThreadOpened);
+                }
+            }
+            self.checkpoint();
+        }
+    }
+
+    fn dispatch_send(&mut self) -> bool {
+        if self.demo || self.ownership_denied || self.current().archived() {
+            return false;
         }
         if self.has_pending_context_imports(&self.machines.selected, self.current().id) {
             self.current_mut().attachment_error = Some(
                 "Still bringing attached context into this message. Send again once its chip resolves."
                     .into(),
             );
-            return;
+            return false;
         }
         if self.current().resume_pending() {
-            return;
+            return false;
         }
         if self.current().queued_edit.is_some() {
             let target_server_id = self.machine_identity(&self.machines.selected);
@@ -6427,19 +7338,31 @@ impl State {
                     }
                 });
             self.checkpoint();
-            return;
+            return false;
+        }
+        if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
+            return false;
         }
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
-                return;
+                return false;
             }
-            if self.current().client_draft {
-                self.promote_client_draft();
-                return;
+            if !self.current().has_draft_content() {
+                return false;
             }
-            if self.current().remote_send.is_some() || !self.current().has_draft_content() {
-                return;
+            if !self.machine_connected(&self.machines.selected) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Not connected: message not sent",
+                    Some("Reconnecting to the environment. Try again once it is connected.".into()),
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            }
+            if self.current().remote_send.is_some() {
+                return false;
             }
             // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
@@ -6457,19 +7380,23 @@ impl State {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     self.current_mut().attachment_error = Some(error);
-                    return;
+                    return false;
                 }
             };
             if !self.headless
                 && let Some(error) = self.current().validate_prompt_length(&prompt)
             {
                 self.current_mut().submission_error = Some(error);
-                return;
+                return false;
             }
             self.current_mut().submission_error = None;
+            if self.current().client_draft {
+                self.promote_client_draft();
+                return self.current().client_creating.is_some();
+            }
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
                 "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
-            match result {
+            return match result {
                 Some(Ok(id)) => {
                     let snapshot = crate::composer_rich::Snapshot::capture_with_context(
                         &self.current().draft,
@@ -6482,27 +7409,30 @@ impl State {
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    true
                 }
-                Some(Err(error)) => self.storage_error = Some(error),
-                None => {}
-            }
-            return;
+                Some(Err(error)) => {
+                    self.storage_error = Some(error);
+                    false
+                }
+                None => false,
+            };
         }
         if self.network_blocked() {
             self.current_mut().error =
                 Some("Waiting for the network after resume. Your draft has not been sent.".into());
-            return;
+            return false;
         }
         if self.current().status == Status::Paused {
             self.current_mut().status = Status::Ready;
             self.current_mut().error = None;
         }
-        if self.demo
-            || self.current().archived()
-            || self.current().configuring
+        if self.current().configuring
+            || self.current().native.operating()
+            || self.current().phase == "Stopping"
             || !self.current().has_draft_content()
         {
-            return;
+            return false;
         }
         let text = crate::composer_rich::markdown(&self.current().draft)
             .trim()
@@ -6521,13 +7451,13 @@ impl State {
         }) {
             Some("/model") => {
                 self.choose_slash("model".into());
-                return;
+                return false;
             }
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
                         Some("Compaction does not accept attachments. Your draft was kept.".into());
-                    return;
+                    return false;
                 }
                 if self.current().can_compact() {
                     let instructions = words
@@ -6538,12 +7468,12 @@ impl State {
                     self.current_mut().draft.replace_text("");
                     self.compact_context(instructions);
                 }
-                return;
+                return false;
             }
             Some(command @ ("/goal" | "/feedback")) if self.current().harness == "codex" => {
                 if self.current().harness_state["codexNativeExtensions"] != true {
                     self.current_mut().error = Some("This Codex version has no verified native command protocol. Update Codex outside Shina.".into());
-                    return;
+                    return false;
                 }
                 let arguments = words.next().unwrap_or("").trim().to_owned();
                 if self.current().status.busy()
@@ -6551,13 +7481,13 @@ impl State {
                     && !matches!(arguments.as_str(), "" | "pause" | "clear")
                 {
                     self.current_mut().error = Some("Wait for Codex to finish before running this command. Your draft was kept.".into());
-                    return;
+                    return false;
                 }
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error = Some(
                         "Native commands do not accept attachments. Your draft was kept.".into(),
                     );
-                    return;
+                    return false;
                 }
                 self.current_mut().native.pending_command =
                     Some(json!({"name":command.trim_start_matches('/'),"arguments":arguments}));
@@ -6567,7 +7497,7 @@ impl State {
                 } else {
                     self.current_mut().drive_session();
                 }
-                return;
+                return false;
             }
             Some(command) if command.starts_with('/') => {
                 let name = command.trim_start_matches('/');
@@ -6586,7 +7516,7 @@ impl State {
                             "ACP"
                         }
                     ));
-                    return;
+                    return false;
                 }
             }
             _ => {}
@@ -6605,7 +7535,7 @@ impl State {
                 ) && let Some(error) = self.current().validate_prompt_length(&prompt)
                 {
                     self.current_mut().submission_error = Some(error);
-                    return;
+                    return false;
                 }
                 self.current_mut().submission_error = None;
             }
@@ -6627,8 +7557,11 @@ impl State {
                             .unwrap_or_else(|| m.to_owned())
                     }
                 });
-            self.checkpoint();
-            return;
+            let dispatched = !self.current().has_draft_content();
+            if dispatched {
+                self.checkpoint();
+            }
+            return dispatched;
         }
         if !self.headless {
             if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
@@ -6642,7 +7575,7 @@ impl State {
             ) && let Some(error) = self.current().validate_prompt_length(&prompt)
             {
                 self.current_mut().submission_error = Some(error);
-                return;
+                return false;
             }
             self.current_mut().submission_error = None;
         }
@@ -6664,12 +7597,16 @@ impl State {
                         .unwrap_or_else(|| m.to_owned())
                 }
             });
+        if self.current().has_draft_content() || self.current().status != Status::Running {
+            return false;
+        }
         let id = self.current().id;
         self.invalidate_undo(id);
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
         self.checkpoint();
+        true
     }
 
     pub fn retry(&mut self) {
@@ -6714,6 +7651,60 @@ impl State {
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh(self.data_dir.clone(), self.wake.clone());
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    pub fn supports_model_catalog_refresh(&self) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(
+                &self.machines.selected,
+                crate::protocol::MODEL_CATALOG_REFRESH,
+            )
+        })
+    }
+
+    /// Ported from KSG Code's `ProviderModelPicker.tsx`: opening the picker refreshes the model
+    /// catalog through the capability-gated `modelCatalogOnly` path, throttled by 5 minutes.
+    pub fn refresh_catalog_on_open(&mut self) {
+        if self.client.is_some() {
+            if !self.supports_model_catalog_refresh() {
+                return;
+            }
+            self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(false);
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    /// Explicit retry button bypasses the on-demand throttle and retry backoff.
+    pub fn force_refresh_catalog(&mut self) {
+        self.catalog.error = None;
+        if self.forward("catalog.refresh", json!({"force": true})) {
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(true);
+        if matches!(self.current().harness.as_str(), "codex" | "claude")
+            && self.current().pi.is_some()
+        {
+            self.current_mut()
+                .command("get_available_models", json!({}));
+            self.current_mut().refresh_commands();
+        }
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), true);
         }
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
@@ -7107,6 +8098,12 @@ impl State {
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
         self.thread_defaults.validate()?;
+        self.model_favorites = match index.get("modelFavorites") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone()).map_err(|_| "Invalid model favorites.")?,
+            ),
+        };
         self.persist_transcripts = self.headless || index["threadViews"].is_array();
         self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
         self.command_receipts =
@@ -7267,6 +8264,13 @@ impl State {
                         thread.model = model.into();
                     }
                     thread.selected_thinking = record["thinking"].as_str().map(str::to_owned);
+                    if let Some(options) = record.get("options")
+                        && let Ok(parsed) = serde_json::from_value::<
+                            Vec<crate::model_selection::ProviderOptionSelection>,
+                        >(options.clone())
+                    {
+                        thread.model_options = parsed;
+                    }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
                     }
@@ -7502,14 +8506,29 @@ impl State {
         Ok(())
     }
 
-    fn ui_snapshot(&self) -> Value {
+    pub(crate) fn ui_snapshot(&self) -> Value {
         let mut prefs_value = serde_json::to_value(&self.preferences).unwrap_or_else(|_| json!({}));
         if let Some(map) = prefs_value.as_object_mut() {
             map.remove("keybindings");
         }
+        let draft_model_states: serde_json::Map<String, Value> = self
+            .threads
+            .iter()
+            .filter(|t| t.draft_model_state.model_selection_explicit || t.has_draft_content())
+            .filter(|t| {
+                !t.draft_model_state.model_selection_by_provider.is_empty()
+                    || t.draft_model_state.active_provider.is_some()
+            })
+            .filter_map(|t| {
+                serde_json::to_value(&t.draft_model_state)
+                    .ok()
+                    .map(|val| (t.id.to_string(), val))
+            })
+            .collect();
         json!({
             "background": self.background.settings,
             "preferences": prefs_value,
+            "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -7552,7 +8571,7 @@ impl State {
             json!({"version":1,"pendingMessages":pending,"background":{"keep_awake":self.background_settings().keep_awake}})
         }
     }
-    fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
+    pub(crate) fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
         }
@@ -7654,6 +8673,18 @@ impl State {
                     .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
                 {
                     thread.restore_pending_inputs(value)?;
+                }
+            }
+        }
+        if let Some(draft_models) = ui.get("draftModelStates").and_then(Value::as_object) {
+            for (id, value) in draft_models {
+                if let Some(thread) = id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+                    && let Ok(state) = serde_json::from_value(value.clone())
+                {
+                    thread.draft_model_state = state;
                 }
             }
         }
@@ -7862,6 +8893,7 @@ impl State {
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
             "threadDefaults": self.thread_defaults,
+            "modelFavorites": self.model_favorites,
             "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
@@ -8092,6 +9124,7 @@ impl Thread {
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
+            "options":self.model_options,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
         record
@@ -8114,8 +9147,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     state.html_windows.theme(state.dark);
     let keybindings_changed = !state.headless && state.poll_keybindings();
-    let browsing =
-        state.poll_folder_browser() | state.poll_settings() | html_changed | keybindings_changed;
+    let browsing = state.poll_folder_browser()
+        | state.poll_settings()
+        | state.poll_thread_find(tx)
+        | state.poll_sidebar_search(tx)
+        | html_changed
+        | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -8187,6 +9224,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut run_ended = false;
     let mut crew_questions = Vec::new();
+    let mut background_failures = Vec::new();
     let mut event_budget_exhausted = false;
     if changed {
         state.persistence_scope = None;
@@ -8203,6 +9241,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
         let effects_before = crate::outbox::captured_count();
         let mut thread_changed = thread.poll_memory_command();
+        let was_bg_pending = thread.background_start_pending;
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
             let event = thread.pi.as_ref().and_then(|pi| pi.events.try_recv().ok());
@@ -8219,6 +9258,15 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 Event::Record(record) => {
                     state.background.observe_record(&record);
                     let settled = record["type"] == "agent_settled";
+                    if matches!(
+                        record["type"].as_str(),
+                        Some("agent_start" | "message_start" | "agent_settled")
+                    ) || (record["type"] == "response"
+                        && record["command"] == "prompt"
+                        && record["success"] != false)
+                    {
+                        thread.background_start_pending = false;
+                    }
                     if record["type"] == "extension_ui_request"
                         && !thread.recovering_task
                         && matches!(
@@ -8281,6 +9329,19 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             );
             thread_changed = true;
         }
+        if was_bg_pending && thread.status == Status::Failed {
+            thread.background_start_pending = false;
+            thread_changed = true;
+            if index != state.active {
+                background_failures.push((
+                    thread.id,
+                    thread
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Failed to send message.".into()),
+                ));
+            }
+        }
         thread_changed |= thread.reclaim_idle(Instant::now());
         // A quiet RPC stream must not freeze the visible work/thinking clocks.
         if !state.headless && index == state.active && thread.status.busy() {
@@ -8327,7 +9388,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    let global_changed = state.pause_offline_errors()
+    let mut global_changed = false;
+    for (thread_id, error) in background_failures {
+        state.notify_background_failure("local", thread_id, error);
+        global_changed = true;
+    }
+    global_changed |= state.pause_offline_errors()
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
     if global_changed {
@@ -8419,6 +9485,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             changed = true;
         } else {
             tx.wake_after(Duration::from_millis(notice.expires - at));
+        }
+    }
+    changed |= state.expire_toasts();
+    for toast in &state.toasts {
+        if let Some(expires) = toast.expires_at
+            && expires > at
+        {
+            tx.wake_after(Duration::from_millis(expires - at));
         }
     }
     if let Some(error) = state
@@ -9686,6 +10760,7 @@ mod tests {
             context_window: Some(100),
             supports_images: Some(true),
             service_tiers: vec![],
+            ..Default::default()
         };
         state.current_mut().harness = "codex".into();
         state.current_mut().models = vec![model];
@@ -10028,6 +11103,7 @@ mod tests {
             context_window: None,
             supports_images: None,
             service_tiers: vec![],
+            ..Default::default()
         }];
         let index = restored.threads.len() - 1;
         restored.inherit_composer(
@@ -13972,5 +15048,284 @@ mod tests {
 
         thread.history_loaded = true;
         assert!(!thread.restoring_history());
+    }
+
+    #[test]
+    fn send_background_starts_draft_in_background_inherits_composer_and_notifies() {
+        let mut state = State::new(".".into(), false);
+        let dir_b = std::env::temp_dir().join(format!("shina-bg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir_b);
+        let p2 = state.add_project(dir_b.clone()).unwrap().unwrap();
+        let model = AgentModel {
+            provider: "codex".into(),
+            id: "codex-fast".into(),
+            name: "Codex Fast".into(),
+            thinking_levels: vec!["low".into(), "high".into()],
+            context_window: Some(100_000),
+            supports_images: Some(true),
+            service_tiers: vec![
+                json!({"id":"default","name":"Standard"}),
+                json!({"id":"fast","name":"Fast"}),
+            ],
+            ..Default::default()
+        };
+        state.codex_catalog.models = vec![model.clone()];
+        let (pi, _cmds, _events) = Pi::test_connection();
+        {
+            let t = state.current_mut();
+            t.harness = "codex".into();
+            t.models = vec![model];
+            t.set_model("codex".into(), "codex-fast".into());
+            t.set_thinking("high".into());
+            t.set_service_tier("fast".into());
+            state.set_access_mode(AccessMode::ReadOnly);
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.draft.replace_text("Background task");
+            t.add_attachment(test_attachment("shot.png", 1)).unwrap();
+        }
+        let bg_id = state.current().id;
+
+        state.send_background();
+
+        // Fresh draft composer is active, focused, empty, and inherits selections.
+        assert_ne!(state.current().id, bg_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+        assert!(state.current().draft.text.is_empty());
+        assert!(state.current().draft_images.is_empty());
+        assert!(state.current().messages.is_empty());
+        assert!(state.current().error.is_none());
+        assert_eq!(state.current().project, Some(p2));
+        assert_eq!(state.current().machine, "local");
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(
+            state.current().selected_model,
+            Some(("codex".into(), "codex-fast".into()))
+        );
+        assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+        assert_eq!(state.current().harness_state["serviceTier"], "fast");
+        assert_eq!(state.current().native.access, AccessMode::ReadOnly);
+        assert!(state.current().captain.is_none());
+
+        // Background thread is running and visible in sidebar Active section.
+        let bg = state.threads.iter().find(|t| t.id == bg_id).unwrap();
+        assert_eq!(bg.status, Status::Running);
+        assert_eq!(bg.messages.len(), 1);
+        assert_eq!(bg.messages[0].text, "Background task");
+        assert!(!bg.is_draft());
+        assert!(
+            state
+                .sidebar_threads()
+                .iter()
+                .any(|&i| state.threads[i].id == bg_id)
+        );
+
+        // 5-second "Started in background" toast with "Open" action.
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Started in background");
+        assert_eq!(toast.action_label.as_deref(), Some("Open"));
+        assert!(toast.expires_at.is_some());
+
+        // Completing in background marks the thread unread; clicking Open navigates to it and clears unread.
+        let bg_idx = state.threads.iter().position(|t| t.id == bg_id).unwrap();
+        state.threads[bg_idx].apply(json!({"type":"agent_settled"}));
+        let completed_at = state.threads[bg_idx].life.last_completed_at.unwrap();
+        state.threads[bg_idx].life.last_visited_at = Some(completed_at.saturating_sub(100));
+        assert!(state.threads[bg_idx].unread());
+
+        let toast_id = toast.id;
+        state.activate_toast(toast_id);
+        assert_eq!(state.current().id, bg_id);
+        assert!(state.toasts.is_empty());
+        assert!(!state.current().unread());
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn send_and_new_thread_works_on_idle_and_running_threads_and_respects_guards() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, _events) = Pi::test_connection();
+        let original_id = state.current().id;
+        {
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: "You",
+                text: "Prior message".into(),
+                images: vec![],
+                context: None,
+            });
+            t.draft.replace_text("First message");
+        }
+        state.send_background();
+        let fresh_id = state.current().id;
+        assert_ne!(fresh_id, original_id);
+        // Existing idle thread -> sendAndNewThread opens a fresh draft without "Started in background" toast.
+        assert!(state.toasts.is_empty());
+
+        // Switch back to original_id (which is now running!) and test sendAndNewThread while running.
+        let orig_idx = state
+            .threads
+            .iter()
+            .position(|t| t.id == original_id)
+            .unwrap();
+        state.select_thread(orig_idx);
+        state.current_mut().native.follow_up = true;
+        state.current_mut().draft.replace_text("Queued follow up");
+        state.send_background();
+        let after_running_id = state.current().id;
+        assert_ne!(after_running_id, original_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+        assert!(state.toasts.is_empty());
+        let orig = state.threads.iter().find(|t| t.id == original_id).unwrap();
+        assert_eq!(orig.native.queue.len(), 1);
+        assert_eq!(orig.native.queue[0].prompt.text, "Queued follow up");
+        let _ = commands;
+    }
+
+    #[test]
+    fn send_background_guards_block_empty_validation_pending_archived_and_queued_edit() {
+        // 1. Empty prompt
+        let mut state = State::new(".".into(), false);
+        let id = state.current().id;
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().id, id);
+        assert!(state.toasts.is_empty());
+
+        // 2. Prompt length validation error (> 120,000 chars)
+        state
+            .current_mut()
+            .draft
+            .replace_text(&"x".repeat(crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1));
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.current().submission_error.is_some());
+        assert!(state.toasts.is_empty());
+        state.current_mut().submission_error = None;
+
+        // 3. Pending request / question blocks send_background
+        state.current_mut().draft.replace_text("Blocked by request");
+        state.current_mut().request = Some(json!({"id":"req-1","method":"confirm"}));
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().draft.text, "Blocked by request");
+        state.current_mut().request = None;
+
+        // 4. Archived thread blocks send_background
+        state.current_mut().life.archived_at = Some(1);
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().draft.text, "Blocked by request");
+        state.current_mut().life.archived_at = None;
+
+        // 5. Queued edit mode saves in place without opening a new thread
+        let (pi, _cmds, _evs) = Pi::test_connection();
+        let t = state.current_mut();
+        t.pi = Some(pi);
+        t.model_provider = "cpa".into();
+        t.status = Status::Running;
+        t.native.follow_up = true;
+        t.draft.replace_text("Queued original");
+        t.send_during_run();
+        let qid = t.native.queue[0].id;
+        t.edit_queued(qid);
+        t.draft.replace_text("Queued edited");
+        state.send_background();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().native.queue[0].prompt.text, "Queued edited");
+        assert!(state.current().queued_edit.is_none());
+    }
+
+    #[test]
+    fn failed_background_send_recovers_draft_sets_error_and_offers_open_draft_toast() {
+        let mut state = State::new(".".into(), false);
+        state.runtime_enabled = true;
+        let bg_id = state.current().id;
+        let img = test_attachment("fail.png", 1);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().supports_images = Some(true);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Will fail on connect");
+        state.current_mut().add_attachment(img.clone()).unwrap();
+        // Force synchronous connect_thread failure via missing directory on unknown machine.
+        state.current_mut().machine = "missing-host".into();
+
+        state.send_background();
+
+        // User landed on a fresh composer.
+        assert_ne!(state.current().id, bg_id);
+        assert!(state.current().is_draft());
+        assert!(state.current().draft.focused);
+
+        // Background task failed toast with "Open draft" action is shown.
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.title, "Background task failed");
+        assert!(toast.description.is_some());
+        assert_eq!(toast.action_label.as_deref(), Some("Open draft"));
+
+        // Clicking "Open draft" opens the failed draft with restored text, attachments, and error.
+        let toast_id = toast.id;
+        state.activate_toast(toast_id);
+        assert_eq!(state.current().id, bg_id);
+        assert_eq!(state.current().draft.text, "Will fail on connect");
+        assert_eq!(state.current().draft_images, vec![img]);
+        assert!(state.current().error.is_some());
+
+        // Async failure during startup in poll() replaces "Started in background" with "Background task failed".
+        let mut async_state = State::new(".".into(), false);
+        let (pi, _cmds, events) = Pi::test_connection();
+        let async_bg_id = async_state.current().id;
+        async_state.current_mut().pi = Some(pi);
+        async_state.current_mut().initializing = true;
+        async_state.current_mut().model_provider = "cpa".into();
+        async_state
+            .current_mut()
+            .draft
+            .replace_text("Async failure");
+        async_state.send_background();
+        assert_eq!(async_state.toasts[0].title, "Started in background");
+
+        events.send(Event::Error("Process crashed".into())).unwrap();
+        poll(&mut async_state, 0.0, &mut Tx::default());
+
+        assert_eq!(async_state.toasts.len(), 1);
+        assert_eq!(async_state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(async_state.toasts[0].title, "Background task failed");
+        assert_eq!(
+            async_state.toasts[0].description.as_deref(),
+            Some("Process crashed")
+        );
+        assert_eq!(
+            async_state.toasts[0].action_label.as_deref(),
+            Some("Open draft")
+        );
+        let bg_after = async_state
+            .threads
+            .iter()
+            .find(|t| t.id == async_bg_id)
+            .unwrap();
+        assert_eq!(bg_after.draft.text, "Async failure");
+        assert_eq!(bg_after.error.as_deref(), Some("Process crashed"));
+
+        // Dismiss and 5s timeout expiration remove toasts cleanly.
+        async_state.toasts[0].expires_at = Some(1);
+        poll(&mut async_state, 0.0, &mut Tx::default());
+        assert!(async_state.toasts.is_empty());
+        async_state.notify_background_started("local", async_bg_id);
+        assert_eq!(async_state.toasts.len(), 1);
+        let dismiss_id = async_state.toasts[0].id;
+        async_state.dismiss_toast(dismiss_id);
+        assert!(async_state.toasts.is_empty());
     }
 }

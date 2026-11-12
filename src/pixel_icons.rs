@@ -29,6 +29,10 @@ glyph!(
     r#"<path d="M4 8h4v2h-4zM16 8h4v2h-4zM6 10h4v2h-4zM14 10h4v2h-4zM8 12h4v2h-4zM12 12h4v2h-4zM10 14h4v2h-4z"/>"#
 );
 glyph!(
+    CHEVRON_UP,
+    r#"<path d="M4 14h4v2H4zM16 14h4v2h-4zM6 12h4v2H6zM14 12h4v2h-4zM8 10h4v2H8zM12 10h4v2h-4zM10 8h4v2h-4z"/>"#
+);
+glyph!(
     CLOSE,
     r#"<path d="M7 19H5V17H7V19ZM19 19H17V17H19V19ZM9 15V17H7V15H9ZM17 17H15V15H17V17ZM11 15H9V13H11V15ZM15 15H13V13H15V15ZM13 13H11V11H13V13ZM11 11H9V9H11V11ZM15 11H13V9H15V11ZM9 9H7V7H9V9ZM17 9H15V7H17V9ZM7 7H5V5H7V7ZM19 7H17V5H19V7Z"/>"#
 );
@@ -230,6 +234,18 @@ glyph!(
     UNRESOLVED,
     r#"<path d="M8 2h4v2H8zm6 0h4v2h-4zM4 4h2v2H4zm14 0h2v2h-2zM2 8h2v4H2zm18 0h2v4h-2zM2 14h2v4H2zm18 0h2v4h-2zM4 18h2v2H4zm14 0h2v2h-2zM8 20h4v2H8zm6 0h4v2h-4z"/>"#
 );
+glyph!(
+    WORKFLOW,
+    r#"<path d="M2 2h8v8H2zM14 2h8v8h-8zM14 14h8v8h-8zM4 4v4h4V4zM16 4v4h4V4zM16 16v4h4v-4zM10 5h4v2h-4zM5 10h2v8H5zM7 17h7v2H7z"/>"#
+);
+glyph!(
+    STAR,
+    r#"<path d="M10 2h4v4h-4zM8 6h8v2H8zM2 8h20v2H2zM4 10h16v2H4zM6 12h12v4H6zM4 16h6v4H4zM14 16h6v4h-6zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
+);
+glyph!(
+    STAR_OFF,
+    r#"<path d="M10 2h4v2h-4zM8 4h2v4H8zM14 4h2v4h-2zM2 8h6v2H2zM16 8h6v2h-6zM4 10h2v2H4zM18 10h2v2h-2zM6 12h2v4H6zM16 12h2v4h-2zM10 14h4v2h-4zM4 16h4v4H4zM16 16h4v4h-4zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
+);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
 pub(super) fn glyph(kind: &str) -> &'static Icon {
@@ -273,6 +289,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "folder" => &FOLDER,
         "search" => &SEARCH,
         "chevron" => &CHEVRON_DOWN,
+        "chevron-up" => &CHEVRON_UP,
         "open" => &CHEVRON_RIGHT,
         "lock" => &LOCK,
         "close" => &CLOSE,
@@ -286,6 +303,9 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "crew" => &CREW,
         "copy" => &COPY,
         "unresolved" => &UNRESOLVED,
+        "star" => &STAR,
+        "star-off" => &STAR_OFF,
+        "workflow" => &WORKFLOW,
         _ => &CHECK,
     }
 }

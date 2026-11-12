@@ -8,6 +8,12 @@ mod history;
 #[allow(dead_code)]
 #[path = "../src/protocol.rs"]
 mod protocol;
+#[allow(dead_code)]
+#[path = "../src/thread_find.rs"]
+mod thread_find;
+#[allow(dead_code)]
+#[path = "../src/thread_search.rs"]
+mod thread_search;
 
 use serde_json::{Value, json};
 use std::{
@@ -2865,6 +2871,8 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             );
             // Match the audit's page-request delay, not a delay on reading live events.
             std::thread::sleep(Duration::from_millis(120));
+        } else if cache.histories.contains_key(&1) && !cache.complete(1) {
+            cache.request_earlier(1, None);
         } else {
             client.read();
         }
@@ -3255,4 +3263,507 @@ fn linked_machine_thread_pill_sends_and_agent_reads_remote_thread_via_read_threa
     drop(b_client);
     machine_a.stop();
     machine_b.stop();
+}
+
+#[test]
+fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut profile = Profile::new();
+    // Seed a realistic large thread (> 2500 items: 900 turns * 3 items = 2700 items).
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    for turn in 0..900usize {
+        messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":format!("Turn prompt {turn}"),"images":[]}));
+        let a_idx = messages.len();
+        messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Turn reply {turn}"),"images":[]}));
+        tools.push(json!({
+            "id":format!("tool-{turn}"),"name":"read","detail":"file.rs","done":true,"failed":false,
+            "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
+            "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
+        }));
+    }
+    let mut index = base["index"].clone();
+    index["threads"][0]["title"] = json!("Huge thread");
+    index["threads"][0]["renamed"] = json!(true);
+    index["threads"][0]["session"] = Value::Null;
+    let mut view = base["threads"][0].clone();
+    view["status"] = json!("Completed");
+    view["messages"] = json!(messages);
+    view["tools"] = json!(tools);
+    index["threadViews"] = json!([view]);
+    fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
+
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello"),
+    );
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    client.rpc("workspace.subscribe", json!({}), json!("sub"));
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({"state":protocol::compact(&client.snapshot),"seq":client.seq,"epoch":client.epoch}),
+        ))
+        .unwrap();
+    client.history_cache = Some(cache);
+
+    // 1. Initial thread.subscribe loads only the recent window, not all 2700 items.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "initial subscribe did not finish"
+        );
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else if cache.histories.contains_key(&1) {
+            break;
+        } else {
+            client.read();
+        }
+    }
+    {
+        let cache = client.history_cache.as_mut().unwrap();
+        assert!(
+            cache.next_history().is_none(),
+            "must stop after initial window"
+        );
+        let view = cache.projected().unwrap();
+        assert_eq!(view["threads"][0]["historyMeta"]["hasMoreHistory"], true);
+        let loaded_msgs = view["threads"][0]["messages"].as_array().unwrap();
+        assert!(
+            loaded_msgs.len() <= 20,
+            "recent budget only, got {}",
+            loaded_msgs.len()
+        );
+        assert_eq!(loaded_msgs.last().unwrap()["text"], "Turn reply 899");
+    }
+
+    // 2. Request earlier pages on demand, including across a reconnect mid-walk.
+    let mut pages = 0usize;
+    let mut reconnected = false;
+    loop {
+        assert!(Instant::now() < deadline, "older paging did not finish");
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+            continue;
+        }
+        let meta = cache
+            .projected()
+            .map(|v| v["threads"][0]["historyMeta"].clone());
+        if meta.as_ref().is_some_and(|m| m["hasMoreHistory"] == false) || cache.complete(1) {
+            break;
+        }
+        if pages == 2 && !reconnected {
+            let saved = client.history_cache.take().unwrap();
+            let token = client.token.clone();
+            drop(client);
+            client = Client::unsubscribed(&profile.discovery(), token);
+            client.snapshot = saved.state.clone();
+            client.seq = saved.seq.unwrap();
+            client.epoch = saved.epoch.clone();
+            let hello = client.rpc(
+                "hello",
+                json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+                json!("reconnect-hello"),
+            );
+            let mut saved = saved;
+            saved.reconnect(&hello["result"]).unwrap();
+            let cursor = json!({"lastSeq":saved.seq,"epoch":saved.epoch});
+            client.history_cache = Some(saved);
+            client.rpc("workspace.subscribe", cursor, json!("reconnect-sub"));
+            reconnected = true;
+            // After reconnect, synchronize thread.subscribe first before requesting next page.
+            let sub = client
+                .history_cache
+                .as_mut()
+                .unwrap()
+                .next_history()
+                .unwrap();
+            assert_eq!(sub["method"], "thread.subscribe");
+            client.rpc("thread.subscribe", sub["params"].clone(), json!("history"));
+        }
+        client
+            .history_cache
+            .as_mut()
+            .unwrap()
+            .request_earlier(1, None);
+        pages += 1;
+    }
+    assert!(
+        pages > 5,
+        "should require multiple older pages, took {pages}"
+    );
+    let cache = client.history_cache.as_ref().unwrap();
+    assert_eq!(
+        cache.histories[&1].1["messages"].as_array().unwrap().len(),
+        1800
+    );
+    assert_eq!(
+        cache.histories[&1].1["tools"].as_array().unwrap().len(),
+        900
+    );
+    assert_eq!(
+        cache.histories[&1].1["messages"][0]["text"],
+        "Turn prompt 0"
+    );
+    assert!(cache.complete(1));
+
+    // 3. Peer lacking history-items (protocolMinor 6) yields explicit update-required state.
+    let mut legacy = client_history::ProjectionCache::default();
+    assert!(
+        legacy
+            .reconnect(&json!({"capabilities":["snapshot-subscriptions"]}))
+            .is_err()
+    );
+    profile.stop();
+}
+
+#[test]
+fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked_machine_and_handles_old_peer()
+ {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut host_a = Profile::new();
+    let mut host_b = Profile::new();
+
+    // Seed 900 turns (2700 items) on host_b with an early unique needle at turn 3.
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    for turn in 0..900usize {
+        let prompt = if turn == 3 {
+            "Turn prompt 3 contains secret-albatross-needle inside".to_owned()
+        } else if turn == 895 {
+            "Turn prompt 895 also has secret-albatross-needle".to_owned()
+        } else {
+            format!("Turn prompt {turn}")
+        };
+        messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":prompt,"images":[]}));
+        let a_idx = messages.len();
+        messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Turn reply {turn}"),"images":[]}));
+        tools.push(json!({
+            "id":format!("tool-{turn}"),"name":"read","detail":"file.rs","done":true,"failed":false,
+            "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
+            "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
+        }));
+    }
+    let mut index = base["index"].clone();
+    index["threads"][0]["title"] = json!("Long searchable thread");
+    index["threads"][0]["renamed"] = json!(true);
+    index["threads"][0]["session"] = Value::Null;
+    let mut view = base["threads"][0].clone();
+    view["status"] = json!("Completed");
+    view["messages"] = json!(messages);
+    view["tools"] = json!(tools);
+    index["threadViews"] = json!([view]);
+    fs::write(host_b.root.join("Shina/index.json"), index.to_string()).unwrap();
+
+    host_a.launch(&["serve"]);
+    host_b.launch(&["serve"]);
+    let discovery_b = host_b.discovery();
+    let paired = host_b.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", discovery_b["port"].as_u64().unwrap());
+    assert!(host_a.cli(&["link", &host, &code]).status.success());
+
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            host_a
+                .root
+                .join("Shina/linked")
+                .join(discovery_b["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut linked_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let hello = linked_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("linked-hello"),
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-find")
+    );
+
+    // Search the complete stored conversation on linked machine host_b.
+    let found = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"secret-albatross-needle"}),
+        json!("find-1"),
+    );
+    assert!(found["error"].is_null(), "{found}");
+    assert_eq!(found["result"]["totalMatches"], 2);
+    assert_eq!(found["result"]["activeIndex"], 0);
+    assert_eq!(found["result"]["match"]["entryId"], "u-3");
+
+    // Step Next -> advances to u-895.
+    let next = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"secret-albatross-needle","start":{"entryId":"u-3","occurrence":0},"offset":1}),
+        json!("find-2"),
+    );
+    assert_eq!(next["result"]["activeIndex"], 1);
+    assert_eq!(next["result"]["match"]["entryId"], "u-895");
+
+    // Load initial scoped window via ProjectionCache, then jump to earlier match u-3!
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    linked_client.rpc("workspace.subscribe", json!({}), json!("sub"));
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({"state":protocol::compact(&linked_client.snapshot),"seq":linked_client.seq,"epoch":linked_client.epoch}),
+        ))
+        .unwrap();
+    linked_client.history_cache = Some(cache);
+    loop {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            linked_client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else if cache.histories.contains_key(&1) {
+            break;
+        }
+    }
+    // u-3 is NOT in initial window; requesting earlier throughEntryId="u-3" loads it!
+    {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        assert!(
+            !cache.histories[&1].1["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "u-3")
+        );
+        cache.request_earlier(1, Some("u-3".into()));
+    }
+    loop {
+        let cache = linked_client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            linked_client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else {
+            break;
+        }
+    }
+    assert!(
+        linked_client.history_cache.as_ref().unwrap().histories[&1].1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "u-3")
+    );
+
+    // Peer without thread-find (protocolMinor 9) does not advertise "thread-find".
+    let mut old_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let old_hello = old_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":9,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert!(
+        !old_hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-find")
+    );
+
+    host_a.stop();
+    host_b.stop();
+}
+
+#[test]
+fn sidebar_search_queries_full_transcripts_across_local_and_linked_servers_and_notes_old_peer() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut host_a = Profile::new();
+    let mut host_b = Profile::new();
+
+    // Seed unvisited thread 2 on host_a with hidden early message, and unvisited thread 2 on host_b.
+    let make_index = |phrase: &str| {
+        let mut messages = Vec::new();
+        for turn in 0..80usize {
+            let prompt = if turn == 4 {
+                format!("Early turn with {phrase} inside")
+            } else {
+                format!("Normal turn {turn}")
+            };
+            messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":prompt,"images":[]}));
+            messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Reply {turn}"),"images":[]}));
+        }
+        let mut index = base["index"].clone();
+        let mut t2 = index["threads"][0].clone();
+        t2["id"] = json!(2);
+        t2["title"] = json!("Unrelated title");
+        t2["renamed"] = json!(true);
+        t2["session"] = Value::Null;
+        index["threads"] = json!([index["threads"][0], t2]);
+        index["nextId"] = json!(3);
+        let mut v1 = base["threads"][0].clone();
+        v1["status"] = json!("Completed");
+        let mut v2 = base["threads"][0].clone();
+        v2["id"] = json!(2);
+        v2["status"] = json!("Completed");
+        v2["messages"] = json!(messages);
+        index["threadViews"] = json!([v1, v2]);
+        index
+    };
+    fs::write(
+        host_a.root.join("Shina/index.json"),
+        make_index("periwinkle-compass").to_string(),
+    )
+    .unwrap();
+    fs::write(
+        host_b.root.join("Shina/index.json"),
+        make_index("cobalt-astrolabe").to_string(),
+    )
+    .unwrap();
+
+    host_a.launch(&["serve"]);
+    host_b.launch(&["serve"]);
+    let discovery_b = host_b.discovery();
+    let paired = host_b.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", discovery_b["port"].as_u64().unwrap());
+    assert!(host_a.cli(&["link", &host, &code]).status.success());
+
+    let mut client_a = host_a.client(uuid::Uuid::new_v4());
+    let hello_a = client_a.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello-a"),
+    );
+    assert!(
+        hello_a["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-search")
+    );
+    client_a.rpc("workspace.subscribe", json!({}), json!("sub-a"));
+    // Unvisited thread 2 has empty messages in compact workspace snapshot.
+    assert!(
+        client_a.snapshot["threads"][1]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let hits_a = client_a.rpc(
+        "threads.search",
+        json!({"query":"periwinkle-compass"}),
+        json!("search-a"),
+    );
+    assert!(hits_a["error"].is_null(), "{hits_a}");
+    let matches_a = hits_a["result"]["matches"].as_array().unwrap();
+    assert_eq!(matches_a.len(), 1);
+    assert_eq!(matches_a[0]["threadId"], 2);
+    assert_eq!(matches_a[0]["entryId"], "u-4");
+    assert!(
+        matches_a[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("periwinkle-compass")
+    );
+
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            host_a
+                .root
+                .join("Shina/linked")
+                .join(discovery_b["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut client_b =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    client_b.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello-b"),
+    );
+    let hits_b = client_b.rpc(
+        "threads.search",
+        json!({"query":"cobalt-astrolabe"}),
+        json!("search-b"),
+    );
+    assert!(hits_b["error"].is_null(), "{hits_b}");
+    let matches_b = hits_b["result"]["matches"].as_array().unwrap();
+    assert_eq!(matches_b.len(), 1);
+    assert_eq!(matches_b[0]["threadId"], 2);
+
+    // Peer lacking thread-search (protocolMinor 9) does not advertise capability.
+    let mut old_client =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    let old_hello = old_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":9,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert!(
+        !old_hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "thread-search")
+    );
+
+    host_a.stop();
+    host_b.stop();
 }

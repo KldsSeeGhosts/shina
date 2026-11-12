@@ -233,10 +233,8 @@ pub(super) fn composer_pi_key(
     if s.undo_key(event, true) {
         return true;
     }
-    if composer_menu::key(s, event) {
-        return true;
-    }
     let is_running = s.current().status.busy();
+    let is_draft_thread = s.current().is_draft();
     let is_composing = s.current().draft.is_composing();
     let send_shortcut = s.preferences.send_shortcut;
     let prompt_text = s.current().draft.text.clone();
@@ -250,23 +248,47 @@ pub(super) fn composer_pi_key(
         tx.physical_key(),
         tx.key_base(),
     );
-    if let Some(intent) = crate::composer::submission_intent_for_command(
+    let submission_intent = crate::composer::submission_intent_for_command(
         event,
         tx.key_repeat(),
         is_composing,
         is_running,
+        is_draft_thread,
         send_shortcut,
         &prompt_text,
         shortcut_command,
-    ) {
+    );
+    if matches!(
+        submission_intent,
+        None | Some(crate::composer::SubmissionIntent::Foreground)
+    ) && composer_menu::key(s, event)
+    {
+        return true;
+    }
+    if let Some(intent) = submission_intent {
         if !s.demo && !s.current().archived() {
-            let previous = s.current().native.follow_up;
-            if intent == crate::composer::SubmissionIntent::Alternate {
-                s.current_mut().native.follow_up = !previous;
+            match intent {
+                crate::composer::SubmissionIntent::Foreground => s.send(),
+                crate::composer::SubmissionIntent::Alternate => {
+                    let previous = s.current().native.follow_up;
+                    s.current_mut().native.follow_up = !previous;
+                    s.send();
+                    s.current_mut().native.follow_up = previous;
+                }
+                crate::composer::SubmissionIntent::Background => s.send_background(),
             }
-            s.send();
-            s.current_mut().native.follow_up = previous;
         }
+        return true;
+    }
+    if !is_composing
+        && tx.key_repeat()
+        && matches!(
+            shortcut_command,
+            Some(
+                "composer.sendAlternate" | "composer.sendBackground" | "composer.sendAndNewThread"
+            )
+        )
+    {
         return true;
     }
     if event.key == rune::Key::Enter && !is_composing && !event.mods.alt {

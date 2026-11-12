@@ -25,6 +25,8 @@ pub struct Preferences {
     pub send_shortcut: crate::composer::SendShortcut,
     pub keybindings: Vec<crate::keybindings::KeybindingRule>,
     pub dismissed_updates: Vec<String>,
+    pub model_favorites: Vec<crate::model_picker::ModelFavorite>,
+    pub sticky_composer: crate::model_selection::StickyComposerState,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -35,6 +37,8 @@ impl Default for Preferences {
             send_shortcut: Default::default(),
             keybindings: Vec::new(),
             dismissed_updates: vec![],
+            model_favorites: vec![],
+            sticky_composer: Default::default(),
         }
     }
 }
@@ -429,6 +433,7 @@ impl State {
         let editable_focus = composer_focus
             || self.search.focused
             || self.model_search.focused
+            || self.thread_find.query.focused
             || self.picker_query.focused
             || self.captain_picker_query.focused
             || self.rename_edit.focused
