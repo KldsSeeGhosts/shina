@@ -181,6 +181,71 @@ pub fn build_history_entries(messages: &[crate::model::Message]) -> Vec<String> 
     entries
 }
 
+pub const COMPOSER_TYPING_IDLE_MS: u64 = 1500;
+
+/// Ported from KSG Code's `composerTypingGuard.ts` and `useComposerTypingGuard.ts`.
+#[derive(Default)]
+pub struct TypingGuard {
+    seen: std::collections::HashSet<String>,
+    held: std::collections::HashSet<String>,
+    last_typed_at: Option<std::time::Instant>,
+}
+
+impl TypingGuard {
+    pub fn on_type(&mut self, now: std::time::Instant) {
+        self.last_typed_at = Some(now);
+    }
+
+    pub fn on_blur_or_send(&mut self) {
+        self.held.clear();
+        self.last_typed_at = None;
+    }
+
+    pub fn on_requests(&mut self, request_ids: &[String], focused: bool, now: std::time::Instant) {
+        let idle = std::time::Duration::from_millis(COMPOSER_TYPING_IDLE_MS);
+        self.held.retain(|id| request_ids.contains(id));
+        for id in request_ids {
+            if !self.seen.contains(id)
+                && focused
+                && self
+                    .last_typed_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < idle)
+            {
+                self.held.insert(id.clone());
+            }
+            self.seen.insert(id.clone());
+        }
+    }
+
+    pub fn release_if_idle(&mut self, now: std::time::Instant) -> bool {
+        if self.held.is_empty() {
+            return false;
+        }
+        let idle = std::time::Duration::from_millis(COMPOSER_TYPING_IDLE_MS);
+        if self
+            .last_typed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= idle)
+        {
+            self.held.clear();
+            self.last_typed_at = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn is_held(&self, request_id: &str) -> bool {
+        self.held.contains(request_id)
+    }
+
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        if self.held.is_empty() {
+            return None;
+        }
+        let at = self.last_typed_at?;
+        Some(at + std::time::Duration::from_millis(COMPOSER_TYPING_IDLE_MS))
+    }
+}
+
 /// Per-thread browsing state. Keep the whole edit so recall also preserves the caret and marks.
 #[derive(Default)]
 pub struct History {
@@ -668,5 +733,51 @@ mod tests {
                     .into()
             )
         );
+    }
+
+    #[test]
+    fn typing_guard_holds_for_1500ms_and_releases_on_blur_send_or_idle() {
+        let mut guard = TypingGuard::default();
+        let t0 = std::time::Instant::now();
+        let reqs = vec!["req-1".to_owned()];
+
+        // Unfocused composer never holds.
+        guard.on_type(t0);
+        guard.on_requests(&reqs, false, t0 + std::time::Duration::from_millis(100));
+        assert!(!guard.is_held("req-1"));
+
+        // Focused + recent typing holds new request.
+        let reqs2 = vec!["req-2".to_owned()];
+        guard.on_type(t0);
+        guard.on_requests(&reqs2, true, t0 + std::time::Duration::from_millis(200));
+        assert!(guard.is_held("req-2"));
+
+        // Re-evaluating the same request id does not re-hold once seen, even if typing continues.
+        guard.on_blur_or_send();
+        assert!(!guard.is_held("req-2"));
+        guard.on_type(t0 + std::time::Duration::from_millis(300));
+        guard.on_requests(&reqs2, true, t0 + std::time::Duration::from_millis(400));
+        assert!(!guard.is_held("req-2"));
+
+        // Idle timeout at 1500ms releases held request.
+        let reqs3 = vec!["req-3".to_owned()];
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        guard.on_type(t1);
+        guard.on_requests(&reqs3, true, t1 + std::time::Duration::from_millis(100));
+        assert!(guard.is_held("req-3"));
+        assert!(!guard.release_if_idle(t1 + std::time::Duration::from_millis(1499)));
+        assert!(guard.is_held("req-3"));
+        assert!(guard.release_if_idle(t1 + std::time::Duration::from_millis(1500)));
+        assert!(!guard.is_held("req-3"));
+
+        // Request arriving at or after 1500ms since last type is not held.
+        let reqs4 = vec!["req-4".to_owned()];
+        guard.on_type(t1);
+        guard.on_requests(
+            &reqs4,
+            true,
+            t1 + std::time::Duration::from_millis(COMPOSER_TYPING_IDLE_MS),
+        );
+        assert!(!guard.is_held("req-4"));
     }
 }

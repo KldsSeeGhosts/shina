@@ -342,6 +342,7 @@ pub struct Thread {
     pub draft: TextEdit,
     /// Images selected for the next send, kept separate from text undo history.
     pub prompt_history: crate::composer::History,
+    pub typing_guard: crate::composer::TypingGuard,
     pub paste_history: crate::composer_paste::PasteHistory,
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
@@ -573,6 +574,7 @@ impl Thread {
             work: vec![],
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
+            typing_guard: crate::composer::TypingGuard::default(),
             paste_history: crate::composer_paste::PasteHistory::default(),
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
@@ -929,6 +931,7 @@ impl Thread {
             }
         };
         self.prompt_history.reset();
+        self.typing_guard.on_blur_or_send();
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
@@ -2082,6 +2085,7 @@ impl Thread {
                 ) {
                     self.reply.replace_text(string(&record, "prefill"));
                     self.request = Some(record);
+                    self.refresh_typing_guard();
                     self.status = Status::Waiting;
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
@@ -7014,6 +7018,11 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         tx.wake_after(remaining);
     }
     changed |= state.poll_projects();
+    for thread in &mut state.threads {
+        if !thread.draft.focused {
+            thread.typing_guard.on_blur_or_send();
+        }
+    }
     if state.catalog.poll() {
         state.apply_catalog();
         changed = true;

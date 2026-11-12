@@ -8389,10 +8389,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
                 .selectable(true),
         );
     }
-    if t.native.questionnaire.is_some() && t.request.is_some() {
+    let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
+    if t.native.questionnaire.is_some() && request_visible {
         return area.child(pi_ui::questionnaire_drawer(s, p));
     }
-    if t.request.is_some() {
+    if request_visible {
         area = area.child(dialog(s, p));
     }
     let can_send = !s.demo
@@ -8400,7 +8401,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         && !t.initializing
         && !t.archived()
         && !t.configuring
-        && t.request.is_none()
+        && !request_visible
         && !t.native.operating()
         && t.phase != "Stopping"
         && t.has_draft_content();
@@ -8591,6 +8592,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
         .on_input_change(|s: &mut State, _| {
             let t = s.current_mut();
             t.composer_rules.changed(&mut t.draft);
+            t.typing_guard.on_type(std::time::Instant::now());
             t.update_submission_error();
             s.ensure_composer_commands();
         })
@@ -15750,6 +15752,43 @@ pub(crate) mod tests {
             );
             assert!(
                 rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                "{width}: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typing_guard_hides_arriving_request_while_typing_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("a".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+
+            rt.state.current_mut().apply(json!({
+                "type": "extension_ui_request",
+                "id": "guard-req",
+                "method": "confirm",
+                "title": "Allow?",
+                "message": "Run tool?"
+            }));
+            rt.frame(0.0);
+            assert!(rt.find("dialog-confirm").is_none());
+
+            // Blurring the composer immediately releases the held request.
+            rt.state.current_mut().draft.focused = false;
+            rt.state.current_mut().typing_guard.on_blur_or_send();
+            rt.invalidate();
+            rt.frame(0.0);
+            let (rect, _) = rt
+                .presented("dialog-confirm")
+                .unwrap_or_else(|| panic!("{width}: dialog-confirm"));
+            assert!(
+                rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
                 "{width}: {rect:?}"
             );
         }
