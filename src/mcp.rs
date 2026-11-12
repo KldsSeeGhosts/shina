@@ -660,8 +660,15 @@ fn serve(
 }
 
 fn tool_result(value: Value) -> Value {
+    let mut metadata = value.clone();
+    if let Some(screenshot) = metadata
+        .get_mut("screenshot")
+        .and_then(Value::as_object_mut)
+    {
+        screenshot.remove("data");
+    }
     let mut content = vec![
-        json!({"type":"text","text":serde_json::to_string_pretty(&value).unwrap_or_default()}),
+        json!({"type":"text","text":serde_json::to_string_pretty(&metadata).unwrap_or_default()}),
     ];
     if let Some(data) = value["screenshot"]["data"].as_str() {
         content.push(json!({"type":"image","mimeType":"image/png","data":data}));

@@ -891,6 +891,7 @@ async fn cache_images(
     projected: &mut Value,
     fetch: bool,
 ) -> Result<(), String> {
+    cache_html(remote, profile, projected, fetch).await?;
     fn paths(value: &Value, prefix: String, out: &mut Vec<String>) {
         if out.len() >= 32 {
             return;
@@ -995,6 +996,111 @@ async fn cache_images(
         *projected
             .pointer_mut(&path)
             .ok_or("Missing image reference.")? = attachment;
+    }
+    Ok(())
+}
+
+pub(crate) async fn cache_html(
+    remote: &crate::peer::Link,
+    profile: &std::path::Path,
+    projected: &Value,
+    fetch: bool,
+) -> Result<(), String> {
+    fn references(value: &Value, out: &mut Vec<crate::html_render::Reference>, depth: usize) {
+        if depth == 0 || out.len() >= 32 {
+            return;
+        }
+        if let Some(reference) = crate::html_render::Reference::read(&value["htmlRender"]) {
+            if !out
+                .iter()
+                .any(|r| r.attachment_id == reference.attachment_id)
+            {
+                out.push(reference);
+            }
+            return;
+        }
+        match value {
+            Value::Object(object) => {
+                for value in object.values() {
+                    references(value, out, depth - 1);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    references(value, out, depth - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !fetch {
+        return Ok(());
+    }
+    let mut records = vec![];
+    references(projected, &mut records, 24);
+    if records.is_empty() {
+        return Ok(());
+    }
+    let http = crate::peer::http()?;
+    let address = remote.address()?;
+    let directory = profile.join("attachments");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    for reference in records {
+        for blob in reference.blobs() {
+            let path = directory.join(&blob.id);
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == blob.bytes) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            while bytes.len() < blob.bytes as usize {
+                let response = http
+                    .get(format!(
+                        "http://{address}/v1/blobs/{}?offset={}&limit={}",
+                        blob.id,
+                        bytes.len(),
+                        protocol::PAGE_BYTES
+                    ))
+                    .bearer_auth(&remote.token)
+                    .send()
+                    .await
+                    .map_err(|_| "Remote HTML render unavailable.")?;
+                if !response.status().is_success()
+                    || response
+                        .content_length()
+                        .is_none_or(|n| n > protocol::MAX_PAGE_BYTES as u64)
+                {
+                    return Err("Invalid remote HTML blob response.".into());
+                }
+                let chunk = response
+                    .bytes()
+                    .await
+                    .map_err(|_| "Remote HTML render interrupted.")?;
+                if chunk.is_empty() || bytes.len() + chunk.len() > blob.bytes as usize {
+                    return Err("Invalid remote HTML blob length.".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if blob.id.ends_with(".png") {
+                let image = image::ImageReader::with_format(
+                    std::io::Cursor::new(&bytes),
+                    image::ImageFormat::Png,
+                )
+                .into_dimensions()
+                .map_err(|_| "Invalid remote HTML snapshot.")?;
+                let snapshot = [&reference.light, &reference.dark]
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s.blob.id == blob.id)
+                    .ok_or("Unbound snapshot.")?;
+                if image != (snapshot.width, snapshot.height) {
+                    return Err("Remote snapshot dimensions mismatch.".into());
+                }
+            } else if std::str::from_utf8(&bytes).is_err() {
+                return Err("Invalid remote HTML encoding.".into());
+            }
+            crate::store::write_atomic(&path, &bytes).map_err(|e| e.to_string())?;
+        }
+        crate::html_render::import(&directory, &reference)?;
     }
     Ok(())
 }

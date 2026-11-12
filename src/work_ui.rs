@@ -97,6 +97,7 @@ pub(super) fn kind_icon(kind: ToolKind) -> &'static str {
         ToolKind::List => "folder",
         ToolKind::Subagent => "crew",
         ToolKind::Plan => "list",
+        ToolKind::Html => "open",
         ToolKind::Other => "wrench",
     }
 }
@@ -451,6 +452,82 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
         ));
     }
     body.child(rule(p)).child(raw(s, p, index))
+}
+
+/// Ported from KSG's HtmlRenderFrame and HtmlRenderTimelineRow placement.
+/// The native-specific snapshot/open presentation follows the HTML rendering brief.
+pub(super) fn html_card(s: &State, p: Palette, index: usize) -> El {
+    let t = s.current();
+    let Some(reference) = crate::html_render::find_reference(&t.tools[index].structured)
+        .filter(|r| r.thread_id == t.id)
+    else {
+        return label("HTML render unavailable", SMALL, p.muted);
+    };
+    let mut body = col().min_w(0.0).gap(8.0).padding(12.0).child(
+        row()
+            .center_y()
+            .gap(8.0)
+            .min_w(0.0)
+            .child(pixel_text("HTML", p.muted))
+            .child(
+                label(&reference.title, LABEL, p.ink)
+                    .truncate()
+                    .min_w(0.0)
+                    .shrink(),
+            )
+            .child(spacer())
+            .child(icon("open", p.sea)),
+    );
+    if let Some(snapshot) = reference.snapshot(s.dark)
+        && s.data_dir
+            .join("attachments")
+            .join(&snapshot.blob.id)
+            .is_file()
+    {
+        let handle = s.attachment_cache.file(
+            s.data_dir.join("attachments").join(&snapshot.blob.id),
+            snapshot.width.max(snapshot.height) as f32,
+            1.0,
+        );
+        if rune::is_headless() {
+            let _ = handle.wait();
+        }
+        // Crop below the 480 pt cap. Do not shrink a tall page to fit its whole height.
+        body = body.child(
+            col()
+                .key(format!("html-snapshot-{}-{index}", t.id))
+                .min_w(0.0)
+                .max_h(480.0)
+                .clip_rounded(0.0)
+                .child(
+                    el().key(format!("html-snapshot-image-{}-{index}", t.id))
+                        .w_full()
+                        .aspect_ratio(snapshot.width as f32 / snapshot.height as f32)
+                        .pixels_fit(handle.pixels(), rune::SurfaceFit::Fit),
+                ),
+        );
+    } else {
+        body = body.child(
+            label("Open to view", SMALL, p.muted).key(format!("html-placeholder-{}-{index}", t.id)),
+        );
+    }
+    let key = format!("html-card-{}-{index}", t.id);
+    framed(body.fill(p.card).radius(6.0), p)
+        .key(key)
+        .role("button")
+        .label(format!("Open {}", reference.title))
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(move |s: &mut State| {
+            s.html_windows.open_async(
+                s.data_dir.join("attachments"),
+                reference.clone(),
+                s.dark,
+                s.wake.clone(),
+            );
+        })
 }
 
 fn raw(s: &State, p: Palette, index: usize) -> El {

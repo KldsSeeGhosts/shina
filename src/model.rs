@@ -2377,6 +2377,8 @@ pub struct State {
     pub portraits: crate::runtime::UiResource<crate::portraits::Portraits>,
     /// Decodes composer and conversation thumbnails off the UI thread.
     pub attachment_cache: crate::runtime::UiResource<rune::ImageCache>,
+    pub html_windows: Arc<crate::html_window::Windows>,
+    pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub captain_picker: bool,
@@ -2482,6 +2484,8 @@ impl State {
             background: Default::default(),
             data_dir: crate::store::directory()
                 .unwrap_or_else(|| std::env::temp_dir().join("Shina")),
+            html_windows: Default::default(),
+            html_lane_width: crate::html_render::COLUMN_WIDTH,
             launch_project: (!workspace.as_os_str().is_empty()).then_some(workspace.clone()),
             threads: vec![Thread::new(1)],
             active: 0,
@@ -5043,6 +5047,22 @@ impl State {
     }
 
     fn mcp_request(&mut self, request: crate::mcp::Request) {
+        if matches!(request.tool.as_str(), "html_render" | "html_preview") {
+            let Some(thread) = self.threads.iter().find(|t| t.id == request.thread) else {
+                let _ = request
+                    .reply
+                    .send(Err("The calling thread no longer exists.".into()));
+                return;
+            };
+            crate::html_render::request(
+                request,
+                self.data_dir.join("attachments"),
+                thread.native.access == AccessMode::Full,
+                self.html_lane_width,
+                self.wake.clone(),
+            );
+            return;
+        }
         if self.learned_memory_request(&request) {
             return;
         }
@@ -6560,7 +6580,19 @@ impl State {
 }
 
 pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    let browsing = state.poll_folder_browser();
+    let mut html_changed = false;
+    while let Some(outcome) = state.html_windows.next() {
+        html_changed = true;
+        match outcome {
+            Ok(Some(url)) => {
+                let _ = tx.open_url(&url);
+            }
+            Ok(None) => {}
+            Err(error) => state.storage_error = Some(error),
+        }
+    }
+    state.html_windows.theme(state.dark);
+    let browsing = state.poll_folder_browser() | html_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {

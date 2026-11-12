@@ -2,6 +2,53 @@ use super::*;
 use crate::ui::tests::{press, runtime};
 
 #[test]
+fn html_cards_fit_the_lane_cap_the_snapshot_and_switch_theme_at_every_width() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for snapshot in [false, true] {
+            let reference = crate::html_render::tests::fixture(snapshot);
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.apply(json!({"type":"tool_execution_start","toolCallId":"html","toolName":"html_render","args":{}}));
+            t.apply(json!({"type":"tool_execution_end","toolCallId":"html",
+                "result":{"content":[],"structuredContent":crate::html_render::result(&reference)}}));
+            for dark in [false, true] {
+                rt.state.dark = dark;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let (lane, _) = rt.presented("chat-lane").unwrap();
+                let (card, _) = rt.presented("html-card-1-0").unwrap();
+                assert!(
+                    card[0] >= lane[0] && card[0] + card[2] <= lane[0] + lane[2] + 0.5,
+                    "{width}/{snapshot}/{dark}: {card:?} vs {lane:?}"
+                );
+                if snapshot {
+                    let (image, _) = rt.presented("html-snapshot-1-0").unwrap();
+                    assert!(image[3] > 0.0 && image[3] <= 480.5, "{image:?}");
+                    assert!(rt.find("html-placeholder-1-0").is_none());
+                    let (natural, _) = rt.presented("html-snapshot-image-1-0").unwrap();
+                    let expected_ratio = reference.snapshot(dark).unwrap().width as f32
+                        / reference.snapshot(dark).unwrap().height as f32;
+                    assert!(
+                        (natural[2] / natural[3] - expected_ratio).abs() < 0.02,
+                        "{natural:?}"
+                    );
+                } else {
+                    assert!(rt.find("html-placeholder-1-0").is_some());
+                    assert!(rt.find("html-snapshot-1-0").is_none());
+                }
+                let button = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some("html-card-1-0"))
+                    .unwrap();
+                assert_eq!(button.role, "button");
+                assert_eq!(button.label.as_deref(), Some("Open Example chart"));
+            }
+        }
+    }
+}
+
+#[test]
 fn expanded_kinds_fit_the_lane_and_each_output_block_is_capped() {
     use ToolKind::*;
     for width in [620.0, 960.0, 1280.0, 1920.0] {
