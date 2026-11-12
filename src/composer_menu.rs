@@ -163,6 +163,8 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                 Token::Thread {
                     id: thread.id,
                     title: thread.title.clone(),
+                    machine: Some(thread.machine.clone()),
+                    extra: Default::default(),
                 },
                 thread.title.clone(),
             ),

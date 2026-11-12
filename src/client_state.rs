@@ -1707,7 +1707,34 @@ impl State {
         let Some((_, edit, images)) = submitted else {
             return;
         };
-        let params = json!({"threadId":id,"text":edit.text,"attachments":images,
+        let label = |machine: &str| -> String {
+            if machine == "local" {
+                "Local".into()
+            } else {
+                self.client
+                    .as_ref()
+                    .and_then(|client| client.linked.get(machine))
+                    .and_then(|client| client.remote.as_ref())
+                    .map(|link| link.host.clone())
+                    .or_else(|| {
+                        self.peers
+                            .iter()
+                            .find(|p| p.server_id == machine)
+                            .map(|p| p.label.clone())
+                    })
+                    .unwrap_or_else(|| machine.into())
+            }
+        };
+        let prompt = match crate::composer_tokens::prompt_for(&edit, &images, Some(server), &label)
+        {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                draft.attachment_error = Some(error.clone());
+                self.machines.notice = Some(error);
+                return;
+            }
+        };
+        let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
             "editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
         let result = commands
             .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
@@ -4202,5 +4229,80 @@ mod tests {
         assert!(state.poll_client(&mut Tx::default()));
         assert!(state.undo.is_none());
         assert!(state.current().pi.is_none());
+    }
+
+    #[test]
+    fn retargeted_thread_pill_keeps_owner_and_drops_read_thread_hint() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote_client, _rx2) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("server-b".into(), remote_client);
+        state.client = Some(client);
+
+        let mut local_thread_7 = Thread::new(7);
+        local_thread_7.machine = "local".into();
+        local_thread_7.title = "Local seven".into();
+        let mut local_draft = Thread::new(1);
+        local_draft.machine = "local".into();
+        local_draft.client_draft = true;
+
+        let mut remote_thread_7 = Thread::new(7);
+        remote_thread_7.machine = "server-b".into();
+        remote_thread_7.title = "Remote seven".into();
+        let mut remote_draft = Thread::new(1);
+        remote_draft.machine = "server-b".into();
+        remote_draft.client_draft = true;
+
+        state.threads = vec![local_draft, local_thread_7];
+        state
+            .machines
+            .threads
+            .insert("server-b".into(), vec![remote_draft, remote_thread_7]);
+        state.peers.push(crate::peer::Peer {
+            server_id: "server-b".into(),
+            host: "studio.local".into(),
+            label: "Studio".into(),
+            linked_at: 0,
+            capabilities: json!({}),
+            last_reached_at: None,
+            last_error: None,
+        });
+
+        let token = crate::composer_tokens::Token::Thread {
+            id: 7,
+            title: "Local seven".into(),
+            machine: Some("local".into()),
+            extra: Default::default(),
+        };
+        let mut draft = crate::composer_rich::draft("check @loc");
+        draft.replace_with_pill(6..10, token.id(), "Local seven");
+        state.current_mut().draft = draft;
+
+        let same_machine_prompt = crate::composer_tokens::prompt_for(
+            &state.current().draft,
+            &[],
+            Some(&state.current().machine),
+            &|machine| state.machine_label(machine),
+        )
+        .unwrap();
+        assert_eq!(
+            same_machine_prompt.text,
+            "check Shina thread \"Local seven\", read_thread({\"thread_id\":7})"
+        );
+
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "server-b");
+        let retargeted_prompt = crate::composer_tokens::prompt_for(
+            &state.current().draft,
+            &[],
+            Some(&state.current().machine),
+            &|machine| state.machine_label(machine),
+        )
+        .unwrap();
+        assert_eq!(
+            retargeted_prompt.text,
+            "check Shina thread \"Local seven\" on Local (not readable from this machine)"
+        );
+        assert!(!retargeted_prompt.text.contains("read_thread"));
     }
 }

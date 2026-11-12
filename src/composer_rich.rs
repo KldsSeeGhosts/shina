@@ -126,7 +126,12 @@ fn mark_delimiters(mark: &Mark, content: &str) -> (String, String) {
     (delimiter.into(), delimiter.into())
 }
 
-fn inline(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
+fn inline(
+    edit: &TextEdit,
+    range: std::ops::Range<usize>,
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> String {
     let pills: Vec<_> = edit
         .pills()
         .filter(|(r, _)| r.start >= range.start && r.end <= range.end)
@@ -136,11 +141,21 @@ fn inline(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
         let mut out = String::new();
         let mut cursor = range.start;
         for (pill, token) in pills {
-            out.push_str(&inline(edit, cursor..pill.start));
-            out.push_str(&token.source());
+            out.push_str(&inline(
+                edit,
+                cursor..pill.start,
+                target_machine,
+                machine_name,
+            ));
+            out.push_str(&token.source_for(target_machine, machine_name));
             cursor = pill.end;
         }
-        out.push_str(&inline(edit, cursor..range.end));
+        out.push_str(&inline(
+            edit,
+            cursor..range.end,
+            target_machine,
+            machine_name,
+        ));
         return out;
     }
     let mut bounds = vec![range.start, range.end];
@@ -195,6 +210,14 @@ fn inline(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
 }
 
 pub fn markdown(edit: &TextEdit) -> String {
+    markdown_for(edit, None, &|machine| machine.to_owned())
+}
+
+pub fn markdown_for(
+    edit: &TextEdit,
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> String {
     let paragraphs = edit.paragraphs();
     let mut out = Vec::new();
     let mut numbers = [0usize; 4];
@@ -253,7 +276,10 @@ pub fn markdown(edit: &TextEdit) -> String {
         } else {
             prefix
         };
-        out.push(format!("{prefix}{}", inline(edit, p.range.clone())));
+        out.push(format!(
+            "{prefix}{}",
+            inline(edit, p.range.clone(), target_machine, machine_name)
+        ));
         at += 1;
     }
     out.join("\n")

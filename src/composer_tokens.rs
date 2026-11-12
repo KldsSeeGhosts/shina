@@ -12,6 +12,10 @@ pub enum Token {
     Thread {
         id: usize,
         title: String,
+        #[serde(default)]
+        machine: Option<String>,
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     Skill {
         name: String,
@@ -29,21 +33,80 @@ impl Token {
         }
         serde_json::from_str(id.strip_prefix("shina:")?).ok()
     }
+    #[cfg(test)]
     pub fn source(&self) -> String {
+        self.source_for(None, &|machine| machine.to_owned())
+    }
+    pub fn source_for(
+        &self,
+        target_machine: Option<&str>,
+        machine_name: &dyn Fn(&str) -> String,
+    ) -> String {
         match self {
             Self::File { path, .. } => path.to_string_lossy().into_owned(),
-            Self::Thread { id, title } => format!(
-                "Shina thread {}, read_thread({})",
-                serde_json::to_string(title).unwrap(),
-                serde_json::json!({"thread_id":id})
-            ),
+            Self::Thread {
+                id, title, machine, ..
+            } => {
+                if let (Some(owner), Some(target)) = (machine.as_deref(), target_machine)
+                    && owner != target
+                {
+                    format!(
+                        "Shina thread {} on {} (not readable from this machine)",
+                        serde_json::to_string(title).unwrap(),
+                        machine_name(owner)
+                    )
+                } else {
+                    format!(
+                        "Shina thread {}, read_thread({})",
+                        serde_json::to_string(title).unwrap(),
+                        serde_json::json!({"thread_id":id})
+                    )
+                }
+            }
             // Codex and ACP advertise $name. Pi's bridge expands these exactly as KSG does.
             Self::Skill { name, .. } => format!("${name}"),
         }
     }
 }
 
+pub fn stamp_thread_owner(edit: &mut TextEdit, owner: &str) {
+    let updates: Vec<_> = edit
+        .pills()
+        .filter_map(|(range, id)| match Token::decode(id) {
+            Some(Token::Thread {
+                id,
+                title,
+                machine: None,
+                extra,
+            }) => Some((
+                range,
+                Token::Thread {
+                    id,
+                    title: title.clone(),
+                    machine: Some(owner.to_owned()),
+                    extra,
+                }
+                .id(),
+                title,
+            )),
+            _ => None,
+        })
+        .collect();
+    for (range, new_id, label) in updates {
+        edit.replace_with_pill(range, new_id, &label);
+    }
+}
+
 pub fn prompt(edit: &TextEdit, images: &[Attachment]) -> Result<Prompt, String> {
+    prompt_for(edit, images, None, &|machine| machine.to_owned())
+}
+
+pub fn prompt_for(
+    edit: &TextEdit,
+    images: &[Attachment],
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
     let mut attachments = images.to_vec();
     for (_, id) in edit.pills() {
         if let Some(Token::File { path, .. }) = Token::decode(id) {
@@ -55,7 +118,7 @@ pub fn prompt(edit: &TextEdit, images: &[Attachment]) -> Result<Prompt, String> 
     }
     attachments::validate_prompt_images(&attachments)?;
     Ok(Prompt::new(
-        crate::composer_rich::markdown(edit),
+        crate::composer_rich::markdown_for(edit, target_machine, machine_name),
         attachments,
     ))
 }
@@ -123,10 +186,38 @@ mod tests {
         let thread = Token::Thread {
             id: 42,
             title: "Fix \"quoted\" title".into(),
+            machine: Some("local".into()),
+            extra: Default::default(),
         };
         assert_eq!(
             thread.source(),
             "Shina thread \"Fix \\\"quoted\\\" title\", read_thread({\"thread_id\":42})"
         );
+        assert_eq!(
+            thread.source_for(Some("local"), &|m| m.to_owned()),
+            "Shina thread \"Fix \\\"quoted\\\" title\", read_thread({\"thread_id\":42})"
+        );
+        assert_eq!(
+            thread.source_for(Some("server-b"), &|m| if m == "local" {
+                "Local".into()
+            } else {
+                m.into()
+            }),
+            "Shina thread \"Fix \\\"quoted\\\" title\" on Local (not readable from this machine)"
+        );
+
+        // Missing owner field is treated as owned by its draft's machine; unknown fields are kept.
+        let legacy_and_future =
+            r#"shina:{"kind":"thread","id":9,"title":"Old","futureField":{"nested":1}}"#;
+        let decoded = Token::decode(legacy_and_future)
+            .expect("decode token with missing machine and unknown field");
+        let mut edit = crate::composer_rich::draft("see @t");
+        edit.replace_with_pill(4..6, decoded.id(), "Old");
+        stamp_thread_owner(&mut edit, "server-a");
+        let (_, stamped_id) = edit.pills().next().unwrap();
+        let stamped_json: serde_json::Value =
+            serde_json::from_str(stamped_id.strip_prefix("shina:").unwrap()).unwrap();
+        assert_eq!(stamped_json["machine"], "server-a");
+        assert_eq!(stamped_json["futureField"]["nested"], 1);
     }
 }
