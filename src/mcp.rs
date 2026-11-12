@@ -33,6 +33,10 @@ Shina shows the user every thread, its status, and its transcript.
 
 Ordinary coding tasks need no Shina tools.
 
+Use html_preview with exactly one of html or path to check a self-contained page and receive a PNG, contentHeight and consoleMessages. \
+Use html_render with the same source, title and height to show a finished chart, mockup or status board in this conversation. \
+Only full-access threads may pass a path or inline local images, and pages cannot access Shina or private networks.
+
 - Captain homes are read-only coordinators. Read and plan there, and delegate code changes to \
 workers. A captain's scope contains zero or more workspaces. With no scope it is a general \
 assistant in its own scratch directory. With one workspace delegation defaults there. With \
@@ -248,6 +252,28 @@ pub fn tools() -> Value {
     });
     let mut tools = json!([
         {
+            "name":"html_render",
+            "description":"Show a finished HTML page inline in this thread. Pass exactly one of html or path. Use inline styles and scripts and theme CSS variables --background, --foreground, --card, --muted-foreground, --chart-1 to --chart-6, --radius, --font-sans and --font-mono. Let content set the height; viewport-height units are rejected. Local absolute image paths are inlined only in full access. Use html_preview to check height first.",
+            "inputSchema":{"type":"object","properties":{
+                "html":{"type":"string","minLength":1,"maxLength":512000},
+                "path":{"type":"string","description":"Absolute .html file path, full access only."},
+                "title":{"type":"string","minLength":1,"maxLength":200},
+                "height":{"type":"integer","minimum":80,"maximum":2000}
+            },"required":["title","height"],"oneOf":[{"required":["html"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["html"]}}],"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":true}
+        },
+        {
+            "name":"html_preview",
+            "description":"Check an HTML page before html_render. Returns a PNG, contentHeight, capturedHeight and consoleMessages. Exactly one of html or path; path and local images require full access. Nothing is added to the timeline.",
+            "inputSchema":{"type":"object","properties":{
+                "html":{"type":"string","minLength":1,"maxLength":512000},
+                "path":{"type":"string","description":"Absolute .html file path, full access only."},
+                "width":{"type":"integer","minimum":240,"maximum":1600,"default":728},
+                "appearance":{"type":"string","enum":["dark","light"],"default":"dark"}
+            },"oneOf":[{"required":["html"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["html"]}}],"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}
+        },
+        {
             "name": "orchestrator_capabilities",
             "description": "Read Shina's delegation capabilities: harnesses, discovered model ids and reasoning levels, default and caller selections, and host limits. Call this before choosing a target. ready:false means discovery has not produced a usable catalog; do not invent ids.",
             "inputSchema": {"type":"object","properties":{}},
@@ -448,6 +474,7 @@ fn serve(
     let mut encoding = String::new();
     let mut expect = String::new();
     let mut authorization = String::new();
+    let mut has_origin = false;
     let mut total_headers = line.len();
     loop {
         let header = match limited_line(&mut reader, 8192) {
@@ -487,11 +514,17 @@ fn serve(
                     length = value.trim().parse::<usize>().ok();
                 }
                 "authorization" => authorization = value.trim().to_owned(),
+                "origin" => has_origin = true,
                 "transfer-encoding" => encoding = value.trim().to_ascii_lowercase(),
                 "expect" => expect = value.trim().to_ascii_lowercase(),
                 _ => {}
             }
         }
+    }
+    // Browser documents, including opaque sandbox origins, must never call tools.
+    // Check presence, not value: Origin: null and an empty Origin are both refused.
+    if has_origin {
+        return respond(&mut stream, 403, None, &json!({"error":"origin_refused"}));
     }
     if path.split('?').next() != Some("/mcp") {
         return respond(&mut stream, 404, None, &json!({"error":"not found"}));
@@ -602,10 +635,7 @@ fn serve(
                     .recv_timeout(Duration::from_secs(630))
                     .unwrap_or_else(|_| Err("Shina did not answer within 630 seconds.".into()));
                 Ok(match outcome {
-                    Ok(value) => json!({
-                        "content": [{"type":"text","text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
-                        "structuredContent": value,
-                    }),
+                    Ok(value) => tool_result(value),
                     Err(error) => json!({
                         "content": [{"type":"text","text": error}],
                         "isError": true,
@@ -629,6 +659,16 @@ fn serve(
     respond(&mut stream, 200, None, &body)
 }
 
+fn tool_result(value: Value) -> Value {
+    let mut content = vec![
+        json!({"type":"text","text":serde_json::to_string_pretty(&value).unwrap_or_default()}),
+    ];
+    if let Some(data) = value["screenshot"]["data"].as_str() {
+        content.push(json!({"type":"image","mimeType":"image/png","data":data}));
+    }
+    json!({"content":content,"structuredContent":value})
+}
+
 fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
@@ -648,6 +688,7 @@ fn respond(
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         417 => "Expectation Failed",
@@ -675,6 +716,36 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_every_origin_even_with_the_correct_bearer_token() {
+        let server = start().unwrap();
+        let token = server.token_for(42);
+        let address = server
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp");
+        for origin in ["https://example.com", "null", ""] {
+            let mut socket = TcpStream::connect(address).unwrap();
+            write!(socket,"POST /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\noRiGiN: {origin}\r\nContent-Length: 0\r\n\r\n").unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains("origin_refused"));
+        }
+        assert!(server.next_request().is_none());
+    }
+
+    #[test]
+    fn preview_result_has_a_typed_mcp_image_content_block() {
+        let response = tool_result(json!({"width":728,"contentHeight":100,"capturedHeight":100,
+            "consoleMessages":[],"screenshot":{"mimeType":"image/png","data":"cG5n","width":728,"height":100}}));
+        assert_eq!(
+            response["content"][1],
+            json!({"type":"image","mimeType":"image/png","data":"cG5n"})
+        );
+        assert_eq!(response["structuredContent"]["contentHeight"], 100);
+    }
 
     #[test]
     fn bounded_http_lines_and_chunks_reject_oversize_or_invalid_framing() {
