@@ -913,6 +913,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         } else if s.current().messages.is_empty()
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
+            && !s.current().history_has_more
+            && s.current().history_error.is_none()
         {
             // Sizes from the last layout: the hero keeps its height only while the composer
             // and its crew tray still fit under it.
@@ -3394,6 +3396,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
                     .field_focus(&s.search, p)
                     .hover(p.selected)
+                    .on_layout_tx(|s: &mut State, _rect, tx| {
+                        if !s.sync_sidebar_search_input() {
+                            tx.live_only();
+                        }
+                    })
                     .child(icon("search", p.muted))
                     .child(
                         text_input(&s.search, LABEL)
@@ -3429,6 +3436,23 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     }),
             ),
     );
+    if !s.search.text.is_empty() && !s.sidebar_search.unsupported_servers.is_empty() {
+        side = side.child(
+            label(
+                format!(
+                    "Titles only on {} (update required)",
+                    s.sidebar_search.unsupported_servers.join(", ")
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key("sidebar-search-unsupported")
+            .help(crate::protocol::THREAD_SEARCH_UPDATE_REQUIRED)
+            .px(ROW_INSET)
+            .pb(4.0)
+            .truncate(),
+        );
+    }
     // A workspace filter names itself and clears in one click.
     if scoped {
         side = side.child(
@@ -3576,120 +3600,131 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         }
     }
     let mut first_shelf = true;
-    for section in [
-        Section::Pinned,
-        Section::Active,
-        Section::Snoozed,
-        Section::Settled,
-    ] {
-        let rows: Vec<_> = all
+    if !s.search.text.is_empty() {
+        for entry in all
             .iter()
             .copied()
-            .filter(|entry| {
-                !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
-            })
-            .collect();
-        let shelf = match section {
-            Section::Snoozed => Some(0),
-            Section::Settled => Some(1),
-            _ => None,
-        };
-        if let Some(shelf) = shelf {
-            // Settled stays visible as a drop target while dragging, even when empty.
-            if rows.is_empty() && !(section == Section::Settled && dragging) {
-                continue;
-            }
-            // The first shelf takes the remaining height above it, so the shelves sit at the
-            // bottom of the sidebar as in T3 Code.
-            if first_shelf {
-                content = content.child(spacer().min_h(12.0));
-                first_shelf = false;
-            }
-            let key = format!("shelf-{section:?}");
-            let title = format!("{section:?}");
-            let marker = format!("drop-{section:?}");
-            let open = s.shelves[shelf];
-            // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
-            // above Settled, so both stay whole above the footer when the list is longer than
-            // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
-            // The block carries its rule and the sidebar fill, so rows never show through.
-            let settled_below = section == Section::Snoozed
-                && (dragging
-                    || all.iter().any(|entry| {
-                        !entry.draft
-                            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
-                    }));
-            let inset = if settled_below { SHELF_HEADING } else { 0.0 };
-            content = content.child(
-                col()
-                    .key(format!("shelf-block-{section:?}"))
-                    .h(SHELF_HEADING)
-                    .fill(p.bg)
-                    .sticky_bottom(inset)
-                    .child(dotted_rule(p))
-                    .child(
-                        row()
-                            .key(&key)
-                            .role("button")
-                            .cursor(rune::Cursor::Pointer)
-                            .label(format!("{title}, {} threads", rows.len()))
-                            .focusable(true)
-                            .h(32.0)
-                            .pl(ROW_INSET)
-                            .pr(8.0)
-                            .gap(6.0)
-                            .center_y()
-                            .radius(4.0)
-                            .hover(p.selected)
-                            .on_drawn_layout(move |s: &mut State, rect| {
-                                s.drop_rects.insert(marker.clone(), rect);
-                            })
-                            .on_press(move |s: &mut State| {
-                                s.shelves[shelf] = !s.shelves[shelf];
-                                s.checkpoint();
-                            })
-                            .child(pixel_label(&title, p.muted))
-                            .child(spacer())
-                            .child(pixel_text(rows.len().to_string(), p.muted))
-                            .child(icon(if open { "chevron" } else { "open" }, p.muted)),
-                    ),
-            );
-        } else if dragging {
-            let marker = format!("drop-{section:?}");
-            let selected = s.drag_target.is_some_and(|(to, _)| to == section);
-            content = content.child(
-                row()
-                    .key(&marker)
-                    .h(28.0)
-                    .px(8.0)
-                    .center_y()
-                    .fill(if selected { p.coral_bg } else { p.selected })
-                    .on_drawn_layout(move |s: &mut State, rect| {
-                        s.drop_rects.insert(marker.clone(), rect);
-                    })
-                    .child(pixel_label(&format!("{section:?}"), p.muted)),
-            );
-        }
-        let limit = if section == Section::Settled && s.search.text.is_empty() {
-            s.settled_visible
-        } else {
-            usize::MAX
-        };
-        for entry in rows
-            .iter()
-            .copied()
-            .filter(|entry| entry.visible)
-            .take(limit)
+            .filter(|entry| !entry.draft && entry.visible)
         {
             content = content.child(sidebar_ui::row(s, p, entry));
         }
-        if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
-            content = content.child(button(
-                "settled-more",
-                &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
-                p,
-                |s| s.settled_visible += 25,
-            ));
+    } else {
+        for section in [
+            Section::Pinned,
+            Section::Active,
+            Section::Snoozed,
+            Section::Settled,
+        ] {
+            let rows: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
+                })
+                .collect();
+            let shelf = match section {
+                Section::Snoozed => Some(0),
+                Section::Settled => Some(1),
+                _ => None,
+            };
+            if let Some(shelf) = shelf {
+                // Settled stays visible as a drop target while dragging, even when empty.
+                if rows.is_empty() && !(section == Section::Settled && dragging) {
+                    continue;
+                }
+                // The first shelf takes the remaining height above it, so the shelves sit at the
+                // bottom of the sidebar as in T3 Code.
+                if first_shelf {
+                    content = content.child(spacer().min_h(12.0));
+                    first_shelf = false;
+                }
+                let key = format!("shelf-{section:?}");
+                let title = format!("{section:?}");
+                let marker = format!("drop-{section:?}");
+                let open = s.shelves[shelf];
+                // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
+                // above Settled, so both stay whole above the footer when the list is longer than
+                // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
+                // The block carries its rule and the sidebar fill, so rows never show through.
+                let settled_below = section == Section::Snoozed
+                    && (dragging
+                        || all.iter().any(|entry| {
+                            !entry.draft
+                                && lifecycle::section(&entry.life, lifecycle::now())
+                                    == Section::Settled
+                        }));
+                let inset = if settled_below { SHELF_HEADING } else { 0.0 };
+                content = content.child(
+                    col()
+                        .key(format!("shelf-block-{section:?}"))
+                        .h(SHELF_HEADING)
+                        .fill(p.bg)
+                        .sticky_bottom(inset)
+                        .child(dotted_rule(p))
+                        .child(
+                            row()
+                                .key(&key)
+                                .role("button")
+                                .cursor(rune::Cursor::Pointer)
+                                .label(format!("{title}, {} threads", rows.len()))
+                                .focusable(true)
+                                .h(32.0)
+                                .pl(ROW_INSET)
+                                .pr(8.0)
+                                .gap(6.0)
+                                .center_y()
+                                .radius(4.0)
+                                .hover(p.selected)
+                                .on_drawn_layout(move |s: &mut State, rect| {
+                                    s.drop_rects.insert(marker.clone(), rect);
+                                })
+                                .on_press(move |s: &mut State| {
+                                    s.shelves[shelf] = !s.shelves[shelf];
+                                    s.checkpoint();
+                                })
+                                .child(pixel_label(&title, p.muted))
+                                .child(spacer())
+                                .child(pixel_text(rows.len().to_string(), p.muted))
+                                .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                        ),
+                );
+            } else if dragging {
+                let marker = format!("drop-{section:?}");
+                let selected = s.drag_target.is_some_and(|(to, _)| to == section);
+                content = content.child(
+                    row()
+                        .key(&marker)
+                        .h(28.0)
+                        .px(8.0)
+                        .center_y()
+                        .fill(if selected { p.coral_bg } else { p.selected })
+                        .on_drawn_layout(move |s: &mut State, rect| {
+                            s.drop_rects.insert(marker.clone(), rect);
+                        })
+                        .child(pixel_label(&format!("{section:?}"), p.muted)),
+                );
+            }
+            let limit = if section == Section::Settled && s.search.text.is_empty() {
+                s.settled_visible
+            } else {
+                usize::MAX
+            };
+            for entry in rows
+                .iter()
+                .copied()
+                .filter(|entry| entry.visible)
+                .take(limit)
+            {
+                content = content.child(sidebar_ui::row(s, p, entry));
+            }
+            if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
+                content = content.child(button(
+                    "settled-more",
+                    &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
+                    p,
+                    |s| s.settled_visible += 25,
+                ));
+            }
         }
     }
     if captains.is_empty() && (all.is_empty() || !s.search.text.is_empty() && visible.is_empty()) {
@@ -4807,8 +4842,20 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .radius(4.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
-        .on_press_tx(move |s: &mut State, tx| {
-            s.click_thread(index, tx.mods());
+        .on_press_tx({
+            let content_match = !s.search.text.is_empty()
+                && !s.thread_title_search_matches(thread)
+                && s.sidebar_search
+                    .visible_matches
+                    .contains_key(&(s.machines.selected.clone(), id));
+            let server = s.machines.selected.clone();
+            move |s: &mut State, tx| {
+                if content_match {
+                    s.open_thread_at_search_match(&server, id);
+                } else {
+                    s.click_thread(index, tx.mods());
+                }
+            }
         })
         .on_double_press(move |s: &mut State| s.begin_rename(id))
         .on_key(move |s: &mut State, ev, _| {
@@ -5106,17 +5153,56 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .child(spacer()),
         )
         .child(slot);
-    item.child(
-        col()
-            .grow(1.0)
-            .min_w(0.0)
-            .px(ROW_INSET)
-            .pt(9.0)
-            .pb(10.0)
-            .gap(5.0)
-            .child(top)
-            .child(row().child(title)),
-    )
+    let mut card = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .px(ROW_INSET)
+        .pt(9.0)
+        .pb(10.0)
+        .gap(5.0)
+        .child(top)
+        .child(row().child(title));
+    if !shelved
+        && !s.search.text.is_empty()
+        && !s.thread_title_search_matches(thread)
+        && let Some(hit) = s
+            .sidebar_search
+            .visible_matches
+            .get(&(s.machines.selected.clone(), id))
+    {
+        card = card.child(search_snippet_el(
+            &s.machines.selected,
+            id,
+            &hit.snippet,
+            &s.search.text,
+            p.muted,
+            p.brass,
+        ));
+    }
+    item.child(card)
+}
+
+pub(super) fn search_snippet_el(
+    server: &str,
+    id: usize,
+    snippet: &str,
+    query: &str,
+    muted: Color,
+    brass: Color,
+) -> El {
+    let ranges = crate::thread_search::find_snippet_token_ranges(snippet, query);
+    let mut lbl = label(snippet, SMALL, muted)
+        .key(format!("sidebar-search-snippet-{server}-{id}"))
+        .truncate()
+        .min_w(0.0);
+    if !ranges.is_empty() {
+        lbl = lbl.text_highlights(
+            ranges
+                .into_iter()
+                .map(|r| rune::TextHighlight::new(r, brass.alpha(0.32))),
+        );
+    }
+    lbl
 }
 
 /// The least width of a shelved row's status slot: room for "10m" and "1d".
@@ -8266,9 +8352,12 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         return work_ui::plan_card(s, p, index);
     }
     let title = tool_title(tool);
+    let tool_id = tool.id.clone();
+    let line_key = format!("inline-tool-{}-{index}", t.id);
+    let press_key = line_key.clone();
     let mut content = col().gap(4.0).child(
         activity_line(
-            format!("inline-tool-{}-{index}", t.id),
+            line_key,
             format!(
                 "{} output for {title}",
                 if tool.expanded { "Hide" } else { "Show" }
@@ -8279,9 +8368,16 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             work_ui::kind_icon(tool.resolved_kind()),
             p,
         )
-        .on_press(move |s: &mut State| {
-            let tool = &mut s.current_mut().tools[index];
-            tool.expanded = !tool.expanded;
+        .on_press_tx(move |s: &mut State, tx| {
+            tx.keep_on_screen(press_key.clone());
+            if let Some(tool) = s
+                .current_mut()
+                .tools
+                .iter_mut()
+                .find(|tool| tool.id == tool_id)
+            {
+                tool.expanded = !tool.expanded;
+            }
         }),
     );
     if !tool.subagents.is_empty() {
@@ -8300,15 +8396,18 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     let t = s.current();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
+    let first_id = tools[0].id.clone();
     let expanded = tools[0].group_expanded;
     let failed = tools.iter().filter(|tool| tool.failed).count();
     let summary = tool_summary(&tools);
+    let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
+    let press_key = toggle_key.clone();
     let mut group = col()
         .key(format!("tool-group-{}-{first}", t.id))
         .gap(2.0)
         .child(
             activity_line(
-                format!("toggle-tool-group-{}-{first}", t.id),
+                toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
                 (summary.clone(), ""),
                 failed > 0,
@@ -8316,9 +8415,16 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
                 "list",
                 p,
             )
-            .on_press(move |s: &mut State| {
-                let tool = &mut s.current_mut().tools[first];
-                tool.group_expanded = !tool.group_expanded;
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.keep_on_screen(press_key.clone());
+                if let Some(tool) = s
+                    .current_mut()
+                    .tools
+                    .iter_mut()
+                    .find(|tool| tool.id == first_id)
+                {
+                    tool.group_expanded = !tool.group_expanded;
+                }
             }),
         );
     if expanded {
@@ -8331,7 +8437,13 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
-fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
+fn transcript_part(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    part: &TranscriptPart,
+    occ_base: &mut usize,
+) -> El {
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
@@ -8341,14 +8453,34 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
+            let message_id = &t.messages[*message].id;
             let offset = *from;
             let thread_id = t.id;
             let streaming = t.status == Status::Running && message + 1 == t.messages.len();
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let mut active_occ = None;
+            let find_param = find_query.map(|query| {
+                let hits = crate::thread_find::find_markdown_occurrences(chunk, query).len();
+                active_occ = s
+                    .thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == *message_id)
+                    .and_then(|m| {
+                        (m.occurrence >= *occ_base && m.occurrence < *occ_base + hits)
+                            .then_some(m.occurrence - *occ_base)
+                    });
+                *occ_base += hits;
+                (query, active_occ)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
             memo(
                 format!("message-{}-{message}-body-{from}", t.id),
-                (chunk, s.dark, streaming, wide),
+                (chunk, s.dark, streaming, wide, memo_find),
                 || {
-                    markdown_ui::render(
+                    markdown_ui::render_with_find(
                         chunk,
                         p,
                         s.dark,
@@ -8356,6 +8488,7 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
                         false,
                         streaming,
                         &format!("{thread_id}-{message_index}-{offset}"),
+                        find_param,
                     )
                 },
             )
@@ -8433,19 +8566,43 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 )),
         );
     }
+    let mut occ_base = 0usize;
+    let mut part_occs = vec![0usize; parts.len()];
+    if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+        let query = s.thread_find.query.text.trim();
+        let mut last_msg = None;
+        for (i, part) in parts.iter().enumerate() {
+            if let TranscriptPart::Text { message, from, to } = part {
+                if last_msg != Some(*message) {
+                    occ_base = 0;
+                    last_msg = Some(*message);
+                }
+                part_occs[i] = occ_base;
+                occ_base += crate::thread_find::find_markdown_occurrences(
+                    &t.messages[*message].text[*from..*to],
+                    query,
+                )
+                .len();
+            }
+        }
+    }
+    let render_part = |part_index: usize| {
+        let mut base = part_occs[part_index];
+        transcript_part(s, p, wide, &parts[part_index], &mut base)
+    };
     if let Some(index) = preamble {
-        response = response.child(transcript_part(s, p, wide, &parts[index]));
+        response = response.child(render_part(index));
     } else if live && last_work.is_none() {
         // Until Pi emits work, streamed text is the preamble.
-        for part in &parts {
-            response = response.child(transcript_part(s, p, wide, part));
+        for index in 0..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     let work_rows = |mut rows: El, lift_cards: bool| {
         if let Some(last) = last_work {
             for (index, part) in parts[..=last].iter().enumerate() {
                 if Some(index) != preamble && !(lift_cards && card(part)) {
-                    let row = transcript_part(s, p, wide, part);
+                    let row = render_part(index);
                     // Prose between tool rows keeps its paragraph rhythm and the lane's one
                     // left margin. Tool rows are indented as a group by the same amount while
                     // the turn runs and after it ends, so nothing jumps when it finishes.
@@ -8512,12 +8669,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
             (false, None) => "Worked".into(),
         };
+        let toggle_key = format!("toggle-work-{}-{start}", t.id);
+        let press_key = toggle_key.clone();
+        let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
             .gap(4.0)
             .child(
                 activity_line(
-                    format!("toggle-work-{}-{start}", t.id),
+                    toggle_key,
                     format!(
                         "{} work section. {title}",
                         if expanded { "Collapse" } else { "Expand" }
@@ -8528,14 +8688,19 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     "clock",
                     p,
                 )
-                .on_press(move |s: &mut State| {
+                .on_press_tx(move |s: &mut State, tx| {
+                    tx.keep_on_screen(press_key.clone());
                     let t = s.current_mut();
-                    match t.work.iter_mut().find(|work| work.start == start) {
+                    let current_start = turn_msg_id
+                        .as_deref()
+                        .and_then(|id| t.messages.iter().position(|m| m.id == id))
+                        .unwrap_or(start);
+                    match t.work.iter_mut().find(|work| work.start == current_start) {
                         Some(work) => work.expanded = !work.expanded,
                         // Turns from before work records existed fold too; opening one
                         // records it.
                         None => t.work.push(crate::model::AssistantWork {
-                            start,
+                            start: current_start,
                             stopped: false,
                             stopped_order: 0,
                             expanded: true,
@@ -8553,37 +8718,443 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         }
         response = response.child(section);
         if let Some(last) = last_work {
-            for part in parts[..=last].iter().filter(|part| card(part)) {
-                response = response.child(transcript_part(s, p, wide, part));
+            for (index, part) in parts[..=last].iter().enumerate() {
+                if card(part) {
+                    response = response.child(render_part(index));
+                }
             }
         }
     }
     if !live || last_work.is_some() {
-        for part in &parts[last_work.map_or(0, |index| index + 1)..] {
-            response = response.child(transcript_part(s, p, wide, part));
+        let from = last_work.map_or(0, |index| index + 1);
+        for index in from..parts.len() {
+            response = response.child(render_part(index));
         }
     }
     response
 }
 
-/// The transcript, laid out in KSG Code's chat lane (`MessagesTimeline`'s
-/// `.chat-content-lane` inside `.messages-timeline-scroll`): 46 rem of content, centred, with
-/// 0.75 rem gutters below 640 px and 3 rem from there up. `pane_width` is the chat column's.
+/// Ported from KSG Code's `TimelineHistoryControl` (`MessagesTimeline.tsx`).
+fn history_control(s: &State, p: Palette) -> Option<El> {
+    let t = s.current();
+    if !t.history_has_more && t.history_error.is_none() {
+        return None;
+    }
+    let thread_id = t.id;
+    let mut section = col()
+        .key(format!("history-control-{thread_id}"))
+        .w_full()
+        .gap(6.0)
+        .pb(8.0);
+    if t.history_has_more {
+        let loading = t.history_loading;
+        let text = if loading {
+            "Loading earlier turns…"
+        } else {
+            "Load earlier turns"
+        };
+        let mut btn = row()
+            .key("history-load-earlier")
+            .role("button")
+            .label("Load earlier turns")
+            .w_full()
+            .py(6.0)
+            .gap(12.0)
+            .center_y()
+            .disabled(loading)
+            .child(el().h(1.0).grow(1.0).fill(p.line))
+            .child(label(text, SMALL, p.muted))
+            .child(el().h(1.0).grow(1.0).fill(p.line));
+        if !loading {
+            btn = btn
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| s.load_earlier_history(thread_id, None));
+        }
+        section = section.child(btn);
+    }
+    if let Some(err) = &t.history_error {
+        section = section.child(
+            label(err, SMALL, p.muted)
+                .key("history-load-error")
+                .role("status")
+                .align(rune::Align::Center)
+                .wrap()
+                .w_full(),
+        );
+    }
+    Some(section)
+}
+
+#[derive(Clone)]
+enum TimelineRow {
+    HistoryControl {
+        key: String,
+    },
+    Boundary {
+        message_index: usize,
+        key: String,
+    },
+    UserOrSystem {
+        index: usize,
+        message_id: String,
+        key: String,
+    },
+    AssistantTurn {
+        start: usize,
+        end: usize,
+        key: String,
+    },
+    LiveTurn {
+        start: usize,
+        key: String,
+    },
+}
+
+impl TimelineRow {
+    fn key(&self) -> &str {
+        match self {
+            Self::HistoryControl { key }
+            | Self::Boundary { key, .. }
+            | Self::UserOrSystem { key, .. }
+            | Self::AssistantTurn { key, .. }
+            | Self::LiveTurn { key, .. } => key,
+        }
+    }
+}
+
+fn push_unique_row_key(seen: &mut std::collections::HashSet<String>, base: String) -> String {
+    if seen.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if t.history_has_more || t.history_error.is_some() {
+        rows.push(TimelineRow::HistoryControl {
+            key: push_unique_row_key(&mut seen, format!("history-control-{}", t.id)),
+        });
+    }
+    let mut index = 0usize;
+    while index < t.messages.len() {
+        let message = &t.messages[index];
+        if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
+            rows.push(TimelineRow::Boundary {
+                message_index: index,
+                key: push_unique_row_key(&mut seen, format!("boundary-{}-{}", t.id, message.id)),
+            });
+        }
+        if message.role == "Pi" {
+            let end = t.messages[index..]
+                .iter()
+                .position(|message| message.role != "Pi")
+                .map_or(t.messages.len(), |offset| index + offset);
+            rows.push(TimelineRow::AssistantTurn {
+                start: index,
+                end,
+                key: push_unique_row_key(&mut seen, format!("turn-{}-{}", t.id, message.id)),
+            });
+            index = end;
+            continue;
+        }
+        rows.push(TimelineRow::UserOrSystem {
+            index,
+            message_id: message.id.clone(),
+            key: push_unique_row_key(&mut seen, format!("row-{}-{}", t.id, message.id)),
+        });
+        index += 1;
+    }
+    if work_ui::has_boundary_events(t, t.messages.len()) {
+        rows.push(TimelineRow::Boundary {
+            message_index: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("boundary-end-{}", t.id)),
+        });
+    }
+    if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
+        rows.push(TimelineRow::LiveTurn {
+            start: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("turn-live-{}", t.id)),
+        });
+    }
+    rows
+}
+
+fn build_user_or_system_row(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    pane_width: f32,
+    index: usize,
+    message_id: &str,
+) -> El {
+    let t = s.current();
+    let message = &t.messages[index];
+    let key = format!("message-{}-{index}", t.id);
+    let body = if message.role == "You" {
+        // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
+        let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
+        let mut user = col()
+            .items_end()
+            .gap(6.0)
+            .max_w(max_width)
+            .shrink()
+            .min_w(0.0);
+        if !message.images.is_empty() {
+            user = user.child(message_images(s, p, &message.images, &key));
+        }
+        if !message.text.trim().is_empty() {
+            let find_query = (s.thread_find_active()
+                && !s.thread_find.query.text.trim().is_empty())
+            .then(|| s.thread_find.query.text.trim());
+            let active_occ = find_query.and_then(|_| {
+                s.thread_find
+                    .active_match
+                    .as_ref()
+                    .filter(|m| m.entry_id == message_id)
+                    .map(|m| m.occurrence)
+            });
+            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
+            user = user.child(
+                memo(
+                    format!("msg-md-{}-{message_id}", t.id),
+                    (&message.text, s.dark, wide, memo_find),
+                    || {
+                        markdown_ui::render_with_find(
+                            &message.text,
+                            p,
+                            s.dark,
+                            wide,
+                            true,
+                            false,
+                            &format!("user-{}-{index}", t.id),
+                            find_query.map(|q| (q, active_occ)),
+                        )
+                    },
+                )
+                .key(format!("{key}-text"))
+                .max_w(max_width)
+                .min_w(0.0)
+                .padding(12.0)
+                .radius(6.0)
+                .fill(p.message_bg)
+                // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
+                // `line` colour disappeared on the `message_bg` fill). No shadow.
+                .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
+            );
+        }
+        row().justify_end().child(user)
+    } else if let Some(completion) = s
+        .is_captain_home(t)
+        .then(|| crew_ui::parse_completion(message.display_text()))
+        .flatten()
+    {
+        crew_ui::result_block(s, p, wide, &completion)
+    } else if let Some(brief) = (message.role == "Shina" && t.delegated)
+        .then(|| crew_ui::parse_brief(message.display_text()))
+        .flatten()
+    {
+        crew_ui::brief_block(s, p, wide, brief)
+    } else {
+        let display = message.display_text();
+        let mut lbl = label(display, body_style(wide), p.ink)
+            .wrap_anywhere()
+            .selectable(true);
+        if s.thread_find_active() && !s.thread_find.query.text.trim().is_empty() {
+            let query = s.thread_find.query.text.trim();
+            let active_occ = s
+                .thread_find
+                .active_match
+                .as_ref()
+                .filter(|m| m.entry_id == message_id)
+                .map(|m| m.occurrence);
+            let ranges = crate::thread_find::find_plain_occurrences(display, query);
+            if !ranges.is_empty() {
+                lbl = lbl.text_highlights(ranges.into_iter().enumerate().map(|(i, range)| {
+                    let is_active = Some(i) == active_occ;
+                    let bg = if is_active {
+                        p.coral.alpha(0.42)
+                    } else {
+                        p.brass.alpha(0.32)
+                    };
+                    let mut hl = rune::TextHighlight::new(range, bg);
+                    if is_active {
+                        hl = hl.key("thread-find-active");
+                    }
+                    hl
+                }));
+            }
+        }
+        col()
+            .gap(4.0)
+            .px(12.0)
+            .py(8.0)
+            .radius(6.0)
+            .fill(p.coral_bg)
+            .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
+            .child(lbl)
+    };
+    col().w_full().child(body.key(key))
+}
+
+/// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
+fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
+    let find = &s.thread_find;
+    let trimmed = find.query.text.trim();
+    let has_query = !trimmed.is_empty();
+    let no_results = has_query
+        && !find.loading
+        && find.error.is_none()
+        && !find.unsupported
+        && find.total_matches == 0;
+    let status_text = if find.unsupported {
+        "Update required".to_owned()
+    } else if find.loading && find.total_matches == 0 {
+        "Searching…".to_owned()
+    } else if find.error.is_some() {
+        "Search failed".to_owned()
+    } else if has_query {
+        if find.total_matches == 0 {
+            "0/0".to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                find.active_index.min(find.total_matches - 1) + 1,
+                find.total_matches
+            )
+        }
+    } else {
+        String::new()
+    };
+    let nav_disabled = find.total_matches == 0 || find.loading || find.unsupported;
+    let bar_width = (pane_width - 24.0).clamp(200.0, 340.0);
+    let mut bar = row()
+        .key("thread-find-bar")
+        .role("search")
+        .label("Find in thread")
+        .w(bar_width)
+        .h(36.0)
+        .px(10.0)
+        .gap(4.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.card)
+        .on_layout_tx(|s: &mut State, _rect, tx| {
+            let changed = s.sync_thread_find_input();
+            let revealed = s.consume_pending_find_reveal(tx);
+            if !changed && !revealed {
+                tx.live_only();
+            }
+        })
+        .child(
+            text_input(&find.query, LABEL)
+                .key("thread-find-input")
+                .label("Find in thread")
+                .placeholder("Find in thread", p.muted)
+                .color(p.ink)
+                .single_line()
+                .grow(1.0)
+                .min_w(0.0)
+                .on_edit(|s: &mut State| &mut s.thread_find.query)
+                .on_input_key(|s: &mut State, event, tx| {
+                    if event.key == rune::Key::Enter {
+                        if event.mods.shift {
+                            s.step_thread_find(-1);
+                        } else {
+                            s.step_thread_find(1);
+                        }
+                        s.consume_pending_find_reveal(tx);
+                        true
+                    } else if event.key == rune::Key::Escape {
+                        s.close_thread_find();
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                        true
+                    } else {
+                        false
+                    }
+                }),
+        );
+    if !status_text.is_empty() {
+        bar = bar.child(
+            label(
+                status_text,
+                SMALL.features(TABULAR),
+                if no_results || find.error.is_some() || find.unsupported {
+                    p.danger
+                } else {
+                    p.muted
+                },
+            )
+            .key("thread-find-count")
+            .min_w(36.0)
+            .align(rune::Align::Center),
+        );
+    }
+    if find.error.is_some() && !find.unsupported {
+        bar = bar.child(
+            label("Retry", SMALL, p.ink)
+                .key("thread-find-retry")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .px(4.0)
+                .py(2.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .on_press(|s: &mut State| s.retry_thread_find()),
+        );
+    }
+    bar = bar
+        .child(
+            icon_button(
+                "thread-find-prev",
+                "Previous match",
+                "chevron-up",
+                p,
+                |_| {},
+            )
+            .disabled(nav_disabled)
+            .on_press_tx(|s: &mut State, tx| {
+                s.step_thread_find(-1);
+                s.consume_pending_find_reveal(tx);
+            }),
+        )
+        .child(
+            icon_button("thread-find-next", "Next match", "chevron", p, |_| {})
+                .disabled(nav_disabled)
+                .on_press_tx(|s: &mut State, tx| {
+                    s.step_thread_find(1);
+                    s.consume_pending_find_reveal(tx);
+                }),
+        )
+        .child(icon_button(
+            "thread-find-close",
+            "Close find",
+            "close",
+            p,
+            |s: &mut State| {
+                s.close_thread_find();
+                s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+            },
+        ));
+    framed(bar, p).pin(None, Some(12.0), Some(12.0), None)
+}
+
+/// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
+/// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let gutter = lane_gutter(pane_width);
-    let mut messages = col()
-        .key("chat-lane")
-        .on_layout_tx(|s: &mut State, rect, tx| {
-            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
-            tx.live_only();
-        })
-        .w_full()
-        .max_w(measure(wide))
-        // 24 pt above the first message, counting the cap.
-        .pt(24.0 - TRANSCRIPT_CAP)
-        .pb(24.0)
-        .gap(20.0);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
     let visible_tools = t
@@ -8594,6 +9165,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         && !visible_tools
         && !t.status.busy()
         && t.native.compactions.is_empty()
+        && !t.history_has_more
+        && t.history_error.is_none()
     {
         let mut introduction = col()
             .key("empty-state")
@@ -8626,137 +9199,59 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             introduction = introduction.child(label("Restoring conversation...", SMALL, p.muted));
         }
         return introduction;
-    } else {
-        let cutoff = t.messages.len().saturating_sub(100);
-        // Do not cut through an assistant turn and hide the tools that led to its answer.
-        let start = t.messages[..cutoff]
-            .iter()
-            .rposition(|message| message.role != "Pi")
-            .unwrap_or(0);
-        if start > 0 {
-            messages = messages.child(label("Showing recent turns.", SMALL, p.muted));
-        }
-        let mut index = start;
-        let mut hidden_images = t.messages[start..]
-            .iter()
-            .map(|message| message.images.len())
-            .sum::<usize>()
-            .saturating_sub(32);
-        while index < t.messages.len() {
-            let message = &t.messages[index];
-            if message.role != "Pi" {
-                if let Some(events) = work_ui::boundary_events(s, p, wide, index) {
-                    messages = messages.child(events);
-                }
-            }
-            if message.role == "Pi" {
-                let end = t.messages[index..]
-                    .iter()
-                    .position(|message| message.role != "Pi")
-                    .map_or(t.messages.len(), |offset| index + offset);
-                messages = messages.child(assistant_turn(s, p, wide, index, end));
-                index = end;
-                continue;
-            }
-            let key = format!("message-{}-{index}", t.id);
-            let body = if message.role == "You" {
-                // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
-                let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
-                let mut user = col()
-                    .items_end()
-                    .gap(6.0)
-                    .max_w(max_width)
-                    .shrink()
-                    .min_w(0.0);
-                if !message.images.is_empty() {
-                    let skip = hidden_images.min(message.images.len());
-                    hidden_images -= skip;
-                    if skip > 0 {
-                        user = user.child(label(
-                            format!("{skip} older image previews omitted."),
-                            SMALL,
-                            p.muted,
-                        ));
-                    }
-                    user = user.child(message_images(s, p, &message.images[skip..], &key));
-                }
-                if !message.text.trim().is_empty() {
-                    user = user.child(
-                        memo(
-                            format!("{key}-markdown"),
-                            (&message.text, s.dark, wide),
-                            || {
-                                markdown_ui::render(
-                                    &message.text,
-                                    p,
-                                    s.dark,
-                                    wide,
-                                    true,
-                                    false,
-                                    &format!("user-{}-{index}", t.id),
-                                )
-                            },
-                        )
-                        .key(format!("{key}-text"))
-                        .max_w(max_width)
-                        .min_w(0.0)
-                        .padding(12.0)
-                        .radius(6.0)
-                        .fill(p.message_bg)
-                        // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
-                        // `line` colour disappeared on the `message_bg` fill). No shadow.
-                        .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
-                    );
-                }
-                row().justify_end().child(user)
-            } else if let Some(completion) = s
-                .is_captain_home(t)
-                .then(|| crew_ui::parse_completion(message.display_text()))
-                .flatten()
-            {
-                crew_ui::result_block(s, p, wide, &completion)
-            } else if let Some(brief) = (message.role == "Shina" && t.delegated)
-                .then(|| crew_ui::parse_brief(message.display_text()))
-                .flatten()
-            {
-                crew_ui::brief_block(s, p, wide, brief)
-            } else {
-                col()
-                    .gap(4.0)
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(6.0)
-                    .fill(p.coral_bg)
-                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
-                    .child(
-                        label(message.display_text(), body_style(wide), p.ink)
-                            .wrap_anywhere()
-                            .selectable(true),
-                    )
-            };
-            messages = messages.child(body.key(key));
-            index += 1;
-        }
-        if let Some(events) = work_ui::boundary_events(s, p, wide, t.messages.len()) {
-            messages = messages.child(events);
-        }
-        if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
-            messages = messages.child(assistant_turn(
-                s,
-                p,
-                wide,
-                t.messages.len(),
-                t.messages.len(),
-            ));
-        }
     }
-    col()
-        .key(format!("conversation-{}", t.id))
+
+    let thread_id = t.id;
+    let rows = std::rc::Rc::new(build_timeline_rows(t));
+    let key_rows = rows.clone();
+    let build_rows = rows.clone();
+    let lane = col()
+        .key("chat-lane")
+        .on_layout_tx(|s: &mut State, rect, tx| {
+            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
+            tx.live_only();
+        })
+        .w_full()
+        .max_w(measure(wide))
+        // 24 pt above the first message, counting the cap.
+        .pt(24.0 - TRANSCRIPT_CAP)
+        .pb(24.0)
+        .gap(20.0)
+        .growth(rune::GrowthSpec::default())
+        .virtual_rows(
+            rows.len(),
+            90.0,
+            move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
+            move |s: &State, index| match &build_rows[index] {
+                TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                TimelineRow::Boundary { message_index, .. } => {
+                    work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
+                }
+                TimelineRow::UserOrSystem {
+                    index: msg_idx,
+                    message_id,
+                    ..
+                } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                TimelineRow::AssistantTurn { start, end, .. } => {
+                    assistant_turn(s, p, wide, *start, *end)
+                }
+                TimelineRow::LiveTurn { start, .. } => assistant_turn(s, p, wide, *start, *start),
+            },
+        );
+
+    let find_open = s.thread_find_active();
+    let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
+    let scroller = col()
+        .key(format!("conversation-{thread_id}"))
         .animated_changes()
         .grow(1.0)
         .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
+        .scroll(ScrollSpec { stick_bottom })
+        .on_far_from_bottom(40.0, move |s: &mut State, far| {
+            s.set_timeline_far_from_bottom(thread_id, far);
+        })
+        .on_at_bottom(move |s: &mut State, at| {
+            s.set_timeline_at_bottom(thread_id, at);
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
         // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
@@ -8773,7 +9268,50 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 .sticky_top(0.0)
                 .a11y_hidden(),
         )
-        .child(messages)
+        .child(lane);
+
+    let mut wrapper = col()
+        .key(format!("conversation-wrap-{thread_id}"))
+        .grow(1.0)
+        .min_h(0.0)
+        .child(scroller);
+
+    if s.timeline_is_far_from_bottom(thread_id) && !find_open {
+        let pill = framed(
+            row()
+                .key("scroll-to-end")
+                .role("button")
+                .label("Scroll to end")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .radius(6.0)
+                .fill(p.card)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press_tx(move |s: &mut State, tx| {
+                    s.set_timeline_far_from_bottom(thread_id, false);
+                    tx.scroll_to_bottom(format!("conversation-{thread_id}"));
+                })
+                .child(icon("chevron", p.muted))
+                .child(label("Scroll to end", SMALL, p.ink)),
+            p,
+        );
+        wrapper = wrapper.child(
+            row()
+                .pin(Some(0.0), None, Some(0.0), Some(12.0))
+                .justify_center()
+                .child(pill),
+        );
+    }
+    if find_open {
+        wrapper = wrapper.child(thread_find_bar(s, p, pane_width));
+    }
+
+    wrapper
 }
 
 /// The opaque strip under the chat header's rule, inside the transcript viewport.
@@ -13902,8 +14440,621 @@ pub(crate) mod tests {
         }
         rt.frame(0.0);
         let tree = rt.accessibility_json().to_string();
-        assert_eq!(tree.matches("Attached image:").count(), 32);
-        assert!(tree.contains("older image previews omitted"));
+        assert_eq!(tree.matches("Attached image:").count(), 48);
+        assert!(!tree.contains("older image previews omitted"));
+    }
+
+    #[test]
+    fn older_history_controls_show_load_loading_error_and_end_states_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.messages.push(crate::model::Message {
+                    id: "u1".into(),
+                    role: "You",
+                    text: "Recent message".into(),
+                    images: vec![],
+                });
+                t.history_has_more = true;
+                t.history_loading = false;
+                t.history_error = None;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-earlier").is_some(),
+                "{width}: load button"
+            );
+            assert!(
+                !rt.accessibility_json()
+                    .to_string()
+                    .contains("Showing recent turns."),
+                "{width}: old cutoff notice must be gone"
+            );
+
+            // Loading state.
+            rt.state.current_mut().history_loading = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("Loading earlier turns…")),
+                "{width}: loading label"
+            );
+
+            // Error state.
+            {
+                let t = rt.state.current_mut();
+                t.history_loading = false;
+                t.history_error = Some("History failed".into());
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-error").is_some(),
+                "{width}: error label"
+            );
+
+            // End-of-history state: button and error disappear.
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = false;
+                t.history_error = None;
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.find("history-load-earlier").is_none(),
+                "{width}: hidden at end"
+            );
+            assert!(
+                rt.find("history-load-error").is_none(),
+                "{width}: error cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn virtualised_timeline_mounts_only_viewport_window_and_overscan_for_long_threads() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..500usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt number {turn} with some wrapping prose."),
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply number {turn} with detailed explanation."),
+                        images: vec![],
+                    });
+                }
+            }
+            rt.frame(0.0);
+            let mounted_rows: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|e| {
+                    e.key
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("row-") || k.starts_with("turn-"))
+                })
+                .collect();
+            assert!(
+                !mounted_rows.is_empty() && mounted_rows.len() < 80,
+                "{width}: expected virtualised window, mounted {} rows",
+                mounted_rows.len()
+            );
+            assert!(
+                rt.find("row-1-u-0").is_none(),
+                "{width}: oldest row must be unmounted when pinned at bottom"
+            );
+            assert!(
+                rt.presented("turn-1-a-499").is_some(),
+                "{width}: newest row must be presented"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_anchor_preserves_visible_row_on_prepend_expand_image_load_and_width_change() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = true;
+                for turn in 0..80usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Question {turn}: keeping anchor steady."),
+                        images: if turn == 35 {
+                            vec![Attachment {
+                                id: "img-35.png".into(),
+                                name: "img-35.png".into(),
+                                mime: "image/png".into(),
+                                width: 400,
+                                height: 120,
+                                bytes: 1,
+                                path: None,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    });
+                    let a_idx = t.messages.len();
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Answer {turn}: extra text to take vertical space."),
+                        images: vec![],
+                    });
+                    if turn == 45 {
+                        t.tools.push(crate::model::Tool {
+                            id: "tool-45".into(),
+                            name: "read".into(),
+                            kind: Some(crate::work::ToolKind::Read),
+                            changes: vec![],
+                            input: serde_json::json!({"path": "src/ui.rs"}),
+                            detail: "src/ui.rs".into(),
+                            done: true,
+                            failed: false,
+                            output: "line 1\nline 2\nline 3\nline 4".into(),
+                            images: vec![],
+                            structured: serde_json::Value::Null,
+                            parent_call: None,
+                            exit_code: Some(0),
+                            subagents: vec![],
+                            anchor: crate::model::ToolAnchor {
+                                message: a_idx,
+                                offset: 0,
+                            },
+                            block: 0,
+                            order: 1,
+                            expanded: false,
+                            raw_expanded: false,
+                            group_expanded: false,
+                            started: None,
+                            duration_ms: Some(10),
+                        });
+                        t.work.push(crate::model::AssistantWork {
+                            start: a_idx,
+                            stopped: false,
+                            stopped_order: 0,
+                            expanded: false,
+                            elapsed: Some(3),
+                        });
+                    }
+                }
+            }
+            rt.frame(0.0);
+            // Scroll into the middle around turn 45 (scroll_center_in_instant mounts unrealized rows).
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-u-45"));
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let anchor_before = rt.presented("row-1-u-45").expect("u-45 visible").0;
+
+            // (a) Prepending older turns + clearing history_has_more preserves visible row y.
+            {
+                let t = rt.state.current_mut();
+                let mut prepended = Vec::new();
+                for older in 0..20usize {
+                    prepended.push(crate::model::Message {
+                        id: format!("old-u-{older}"),
+                        role: "You",
+                        text: format!("Older question {older}."),
+                        images: vec![],
+                    });
+                    prepended.push(crate::model::Message {
+                        id: format!("old-a-{older}"),
+                        role: "Pi",
+                        text: format!("Older answer {older}."),
+                        images: vec![],
+                    });
+                }
+                let shift = prepended.len();
+                prepended.append(&mut t.messages);
+                t.messages = prepended;
+                for tool in &mut t.tools {
+                    tool.anchor.message += shift;
+                }
+                for work in &mut t.work {
+                    work.start += shift;
+                }
+                t.history_has_more = false;
+            }
+            rt.invalidate();
+            rt.frame(1.0 / 60.0);
+            let anchor_after_prepend = rt.presented("row-1-u-45").expect("u-45 still visible").0;
+            assert!(
+                (anchor_after_prepend[1] - anchor_before[1]).abs() < 1.0,
+                "{width}: prepend moved anchor from {} to {}",
+                anchor_before[1],
+                anchor_after_prepend[1]
+            );
+
+            // (b) Expanding a work section preserves its toggle row's position.
+            let toggle_key = rt
+                .elements()
+                .into_iter()
+                .find_map(|e| {
+                    e.key
+                        .filter(|k| k.starts_with("toggle-work-"))
+                        .filter(|k| rt.presented(k).is_some())
+                })
+                .expect("toggle-work visible");
+            let toggle_before = rt.presented(&toggle_key).unwrap().0[1];
+            press(&mut rt, &toggle_key);
+            rt.frame(1.0);
+            let toggle_after = rt.presented(&toggle_key).unwrap().0[1];
+            assert!(
+                (toggle_after - toggle_before).abs() < 1.0,
+                "{width}: work expand moved toggle from {toggle_before} to {toggle_after}"
+            );
+
+            // (c) Image height change above the visible anchor preserves the visible anchor.
+            let before_img = rt.presented("row-1-u-45").unwrap().0[1];
+            {
+                let t = rt.state.current_mut();
+                let u35 = t.messages.iter_mut().find(|m| m.id == "u-35").unwrap();
+                u35.images[0].height = 600;
+            }
+            rt.invalidate();
+            rt.frame(1.0);
+            let after_img = rt.presented("row-1-u-45").unwrap().0[1];
+            assert!(
+                (after_img - before_img).abs() < 1.0,
+                "{width}: image load moved anchor from {before_img} to {after_img}"
+            );
+
+            // (d) Width change keeps the visible anchor in view at the same offset.
+            let before_resize = rt.presented("row-1-u-45").unwrap().0[1];
+            rt.set_viewport((width + 160.0, 720.0), 1.0);
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let after_resize = rt
+                .presented("row-1-u-45")
+                .expect("u-45 still presented after resize")
+                .0[1];
+            assert!(
+                (after_resize - before_resize).abs() < 2.0,
+                "{width}: resize moved anchor from {before_resize} to {after_resize}"
+            );
+        }
+    }
+
+    #[test]
+    fn stick_to_bottom_follows_streaming_and_unpins_when_user_scrolls_up() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt {turn}"),
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                    });
+                }
+                t.status = Status::Running;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: starts at bottom"
+            );
+
+            // Streaming growth while pinned keeps bottom in view.
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nMore streamed lines\n\nEven more");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: stays pinned while streaming"
+            );
+
+            // Scrolling up unpins and shows Scroll to end; further streaming does NOT yank back down.
+            let (conv, _) = rt.presented("conversation-1").unwrap();
+            for _ in 0..20 {
+                rt.wheel(conv[0] + conv[2] * 0.5, conv[1] + conv[3] * 0.5, 400.0);
+                rt.frame(1.0 / 60.0);
+            }
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39")
+                    .is_none_or(|(r, _)| r[1] >= conv[1] + conv[3]),
+                "{width}: scrolled away from bottom: {:?} vs conv {:?}",
+                rt.presented("turn-1-a-39"),
+                conv
+            );
+            assert!(
+                rt.presented("scroll-to-end").is_some(),
+                "{width}: scroll-to-end pill visible"
+            );
+            let scrolled_row = rt
+                .elements()
+                .into_iter()
+                .find(|e| {
+                    e.key.as_deref().is_some_and(|k| k.starts_with("row-1-u-"))
+                        && rt.presented(e.key.as_deref().unwrap()).is_some()
+                })
+                .map(|e| (e.key.unwrap(), e.rect[1]))
+                .unwrap();
+
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nTail chunk while reading history");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                (rt.presented(&scrolled_row.0).unwrap().0[1] - scrolled_row.1).abs() < 1.0,
+                "{width}: streaming must not pull scrolled-up reader back down"
+            );
+
+            // Clicking scroll-to-end jumps back to bottom and hides the pill.
+            press(&mut rt, "scroll-to-end");
+            for _ in 0..240 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: returned to bottom"
+            );
+            assert!(
+                rt.find("scroll-to-end").is_none(),
+                "{width}: pill hides at bottom"
+            );
+        }
+    }
+
+    #[test]
+    fn find_bar_opens_via_chat_find_displays_counts_steps_matches_highlights_and_jumps_to_match() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            rt.poll = Some(|s, _, tx| s.poll_thread_find(tx));
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    let prompt = if turn == 2 {
+                        "Early message with target-canary-word here".to_owned()
+                    } else if turn == 38 {
+                        "Late message with target-canary-word too".to_owned()
+                    } else {
+                        format!("Ordinary message {turn}")
+                    };
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: prompt,
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                    });
+                }
+            }
+            rt.frame(0.0);
+
+            // Wire chat.find shortcut (Ctrl+F / Cmd+F).
+            let mod_key = if cfg!(target_os = "macos") {
+                rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                }
+            } else {
+                rune::Mods {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            };
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("f".into()),
+                mods: mod_key,
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.presented("thread-find-bar").is_some(),
+                "{width}: bar opens"
+            );
+            assert!(
+                rt.presented("thread-find-input").is_some(),
+                "{width}: input shown"
+            );
+            assert!(
+                rt.presented("thread-find-prev").is_some(),
+                "{width}: prev shown"
+            );
+            assert!(
+                rt.presented("thread-find-next").is_some(),
+                "{width}: next shown"
+            );
+            assert!(
+                rt.presented("thread-find-close").is_some(),
+                "{width}: close shown"
+            );
+
+            // Bar stays inside the pane without clipping or overflowing.
+            let (bar, _) = rt.presented("thread-find-bar").unwrap();
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            assert!(
+                bar[0] >= pane[0] && bar[0] + bar[2] <= pane[0] + pane[2] + 0.5,
+                "{width}: bar {bar:?} outside pane {pane:?}"
+            );
+
+            // Typing a missing query reports 0/0.
+            rt.paste("missing-query-xyz");
+            rt.frame(0.2);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("0/0"),
+                "{width}"
+            );
+
+            // Replace with matching query -> shows 1/2, highlights match, and jumps to u-2!
+            rt.state.set_thread_find_query("target-canary-word".into());
+            rt.invalidate();
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-2").is_some(),
+                "{width}: jumped to match u-2"
+            );
+            assert!(
+                rt.elements().iter().any(|e| e.role == "mark"),
+                "{width}: highlight mark rendered"
+            );
+
+            // Next -> jumps to 2/2 (u-38); Next again wraps to 1/2 (u-2).
+            press(&mut rt, "thread-find-next");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("2/2"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("row-1-u-38").is_some(),
+                "{width}: jumped to match u-38"
+            );
+
+            press(&mut rt, "thread-find-prev");
+            for _ in 0..10 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("1/2"),
+                "{width}"
+            );
+
+            // Close via close button restores composer focus.
+            press(&mut rt, "thread-find-close");
+            rt.frame(0.0);
+            assert!(rt.find("thread-find-bar").is_none(), "{width}: bar closed");
+            assert!(
+                rt.state.current().draft.focused,
+                "{width}: composer refocused"
+            );
+
+            // Explicit unsupported state for a peer without thread-find.
+            rt.state.open_thread_find();
+            rt.state.thread_find.unsupported = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(
+                element_text(&rt, "thread-find-count").as_deref(),
+                Some("Update required"),
+                "{width}: unsupported peer state"
+            );
+            rt.state.close_thread_find();
+        }
+    }
+
+    #[test]
+    fn sidebar_search_shows_title_matches_before_message_matches_with_snippets_and_jumps_to_match()
+    {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.threads.push(Thread::new(2));
+            rt.state.threads[0].title = "Alpha workspace task".into();
+            rt.state.threads[0].renamed = true;
+            rt.state.threads[1].title = "Unrelated thread".into();
+            rt.state.threads[1].renamed = true;
+            // Thread 2 is unvisited (no messages loaded locally), matched via server search!
+            rt.state.search.replace_text("alpha");
+            rt.state.sidebar_search.visible_query = "alpha".into();
+            rt.state.sidebar_search.visible_matches.insert(
+                ("local".into(), 2),
+                crate::thread_search::ThreadSearchHit {
+                    thread_id: 2,
+                    project_id: None,
+                    entry_id: "u-4".into(),
+                    source: "user".into(),
+                    snippet: "…matched alpha inside unvisited history…".into(),
+                    quality: 1.0,
+                    hits: 1,
+                    updated: 10,
+                },
+            );
+            rt.state.sidebar_search.shown_order = vec![("local".into(), 2)];
+            rt.state.sidebar_search.unsupported_servers = vec!["Studio".into()];
+            rt.frame(0.0);
+
+            let (row1, _) = rt.presented("thread-1").expect("title match shown");
+            let (row2, _) = rt.presented("thread-2").expect("message match shown");
+            assert!(
+                row1[1] < row2[1],
+                "{width}: title match must appear before message match"
+            );
+            assert!(
+                rt.presented("sidebar-search-snippet-local-2").is_some(),
+                "{width}: snippet shown for message-matched row"
+            );
+            assert!(
+                rt.presented("sidebar-search-unsupported").is_some(),
+                "{width}: unsupported server notice shown"
+            );
+
+            // Clicking the message-matched row opens thread 2 and opens find on the matched query.
+            press(&mut rt, "thread-2");
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().id, 2, "{width}: opened thread 2");
+            assert!(rt.state.thread_find.open, "{width}: find bar opened");
+            assert_eq!(
+                rt.state.thread_find.query.text, "alpha",
+                "{width}: query set"
+            );
+        }
     }
 
     #[test]

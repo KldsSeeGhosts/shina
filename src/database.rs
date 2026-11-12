@@ -1044,6 +1044,27 @@ impl Database {
         text.map(|text| serde_json::from_str(&text).map_err(error))
             .transpose()
     }
+    pub fn thread_search_index(&self) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        let mut stmt = inner
+            .connection
+            .prepare(
+                "SELECT payload FROM projection_records WHERE document='index.json' AND scope LIKE 'threads/%' AND key='$'",
+            )
+            .map_err(error)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(error)?;
+        rows.into_iter()
+            .map(|text| serde_json::from_str(&text).map_err(error))
+            .collect()
+    }
+
     pub fn committed_snapshot(&self) -> Result<Value, String> {
         let inner = self.0.lock().expect("database");
         let state = self

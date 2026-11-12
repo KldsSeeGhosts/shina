@@ -33,6 +33,12 @@ struct View {
     fields: Value,
     fields_sequence: u64,
     cursor: Option<String>,
+    has_more: bool,
+    loading: bool,
+    error: Option<String>,
+    expanded: bool,
+    load_requested: bool,
+    through_entry_id: Option<String>,
     ready: bool,
 }
 
@@ -49,6 +55,7 @@ struct History {
     subscribe: bool,
     snapshot: bool,
     cursor: Option<String>,
+    through_entry_id: Option<String>,
     fragment: Value,
     text: String,
     waiting: bool,
@@ -108,6 +115,20 @@ impl ProjectionCache {
             .is_some_and(|view| view.ready && view.cursor.is_none())
     }
 
+    pub(crate) fn request_earlier(&mut self, thread: u64, through_entry_id: Option<String>) {
+        let Some(view) = self.views.get_mut(&thread) else {
+            return;
+        };
+        if !view.has_more || view.cursor.is_none() || view.loading {
+            return;
+        }
+        view.loading = true;
+        view.error = None;
+        view.load_requested = true;
+        view.through_entry_id = through_entry_id;
+        self.dirty = true;
+    }
+
     fn install(&mut self, thread: u64) -> Result<(), String> {
         let Some(view) = self.views.get(&thread).filter(|view| view.ready) else {
             return Ok(());
@@ -121,6 +142,29 @@ impl ProjectionCache {
                 .then(a.ordinal.cmp(&b.ordinal))
                 .then(a.source_item_id.cmp(&b.source_item_id))
         });
+        let mut ordinal_to_local = HashMap::new();
+        let mut min_msg_ordinal = None::<usize>;
+        let mut max_msg_ordinal = None::<usize>;
+        let mut local_msg_count = 0usize;
+        for row in &rows {
+            if row.field == "messages" {
+                ordinal_to_local.insert(row.ordinal, local_msg_count);
+                min_msg_ordinal = Some(min_msg_ordinal.map_or(row.ordinal, |m| m.min(row.ordinal)));
+                max_msg_ordinal = Some(max_msg_ordinal.map_or(row.ordinal, |m| m.max(row.ordinal)));
+                local_msg_count += 1;
+            }
+        }
+        let remap_msg = |server_ord: usize| -> Option<usize> {
+            if let Some(&local) = ordinal_to_local.get(&server_ord) {
+                Some(local)
+            } else if max_msg_ordinal.is_some_and(|max| server_ord > max) {
+                Some(local_msg_count)
+            } else if min_msg_ordinal.is_some() {
+                None
+            } else {
+                Some(server_ord)
+            }
+        };
         for field in protocol::HISTORY_FIELDS {
             if history.get(field).is_none() {
                 history[field] = json!([]);
@@ -133,10 +177,42 @@ impl ProjectionCache {
             if !history[&row.field].is_array() {
                 history[&row.field] = json!([]);
             }
-            history[&row.field]
-                .as_array_mut()
-                .unwrap()
-                .push(row.item.clone());
+            let mut item = row.item.clone();
+            match row.field.as_str() {
+                "tools" | "thoughts" | "compactions" => {
+                    if let Some(server_ord) = item["anchor"]["message"].as_u64() {
+                        let Some(local) = remap_msg(server_ord as usize) else {
+                            continue;
+                        };
+                        item["anchor"]["message"] = json!(local);
+                    }
+                }
+                "work" => {
+                    if let Some(server_ord) = item["start"].as_u64() {
+                        let Some(local) = remap_msg(server_ord as usize) else {
+                            continue;
+                        };
+                        item["start"] = json!(local);
+                    }
+                }
+                _ => {}
+            }
+            history[&row.field].as_array_mut().unwrap().push(item);
+        }
+        if let Some(retries) = history
+            .get_mut("harness_state")
+            .and_then(|hs| hs.get_mut("workRetries"))
+            .and_then(Value::as_array_mut)
+        {
+            retries.retain_mut(|retry| {
+                if let Some(server_ord) = retry["anchor"]["message"].as_u64() {
+                    let Some(local) = remap_msg(server_ord as usize) else {
+                        return false;
+                    };
+                    retry["anchor"]["message"] = json!(local);
+                }
+                true
+            });
         }
         let bytes = history.to_string().len();
         if bytes > protocol::MAX_SNAPSHOT_BYTES {
@@ -282,13 +358,21 @@ impl ProjectionCache {
             );
         }
         let view = self.views.get_mut(&thread).ok_or("Missing history base.")?;
-        for row in page["items"].as_array().ok_or("Invalid history items.")? {
+        let previous_cursor = view.cursor.clone();
+        let previous_through = view.through_entry_id.clone();
+        let items = page["items"].as_array().ok_or("Invalid history items.")?;
+        let mut page_has_turn_start = false;
+        for row in items {
             let row: Row = serde_json::from_value(row.clone()).map_err(|e| e.to_string())?;
             if row.source_thread_id != thread {
                 return Err("Cross-thread history item.".into());
             }
             if !protocol::HISTORY_FIELDS.contains(&row.field.as_str()) {
                 continue;
+            }
+            if row.field == "messages" && matches!(row.item["role"].as_str(), Some("You" | "user"))
+            {
+                page_has_turn_start = true;
             }
             let id = &row.source_item_id;
             // Newer live records and removals win over concurrently read older pages.
@@ -315,6 +399,39 @@ impl ProjectionCache {
                 .into();
         }
         view.cursor = page["nextCursor"].as_str().map(str::to_owned);
+        view.has_more = page["hasMoreHistory"]
+            .as_bool()
+            .unwrap_or(view.cursor.is_some());
+        if snapshot {
+            view.loading = false;
+            view.error = None;
+            view.expanded = false;
+            view.load_requested = false;
+            view.through_entry_id = None;
+        } else {
+            view.expanded = true;
+            view.error = None;
+            let keep_paging = if let Some(target) = &previous_through {
+                let target_loaded = view.rows.values().any(|(_, r)| {
+                    r.source_item_id == *target || r.item["id"].as_str() == Some(target.as_str())
+                });
+                !target_loaded && view.has_more && view.cursor.is_some()
+            } else {
+                view.has_more && view.cursor.is_some() && !page_has_turn_start
+            };
+            if keep_paging && (view.cursor.is_none() || view.cursor == previous_cursor) {
+                view.loading = false;
+                view.load_requested = false;
+                view.through_entry_id = None;
+                view.error = Some("History did not advance.".into());
+            } else {
+                view.loading = keep_paging;
+                view.load_requested = keep_paging;
+                if !keep_paging {
+                    view.through_entry_id = None;
+                }
+            }
+        }
         view.ready = true;
         // Older history reads do not advance the live replay cursor.
         self.install(thread)
@@ -402,16 +519,30 @@ impl ProjectionCache {
                 }
                 if !value["error"].is_null() {
                     let code = value["error"]["code"].as_i64();
+                    let message = value["error"]["message"]
+                        .as_str()
+                        .unwrap_or("History read failed.");
                     if code == Some(protocol::HISTORY_UPDATE_REQUIRED_CODE) {
                         self.update_required = true;
                     }
-                    self.failed(
-                        walk.thread,
-                        value["error"]["message"]
-                            .as_str()
-                            .unwrap_or("History read failed."),
-                        code == Some(protocol::HISTORY_LEASE_GONE_CODE),
-                    );
+                    if !walk.subscribe
+                        && !walk.snapshot
+                        && code != Some(protocol::HISTORY_LEASE_GONE_CODE)
+                    {
+                        if let Some(view) = self.views.get_mut(&walk.thread) {
+                            view.loading = false;
+                            view.load_requested = false;
+                            view.through_entry_id = None;
+                            view.error = Some(message.into());
+                        }
+                        self.dirty = true;
+                    } else {
+                        self.failed(
+                            walk.thread,
+                            message,
+                            code == Some(protocol::HISTORY_LEASE_GONE_CODE),
+                        );
+                    }
                     return Ok(());
                 }
                 let result = &value["result"];
@@ -488,15 +619,20 @@ impl ProjectionCache {
                 return None;
             }
             let subscribe = self.subscribed != Some(thread);
-            let cursor = self.views.get(&thread).and_then(|view| view.cursor.clone());
-            if !subscribe && cursor.is_none() {
+            let view = self.views.get(&thread);
+            let cursor = view.and_then(|view| view.cursor.clone());
+            let want_earlier =
+                view.is_some_and(|view| view.load_requested && view.cursor.is_some());
+            if !subscribe && !want_earlier {
                 return None;
             }
+            let through_entry_id = view.and_then(|view| view.through_entry_id.clone());
             self.inflight = Some(History {
                 thread,
                 subscribe,
                 snapshot: false,
                 cursor,
+                through_entry_id,
                 fragment: Value::Null,
                 text: String::new(),
                 waiting: false,
@@ -525,6 +661,9 @@ impl ProjectionCache {
                 params["fragmentCursor"] = walk.fragment.clone();
             } else if let Some(cursor) = &walk.cursor {
                 params["historyCursor"] = json!(cursor);
+                if let Some(through) = &walk.through_entry_id {
+                    params["throughEntryId"] = json!(through);
+                }
             }
             "thread.history"
         };
@@ -557,6 +696,14 @@ impl ProjectionCache {
                     for field in protocol::HISTORY_FIELDS {
                         thread[field] = history[field].clone();
                     }
+                }
+                if let Some(view) = self.views.get(&id) {
+                    thread["historyMeta"] = json!({
+                        "hasMoreHistory": view.has_more,
+                        "loading": view.loading,
+                        "error": view.error,
+                        "expanded": view.expanded,
+                    });
                 }
                 if let Some(retry) = self.retries.get(&id) {
                     thread["historyRetry"] = json!({"count":retry.attempts,"limit":1,"fullRestarts":retry.restarts,
@@ -593,6 +740,15 @@ mod tests {
     }
 
     fn answer(cache: &mut ProjectionCache, streams: &Streams, fragments: &mut Fragments) -> Value {
+        answer_with_budget(cache, streams, fragments, 1024)
+    }
+
+    fn answer_with_budget(
+        cache: &mut ProjectionCache,
+        streams: &Streams,
+        fragments: &mut Fragments,
+        budget: usize,
+    ) -> Value {
         let request = cache.next_history().expect("history request");
         assert!(cache.next_history().is_none(), "one in-flight request");
         let params = &request["params"];
@@ -613,7 +769,7 @@ mod tests {
             } else {
                 let mut page = fragments
                     .read(thread, params, Instant::now(), || {
-                        streams.page(thread, None, 1024)
+                        streams.page(thread, None, budget)
                     })
                     .unwrap();
                 page["kind"] = json!("snapshot");
@@ -623,7 +779,7 @@ mod tests {
         } else {
             fragments
                 .read(thread, params, Instant::now(), || {
-                    streams.page(thread, params["historyCursor"].as_str(), 1024)
+                    streams.page(thread, params["historyCursor"].as_str(), budget)
                 })
                 .unwrap()
         };
@@ -645,6 +801,7 @@ mod tests {
         let mut sequence = 1;
         let mut steps = 0;
         while !cache.complete(1) {
+            cache.request_earlier(1, None);
             // Revisions during a walk require no additional download or request.
             sequence += 1;
             thread["messages"][1]["text"] = json!(format!("live-{sequence}"));
@@ -771,6 +928,7 @@ mod tests {
                 ));
                 answer(&mut cache, &partial, &mut Fragments::default());
                 assert!(!cache.complete(1));
+                cache.request_earlier(1, None);
             }
         }
         assert!(cache.next_history().is_none());
@@ -817,5 +975,143 @@ mod tests {
         answer(&mut cache, &streams, &mut fragments);
         assert_eq!(cache.histories[&1].1["messages"][0]["text"], "update-200");
         assert!(cache.next_history().is_none());
+    }
+
+    #[test]
+    fn initial_snapshot_does_not_auto_fetch_older_history_until_requested() {
+        let mut messages = Vec::new();
+        for turn in 0..15usize {
+            messages
+                .push(json!({"id":format!("u-{turn}"),"role":"You","text":format!("User {turn}")}));
+            messages.push(
+                json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Answer {turn}")}),
+            );
+        }
+        let mut initial = snapshot(1, json!({"id":1,"messages":messages,"stats":{}}));
+        crate::history::stamp(&Value::Null, &mut initial["state"]["threads"][0], 1);
+        let streams = Streams::new(&initial);
+        let mut cache = cache(&initial);
+        let mut fragments = Fragments::default();
+
+        // Initial thread.subscribe delivers recent 10 turns only, then stops!
+        let sub = answer_with_budget(
+            &mut cache,
+            &streams,
+            &mut fragments,
+            crate::history::PAGE_MAX_ENCODED_BYTES,
+        );
+        assert_eq!(sub["method"], "thread.subscribe");
+        assert!(
+            cache.next_history().is_none(),
+            "client must not eagerly walk older history before user requests it"
+        );
+        let projected = cache.projected().unwrap();
+        assert_eq!(
+            projected["threads"][0]["historyMeta"]["hasMoreHistory"],
+            true
+        );
+        assert_eq!(projected["threads"][0]["historyMeta"]["loading"], false);
+        assert_eq!(
+            projected["threads"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            20
+        );
+
+        // User requests earlier turns -> triggers thread.history and reaches end of history.
+        cache.request_earlier(1, None);
+        let loading_view = cache.projected().unwrap();
+        assert_eq!(loading_view["threads"][0]["historyMeta"]["loading"], true);
+        let req = answer_with_budget(
+            &mut cache,
+            &streams,
+            &mut fragments,
+            crate::history::PAGE_MAX_ENCODED_BYTES,
+        );
+        assert_eq!(req["method"], "thread.history");
+        assert!(cache.next_history().is_none());
+        let final_view = cache.projected().unwrap();
+        assert_eq!(
+            final_view["threads"][0]["historyMeta"]["hasMoreHistory"],
+            false
+        );
+        assert_eq!(final_view["threads"][0]["historyMeta"]["loading"], false);
+        assert_eq!(
+            final_view["threads"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            30
+        );
+    }
+
+    #[test]
+    fn load_earlier_keeps_error_state_allows_retry_and_remaps_tool_anchors() {
+        let mut messages = Vec::new();
+        let mut tools = Vec::new();
+        for turn in 0..12usize {
+            messages
+                .push(json!({"id":format!("u-{turn}"),"role":"You","text":format!("User {turn}")}));
+            let a_idx = messages.len();
+            messages.push(
+                json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Answer {turn}")}),
+            );
+            tools.push(json!({"id":format!("t-{turn}"),"name":"read","detail":"f","done":true,"failed":false,"output":"","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],"anchor":{"message":a_idx,"offset":0},"block":0,"order":1}));
+        }
+        let mut initial = snapshot(
+            1,
+            json!({"id":1,"messages":messages,"tools":tools,"stats":{}}),
+        );
+        crate::history::stamp(&Value::Null, &mut initial["state"]["threads"][0], 1);
+        let streams = Streams::new(&initial);
+        let mut cache = cache(&initial);
+        let mut fragments = Fragments::default();
+        answer_with_budget(
+            &mut cache,
+            &streams,
+            &mut fragments,
+            crate::history::PAGE_MAX_ENCODED_BYTES,
+        );
+
+        // Tools loaded in initial window (turns 2..12) must have anchor.message remapped to 0..20!
+        let installed_tools = cache.histories[&1].1["tools"].as_array().unwrap();
+        assert_eq!(installed_tools.len(), 10);
+        assert_eq!(installed_tools[0]["anchor"]["message"], 1);
+        assert_eq!(installed_tools[9]["anchor"]["message"], 19);
+
+        // Simulate failure when loading earlier turns -> error state set, retry works.
+        cache.request_earlier(1, None);
+        assert!(cache.next_history().is_some());
+        cache
+            .receive(&protocol::response(
+                json!("history"),
+                Err("Network timeout".into()),
+            ))
+            .unwrap();
+        let errored = cache.projected().unwrap();
+        assert_eq!(errored["threads"][0]["historyMeta"]["loading"], false);
+        assert_eq!(
+            errored["threads"][0]["historyMeta"]["error"],
+            "Network timeout"
+        );
+        assert!(cache.next_history().is_none());
+
+        // Retry succeeds and loads remaining turns 0..2.
+        cache.request_earlier(1, None);
+        answer_with_budget(
+            &mut cache,
+            &streams,
+            &mut fragments,
+            crate::history::PAGE_MAX_ENCODED_BYTES,
+        );
+        let done = cache.projected().unwrap();
+        assert_eq!(done["threads"][0]["historyMeta"]["hasMoreHistory"], false);
+        assert!(done["threads"][0]["historyMeta"]["error"].is_null());
+        assert_eq!(
+            cache.histories[&1].1["messages"].as_array().unwrap().len(),
+            24
+        );
+        assert_eq!(cache.histories[&1].1["tools"].as_array().unwrap().len(), 12);
     }
 }

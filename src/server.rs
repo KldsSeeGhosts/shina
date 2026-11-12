@@ -604,6 +604,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 protocol::MODEL_CATALOG_REFRESH,
                                 protocol::MODEL_OPTIONS,
                             ]);
+                            capabilities.extend([protocol::THREAD_FIND, protocol::THREAD_SEARCH]);
                         }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
@@ -700,11 +701,45 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     } else {
                         params["threadId"].as_u64().ok_or_else(|| "Invalid thread id.".to_owned()).and_then(|thread_id| {
                             history_leases.read(thread_id, params, Instant::now(), || {
-                                shared.history_streams.lock().expect("history streams").page(thread_id,
-                                    params["historyCursor"].as_str(), crate::history::byte_budget(params))
+                                shared.history_streams.lock().expect("history streams").page_with_target(
+                                    thread_id,
+                                    params["historyCursor"].as_str(),
+                                    crate::history::byte_budget(params),
+                                    params["throughEntryId"].as_str(),
+                                )
                             })
                         })
                     }
+                } else if method == "thread.find" {
+                    params["threadId"]
+                        .as_u64()
+                        .ok_or_else(|| "Invalid thread id.".to_owned())
+                        .and_then(|thread_id| {
+                            shared
+                                .history_streams
+                                .lock()
+                                .expect("history streams")
+                                .find_thread(thread_id, params)
+                        })
+                } else if method == "threads.search" {
+                    let index_threads = {
+                        let current = shared.snapshots.borrow().clone();
+                        if !current["state"].is_null() {
+                            Ok(current["state"]["index"]["threads"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default())
+                        } else {
+                            shared.database.thread_search_index()
+                        }
+                    };
+                    index_threads.and_then(|threads| {
+                        shared
+                            .history_streams
+                            .lock()
+                            .expect("history streams")
+                            .search_threads(params, &threads)
+                    })
                 } else {
                     if shared.remote && matches!(method, "devices.grant" | "devices.revokeGrant") {
                         if !send(&mut socket, protocol::response(id, Err("Change update grants on the target machine itself.".into()))).await { break; }

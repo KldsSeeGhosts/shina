@@ -17,6 +17,67 @@ pub const REPLAY_BYTES: usize = 1024 * 1024;
 const RETAIN_EVENTS: usize = 1024;
 const RETAIN_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 75;
+const PAGE_USER_TURNS_INITIAL: usize = 10;
+const PAGE_USER_TURNS_OLDER: usize = 20;
+const PAGE_TURN_ITEMS: usize = 500;
+const PAGE_RAW_TURNS: usize = 150;
+#[cfg(test)]
+pub const PAGE_MAX_ENCODED_BYTES: usize = 1_048_576;
+
+fn is_timeline_field(field: &str) -> bool {
+    matches!(
+        field,
+        "messages" | "tools" | "thoughts" | "work" | "compactions"
+    )
+}
+
+fn is_user_turn_row(row: &Row) -> bool {
+    row.field == "messages" && matches!(row.item["role"].as_str(), Some("You" | "user"))
+}
+
+fn timeline_sort_key(row: &Row, total_messages: usize) -> (usize, u8, u64, usize, usize) {
+    match row.field.as_str() {
+        "work" => (
+            row.item["start"].as_u64().map(|m| m as usize).unwrap_or(0),
+            0,
+            row.item["stopped_order"].as_u64().unwrap_or(0),
+            row.ordinal,
+            row.position,
+        ),
+        "thoughts" => (
+            row.item["anchor"]["message"]
+                .as_u64()
+                .map(|m| m as usize)
+                .unwrap_or(0),
+            1,
+            row.item["order"].as_u64().unwrap_or(row.ordinal as u64),
+            row.ordinal,
+            row.position,
+        ),
+        "tools" => (
+            row.item["anchor"]["message"]
+                .as_u64()
+                .map(|m| m as usize)
+                .unwrap_or(0),
+            2,
+            row.item["order"].as_u64().unwrap_or(row.ordinal as u64),
+            row.ordinal,
+            row.position,
+        ),
+        "compactions" => (
+            row.item["anchor"]["message"]
+                .as_u64()
+                .map(|m| m as usize)
+                .unwrap_or(total_messages),
+            3,
+            row.item["order"].as_u64().unwrap_or(row.ordinal as u64),
+            row.ordinal,
+            row.position,
+        ),
+        "messages" => (row.ordinal, 4, 0, row.ordinal, row.position),
+        _ => (usize::MAX, 5, 0, row.ordinal, row.position),
+    }
+}
 
 /// KSG stores the identity and sequence beside each projected turn item.
 /// Match known records before allocating IDs, including adapter history refreshes.
@@ -512,10 +573,219 @@ impl Streams {
         self.threads.get(&thread).map(|p| p.sequence)
     }
 
+    /// Ported from KSG `ThreadFind.searchThread` over the complete stored conversation.
+    pub fn find_thread(&self, thread: u64, params: &Value) -> Result<Value, String> {
+        let projection = self.threads.get(&thread).ok_or("Unknown thread.")?;
+        let query = params["query"]
+            .as_str()
+            .ok_or("Search query is required.")?;
+        let start = params
+            .get("start")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value::<crate::thread_find::ThreadFindStart>(v.clone()))
+            .transpose()
+            .map_err(|e| format!("Invalid find start: {e}"))?;
+        let offset = params["offset"].as_i64().unwrap_or(0);
+        let index = params["index"].as_u64().map(|n| n as usize);
+
+        let mut msg_rows: Vec<&Row> = projection
+            .rows
+            .iter()
+            .filter(|row| row.field == "messages")
+            .collect();
+        msg_rows.sort_by_key(|row| (row.ordinal, row.position));
+
+        let docs_owned: Vec<(String, &str, String)> = msg_rows
+            .into_iter()
+            .map(|row| {
+                let entry_id = row.item["id"]
+                    .as_str()
+                    .unwrap_or(&row.source_item_id)
+                    .to_owned();
+                let role = row.item["role"].as_str().unwrap_or("Pi");
+                let raw = row.item["text"].as_str().unwrap_or("");
+                let text = if role == "Shina" {
+                    raw.strip_prefix("[Shina] ")
+                        .map(|body| {
+                            body.split_once('\n')
+                                .filter(|(header, _)| header.starts_with("[delivery "))
+                                .map(|(_, rest)| rest)
+                                .unwrap_or(body)
+                        })
+                        .unwrap_or(raw)
+                        .to_owned()
+                } else {
+                    raw.to_owned()
+                };
+                (entry_id, role, text)
+            })
+            .collect();
+        let docs: Vec<crate::thread_find::SearchDocument<'_>> = docs_owned
+            .iter()
+            .map(
+                |(entry_id, role, text)| crate::thread_find::SearchDocument {
+                    entry_id,
+                    role,
+                    text,
+                },
+            )
+            .collect();
+
+        let result = crate::thread_find::search_documents(
+            &docs,
+            query,
+            start.as_ref(),
+            offset,
+            index,
+            projection.sequence,
+        );
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    /// Ported from KSG `ThreadSearch.search` over all stored conversation transcripts.
+    pub fn search_threads(&self, params: &Value, index_threads: &[Value]) -> Result<Value, String> {
+        let query = params["query"]
+            .as_str()
+            .ok_or("Search query is required.")?;
+        let trimmed: String = query
+            .trim()
+            .chars()
+            .take(crate::thread_search::THREAD_SEARCH_QUERY_MAX_LENGTH)
+            .collect();
+        let tokens = crate::thread_search::message_search_tokens(&trimmed);
+        if tokens.long.is_empty() {
+            return Ok(json!({"matches": []}));
+        }
+        let limit = params["limit"].as_u64().unwrap_or(50).min(200) as usize;
+        let project_filter = params.get("projectId").and_then(Value::as_u64);
+
+        let mut results = Vec::new();
+        for record in index_threads {
+            let Some(thread_id) = record["id"].as_u64() else {
+                continue;
+            };
+            if !record["lifecycle"]["archivedAt"].is_null() || record["delegated"] == true {
+                continue;
+            }
+            let project_id = record["project"].as_u64();
+            if let Some(filter) = project_filter
+                && project_id != Some(filter)
+            {
+                continue;
+            }
+            let Some(projection) = self.threads.get(&thread_id) else {
+                continue;
+            };
+            let updated = record["updated"].as_u64().unwrap_or(0);
+            let mut best: Option<(crate::thread_search::ThreadSearchHit, usize)> = None;
+            let mut hit_count = 0usize;
+
+            let mut msg_rows: Vec<&Row> = projection
+                .rows
+                .iter()
+                .filter(|row| row.field == "messages")
+                .collect();
+            msg_rows.sort_by_key(|row| std::cmp::Reverse((row.ordinal, row.position)));
+
+            for row in msg_rows {
+                let role = row.item["role"].as_str().unwrap_or("");
+                if !matches!(role, "You" | "user" | "Pi" | "assistant") {
+                    continue;
+                }
+                let raw = row.item["text"].as_str().unwrap_or("");
+                let stripped = crate::thread_search::strip_markdown_links(raw);
+                let Some(grade) = crate::thread_search::grade_message(&stripped, &tokens) else {
+                    continue;
+                };
+                let entry_id = row.item["id"]
+                    .as_str()
+                    .unwrap_or(&row.source_item_id)
+                    .to_owned();
+                let source = if matches!(role, "You" | "user") {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let candidate = crate::thread_search::ThreadSearchHit {
+                    thread_id: thread_id as usize,
+                    project_id: project_id.map(|id| id as usize),
+                    entry_id,
+                    source: source.to_owned(),
+                    snippet: crate::thread_search::build_search_snippet(&stripped, grade.offset),
+                    quality: grade.quality,
+                    hits: 1,
+                    updated,
+                };
+                match &mut best {
+                    None => {
+                        hit_count = 1;
+                        best = Some((candidate, row.ordinal));
+                    }
+                    Some((current, current_ord)) => {
+                        if (candidate.quality - current.quality).abs() < f64::EPSILON {
+                            hit_count += 1;
+                            let better_source =
+                                candidate.source == "user" && current.source != "user";
+                            if better_source
+                                || (candidate.source == current.source
+                                    && row.ordinal > *current_ord)
+                            {
+                                *current = candidate;
+                                *current_ord = row.ordinal;
+                            }
+                        } else if candidate.quality > current.quality {
+                            hit_count = 1;
+                            *current = candidate;
+                            *current_ord = row.ordinal;
+                        }
+                    }
+                }
+                if hit_count >= crate::thread_search::MESSAGE_HIT_LIMIT {
+                    break;
+                }
+            }
+            if let Some((mut hit, _)) = best {
+                hit.hits = hit_count;
+                results.push(hit);
+            }
+        }
+        crate::thread_search::rank_message_matches(&mut results);
+        results.truncate(limit);
+        Ok(json!({"matches": results}))
+    }
+
     /// Ported from KSG ProjectionStore.getThreadHistoryPage and threadHistoryPaging.
     /// Page backwards by source identity. A content revision never invalidates the anchor.
     pub fn page(&self, thread: u64, cursor: Option<&str>, budget: usize) -> Result<Value, String> {
+        self.page_with_target(thread, cursor, budget, None)
+    }
+
+    /// Ported from KSG ProjectionStore.getThreadHistoryPage and olderHistoryPagePolicy.
+    pub fn page_with_target(
+        &self,
+        thread: u64,
+        cursor: Option<&str>,
+        budget: usize,
+        through_entry_id: Option<&str>,
+    ) -> Result<Value, String> {
         let projection = self.threads.get(&thread).ok_or("Unknown thread.")?;
+        let total_messages = projection
+            .rows
+            .iter()
+            .filter(|row| row.field == "messages")
+            .count();
+        let mut timeline: Vec<&Row> = projection
+            .rows
+            .iter()
+            .filter(|row| is_timeline_field(&row.field))
+            .collect();
+        timeline.sort_by_key(|row| timeline_sort_key(row, total_messages));
+        let control: Vec<&Row> = projection
+            .rows
+            .iter()
+            .filter(|row| !is_timeline_field(&row.field))
+            .collect();
+
         let end = if let Some(cursor) = cursor {
             if cursor.len() > 4096 {
                 return Err("Invalid history cursor.".into());
@@ -530,45 +800,107 @@ impl Streams {
             {
                 return Err("Invalid history cursor.".into());
             }
-            projection
-                .rows
+            let si = anchor["si"].as_str().unwrap();
+            timeline
                 .iter()
-                .position(|row| row.source_item_id == anchor["si"].as_str().unwrap())
+                .position(|row| row.source_item_id == si)
                 .unwrap_or_else(|| {
                     if anchor["v"] == 2 {
-                        projection
-                            .rows
-                            .iter()
-                            .take_while(|row| row.position < anchor["p"].as_u64().unwrap() as usize)
-                            .count()
+                        let p = anchor["p"].as_u64().unwrap() as usize;
+                        timeline.iter().take_while(|row| row.position < p).count()
                     } else {
-                        (anchor["p"].as_u64().unwrap() as usize).min(projection.rows.len())
+                        (anchor["p"].as_u64().unwrap() as usize).min(timeline.len())
                     }
                 })
         } else {
-            projection.rows.len()
+            timeline.len()
         };
-        let mut start = end;
-        let mut bytes = 0;
-        while start > 0 && end - start < PAGE_ITEMS {
-            let size = serde_json::to_string(&projection.rows[start - 1])
-                .map_err(|e| e.to_string())?
-                .len();
-            if start < end && bytes + size > budget {
+
+        let base_user_turns = if cursor.is_some() {
+            PAGE_USER_TURNS_OLDER
+        } else {
+            PAGE_USER_TURNS_INITIAL
+        };
+        let (max_user_turns, max_items, max_turn_items) = if let Some(target_id) = through_entry_id
+            && let Some(target_index) = timeline[..end]
+                .iter()
+                .position(|row| row.source_item_id == target_id || row.item["id"] == target_id)
+        {
+            let turns_between = timeline[target_index..end]
+                .iter()
+                .filter(|row| is_user_turn_row(row))
+                .count();
+            let extra = usize::from(!is_user_turn_row(timeline[target_index]));
+            (
+                (PAGE_USER_TURNS_OLDER * 2).min(PAGE_USER_TURNS_OLDER.max(turns_between + extra)),
+                PAGE_ITEMS * 2,
+                PAGE_TURN_ITEMS * 2,
+            )
+        } else {
+            (base_user_turns, PAGE_ITEMS, PAGE_TURN_ITEMS)
+        };
+
+        let has_user_turns = timeline[..end].iter().any(|row| is_user_turn_row(row));
+        let row_limit = if has_user_turns {
+            max_turn_items
+        } else {
+            max_items
+        };
+
+        let mut selected = Vec::new();
+        let mut bytes = 0usize;
+        let mut user_turns = 0usize;
+        let mut raw_turns = 0usize;
+        for index in (0..end).rev() {
+            let row = timeline[index];
+            if !selected.is_empty()
+                && (selected.len() >= row_limit
+                    || (has_user_turns
+                        && (user_turns >= max_user_turns || raw_turns >= PAGE_RAW_TURNS)))
+            {
                 break;
             }
+            let size = serde_json::to_string(row).map_err(|e| e.to_string())?.len();
+            if !selected.is_empty() && bytes + size > budget {
+                break;
+            }
+            selected.push(row);
             bytes += size;
-            start -= 1;
+            if is_user_turn_row(row) {
+                user_turns += 1;
+                raw_turns += 1;
+            } else if row.field == "messages" && row.item["role"] == "Shina" {
+                raw_turns += 1;
+            }
         }
-        let next = (start > 0).then(|| {
-            let row = &projection.rows[start];
+        if user_turns == 0 {
+            selected.truncate(max_items);
+        }
+        selected.reverse();
+
+        let oldest_index = selected
+            .first()
+            .and_then(|oldest| {
+                timeline
+                    .iter()
+                    .position(|row| row.source_item_id == oldest.source_item_id)
+            })
+            .unwrap_or(0);
+        let has_more = oldest_index > 0;
+        let next = has_more.then(|| {
+            let row = timeline[oldest_index];
             json!({"v":2,"seq":projection.sequence,"st":thread,"si":row.source_item_id,"p":row.position})
                 .to_string()
         });
+
+        let mut items: Vec<Row> = selected.into_iter().cloned().collect();
+        if cursor.is_none() {
+            items.extend(control.into_iter().cloned());
+        }
         Ok(
             json!({"threadId":thread,"snapshotSequence":projection.sequence,
-            "historyRevision":projection.revision,"items":&projection.rows[start..end],
-            "fields":projection.fields,"nextCursor":next,"hasMoreHistory":next.is_some()}),
+            "historyRevision":projection.revision,"items":items,
+            "fields":projection.fields,"nextCursor":next,"hasMoreHistory":has_more}),
         )
     }
 }
@@ -866,5 +1198,90 @@ mod tests {
         }
         assert!(large.bytes <= RETAIN_BYTES);
         assert!(large.replay(1, 2).is_none());
+    }
+
+    #[test]
+    fn initial_window_respects_user_turn_budget_and_older_pages_step_through_end_of_history() {
+        // 35 user turns (70 messages) + 35 tools + 35 work sections.
+        let mut messages = Vec::new();
+        let mut tools = Vec::new();
+        let mut work = Vec::new();
+        for turn in 0..35usize {
+            let user_idx = messages.len();
+            messages.push(
+                json!({"id":format!("u-{turn}"),"role":"You","text":format!("User turn {turn}")}),
+            );
+            let assistant_idx = messages.len();
+            messages.push(
+                json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Answer {turn}")}),
+            );
+            tools.push(json!({"id":format!("tool-{turn}"),"name":"read","detail":"a.rs","done":true,"failed":false,"output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],"anchor":{"message":assistant_idx,"offset":0},"block":0,"order":1}));
+            work.push(json!({"start":assistant_idx,"stopped":false,"stopped_order":0,"elapsed":1}));
+            let _ = user_idx;
+        }
+        let mut snap = json!({"seq":1,"state":{"threads":[{"id":1,"messages":messages,"tools":tools,"work":work,"stats":{},"models":[{"id":"m1"}]}]}});
+        stamp(&Value::Null, &mut snap["state"]["threads"][0], 1);
+        let streams = Streams::new(&snap);
+
+        // Initial window (cursor = None) stops at 10 user turns (turns 25..35), not 75 arbitrary rows.
+        let initial = streams.page(1, None, 1_048_576).unwrap();
+        assert_eq!(initial["hasMoreHistory"], true);
+        let initial_msgs: Vec<_> = initial["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["field"] == "messages")
+            .collect();
+        assert_eq!(initial_msgs.len(), 20, "10 user turns = 20 messages");
+        assert_eq!(initial_msgs[0]["item"]["text"], "User turn 25");
+        assert_eq!(initial_msgs.last().unwrap()["item"]["text"], "Answer 34");
+        // Control arrays (models) must arrive in the initial window.
+        assert!(
+            initial["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["field"] == "models")
+        );
+
+        // Older page 1 uses OLDER_THREAD_USER_TURN_LIMIT = 20 user turns (turns 5..25).
+        let page1 = streams
+            .page(1, initial["nextCursor"].as_str(), 1_048_576)
+            .unwrap();
+        assert_eq!(page1["hasMoreHistory"], true);
+        let page1_msgs: Vec<_> = page1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["field"] == "messages")
+            .collect();
+        assert_eq!(page1_msgs.len(), 40, "20 user turns = 40 messages");
+        assert_eq!(page1_msgs[0]["item"]["text"], "User turn 5");
+        assert_eq!(page1_msgs.last().unwrap()["item"]["text"], "Answer 24");
+
+        // Older page 2 reaches turn 0 and sets hasMoreHistory = false, nextCursor = null.
+        let page2 = streams
+            .page(1, page1["nextCursor"].as_str(), 1_048_576)
+            .unwrap();
+        assert_eq!(page2["hasMoreHistory"], false);
+        assert!(page2["nextCursor"].is_null());
+        let page2_msgs: Vec<_> = page2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["field"] == "messages")
+            .collect();
+        assert_eq!(page2_msgs.len(), 10, "remaining 5 user turns = 10 messages");
+        assert_eq!(page2_msgs[0]["item"]["text"], "User turn 0");
+    }
+
+    #[test]
+    fn empty_or_short_thread_has_no_more_history() {
+        let mut empty = snapshot(1, json!([]));
+        stamp(&Value::Null, &mut empty["state"]["threads"][0], 1);
+        let streams = Streams::new(&empty);
+        let page = streams.page(1, None, 65536).unwrap();
+        assert_eq!(page["hasMoreHistory"], false);
+        assert!(page["nextCursor"].is_null());
     }
 }

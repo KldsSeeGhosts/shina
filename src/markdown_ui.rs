@@ -69,8 +69,9 @@ fn ordinary(
     user: bool,
     identity: String,
     p: Palette,
+    find: Option<(&str, Option<usize>)>,
 ) -> El {
-    Markdown::new(source)
+    let mut md = Markdown::new(source)
         .streaming(streaming)
         .selectable(true)
         .copy_source(!user)
@@ -83,8 +84,21 @@ fn ordinary(
                 &format!("{identity}-{}", frame.index),
                 p,
             )
-        })
-        .render(style)
+        });
+    if let Some((query, active_occ)) = find {
+        let hits = crate::thread_find::find_markdown_occurrences(source, query);
+        if !hits.is_empty() {
+            md = md.highlights(hits.into_iter().enumerate().map(|(i, ranges)| {
+                let is_active = Some(i) == active_occ;
+                let mut hl = rune_kit::markdown::Highlight::new().current_match(is_active);
+                if is_active {
+                    hl = hl.key("thread-find-active");
+                }
+                (ranges, hl)
+            }));
+        }
+    }
+    md.render(style)
 }
 
 /// Ported from KSG Code's ChatMarkdown and chat/MarkdownCodeBlock.
@@ -96,6 +110,19 @@ pub(super) fn render(
     user: bool,
     streaming: bool,
     identity: &str,
+) -> El {
+    render_with_find(source, p, dark, wide, user, streaming, identity, None)
+}
+
+pub(super) fn render_with_find(
+    source: &str,
+    p: Palette,
+    dark: bool,
+    wide: bool,
+    user: bool,
+    streaming: bool,
+    identity: &str,
+    find: Option<(&str, Option<usize>)>,
 ) -> El {
     let source = if user {
         user_source(source)
@@ -122,6 +149,9 @@ pub(super) fn render(
         // Rune's inline code chip has a fixed corner radius; only its fill is ours.
         .inline_code_bg(p.code_bg)
         .selection(p.coral_bg)
+        .highlight_bg(p.brass.alpha(0.32))
+        .highlight_current_bg(p.coral.alpha(0.42))
+        .highlight_current_ring(Some((p.coral, 1.5)))
         // The header frame owns the visible border. Rune's inner card has none.
         .code_block(p.code_bg, Color::TRANSPARENT)
         .diff(p.sea_bg, removed)
@@ -166,30 +196,57 @@ pub(super) fn render(
         }
     }
     if diffs.is_empty() {
-        return ordinary(&source, &style, streaming, user, identity.into(), p);
+        return ordinary(&source, &style, streaming, user, identity.into(), p, find);
     }
     let diff_style = style.clone().code_block_padding(12.0, 6.0);
     let mut content = col().w_full().min_w(0.0).gap(12.0).selection_group(true);
     let mut from = 0;
+    let mut occ_base = 0usize;
+    let chunk_find = |slice: &str, occ_base: &mut usize| -> Option<(&str, Option<usize>)> {
+        let (query, active_occ) = find?;
+        let count = crate::thread_find::find_markdown_occurrences(slice, query).len();
+        let local_active = active_occ
+            .and_then(|o| (o >= *occ_base && o < *occ_base + count).then_some(o - *occ_base));
+        *occ_base += count;
+        Some((query, local_active))
+    };
     for (range, language, code) in diffs {
         if !source[from..range.start].trim().is_empty() {
+            let slice = &source[from..range.start];
+            let part_find = chunk_find(slice, &mut occ_base);
             content = content.child(ordinary(
-                &source[from..range.start],
+                slice,
                 &style,
                 streaming,
                 user,
                 format!("{identity}-part-{from}"),
                 p,
+                part_find,
             ));
         }
         // Tinted rows run edge to edge, so the block keeps a 6 px pad above the first row and
         // below the last, in place of the 12 px that left an empty line under the header.
-        let diff = Markdown::new(&source[range.clone()])
+        let diff_slice = &source[range.clone()];
+        let diff_find = chunk_find(diff_slice, &mut occ_base);
+        let mut diff_md = Markdown::new(diff_slice)
             .streaming(streaming)
             .selectable(true)
             .copy_source(!user)
-            .scroll_wide(true)
-            .render(&diff_style);
+            .scroll_wide(true);
+        if let Some((query, active_occ)) = diff_find {
+            let hits = crate::thread_find::find_markdown_occurrences(diff_slice, query);
+            if !hits.is_empty() {
+                diff_md = diff_md.highlights(hits.into_iter().enumerate().map(|(i, ranges)| {
+                    let is_active = Some(i) == active_occ;
+                    let mut hl = rune_kit::markdown::Highlight::new().current_match(is_active);
+                    if is_active {
+                        hl = hl.key("thread-find-active");
+                    }
+                    (ranges, hl)
+                }));
+            }
+        }
+        let diff = diff_md.render(&diff_style);
         content = content.child(code_frame(
             diff,
             &language,
@@ -200,13 +257,16 @@ pub(super) fn render(
         from = range.end;
     }
     if !source[from..].trim().is_empty() {
+        let slice = &source[from..];
+        let part_find = chunk_find(slice, &mut occ_base);
         content = content.child(ordinary(
-            &source[from..],
+            slice,
             &style,
             streaming,
             user,
             format!("{identity}-part-{from}"),
             p,
+            part_find,
         ));
     }
     content
