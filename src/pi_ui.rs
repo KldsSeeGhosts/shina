@@ -222,7 +222,7 @@ pub(super) fn composer_pi_key(
     tx: &rune::Tx,
     caret_edges: Option<[bool; 2]>,
 ) -> bool {
-    if composer_queue_key(s, event) {
+    if composer_queue_key(s, event, tx) {
         return true;
     }
     if s.undo_key(event, true) {
@@ -235,13 +235,24 @@ pub(super) fn composer_pi_key(
     let is_composing = s.current().draft.is_composing();
     let send_shortcut = s.preferences.send_shortcut;
     let prompt_text = s.current().draft.text.clone();
-    if let Some(intent) = crate::composer::submission_intent_for_key(
+    let resolved = s.resolved_keybindings();
+    let ctx = s.shortcut_context(true);
+    let shortcut_command = crate::keybindings::resolve_shortcut_command(
+        event,
+        &resolved,
+        &ctx,
+        crate::keybindings::Platform::current(),
+        tx.physical_key(),
+        tx.key_base(),
+    );
+    if let Some(intent) = crate::composer::submission_intent_for_command(
         event,
         tx.key_repeat(),
         is_composing,
         is_running,
         send_shortcut,
         &prompt_text,
+        shortcut_command,
     ) {
         if !s.demo && !s.current().archived() {
             let previous = s.current().native.follow_up;
@@ -298,21 +309,24 @@ pub(super) fn composer_pi_key(
 }
 
 /// KSG Code's thread.editQueuedMessage and thread.steerQueuedMessage shortcuts.
-fn composer_queue_key(s: &mut State, event: &rune::KeyEvent) -> bool {
+fn composer_queue_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> bool {
     if s.current().draft.is_composing() || s.current().request.is_some() {
         return false;
     }
-    let edit_latest = event.key == rune::Key::Up
-        && event.mods.alt
-        && !event.mods.ctrl
-        && !event.mods.cmd
-        && !event.mods.shift
+    let resolved = s.resolved_keybindings();
+    let ctx = s.shortcut_context(true);
+    let command = crate::keybindings::resolve_shortcut_command(
+        event,
+        &resolved,
+        &ctx,
+        crate::keybindings::Platform::current(),
+        tx.physical_key(),
+        tx.key_base(),
+    );
+    let edit_latest = command == Some("thread.editQueuedMessage")
         && s.current().draft.focus == 0
         && s.current().draft.anchor == 0;
-    let promote_next = event.key == rune::Key::Enter
-        && event.mods.shift
-        && (event.mods.cmd || event.mods.ctrl)
-        && !event.mods.alt;
+    let promote_next = command == Some("thread.steerQueuedMessage");
     let id = if edit_latest {
         s.current().native.queue.back().map(|q| q.id)
     } else if promote_next {

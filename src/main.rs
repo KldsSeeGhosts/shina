@@ -28,6 +28,7 @@ mod html_network;
 mod html_render;
 mod html_window;
 mod install;
+mod keybindings;
 mod lifecycle;
 mod maintenance;
 mod mcp;
@@ -56,7 +57,7 @@ mod visuals;
 mod work;
 
 use model::State;
-use rune::{AppSpec, Key, KeyEvent, Tx};
+use rune::{AppSpec, KeyEvent, Tx};
 use std::{path::PathBuf, sync::OnceLock};
 
 static OPTIONS: OnceLock<(PathBuf, bool, bool)> = OnceLock::new();
@@ -97,82 +98,113 @@ fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if state.undo_key(event, false) {
         return true;
     }
-    if event.mods.shift && event.is_command('s') {
-        state.settle_thread(state.current().id);
-    } else if event.mods.shift && event.is_command('p') {
-        state.pin_thread(state.current().id);
-    } else if event.mods.shift
-        && (event.is_command('[')
-            || event.is_command(']')
-            || event.is_command('{')
-            || event.is_command('}'))
-    {
-        let order = ui::sidebar_navigation(state);
-        if !order.is_empty() {
-            let i = order
-                .iter()
-                .position(|(server, id)| {
-                    server == &state.machines.selected && *id == state.current().id
-                })
-                .unwrap_or(0);
-            let next = if event.is_command('[') || event.is_command('{') {
-                (i + order.len() - 1) % order.len()
-            } else {
-                (i + 1) % order.len()
-            };
-            let (server, id) = &order[next];
-            if state.client.is_some() {
-                state.open_machine_thread(server, *id);
-            } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id) {
-                state.select_thread(index);
+    if state.settings_menu && state.settings.shortcut_capture.is_some() {
+        return false;
+    }
+    let resolved = state.resolved_keybindings();
+    let ctx = state.shortcut_context(state.current().draft.focused);
+    let command = crate::keybindings::resolve_shortcut_command(
+        event,
+        &resolved,
+        &ctx,
+        crate::keybindings::Platform::current(),
+        tx.physical_key(),
+        tx.key_base(),
+    );
+    let Some(command) = command else {
+        return false;
+    };
+    dispatch_global_command(state, command, event, tx)
+}
+
+fn dispatch_global_command(
+    state: &mut State,
+    command: &str,
+    _event: &KeyEvent,
+    tx: &mut Tx,
+) -> bool {
+    match command {
+        "thread.settle" => state.settle_thread(state.current().id),
+        "thread.pin" => state.pin_thread(state.current().id),
+        "thread.previous" | "thread.next" => {
+            let order = ui::sidebar_navigation(state);
+            if !order.is_empty() {
+                let i = order
+                    .iter()
+                    .position(|(server, id)| {
+                        server == &state.machines.selected && *id == state.current().id
+                    })
+                    .unwrap_or(0);
+                let next = if command == "thread.previous" {
+                    (i + order.len() - 1) % order.len()
+                } else {
+                    (i + 1) % order.len()
+                };
+                let (server, id) = &order[next];
+                if state.client.is_some() {
+                    state.open_machine_thread(server, *id);
+                } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id)
+                {
+                    state.select_thread(index);
+                }
             }
         }
-    } else if matches!(event.key, Key::Command('1'..='9')) && !event.mods.shift && !event.mods.alt {
-        let Key::Command(n) = event.key else {
-            unreachable!()
-        };
-        if let Some((server, id)) = ui::sidebar_navigation(state).get(n as usize - '1' as usize) {
-            if state.client.is_some() {
-                state.open_machine_thread(server, *id);
-            } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id) {
-                state.select_thread(index);
+        cmd if cmd.starts_with("thread.jump.") => {
+            if let Some(index) = cmd
+                .strip_prefix("thread.jump.")
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1))
+                && let Some((server, id)) = ui::sidebar_navigation(state).get(index)
+            {
+                if state.client.is_some() {
+                    state.open_machine_thread(server, *id);
+                } else if let Some(pos) = state.threads.iter().position(|thread| thread.id == *id) {
+                    state.select_thread(pos);
+                }
             }
         }
-    } else if event.is_command('n') {
-        if event.mods.alt {
-            state.new_thread_in(None);
-            state.current_mut().draft.focused = true;
-        } else if event.mods.shift {
+        "chat.new" => state.new_thread_click(false),
+        "chat.newLocal" => {
             state.new_thread();
             state.current_mut().draft.focused = true;
-        } else {
-            state.new_thread_click(false);
         }
-    } else if event.mods.shift && event.is_command('o') {
-        state.new_thread_click(false);
-    } else if event.is_command('o') {
-        projects::pick_folder(state, tx);
-    } else if event.is_command('b') {
-        if state.viewport_width < 760.0 {
-            state.compact_sidebar = !state.compact_sidebar;
-        } else {
-            state.sidebar = !state.sidebar;
+        "chat.newWithoutProject" => {
+            state.new_thread_in(None);
+            state.current_mut().draft.focused = true;
         }
-        state.checkpoint();
-    } else if event.is_command('l') {
-        state.current_mut().draft.focused = true;
-    } else if event.is_command('k') {
-        state.search.focused = true;
-    } else if event.is_command('=') || event.is_command('+') {
-        state.step_zoom(1);
-    } else if event.is_command('-') || event.is_command('_') {
-        state.step_zoom(-1);
-    } else if event.is_command('0') {
-        state.step_zoom(0);
-    } else if event.key == Key::Escape && state.current().status.busy() {
-        state.current_mut().stop();
-    } else {
-        return false;
+        "editor.openFavorite" => projects::pick_folder(state, tx),
+        "sidebar.toggle" => {
+            if state.viewport_width < 760.0 {
+                state.compact_sidebar = !state.compact_sidebar;
+            } else {
+                state.sidebar = !state.sidebar;
+            }
+            state.checkpoint();
+        }
+        "composer.focus" => {
+            state.current_mut().draft.focused = true;
+        }
+        "commandPalette.toggle" => {
+            state.search.focused = true;
+        }
+        "view.zoomIn" => state.step_zoom(1),
+        "view.zoomOut" => state.step_zoom(-1),
+        "view.resetZoom" => state.step_zoom(0),
+        "thread.stop" => {
+            if state.current().status.busy() {
+                state.current_mut().stop();
+            } else {
+                return false;
+            }
+        }
+        "thread.undo" => {
+            if state.undo.is_some() {
+                state.undo_thread_action();
+            } else {
+                return false;
+            }
+        }
+        _ => return false,
     }
     true
 }

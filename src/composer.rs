@@ -52,28 +52,56 @@ pub fn submission_intent_for_key(
     send_shortcut: SendShortcut,
     prompt: &str,
 ) -> Option<SubmissionIntent> {
+    let mut ctx = crate::keybindings::ShortcutContext::desktop();
+    ctx.composer_focus = true;
+    ctx.turn_running = is_running;
+    ctx.composer_requires_modifier = requires_modifier(send_shortcut, prompt);
+    let defaults = crate::keybindings::default_resolved_keybindings();
+    let command = crate::keybindings::resolve_shortcut_command(
+        event,
+        &defaults,
+        &ctx,
+        crate::keybindings::Platform::current(),
+        None,
+        None,
+    );
+    submission_intent_for_command(
+        event,
+        key_repeat,
+        is_composing,
+        is_running,
+        send_shortcut,
+        prompt,
+        command,
+    )
+}
+
+pub fn submission_intent_for_command(
+    event: &KeyEvent,
+    key_repeat: bool,
+    is_composing: bool,
+    is_running: bool,
+    send_shortcut: SendShortcut,
+    prompt: &str,
+    command: Option<&str>,
+) -> Option<SubmissionIntent> {
     if is_composing || key_repeat {
         return None;
     }
-    if event.key != Key::Enter || event.mods.alt {
+    if command == Some("composer.sendAlternate") && is_running {
+        return Some(SubmissionIntent::Alternate);
+    }
+    if command == Some("composer.sendBackground")
+        || command == Some("composer.sendAndNewThread")
+        || command.is_some()
+    {
+        return None;
+    }
+    if event.key != Key::Enter || event.mods.shift || event.mods.alt {
         return None;
     }
     let has_mod = event.mods.cmd || event.mods.ctrl;
-    let needs_mod = requires_modifier(send_shortcut, prompt);
-    if is_running && has_mod && !event.mods.logo {
-        if needs_mod {
-            if event.mods.shift {
-                return Some(SubmissionIntent::Alternate);
-            }
-            return Some(SubmissionIntent::Foreground);
-        } else if !event.mods.shift {
-            return Some(SubmissionIntent::Alternate);
-        }
-    }
-    if event.mods.shift {
-        return None;
-    }
-    if needs_mod && !has_mod {
+    if requires_modifier(send_shortcut, prompt) && !has_mod {
         return None;
     }
     Some(SubmissionIntent::Foreground)

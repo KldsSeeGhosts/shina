@@ -20,6 +20,7 @@ pub struct Preferences {
     pub confirm_archive: bool,
     pub confirm_delete: bool,
     pub send_shortcut: crate::composer::SendShortcut,
+    pub keybindings: Vec<crate::keybindings::KeybindingRule>,
     pub dismissed_updates: Vec<String>,
 }
 impl Default for Preferences {
@@ -28,6 +29,7 @@ impl Default for Preferences {
             confirm_archive: false,
             confirm_delete: true,
             send_shortcut: Default::default(),
+            keybindings: Vec::new(),
             dismissed_updates: vec![],
         }
     }
@@ -187,6 +189,9 @@ impl ThreadDefaults {
 pub struct Dialog {
     pub section: usize,
     pub search: rune::TextEdit,
+    pub shortcut_search: rune::TextEdit,
+    pub shortcut_capture: Option<String>,
+    pub shortcut_notice: Option<String>,
     pub machine: String,
     pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
@@ -207,6 +212,9 @@ impl Default for Dialog {
         Self {
             section: 0,
             search: Default::default(),
+            shortcut_search: Default::default(),
+            shortcut_capture: None,
+            shortcut_notice: None,
             machine: "local".into(),
             profile_target: None,
             snooze: Default::default(),
@@ -226,11 +234,46 @@ impl Default for Dialog {
 }
 
 impl State {
+    pub fn resolved_keybindings(&self) -> Vec<crate::keybindings::ResolvedKeybindingRule> {
+        crate::keybindings::merge_with_default_keybindings(&self.preferences.keybindings)
+    }
+
+    pub fn shortcut_context(&self, composer_focus: bool) -> crate::keybindings::ShortcutContext {
+        let t = self.current();
+        let editable_focus = composer_focus
+            || self.search.focused
+            || self.model_search.focused
+            || self.picker_query.focused
+            || self.captain_picker_query.focused
+            || self.rename_edit.focused
+            || self.snooze_edit.focused
+            || t.reply.focused
+            || self.settings.search.focused
+            || self.settings.snooze.focused
+            || self.settings.add_project_base.focused
+            || self.settings.model.focused
+            || self.settings.provider.focused
+            || self.settings.effort.focused
+            || self.settings.shortcut_capture.is_some();
+        let mut ctx = crate::keybindings::ShortcutContext::desktop();
+        ctx.editable_focus = editable_focus;
+        ctx.composer_focus = composer_focus;
+        ctx.draft_thread_route = t.is_draft();
+        ctx.turn_running = t.status.busy();
+        ctx.composer_requires_modifier =
+            crate::composer::requires_modifier(self.preferences.send_shortcut, &t.draft.text);
+        ctx.model_picker_open = self.settings_picker == Some(SettingsPicker::Model);
+        ctx
+    }
+
     pub fn open_settings(&mut self) {
         self.settings_menu = true;
         self.settings.section = 0;
         self.settings.machine = "local".into();
         self.settings.search.replace_text("");
+        self.settings.shortcut_search.replace_text("");
+        self.settings.shortcut_capture = None;
+        self.settings.shortcut_notice = None;
         self.settings.notice = None;
         if !self.demo && !cfg!(test) && self.settings.version_probe.is_none() {
             let (send, receive) = std::sync::mpsc::channel();
