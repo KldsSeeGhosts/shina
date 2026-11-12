@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 4;
+pub const MINOR: u32 = 5;
+pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
 pub const FILESYSTEM_BROWSE: &str = "filesystem-browse";
 
@@ -39,6 +40,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "filesystem.browse" => "read",
         "request.respond" => "approve",
         "devices.list"
+        | "peer.link" | "peer.list" | "peer.unlink"
         | "devices.pair"
         | "devices.revoke"
         | "server.validateRestart"
@@ -47,7 +49,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.clientReady"
         | "server.commitRestart"
         | "server.stop" => "maintain",
-        "peer.link" | "peer.list" | "peer.unlink" => "peer-delegate",
+        "peer.capabilities" | "peer.thread.launch" | "peer.thread.status"
+        | "peer.thread.read" | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
         "thread.send"
         | "thread.stop"
         | "thread.configure"
@@ -300,7 +303,7 @@ pub struct RequestResponse {
     pub answers: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Command {
     pub command_id: uuid::Uuid,
@@ -383,6 +386,9 @@ mod tests {
             "uploads.write",
             "devices.revoke",
             "command.get",
+            "peer.link", "peer.list", "peer.unlink", "peer.capabilities",
+            "peer.thread.launch", "peer.thread.status", "peer.thread.read",
+            "peer.thread.send", "peer.thread.stop",
         ]);
         for source in [reducer, runtime, server] {
             let pieces: Vec<_> = source.split('"').collect();
@@ -419,6 +425,7 @@ mod tests {
                 | "filesystem.browse" => "read",
                 "request.respond" => "approve",
                 "devices.list"
+                | "peer.link" | "peer.list" | "peer.unlink"
                 | "devices.pair"
                 | "devices.revoke"
                 | "server.validateRestart"
@@ -427,6 +434,8 @@ mod tests {
                 | "server.clientReady"
                 | "server.commitRestart"
                 | "server.stop" => "maintain",
+                "peer.capabilities" | "peer.thread.launch" | "peer.thread.status"
+                | "peer.thread.read" | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
                 _ => "operate",
             };
             assert_eq!(method_grant(method), Some(expected), "{method}");

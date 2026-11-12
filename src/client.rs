@@ -531,7 +531,7 @@ async fn connect(
         token
     };
     let endpoint = match remote {
-        Some(link) => format!("ws://{}/v1/ws", link.address()?),
+        Some(link) => format!("ws://{}/v1/ws", crate::peer::pin(link).await?.host),
         None => format!("ws://127.0.0.1:{}/v1/ws", discovery.port),
     };
     let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
@@ -1136,6 +1136,10 @@ pub async fn remote_rpc(
     method: &str,
     args: Value,
 ) -> Result<Value, String> {
+    remote_command(link, Command::new(method, args)).await
+}
+
+pub async fn remote_command(link: &crate::peer::Link, command: Command) -> Result<Value, String> {
     tokio::time::timeout(Duration::from_secs(8), async {
         let (mut socket, hello) = connect(
             &remote_discovery(link),
@@ -1146,12 +1150,11 @@ pub async fn remote_rpc(
             Some(link),
         )
         .await?;
-        if method == "filesystem.browse" && !supports_browse(&hello) {
+        if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),
             );
         }
-        let command = Command::new(method, args);
         socket
             .send(wire_command(&command))
             .await

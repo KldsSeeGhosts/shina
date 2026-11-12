@@ -14,6 +14,7 @@ pub struct Pairing {
 }
 impl Pairing {
     pub fn is_peer(&self) -> bool { self.peer }
+    #[cfg(test)]
     pub fn create(&mut self, now: u64) -> Result<serde_json::Value, String> {
         self.create_scoped(now, false)
     }
