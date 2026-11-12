@@ -846,6 +846,7 @@ impl State {
                     }
                 }
                 crate::client::Event::Receipt(command, value) => {
+                    self.apply_tab_receipt(&server, &command, &value);
                     if let Some(thread) = self
                         .threads
                         .iter_mut()
@@ -869,18 +870,6 @@ impl State {
                             self.restart_notice = Some(error.into());
                         }
                     } else if value["result"]["status"] == "accepted" {
-                        if matches!(
-                            command.method.as_str(),
-                            "thread.create"
-                                | "captain.open"
-                                | "captain.put"
-                                | "captain.reset"
-                                | "thread.fork"
-                                | "project.put"
-                        ) && let Some(id) = value["result"]["result"]["threadId"].as_u64()
-                        {
-                            self.client_select = Some(id as usize);
-                        }
                         if matches!(command.method.as_str(), "thread.stop" | "thread.rewind")
                             && let Some(id) = command.params["threadId"].as_u64()
                         {
@@ -975,6 +964,7 @@ impl State {
             self.client_select = None;
             self.select_thread(index);
         }
+        self.open_requested_tab();
         for (id, command_id) in self.client_recover.clone() {
             if self
                 .recovered_inputs
@@ -1043,6 +1033,7 @@ impl State {
         let active = self.current().id;
         let tabs = self.tabs.clone();
         let first = self.client_views["index"].is_null();
+        let restore_navigation = first && (self.tab_epoch == 0 || tabs.is_empty());
         let dark = if first {
             self.client_views["localUi"]["dark"]
                 .as_bool()
@@ -1062,8 +1053,8 @@ impl State {
         let scope = self.project_scope;
         let additional = self.scope_additional.clone();
         let mut old = std::mem::take(&mut self.threads);
-        // restore_global validates record references; retain only its server-owned records.
-        self.restore_global(&projection["index"])?;
+        // Validate server records without session restoration's navigation or draft creation.
+        self.restore_records(&projection["index"], false)?;
         let metadata = std::mem::take(&mut self.threads);
         for mut thread in metadata {
             if let Some(index) = old.iter().position(|old| old.id == thread.id) {
@@ -1100,6 +1091,10 @@ impl State {
                 view.apply(thread)?;
             }
         }
+        // A background deletion cannot close this device's tabs or move its focus.
+        // Retain their last view until the user closes them or an owned delete receipt arrives.
+        self.threads
+            .extend(old.into_iter().filter(|t| tabs.contains(&t.id)));
         self.active = self
             .threads
             .iter()
@@ -1109,16 +1104,19 @@ impl State {
             .into_iter()
             .filter(|id| self.threads.iter().any(|t| t.id == *id))
             .collect();
-        if !self.tabs.contains(&self.current().id) {
-            self.tabs.push(self.current().id);
-        }
         self.dark = dark;
         self.zoom = zoom;
         self.project_scope = scope;
         self.scope_additional = additional;
         self.recovery_notice = projection["recoveryNotice"].as_str().map(str::to_owned);
         if !self.undo.as_ref().is_some_and(|notice| {
-            notice.action == Action::Discard && notice.expires > lifecycle::now()
+            notice.action == Action::Discard
+                && notice.expires > lifecycle::now()
+                && notice.entries.iter().any(|e| {
+                    e.steps
+                        .iter()
+                        .any(|step| matches!(step, UndoStep::RestoreDraft(_)))
+                })
         }) {
             self.undo =
                 serde_json::from_value(projection["undo"].clone()).map_err(|e| e.to_string())?;
@@ -1135,9 +1133,9 @@ impl State {
             .map(Value::take)
             .unwrap_or(Value::Null);
         self.client_views = projection;
-        if !local.is_null() {
+        if first && !local.is_null() {
             self.restore_ui(&local)?;
-            if let Some(tabs) = local["tabs"].as_array() {
+            if restore_navigation && let Some(tabs) = local["tabs"].as_array() {
                 self.tabs = tabs
                     .iter()
                     .filter_map(Value::as_u64)
@@ -1145,16 +1143,18 @@ impl State {
                     .filter(|id| self.threads.iter().any(|t| t.id == *id))
                     .collect();
             }
-            if let Some(index) = self
-                .threads
-                .iter()
-                .position(|thread| json!(thread.id) == local["active"])
+            if restore_navigation
+                && let Some(index) = self
+                    .threads
+                    .iter()
+                    .position(|thread| json!(thread.id) == local["active"])
             {
                 self.active = index;
             }
         }
-        if !self.tabs.contains(&self.current().id) {
-            self.tabs.push(self.current().id);
+        if first {
+            let id = self.current().id;
+            insert_tab(&mut self.tabs, id, id);
         }
         self.client_recover
             .retain(|id, _| self.threads.iter().any(|thread| thread.id == *id));
@@ -1415,6 +1415,70 @@ impl State {
         });
     }
     pub(crate) fn forward(&mut self, method: &str, params: Value) -> bool {
+        let intent = match method {
+            "thread.create" | "thread.fork" | "captain.open" | "captain.put" | "project.put" => {
+                Some(TabIntent::Open(None))
+            }
+            "thread.delete" => params["threadId"].as_u64().map(|id| {
+                let roots: Vec<usize> = serde_json::from_value(params["threadIds"].clone())
+                    .unwrap_or_else(|_| vec![id as usize]);
+                TabIntent::Delete(
+                    roots
+                        .into_iter()
+                        .flat_map(|id| self.deletion_ids(id))
+                        .collect(),
+                )
+            }),
+            "thread.lifecycle" => params["threadId"].as_u64().and_then(|id| {
+                let thread = self.threads.iter().find(|t| t.id == id as usize)?;
+                match params["action"].as_str() {
+                    Some("settle") if !thread.life.settled() => {
+                        Some(TabIntent::Park(thread.id, true))
+                    }
+                    Some("archive") if !thread.archived() => {
+                        Some(TabIntent::Park(thread.id, false))
+                    }
+                    Some("snooze") => Some(TabIntent::Park(thread.id, true)),
+                    Some("discard") => Some(TabIntent::Park(thread.id, false)),
+                    _ => None,
+                }
+            }),
+            "thread.drop" if params["to"] == "Settled" => {
+                params["threadId"].as_u64().and_then(|id| {
+                    self.threads
+                        .iter()
+                        .find(|t| t.id == id as usize && !t.life.settled())
+                        .map(|t| TabIntent::Park(t.id, true))
+                })
+            }
+            "thread.undo" => {
+                let entries = self.undo.as_ref().map_or(&[][..], |n| &n.entries);
+                Some(TabIntent::Undo(
+                    entries
+                        .iter()
+                        .filter_map(|e| {
+                            self.undo_tabs
+                                .get(&(self.machines.selected.clone(), e.id))
+                                .map(|(p, _)| (e.id, *p))
+                        })
+                        .collect(),
+                    entries.iter().find_map(|e| {
+                        self.undo_tabs
+                            .get(&(self.machines.selected.clone(), e.id))
+                            .and_then(|(_, active)| active.then_some(e.id))
+                    }),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(intent) = intent
+            && let Some(result) = self.request_tab_command(method, params.clone(), intent)
+        {
+            if let Err(error) = result {
+                self.storage_error = Some(error);
+            }
+            return true;
+        }
         if let Some(result) = self.remote(method, params) {
             if let Err(error) = result {
                 self.storage_error = Some(error);
@@ -1422,6 +1486,136 @@ impl State {
             true
         } else {
             false
+        }
+    }
+    pub(super) fn request_new_thread(
+        &mut self,
+        project: Option<ProjectId>,
+        replace: Option<usize>,
+    ) {
+        let params = json!({"project":project,"seed":self.composer_seed(),
+            "occupiedDrafts":self.threads.iter().filter(|t| t.has_draft_content()).map(|t| t.id).collect::<Vec<_>>()});
+        if let Some(Err(error)) =
+            self.request_tab_command("thread.create", params, TabIntent::Open(replace))
+        {
+            self.storage_error = Some(error);
+        }
+    }
+    pub(super) fn request_tab_command(
+        &mut self,
+        method: &str,
+        params: Value,
+        intent: TabIntent,
+    ) -> Option<Result<uuid::Uuid, String>> {
+        let result = self.remote(method, params)?;
+        if let Ok(id) = result {
+            if matches!(&intent, TabIntent::Open(_) | TabIntent::Undo(..))
+                || matches!(&intent, TabIntent::Park(thread, _) if *thread == self.current().id)
+                || matches!(&intent, TabIntent::Delete(ids) if ids.contains(&self.current().id))
+            {
+                self.tab_epoch += 1;
+                self.requested_tab = None;
+            }
+            if let TabIntent::Park(thread, _) = &intent
+                && let Some(position) = self.tabs.iter().position(|id| id == thread)
+            {
+                self.undo_tabs.insert(
+                    (self.machines.selected.clone(), *thread),
+                    (position, self.current().id == *thread),
+                );
+            }
+            if let TabIntent::Delete(ids) = &intent {
+                for (position, thread) in self.tabs.iter().enumerate() {
+                    if ids.contains(thread) {
+                        self.undo_tabs.insert(
+                            (self.machines.selected.clone(), *thread),
+                            (position, self.current().id == *thread),
+                        );
+                    }
+                }
+            }
+            self.tab_intents.insert(
+                (self.machines.selected.clone(), id),
+                (self.tab_epoch, intent),
+            );
+        }
+        Some(result)
+    }
+    fn apply_tab_receipt(&mut self, server: &str, command: &Command, value: &Value) {
+        let Some((epoch, intent)) = self
+            .tab_intents
+            .remove(&(server.into(), command.command_id))
+        else {
+            return;
+        };
+        if value["result"]["status"] != "accepted" {
+            return;
+        }
+        match intent {
+            TabIntent::Open(replace) if epoch == self.tab_epoch => {
+                if let Some(id) = value["result"]["result"]["threadId"].as_u64() {
+                    self.requested_tab = Some((server.into(), id as usize, epoch, replace));
+                }
+            }
+            TabIntent::Park(id, settle) if epoch == self.tab_epoch || self.current().id != id => {
+                self.remove_tab(id, settle)
+            }
+            TabIntent::Delete(ids) => {
+                let active = self.current().id;
+                self.tabs.retain(|id| *id == active || !ids.contains(id));
+                if ids.contains(&active) && epoch == self.tab_epoch {
+                    self.remove_tab(active, false);
+                }
+            }
+            TabIntent::Undo(tabs, focus) if epoch == self.tab_epoch => {
+                self.requested_tab_restore = Some(RequestedTabRestore {
+                    server: server.into(),
+                    epoch,
+                    tabs,
+                    focus,
+                });
+                self.restore_requested_tabs();
+            }
+            _ => {}
+        }
+    }
+    fn open_requested_tab(&mut self) {
+        self.restore_requested_tabs();
+        let Some((server, id, epoch, replace)) = self.requested_tab.clone() else {
+            return;
+        };
+        if server != self.machines.selected || epoch != self.tab_epoch {
+            self.requested_tab = None;
+            return;
+        }
+        if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+            if let Some(old) = replace.filter(|old| *old != id && self.tabs.contains(old)) {
+                self.tabs.retain(|tab| *tab != id);
+                if let Some(position) = self.tabs.iter().position(|tab| *tab == old) {
+                    self.tabs[position] = id;
+                }
+            }
+            self.select_thread(index);
+        }
+    }
+    fn restore_requested_tabs(&mut self) {
+        let Some(request) = &self.requested_tab_restore else {
+            return;
+        };
+        if request.server != self.machines.selected || request.epoch != self.tab_epoch {
+            self.requested_tab_restore = None;
+            return;
+        }
+        if request
+            .tabs
+            .iter()
+            .all(|(id, _)| self.threads.iter().any(|t| t.id == *id))
+        {
+            let request = self
+                .requested_tab_restore
+                .take()
+                .expect("pending tab restore");
+            self.restore_tabs(request.tabs, request.focus);
         }
     }
 
@@ -1525,21 +1719,14 @@ impl State {
                 if project.is_some() && self.project(project).is_none() {
                     return Err("Unknown project.".into());
                 }
-                let occupied = args["occupiedDrafts"].as_array();
-                let reuse_occupied = self
-                    .threads
-                    .iter()
-                    .find(|t| t.project == project && t.blank_draft())
-                    .is_some_and(|t| occupied.is_some_and(|ids| ids.contains(&json!(t.id))));
-                if reuse_occupied {
-                    let mut thread = Thread::new(self.next_id);
-                    self.next_id += 1;
-                    thread.project = project;
-                    self.threads.push(thread);
-                    self.select_thread(self.threads.len() - 1);
+                let occupied: Vec<usize> =
+                    serde_json::from_value(args["occupiedDrafts"].clone()).unwrap_or_default();
+                let seed = if args["seed"].is_object() {
+                    args["seed"].clone()
                 } else {
-                    self.new_thread_in(project);
-                }
+                    self.composer_seed()
+                };
+                self.create_thread_in(project, &occupied, &seed);
                 return Ok(json!({"threadId":self.current().id}));
             }
             "thread.rename" => {
@@ -1552,14 +1739,27 @@ impl State {
                 }
             }
             "thread.delete" => {
-                self.delete_thread = Some(self.current().id);
-                self.confirm_delete();
+                if args["blankOnly"] == true {
+                    if self.current().blank_draft() {
+                        self.remove_threads(&std::collections::HashSet::from([self.current().id]));
+                    }
+                } else {
+                    self.delete_thread = Some(self.current().id);
+                    self.delete_roots =
+                        serde_json::from_value(args["threadIds"].clone()).unwrap_or_default();
+                    self.confirm_delete();
+                }
             }
             "thread.lifecycle" => {
                 let id = self.current().id;
                 match args["action"].as_str() {
                     Some("pin") => self.pin_thread(id),
-                    Some("archive") => self.archive_thread(id),
+                    Some("archive") => self.archive_thread_record(id, args["keepBlank"] == true),
+                    Some("discard") => self.discard_draft(id),
+                    Some("unarchive") => {
+                        self.invalidate_undo(id);
+                        self.current_mut().life.archived_at = None;
+                    }
                     Some("settle") => self.settle_thread(id),
                     Some("unsnooze") => self.unsnooze_thread(id),
                     Some("snooze") => {
@@ -1580,7 +1780,12 @@ impl State {
                 }
             }
             "thread.undo" => {
-                if json!(self.undo) != args["expected"] {
+                if self
+                    .undo
+                    .as_ref()
+                    .is_none_or(|notice| notice.expires <= lifecycle::now())
+                    || json!(self.undo) != args["expected"]
+                {
                     return Err("The undo action changed or expired.".into());
                 }
                 self.undo_thread_action();
@@ -1806,6 +2011,481 @@ impl Thread {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeState;
+
+    fn tab_client() -> (State, State, tokio::sync::mpsc::Receiver<Command>) {
+        let mut server = State::new(".".into(), false);
+        server.threads = (1..=4)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Thread {id}");
+                thread.renamed = true;
+                thread.project = Some(1);
+                thread
+            })
+            .collect();
+        server.next_id = 5;
+        server.tabs = vec![1, 2, 3];
+        let mut state = State::new(".".into(), false);
+        let mut client = crate::client::Client::new(state.data_dir.clone());
+        let mut commands = client.test_commands();
+        state.client = Some(client);
+        state.apply_projection(server.projection()).unwrap();
+        state.tabs = vec![1, 2, 3];
+        state.select_thread(1);
+        while commands.try_recv().is_ok() {}
+        (state, server, commands)
+    }
+
+    fn accepted(result: Value) -> Value {
+        json!({"result":{"status":"accepted","result":result}})
+    }
+
+    #[test]
+    fn projections_never_open_server_tabs_or_override_a_later_click() {
+        let (mut state, mut server, _) = tab_client();
+        state.client_views["localUi"] = json!({"active":1,"tabs":[1]});
+        state.select_thread(2);
+        let before = (state.tabs.clone(), state.current().id);
+        server.select_thread(3);
+        server.new_thread_in(None);
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!((state.tabs.clone(), state.current().id), before);
+        server.request_delete(3);
+        server.confirm_delete();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!((state.tabs.clone(), state.current().id), before);
+    }
+
+    #[test]
+    fn first_projection_restores_the_device_session_including_blank_tabs() {
+        let (mut state, mut server, _) = tab_client();
+        server.new_thread_in(None);
+        let blank = server.current().id;
+        let mut ui = state.ui_snapshot();
+        ui["active"] = json!(blank);
+        ui["tabs"] = json!([2, blank, 1]);
+        state.client_views = json!({"localUi":ui});
+        state.tab_epoch = 0;
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.tabs, [2, blank, 1]);
+        assert_eq!(state.current().id, blank);
+    }
+
+    #[test]
+    fn a_click_before_the_first_projection_wins_over_the_saved_active_thread() {
+        let (mut state, server, _) = tab_client();
+        let mut ui = state.ui_snapshot();
+        ui["active"] = json!(1);
+        ui["tabs"] = json!([1]);
+        state.client_views = json!({"localUi":ui});
+        state.select_thread(2);
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.current().id, 3);
+        assert_eq!(state.tabs, [1, 2, 3]);
+    }
+
+    #[test]
+    fn only_owned_current_open_receipts_can_open_tabs_even_before_projection() {
+        let (mut state, mut server, mut commands) = tab_client();
+        let other = Command::new("thread.create", json!({}));
+        state.apply_tab_receipt("local", &other, &accepted(json!({"threadId":4})));
+        state.open_requested_tab();
+        assert_eq!(state.tabs, [1, 2, 3]);
+        state.new_thread_in(None);
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "thread.create")
+            .unwrap();
+        let result = server.execute_command(&command).unwrap();
+        let fresh = result["threadId"].as_u64().unwrap() as usize;
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        state.open_requested_tab();
+        assert_eq!(state.current().id, 2);
+        state.apply_projection(server.projection()).unwrap();
+        state.open_requested_tab();
+        assert_eq!(state.tabs, [1, 2, fresh, 3]);
+        assert_eq!(state.current().id, fresh);
+
+        state.new_thread_in(Some(1));
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "thread.create")
+            .unwrap();
+        state.select_thread(0);
+        let before = state.tabs.clone();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        state.open_requested_tab();
+        assert_eq!(state.current().id, 1);
+        assert_eq!(state.tabs, before);
+    }
+
+    #[test]
+    fn client_parks_and_undo_use_device_tab_positions_not_server_positions() {
+        for action in ["settle", "archive", "delete", "drop"] {
+            let (mut state, mut server, mut commands) = tab_client();
+            server.tabs = vec![4, 3, 2, 1];
+            if action == "delete" {
+                state.request_delete(2);
+                state.confirm_delete();
+            } else if action == "settle" {
+                state.settle_thread(2);
+            } else if action == "drop" {
+                state.drop_thread(2, Section::Settled, None);
+            } else {
+                state.archive_thread(2);
+            }
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| c.method != "thread.visit")
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_projection(server.projection()).unwrap();
+            assert_eq!(state.current().id, 2, "projection must not navigate");
+            assert!(
+                state
+                    .tab_intents
+                    .contains_key(&("local".into(), command.command_id)),
+                "missing owned {action} intent"
+            );
+            assert_eq!(
+                state.tab_intents[&("local".into(), command.command_id)].0,
+                state.tab_epoch,
+                "projection changed the navigation epoch"
+            );
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            assert_eq!(state.tabs, [1, 3], "{action}");
+            assert_eq!(state.current().id, 3);
+            state.undo_thread_action();
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| c.method == "thread.undo")
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_projection(server.projection()).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            assert_eq!(state.tabs, [1, 2, 3], "{action}");
+            assert_eq!(state.current().id, 2);
+        }
+    }
+
+    #[test]
+    fn client_blank_tab_close_deletes_draft_but_written_drafts_survive() {
+        let (mut state, mut server, mut commands) = tab_client();
+        server.threads[1] = Thread::new(2);
+        state.apply_projection(server.projection()).unwrap();
+        state.close_tab(2);
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "thread.delete")
+            .unwrap();
+        assert_eq!(command.params["blankOnly"], true);
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, [1, 3]);
+        assert_eq!(state.current().id, 3);
+        assert!(!server.threads.iter().any(|t| t.id == 2));
+        state.apply_projection(server.projection()).unwrap();
+        assert!(!state.threads.iter().any(|t| t.id == 2));
+        state.current_mut().draft.replace_text("Keep this");
+        state.close_tab(3);
+        assert!(
+            state
+                .threads
+                .iter()
+                .any(|t| t.id == 3 && t.draft.text == "Keep this")
+        );
+        assert_eq!(state.current().id, 1);
+    }
+
+    #[test]
+    fn client_last_archive_discard_and_delete_tabs_wait_for_their_own_replacement_receipt() {
+        for action in ["archive", "discard", "delete"] {
+            let (mut state, mut server, mut commands) = tab_client();
+            state.tabs = vec![2];
+            match action {
+                "archive" => state.archive_thread(2),
+                "discard" => {
+                    state.current_mut().draft.replace_text("Discarded");
+                    state.discard_draft(2);
+                }
+                _ => {
+                    state.request_delete(2);
+                    state.confirm_delete();
+                }
+            }
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| matches!(c.method.as_str(), "thread.lifecycle" | "thread.delete"))
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_projection(server.projection()).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            assert_eq!(state.tabs, [2], "keep a tab while create is pending");
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| c.method == "thread.create")
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            state.apply_projection(server.projection()).unwrap();
+            state.open_requested_tab();
+            assert!(state.current().blank_draft());
+            assert_eq!(state.current().project, Some(1));
+            assert_eq!(state.tabs, [state.current().id]);
+        }
+    }
+
+    #[test]
+    fn client_last_settle_tab_replaces_itself_with_a_sidebar_row() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.tabs = vec![2];
+        state.settle_thread(2);
+        let command = commands.try_recv().unwrap();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        let order = state.sidebar_threads();
+        let position = order
+            .iter()
+            .position(|i| state.threads[*i].id == 2)
+            .unwrap();
+        let expected = state.threads[order[(position + 1) % order.len()]].id;
+        assert_eq!(state.tabs, [expected]);
+        assert_eq!(state.current().id, expected);
+    }
+
+    #[test]
+    fn client_discard_archives_without_transmitting_the_draft_and_undo_restores_it() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state
+            .current_mut()
+            .draft
+            .replace_text("Private discarded text");
+        state.discard_draft(2);
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.method, "thread.lifecycle");
+        assert!(
+            !command
+                .params
+                .to_string()
+                .contains("Private discarded text")
+        );
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, [1, 3]);
+        assert!(
+            server
+                .threads
+                .iter()
+                .find(|t| t.id == 2)
+                .unwrap()
+                .archived()
+        );
+        state.undo_thread_action();
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.params["action"] == "unarchive")
+            .unwrap();
+        server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.current().draft.text, "Private discarded text");
+        assert_eq!(state.tabs, [1, 2, 3]);
+        assert!(!state.current().archived());
+    }
+
+    #[test]
+    fn client_captain_reset_replaces_the_old_home_tab() {
+        let (mut state, mut server, mut commands) = tab_client();
+        server.captains = Captain::presets();
+        server.open_captain(0);
+        let old = server.current().id;
+        state.apply_projection(server.projection()).unwrap();
+        state.select_thread(state.threads.iter().position(|t| t.id == old).unwrap());
+        let tabs = state.tabs.clone();
+        state.reset_captain_conversation(0).unwrap();
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "captain.reset")
+            .unwrap();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        state.open_requested_tab();
+        let fresh = state.current().id;
+        assert_ne!(fresh, old);
+        assert_eq!(
+            state.tabs,
+            tabs.into_iter()
+                .map(|id| if id == old { fresh } else { id })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn client_delete_closes_descendant_tabs_and_undo_focuses_the_original_active_tab() {
+        let (mut state, mut server, mut commands) = tab_client();
+        server.threads[1].parent = Some(1);
+        server.threads[1].delegated = true;
+        server.threads[2].parent = Some(1);
+        server.threads[2].delegated = true;
+        state.apply_projection(server.projection()).unwrap();
+        state.select_thread(3);
+        state.select_thread(1);
+        let before = state.tabs.clone();
+        state.request_delete(1);
+        state.confirm_delete();
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "thread.delete")
+            .unwrap();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, [4]);
+        assert_eq!(state.current().id, 4);
+        state.undo_thread_action();
+        let command = std::iter::from_fn(|| commands.try_recv().ok())
+            .find(|c| c.method == "thread.undo")
+            .unwrap();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, before);
+        assert_eq!(state.current().id, 2);
+    }
+
+    #[test]
+    fn client_bulk_delete_is_one_undoable_action_and_keeps_an_unaffected_active_tab() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.selected_threads = vec![1, 3];
+        state.request_delete(1);
+        state.confirm_delete();
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.params["threadIds"], json!([1, 3]));
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, [2]);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(server.undo.as_ref().unwrap().entries.len(), 2);
+        state.undo_thread_action();
+        let command = commands.try_recv().unwrap();
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        assert_eq!(state.tabs, [1, 2, 3]);
+    }
+
+    #[test]
+    fn delete_undo_waits_for_its_projection_and_a_later_click_can_cancel_navigation() {
+        for abandon in [false, true] {
+            let (mut state, mut server, mut commands) = tab_client();
+            state.request_delete(2);
+            state.confirm_delete();
+            let command = commands.try_recv().unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_projection(server.projection()).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            state.apply_projection(server.projection()).unwrap();
+            assert!(!state.threads.iter().any(|t| t.id == 2));
+            state.undo_thread_action();
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| c.method == "thread.undo")
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            assert_eq!(state.current().id, 3);
+            assert_eq!(state.tabs, [1, 3]);
+            if abandon {
+                state.select_thread(0);
+            }
+            state.apply_projection(server.projection()).unwrap();
+            state.open_requested_tab();
+            if abandon {
+                assert_eq!(state.current().id, 1);
+                assert_eq!(state.tabs, [1, 3]);
+            } else {
+                assert_eq!(state.current().id, 2);
+                assert_eq!(state.tabs, [1, 2, 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn client_empty_draft_archive_and_discard_restore_the_tab_on_undo() {
+        for action in [Action::Archive, Action::Discard] {
+            let (mut state, mut server, mut commands) = tab_client();
+            server.threads[1] = Thread::new(2);
+            state.apply_projection(server.projection()).unwrap();
+            if action == Action::Archive {
+                state.archive_thread(2);
+            } else {
+                state.discard_draft(2);
+            }
+            let command = commands.try_recv().unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_projection(server.projection()).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            state.apply_projection(server.projection()).unwrap();
+            assert_eq!(state.tabs, [1, 3]);
+            assert_eq!(state.undo.as_ref().unwrap().action, action);
+            state.undo_thread_action();
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|c| c.method == "thread.undo")
+                .unwrap();
+            let result = server.execute_command(&command).unwrap();
+            state.apply_tab_receipt("local", &command, &accepted(result));
+            state.apply_projection(server.projection()).unwrap();
+            state.open_requested_tab();
+            assert_eq!(state.current().id, 2);
+            assert_eq!(state.tabs, [1, 2, 3]);
+            assert!(state.undo.is_none());
+        }
+    }
+
+    #[test]
+    fn the_latest_create_request_wins_without_waiting_for_an_earlier_receipt() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.new_thread_in(None);
+        state.new_thread_in(Some(1));
+        let creates: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(|c| c.method == "thread.create")
+            .collect();
+        assert_eq!(creates.len(), 2);
+        let first = server.execute_command(&creates[0]).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &creates[0], &accepted(first));
+        state.open_requested_tab();
+        assert_eq!(state.current().id, 2);
+        let second = server.execute_command(&creates[1]).unwrap();
+        let fresh = second["threadId"].as_u64().unwrap() as usize;
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &creates[1], &accepted(second));
+        state.open_requested_tab();
+        assert_eq!(state.current().id, fresh);
+        assert_eq!(state.tabs, [1, 2, fresh, 3]);
+    }
+
+    #[test]
+    fn client_create_carries_the_composer_selection_captured_on_this_device() {
+        let (mut state, mut server, mut commands) = tab_client();
+        let source = &mut server.threads[1];
+        source.harness = "codex".into();
+        source.models = vec![AgentModel::from_harness_value(&json!({"provider":"codex","id":"chosen","name":"Chosen","reasoningLevels":["high"]}), "codex").unwrap()];
+        source.models[0].thinking_levels = vec!["high".into()];
+        source.selected_model = Some(("codex".into(), "chosen".into()));
+        source.selected_thinking = Some("high".into());
+        state.apply_projection(server.projection()).unwrap();
+        state.new_thread_in(Some(1));
+        let command = commands.try_recv().unwrap();
+        server.threads[1].selected_model = Some(("codex".into(), "changed-elsewhere".into()));
+        let result = server.execute_command(&command).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        state.apply_tab_receipt("local", &command, &accepted(result));
+        state.open_requested_tab();
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(
+            state.current().selected_model,
+            Some(("codex".into(), "chosen".into()))
+        );
+        assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+    }
 
     #[test]
     fn machine_views_isolate_equal_thread_ids_drafts_projects_and_commands() {

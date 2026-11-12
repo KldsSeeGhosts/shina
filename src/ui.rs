@@ -9705,6 +9705,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tab_transitions_always_render_the_active_thread_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("First draft");
+            rt.state.new_thread_in(None);
+            rt.state.current_mut().draft.replace_text("Second draft");
+            let second = rt.state.current().id;
+            for action in 0..5 {
+                match action {
+                    0 => rt.state.select_thread(0),
+                    1 => rt.state.close_tab(second),
+                    2 => rt.state.settle_thread(rt.state.current().id),
+                    3 => rt.state.archive_thread(rt.state.current().id),
+                    _ => rt.state.undo_thread_action(),
+                }
+                rt.invalidate();
+                rt.frame(action as f64 * 2.0);
+                rt.frame(action as f64 * 2.0 + 1.0);
+                assert!(
+                    rt.state.tabs.contains(&rt.state.current().id),
+                    "{width}, {action}"
+                );
+                assert!(rt.presented("active-tab").is_some(), "{width}, {action}");
+                assert!(rt.presented("thread-tabs").is_some(), "{width}, {action}");
+            }
+        }
+    }
+
+    #[test]
     fn a_docked_brief_has_one_control_and_routine_schedules_are_whole() {
         let mut rt = runtime(1440.0);
         crate::captain_brief_demo(&mut rt.state);

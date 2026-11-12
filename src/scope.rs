@@ -111,7 +111,11 @@ impl State {
     }
 
     pub fn reset_captain_conversation(&mut self, captain: usize) -> Result<(), String> {
-        if let Some(result) = self.remote("captain.reset", json!({"captain":captain})) {
+        if let Some(result) = self.request_tab_command(
+            "captain.reset",
+            json!({"captain":captain}),
+            TabIntent::Open(self.captain_home(captain)),
+        ) {
             return result.map(|_| ());
         }
         self.require_captain(captain)?;
@@ -148,6 +152,9 @@ impl State {
             }
         }
         self.sync_memory_links();
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| Some(**tab) == old) {
+            *tab = id;
+        }
         self.open_captain(captain);
         Ok(())
     }
@@ -587,8 +594,15 @@ mod tests {
             .unwrap();
         let task = state.tasks[0].id.clone();
         let delivery = state.tasks[0].delivery_id.clone();
+        let tabs = state.tabs.clone();
         state.reset_captain_conversation(0).unwrap();
         let new = state.current().id;
+        assert_eq!(
+            state.tabs,
+            tabs.iter()
+                .map(|id| if *id == old { new } else { *id })
+                .collect::<Vec<_>>()
+        );
         assert_ne!(old, new);
         assert!(state.current().session.is_none());
         assert!(!state.current().harness_context_sent);

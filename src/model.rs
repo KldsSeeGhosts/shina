@@ -2006,6 +2006,46 @@ impl Thread {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TabIntent {
+    Open(Option<usize>),
+    Park(usize, bool),
+    Delete(std::collections::HashSet<usize>),
+    Undo(Vec<(usize, usize)>, Option<usize>),
+}
+
+struct DeletedRecords {
+    tasks: Vec<Task>,
+    homes: Vec<(usize, usize)>,
+    projects: Vec<(ProjectId, usize)>,
+}
+
+struct RequestedTabRestore {
+    server: String,
+    epoch: u64,
+    tabs: Vec<(usize, usize)>,
+    focus: Option<usize>,
+}
+
+/// Insert beside the active tab without moving an already-open tab.
+fn insert_tab(tabs: &mut Vec<usize>, active: usize, id: usize) {
+    if !tabs.contains(&id) {
+        let position = tabs
+            .iter()
+            .position(|tab| *tab == active)
+            .map_or(tabs.len(), |i| i + 1);
+        tabs.insert(position, id);
+    }
+}
+
+/// Return the right neighbour, or the left neighbour at the end of the strip.
+fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
+    let position = tabs.iter().position(|tab| *tab == id)?;
+    tabs.get(position + 1)
+        .or_else(|| position.checked_sub(1).and_then(|i| tabs.get(i)))
+        .copied()
+}
+
 pub struct State {
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
@@ -2017,6 +2057,13 @@ pub struct State {
     persist_transcripts: bool,
     client_views: Value,
     client_select: Option<usize>,
+    tab_epoch: u64,
+    tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
+    requested_tab: Option<(String, usize, u64, Option<usize>)>,
+    requested_tab_restore: Option<RequestedTabRestore>,
+    undo_tabs: std::collections::HashMap<(String, usize), (usize, bool)>,
+    deleted_threads: Vec<Thread>,
+    deleted_records: Option<DeletedRecords>,
     client_recover: std::collections::HashMap<usize, uuid::Uuid>,
     recovered_inputs: std::collections::BTreeMap<usize, Value>,
     pub background: background::Background,
@@ -2187,6 +2234,13 @@ impl State {
             persist_transcripts: false,
             client_views: json!({}),
             client_select: None,
+            tab_epoch: 0,
+            tab_intents: Default::default(),
+            requested_tab: None,
+            requested_tab_restore: None,
+            undo_tabs: Default::default(),
+            deleted_threads: Vec::new(),
+            deleted_records: None,
             client_recover: Default::default(),
             recovered_inputs: Default::default(),
             background: Default::default(),
@@ -2309,6 +2363,8 @@ impl State {
         };
         if notice.expires <= at {
             self.undo = None;
+            self.deleted_threads.clear();
+            self.deleted_records = None;
             return false;
         }
         if event.is_command('z') && !event.mods.shift && (!text_field || notice.owns_text_key) {
@@ -2324,6 +2380,16 @@ impl State {
         if index >= self.threads.len() {
             return;
         }
+        let active = self.threads.get(self.active).map_or(0, |t| t.id);
+        insert_tab(&mut self.tabs, active, self.threads[index].id);
+        self.tab_epoch += 1;
+        self.requested_tab = None;
+        self.requested_tab_restore = None;
+        self.focus_thread(index);
+    }
+    /// Focus an existing tab. Background reducers must not open tabs.
+    fn focus_thread(&mut self, index: usize) {
+        debug_assert!(self.tabs.contains(&self.threads[index].id));
         self.active = index;
         if !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
@@ -2333,10 +2399,6 @@ impl State {
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
         }
-        if !self.tabs.contains(&id) {
-            self.tabs.push(id);
-        }
-        self.drop_blank_tabs();
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
         if !self.in_scope(self.current()) {
             self.project_scope = ProjectScope::All;
@@ -2344,52 +2406,25 @@ impl State {
         }
         self.checkpoint();
     }
-    /// As in KSG Code, a blank draft is only a landing page: it keeps a tab while it is open and
-    /// loses it once another thread opens. new_thread_in reopens the same draft later.
-    fn drop_blank_tabs(&mut self) {
-        let current = self.current().id;
-        let threads = &self.threads;
-        self.tabs.retain(|&tab| {
-            tab == current || !threads.iter().any(|t| t.id == tab && t.blank_draft())
-        });
-    }
-    /// Closing a blank draft's tab closes the draft. Otherwise the selection returns to the last
-    /// remaining tab.
+    /// Closing a blank draft also deletes it. Written drafts survive without a tab.
     pub fn close_tab(&mut self, id: usize) {
-        if self.client.is_some() {
-            if self.tabs.len() > 1 {
-                self.tabs.retain(|tab| *tab != id);
-                if self.current().id == id
-                    && let Some(index) = self
-                        .threads
-                        .iter()
-                        .position(|t| self.tabs.last() == Some(&t.id))
-                {
-                    self.select_thread(index);
-                }
-                self.checkpoint();
-            }
+        if !self.tabs.contains(&id) {
             return;
         }
         let Some(index) = self.threads.iter().position(|t| t.id == id) else {
             return;
         };
         if self.threads[index].blank_draft() {
+            if self.forward("thread.delete", json!({"threadId":id,"blankOnly":true})) {
+                return;
+            }
             self.remove_threads(&std::collections::HashSet::from([id]));
             return;
         }
         if self.tabs.len() <= 1 {
             return;
         }
-        self.tabs.retain(|&tab| tab != id);
-        if self.current().id == id
-            && let Some(index) = self
-                .threads
-                .iter()
-                .position(|t| Some(&t.id) == self.tabs.last())
-        {
-            self.select_thread(index);
-        }
+        self.remove_tab(id, false);
         self.checkpoint();
     }
     pub fn project(&self, id: Option<ProjectId>) -> Option<&Project> {
@@ -3005,8 +3040,8 @@ impl State {
             } else {
                 std::mem::take(&mut self.delete_roots)
             };
-            for id in roots {
-                self.forward("thread.delete", json!({"threadId":id}));
+            if let Some(id) = roots.first() {
+                self.forward("thread.delete", json!({"threadId":id,"threadIds":roots}));
             }
             self.delete_thread = None;
             return;
@@ -3023,16 +3058,70 @@ impl State {
             .into_iter()
             .flat_map(|id| self.deletion_ids(id))
             .collect();
+        self.delete_with_undo(ids, Action::Delete);
+    }
+    fn delete_with_undo(&mut self, ids: std::collections::HashSet<usize>, action: Action) {
+        self.deleted_threads.clear();
+        self.deleted_records = Some(DeletedRecords {
+            tasks: self
+                .tasks
+                .iter()
+                .filter(|task| {
+                    ids.contains(&task.parent_thread_id) || ids.contains(&task.child_thread_id)
+                })
+                .cloned()
+                .collect(),
+            homes: self
+                .captain_homes
+                .iter()
+                .filter(|(_, home)| ids.contains(home))
+                .map(|(captain, home)| (*captain, *home))
+                .collect(),
+            projects: self
+                .projects
+                .entries
+                .iter()
+                .filter_map(|project| {
+                    project
+                        .captain_thread
+                        .filter(|id| ids.contains(id))
+                        .map(|home| (project.id, home))
+                })
+                .collect(),
+        });
+        self.undo = None;
         for id in &ids {
-            self.invalidate_undo(*id);
+            if let Some(index) = self.threads.iter().position(|t| t.id == *id) {
+                self.remember(Action::Delete, index);
+            }
         }
         self.remove_threads(&ids);
+        if let Some(notice) = &mut self.undo {
+            notice.action = action;
+        }
     }
     /// Removes threads and their records, then selects the survivor and saves. The caller
     /// handles undo and tab refusals.
     fn remove_threads(&mut self, ids: &std::collections::HashSet<usize>) {
         let current = self.current().id;
         let project = self.current().project;
+        let seed = self.composer_seed();
+        let neighbour = self
+            .tabs
+            .iter()
+            .position(|id| *id == current)
+            .and_then(|position| {
+                self.tabs[position + 1..]
+                    .iter()
+                    .find(|id| !ids.contains(id))
+                    .or_else(|| {
+                        self.tabs[..position]
+                            .iter()
+                            .rev()
+                            .find(|id| !ids.contains(id))
+                    })
+                    .copied()
+            });
         let mut parents = Vec::new();
         for thread in &mut self.threads {
             if ids.contains(&thread.id) {
@@ -3048,7 +3137,21 @@ impl State {
                 }
             }
         }
-        self.threads.retain(|t| !ids.contains(&t.id));
+        let mut removed = Vec::new();
+        self.threads.retain_mut(|thread| {
+            if ids.contains(&thread.id) {
+                // Keep the disconnected in-memory transcript for the five-second delete undo.
+                if self.undo.as_ref().is_some_and(|n| {
+                    n.action == Action::Delete && n.entries.iter().any(|e| e.id == thread.id)
+                }) {
+                    removed.push(std::mem::replace(thread, Thread::new(0)));
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.deleted_threads.extend(removed);
         self.captain_homes.retain(|_, home| !ids.contains(home));
         self.sync_memory_links();
         self.tasks.retain(|task| {
@@ -3081,12 +3184,12 @@ impl State {
             .threads
             .iter()
             .position(|t| t.id == current)
-            .or_else(|| self.threads.iter().position(|t| self.tabs.contains(&t.id)))
+            .or_else(|| self.threads.iter().position(|t| Some(t.id) == neighbour))
             .unwrap_or(0);
-        if self.threads.is_empty() {
-            self.new_thread_in(project);
-        } else {
-            self.select_thread(self.active);
+        if ids.contains(&current) && neighbour.is_none() {
+            self.create_thread_in(project, &[], &seed);
+        } else if ids.contains(&current) {
+            self.focus_thread(self.active);
         }
         self.checkpoint();
     }
@@ -3120,9 +3223,12 @@ impl State {
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
+        self.archive_thread_record(id, false);
+    }
+    fn archive_thread_record(&mut self, id: usize, keep_blank: bool) {
         if self.forward(
             "thread.lifecycle",
-            json!({"threadId":id,"action":"archive"}),
+            json!({"threadId":id,"action":"archive","keepBlank":keep_blank}),
         ) {
             return;
         }
@@ -3138,9 +3244,8 @@ impl State {
             return;
         }
         // A blank draft has nothing to keep, so archiving it never leaves an archive row.
-        if self.threads[index].blank_draft() {
-            self.invalidate_undo(id);
-            self.remove_threads(&std::collections::HashSet::from([id]));
+        if self.threads[index].blank_draft() && !keep_blank {
+            self.delete_with_undo(std::collections::HashSet::from([id]), Action::Archive);
             return;
         }
         if self.threads[index].archived() {
@@ -3150,8 +3255,7 @@ impl State {
             self.remember(Action::Archive, index);
             self.threads[index].life.archived_at = Some(lifecycle::now());
             self.threads[index].disconnect();
-            self.tabs.retain(|t| *t != id);
-            self.advance_parked(id);
+            self.remove_tab(id, false);
         }
         self.checkpoint();
     }
@@ -3197,10 +3301,21 @@ impl State {
         }
     }
     fn remember(&mut self, action: Action, index: usize) {
+        if action != Action::Delete {
+            self.deleted_threads.clear();
+            self.deleted_records = None;
+        }
         let t = &self.threads[index];
         let mut steps = lifecycle::plan_undo(action, &t.life, &t.draft.text);
         if action == Action::Discard && !t.draft_images.is_empty() {
             steps.push(UndoStep::RestoreImages(t.draft_images.clone()));
+        }
+        if matches!(
+            action,
+            Action::Settle | Action::Snooze | Action::Archive | Action::Discard | Action::Delete
+        ) && let Some(position) = self.tabs.iter().position(|id| *id == t.id)
+        {
+            steps.push(UndoStep::RestoreTab(position, self.current().id == t.id));
         }
         UndoNotice::push(&mut self.undo, action, t.id, steps, lifecycle::now());
     }
@@ -3239,32 +3354,47 @@ impl State {
         self.checkpoint();
     }
     fn advance_parked(&mut self, id: usize) {
-        if self.current().id != id {
+        self.remove_tab(id, true);
+    }
+    /// Ported from KSG Code's Sidebar settle advance and useThreadActions archive fallback.
+    /// Existing tabs take precedence. Only the last tab can open a replacement.
+    fn remove_tab(&mut self, id: usize, settle: bool) {
+        if !self.tabs.contains(&id) {
             return;
         }
+        if self.current().id != id {
+            self.tabs.retain(|tab| *tab != id);
+            return;
+        }
+        self.tab_epoch += 1;
+        if let Some(neighbour) = tab_neighbour(&self.tabs, id)
+            && let Some(index) = self.threads.iter().position(|t| t.id == neighbour)
+        {
+            self.tabs.retain(|tab| *tab != id);
+            self.focus_thread(index);
+            return;
+        }
+        let project = self.current().project;
         let order = self.sidebar_threads();
         let start = order
             .iter()
             .position(|i| self.threads[*i].id == id)
             .unwrap_or(0);
-        for offset in 1..=order.len() {
+        for offset in 1..=if settle { order.len() } else { 0 } {
             let i = order[(start + offset) % order.len()];
             let t = &self.threads[i];
             if self.valid_after_park(t, id) {
+                self.tabs.retain(|tab| *tab != id);
                 self.select_thread(i);
                 return;
             }
         }
-        let project = self.current().project;
-        if let Some(index) = self
-            .open_tabs()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .find(|&i| self.valid_after_park(&self.threads[i], id))
-        {
-            self.select_thread(index);
+        if self.client.is_some() {
+            // Keep the shown tab until this device's create receipt can replace it.
+            self.request_new_thread(project, Some(id));
             return;
         }
+        self.tabs.retain(|tab| *tab != id);
         self.new_thread_in(project);
     }
     fn valid_after_park(&self, t: &Thread, parked: usize) -> bool {
@@ -3274,14 +3404,6 @@ impl State {
                 self.thread_section(t, lifecycle::now()),
                 Section::Snoozed | Section::Settled
             )
-    }
-    /// Tabs whose thread still exists, including drafts and hidden captain homes.
-    fn open_tabs(&self) -> impl Iterator<Item = usize> + '_ {
-        self.tabs.iter().filter_map(|id| {
-            self.threads
-                .iter()
-                .position(|t| t.id == *id && !t.archived())
-        })
     }
     pub fn can_snooze(&self, id: usize) -> bool {
         self.threads.iter().find(|t| t.id == id).is_some_and(|t| {
@@ -3344,9 +3466,27 @@ impl State {
     pub fn discard_draft(&mut self, id: usize) {
         if self.client.is_some() {
             if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+                if self.threads[index].blank_draft() {
+                    self.forward(
+                        "thread.lifecycle",
+                        json!({"threadId":id,"action":"discard"}),
+                    );
+                    return;
+                }
                 self.remember(Action::Discard, index);
                 self.threads[index].draft.replace_text("");
                 self.threads[index].draft_images.clear();
+                if self.threads[index].is_draft() {
+                    // Draft text belongs to this device. Keep the server record so local Undo
+                    // can restore it without sending the discarded text to the server.
+                    self.forward(
+                        "thread.lifecycle",
+                        json!({"threadId":id,"action":"archive","keepBlank":true}),
+                    );
+                    self.threads[index].life.archived_at = Some(lifecycle::now());
+                } else {
+                    self.remove_tab(id, false);
+                }
                 self.checkpoint();
             }
             return;
@@ -3354,13 +3494,12 @@ impl State {
         let Some(i) = self.threads.iter().position(|t| t.id == id) else {
             return;
         };
-        // A blank draft holds nothing to undo and never becomes an archive row.
+        // Keep an empty draft only in the short undo window, never as an archive row.
         if self.threads[i].blank_draft()
             && self.threads[i].messages.is_empty()
             && self.threads[i].session.is_none()
         {
-            self.invalidate_undo(id);
-            self.remove_threads(&std::collections::HashSet::from([id]));
+            self.delete_with_undo(std::collections::HashSet::from([id]), Action::Discard);
             return;
         }
         self.remember(Action::Discard, i);
@@ -3369,24 +3508,67 @@ impl State {
         self.threads[i].attachment_error = None;
         if self.threads[i].messages.is_empty() && self.threads[i].session.is_none() {
             self.threads[i].life.archived_at = Some(lifecycle::now());
-            self.advance_parked(id);
         }
+        self.remove_tab(id, false);
         self.checkpoint();
     }
     pub fn undo_thread_action(&mut self) {
+        let at = lifecycle::now();
+        if self
+            .undo
+            .as_ref()
+            .is_some_and(|notice| notice.expires <= at)
+        {
+            self.undo = None;
+            self.deleted_threads.clear();
+            self.deleted_records = None;
+            return;
+        }
         if self.client.is_some()
-            && self
-                .undo
-                .as_ref()
-                .is_some_and(|notice| notice.action != Action::Discard)
+            && self.undo.as_ref().is_some_and(|notice| {
+                notice.action != Action::Discard
+                    || !notice.entries.iter().any(|e| {
+                        e.steps
+                            .iter()
+                            .any(|step| matches!(step, UndoStep::RestoreDraft(_)))
+                    })
+            })
         {
             self.forward("thread.undo", json!({"expected":self.undo}));
             return;
         }
-        let at = lifecycle::now();
         let Some(notice) = self.undo.take().filter(|n| n.expires > at) else {
             return;
         };
+        if self.deleted_records.is_some() {
+            self.threads.append(&mut self.deleted_threads);
+            if let Some(records) = self.deleted_records.take() {
+                for task in records.tasks {
+                    if !self.tasks.iter().any(|t| t.id == task.id)
+                        && self.threads.iter().any(|t| t.id == task.parent_thread_id)
+                        && self.threads.iter().any(|t| t.id == task.child_thread_id)
+                    {
+                        self.tasks.push(task);
+                    }
+                }
+                for (captain, home) in records.homes {
+                    if self.threads.iter().any(|t| t.id == home) {
+                        self.captain_homes.entry(captain).or_insert(home);
+                    }
+                }
+                for (id, home) in records.projects {
+                    if let Some(project) = self.projects.entries.iter_mut().find(|p| p.id == id)
+                        && project.captain_thread.is_none()
+                    {
+                        project.captain_thread = Some(home);
+                    }
+                }
+                self.sync_memory_links();
+            }
+        }
+        let mut restore_tabs = Vec::new();
+        let mut restore_drafts = Vec::new();
+        let mut focus = None;
         for entry in notice.entries {
             let Some(i) = self.threads.iter().position(|t| t.id == entry.id) else {
                 continue;
@@ -3406,16 +3588,54 @@ impl State {
                     UndoStep::RestoreDraft(draft) => {
                         t.draft.replace_text(&draft);
                         t.life.archived_at = None;
+                        restore_drafts.push(entry.id);
                     }
                     UndoStep::RestoreImages(images) => {
                         t.draft_images = images;
                         t.attachment_error =
                             attachments::validate_prompt_images(&t.draft_images).err();
                     }
+                    UndoStep::RestoreTab(position, was_active) => {
+                        restore_tabs.push((entry.id, position));
+                        if was_active {
+                            focus = Some(entry.id);
+                        }
+                    }
                 }
             }
         }
+        if self.client.is_some() && notice.action == Action::Discard {
+            for id in restore_drafts {
+                self.forward(
+                    "thread.lifecycle",
+                    json!({"threadId":id,"action":"unarchive"}),
+                );
+            }
+        }
+        self.restore_tabs(restore_tabs, focus);
         self.checkpoint();
+    }
+    fn restore_tabs(&mut self, mut tabs: Vec<(usize, usize)>, preferred: Option<usize>) {
+        tabs.sort_by_key(|(_, position)| *position);
+        let mut focus = None;
+        for (id, position) in tabs {
+            if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+                self.tabs.retain(|tab| *tab != id);
+                self.tabs.insert(position.min(self.tabs.len()), id);
+                focus = Some(index);
+            }
+        }
+        if let Some(index) = preferred
+            .and_then(|id| {
+                self.threads
+                    .iter()
+                    .position(|t| t.id == id && self.tabs.contains(&id))
+            })
+            .or(focus)
+        {
+            self.tab_epoch += 1;
+            self.focus_thread(index);
+        }
     }
     pub fn drop_thread(&mut self, id: usize, to: Section, before: Option<usize>) {
         if self.forward(
@@ -3562,13 +3782,70 @@ impl State {
         self.new_thread_in(project);
     }
     pub fn new_thread_in(&mut self, project: Option<ProjectId>) {
-        if self.forward("thread.create", json!({"project":project,"occupiedDrafts":self.threads.iter().filter(|t| t.has_draft_content()).map(|t| t.id).collect::<Vec<_>>()})) { self.project_picker = None; return; }
+        if self.client.is_some() {
+            self.request_new_thread(project, None);
+            self.project_picker = None;
+            return;
+        }
+        let seed = self.composer_seed();
+        self.create_thread_in(project, &[], &seed);
+    }
+    // Ported from KSG Code's useHandleNewThread composer model override.
+    fn composer_seed(&self) -> Value {
+        self.threads.get(self.active).map_or(Value::Null, |thread| {
+            json!({"harness":thread.harness,"model":thread.selected_or_effective_model(),
+                "thinking":thread.selected_or_effective_reasoning()})
+        })
+    }
+    fn inherit_composer(&mut self, index: usize, seed: &Value) {
+        let Some(harness) = seed["harness"]
+            .as_str()
+            .filter(|id| self.validate_harness(id).is_ok())
+        else {
+            return;
+        };
+        let models = self.harness_models(harness);
+        let selection: Option<(String, String)> =
+            serde_json::from_value(seed["model"].clone()).ok().flatten();
+        let Some(model) = selection.as_ref().and_then(|(provider, id)| {
+            models
+                .iter()
+                .find(|m| &m.provider == provider && &m.id == id)
+        }) else {
+            return;
+        };
+        let thread = &mut self.threads[index];
+        thread.harness = harness.into();
+        thread.models = models.clone();
+        thread.model_provider = model.provider.clone();
+        thread.model_id = model.id.clone();
+        thread.model = model.name.clone();
+        thread.context_window = model.context_window;
+        thread.supports_images = model.supports_images;
+        thread.selected_model = selection;
+        thread.thinking_levels = model.thinking_levels.clone();
+        if let Some(level) = seed["thinking"]
+            .as_str()
+            .filter(|level| model.thinking_levels.iter().any(|v| v == level))
+        {
+            thread.selected_thinking = Some(level.into());
+            thread.thinking = level.into();
+        } else if !thread.thinking_levels.contains(&thread.thinking) {
+            thread.selected_thinking = None;
+            thread.thinking.clear();
+        }
+    }
+    fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
             return;
         }
         // T3 keeps one draft thread per logical project and reopens it instead of adding another.
         let reuse = self.threads.iter().position(|t| {
-            t.project == project && !t.delegated && !t.captain_home && t.blank_draft()
+            t.project == project
+                && !t.delegated
+                && !t.captain_home
+                && t.blank_draft()
+                && !occupied.contains(&t.id)
         });
         let index = reuse.unwrap_or_else(|| {
             let mut thread = Thread::new(self.next_id);
@@ -3591,11 +3868,13 @@ impl State {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
         }
-        self.select_thread(index);
-        if reuse.is_none() && !self.catalog.models.is_empty() {
+        if reuse.is_none() {
             self.apply_catalog();
-            self.checkpoint();
         }
+        if reuse.is_none() || self.threads[index].selected_model.is_none() {
+            self.inherit_composer(index, seed);
+        }
+        self.select_thread(index);
     }
     pub fn open_captain(&mut self, captain: usize) {
         if self.forward("captain.open", json!({"threadId":self.current().id,"captain":captain,"project":self.captain_project,"assignProject":self.projects.captain_target})) {
@@ -3637,9 +3916,7 @@ impl State {
             .captain_home(captain)
             .and_then(|home| self.threads.iter().position(|t| t.id == home))
         {
-            self.active = index;
-            self.current_mut().life.archived_at = None;
-            self.current_mut().life.last_visited_at = Some(lifecycle::now());
+            self.threads[index].life.archived_at = None;
         } else {
             let mut thread = Thread::new(self.next_id);
             thread.harness = self.default_harness.clone();
@@ -3651,9 +3928,13 @@ impl State {
             thread.project = project_id;
             thread.machine = machine;
             self.threads.push(thread);
-            self.active = self.threads.len() - 1;
         }
-        let home = self.current().id;
+        let index = self
+            .threads
+            .iter()
+            .position(|t| t.captain == Some(captain) && Some(t.id) == existing_home)
+            .unwrap_or(self.threads.len() - 1);
+        let home = self.threads[index].id;
         self.captain_homes.insert(captain, home);
         if let Some(project) = self
             .projects
@@ -3670,7 +3951,7 @@ impl State {
         self.show_archive = false;
         self.captain_picker = false;
         self.projects.captain_target = None;
-        self.select_thread(self.active);
+        self.select_thread(index);
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
         }
@@ -4891,7 +5172,9 @@ impl State {
         false
     }
     pub fn add_project(&mut self, path: PathBuf) -> Result<ProjectId, String> {
-        if let Some(result) = self.remote("project.put", json!({"path":path})) {
+        if let Some(result) =
+            self.request_tab_command("project.put", json!({"path":path}), TabIntent::Open(None))
+        {
             result?;
             return Ok(0);
         }
@@ -4925,8 +5208,6 @@ impl State {
             .max_by_key(|(_, t)| (t.updated, t.id))
             .map(|(i, _)| i)
         {
-            self.active = index;
-            self.current_mut().life.last_visited_at = Some(lifecycle::now());
             self.select_thread(index);
         } else {
             self.new_thread_in(Some(id));
@@ -5120,6 +5401,10 @@ impl State {
     }
 
     fn restore_global(&mut self, index: &Value) -> Result<(), String> {
+        self.restore_records(index, true)
+    }
+    /// Projections share record validation with session restore, but never restore navigation.
+    fn restore_records(&mut self, index: &Value, restore_session: bool) -> Result<(), String> {
         self.persist_transcripts = self.headless || index["threadViews"].is_array();
         self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
         self.command_receipts =
@@ -5358,39 +5643,43 @@ impl State {
             self.restore_captain_records(index, &project_remap)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
-            self.tabs = index["tabs"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_u64)
-                .filter_map(|id| usize::try_from(id).ok())
-                .filter(|id| self.threads.iter().any(|t| t.id == *id && !t.archived()))
-                .collect();
-            let mut seen_tabs = std::collections::HashSet::new();
-            self.tabs.retain(|id| seen_tabs.insert(*id));
-            // An archived thread is never reopened at launch. Without any live thread, land on
-            // the most recent workspace's draft, as KSG Code's index route does.
-            let active = self
-                .threads
-                .iter()
-                .position(|t| Some(t.id as u64) == index["active"].as_u64() && !t.archived())
-                .or_else(|| self.threads.iter().position(|t| !t.archived()));
-            if let Some(active) = active {
-                self.active = active;
-                if !self.tabs.contains(&self.current().id) {
-                    self.tabs.push(self.current().id);
-                }
-                self.drop_blank_tabs();
-            } else {
-                let project = self
-                    .projects
-                    .entries
+            if restore_session {
+                self.tabs = index["tabs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_u64)
+                    .filter_map(|id| usize::try_from(id).ok())
+                    .filter(|id| self.threads.iter().any(|t| t.id == *id && !t.archived()))
+                    .collect();
+                let mut seen_tabs = std::collections::HashSet::new();
+                self.tabs.retain(|id| seen_tabs.insert(*id));
+                // An archived thread is never reopened at launch. Without any live thread, land on
+                // the most recent workspace's draft, as KSG Code's index route does.
+                let active = self
+                    .threads
                     .iter()
-                    .filter(|p| !p.hidden)
-                    .max_by_key(|p| (p.updated, p.id))
-                    .map(|p| p.id);
-                self.active = self.active.min(self.threads.len().saturating_sub(1));
-                self.new_thread_in(project);
+                    .position(|t| Some(t.id as u64) == index["active"].as_u64() && !t.archived())
+                    .or_else(|| self.threads.iter().position(|t| !t.archived()));
+                if let Some(active) = active {
+                    self.active = active;
+                    if !self.tabs.contains(&self.current().id) {
+                        self.tabs.push(self.current().id);
+                    }
+                } else {
+                    let project = self
+                        .projects
+                        .entries
+                        .iter()
+                        .filter(|p| !p.hidden)
+                        .max_by_key(|p| (p.updated, p.id))
+                        .map(|p| p.id);
+                    self.active = self.active.min(self.threads.len().saturating_sub(1));
+                    self.new_thread_in(project);
+                }
+            } else {
+                self.active = 0;
+                self.tabs.clear();
             }
         } else {
             return Err("The saved index has no valid thread list.".into());
@@ -5419,7 +5708,9 @@ impl State {
                 .map(ProjectScope::Project)
                 .unwrap_or(ProjectScope::All),
         };
-        self.capture_opened_draft();
+        if restore_session {
+            self.capture_opened_draft();
+        }
         self.restore_tasks(index, &project_remap)?;
         if self.persist_transcripts && !self.headless && self.client.is_none() {
             self.restore_persisted_history(&index["threadViews"])?;
@@ -6170,6 +6461,8 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if let Some(notice) = &state.undo {
         if notice.expires <= at {
             state.undo = None;
+            state.deleted_threads.clear();
+            state.deleted_records = None;
             changed = true;
         } else {
             tx.wake_after(Duration::from_millis(notice.expires - at));
@@ -7022,7 +7315,10 @@ mod tests {
         );
         state.discard_draft(state.current().id);
         assert_eq!(state.threads.len(), 2, "the blank thread is gone");
-        assert!(state.undo.is_none(), "a blank draft offers no Undo");
+        assert!(
+            state.undo.is_some(),
+            "discarding a blank draft can restore its tab"
+        );
         assert!(state.sidebar_threads().is_empty());
         state.show_archive = true;
         assert!(state.sidebar_threads().is_empty(), "nothing was archived");
@@ -7107,11 +7403,11 @@ mod tests {
         let blank = state.current().id;
         assert!(state.current().blank_draft());
         let written = 2;
-        assert_eq!(state.tabs, vec![1, written, blank]);
+        assert_eq!(state.tabs, vec![1, blank, written]);
         state.close_tab(blank);
         assert!(!state.threads.iter().any(|t| t.id == blank));
         assert_eq!(state.tabs, vec![1, written]);
-        assert_eq!(state.current().draft.text, "A prompt");
+        assert_eq!(state.current().draft.text, "Keep this draft");
         state.select_thread(1);
         assert_eq!(state.current().draft.text, "Keep this draft");
         state.close_tab(written);
@@ -7124,7 +7420,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_a_blank_draft_drops_its_tab_and_reopening_reuses_it() {
+    fn leaving_a_blank_draft_keeps_its_tab_and_reopening_reuses_it() {
         let mut state = State::new(".".into(), false);
         state.current_mut().draft.replace_text("A prompt");
         let written = state.current().id;
@@ -7134,14 +7430,14 @@ mod tests {
         let blank = state.current().id;
         assert_eq!(state.tabs, vec![written, blank]);
         state.select_thread(0);
-        assert_eq!(state.tabs, vec![written], "the blank draft's tab closes");
+        assert_eq!(state.tabs, vec![written, blank]);
         assert!(
-            !state.snapshot()["threads"]
+            state.snapshot()["threads"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|t| t["id"] == blank),
-            "an unopened blank draft is not saved"
+            "an open blank draft is saved"
         );
         for _ in 0..3 {
             state.new_thread_in(Some(2));
@@ -7149,7 +7445,7 @@ mod tests {
         }
         assert_eq!(
             state.tabs,
-            vec![written],
+            vec![written, blank],
             "repeated new threads never pile up tabs"
         );
         state.new_thread_in(Some(2));
@@ -7161,6 +7457,254 @@ mod tests {
             vec![written, blank],
             "a draft with text keeps its tab"
         );
+    }
+
+    fn tab_fixture() -> State {
+        let mut state = State::new(".".into(), false);
+        state.threads = (1..=5)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Thread {id}");
+                thread.renamed = true;
+                thread.project = Some(1);
+                thread
+            })
+            .collect();
+        state.next_id = 6;
+        state.tabs = vec![1, 2, 3, 4];
+        state.active = 1;
+        state
+    }
+
+    #[test]
+    fn tab_insertion_and_neighbours_are_stable() {
+        let mut tabs = vec![1, 2, 3];
+        insert_tab(&mut tabs, 1, 4);
+        assert_eq!(tabs, [1, 4, 2, 3]);
+        insert_tab(&mut tabs, 4, 3);
+        assert_eq!(tabs, [1, 4, 2, 3]);
+        assert_eq!(tab_neighbour(&tabs, 4), Some(2));
+        assert_eq!(tab_neighbour(&tabs, 3), Some(2));
+        assert_eq!(tab_neighbour(&[1], 1), None);
+        assert_eq!(tab_neighbour(&tabs, 99), None);
+    }
+
+    #[test]
+    fn explicit_opens_insert_next_to_active_and_existing_tabs_never_move() {
+        let mut state = tab_fixture();
+        state.select_thread(4);
+        assert_eq!(state.tabs, [1, 2, 5, 3, 4]);
+        state.select_thread(0);
+        assert_eq!(state.tabs, [1, 2, 5, 3, 4]);
+        assert_eq!(state.current().id, 1);
+    }
+
+    #[test]
+    fn closing_middle_rightmost_and_inactive_tabs_uses_neighbours() {
+        let mut state = tab_fixture();
+        state.close_tab(2);
+        assert_eq!(state.current().id, 3);
+        assert_eq!(state.tabs, [1, 3, 4]);
+        state.close_tab(1);
+        assert_eq!(state.current().id, 3);
+        state.select_thread(3);
+        state.close_tab(4);
+        assert_eq!(state.current().id, 3);
+        assert_eq!(state.tabs, [3]);
+        state.close_tab(3);
+        assert_eq!(state.tabs, [3]);
+    }
+
+    #[test]
+    fn parking_uses_open_neighbours_and_undo_restores_the_old_slot() {
+        for action in [
+            Action::Settle,
+            Action::Archive,
+            Action::Discard,
+            Action::Delete,
+        ] {
+            let mut state = tab_fixture();
+            state.current_mut().draft.replace_text("Keep this text");
+            match action {
+                Action::Settle => state.settle_thread(2),
+                Action::Archive => state.archive_thread(2),
+                Action::Discard => state.discard_draft(2),
+                Action::Delete => {
+                    state.request_delete(2);
+                    state.confirm_delete();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(state.tabs, [1, 3, 4], "{action:?}");
+            assert_eq!(state.current().id, 3, "{action:?}");
+            assert!(!state.tabs.contains(&5));
+            state.undo_thread_action();
+            assert_eq!(state.tabs, [1, 2, 3, 4], "{action:?}");
+            assert_eq!(state.current().id, 2, "{action:?}");
+            assert_eq!(state.current().draft.text, "Keep this text");
+        }
+    }
+
+    #[test]
+    fn last_settle_tab_replaces_itself_with_the_next_sidebar_row() {
+        let mut state = tab_fixture();
+        state.tabs = vec![2];
+        state.settle_thread(2);
+        let order = state.sidebar_threads();
+        let position = order
+            .iter()
+            .position(|i| state.threads[*i].id == 2)
+            .unwrap();
+        let expected = state.threads[order[(position + 1) % order.len()]].id;
+        assert_eq!(state.tabs, [expected]);
+        assert_eq!(state.current().id, expected);
+        state.undo_thread_action();
+        assert_eq!(state.tabs, [2, expected]);
+        assert_eq!(state.current().id, 2);
+    }
+
+    #[test]
+    fn last_archive_discard_and_delete_tab_get_a_same_project_draft() {
+        for action in [Action::Archive, Action::Discard, Action::Delete] {
+            let mut state = tab_fixture();
+            state.tabs = vec![2];
+            state.current_mut().draft.replace_text("Keep");
+            match action {
+                Action::Archive => state.archive_thread(2),
+                Action::Discard => state.discard_draft(2),
+                Action::Delete => {
+                    state.request_delete(2);
+                    state.confirm_delete();
+                }
+                _ => unreachable!(),
+            }
+            assert!(state.current().blank_draft(), "{action:?}");
+            assert_eq!(state.current().project, Some(1));
+            assert_eq!(state.tabs, [state.current().id]);
+        }
+    }
+
+    #[test]
+    fn archiving_or_discarding_an_empty_draft_can_undo_its_tab_removal() {
+        for action in [Action::Archive, Action::Discard] {
+            let mut state = State::new(".".into(), false);
+            let old = state.current().id;
+            if action == Action::Archive {
+                state.archive_thread(old);
+            } else {
+                state.discard_draft(old);
+            }
+            assert!(!state.threads.iter().any(|t| t.id == old));
+            assert_eq!(state.undo.as_ref().unwrap().action, action);
+            state.undo_thread_action();
+            assert_eq!(state.current().id, old);
+            assert_eq!(state.tabs[0], old);
+            assert!(state.current().blank_draft());
+        }
+    }
+
+    #[test]
+    fn background_settle_and_crew_creation_do_not_open_tabs_or_move_focus() {
+        let mut state = tab_fixture();
+        let before = (state.tabs.clone(), state.current().id);
+        state.sweep_lifecycle(lifecycle::now() + 100 * 86_400_000);
+        state.demo = true;
+        state
+            .mcp_call(2, "delegate_task", &json!({"prompt":"A background worker"}))
+            .unwrap();
+        assert_eq!((state.tabs.clone(), state.current().id), before);
+    }
+
+    #[test]
+    fn new_thread_inherits_valid_composer_selection_and_rejects_stale_models() {
+        let mut state = tab_fixture();
+        let model = AgentModel {
+            provider: "codex".into(),
+            id: "chosen".into(),
+            name: "Chosen".into(),
+            thinking_levels: vec!["high".into()],
+            context_window: Some(100),
+            supports_images: Some(true),
+        };
+        state.current_mut().harness = "codex".into();
+        state.current_mut().models = vec![model];
+        state.current_mut().selected_model = Some(("codex".into(), "chosen".into()));
+        state.current_mut().selected_thinking = Some("high".into());
+        state.new_thread_in(Some(1));
+        let draft = state.current().id;
+        assert_eq!(state.tabs, [1, 2, draft, 3, 4]);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(
+            state.current().selected_model,
+            Some(("codex".into(), "chosen".into()))
+        );
+        assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+        state.current_mut().draft.replace_text("Occupied");
+        state.current_mut().selected_model = Some(("codex".into(), "removed".into()));
+        state.new_thread_in(Some(1));
+        assert_eq!(state.current().harness, state.default_harness);
+        assert_eq!(state.current().selected_model, None);
+    }
+
+    #[test]
+    fn new_threads_keep_default_effort_when_the_inherited_effort_is_invalid() {
+        let mut state = tab_fixture();
+        let model = AgentModel::from_value(
+            &json!({"provider":"cpa","id":"chosen","name":"Chosen","reasoning":true}),
+        )
+        .unwrap();
+        state.catalog.models = vec![model.clone()];
+        state.catalog.default_model = Some(model);
+        state.catalog.default_thinking = "low".into();
+        state.current_mut().selected_model = Some(("cpa".into(), "chosen".into()));
+        state.current_mut().selected_thinking = Some("invalid".into());
+        state.new_thread_in(None);
+        assert_eq!(
+            state.current().selected_model,
+            Some(("cpa".into(), "chosen".into()))
+        );
+        assert_eq!(state.current().thinking, "low");
+        assert_eq!(state.current().selected_thinking, None);
+    }
+
+    #[test]
+    fn an_attachment_only_draft_survives_its_tab_closing_locally_and_in_client_mode() {
+        for client in [false, true] {
+            let mut state = tab_fixture();
+            state.threads[1] = Thread::new(2);
+            state.threads[1]
+                .draft_images
+                .push(test_attachment("only.png", 1));
+            if client {
+                state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+            }
+            state.close_tab(2);
+            assert_eq!(state.tabs, [1, 3, 4]);
+            assert_eq!(state.current().id, 3);
+            assert_eq!(
+                state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == 2)
+                    .unwrap()
+                    .draft_images
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn restoring_a_session_preserves_blank_tabs_and_the_active_tab() {
+        let mut state = tab_fixture();
+        state.new_thread_in(None);
+        let blank = state.current().id;
+        state.select_thread(1);
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&state.snapshot()).unwrap();
+        assert_eq!(restored.tabs, state.tabs);
+        assert!(restored.tabs.contains(&blank));
+        assert_eq!(restored.current().id, 2);
     }
 
     #[test]
@@ -9766,7 +10310,7 @@ mod tests {
         state.current_mut().draft.replace_text("Write the report");
         state.new_thread();
         assert_eq!(state.current().model, "Default CPA");
-        assert_eq!(state.current().thinking, "low");
+        assert_eq!(state.current().thinking, "high");
         assert!(!state.current().models.is_empty());
     }
 
