@@ -913,6 +913,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         } else if s.current().messages.is_empty()
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
+            && !s.current().history_has_more
+            && s.current().history_error.is_none()
         {
             // Sizes from the last layout: the hero keeps its height only while the composer
             // and its crew tray still fit under it.
@@ -7305,6 +7307,59 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     response
 }
 
+/// Ported from KSG Code's `TimelineHistoryControl` (`MessagesTimeline.tsx`).
+fn history_control(s: &State, p: Palette) -> Option<El> {
+    let t = s.current();
+    if !t.history_has_more && t.history_error.is_none() {
+        return None;
+    }
+    let thread_id = t.id;
+    let mut section = col()
+        .key(format!("history-control-{thread_id}"))
+        .w_full()
+        .gap(6.0)
+        .pb(8.0);
+    if t.history_has_more {
+        let loading = t.history_loading;
+        let text = if loading {
+            "Loading earlier turns…"
+        } else {
+            "Load earlier turns"
+        };
+        let mut btn = row()
+            .key("history-load-earlier")
+            .role("button")
+            .label("Load earlier turns")
+            .w_full()
+            .py(6.0)
+            .gap(12.0)
+            .center_y()
+            .disabled(loading)
+            .child(el().h(1.0).grow(1.0).fill(p.line))
+            .child(label(text, SMALL, p.muted))
+            .child(el().h(1.0).grow(1.0).fill(p.line));
+        if !loading {
+            btn = btn
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| s.load_earlier_history(thread_id, None));
+        }
+        section = section.child(btn);
+    }
+    if let Some(err) = &t.history_error {
+        section = section.child(
+            label(err, SMALL, p.muted)
+                .key("history-load-error")
+                .role("status")
+                .align(rune::Align::Center)
+                .wrap()
+                .w_full(),
+        );
+    }
+    Some(section)
+}
+
 /// The transcript, laid out in KSG Code's chat lane (`MessagesTimeline`'s
 /// `.chat-content-lane` inside `.messages-timeline-scroll`): 46 rem of content, centred, with
 /// 0.75 rem gutters below 640 px and 3 rem from there up. `pane_width` is the chat column's.
@@ -7333,6 +7388,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         && !visible_tools
         && !t.status.busy()
         && t.native.compactions.is_empty()
+        && !t.history_has_more
+        && t.history_error.is_none()
     {
         let mut introduction = col()
             .key("empty-state")
@@ -7366,21 +7423,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         }
         return introduction;
     } else {
-        let cutoff = t.messages.len().saturating_sub(100);
-        // Do not cut through an assistant turn and hide the tools that led to its answer.
-        let start = t.messages[..cutoff]
-            .iter()
-            .rposition(|message| message.role != "Pi")
-            .unwrap_or(0);
-        if start > 0 {
-            messages = messages.child(label("Showing recent turns.", SMALL, p.muted));
+        if let Some(control) = history_control(s, p) {
+            messages = messages.child(control);
         }
-        let mut index = start;
-        let mut hidden_images = t.messages[start..]
-            .iter()
-            .map(|message| message.images.len())
-            .sum::<usize>()
-            .saturating_sub(32);
+        let mut index = 0;
         while index < t.messages.len() {
             let message = &t.messages[index];
             if message.role != "Pi" {
@@ -7408,16 +7454,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     .shrink()
                     .min_w(0.0);
                 if !message.images.is_empty() {
-                    let skip = hidden_images.min(message.images.len());
-                    hidden_images -= skip;
-                    if skip > 0 {
-                        user = user.child(label(
-                            format!("{skip} older image previews omitted."),
-                            SMALL,
-                            p.muted,
-                        ));
-                    }
-                    user = user.child(message_images(s, p, &message.images[skip..], &key));
+                    user = user.child(message_images(s, p, &message.images, &key));
                 }
                 if !message.text.trim().is_empty() {
                     user = user.child(
@@ -12617,8 +12654,79 @@ pub(crate) mod tests {
         }
         rt.frame(0.0);
         let tree = rt.accessibility_json().to_string();
-        assert_eq!(tree.matches("Attached image:").count(), 32);
-        assert!(tree.contains("older image previews omitted"));
+        assert_eq!(tree.matches("Attached image:").count(), 48);
+        assert!(!tree.contains("older image previews omitted"));
+    }
+
+    #[test]
+    fn older_history_controls_show_load_loading_error_and_end_states_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.messages.push(crate::model::Message {
+                    id: "u1".into(),
+                    role: "You",
+                    text: "Recent message".into(),
+                    images: vec![],
+                });
+                t.history_has_more = true;
+                t.history_loading = false;
+                t.history_error = None;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-earlier").is_some(),
+                "{width}: load button"
+            );
+            assert!(
+                !rt.accessibility_json()
+                    .to_string()
+                    .contains("Showing recent turns."),
+                "{width}: old cutoff notice must be gone"
+            );
+
+            // Loading state.
+            rt.state.current_mut().history_loading = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("Loading earlier turns…")),
+                "{width}: loading label"
+            );
+
+            // Error state.
+            {
+                let t = rt.state.current_mut();
+                t.history_loading = false;
+                t.history_error = Some("History failed".into());
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.presented("history-load-error").is_some(),
+                "{width}: error label"
+            );
+
+            // End-of-history state: button and error disappear.
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = false;
+                t.history_error = None;
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(
+                rt.find("history-load-earlier").is_none(),
+                "{width}: hidden at end"
+            );
+            assert!(
+                rt.find("history-load-error").is_none(),
+                "{width}: error cleared"
+            );
+        }
     }
 
     #[test]

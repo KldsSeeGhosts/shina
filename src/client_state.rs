@@ -286,6 +286,7 @@ impl ThreadView {
         thread.resumable_run_id = self.resumable_run_id;
         thread.continuation_of_run_id = self.continuation_of_run_id;
         thread.run_control_supported = self.run_control_supported;
+        let old_messages = std::mem::take(&mut thread.messages);
         thread.messages = self
             .messages
             .into_iter()
@@ -347,11 +348,16 @@ impl ThreadView {
         thread.thoughts = thoughts;
         let mut work = self.work;
         for item in &mut work {
-            item.expanded = thread
-                .work
-                .iter()
-                .find(|old| old.start == item.start)
-                .is_none_or(|old| old.expanded);
+            let message_id = thread.messages.get(item.start).map(|m| m.id.as_str());
+            let matched = message_id
+                .and_then(|id| {
+                    thread
+                        .work
+                        .iter()
+                        .find(|old| old_messages.get(old.start).map(|m| m.id.as_str()) == Some(id))
+                })
+                .or_else(|| thread.work.iter().find(|old| old.start == item.start));
+            item.expanded = matched.is_none_or(|old| old.expanded);
         }
         thread.work = work;
         thread.harness_state = self.harness_state;
@@ -1455,9 +1461,17 @@ impl State {
         }
         let views: Vec<ThreadView> =
             serde_json::from_value(projection["threads"].clone()).map_err(|e| e.to_string())?;
-        for view in views {
+        for (view, raw) in views
+            .into_iter()
+            .zip(projection["threads"].as_array().into_iter().flatten())
+        {
             if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == view.id) {
                 view.apply(thread)?;
+                if let Some(meta) = raw.get("historyMeta").filter(|m| m.is_object()) {
+                    thread.history_has_more = meta["hasMoreHistory"] == true;
+                    thread.history_loading = meta["loading"] == true;
+                    thread.history_error = meta["error"].as_str().map(str::to_owned);
+                }
             }
         }
         self.active = self
@@ -1567,6 +1581,24 @@ impl State {
                 .ok_or_else(|| "This machine is not linked.".to_string())?
                 .send(method, params)
         })
+    }
+
+    pub fn load_earlier_history(&mut self, thread_id: usize, through_entry_id: Option<String>) {
+        let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) else {
+            return;
+        };
+        if !thread.history_has_more || thread.history_loading {
+            return;
+        }
+        thread.history_loading = true;
+        thread.history_error = None;
+        if let Some(client) = &self.client {
+            if self.machines.selected == "local" {
+                client.load_earlier_history(thread_id, through_entry_id);
+            } else if let Some(linked) = client.linked.get(&self.machines.selected) {
+                linked.load_earlier_history(thread_id, through_entry_id);
+            }
+        }
     }
     pub fn machine_label(&self, server: &str) -> String {
         if server == "local" {

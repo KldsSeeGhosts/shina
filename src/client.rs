@@ -89,6 +89,7 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
     history_thread: Arc<AtomicUsize>,
+    history_requests: Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
 }
 
 impl Client {
@@ -133,6 +134,7 @@ impl Client {
             stop: Arc::default(),
             worker: Arc::default(),
             history_thread: Arc::default(),
+            history_requests: Arc::default(),
         }
     }
     pub fn set_device_directory(&mut self, directory: PathBuf) {
@@ -161,6 +163,7 @@ impl Client {
         let stop = self.stop.clone();
         let ready = self.commands.ready.clone();
         let history_thread = self.history_thread.clone();
+        let history_requests = self.history_requests.clone();
         let remote = self.remote.clone();
         let info = self.info.clone();
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
@@ -169,7 +172,13 @@ impl Client {
                 .build()
                 .expect("client runtime");
             runtime.block_on(supervise(
-                (directory, device_directory, history_thread, remote),
+                (
+                    directory,
+                    device_directory,
+                    history_thread,
+                    history_requests,
+                    remote,
+                ),
                 info,
                 input,
                 output,
@@ -232,6 +241,12 @@ impl Client {
     }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
+    }
+    pub fn load_earlier_history(&self, thread: usize, through_entry_id: Option<String>) {
+        self.history_requests
+            .lock()
+            .expect("history requests")
+            .push_back((thread, through_entry_id));
     }
     pub fn event(&self) -> Option<Event> {
         self.events.try_recv().ok()
@@ -437,11 +452,13 @@ async fn connect(
     Ok((socket, reply["result"].clone()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     profile: (
         PathBuf,
         PathBuf,
         Arc<AtomicUsize>,
+        Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
         Option<crate::peer::Link>,
     ),
     info: Arc<Mutex<Value>>,
@@ -452,7 +469,7 @@ async fn supervise(
     ready: Arc<AtomicBool>,
     wake: rune::Waker,
 ) {
-    let (directory, device_directory, history_thread, remote) = profile;
+    let (directory, device_directory, history_thread, history_requests, remote) = profile;
     let info_file = device_directory.join("connection-info.json");
     if let Ok(bytes) = std::fs::read(&info_file)
         && let Ok(value) = serde_json::from_slice(&bytes)
@@ -537,6 +554,13 @@ async fn supervise(
             0 => None,
             id => Some(id as u64),
         };
+        while let Some((thread, through)) = history_requests
+            .lock()
+            .expect("history requests")
+            .pop_front()
+        {
+            cache.request_earlier(thread as u64, through);
+        }
         if socket.is_none() {
             ready.store(false, Ordering::Release);
             if let Some(process) = &mut child
@@ -735,6 +759,17 @@ async fn supervise(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                while let Some((thread, through)) = history_requests
+                    .lock()
+                    .expect("history requests")
+                    .pop_front()
+                {
+                    cache.request_earlier(thread as u64, through);
+                }
+                if let Some(projected) = cache.projected() {
+                    *snapshot.lock().expect("client snapshot") = Some(projected);
+                    wake();
+                }
                 if let Some(request) = cache.next_history()
                     && !send(connected, Message::Text(request.to_string().into())).await {
                         socket = None;
@@ -823,9 +858,6 @@ async fn cache_images(
 ) -> Result<(), String> {
     cache_html(remote, profile, projected, fetch).await?;
     fn paths(value: &Value, prefix: String, out: &mut Vec<String>) {
-        if out.len() >= 32 {
-            return;
-        }
         match value {
             Value::Object(object)
                 if object

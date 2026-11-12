@@ -693,8 +693,12 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     } else {
                         params["threadId"].as_u64().ok_or_else(|| "Invalid thread id.".to_owned()).and_then(|thread_id| {
                             history_leases.read(thread_id, params, Instant::now(), || {
-                                shared.history_streams.lock().expect("history streams").page(thread_id,
-                                    params["historyCursor"].as_str(), crate::history::byte_budget(params))
+                                shared.history_streams.lock().expect("history streams").page_with_target(
+                                    thread_id,
+                                    params["historyCursor"].as_str(),
+                                    crate::history::byte_budget(params),
+                                    params["throughEntryId"].as_str(),
+                                )
                             })
                         })
                     }

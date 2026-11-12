@@ -2865,6 +2865,8 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             );
             // Match the audit's page-request delay, not a delay on reading live events.
             std::thread::sleep(Duration::from_millis(120));
+        } else if cache.histories.contains_key(&1) && !cache.complete(1) {
+            cache.request_earlier(1, None);
         } else {
             client.read();
         }
@@ -3125,5 +3127,177 @@ fn durable_credentials_survive_restart_and_revoked_sockets_cannot_mutate() {
         ))
         .ok();
     assert!(!matches!(victim.socket.read(), Ok(Message::Text(_))));
+    profile.stop();
+}
+
+#[test]
+fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+
+    let mut profile = Profile::new();
+    // Seed a realistic large thread (> 2500 items: 900 turns * 3 items = 2700 items).
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    for turn in 0..900usize {
+        messages.push(json!({"id":format!("u-{turn}"),"role":"You","text":format!("Turn prompt {turn}"),"images":[]}));
+        let a_idx = messages.len();
+        messages.push(json!({"id":format!("a-{turn}"),"role":"Pi","text":format!("Turn reply {turn}"),"images":[]}));
+        tools.push(json!({
+            "id":format!("tool-{turn}"),"name":"read","detail":"file.rs","done":true,"failed":false,
+            "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
+            "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
+        }));
+    }
+    let mut index = base["index"].clone();
+    index["threads"][0]["title"] = json!("Huge thread");
+    index["threads"][0]["renamed"] = json!(true);
+    index["threads"][0]["session"] = Value::Null;
+    let mut view = base["threads"][0].clone();
+    view["status"] = json!("Completed");
+    view["messages"] = json!(messages);
+    view["tools"] = json!(tools);
+    index["threadViews"] = json!([view]);
+    fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
+
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello"),
+    );
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    client.rpc("workspace.subscribe", json!({}), json!("sub"));
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({"state":protocol::compact(&client.snapshot),"seq":client.seq,"epoch":client.epoch}),
+        ))
+        .unwrap();
+    client.history_cache = Some(cache);
+
+    // 1. Initial thread.subscribe loads only the recent window, not all 2700 items.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "initial subscribe did not finish"
+        );
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+        } else if cache.histories.contains_key(&1) {
+            break;
+        } else {
+            client.read();
+        }
+    }
+    {
+        let cache = client.history_cache.as_mut().unwrap();
+        assert!(
+            cache.next_history().is_none(),
+            "must stop after initial window"
+        );
+        let view = cache.projected().unwrap();
+        assert_eq!(view["threads"][0]["historyMeta"]["hasMoreHistory"], true);
+        let loaded_msgs = view["threads"][0]["messages"].as_array().unwrap();
+        assert!(
+            loaded_msgs.len() <= 20,
+            "recent budget only, got {}",
+            loaded_msgs.len()
+        );
+        assert_eq!(loaded_msgs.last().unwrap()["text"], "Turn reply 899");
+    }
+
+    // 2. Request earlier pages on demand, including across a reconnect mid-walk.
+    let mut pages = 0usize;
+    let mut reconnected = false;
+    loop {
+        assert!(Instant::now() < deadline, "older paging did not finish");
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(req) = cache.next_history() {
+            client.rpc(
+                req["method"].as_str().unwrap(),
+                req["params"].clone(),
+                json!("history"),
+            );
+            continue;
+        }
+        let meta = cache
+            .projected()
+            .map(|v| v["threads"][0]["historyMeta"].clone());
+        if meta.as_ref().is_some_and(|m| m["hasMoreHistory"] == false) || cache.complete(1) {
+            break;
+        }
+        if pages == 2 && !reconnected {
+            let saved = client.history_cache.take().unwrap();
+            let token = client.token.clone();
+            drop(client);
+            client = Client::unsubscribed(&profile.discovery(), token);
+            client.snapshot = saved.state.clone();
+            client.seq = saved.seq.unwrap();
+            client.epoch = saved.epoch.clone();
+            let hello = client.rpc(
+                "hello",
+                json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+                json!("reconnect-hello"),
+            );
+            let mut saved = saved;
+            saved.reconnect(&hello["result"]).unwrap();
+            let cursor = json!({"lastSeq":saved.seq,"epoch":saved.epoch});
+            client.history_cache = Some(saved);
+            client.rpc("workspace.subscribe", cursor, json!("reconnect-sub"));
+            reconnected = true;
+            // After reconnect, synchronize thread.subscribe first before requesting next page.
+            let sub = client
+                .history_cache
+                .as_mut()
+                .unwrap()
+                .next_history()
+                .unwrap();
+            assert_eq!(sub["method"], "thread.subscribe");
+            client.rpc("thread.subscribe", sub["params"].clone(), json!("history"));
+        }
+        client
+            .history_cache
+            .as_mut()
+            .unwrap()
+            .request_earlier(1, None);
+        pages += 1;
+    }
+    assert!(
+        pages > 5,
+        "should require multiple older pages, took {pages}"
+    );
+    let cache = client.history_cache.as_ref().unwrap();
+    assert_eq!(
+        cache.histories[&1].1["messages"].as_array().unwrap().len(),
+        1800
+    );
+    assert_eq!(
+        cache.histories[&1].1["tools"].as_array().unwrap().len(),
+        900
+    );
+    assert_eq!(
+        cache.histories[&1].1["messages"][0]["text"],
+        "Turn prompt 0"
+    );
+    assert!(cache.complete(1));
+
+    // 3. Peer lacking history-items (protocolMinor 6) yields explicit update-required state.
+    let mut legacy = client_history::ProjectionCache::default();
+    assert!(
+        legacy
+            .reconnect(&json!({"capabilities":["snapshot-subscriptions"]}))
+            .is_err()
+    );
     profile.stop();
 }
