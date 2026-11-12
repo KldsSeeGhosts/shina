@@ -150,6 +150,19 @@ impl Client {
         json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":""})
     }
 
+    fn history_value(&self) -> Value {
+        let replayed = self.history.iter().any(|m| {
+            m["role"] == "user"
+                || m["role"] == "toolResult" && m["toolKind"] != "plan"
+                || m["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b["type"] != "toolCall" || b["toolKind"] != "plan")
+                })
+        });
+        json!({"messages":self.history,"historyReplayed":replayed})
+    }
+
     fn mcp_servers(&self) -> Result<Value, String> {
         let host = self
             .start
@@ -304,7 +317,7 @@ impl Client {
                 self.reply(&json!({"id":"state","type":"get_state"}), self.state());
                 self.reply(
                     &json!({"id":"history","type":"get_messages"}),
-                    json!({"messages":self.history}),
+                    self.history_value(),
                 );
                 self.reply(
                     &json!({"id":"commands","type":"get_commands"}),
@@ -418,7 +431,7 @@ impl Client {
             "get_entries" | "get_messages" => {
                 let mut request = record.clone();
                 request["type"] = json!("get_messages");
-                self.reply(&request, json!({"messages":self.history}));
+                self.reply(&request, self.history_value());
             }
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
             "get_available_thinking_levels" => self.reply(&record, json!({"levels":[]})),
@@ -526,6 +539,15 @@ impl Client {
     fn settle(&mut self, aborted: bool) {
         self.running = false;
         let aborted = aborted || self.cancelling;
+        if aborted
+            && let Some(message) = self
+                .history
+                .iter_mut()
+                .rev()
+                .find(|m| m["role"] == "assistant")
+        {
+            message["stopReason"] = json!("aborted");
+        }
         self.cancelling = false;
         self.events
             .push(json!({"type":"agent_settled","aborted":aborted}));
@@ -730,26 +752,31 @@ impl Client {
                     .as_str()
                     .or_else(|| tool["kind"].as_str())
                     .unwrap_or("ACP tool");
+                let metadata = tool_metadata(&tool);
                 if new {
                     self.history_chunk(
                         "assistant",
-                        json!({"type":"toolCall","id":id,"name":name,"arguments":tool["rawInput"]}),
+                        json!({"type":"toolCall","id":id,"name":name,"arguments":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}),
                     );
                     if emit {
-                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"]}));
+                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
                 let done = matches!(tool["status"].as_str(), Some("completed" | "failed"));
                 let result = tool_result(&tool);
                 if done {
+                    let mut saved = result.clone();
+                    saved["role"] = json!("toolResult");
+                    saved["toolCallId"] = json!(id);
+                    saved["isError"] = json!(tool["status"] == "failed");
                     if let Some(previous) = self
                         .history
                         .iter_mut()
                         .find(|m| m["role"] == "toolResult" && m["toolCallId"] == id)
                     {
-                        *previous = json!({"role":"toolResult","toolCallId":id,"content":result["content"],"isError":tool["status"]=="failed"});
+                        *previous = saved;
                     } else {
-                        self.history.push(json!({"role":"toolResult","toolCallId":id,"content":result["content"],"isError":tool["status"]=="failed"}));
+                        self.history.push(saved);
                     }
                 }
                 if emit {
@@ -769,7 +796,19 @@ impl Client {
                     );
                 }
             }
-            "plan" | "plan_update" | "current_mode_update" => {
+            "plan" | "plan_update" => {
+                let turn = self.history.iter().filter(|m| m["role"] == "user").count();
+                let id = update["planId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("acp-plan-{turn}"));
+                let mut value = update.clone();
+                value["_shinaPlanId"] = json!(id);
+                crate::work::save_plan(&mut self.history, &id, &value);
+                self.events
+                    .push(json!({"type":"harness_update","field":"plan","value":value}));
+            }
+            "current_mode_update" => {
                 self.events.push(
                     json!({"type":"harness_update","field":update["sessionUpdate"],"value":update}),
                 );
@@ -799,7 +838,70 @@ fn tool_result(tool: &Value) -> Value {
     if content.is_empty() && !tool["rawOutput"].is_null() {
         content.push(json!({"type":"text","text":tool["rawOutput"].as_str().map(str::to_owned).unwrap_or_else(||tool["rawOutput"].to_string())}));
     }
-    json!({"content":content,"details":{"acp":tool}})
+    let mut result = tool_metadata(tool);
+    result["content"] = json!(content);
+    result["details"] = json!({"acp":tool,"exitCode":tool["rawOutput"]["exitCode"]});
+    result
+}
+
+/// Ported from KSG Code's provider-acp adapter's kind switch and diff parts.
+fn tool_metadata(tool: &Value) -> Value {
+    use crate::work::{FileChange, ToolKind, result_metadata, text_diff};
+    let kind = match tool["kind"].as_str().unwrap_or("") {
+        "execute" => ToolKind::Command,
+        "edit" | "delete" | "move" => ToolKind::FileChange,
+        "search"
+            if tool["rawInput"]["url"].is_string()
+                || tool["rawOutput"]["results"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|r| r["url"].is_string())) =>
+        {
+            ToolKind::WebSearch
+        }
+        "search" => ToolKind::FileSearch,
+        "fetch" => ToolKind::WebSearch,
+        "read" => ToolKind::Read,
+        "list" => ToolKind::List,
+        "subagent" => ToolKind::Subagent,
+        "plan" => ToolKind::Plan,
+        _ => ToolKind::Other,
+    };
+    let mut changes: Vec<_> = tool["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["type"] == "diff")
+        .filter_map(|part| {
+            let path = part["path"].as_str()?;
+            let diff = part["patch"]["text"]
+                .as_str()
+                .or_else(|| part["diff"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    text_diff(
+                        part["oldText"].as_str().unwrap_or(""),
+                        part["newText"].as_str().unwrap_or(""),
+                    )
+                });
+            let mut change = FileChange::new(path, tool["kind"].as_str().unwrap_or("edit"), &diff);
+            change.old_path = part["oldPath"].as_str().map(str::to_owned);
+            Some(change)
+        })
+        .collect();
+    if kind == ToolKind::FileChange && changes.is_empty() {
+        for location in tool["locations"].as_array().into_iter().flatten() {
+            if let Some(path) = location["path"].as_str() {
+                changes.push(FileChange::new(
+                    path,
+                    tool["kind"].as_str().unwrap_or("edit"),
+                    "",
+                ));
+            }
+        }
+    }
+    let mut metadata = result_metadata(kind, changes, &tool["rawOutput"]);
+    metadata["input"] = tool["rawInput"].clone();
+    metadata
 }
 
 fn run(

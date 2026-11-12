@@ -1,6 +1,170 @@
 use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
+#[test]
+fn typed_items_survive_live_and_history_reduction() {
+    use crate::work::ToolKind::*;
+    for (native, expected) in [
+        ("commandExecution", Command),
+        ("fileChange", FileChange),
+        ("fileSearch", FileSearch),
+        ("webSearch", WebSearch),
+        ("readFile", Read),
+        ("listDirectory", List),
+        ("collabAgentToolCall", Subagent),
+        ("todoList", Plan),
+        ("unknown", Other),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "read-only"));
+        let item = json!({"id":"typed","type":native,"status":"completed","command":"pwd",
+            "changes":[{"path":"old.rs","kind":{"type":"update","move_path":"new.rs"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}],
+            "results":[{"fileName":"new.rs","line":2,"preview":"new","url":"https://example.com","title":"Example","snippet":"Text"}]});
+        client.item(&item, false, true);
+        client.item(&item, true, true);
+        let mut live = Thread::new(1);
+        for event in client.events {
+            live.apply(event);
+        }
+        let mut restored = Thread::new(2);
+        restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+        for thread in [&live, &restored] {
+            let tool = &thread.tools[0];
+            assert_eq!(tool.kind, Some(expected), "{native}");
+            if expected == FileChange {
+                assert_eq!(tool.changes[0].path, "new.rs");
+                assert_eq!(tool.changes[0].old_path.as_deref(), Some("old.rs"));
+                assert_eq!(
+                    (tool.changes[0].additions, tool.changes[0].deletions),
+                    (1, 1)
+                );
+            }
+            if expected == FileSearch {
+                assert_eq!(tool.structured["fileSearchResults"][0]["line"], 2);
+            }
+            if expected == WebSearch {
+                assert_eq!(tool.structured["webResults"][0]["title"], "Example");
+            }
+        }
+    }
+}
+
+#[test]
+fn plan_updates_replace_the_first_card_in_live_and_replayed_history() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.turn = Some("turn-plan".into());
+    client
+        .notification(
+            "turn/plan/updated",
+            &json!({"plan":[{"step":"First","status":"pending"}]}),
+        )
+        .unwrap();
+    client.item(
+        &json!({"id":"cmd","type":"commandExecution","command":"pwd","status":"completed"}),
+        true,
+        true,
+    );
+    client.notification("turn/plan/updated",&json!({"plan":[{"step":"First","status":"completed"},{"step":"Next","status":"in_progress"}]})).unwrap();
+    client.item(
+        &json!({"id":"proposal","type":"plan","text":"## Proposed plan\n\nUse **Rust**."}),
+        true,
+        true,
+    );
+    let mut live = Thread::new(1);
+    for event in client.events {
+        live.apply(event);
+    }
+    let mut restored = Thread::new(2);
+    restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+    for t in [&live, &restored] {
+        assert_eq!(t.tools.len(), 3);
+        assert_eq!(t.tools[0].resolved_kind(), crate::work::ToolKind::Plan);
+        assert_eq!(t.tools[1].resolved_kind(), crate::work::ToolKind::Command);
+        let plan = crate::work::plan_data(&t.tools[0].input);
+        assert_eq!(plan["steps"][0]["status"], "completed");
+        assert_eq!(plan["steps"][1]["status"], "running");
+        assert!(
+            crate::work::plan_data(&t.tools[2].input)["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("**Rust**")
+        );
+        let saved: crate::model::Tool =
+            serde_json::from_value(serde_json::to_value(&t.tools[0]).unwrap()).unwrap();
+        assert_eq!(saved.input, t.tools[0].input);
+    }
+}
+
+#[test]
+fn codex_compaction_replay_keeps_its_position_and_interrupted_turns_keep_the_marker() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.replay(&json!({"id":"one","status":"completed","items":[
+        {"type":"userMessage","id":"u1","content":[{"type":"text","text":"Before"}]},
+        {"type":"agentMessage","id":"a1","text":"First"},
+        {"type":"contextCompaction","id":"compact"}]}));
+    client.replay(&json!({"id":"two","status":"interrupted","items":[
+        {"type":"userMessage","id":"u2","content":[{"type":"text","text":"After"}]},
+        {"type":"commandExecution","id":"cmd","command":"pwd","status":"completed"}]}));
+    let mut thread = Thread::new(1);
+    thread.apply(
+        json!({"type":"response","id":"history","command":"get_messages","success":true,
+        "data":{"messages":client.history,"compactions":client.compactions}}),
+    );
+    assert_eq!(
+        crate::work::compaction_anchor(&thread, &thread.native.compactions[0]).message,
+        2
+    );
+    assert!(thread.work.last().unwrap().stopped);
+}
+
+#[test]
+fn codex_provider_retries_replace_one_event_and_recover_or_fail() {
+    for failed in [false, true] {
+        let mut client = Client::new(spec(SessionSource::New, "read-only"));
+        client
+            .notification("turn/started", &json!({"turn":{"id":"retry"}}))
+            .unwrap();
+        for attempt in [1, 2] {
+            client
+                .notification(
+                    "error",
+                    &json!({"willRetry":true,"attempt":attempt,"maxAttempts":5,
+                "error":{"message":"Temporary error"}}),
+                )
+                .unwrap();
+        }
+        if failed {
+            assert!(
+                client
+                    .notification(
+                        "error",
+                        &json!({"willRetry":false,"error":{"message":"Final error"}})
+                    )
+                    .is_err()
+            );
+        } else {
+            client
+                .notification(
+                    "turn/completed",
+                    &json!({"turn":{"id":"retry","status":"completed","items":[]}}),
+                )
+                .unwrap();
+        }
+        let mut thread = Thread::new(1);
+        for event in client.events {
+            thread.apply(event);
+        }
+        let events = crate::work::retry_events(&thread);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["attempt"], 2);
+        assert_eq!(events[0]["maxAttempts"], 5);
+        assert_eq!(events[0]["running"], false);
+        assert_eq!(events[0]["success"], !failed);
+        if failed {
+            assert_eq!(thread.error.as_deref(), Some("Final error"));
+        }
+    }
+}
+
 fn spec(source: SessionSource, access: &str) -> Start {
     Start {
         id: "codex".into(),

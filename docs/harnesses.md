@@ -84,7 +84,7 @@ Shina also detects `claude-code-acp`, `codex-acp`, `gemini --experimental-acp`, 
 
 ## ACP protocol and limits
 
-The client implements ACP protocol version 1 as JSON-RPC 2.0 JSONL over stdio. It negotiates capabilities, starts sessions in the thread's project or scratch directory, and supports text and negotiated image prompts. Agent text, thoughts, tool calls and tool results use Shina's existing transcript reducer. Plans and mode updates remain in per-thread runtime metadata. Advertised commands enter the composer command menu.
+The client implements ACP protocol version 1 as JSON-RPC 2.0 JSONL over stdio. It negotiates capabilities, starts sessions in the thread's project or scratch directory, and supports text and negotiated image prompts. Agent text, thoughts, tool calls and tool results use Shina's existing transcript reducer. Plans also enter the transcript as typed cards, with later updates replacing the first card. Mode updates remain in per-thread runtime metadata. Advertised commands enter the composer command menu.
 
 When the agent advertises `promptCapabilities.embeddedContext`, file attachments use `resource` blocks for valid UTF-8 text without NULs up to 256 KiB, and `resource_link` blocks for binary files, larger files and folders. Without embedded context, Shina sends absolute path text. Images keep their negotiated typed image blocks. Files remain at their original paths; missing files block sending without clearing the draft.
 
@@ -113,6 +113,32 @@ ACP and Codex use the same bounded connection queues, shutdown registry and per-
 Claude uses that same process owner, bounded queues, shutdown registry and kill-on-close implementation.
 
 ## Validation
+
+### Typed transcript tools
+
+`Tool.kind` and `Tool.changes` default to absent and empty for saved transcripts and
+older server projections. Only an absent kind uses the legacy Pi name classifier.
+Each change keeps `path`, optional `old_path`, `operation`, unified `diff`, `additions`
+and `deletions`. ACP old/new text becomes a unified diff before flattening.
+
+`Tool.input` retains named input fields. `Tool.structured` retains the native
+`structuredContent`, `details` and `nestedCalls`, plus `input`. Normalized search
+results live at `fileSearchResults` as `{fileName, line?, column?, preview?}` and
+`webResults` as `{url, title?, snippet?}`. Providers that supply no structured
+results keep their text output. No result entries are inferred from prose.
+
+Plans use typed tools so the existing transcript projection carries each card.
+Adapters replace the same plan ID's payload in place, including in replay history.
+Tool and thought `order` values preserve events at the same text offset and default
+to the old content-block order for legacy records.
+
+Compaction records retain a transcript `anchor` and their original `historyIndex`
+in provider history. Completion replaces the running record without moving it.
+Legacy compactions without position metadata remain at the transcript's end.
+`AssistantWork.stopped` is a durable turn marker and defaults to false.
+`harness_state.workRetries` retains one anchored retry event per turn, including
+its latest attempt, limit when reported, recovery or final error. Native Codex
+retry errors do not always include an attempt limit; Shina does not invent one.
 
 `cargo test acp::tests` runs a Python ACP fixture from an owned temporary Shina profile. Python must be installed as `python` on Windows or `python3` on Unix. No third-party agents or external inference run in automated tests. Tests cover initialization, authenticated MCP registration and relay, stream reduction, permission responses and policy, cancellation, load/resume, images, queues, model switching, authentication denial and unsupported capabilities. Layout tests cover the harness picker at 620, 960, 1280 and 1920 pixels.
 

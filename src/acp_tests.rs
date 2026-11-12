@@ -3,6 +3,41 @@ use crate::model::{Status, Thread};
 use std::sync::Arc;
 
 #[test]
+fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
+    use crate::work::ToolKind::*;
+    for (native, expected) in [
+        ("execute", Command),
+        ("edit", FileChange),
+        ("search", FileSearch),
+        ("fetch", WebSearch),
+        ("read", Read),
+        ("list", List),
+        ("subagent", Subagent),
+        ("plan", Plan),
+        ("other", Other),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.ready = true;
+        client.running = true;
+        client.update(&json!({"sessionUpdate":"tool_call","toolCallId":"typed","title":"A provider title","kind":native,
+            "rawInput":{"command":"pwd","pattern":"foo"},"status":"completed",
+            "rawOutput":{"results":[{"fileName":"a.rs","line":3,"preview":"foo"}]},
+            "content":[{"type":"diff","path":"a.rs","oldText":"old\n","newText":"new\n"}]}));
+        let mut live = Thread::new(1);
+        for event in client.events {
+            live.apply(event);
+        }
+        let mut restored = Thread::new(2);
+        restored.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+        for thread in [&live, &restored] {
+            let tool = &thread.tools[0];
+            assert_eq!(tool.kind, Some(expected), "{native}");
+            assert_eq!(tool.changes[0].diff, "@@ -1 +1 @@\n-old\n+new\n");
+        }
+    }
+}
+
+#[test]
 fn file_prompts_use_negotiated_resources_or_path_text() {
     let directory = crate::store::directory().unwrap();
     let path = directory.join("resource.txt");
@@ -38,6 +73,51 @@ fn file_prompts_use_negotiated_resources_or_path_text() {
         assert!(client.running);
         assert_eq!(client.history[0]["content"][1], content[1]);
     }
+}
+
+#[test]
+fn acp_plan_updates_keep_the_original_position_and_replay_the_latest_steps() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client
+        .update(&json!({"sessionUpdate":"plan","entries":[{"content":"Read","status":"pending"}]}));
+    client.update(&json!({"sessionUpdate":"tool_call","toolCallId":"read","title":"Read","kind":"read","status":"completed","rawInput":{"path":"a.rs"}}));
+    client.update(&json!({"sessionUpdate":"plan_update","entries":[{"content":"Read","status":"completed"},{"content":"Write","status":"in_progress"}]}));
+    let mut live = Thread::new(1);
+    for event in client.events {
+        live.apply(event);
+    }
+    let mut replayed = Thread::new(2);
+    replayed.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":client.history}}));
+    for t in [&live, &replayed] {
+        assert_eq!(t.tools.len(), 2);
+        assert_eq!(t.tools[0].resolved_kind(), crate::work::ToolKind::Plan);
+        assert_eq!(t.tools[1].resolved_kind(), crate::work::ToolKind::Read);
+        let plan = crate::work::plan_data(&t.tools[0].input);
+        assert_eq!(plan["steps"][0]["status"], "completed");
+        assert_eq!(plan["steps"][1]["status"], "running");
+    }
+}
+
+#[test]
+fn acp_diff_parts_keep_native_unified_patches_without_old_new_text() {
+    let patch = "@@ -8 +8 @@\n-old\n+new\n";
+    let mut t = Thread::new(1);
+    t.apply(json!({"type":"tool_execution_start","toolCallId":"edit","toolName":"Provider title","args":{}}));
+    let result = tool_result(
+        &json!({"kind":"move","content":[{"type":"diff","path":"new.rs",
+        "oldPath":"old.rs","patch":{"format":"unified","text":patch}}]}),
+    );
+    t.apply(json!({"type":"tool_execution_end","toolCallId":"edit","result":result}));
+    assert_eq!(t.tools[0].changes[0].diff, patch);
+    assert_eq!(t.tools[0].changes[0].old_path.as_deref(), Some("old.rs"));
+    assert_eq!(
+        (
+            t.tools[0].changes[0].additions,
+            t.tools[0].changes[0].deletions
+        ),
+        (1, 1)
+    );
 }
 
 fn spec(source: SessionSource) -> Start {
@@ -158,8 +238,13 @@ fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
     pump(&mut thread, |t| t.status == Status::Completed);
     assert!(thread.messages.iter().any(|m| m.text == "Hello ACP"));
     assert_eq!(thread.thoughts[0].text, "Checking");
-    assert!(thread.tools[0].done);
-    assert_eq!(thread.tools[0].output, "Written");
+    let write = thread
+        .tools
+        .iter()
+        .find(|t| t.resolved_kind() == crate::work::ToolKind::FileChange)
+        .unwrap();
+    assert!(write.done);
+    assert_eq!(write.output, "Written");
     assert!(thread.harness_context_sent);
     let wire = records(&log);
     let prompt = wire

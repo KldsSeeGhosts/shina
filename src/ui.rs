@@ -22,6 +22,8 @@ mod pi_ui;
 mod pixel_icons;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
+#[path = "work_ui.rs"]
+mod work_ui;
 pub(crate) use pi_ui::questionnaire_key;
 
 /// Keyboard navigation uses the same server-scoped order as the unified sidebar.
@@ -6045,45 +6047,27 @@ fn remote_project_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// What a tool call does, for its one-line row: icon, past and present verb, and what it
-/// acts on. Reads, listings and searches count as exploring when grouped, as Cursor does.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ToolKind {
-    Read,
-    List,
-    Search,
-    Edit,
-    Run,
-    Other,
-}
-
-fn tool_kind(name: &str) -> ToolKind {
-    match name.to_ascii_lowercase().as_str() {
-        "read" | "read_file" => ToolKind::Read,
-        "edit" | "write" | "edit_file" | "write_file" | "apply_patch" => ToolKind::Edit,
-        "bash" | "powershell" | "shell" | "exec" | "exec_command" => ToolKind::Run,
-        "grep" | "rg" | "search" | "find" => ToolKind::Search,
-        "ls" | "list" | "list_directory" => ToolKind::List,
-        _ => ToolKind::Other,
-    }
-}
-
 /// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
 fn tool_verb(tool: &Tool) -> String {
+    use crate::work::ToolKind::*;
     let done = tool.done || tool.failed;
-    match (tool_kind(&tool.name), done) {
-        (ToolKind::Read, true) => "Read".into(),
-        (ToolKind::Read, false) => "Reading".into(),
-        (ToolKind::List, true) => "Listed".into(),
-        (ToolKind::List, false) => "Listing".into(),
-        (ToolKind::Search, true) => "Searched".into(),
-        (ToolKind::Search, false) => "Searching".into(),
-        (ToolKind::Edit, true) => "Edited".into(),
-        (ToolKind::Edit, false) => "Editing".into(),
-        (ToolKind::Run, true) => "Ran".into(),
-        (ToolKind::Run, false) => "Running".into(),
-        (ToolKind::Other, true) => format!("Called {}", tool.name),
-        (ToolKind::Other, false) => format!("Calling {}", tool.name),
+    match (tool.resolved_kind(), done) {
+        (Read, true) => "Read".into(),
+        (Read, false) => "Reading".into(),
+        (List, true) => "Listed".into(),
+        (List, false) => "Listing".into(),
+        (FileSearch | WebSearch, true) => "Searched".into(),
+        (FileSearch | WebSearch, false) => "Searching".into(),
+        (FileChange, true) => "Changed".into(),
+        (FileChange, false) => "Changing".into(),
+        (Command, true) => "Ran".into(),
+        (Command, false) => "Running".into(),
+        (Subagent, true) => "Delegated".into(),
+        (Subagent, false) => "Delegating".into(),
+        (Plan, true) => "Updated plan".into(),
+        (Plan, false) => "Updating plan".into(),
+        (Other, true) => format!("Called {}", tool.name),
+        (Other, false) => format!("Calling {}", tool.name),
     }
 }
 
@@ -6100,64 +6084,9 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// One line for a batch: "Explored 3 files, 2 searches", "Edited 1 file", "Ran 2 commands".
+/// Ported from KSG Code's work-log/presentation.ts summarizeToolGroup.
 fn tool_summary(tools: &[&Tool]) -> String {
-    let count = |kind: ToolKind| tools.iter().filter(|t| tool_kind(&t.name) == kind).count();
-    let (read, list, search) = (
-        count(ToolKind::Read),
-        count(ToolKind::List),
-        count(ToolKind::Search),
-    );
-    let mut parts = vec![];
-    if read + list + search > 0 {
-        let mut explored = vec![];
-        if read > 0 {
-            explored.push(plural(read, "file", "files"));
-        }
-        if list > 0 {
-            explored.push(plural(list, "directory", "directories"));
-        }
-        if search > 0 {
-            explored.push(plural(search, "search", "searches"));
-        }
-        // A batch of reads alone reads as plain "Read 2 files".
-        let verb = if list + search == 0 {
-            "Read"
-        } else if read + search == 0 {
-            "Listed"
-        } else if read + list == 0 {
-            "Searched"
-        } else {
-            "Explored"
-        };
-        parts.push(if verb == "Searched" {
-            format!("Ran {}", explored.join(", "))
-        } else {
-            format!("{verb} {}", explored.join(", "))
-        });
-    }
-    for (kind, verb, one, many) in [
-        (ToolKind::Edit, "Edited", "file", "files"),
-        (ToolKind::Run, "Ran", "command", "commands"),
-        (ToolKind::Other, "Called", "tool", "tools"),
-    ] {
-        let n = count(kind);
-        if n > 0 {
-            parts.push(format!("{verb} {}", plural(n, one, many)));
-        }
-    }
-    parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| {
-            if i == 0 {
-                part.clone()
-            } else {
-                part.to_lowercase()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    crate::work::summarize(tools)
 }
 
 /// Turn and thinking durations, as Cursor writes them: 45s, 2m 5s, 1h 3m.
@@ -6177,7 +6106,9 @@ enum TranscriptPart {
         to: usize,
     },
     Tools(Vec<usize>),
-    Thought(usize),
+    Thought(Vec<usize>),
+    Compaction(usize),
+    Retry(usize),
 }
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
@@ -6187,14 +6118,67 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
         .iter()
         .enumerate()
         .filter(|(_, tool)| (start..end).contains(&tool.anchor.message))
-        .map(|(index, tool)| (tool.anchor, tool.block, false, index))
+        .map(|(index, tool)| {
+            (
+                tool.anchor,
+                if tool.order == 0 {
+                    tool.block as u64
+                } else {
+                    tool.order
+                },
+                0,
+                index,
+            )
+        })
         .collect();
     events.extend(
         t.thoughts
             .iter()
             .enumerate()
             .filter(|(_, thought)| (start..end).contains(&thought.anchor.message))
-            .map(|(index, thought)| (thought.anchor, thought.block, true, index)),
+            .map(|(index, thought)| {
+                (
+                    thought.anchor,
+                    if thought.order == 0 {
+                        thought.block as u64
+                    } else {
+                        thought.order
+                    },
+                    1,
+                    index,
+                )
+            }),
+    );
+    events.extend(
+        t.native
+            .compactions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let anchor = crate::work::compaction_anchor(t, item);
+                (start..end).contains(&anchor.message).then_some((
+                    anchor,
+                    item["order"].as_u64().unwrap_or(u64::MAX),
+                    2,
+                    index,
+                ))
+            }),
+    );
+    events.extend(
+        crate::work::retry_events(t)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let anchor =
+                    serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
+                        .ok()?;
+                (start..end).contains(&anchor.message).then_some((
+                    anchor,
+                    item["order"].as_u64().unwrap_or(u64::MAX),
+                    3,
+                    index,
+                ))
+            }),
     );
     events.sort_by_key(|(anchor, block, _, _)| (*anchor, *block));
     let mut events = events.into_iter().peekable();
@@ -6207,7 +6191,7 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
             .peek()
             .is_some_and(|event| event.0.message == message)
         {
-            let (anchor, _, thinking, index) = events.next().unwrap();
+            let (anchor, _, kind, index) = events.next().unwrap();
             let to = if anchor.offset >= from && text.is_char_boundary(anchor.offset) {
                 anchor.offset
             } else {
@@ -6216,10 +6200,22 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
             if to > from {
                 parts.push(TranscriptPart::Text { message, from, to });
             }
-            if thinking {
-                parts.push(TranscriptPart::Thought(index));
+            if kind == 2 {
+                parts.push(TranscriptPart::Compaction(index));
+            } else if kind == 3 {
+                parts.push(TranscriptPart::Retry(index));
+            } else if kind == 1 {
+                if let Some(TranscriptPart::Thought(indices)) = parts.last_mut() {
+                    indices.push(index);
+                } else {
+                    parts.push(TranscriptPart::Thought(vec![index]));
+                }
             } else if previous_anchor == Some(anchor)
                 && let Some(TranscriptPart::Tools(indices)) = parts.last_mut()
+                && t.tools[index].resolved_kind() != crate::work::ToolKind::Plan
+                && indices
+                    .last()
+                    .is_some_and(|i| t.tools[*i].resolved_kind() != crate::work::ToolKind::Plan)
             {
                 indices.push(index);
             } else {
@@ -6294,6 +6290,9 @@ fn activity_line(
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
+    if tool.resolved_kind() == crate::work::ToolKind::Plan {
+        return work_ui::plan_card(s, p, index);
+    }
     let title = tool_title(tool);
     let mut content = col().gap(4.0).child(
         activity_line(
@@ -6305,14 +6304,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             (tool_verb(tool), &tool.detail),
             tool.failed,
             tool.expanded,
-            match tool_kind(&tool.name) {
-                ToolKind::Read => "eye",
-                ToolKind::List => "folder",
-                ToolKind::Search => "search",
-                ToolKind::Edit => "edit",
-                ToolKind::Run => "terminal",
-                ToolKind::Other => "wrench",
-            },
+            work_ui::kind_icon(tool.resolved_kind()),
             p,
         )
         .on_press(move |s: &mut State| {
@@ -6324,101 +6316,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         content = content.child(pi_ui::subagent_results(tool, p));
     }
     if tool.expanded {
-        content = content.child(
-            col()
-                .key(format!("tool-output-{}-{index}", t.id))
-                .role("group")
-                .label(format!("Output for {title}"))
-                .mb(4.0)
-                .ml(28.0)
-                .radius(6.0)
-                .fill(p.code_bg)
-                .border(1.0, p.line)
-                .child(
-                    label(&tool.detail, SMALL, p.muted)
-                        .wrap_anywhere()
-                        .selectable(true)
-                        .px(12.0)
-                        .pt(9.0)
-                        .pb(7.0),
-                )
-                .child(rule(p))
-                .child(
-                    col()
-                        .max_h(200.0)
-                        .px(12.0)
-                        .py(9.0)
-                        .scroll(ScrollSpec {
-                            stick_bottom: !tool.done,
-                        })
-                        .child(
-                            label(
-                                if tool.output.is_empty() {
-                                    if tool.done {
-                                        "No output"
-                                    } else {
-                                        "Waiting for output"
-                                    }
-                                } else {
-                                    &tool.output
-                                },
-                                TextStyle::new(12.0, 400.0)
-                                    .family(rune::Family::SystemMono)
-                                    .lh(18.0),
-                                if tool.output.is_empty() {
-                                    p.muted
-                                } else {
-                                    p.ink
-                                },
-                            )
-                            .wrap_anywhere()
-                            .selectable(true),
-                        ),
-                ),
-        );
-    }
-    if tool.expanded {
-        if let Some(exit) = tool.exit_code {
-            content = content.child(label(format!("Exit code {exit}"), SMALL, p.muted));
-        }
-        if let Some(parent) = &tool.parent_call {
-            content =
-                content.child(label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere());
-        }
-        if !tool.images.is_empty() {
-            content = content.child(message_images(
-                s,
-                p,
-                &tool.images,
-                &format!("tool-image-{}-{index}", t.id),
-            ));
-        }
-        if tool.subagents.is_empty()
-            && tool
-                .structured
-                .as_object()
-                .is_some_and(|data| data.values().any(|v| !v.is_null()))
-        {
-            content = content.child(
-                col()
-                    .max_h(200.0)
-                    .scroll(ScrollSpec {
-                        stick_bottom: false,
-                    })
-                    .child(
-                        label(
-                            truncate(
-                                &serde_json::to_string_pretty(&tool.structured).unwrap_or_default(),
-                                50_000,
-                            ),
-                            SMALL,
-                            p.ink,
-                        )
-                        .wrap_anywhere()
-                        .selectable(true),
-                    ),
-            );
-        }
+        content = content.child(work_ui::expanded(s, p, index));
     }
     content
 }
@@ -6461,79 +6359,13 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
-fn inline_thought(s: &State, p: Palette, index: usize) -> El {
-    let t = s.current();
-    let thought = &t.thoughts[index];
-    let timing = thought.duration_ms.or_else(|| {
-        (!thought.done)
-            .then(|| {
-                thought
-                    .started
-                    .map(|start| start.elapsed().as_millis() as u64)
-            })
-            .flatten()
-    });
-    let (verb, detail) = match (thought.done, timing) {
-        (true, Some(ms)) if ms < 500 => ("Thought", "briefly".to_string()),
-        (true, Some(ms)) => ("Thought", elapsed_label(ms / 1000)),
-        (false, Some(ms)) => ("Thinking", elapsed_label(ms / 1000)),
-        (true, None) => ("Thought", String::new()),
-        (false, None) => ("Thinking", String::new()),
-    };
-    let mut content = col().gap(4.0).child(
-        activity_line(
-            format!("inline-thought-{}-{index}", t.id),
-            format!(
-                "{} thinking text",
-                if thought.expanded { "Hide" } else { "Show" }
-            ),
-            (verb.into(), &detail),
-            false,
-            thought.expanded,
-            "brain",
-            p,
-        )
-        .on_press(move |s: &mut State| {
-            let thought = &mut s.current_mut().thoughts[index];
-            thought.expanded = !thought.expanded;
-        }),
-    );
-    if thought.expanded {
-        // Thinking reads as a quiet aside, not a boxed output.
-        content = content.child(
-            col()
-                .key(format!("thought-output-{}-{index}", t.id))
-                .role("group")
-                .label("Thinking text")
-                .pl(28.0)
-                .mb(4.0)
-                .max_h(220.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: !thought.done,
-                })
-                .child(
-                    label(
-                        if thought.text.is_empty() {
-                            "Pi did not provide visible thinking text."
-                        } else {
-                            &thought.text
-                        },
-                        TextStyle::new(13.0, 400.0).lh(20.0),
-                        p.faint,
-                    )
-                    .wrap_anywhere()
-                    .selectable(true),
-                ),
-        );
-    }
-    content
-}
-
 fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> El {
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
-        TranscriptPart::Thought(index) => inline_thought(s, p, *index),
+        TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
+        TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
+        TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
@@ -6593,6 +6425,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         parts[..last]
             .iter()
             .position(|part| matches!(part, TranscriptPart::Text { .. }))
+            .filter(|index| {
+                !parts[..*index].iter().any(|part| match part {
+                    TranscriptPart::Compaction(_) | TranscriptPart::Retry(_) => true,
+                    TranscriptPart::Tools(indices) => indices
+                        .iter()
+                        .any(|i| t.tools[*i].resolved_kind() == crate::work::ToolKind::Plan),
+                    _ => false,
+                })
+            })
     });
     let live = end == t.messages.len() && t.status.busy();
     let work = t.work.iter().find(|work| work.start == start);
@@ -6681,11 +6522,16 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 ),
         );
         response = response.child(rows);
-    } else if last_work.is_some() {
+    } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let title = match work.and_then(|work| work.elapsed) {
-            Some(seconds) => format!("Worked for {}", elapsed_label(seconds)),
-            None => "Worked".into(),
+        let title = match (
+            work.is_some_and(|work| work.stopped),
+            work.and_then(|work| work.elapsed),
+        ) {
+            (true, Some(seconds)) => format!("You stopped after {}", elapsed_label(seconds)),
+            (true, None) => "You stopped this response".into(),
+            (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
+            (false, None) => "Worked".into(),
         };
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
@@ -6711,6 +6557,8 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         // records it.
                         None => t.work.push(crate::model::AssistantWork {
                             start,
+                            stopped: false,
+                            stopped_order: 0,
                             expanded: true,
                             elapsed: None,
                         }),
@@ -6759,7 +6607,11 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .tools
         .iter()
         .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
-    if t.messages.is_empty() && !visible_tools && !t.status.busy() {
+    if t.messages.is_empty()
+        && !visible_tools
+        && !t.status.busy()
+        && t.native.compactions.is_empty()
+    {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
@@ -6809,6 +6661,11 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             .saturating_sub(32);
         while index < t.messages.len() {
             let message = &t.messages[index];
+            if message.role != "Pi" {
+                if let Some(events) = work_ui::boundary_events(s, p, wide, index) {
+                    messages = messages.child(events);
+                }
+            }
             if message.role == "Pi" {
                 let end = t.messages[index..]
                     .iter()
@@ -6897,7 +6754,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             messages = messages.child(body.key(key));
             index += 1;
         }
-        messages = messages.child(pi_ui::compaction_activity(s, p));
+        if let Some(events) = work_ui::boundary_events(s, p, wide, t.messages.len()) {
+            messages = messages.child(events);
+        }
         if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
             messages = messages.child(assistant_turn(
                 s,
@@ -8424,7 +8283,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
-    fn runtime(width: f32) -> Runtime<State> {
+    pub(super) fn runtime(width: f32) -> Runtime<State> {
         let mut rt = Runtime::with_text(
             State::new(".".into(), false),
             view,
@@ -9518,7 +9377,7 @@ pub(crate) mod tests {
         assert!(rt.state.routines(0).is_empty());
         assert!(rt.state.current().pi.is_none());
     }
-    fn press(rt: &mut Runtime<State>, key: &str) {
+    pub(super) fn press(rt: &mut Runtime<State>, key: &str) {
         rt.frame(0.25);
         let (x, y) = rt
             .find(key)
@@ -11860,14 +11719,14 @@ pub(crate) mod tests {
         );
         assert_eq!(
             tool_summary(&t.tools[2..].iter().collect::<Vec<_>>()),
-            "Edited 1 file, ran 1 command"
+            "Changed 1 file and ran 1 command"
         );
         let explored = [&t.tools[0], &t.tools[0]];
         let mut search = t.tools[0].clone();
         search.name = "grep".into();
         assert_eq!(
             tool_summary(&[explored[0], explored[1], &search]),
-            "Explored 2 files, 1 search"
+            "Read 2 files and searched code 1 time"
         );
         assert_eq!(elapsed_label(125), "2m 5s");
         assert_eq!(tool_title(&t.tools[3]), "Ran npm test -- reconnect.test.ts");
@@ -11890,7 +11749,7 @@ pub(crate) mod tests {
             turn_parts(&thread, 0, 1),
             vec![
                 TranscriptPart::Tools(vec![0]),
-                TranscriptPart::Thought(0),
+                TranscriptPart::Thought(vec![0]),
                 TranscriptPart::Tools(vec![1]),
                 TranscriptPart::Text {
                     message: 0,

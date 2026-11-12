@@ -11,6 +11,7 @@ rune-kit = { git = "https://github.com/anomalyco/rune", rev = "22fcaf167b5e8d74e
 serde_json = "1"
 serde_yaml_ng = "0.10"
 serde_json_lenient = "0.2"
+similar = "2"
 pulldown-cmark = { version = "0.13", default-features = false }
 sha2 = "0.10"
 chrono = "0.4"

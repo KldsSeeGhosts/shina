@@ -514,13 +514,27 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
 /// KSG Code's context meter exposes its native compact action next to context details.
 /// Ported from KSG Code's MessagesTimeline.logic.ts `context-compaction` rows:
 /// collapsed summary, status and token figures.
-pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
+pub(super) fn compaction_activity(s: &State, p: Palette, selected: usize) -> El {
     let t = s.current();
     if t.native.compactions.is_empty() {
         return el();
     }
-    let mut list = col().key("compaction-history").gap(6.0).w_full();
-    for (index, item) in t.native.compactions.iter().enumerate() {
+    let mut list = col()
+        .key(if selected == 0 {
+            "compaction-history".into()
+        } else {
+            format!("compaction-position-{selected}")
+        })
+        .gap(6.0)
+        .w_full()
+        .min_w(0.0);
+    for (index, item) in t
+        .native
+        .compactions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index == selected)
+    {
         let result = if item["result"].is_object() {
             &item["result"]
         } else {
@@ -546,7 +560,12 @@ pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
                 row()
                     .gap(8.0)
                     .center_y()
-                    .child(label(title, SMALL, p.muted))
+                    .child(
+                        pixel_text(title, p.muted)
+                            .min_w(0.0)
+                            .shrink()
+                            .wrap_anywhere(),
+                    )
                     .child(spacer())
                     .child(button(
                         &format!("compaction-toggle-{index}"),
@@ -563,12 +582,11 @@ pub(super) fn compaction_activity(s: &State, p: Palette) -> El {
                     )),
             );
         if let Some(before) = result["tokensBefore"].as_u64() {
-            card = card.child(label(
+            card = card.child(pixel_text(
                 match result["estimatedTokensAfter"].as_u64() {
                     Some(after) => format!("{before} tokens before, about {after} after"),
                     None => format!("{before} tokens before"),
                 },
-                SMALL,
                 p.muted,
             ));
         }

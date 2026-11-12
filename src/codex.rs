@@ -135,6 +135,8 @@ struct Client {
     turn: Option<String>,
     ready: bool,
     running: bool,
+    retry_attempt: u64,
+    retrying: bool,
     cancelling: bool,
     interrupt_sent: bool,
     compact_request: Option<Value>,
@@ -169,6 +171,8 @@ impl Client {
             turn: None,
             ready: false,
             running: false,
+            retry_attempt: 0,
+            retrying: false,
             cancelling: false,
             interrupt_sent: false,
             compact_request: None,
@@ -781,6 +785,8 @@ impl Client {
     fn notification(&mut self, method: &str, params: &Value) -> Result<(), String> {
         match method {
             "turn/started" => {
+                self.retry_attempt = 0;
+                self.retrying = false;
                 self.running = true;
                 self.turn = params["turn"]["id"].as_str().map(str::to_owned);
                 if self.cancelling && !self.interrupt_sent {
@@ -807,9 +813,24 @@ impl Client {
                     .push(json!({"type":"tool_execution_update","toolCallId":id,
                     "partialResult":{"content":[{"type":"text","text":output}]}}));
             }
-            "turn/plan/updated" => self
-                .events
-                .push(json!({"type":"harness_update","field":"plan","value":params})),
+            "turn/plan/updated" => {
+                let turn = params["turnId"]
+                    .as_str()
+                    .or(self.turn.as_deref())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        self.history
+                            .iter()
+                            .filter(|m| m["role"] == "user")
+                            .count()
+                            .to_string()
+                    });
+                let id = params["planId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("codex-plan-{turn}"));
+                self.plan(params, &id, true);
+            }
             "thread/tokenUsage/updated" => {
                 if self.compacting {
                     return Ok(());
@@ -847,6 +868,20 @@ impl Client {
                 }
                 let failed = turn["status"] == "failed";
                 let aborted = self.cancelling || turn["status"] == "interrupted";
+                if self.retrying {
+                    let error = self.redact(if aborted {
+                        "Provider retry stopped"
+                    } else {
+                        turn["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex turn failed.")
+                    });
+                    self.events.push(
+                        json!({"type":"auto_retry_end","success":!failed && !aborted,
+                        "finalError":error}),
+                    );
+                    self.retrying = false;
+                }
                 for item in turn["items"].as_array().into_iter().flatten() {
                     if item["type"] == "contextCompaction" {
                         self.replay_compaction(item, turn, true);
@@ -888,6 +923,12 @@ impl Client {
                     self.prompt(record)?;
                 }
             }
+            "error" if params["willRetry"] == true => {
+                self.retry_attempt = params["attempt"].as_u64().unwrap_or(self.retry_attempt + 1);
+                self.retrying = true;
+                self.events.push(json!({"type":"auto_retry_start","attempt":self.retry_attempt,
+                    "maxAttempts":params["maxAttempts"],"errorMessage":self.redact(params["error"]["message"].as_str().unwrap_or("Codex provider error."))}));
+            }
             "error" if params["willRetry"] != true && self.compacting => {
                 self.compaction_error = Some(
                     self.redact(
@@ -898,6 +939,11 @@ impl Client {
                 );
             }
             "error" if params["willRetry"] != true => {
+                if self.retrying {
+                    self.events.push(json!({"type":"auto_retry_end","success":false,"finalError":
+                        self.redact(params["error"]["message"].as_str().unwrap_or("Codex failed."))}));
+                    self.retrying = false;
+                }
                 return Err(self.redact(
                     params["error"]["message"]
                         .as_str()
@@ -1026,9 +1072,7 @@ impl Client {
                     }
                 }
             }
-            "plan" if done => self
-                .events
-                .push(json!({"type":"harness_update","field":"plan","value":item})),
+            "plan" if done => self.plan(item, &format!("codex-plan-{id}"), emit),
             "userMessage" | "agentMessage" | "reasoning" | "plan" => {}
             _ => {
                 let name = match kind {
@@ -1039,25 +1083,40 @@ impl Client {
                     }
                     _ => kind,
                 };
+                let metadata = tool_metadata(item);
                 if new {
-                    self.history.push(json!({"role":"assistant","content":[{"type":"toolCall","id":id,"name":name,"arguments":item}]}));
+                    self.history.push(json!({"role":"assistant","content":[{"type":"toolCall","id":id,"name":name,"arguments":item,"toolKind":metadata["toolKind"],"changes":metadata["changes"]}]}));
                     if emit {
-                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":item}));
+                        self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":item,"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
                 if done {
                     let output = item["aggregatedOutput"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| item.to_string());
+                        .or_else(|| item["output"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| {
+                            if metadata["toolKind"] == "other" {
+                                item.to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
                     let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
                         || item["exitCode"].as_i64().is_some_and(|code| code != 0);
                     let content = json!([{"type":"text","text":output}]);
-                    self.history.push(json!({"role":"toolResult","toolCallId":id,"content":content,"isError":failed}));
+                    let mut result = metadata;
+                    result["content"] = content;
+                    result["details"] = json!({"codex":item,"exitCode":item["exitCode"]});
+                    let mut saved = result.clone();
+                    saved["role"] = json!("toolResult");
+                    saved["toolCallId"] = json!(id);
+                    saved["isError"] = json!(failed);
+                    self.history.push(saved);
                     if emit {
                         self.events
                             .push(json!({"type":"tool_execution_end","toolCallId":id,
-                        "result":{"content":content},"isError":failed}));
+                        "result":result,"isError":failed}));
                     }
                 }
             }
@@ -1066,6 +1125,16 @@ impl Client {
             self.completed.insert(id.into());
             self.items.remove(id);
             self.text.remove(&format!("output:{id}"));
+        }
+    }
+
+    fn plan(&mut self, source: &Value, id: &str, emit: bool) {
+        let mut source = source.clone();
+        source["_shinaPlanId"] = json!(id);
+        crate::work::save_plan(&mut self.history, id, &source);
+        if emit {
+            self.events
+                .push(json!({"type":"harness_update","field":"plan","value":source}));
         }
     }
 
@@ -1118,7 +1187,8 @@ impl Client {
         if self.compactions.len() >= 32 {
             self.compactions.remove(0);
         }
-        self.compactions.push(json!({"running":true}));
+        self.compactions
+            .push(json!({"running":true,"historyIndex":self.history.len()}));
         if emit {
             self.events.push(json!({"type":"compaction_start"}));
         }
@@ -1133,6 +1203,7 @@ impl Client {
             .last()
             .is_some_and(|row| row["running"] == true)
         {
+            outcome["historyIndex"] = self.compactions.last().unwrap()["historyIndex"].clone();
             *self.compactions.last_mut().unwrap() = outcome.clone();
         } else {
             return;
@@ -1175,13 +1246,19 @@ impl Client {
     fn finish_history_turn(&mut self, turn: &Value) {
         // Only a successfully settled turn proves a final reply. Commentary before an
         // interrupt or crash must never make durable task recovery report success.
-        let has_message =
-            self.active_message.is_some()
-                || turn["items"].as_array().into_iter().flatten().any(|item| {
-                    matches!(item["type"].as_str(), Some("agentMessage" | "reasoning"))
-                });
+        let has_message = self.active_message.is_some()
+            || turn["items"].as_array().into_iter().flatten().any(|item| {
+                !matches!(
+                    item["type"].as_str(),
+                    Some("userMessage" | "contextCompaction")
+                )
+            });
         if has_message
-            && let Some(message) = self.history.last_mut().filter(|m| m["role"] == "assistant")
+            && let Some(message) = self
+                .history
+                .iter_mut()
+                .rev()
+                .find(|m| m["role"] == "assistant")
         {
             message["stopReason"] = json!(match turn["status"].as_str() {
                 Some("completed") => "stop",
@@ -1442,3 +1519,44 @@ fn run(
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+/// Ported from KSG Code's CodexAdapterV2 item contracts, before output is flattened.
+fn tool_metadata(item: &Value) -> Value {
+    use crate::work::{FileChange, ToolKind, result_metadata};
+    let kind = match item["type"].as_str().unwrap_or("") {
+        "commandExecution" => ToolKind::Command,
+        "fileChange" => ToolKind::FileChange,
+        "fileSearch" => ToolKind::FileSearch,
+        "webSearch" | "webFetch" => ToolKind::WebSearch,
+        "readFile" | "imageView" => ToolKind::Read,
+        "listDirectory" => ToolKind::List,
+        "collabAgentToolCall" | "collabAgentSpawn" | "collabAgentInteraction" => ToolKind::Subagent,
+        "todoList" | "plan" => ToolKind::Plan,
+        _ => ToolKind::Other,
+    };
+    let changes = item["changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            let path = change["path"].as_str()?;
+            let operation = change["kind"]["type"]
+                .as_str()
+                .or_else(|| change["kind"].as_str())
+                .unwrap_or("update");
+            let mut file = FileChange::new(path, operation, change["diff"].as_str().unwrap_or(""));
+            if let Some(moved) = change["kind"]["move_path"]
+                .as_str()
+                .or_else(|| change["kind"]["movePath"].as_str())
+            {
+                file.old_path = Some(file.path);
+                file.path = moved.into();
+                file.operation = "move".into();
+            }
+            Some(file)
+        })
+        .collect();
+    let mut metadata = result_metadata(kind, changes, item);
+    metadata["input"] = item.clone();
+    metadata
+}
