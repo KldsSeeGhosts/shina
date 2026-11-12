@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, SystemTime};
 
 pub const MAX_KEYBINDING_VALUE_LENGTH: usize = 64;
 pub const MAX_KEYBINDING_WHEN_LENGTH: usize = 256;
@@ -912,20 +918,24 @@ pub fn resolve_event_keys(
     key_base: Option<char>,
 ) -> HashSet<String> {
     let mut keys = HashSet::new();
+    let mut layout_is_ascii_letter = false;
     match &event.key {
         rune::Key::Text(t) => {
             let lower = t.to_lowercase();
-            keys.insert(lower.clone());
             let mut chars = lower.chars();
-            if let (Some(ch), None) = (chars.next(), chars.next())
-                && event.mods.shift
-                && let Some(unshifted) = us_shifted_to_unshifted(ch)
-            {
-                keys.insert(unshifted.to_string());
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                layout_is_ascii_letter = ch.is_ascii_lowercase();
+                if event.mods.shift
+                    && let Some(unshifted) = us_shifted_to_unshifted(ch)
+                {
+                    keys.insert(unshifted.to_string());
+                }
             }
+            keys.insert(lower);
         }
         rune::Key::Command(ch) => {
             let lower = ch.to_ascii_lowercase();
+            layout_is_ascii_letter = lower.is_ascii_lowercase();
             keys.insert(lower.to_string());
             if event.mods.shift
                 && let Some(unshifted) = us_shifted_to_unshifted(lower)
@@ -981,7 +991,7 @@ pub fn resolve_event_keys(
         keys.insert(base.to_ascii_lowercase().to_string());
     }
     if let Some(code) = physical {
-        if let Some(letter) = physical_letter_token(code) {
+        if !layout_is_ascii_letter && let Some(letter) = physical_letter_token(code) {
             keys.insert(letter.to_string());
         }
         if let Some(token) = us_physical_key_token(code) {
@@ -989,6 +999,21 @@ pub fn resolve_event_keys(
         }
     }
     keys
+}
+
+/// Ported from KSG Code's `isRichTextBoldShortcut` (`apps/web/src/keybindings.ts`):
+/// Mod+B without extra modifiers, with non-empty text selection.
+pub fn is_rich_text_bold_shortcut(
+    event: &rune::KeyEvent,
+    physical: Option<rune::PhysicalKeyCode>,
+    key_base: Option<char>,
+    has_selection: bool,
+) -> bool {
+    has_selection
+        && (event.mods.cmd || event.mods.ctrl)
+        && !event.mods.alt
+        && !event.mods.shift
+        && resolve_event_keys(event, physical, key_base).contains("b")
 }
 
 pub fn matches_keybinding_shortcut(
@@ -1181,6 +1206,92 @@ pub fn shortcut_to_keybinding_input(shortcut: &KeybindingShortcut) -> String {
     };
     parts.push(key_token);
     parts.join("+")
+}
+
+pub const CORE_WHEN_VARIABLES: &[&str] = &[
+    "terminalFocus",
+    "terminalOpen",
+    "previewOpen",
+    "isWeb",
+    "isDesktop",
+    "true",
+    "false",
+];
+
+fn collect_when_identifiers(node: Option<&WhenNode>, out: &mut HashSet<String>) {
+    let Some(node) = node else { return };
+    match node {
+        WhenNode::Identifier { name } => {
+            out.insert(name.clone());
+        }
+        WhenNode::Not { node } => collect_when_identifiers(Some(node), out),
+        WhenNode::And { left, right } | WhenNode::Or { left, right } => {
+            collect_when_identifiers(Some(left), out);
+            collect_when_identifiers(Some(right), out);
+        }
+    }
+}
+
+pub fn build_when_variable_options() -> Vec<String> {
+    let mut vars: HashSet<String> = CORE_WHEN_VARIABLES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for rule in default_resolved_keybindings() {
+        collect_when_identifiers(rule.when_ast.as_ref(), &mut vars);
+    }
+    let mut list: Vec<String> = vars.into_iter().collect();
+    list.sort_by(|left, right| {
+        let l_idx = CORE_WHEN_VARIABLES.iter().position(|&c| c == left);
+        let r_idx = CORE_WHEN_VARIABLES.iter().position(|&c| c == right);
+        match (l_idx, r_idx) {
+            (Some(l), Some(r)) => l.cmp(&r),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+    list
+}
+
+pub fn default_when_variable() -> String {
+    build_when_variable_options()
+        .into_iter()
+        .find(|v| v != "true" && v != "false")
+        .unwrap_or_else(|| "terminalFocus".into())
+}
+
+pub fn is_known_when_variable(identifier: &str) -> bool {
+    build_when_variable_options()
+        .iter()
+        .any(|known| known == identifier)
+}
+
+pub fn unknown_when_variables(node: Option<&WhenNode>) -> Vec<String> {
+    let mut identifiers = HashSet::new();
+    collect_when_identifiers(node, &mut identifiers);
+    let known: HashSet<String> = build_when_variable_options().into_iter().collect();
+    let mut unknown: Vec<String> = identifiers
+        .into_iter()
+        .filter(|id| !known.contains(id))
+        .collect();
+    unknown.sort();
+    unknown
+}
+
+pub fn parse_when_expression_draft(expression: &str) -> Result<Option<WhenNode>, String> {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_KEYBINDING_WHEN_LENGTH {
+        return Err(format!(
+            "When expression must be {MAX_KEYBINDING_WHEN_LENGTH} characters or fewer."
+        ));
+    }
+    parse_keybinding_when_expression(trimmed)
+        .map(Some)
+        .ok_or_else(|| "Use variables with !, &&, ||, and parentheses.".into())
 }
 
 pub fn when_ast_to_expression(node: Option<&WhenNode>) -> String {
@@ -1659,6 +1770,74 @@ pub fn conflict_warning_description(labels: &[String]) -> Option<String> {
     }
 }
 
+pub fn build_keybinding_command_options(keybindings: &[ResolvedKeybindingRule]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut commands = Vec::new();
+    for &cmd in STATIC_COMMANDS {
+        if seen.insert(cmd.to_owned()) {
+            commands.push(cmd.to_owned());
+        }
+    }
+    for binding in keybindings {
+        if seen.insert(binding.command.clone()) {
+            commands.push(binding.command.clone());
+        }
+    }
+    commands.sort_by(|left, right| {
+        let left_rank = usage_command_rank(left);
+        let right_rank = usage_command_rank(right);
+        match (left_rank, right_rank) {
+            (Some(l), Some(r)) => l.cmp(&r),
+            _ => {
+                let lk = if left_rank.is_some() {
+                    command_label("usage.cost")
+                } else {
+                    command_label(left)
+                };
+                let rk = if right_rank.is_some() {
+                    command_label("usage.cost")
+                } else {
+                    command_label(right)
+                };
+                lk.cmp(&rk)
+            }
+        }
+    });
+    commands
+}
+
+pub fn validate_keybinding_draft(command: &str, key: &str, when: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("Select a command.".into());
+    }
+    if !is_valid_command(command) {
+        return Err("Unknown keybinding command.".into());
+    }
+    let trimmed_key = key.trim();
+    if trimmed_key.is_empty() {
+        return Err("Press shortcut".into());
+    }
+    if trimmed_key.len() > MAX_KEYBINDING_VALUE_LENGTH {
+        return Err(format!(
+            "Keybinding must be {MAX_KEYBINDING_VALUE_LENGTH} characters or fewer."
+        ));
+    }
+    if parse_keybinding_shortcut(trimmed_key).is_none() {
+        return Err("Invalid keybinding.".into());
+    }
+    let trimmed_when = when.trim();
+    if trimmed_when.len() > MAX_KEYBINDING_WHEN_LENGTH {
+        return Err(format!(
+            "When expression must be {MAX_KEYBINDING_WHEN_LENGTH} characters or fewer."
+        ));
+    }
+    if !trimmed_when.is_empty() && parse_keybinding_when_expression(trimmed_when).is_none() {
+        return Err("Use variables with !, &&, ||, and parentheses.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn upsert_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1666,16 +1845,15 @@ pub fn upsert_custom_rule(
     when: Option<&str>,
     replace: Option<(&str, &str, Option<&str>)>,
 ) -> Result<(), String> {
-    if !is_valid_command(command) {
-        return Err("Unknown keybinding command.".into());
-    }
+    validate_keybinding_draft(command, key, when.unwrap_or(""))?;
     let parsed = parse_keybinding_shortcut(key).ok_or("Invalid keybinding.")?;
     let normalized_key = shortcut_to_keybinding_input(&parsed);
     let normalized_when = when
         .map(str::trim)
         .filter(|w| !w.is_empty())
         .map(|w| {
-            let ast = parse_keybinding_when_expression(w).ok_or("Invalid when expression.")?;
+            let ast = parse_keybinding_when_expression(w)
+                .ok_or("Use variables with !, &&, ||, and parentheses.")?;
             Ok::<_, String>(when_ast_to_expression(Some(&ast)))
         })
         .transpose()?;
@@ -1723,6 +1901,7 @@ pub fn upsert_custom_rule(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn remove_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1752,6 +1931,7 @@ pub fn remove_custom_rule(
     });
 }
 
+#[cfg(test)]
 pub fn reset_custom_rule(
     custom: &mut Vec<KeybindingRule>,
     command: &str,
@@ -1767,6 +1947,459 @@ pub fn reset_custom_rule(
         upsert_custom_rule(custom, command, default_key, default_when_opt, None)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeybindingsIssue {
+    MalformedConfig { message: String },
+    InvalidEntry { index: usize, message: String },
+}
+
+impl KeybindingsIssue {
+    pub fn display_message(&self) -> String {
+        match self {
+            Self::MalformedConfig { message } => {
+                format!("Malformed keybindings.json: {message}")
+            }
+            Self::InvalidEntry { index, message } => {
+                format!("Ignored keybindings.json entry #{}: {message}", index + 1)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeybindingsFileState {
+    pub rules: Vec<KeybindingRule>,
+    pub issues: Vec<KeybindingsIssue>,
+}
+
+fn keybinding_shortcut_context(rule: &KeybindingRule) -> Option<String> {
+    let shortcut = parse_keybinding_shortcut(&rule.key)?;
+    let encoded = shortcut_to_keybinding_input(&shortcut);
+    Some(format!("{encoded}\0{}", rule.when.as_deref().unwrap_or("")))
+}
+
+fn has_same_shortcut_context(left: &KeybindingRule, right: &KeybindingRule) -> bool {
+    match (
+        keybinding_shortcut_context(left),
+        keybinding_shortcut_context(right),
+    ) {
+        (Some(l), Some(r)) => l == r,
+        _ => false,
+    }
+}
+
+fn rule_identity(rule: &KeybindingRule) -> (String, String, Option<String>) {
+    let key = parse_keybinding_shortcut(&rule.key)
+        .map(|s| shortcut_to_keybinding_input(&s))
+        .unwrap_or_else(|| rule.key.trim().to_owned());
+    let when = rule
+        .when
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .and_then(parse_keybinding_when_expression)
+        .map(|ast| when_ast_to_expression(Some(&ast)));
+    (rule.command.clone(), key, when)
+}
+
+fn is_same_keybinding_rule(left: &KeybindingRule, right: &KeybindingRule) -> bool {
+    rule_identity(left) == rule_identity(right)
+}
+
+fn decode_keybinding_entry(entry: &serde_json::Value) -> Result<KeybindingRule, String> {
+    let obj = entry
+        .as_object()
+        .ok_or_else(|| "Expected an object with key and command.".to_owned())?;
+    let key = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing key.".to_owned())?;
+    let command = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing command.".to_owned())?;
+    let when = match obj.get("when") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(w)) => {
+            let trimmed = w.trim();
+            if trimmed.is_empty() {
+                return Err("When expression cannot be empty.".into());
+            }
+            Some(trimmed.to_owned())
+        }
+        Some(_) => return Err("When expression must be a string.".into()),
+    };
+    validate_keybinding_draft(command, key, when.as_deref().unwrap_or(""))?;
+    let rule = KeybindingRule {
+        key: key.to_owned(),
+        command: command.to_owned(),
+        when,
+    };
+    if compile_resolved_keybinding_rule(&rule).is_none() {
+        return Err("Invalid keybinding rule.".into());
+    }
+    Ok(rule)
+}
+
+fn parse_lenient_entries(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    let value: serde_json::Value =
+        serde_json_lenient::from_str(raw).map_err(|err| format!("expected JSON array ({err})"))?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "expected JSON array".to_owned())
+}
+
+fn write_keybindings_entries_atomically(
+    path: &Path,
+    entries: &[serde_json::Value],
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create keybindings config directory: {err}"))?;
+    }
+    let mut encoded = serde_json::to_string_pretty(entries)
+        .map_err(|err| format!("failed to encode keybindings config: {err}"))?;
+    encoded.push('\n');
+    crate::store::write_atomic(path, encoded.as_bytes())
+        .map_err(|err| format!("failed to write keybindings config: {err}"))
+}
+
+pub fn load_runtime_keybindings_file(path: &Path) -> KeybindingsFileState {
+    if !path.exists() {
+        return KeybindingsFileState::default();
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return KeybindingsFileState {
+                rules: Vec::new(),
+                issues: vec![KeybindingsIssue::MalformedConfig {
+                    message: format!("failed to read keybindings config ({err})"),
+                }],
+            };
+        }
+    };
+    let entries = match parse_lenient_entries(&raw) {
+        Ok(entries) => entries,
+        Err(detail) => {
+            return KeybindingsFileState {
+                rules: Vec::new(),
+                issues: vec![KeybindingsIssue::MalformedConfig { message: detail }],
+            };
+        }
+    };
+    let mut rules = Vec::new();
+    let mut issues = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match decode_keybinding_entry(entry) {
+            Ok(rule) => rules.push(rule),
+            Err(message) => issues.push(KeybindingsIssue::InvalidEntry { index, message }),
+        }
+    }
+    if rules.len() > MAX_KEYBINDINGS_COUNT {
+        let start = rules.len() - MAX_KEYBINDINGS_COUNT;
+        rules.drain(..start);
+    }
+    KeybindingsFileState { rules, issues }
+}
+
+fn load_writable_keybindings_entries(
+    path: &Path,
+) -> Result<Vec<(serde_json::Value, Option<KeybindingRule>)>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "Unable to parse keybindings config at {}: {err}",
+            path.display()
+        )
+    })?;
+    let entries = parse_lenient_entries(&raw).map_err(|detail| {
+        format!(
+            "Unable to parse keybindings config at {}: {detail}",
+            path.display()
+        )
+    })?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let decoded = decode_keybinding_entry(&entry).ok();
+            (entry, decoded)
+        })
+        .collect())
+}
+
+pub fn sync_default_keybindings_on_startup(
+    path: &Path,
+    legacy_overrides: &[KeybindingRule],
+) -> Result<KeybindingsFileState, String> {
+    if !path.exists() {
+        let defaults = default_keybinding_rules();
+        let mut initial: Vec<KeybindingRule> = Vec::new();
+        if legacy_overrides.is_empty() {
+            initial = defaults;
+        } else {
+            let existing_cmds: HashSet<&str> = legacy_overrides
+                .iter()
+                .map(|r| r.command.as_str())
+                .collect();
+            for default_rule in defaults {
+                if existing_cmds.contains(default_rule.command.as_str()) {
+                    continue;
+                }
+                if legacy_overrides
+                    .iter()
+                    .any(|entry| has_same_shortcut_context(entry, &default_rule))
+                {
+                    continue;
+                }
+                initial.push(default_rule);
+            }
+            initial.extend(legacy_overrides.iter().cloned());
+        }
+        if initial.len() > MAX_KEYBINDINGS_COUNT {
+            let start = initial.len() - MAX_KEYBINDINGS_COUNT;
+            initial.drain(..start);
+        }
+        let values: Vec<serde_json::Value> = initial
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        write_keybindings_entries_atomically(path, &values)?;
+        return Ok(load_runtime_keybindings_file(path));
+    }
+
+    let state = load_runtime_keybindings_file(path);
+    if !state.issues.is_empty() {
+        return Ok(state);
+    }
+
+    let existing_cmds: HashSet<&str> = state.rules.iter().map(|r| r.command.as_str()).collect();
+    let mut missing_defaults = Vec::new();
+    for default_rule in default_keybinding_rules() {
+        if existing_cmds.contains(default_rule.command.as_str()) {
+            continue;
+        }
+        if state
+            .rules
+            .iter()
+            .any(|entry| has_same_shortcut_context(entry, &default_rule))
+        {
+            continue;
+        }
+        missing_defaults.push(default_rule);
+    }
+    let available = MAX_KEYBINDINGS_COUNT.saturating_sub(state.rules.len());
+    let to_prepend: Vec<KeybindingRule> = missing_defaults.into_iter().take(available).collect();
+    if !to_prepend.is_empty() {
+        let mut combined = to_prepend;
+        combined.extend(state.rules);
+        let values: Vec<serde_json::Value> = combined
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        write_keybindings_entries_atomically(path, &values)?;
+        return Ok(load_runtime_keybindings_file(path));
+    }
+    Ok(state)
+}
+
+pub fn upsert_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+    replace: Option<(&str, &str, Option<&str>)>,
+) -> Result<KeybindingsFileState, String> {
+    validate_keybinding_draft(command, key, when.unwrap_or(""))?;
+    let parsed = parse_keybinding_shortcut(key).ok_or("Invalid keybinding.")?;
+    let normalized_key = shortcut_to_keybinding_input(&parsed);
+    let normalized_when = when
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let ast = parse_keybinding_when_expression(w)
+                .ok_or("Use variables with !, &&, ||, and parentheses.")?;
+            Ok::<_, String>(when_ast_to_expression(Some(&ast)))
+        })
+        .transpose()?;
+    let new_rule = KeybindingRule {
+        key: normalized_key,
+        command: command.to_owned(),
+        when: normalized_when,
+    };
+    let replace_rule = replace.map(|(rc, rk, rw)| KeybindingRule {
+        key: rk.trim().to_owned(),
+        command: rc.to_owned(),
+        when: rw
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned),
+    });
+
+    let existing = load_writable_keybindings_entries(path)?;
+    let mut next_values: Vec<serde_json::Value> = existing
+        .into_iter()
+        .filter_map(|(value, decoded)| match decoded {
+            None => Some(value),
+            Some(entry) => {
+                let drop_new = is_same_keybinding_rule(&entry, &new_rule);
+                let drop_replace = replace_rule
+                    .as_ref()
+                    .is_some_and(|target| is_same_keybinding_rule(&entry, target));
+                if drop_new || drop_replace {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+        })
+        .collect();
+    next_values.push(
+        serde_json::to_value(&new_rule)
+            .map_err(|err| format!("failed to serialize keybinding: {err}"))?,
+    );
+    if next_values.len() > MAX_KEYBINDINGS_COUNT {
+        let start = next_values.len() - MAX_KEYBINDINGS_COUNT;
+        next_values.drain(..start);
+    }
+    write_keybindings_entries_atomically(path, &next_values)?;
+    Ok(load_runtime_keybindings_file(path))
+}
+
+pub fn remove_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+) -> Result<KeybindingsFileState, String> {
+    let target = KeybindingRule {
+        key: key.trim().to_owned(),
+        command: command.to_owned(),
+        when: when
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned),
+    };
+    let existing = load_writable_keybindings_entries(path)?;
+    let next_values: Vec<serde_json::Value> = existing
+        .into_iter()
+        .filter_map(|(value, decoded)| match decoded {
+            None => Some(value),
+            Some(entry) if is_same_keybinding_rule(&entry, &target) => None,
+            Some(_) => Some(value),
+        })
+        .collect();
+    write_keybindings_entries_atomically(path, &next_values)?;
+    Ok(load_runtime_keybindings_file(path))
+}
+
+pub fn reset_keybinding_in_file(
+    path: &Path,
+    command: &str,
+    key: &str,
+    when: Option<&str>,
+    default_key: Option<&str>,
+    default_when: &str,
+) -> Result<KeybindingsFileState, String> {
+    if let Some(default_key) = default_key {
+        let default_when_opt = (!default_when.trim().is_empty()).then_some(default_when);
+        upsert_keybinding_in_file(
+            path,
+            command,
+            default_key,
+            default_when_opt,
+            Some((command, key, when)),
+        )
+    } else {
+        remove_keybinding_in_file(path, command, key, when)
+    }
+}
+
+pub type FileStamp = (Option<SystemTime>, u64);
+
+pub fn read_file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+#[derive(Default)]
+pub struct KeybindingsWatcher {
+    stamp: Option<FileStamp>,
+    dirty: Arc<AtomicBool>,
+    stop: Option<Arc<AtomicBool>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeybindingsWatcher {
+    pub fn record_stamp(&mut self, path: &Path) {
+        self.stamp = read_file_stamp(path);
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    pub fn start(&mut self, path: std::path::PathBuf, wake: rune::Waker) {
+        self.stop_worker();
+        let initial = read_file_stamp(&path);
+        self.stamp = initial;
+        let dirty = self.dirty.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        self.stop = Some(stop);
+        self.worker = Some(std::thread::spawn(move || {
+            let mut seen = initial;
+            let mut pending_since: Option<std::time::Instant> = None;
+            while !stop_flag.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(200));
+                if stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                let current = read_file_stamp(&path);
+                if current != seen {
+                    seen = current;
+                    pending_since = Some(std::time::Instant::now());
+                } else if let Some(since) = pending_since
+                    && since.elapsed() >= Duration::from_millis(100)
+                {
+                    pending_since = None;
+                    dirty.store(true, Ordering::Release);
+                    wake();
+                }
+            }
+        }));
+    }
+
+    pub fn poll(&mut self, path: &Path) -> Option<KeybindingsFileState> {
+        let signaled = self.dirty.swap(false, Ordering::AcqRel);
+        let current = read_file_stamp(path);
+        if !signaled && current == self.stamp {
+            return None;
+        }
+        self.stamp = current;
+        Some(load_runtime_keybindings_file(path))
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for KeybindingsWatcher {
+    fn drop(&mut self) {
+        self.stop_worker();
+    }
 }
 
 #[cfg(test)]
@@ -2142,5 +2775,81 @@ mod tests {
         )
         .unwrap();
         assert!(custom.is_empty());
+    }
+
+    #[test]
+    fn rich_text_bold_shortcut_follows_layout_and_selection_rules() {
+        // Non-Latin layout ('и' at physical KeyB) matches when selected.
+        let cyrillic_b = ev(
+            Key::Text("и".into()),
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert!(is_rich_text_bold_shortcut(
+            &cyrillic_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
+        assert!(!is_rich_text_bold_shortcut(
+            &cyrillic_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            false
+        ));
+
+        // Latin layout letter 'x' at physical KeyB does NOT match 'b'.
+        let x_on_b = ev(
+            Key::Command('x'),
+            Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        );
+        assert!(!is_rich_text_bold_shortcut(
+            &x_on_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
+
+        // Latin layout letter 'b' at physical KeyN DOES match 'b'.
+        let b_on_n = ev(
+            Key::Command('b'),
+            Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        );
+        assert!(is_rich_text_bold_shortcut(
+            &b_on_n,
+            Some(PhysicalKeyCode::KeyN),
+            None,
+            true
+        ));
+        assert!(!is_rich_text_bold_shortcut(
+            &b_on_n,
+            Some(PhysicalKeyCode::KeyN),
+            None,
+            false
+        ));
+
+        // Extra shift or alt prevents bold shortcut.
+        let mod_shift_b = ev(
+            Key::Command('b'),
+            Mods {
+                cmd: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(!is_rich_text_bold_shortcut(
+            &mod_shift_b,
+            Some(PhysicalKeyCode::KeyB),
+            None,
+            true
+        ));
     }
 }
