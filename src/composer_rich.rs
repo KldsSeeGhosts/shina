@@ -4,6 +4,8 @@ use rune::{Block, Key, KeyEvent, Mark, TextEdit};
 
 #[path = "composer_code.rs"]
 mod code;
+#[path = "composer_markdown_paste.rs"]
+mod pasted;
 #[path = "composer_inline.rs"]
 mod source;
 
@@ -20,6 +22,11 @@ pub fn draft(text: impl Into<String>) -> TextEdit {
         Mark::Link(String::new()),
     ])
 }
+
+pub use pasted::mention_path as pasted_mention_path;
+#[cfg(test)]
+pub use pasted::paste;
+pub use pasted::paste_with_path_query;
 
 /// The editor document, not its expanded Markdown transport. Ported from KSG Code's
 /// snapshotComposerSend/restoreComposerDraft. Attachments exclude files derived from pills.
@@ -82,12 +89,21 @@ fn same_document(a: &TextEdit, b: &TextEdit) -> bool {
 }
 
 impl Rules {
+    pub fn pasted(&mut self) {
+        self.converted = None;
+        self.suppress = true;
+    }
+
     /// Ported from ComposerPromptEditorTiptap and the Composer* mark extensions.
     pub fn key(&mut self, edit: &mut TextEdit, ev: &KeyEvent) -> bool {
         if edit.is_composing() {
+            self.suppress = false;
             return false;
         }
-        self.suppress = !matches!(ev.key, Key::Text(_));
+        self.suppress = matches!(ev.key, Key::Backspace | Key::Delete)
+            || ev.is_command('z')
+            || ev.is_command('y')
+            || ev.is_command('x');
         if ev.key == Key::Backspace
             && !ev.mods.cmd
             && !ev.mods.ctrl
@@ -132,7 +148,7 @@ impl Rules {
         if code::key(edit, ev) {
             return true;
         }
-        if ev.key == Key::Enter && !ev.mods.cmd && !ev.mods.ctrl && !ev.mods.alt {
+        if ev.key == Key::Enter && !ev.mods.cmd && !ev.mods.ctrl {
             let line = edit.line_range(edit.line_of_byte(edit.focus));
             if edit.anchor == edit.focus
                 && edit.focus == line.end
@@ -147,6 +163,14 @@ impl Rules {
                 self.converted = Some(edit.clone());
                 return true;
             }
+            // KSG intercepts Shift-Enter too and splits a block with its marks,
+            // rather than invoking Tiptap's hard-break keymap.
+            if edit.active_block() == Block::Paragraph {
+                edit.insert("\n");
+            } else {
+                edit.key(&KeyEvent::from(Key::Enter), None);
+            }
+            return true;
         }
         false
     }
@@ -169,17 +193,27 @@ impl Rules {
         }
         let line = edit.line_range(edit.line_of_byte(edit.focus));
         let prefix = &edit.text[line.start..edit.focus];
-        let block = match prefix {
-            "- " | "* " => Block::Bullet(0),
-            "1. " => Block::Numbered(0),
-            "> " => Block::Quote,
+        let (block, marker_end) = match prefix {
+            "* " => (Block::Bullet(0), edit.focus),
+            "1. " => (Block::Numbered(0), edit.focus),
+            "> " => (Block::Quote, edit.focus),
+            _ if prefix.starts_with("- ")
+                && prefix.len() == 2 + prefix[2..].chars().next().map_or(0, char::len_utf8)
+                && prefix[2..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !source::space(c) && c != '[') =>
+            {
+                (Block::Bullet(0), line.start + 2)
+            }
             _ => return,
         };
         let end = edit.focus;
         edit.undo_group(|e| {
-            e.set_selection(line.start, end);
+            e.set_selection(line.start, marker_end);
             e.insert("");
             e.set_block(block);
+            e.set_caret(end - (marker_end - line.start));
         });
         self.converted = Some(edit.clone());
     }
@@ -235,6 +269,7 @@ pub fn editor_key_before_commands(thread: &mut crate::model::Thread, event: &Key
             && edit.active_block() == Block::Paragraph
             && &edit.text[line] == "```";
     if code_key && thread.composer_rules.key(&mut thread.draft, event) {
+        thread.typing_guard.on_type(std::time::Instant::now());
         thread.update_submission_error();
         true
     } else {
@@ -386,7 +421,12 @@ fn input_mark(edit: &mut TextEdit) -> bool {
 }
 
 fn fence(text: &str, minimum: usize) -> String {
-    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let longest = text
+        .split('\n')
+        .filter(|line| pasted::closes(line, "```"))
+        .map(|line| line.bytes().take_while(|b| *b == b'`').count())
+        .max()
+        .unwrap_or(0);
     "`".repeat(minimum.max(longest + 1))
 }
 
@@ -398,6 +438,56 @@ fn inline(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> String {
+    // KSG disables links in new composer documents. Preserve URLs in legacy
+    // Shina snapshots rather than silently losing them on their next send.
+    let links: Vec<_> = edit
+        .marks()
+        .iter()
+        .filter_map(|m| {
+            let Mark::Link(url) = &m.mark else {
+                return None;
+            };
+            let start = m.start.max(range.start);
+            let end = m.end.min(range.end);
+            (start < end).then_some((start..end, url.clone()))
+        })
+        .collect();
+    if !links.is_empty() {
+        let mut without = edit.clone();
+        without.set_marks(
+            edit.marks()
+                .iter()
+                .filter(|m| !matches!(m.mark, Mark::Link(_)))
+                .cloned()
+                .collect(),
+        );
+        let mut out = String::new();
+        let mut cursor = range.start;
+        for (link, url) in links {
+            out.push_str(&inline(
+                &without,
+                cursor..link.start,
+                target_machine,
+                machine_name,
+            ));
+            out.push('[');
+            out.push_str(&inline(
+                &without,
+                link.clone(),
+                target_machine,
+                machine_name,
+            ));
+            out.push_str(&format!("]({})", url.replace(')', "\\)")));
+            cursor = link.end;
+        }
+        out.push_str(&inline(
+            &without,
+            cursor..range.end,
+            target_machine,
+            machine_name,
+        ));
+        return out;
+    }
     let mut bounds = vec![range.start, range.end];
     let marks: Vec<_> = edit
         .marks()
@@ -664,7 +754,6 @@ mod tests {
     #[test]
     fn list_rules_continue_indent_outdent_end_and_reverse_once() {
         for (prefix, block) in [
-            ("- ", Block::Bullet(0)),
             ("* ", Block::Bullet(0)),
             ("1. ", Block::Numbered(0)),
             ("> ", Block::Quote),
@@ -684,6 +773,13 @@ mod tests {
             key(&mut edit, &mut rules, Key::Enter);
             assert_eq!(edit.active_block(), Block::Paragraph);
         }
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        key(&mut edit, &mut rules, Key::Text("- ".into()));
+        assert_eq!(edit.active_block(), Block::Paragraph);
+        key(&mut edit, &mut rules, Key::Text("a".into()));
+        assert_eq!(edit.active_block(), Block::Bullet(0));
+        assert_eq!(markdown(&edit), "- a");
         let mut edit = draft("one\ntwo\nthree");
         edit.set_blocks(vec![Block::Numbered(0); 3]);
         edit.set_caret(5);
