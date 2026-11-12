@@ -150,7 +150,8 @@ fn key_inner(
         notice.owns_text_key = false;
     }
     let Some(command) = command else {
-        return false;
+        // No shortcut matched: KSG redirects plain typing to the composer.
+        return tx.is_some_and(|tx| ui::composer_ui::key(state, event, tx));
     };
     dispatch_global_command(state, command, event, key_repeat, tx)
 }
@@ -222,11 +223,11 @@ fn dispatch_global_command(
         "chat.new" => state.new_thread_click(false),
         "chat.newLocal" => {
             state.new_thread();
-            state.current_mut().draft.focused = true;
+            state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
         "chat.newWithoutProject" => {
             state.new_thread_in(None);
-            state.current_mut().draft.focused = true;
+            state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
         "editor.openFavorite" => {
             let Some(tx) = tx else { return false };
@@ -241,7 +242,7 @@ fn dispatch_global_command(
             state.checkpoint();
         }
         "composer.focus" => {
-            state.current_mut().draft.focused = true;
+            state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
         "commandPalette.toggle" => {
             state.search.focused = true;
@@ -1423,7 +1424,7 @@ fn long_draft_demo(state: &mut State) {
          4. I suspect agents don't have the deep knowledge of Shina's tooling and application like they do in KSG Code.\n\
          5. Generally speaking there appear to be bugs.",
     );
-    state.current_mut().draft.focused = true;
+    state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
 }
 
 #[cfg(test)]
