@@ -7122,7 +7122,45 @@ fn content_text(content: &Value) -> String {
             })
             .unwrap_or_default()
     };
-    memory::without_diff(&text).into()
+    memory::without_diff(&without_ansi(&text)).into()
+}
+/// Pi extensions colour their messages for a terminal. Drop the escape sequences (CSI such
+/// as `ESC[38;2;144;144;144m`, OSC up to BEL or `ESC\`, and two-byte escapes) so they do not
+/// show as stray characters.
+fn without_ansi(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.into()
 }
 /// Pi keeps user images as typed content blocks. Import each into the local store so the
 /// conversation can draw it again without retaining Pi's base64 copy in Shina state.
@@ -7157,6 +7195,15 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_text_drops_terminal_escape_sequences() {
+        let content = json!(
+            "\u{1b}[38;2;144;144;144m✻ Worked for 6s\u{1b}[0m \u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{1b}\\ end"
+        );
+        assert_eq!(content_text(&content), "✻ Worked for 6s link end");
+        assert_eq!(content_text(&json!("plain [0m text")), "plain [0m text");
+    }
 
     #[test]
     fn harness_selection_and_awareness_round_trip_and_legacy_indexes_default_to_pi() {
