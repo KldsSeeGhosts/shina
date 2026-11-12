@@ -991,6 +991,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
+    } else if s.confirm_remove_attachment.is_some() {
+        root = root.child(remove_attachment_dialog(s, p));
     } else if s.project_picker == Some(ProjectPicker::AddProject) {
         root = root.child(add_project_palette(s, p));
     } else if s.project_picker.is_some() {
@@ -7916,9 +7918,86 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 .radius(4.0)
                 .fill(Color::BLACK.alpha(0.6))
                 .hover(Color::BLACK.alpha(0.8))
-                .on_press(move |s: &mut State| s.remove_attachment(&id))
+                .on_press(move |s: &mut State| s.request_remove_attachment(&id))
                 .child(icon("close", Color::WHITE).size(12.0, 12.0)),
         )
+}
+
+pub(crate) fn tray_attachments(t: &Thread) -> Vec<&Attachment> {
+    let inline_ids = crate::composer_tokens::collect_inline_context_ids_from_edit(&t.draft);
+    t.draft_images
+        .iter()
+        .filter(|a| {
+            a.is_image()
+                || !inline_ids.contains(
+                    &crate::composer_context::to_kind_scoped_composer_context_id("file", &a.id),
+                )
+        })
+        .collect()
+}
+
+fn remove_attachment_dialog(s: &State, p: Palette) -> El {
+    let name = s
+        .confirm_remove_attachment
+        .as_ref()
+        .and_then(|(tid, id)| s.threads.iter().find(|t| t.id == *tid).map(|t| (t, id)))
+        .and_then(|(t, id)| t.draft_images.iter().find(|a| a.id == *id))
+        .map_or("this image", |a| a.name.as_str());
+    let card = col()
+        .key("remove-attachment-dialog")
+        .role("dialog")
+        .label("Remove attachment")
+        .w(380.0)
+        .max_w(540.0)
+        .padding(16.0)
+        .gap(12.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .on_press(|_: &mut State| {})
+        .child(label("Remove attachment", DIALOG_TITLE, p.ink))
+        .child(
+            label(
+                format!(
+                    "Remove {name} from the message?\nIt is referenced in your text; removing it also removes every reference."
+                ),
+                BODY,
+                p.ink,
+            )
+            .wrap(),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .child(spacer())
+                .child(secondary_button(
+                    "cancel-remove-attachment",
+                    "Cancel",
+                    p,
+                    |s| {
+                        s.confirm_remove_attachment = None;
+                    },
+                ))
+                .child(button(
+                    "confirm-remove-attachment",
+                    "Remove",
+                    p,
+                    |s| s.confirm_remove_attachment_dialog(),
+                )),
+        );
+    el().key("remove-attachment-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .center()
+        .padding(16.0)
+        .fill(Color::BLACK.alpha(0.3))
+        .modal(false, |s: &mut State| {
+            s.confirm_remove_attachment = None;
+        })
+        .child(card)
 }
 
 fn message_images(s: &State, p: Palette, images: &[Attachment], key: &str) -> El {
@@ -8682,7 +8761,8 @@ fn composer(
             s.checkpoint();
         })
         .on_drop_hover(|s: &mut State, over, _| s.attachment_drop_hover = over);
-    if !collapsed && !t.draft_images.is_empty() {
+    let tray_items = tray_attachments(t);
+    if !collapsed && !tray_items.is_empty() {
         let mut tray = row()
             .key("composer-attachments")
             .keeps_text_selection()
@@ -8692,7 +8772,7 @@ fn composer(
             .flex_wrap()
             .px(12.0)
             .pt(12.0);
-        for image in &t.draft_images {
+        for image in tray_items {
             tray = tray.child(attachment_chip(s, p, image));
         }
         card = card.child(tray);
@@ -8806,14 +8886,15 @@ fn composer(
     })
     .on_input_paste(|s: &mut State, content, _| {
         let has_image = content.image().is_some();
+        let bypass = s.composer_ui.consume_paste_as_text();
         if let Some(image) = content.image() {
-            s.attach_image("Pasted image.png", image.png());
+            s.attach_image_with_options("Pasted image.png", image.png(), bypass);
         }
         if !content.files().is_empty() {
             s.attach_paths(content.files());
         }
         if !content.text().is_empty() && !has_image && content.files().is_empty() {
-            if !s.fold_paste(content.text()) {
+            if bypass || !s.fold_paste(content.text()) {
                 crate::composer_paste::insert(s, content.text());
             }
             return true;
@@ -8856,7 +8937,8 @@ fn composer(
                         true,
                     )),
             );
-        for image in t.draft_images.iter().take(3) {
+        let resting_tray = tray_attachments(t);
+        for image in resting_tray.iter().take(3) {
             preview = preview.child(
                 image_preview(
                     s,
@@ -8875,10 +8957,10 @@ fn composer(
                 }),
             );
         }
-        if t.draft_images.len() > 3 {
+        if resting_tray.len() > 3 {
             preview = preview.child(button(
                 "resting-attachments-more",
-                &format!("+{}", t.draft_images.len() - 3),
+                &format!("+{}", resting_tray.len() - 3),
                 p,
                 |s| s.restore_composer_focus(composer_ui::FocusReason::Explicit),
             ));
@@ -10143,7 +10225,7 @@ pub(crate) mod tests {
             rt.paste(" paste");
             rt.frame(1.0);
             assert_eq!(rt.state.model_search.text, "query paste", "{width}");
-            assert_eq!(rt.state.current().draft.text, "Original draft");
+            assert_eq!(rt.state.current().draft.text, "Original draft focus.png ");
             tap(&mut rt, rune::Key::Escape);
             assert!(rt.state.current().draft.focused, "{width}: model menu");
             rt.state.open_captain_selector();
@@ -10151,7 +10233,7 @@ pub(crate) mod tests {
             rt.frame(1.0);
             tap(&mut rt, rune::Key::Text("captain".into()));
             assert_eq!(rt.state.captain_picker_query.text, "captain", "{width}");
-            assert_eq!(rt.state.current().draft.text, "Original draft");
+            assert_eq!(rt.state.current().draft.text, "Original draft focus.png ");
             tap(&mut rt, rune::Key::Escape);
             assert!(rt.state.current().draft.focused, "{width}: captain menu");
         }
@@ -11626,17 +11708,21 @@ pub(crate) mod tests {
                 .attach_paths(&[path.clone(), crate::store::directory().unwrap()]);
             rt.frame(0.0);
             let (composer, _) = rt.presented("composer").unwrap();
-            for attachment in &rt.state.current().draft_images {
-                let (rect, _) = rt
-                    .presented(&format!("attachment-{}", attachment.id))
-                    .unwrap();
-                assert_eq!((rect[2], rect[3]), (64.0, 64.0));
-                assert!(
-                    rect[0] >= composer[0] && rect[0] + rect[2] <= composer[0] + composer[2] + 1.0
-                );
-                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width);
-            }
             assert_eq!(rt.state.current().draft_images.len(), 2);
+            assert_eq!(rt.state.current().draft.pills().count(), 2);
+            let (input, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input[0] >= composer[0] - 0.5
+                    && input[0] + input[2] <= composer[0] + composer[2] + 0.5
+                    && input[0] + input[2] <= width + 0.5
+            );
+            // Inline files are not duplicated in the tray.
+            for attachment in &rt.state.current().draft_images {
+                assert!(
+                    rt.presented(&format!("attachment-{}", attachment.id))
+                        .is_none()
+                );
+            }
         }
     }
 
@@ -16209,10 +16295,13 @@ pub(crate) mod tests {
         let id = rt.state.current().draft_images[0].id.clone();
         assert!(rt.find(&format!("attachment-{id}")).is_some());
         assert!(rt.find(&format!("attachment-thumb-{id}")).is_some());
-        assert_eq!(rt.state.current().draft.text, "Keep this text");
+        assert_eq!(rt.state.current().draft.text, "Keep this text pasted.png ");
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
         press(&mut rt, &format!("remove-attachment-{id}"));
+        press(&mut rt, "confirm-remove-attachment");
         assert!(rt.state.current().draft_images.is_empty());
         assert_eq!(rt.state.current().draft.text, "Keep this text");
+        assert_eq!(rt.state.current().draft.pills().count(), 0);
         assert!(rt.find(&format!("attachment-{id}")).is_none());
     }
 
@@ -16277,18 +16366,21 @@ pub(crate) mod tests {
         let mut rt = runtime(960.0);
         rt.frame(0.0);
         rt.state.current_mut().draft.replace_text("unsent");
+        rt.state.current_mut().draft.set_caret(6);
         press(&mut rt, "composer-input");
         let text = "猫".repeat(crate::composer_paste::THRESHOLD / 3 + 1);
         rt.paste(text.clone());
         rt.frame(0.0);
-        assert_eq!(rt.state.current().draft.text, "unsent");
+        assert_eq!(rt.state.current().draft.text, "unsent pasted-text.txt ");
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
         let attachment = &rt.state.current().draft_images[0];
         assert_eq!(attachment.name, "pasted-text.txt");
         assert_eq!(
             std::fs::read_to_string(attachment.path.as_ref().unwrap()).unwrap(),
             text
         );
-        assert!(rt.find(&format!("attachment-{}", attachment.id)).is_some());
+        // Inline file sits in the editor rather than duplicating in the tray.
+        assert!(rt.find(&format!("attachment-{}", attachment.id)).is_none());
         rt.key(rune::KeyEvent {
             key: rune::Key::Command('z'),
             mods: rune::Mods {
@@ -17618,6 +17710,52 @@ pub(crate) mod tests {
                 projected.contains(r#"<context kind="future-kind" id="future_1">"#),
                 "{projected}"
             );
+        }
+    }
+
+    #[test]
+    fn inline_file_and_contextual_image_chips_render_and_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.poll = Some(|s, now, tx| composer_ui::tick(s, now, tx));
+            let dir = crate::store::directory().unwrap();
+            let file_path = dir.join(format!("notes-{width}.txt"));
+            std::fs::write(&file_path, "notes").unwrap();
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.state.current_mut().draft.replace_text("Inspect ");
+            rt.state.current_mut().draft.set_caret(8);
+            rt.state.attach_paths(&[file_path]);
+            rt.state.attach_image("shot.png", &ui_png(20));
+            rt.invalidate();
+            rt.frame(0.5);
+            rt.frame(1.0);
+
+            assert_eq!(rt.state.current().draft_images.len(), 2);
+            let file_id = rt.state.current().draft_images[0].id.clone();
+            let img_id = rt.state.current().draft_images[1].id.clone();
+            // Inline file is NOT duplicated in tray; image IS in tray AND inline.
+            assert!(rt.find(&format!("attachment-{file_id}")).is_none());
+            assert!(rt.find(&format!("attachment-{img_id}")).is_some());
+            assert_eq!(rt.state.current().draft.pills().count(), 2);
+
+            let (composer_rect, _) = rt.presented("composer").unwrap();
+            let (input_rect, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input_rect[0] >= composer_rect[0] - 0.5
+                    && input_rect[0] + input_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5,
+                "{width}: input {input_rect:?} overflows composer {composer_rect:?}"
+            );
+
+            // Clicking close on a referenced tray image opens confirmation dialog instead of
+            // silently dropping it; confirming removes both the tray image and inline chip.
+            press(&mut rt, &format!("remove-attachment-{img_id}"));
+            assert!(rt.find("remove-attachment-dialog").is_some());
+            assert_eq!(rt.state.current().draft_images.len(), 2);
+            press(&mut rt, "confirm-remove-attachment");
+            assert!(rt.find("remove-attachment-dialog").is_none());
+            assert_eq!(rt.state.current().draft_images.len(), 1);
+            assert_eq!(rt.state.current().draft.pills().count(), 1);
         }
     }
 }

@@ -545,6 +545,67 @@ impl Thread {
             || !self.draft_images.is_empty()
     }
     /// Add a validated attachment while preserving the text draft and its undo history.
+    pub(crate) fn insert_attachment_chips(
+        &mut self,
+        attachments: &[Attachment],
+        skip_image_inline_chip: bool,
+    ) {
+        if attachments.is_empty() || self.request.is_some() {
+            return;
+        }
+        let prose = crate::composer_context::strip_inline_context_references(
+            &crate::composer_rich::markdown(&self.draft),
+        );
+        let image_attachments_get_chips = !skip_image_inline_chip
+            && (self.draft.anchor != self.draft.focus || !prose.trim().is_empty());
+        let mut records = Vec::new();
+        for attachment in attachments {
+            if attachment.is_image() && !image_attachments_get_chips {
+                continue;
+            }
+            let rec = crate::composer_context::attachment_context_record(attachment);
+            if let Some(existing) = self
+                .draft_context
+                .iter_mut()
+                .find(|r| r.context_id == rec.context_id)
+            {
+                *existing = rec.clone();
+            } else {
+                self.draft_context.push(rec.clone());
+            }
+            records.push(rec);
+        }
+        if records.is_empty() {
+            return;
+        }
+        let (start, end) = self.draft.range();
+        let prev = self.draft.text[..start].chars().next_back();
+        let needs_leading_space = !matches!(prev, None | Some(' ' | '\n' | '\t' | '\r'));
+        let replace_end = if self.draft.text[end..].starts_with(' ') {
+            end + 1
+        } else {
+            end
+        };
+        self.draft.undo_group(|e| {
+            e.set_selection(start, replace_end);
+            e.insert(if needs_leading_space { " " } else { "" });
+            for (index, rec) in records.iter().enumerate() {
+                if index > 0 {
+                    e.insert(" ");
+                }
+                let pill_start = e.focus;
+                e.insert(&rec.label);
+                let pill_end = e.focus;
+                let pill_id = crate::composer_context::format_composer_context_href(
+                    rec.kind(),
+                    &rec.context_id,
+                );
+                e.replace_with_pill(pill_start..pill_end, pill_id, &rec.label);
+            }
+            e.insert(" ");
+        });
+    }
+
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
         if self
             .draft_images
@@ -2618,6 +2679,7 @@ pub struct State {
     pub rename_edit: TextEdit,
     pub delete_thread: Option<usize>,
     pub delete_roots: Vec<usize>,
+    pub confirm_remove_attachment: Option<(usize, String)>,
     pub project_scope: ProjectScope,
     pub scope_additional: Vec<ProjectId>,
     pub selected_threads: Vec<usize>,
@@ -2812,6 +2874,7 @@ impl State {
             rename_edit: TextEdit::default(),
             delete_thread: None,
             delete_roots: vec![],
+            confirm_remove_attachment: None,
             project_scope: ProjectScope::All,
             scope_additional: vec![],
             selected_threads: vec![],
@@ -5670,7 +5733,7 @@ impl State {
                 }
                 let t = self.current_mut();
                 t.draft_images.push(attachment.clone());
-                t.paste_history.record(&mut t.draft, attachment);
+                t.insert_attachment_chips(&[attachment], false);
                 self.checkpoint();
                 true
             }
@@ -5692,7 +5755,7 @@ impl State {
             return;
         }
         let mut errors = Vec::new();
-        let mut attached = 0;
+        let mut attached = Vec::new();
         for path in paths {
             if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
                 errors.push(format!(
@@ -5702,8 +5765,8 @@ impl State {
                 break;
             }
             match attachments::attach_file(path) {
-                Ok(image) => match self.threads[index].add_attachment(image) {
-                    Ok(()) => attached += 1,
+                Ok(image) => match self.threads[index].add_attachment(image.clone()) {
+                    Ok(()) => attached.push(image),
                     Err(error) => errors.push(error),
                 },
                 Err(error) => errors.push(error),
@@ -5714,7 +5777,8 @@ impl State {
         } else {
             Some(errors.join(" "))
         };
-        if attached > 0 {
+        if !attached.is_empty() {
+            self.threads[index].insert_attachment_chips(&attached, false);
             if index == self.active {
                 self.restore_composer_focus(
                     crate::ui::composer_ui::FocusReason::AttachmentInserted,
@@ -5723,8 +5787,12 @@ impl State {
             self.checkpoint();
         }
     }
-    /// Attach a pasted PNG image without touching the text draft.
+    /// Attach a pasted PNG image, inserting an inline chip when contextual.
+    #[cfg(test)]
     pub fn attach_image(&mut self, name: &str, bytes: &[u8]) {
+        self.attach_image_with_options(name, bytes, false);
+    }
+    pub fn attach_image_with_options(&mut self, name: &str, bytes: &[u8], skip_inline_chip: bool) {
         if let Some(error) = self.attachment_guard(self.active) {
             self.current_mut().attachment_error = Some(error);
             return;
@@ -5738,9 +5806,11 @@ impl State {
         }
         match attachments::attach_bytes(name, bytes.to_vec()) {
             Ok(image) => {
-                let result = self.current_mut().add_attachment(image);
-                self.current_mut().attachment_error = result.err();
-                if self.current().attachment_error.is_none() {
+                let result = self.current_mut().add_attachment(image.clone());
+                self.current_mut().attachment_error = result.as_ref().err().cloned();
+                if result.is_ok() {
+                    self.current_mut()
+                        .insert_attachment_chips(&[image], skip_inline_chip);
                     self.restore_composer_focus(
                         crate::ui::composer_ui::FocusReason::AttachmentInserted,
                     );
@@ -5748,6 +5818,64 @@ impl State {
             }
             Err(error) => self.current_mut().attachment_error = Some(error),
         }
+        self.checkpoint();
+    }
+    pub fn request_remove_attachment(&mut self, id: &str) {
+        let t = self.current();
+        if let Some(attachment) = t.draft_images.iter().find(|a| a.id == id && a.is_image()) {
+            let ctx_id = crate::composer_context::to_kind_scoped_composer_context_id(
+                "image",
+                &attachment.id,
+            );
+            let referenced = crate::composer_tokens::collect_inline_context_ids_from_edit(&t.draft)
+                .contains(&ctx_id);
+            if referenced {
+                self.confirm_remove_attachment = Some((t.id, id.to_owned()));
+                return;
+            }
+        }
+        self.remove_attachment(id);
+    }
+    pub fn confirm_remove_attachment_dialog(&mut self) {
+        let Some((thread_id, id)) = self.confirm_remove_attachment.take() else {
+            return;
+        };
+        let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) else {
+            return;
+        };
+        let ctx_id = crate::composer_context::to_kind_scoped_composer_context_id("image", &id);
+        let pill_href = crate::composer_context::format_composer_context_href("image", &ctx_id);
+        let ranges: Vec<_> = t
+            .draft
+            .pills()
+            .filter(|(_, pill)| *pill == pill_href)
+            .map(|(range, _)| range)
+            .collect();
+        if !ranges.is_empty() {
+            t.draft.undo_group(|e| {
+                for range in ranges.into_iter().rev() {
+                    let mut start = range.start;
+                    let mut end = range.end;
+                    if e.text[end..].starts_with(' ') {
+                        end += 1;
+                    } else if e.text[..start].ends_with(' ') {
+                        start -= 1;
+                    }
+                    e.set_selection(start, end);
+                    e.insert("");
+                    if start >= e.text.len() {
+                        let trimmed_len = e.text.trim_end().len();
+                        if trimmed_len < e.text.len() {
+                            e.set_selection(trimmed_len, e.text.len());
+                            e.insert("");
+                        }
+                    }
+                }
+            });
+        }
+        t.draft_context.retain(|r| r.context_id != ctx_id);
+        t.retained_context.records.remove(&ctx_id);
+        t.remove_attachment(&id);
         self.checkpoint();
     }
     pub fn remove_attachment(&mut self, id: &str) {
@@ -13040,6 +13168,73 @@ mod tests {
         assert!(state.current().draft_images.is_empty());
         assert_eq!(state.threads[0].draft_images.len(), 1);
         assert_eq!(state.threads[0].draft_images[0].id, image.id);
+    }
+
+    #[test]
+    fn inline_file_and_contextual_image_chips_insert_at_caret_and_retain_records() {
+        let dir = crate::store::directory().unwrap();
+        let file_path = dir.join("spec.txt");
+        std::fs::write(&file_path, "spec body").unwrap();
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("Read and reply");
+        state.current_mut().draft.set_caret(4);
+        state.attach_paths(&[file_path]);
+        assert_eq!(state.current().draft_images.len(), 1);
+        let file_id = state.current().draft_images[0].id.clone();
+        let expected_file_ctx =
+            crate::composer_context::to_kind_scoped_composer_context_id("file", &file_id);
+        assert_eq!(state.current().draft.pills().count(), 1);
+        assert_eq!(
+            crate::composer_rich::markdown(&state.current().draft),
+            format!("Read [spec.txt](t3-context://v1/file/{expected_file_ctx}) and reply")
+        );
+        assert!(
+            state
+                .current()
+                .draft_context
+                .iter()
+                .any(|r| r.context_id == expected_file_ctx)
+        );
+
+        // Contextual image (when draft has prose text) inserts inline chip AND stays in tray.
+        let end = state.current().draft.text.len();
+        state.current_mut().draft.set_caret(end);
+        state.attach_image("shot.png", &test_png(1));
+        assert_eq!(state.current().draft_images.len(), 2);
+        let img_id = state.current().draft_images[1].id.clone();
+        let expected_img_ctx =
+            crate::composer_context::to_kind_scoped_composer_context_id("image", &img_id);
+        assert_eq!(state.current().draft.pills().count(), 2);
+        assert!(
+            crate::composer_rich::markdown(&state.current().draft).contains(&format!(
+                "![shot.png](t3-context://v1/image/{expected_img_ctx})"
+            ))
+        );
+
+        // Undo removes the inline image chip (image stays in tray); deleting the file chip
+        // moves the file attachment into retained_context.
+        state.current_mut().draft.undo();
+        state.current_mut().reconcile_draft_context();
+        assert_eq!(state.current().draft_images.len(), 2);
+        assert_eq!(state.current().draft.pills().count(), 1);
+
+        state.current_mut().draft.undo();
+        state.current_mut().reconcile_draft_context();
+        assert_eq!(state.current().draft.pills().count(), 0);
+        assert_eq!(state.current().draft_images.len(), 1); // only image remains!
+        assert!(
+            state
+                .current()
+                .retained_context
+                .files
+                .contains_key(&expected_file_ctx)
+        );
+
+        // Redo brings both the file chip and backing file attachment back.
+        state.current_mut().draft.redo();
+        state.current_mut().reconcile_draft_context();
+        assert_eq!(state.current().draft.pills().count(), 1);
+        assert_eq!(state.current().draft_images.len(), 2);
     }
 
     #[test]

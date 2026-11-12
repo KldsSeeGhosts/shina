@@ -177,6 +177,7 @@ fn composer_controls_blocked(state: &State) -> bool {
         || state.settings.archive.is_some()
         || state.rename_thread.is_some()
         || state.delete_thread.is_some()
+        || state.confirm_remove_attachment.is_some()
         || t.native.conversation.is_some()
         || t.native.questionnaire.is_some()
 }

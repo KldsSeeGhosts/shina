@@ -97,6 +97,7 @@ fn same_document(a: &TextEdit, b: &TextEdit) -> bool {
 }
 
 impl PasteHistory {
+    #[cfg(test)]
     pub fn record(&mut self, edit: &mut TextEdit, attachment: Attachment) {
         edit.break_history_group();
         self.redo.clear();
