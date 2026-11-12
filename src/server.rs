@@ -240,19 +240,27 @@ async fn blob(
     if authorized(&shared, &headers, "blobs.read").is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if !crate::attachments::safe_id(&id) {
+    if !crate::attachments::safe_id(&id) && !crate::html_render::safe_blob(&id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
         let directory = shared.directory.join("attachments").canonicalize()?;
+        if crate::html_render::safe_blob(&id) && !crate::html_render::owned_blob(&directory, &id) {
+            return Err(std::io::Error::other("Unpublished HTML blob."));
+        }
+        let limit = if crate::html_render::safe_blob(&id) {
+            crate::html_render::MAX_PAGE as u64
+        } else {
+            crate::attachments::MAX_IMAGE_BYTES
+        };
         let path = directory.join(id).canonicalize()?;
         if !path.starts_with(&directory) {
             return Err(std::io::Error::other("Invalid blob path."));
         }
         let mut file = std::fs::File::open(path)?;
         let length = file.metadata()?.len();
-        if page.offset > length || length > crate::attachments::MAX_IMAGE_BYTES {
+        if page.offset > length || length > limit {
             return Err(std::io::Error::other("Invalid blob offset or length."));
         }
         file.seek(std::io::SeekFrom::Start(page.offset))?;
@@ -271,6 +279,7 @@ async fn blob(
                     ("x-blob-length", length.to_string()),
                     ("x-next-offset", next.to_string()),
                     ("cache-control", "no-store".to_owned()),
+                    ("x-content-type-options", "nosniff".to_owned()),
                 ],
                 bytes,
             )
@@ -1542,6 +1551,97 @@ mod tests {
             assert!(!http.post(format!("{url}/commit")).bearer_auth(&link.token).send().await.unwrap().status().is_success());
             fixture.shared.database.revoke(&link.device_id).unwrap();
             assert_eq!(http.post(format!("{base}/v1/uploads")).bearer_auth(&link.token).json(&body).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
+        });
+    }
+
+    #[test]
+    fn published_html_uses_authenticated_paged_blobs_and_linked_client_storage() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("html-server").await;
+            let profile = crate::store::directory().unwrap().join("html-client");
+            let link = fixture.link(&profile).await;
+            let directory = fixture.shared.directory.join("attachments");
+            let input = crate::html_render::input(
+                &json!({"html":"<h1>Linked chart</h1>","title":"Chart","height":80}),
+                false,
+                false,
+            )
+            .unwrap();
+            let reference = crate::html_render::publish(
+                &directory,
+                1,
+                &input,
+                &crate::html_render::tests::Fake(true),
+            )
+            .unwrap();
+            let http = crate::peer::http().unwrap();
+            let base = format!("http://{}", fixture.address);
+            let url = format!("{base}/v1/blobs/{}", reference.html.id);
+            assert_eq!(
+                http.get(&url).send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let response = http
+                .get(format!("{url}?offset=4&limit=5"))
+                .bearer_auth(&link.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-next-offset"], "9");
+            assert_eq!(
+                &response.bytes().await.unwrap()[..],
+                &input.html.as_bytes()[4..9]
+            );
+            let fake = format!("html-1-{}.html", uuid::Uuid::new_v4());
+            std::fs::write(directory.join(&fake), "<h1>Not published</h1>").unwrap();
+            assert_eq!(
+                http.get(format!("{base}/v1/blobs/{fake}"))
+                    .bearer_auth(&link.token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            crate::client::cache_html(
+                &link,
+                &profile,
+                &json!({"tools":[{"structured":{"htmlRender":reference}}]}),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::html_render::page(&profile.join("attachments"), &reference).unwrap(),
+                input.html
+            );
+            assert!(
+                reference
+                    .blobs()
+                    .all(|blob| profile.join("attachments").join(&blob.id).is_file())
+            );
+            let mut large = input;
+            large.html = format!("<!doctype html><p>{}</p>", "x".repeat(11 * 1024 * 1024));
+            let large = crate::html_render::publish(
+                &directory,
+                1,
+                &large,
+                &crate::html_render::tests::Fake(false),
+            )
+            .unwrap();
+            let response = http
+                .get(format!("{base}/v1/blobs/{}?limit=16", large.html.id))
+                .bearer_auth(&link.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-blob-length"].to_str().unwrap(),
+                large.html.bytes.to_string()
+            );
+            assert_eq!(response.bytes().await.unwrap().len(), 16);
         });
     }
 }

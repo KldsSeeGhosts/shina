@@ -14,6 +14,7 @@ pub enum ToolKind {
     List,
     Subagent,
     Plan,
+    Html,
     Other,
 }
 
@@ -62,6 +63,9 @@ pub fn diff_line_kind(line: &str) -> Option<bool> {
 
 /// Legacy records alone use the name classifier. New provider events set a kind explicitly.
 pub fn pi_kind(name: &str) -> ToolKind {
+    if name.rsplit("__").next() == Some("html_render") {
+        return ToolKind::Html;
+    }
     match name.to_ascii_lowercase().as_str() {
         "read" | "read_file" => ToolKind::Read,
         "edit" | "write" | "patch" | "edit_file" | "write_file" | "apply_patch" => {
@@ -93,6 +97,12 @@ impl Tool {
 
     pub(crate) fn accept_work_result(&mut self, result: &Value) {
         self.accept_metadata(result);
+        if self.name.rsplit("__").next() == Some("html_render")
+            && let Some(reference) = crate::html_render::find_reference(result)
+        {
+            self.kind = Some(ToolKind::Html);
+            self.structured["htmlRender"] = json!(reference);
+        }
         if let Some(input) = result.get("input").filter(|v| !v.is_null()) {
             self.input = input.clone();
         }
@@ -245,7 +255,7 @@ pub fn summarize(tools: &[&Tool]) -> String {
         (
             match groups[*i].0 {
                 Command | FileChange | Subagent => 0,
-                Other | Plan => 2,
+                Other | Plan | Html => 2,
                 _ => 1,
             },
             *i,
@@ -320,6 +330,11 @@ pub fn summarize(tools: &[&Tool]) -> String {
                 "{} {}",
                 if running { "Updating" } else { "Updated" },
                 count(n, "plan", "plans")
+            ),
+            Html => format!(
+                "{} {}",
+                if running { "Rendering" } else { "Rendered" },
+                count(n, "page", "pages")
             ),
             Other => format!(
                 "{} {}",

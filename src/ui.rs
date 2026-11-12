@@ -169,6 +169,81 @@ fn palette(dark: bool) -> Palette {
         }
     }
 }
+
+/// KSG's htmlRenderTheme variables, mapped from the same palette as Rune's UI.
+pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
+    let p = palette(dark);
+    let css = |color: Color| {
+        let [r, g, b, a] = color.premul_srgb(1.0);
+        if a < 0.999 {
+            format!(
+                "rgba({},{},{},{a})",
+                (r / a * 255.0).round() as u8,
+                (g / a * 255.0).round() as u8,
+                (b / a * 255.0).round() as u8
+            )
+        } else {
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (r * 255.0).round() as u8,
+                (g * 255.0).round() as u8,
+                (b * 255.0).round() as u8
+            )
+        }
+    };
+    let mut variables = serde_json::Map::new();
+    for (name, color) in [
+        ("background", p.panel),
+        ("foreground", p.ink),
+        ("muted", p.selected),
+        ("muted-foreground", p.muted),
+        ("card", p.card),
+        ("card-foreground", p.ink),
+        ("popover", p.card),
+        ("popover-foreground", p.ink),
+        ("secondary", p.sea_bg),
+        ("secondary-foreground", p.ink),
+        ("border", p.frame),
+        ("input", p.field_line),
+        ("ring", p.coral),
+        ("primary", p.coral),
+        ("primary-foreground", p.on_coral),
+        ("accent", p.coral),
+        ("accent-foreground", p.on_coral),
+        ("accent-surface", p.coral_bg),
+        ("accent-surface-foreground", p.ink),
+        ("destructive", p.danger),
+        ("destructive-foreground", p.danger),
+        ("destructive-surface", p.coral_bg),
+        ("warning", p.brass),
+        ("warning-foreground", p.brass),
+        ("warning-surface", p.card),
+        ("success", p.sea),
+        ("success-foreground", p.sea),
+        ("info", p.sea),
+        ("info-foreground", p.sea),
+        ("code-background", p.code_bg),
+        ("code-foreground", p.ink),
+        ("chart-1", p.sea),
+        ("chart-2", p.coral),
+        ("chart-3", p.brass),
+        ("chart-4", p.danger),
+        ("chart-5", p.muted),
+        ("chart-6", p.faint),
+    ] {
+        variables.insert(format!("--{name}"), css(color).into());
+    }
+    variables.insert("--radius".into(), "4px".into());
+    variables.insert(
+        "--font-sans".into(),
+        r#"Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif"#.into(),
+    );
+    variables.insert(
+        "--font-mono".into(),
+        r#""SF Mono",Menlo,Consolas,monospace"#.into(),
+    );
+    serde_json::json!({"appearance":if dark {"dark"} else {"light"},"variables":variables})
+}
 pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
 /// The pixel face: section labels, counts, timers, status words, badges and the wordmark. It is
 /// drawn for 11 px and its multiples, so use it at 11 or 22 only.
@@ -6361,6 +6436,8 @@ fn tool_verb(tool: &Tool) -> String {
         (Subagent, false) => "Delegating".into(),
         (Plan, true) => "Updated plan".into(),
         (Plan, false) => "Updating plan".into(),
+        (Html, true) => "Rendered".into(),
+        (Html, false) => "Rendering".into(),
         (Other, true) => format!("Called {}", tool.name),
         (Other, false) => format!("Calling {}", tool.name),
     }
@@ -6412,7 +6489,10 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
         .tools
         .iter()
         .enumerate()
-        .filter(|(_, tool)| (start..end).contains(&tool.anchor.message))
+        .filter(|(_, tool)| {
+            (start..end).contains(&tool.anchor.message)
+                && tool.name.rsplit("__").next() != Some("html_preview")
+        })
         .map(|(index, tool)| {
             (
                 tool.anchor,
@@ -6507,10 +6587,16 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
                 }
             } else if previous_anchor == Some(anchor)
                 && let Some(TranscriptPart::Tools(indices)) = parts.last_mut()
-                && t.tools[index].resolved_kind() != crate::work::ToolKind::Plan
-                && indices
-                    .last()
-                    .is_some_and(|i| t.tools[*i].resolved_kind() != crate::work::ToolKind::Plan)
+                && !matches!(
+                    t.tools[index].resolved_kind(),
+                    crate::work::ToolKind::Plan | crate::work::ToolKind::Html
+                )
+                && indices.last().is_some_and(|i| {
+                    !matches!(
+                        t.tools[*i].resolved_kind(),
+                        crate::work::ToolKind::Plan | crate::work::ToolKind::Html
+                    )
+                })
             {
                 indices.push(index);
             } else {
@@ -6585,6 +6671,11 @@ fn activity_line(
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
+    if tool.resolved_kind() == crate::work::ToolKind::Html
+        && crate::html_render::find_reference(&tool.structured).is_some()
+    {
+        return work_ui::html_card(s, p, index);
+    }
     if tool.resolved_kind() == crate::work::ToolKind::Plan {
         return work_ui::plan_card(s, p, index);
     }
@@ -6710,7 +6801,12 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
     let parts = turn_parts(t, start, end);
     // A captain's delegations are its answer, not its working: their task cards stay in view
     // when the rest of the turn folds into "Worked for".
-    let card = |part: &TranscriptPart| crew_ui::is_card_part(s, t, part);
+    let html_card = |part: &TranscriptPart| {
+        matches!(part, TranscriptPart::Tools(indices) if indices.iter().all(|&i|
+                t.tools[i].resolved_kind() == crate::work::ToolKind::Html
+                && crate::html_render::find_reference(&t.tools[i].structured).is_some()))
+    };
+    let card = |part: &TranscriptPart| crew_ui::is_card_part(s, t, part) || html_card(part);
     let last_work = parts
         .iter()
         .rposition(|part| !matches!(part, TranscriptPart::Text { .. }) && !card(part));
@@ -6769,6 +6865,8 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     // the turn runs and after it ends, so nothing jumps when it finishes.
                     rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
                         row.py(6.0)
+                    } else if html_card(part) {
+                        row
                     } else {
                         row.ml(WORK_INDENT)
                     });
@@ -6890,6 +6988,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let gutter = lane_gutter(pane_width);
     let mut messages = col()
         .key("chat-lane")
+        .on_layout_tx(|s: &mut State, rect, tx| {
+            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
+            tx.live_only();
+        })
         .w_full()
         .max_w(measure(wide))
         // 24 pt above the first message, counting the cap.

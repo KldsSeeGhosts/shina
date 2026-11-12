@@ -19,6 +19,11 @@ mod crisp;
 mod database;
 mod harness;
 mod horizon;
+mod html_fallback;
+#[cfg(any(target_os = "macos", windows, test))]
+mod html_network;
+mod html_render;
+mod html_window;
 mod install;
 mod lifecycle;
 mod maintenance;
@@ -198,6 +203,37 @@ fn typed_work_demo(state: &mut State) {
     t.tools[1].expanded = true;
     t.work[0].expanded = true;
     t.work[0].elapsed = Some(42);
+}
+
+/// Opt-in visual fixture. Its blobs always use an isolated temporary profile.
+fn html_demo(state: &mut State) {
+    state.populate_demo();
+    state.data_dir =
+        std::env::temp_dir().join(format!("shina-html-scene-{}", uuid::Uuid::new_v4()));
+    let input = html_render::input(&serde_json::json!({
+        "html":r#"<style>*{box-sizing:border-box}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.plot{padding:16px;background:var(--card);border-radius:var(--radius)}.bar{height:24px;margin:14px 0;background:var(--chart-1)}.bar:nth-child(3){background:var(--chart-2)}.bar:nth-child(4){background:var(--chart-3)}p{color:var(--muted-foreground)}@media(max-width:500px){.grid{grid-template-columns:1fr}}</style><div class="grid"><section class="plot"><b>Example workload</b><p>Illustrative counts, not project data.</p><div class="bar" style="width:82%"></div><div class="bar" style="width:54%"></div><div class="bar" style="width:36%"></div></section><section class="plot"><b>Example next step</b><p>Open this card to use the live HTML page in its own Shina window.</p><button>Try the mockup</button></section></div>"#,
+        "title":"Example HTML chart","height":240
+    }),false,false).expect("valid HTML fixture");
+    let reference = html_render::publish(
+        &state.data_dir.join("attachments"),
+        state.current().id,
+        &input,
+        &html_window::Native,
+    )
+    .expect("publish isolated HTML fixture");
+    let thread = state.current_mut();
+    thread.captain = None;
+    thread.title = "HTML rendering example".into();
+    thread.messages = vec![model::Message {
+        role: "You",
+        text: "Show an example HTML chart.".into(),
+        images: vec![],
+    }];
+    thread.tools.clear();
+    thread.thoughts.clear();
+    thread.work.clear();
+    thread.apply(serde_json::json!({"type":"tool_execution_start","toolCallId":"html-example","toolName":"html_render","args":{}}));
+    thread.apply(serde_json::json!({"type":"tool_execution_end","toolCallId":"html-example","result":{"content":[],"structuredContent":html_render::result(&reference)}}));
 }
 
 /// An offline, read-only fleet fixture for native navigation and sidebar checks.
@@ -579,6 +615,13 @@ fn captain_crews_demo(state: &mut State) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--html-native") {
+        if let Err(error) = html_window::helper() {
+            println!("{}", serde_json::json!({"error":error}));
+            std::process::exit(1);
+        }
+        return;
+    }
     let cli: Vec<String> = std::env::args().skip(1).collect();
     let result = match cli.first().map(String::as_str) {
         Some("service") => Some(service::cli(&cli[1..])),
@@ -738,6 +781,8 @@ fn main() {
             ("fleet", fleet_demo),
             ("fleet-sidebar", |state| { fleet_demo(state); state.compact_sidebar = true; }),
             ("markdown", markdown_demo),
+            ("html-render", html_demo),
+            ("html-render-dark", |state| { html_demo(state); state.dark = true; }),
             ("markdown-dark", |state| { markdown_demo(state); state.dark = true; }),
             ("fleet-dark", |state| { fleet_demo(state); state.dark = true; }),
             ("dark", |state| {
