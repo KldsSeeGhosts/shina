@@ -32,7 +32,7 @@ fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
         for thread in [&live, &restored] {
             let tool = &thread.tools[0];
             assert_eq!(tool.kind, Some(expected), "{native}");
-            assert_eq!(tool.changes[0].diff, "@@ -1,1 +1,1 @@\n-old\n+new\n");
+            assert_eq!(tool.changes[0].diff, "@@ -1 +1 @@\n-old\n+new\n");
         }
     }
 }
@@ -97,6 +97,27 @@ fn acp_plan_updates_keep_the_original_position_and_replay_the_latest_steps() {
         assert_eq!(plan["steps"][0]["status"], "completed");
         assert_eq!(plan["steps"][1]["status"], "running");
     }
+}
+
+#[test]
+fn acp_diff_parts_keep_native_unified_patches_without_old_new_text() {
+    let patch = "@@ -8 +8 @@\n-old\n+new\n";
+    let mut t = Thread::new(1);
+    t.apply(json!({"type":"tool_execution_start","toolCallId":"edit","toolName":"Provider title","args":{}}));
+    let result = tool_result(
+        &json!({"kind":"move","content":[{"type":"diff","path":"new.rs",
+        "oldPath":"old.rs","patch":{"format":"unified","text":patch}}]}),
+    );
+    t.apply(json!({"type":"tool_execution_end","toolCallId":"edit","result":result}));
+    assert_eq!(t.tools[0].changes[0].diff, patch);
+    assert_eq!(t.tools[0].changes[0].old_path.as_deref(), Some("old.rs"));
+    assert_eq!(
+        (
+            t.tools[0].changes[0].additions,
+            t.tools[0].changes[0].deletions
+        ),
+        (1, 1)
+    );
 }
 
 fn spec(source: SessionSource) -> Start {

@@ -1809,6 +1809,37 @@ mod tests {
     use crate::runtime::RuntimeState;
 
     #[test]
+    fn stopped_work_and_retry_events_survive_projection_and_history_reload() {
+        let mut thread = Thread::new(1);
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":"Go"}}));
+        thread.apply(json!({"type":"agent_start"}));
+        thread.apply(json!({"type":"auto_retry_start","attempt":2,"maxAttempts":5,"errorMessage":"Temporary"}));
+        thread.apply(json!({"type":"auto_retry_end","success":true}));
+        thread.apply(json!({"type":"agent_settled","aborted":true}));
+        thread.work[0].elapsed = Some(134);
+        let saved = serde_json::to_value(ThreadView::capture(&thread)).unwrap();
+        let view: ThreadView = serde_json::from_value(saved.clone()).unwrap();
+        let mut restored = Thread::new(1);
+        view.apply(&mut restored).unwrap();
+        assert!(restored.work[0].stopped);
+        assert_eq!(restored.work[0].elapsed, Some(134));
+        assert_eq!(crate::work::retry_events(&restored).len(), 1);
+        assert_eq!(crate::work::retry_events(&restored)[0]["success"], true);
+        // A provider can omit an empty interrupted response from native replay.
+        restored.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,
+            "data":{"messages":[{"role":"user","content":"Go"}]}}),
+        );
+        assert!(restored.work[0].stopped);
+        assert_eq!(restored.work[0].elapsed, Some(134));
+        let mut legacy = saved;
+        legacy["work"][0].as_object_mut().unwrap().remove("stopped");
+        let view: ThreadView = serde_json::from_value(legacy).unwrap();
+        view.apply(&mut restored).unwrap();
+        assert!(!restored.work[0].stopped);
+    }
+
+    #[test]
     fn machine_views_isolate_equal_thread_ids_drafts_projects_and_commands() {
         let (runtime, _) = wired();
         let mut state = State::new(PathBuf::new(), false);

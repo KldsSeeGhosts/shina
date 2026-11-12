@@ -629,9 +629,50 @@ fn history_uses_leaf_ancestry_and_keeps_pre_compaction_messages() {
     assert_eq!(record["data"]["messages"][0]["content"], "Before");
     assert_eq!(record["data"]["messages"][1]["content"], "Right branch");
     assert_eq!(record["data"]["compactions"][0]["summary"], "Summary");
+    assert_eq!(record["data"]["compactions"][0]["historyIndex"], 2);
     let mut broken = json!({"type":"response","command":"get_entries","success":true,"data":{"leafId":"missing","entries":[]}});
     session_history(&mut broken);
     assert_eq!(broken["success"], false);
+}
+
+#[test]
+fn pi_compaction_replay_records_the_middle_of_the_transcript() {
+    let mut record = json!({"type":"response","id":"history","command":"get_entries","success":true,"data":{"leafId":"b","entries":[
+        {"id":"u","type":"message","parentId":null,"message":{"role":"user","content":"Before"}},
+        {"id":"a","type":"message","parentId":"u","message":{"role":"assistant","content":"First answer"}},
+        {"id":"compact","type":"compaction","parentId":"a","summary":"Kept facts"},
+        {"id":"v","type":"message","parentId":"compact","message":{"role":"user","content":"After"}},
+        {"id":"b","type":"message","parentId":"v","message":{"role":"assistant","content":"Second answer"}}
+    ]}});
+    session_history(&mut record);
+    let mut thread = Thread::new(1);
+    thread.apply(record);
+    assert_eq!(
+        crate::work::compaction_anchor(&thread, &thread.native.compactions[0]),
+        ToolAnchor {
+            message: 2,
+            offset: 0
+        }
+    );
+    assert_eq!(thread.messages.len(), 4);
+}
+
+#[test]
+fn stop_records_a_durable_marker_before_the_provider_acknowledges_it() {
+    let (mut t, commands) = thread(Status::Running);
+    t.messages.push(Message {
+        role: "You",
+        text: "Work".into(),
+        images: vec![],
+    });
+    t.started = Some(Instant::now() - Duration::from_secs(134));
+    t.stop();
+    assert!(t.work[0].stopped);
+    assert_eq!(t.work[0].elapsed, Some(134));
+    assert_eq!(command(&commands, "abort")["type"], "abort");
+    let saved = serde_json::to_value(&t.work[0]).unwrap();
+    let restored: AssistantWork = serde_json::from_value(saved).unwrap();
+    assert!(restored.stopped);
 }
 
 #[test]

@@ -59,8 +59,18 @@ pub fn session_history(record: &mut Value) {
         .map(|e| if e["type"] == "custom_message" { json!({"role":"custom","content":e["content"],"display":e["display"],"customType":e["customType"]}) } else { e["message"].clone() }).collect();
     let compactions: Vec<_> = branch
         .iter()
-        .filter(|e| e["type"] == "compaction")
-        .map(|e| (*e).clone())
+        .enumerate()
+        .filter(|(_, e)| e["type"] == "compaction")
+        .map(|(index, e)| {
+            let mut value = (*e).clone();
+            value["historyIndex"] = json!(
+                branch[..index]
+                    .iter()
+                    .filter(|e| e["type"] == "message" || e["type"] == "custom_message")
+                    .count()
+            );
+            value
+        })
         .collect();
     let fork_messages: Vec<_> = branch.iter().filter(|e| e["type"] == "message" && e["message"]["role"] == "user")
         .map(|e| json!({"entryId":e["id"],"text":content_text(&e["message"]["content"]),"content":e["message"]["content"]})).collect();
@@ -1422,15 +1432,39 @@ impl Thread {
         self.native.request_id = Some(self.command_id());
     }
 
-    fn record_compaction(&mut self, value: Value) {
+    pub(super) fn anchor_compactions(&mut self, history_index: usize) {
+        for index in 0..self.native.compactions.len() {
+            if self.native.compactions[index]["historyIndex"].as_u64() == Some(history_index as u64)
+            {
+                self.native.compactions[index]["anchor"] = json!(ToolAnchor {
+                    message: self.messages.len(),
+                    offset: 0
+                });
+                self.native.compactions[index]["order"] = json!(self.next_work_order());
+            }
+        }
+    }
+
+    fn record_compaction(&mut self, mut value: Value) {
         if self
             .native
             .compactions
             .last()
             .is_some_and(|v| v["running"] == true)
         {
+            for key in ["anchor", "order", "historyIndex"] {
+                if !self.native.compactions.last().unwrap()[key].is_null() {
+                    value[key] = self.native.compactions.last().unwrap()[key].clone();
+                }
+            }
             *self.native.compactions.last_mut().unwrap() = value;
         } else {
+            let message = self.assistant.unwrap_or(self.messages.len());
+            value["anchor"] = json!(ToolAnchor {
+                message,
+                offset: self.assistant.map_or(0, |i| self.messages[i].text.len())
+            });
+            value["order"] = json!(self.next_work_order());
             if self.native.compactions.len() >= 32 {
                 self.native.compactions.remove(0);
             }

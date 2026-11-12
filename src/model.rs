@@ -175,6 +175,8 @@ pub struct Tool {
     /// Position in the transcript, including tool calls between text blocks in one message.
     pub anchor: ToolAnchor,
     pub block: usize,
+    #[serde(default)]
+    pub order: u64,
     #[serde(skip)]
     pub expanded: bool,
     #[serde(skip)]
@@ -214,6 +216,7 @@ impl Tool {
             subagents: vec![],
             anchor,
             block: usize::MAX,
+            order: 0,
             expanded: false,
             raw_expanded: false,
             group_expanded: false,
@@ -227,6 +230,8 @@ impl Tool {
 pub struct Thought {
     pub anchor: ToolAnchor,
     pub block: usize,
+    #[serde(default)]
+    pub order: u64,
     pub text: String,
     #[serde(skip)]
     pub expanded: bool,
@@ -240,6 +245,10 @@ pub struct Thought {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssistantWork {
     pub start: usize,
+    #[serde(default)]
+    pub stopped: bool,
+    #[serde(default)]
+    pub stopped_order: u64,
     #[serde(skip)]
     pub expanded: bool,
     pub elapsed: Option<u64>,
@@ -932,6 +941,14 @@ impl Thread {
     }
 
     fn stop_task(&mut self) -> Result<(), String> {
+        if self.status.busy()
+            && !self.initializing
+            && self.queued_prompt.is_none()
+            && self.pending_prompt.is_none()
+            && !self.has_pending_sends()
+        {
+            self.mark_stopped();
+        }
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
@@ -1189,6 +1206,7 @@ impl Thread {
     }
 
     fn fail_session(&mut self, error: String) {
+        self.finish_retry(Some(&error));
         self.memory_staged.clear();
         self.memory_context.clear();
         self.scope_context_pending = true;
@@ -1355,6 +1373,8 @@ impl Thread {
             // A finished turn folds its steps into one "Worked for" line, as Cursor does.
             self.work.push(AssistantWork {
                 start,
+                stopped: false,
+                stopped_order: 0,
                 expanded: false,
                 elapsed: None,
             });
@@ -1365,6 +1385,7 @@ impl Thread {
     fn thought(&mut self, block: usize) -> &mut Thought {
         self.assistant();
         let message = self.assistant.unwrap();
+        let order = self.next_work_order();
         let index = self
             .thoughts
             .iter()
@@ -1376,6 +1397,7 @@ impl Thread {
                         offset: self.messages[message].text.len(),
                     },
                     block,
+                    order,
                     text: String::new(),
                     expanded: false,
                     done: false,
@@ -1417,6 +1439,7 @@ impl Thread {
                     let mut tool =
                         Tool::new(id, string(block, "name"), &block["arguments"], anchor);
                     tool.accept_metadata(block);
+                    tool.order = self.next_work_order();
                     tool.block = block_index;
                     if restored {
                         tool.done = true;
@@ -1426,6 +1449,7 @@ impl Thread {
                     self.tools.push(tool);
                 }
             } else if block["type"] == "thinking" {
+                let order = self.next_work_order();
                 let index = self
                     .thoughts
                     .iter()
@@ -1436,6 +1460,7 @@ impl Thread {
                         self.thoughts.push(Thought {
                             anchor: ToolAnchor { message, offset },
                             block: block_index,
+                            order,
                             text: String::new(),
                             expanded: false,
                             done: true,
@@ -1653,6 +1678,19 @@ impl Thread {
                             return;
                         }
                         if let Some(messages) = record["data"]["messages"].as_array() {
+                            let saved_work = self.work.clone();
+                            let saved_orders: std::collections::HashMap<_, _> = self
+                                .tools
+                                .iter()
+                                .filter(|t| t.order > 0)
+                                .map(|t| (t.id.clone(), t.order))
+                                .collect();
+                            let saved_thoughts: Vec<_> = self
+                                .thoughts
+                                .iter()
+                                .filter(|t| t.order > 0)
+                                .map(|t| (t.anchor, t.block, t.order))
+                                .collect();
                             self.messages.clear();
                             self.tools.clear();
                             self.thoughts.clear();
@@ -1672,7 +1710,8 @@ impl Thread {
                                     .rev()
                                     .collect();
                             }
-                            for message in messages {
+                            for (history_index, message) in messages.iter().enumerate() {
+                                self.anchor_compactions(history_index);
                                 let role = string(message, "role");
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
@@ -1709,6 +1748,11 @@ impl Thread {
                                 }
                                 if role == "assistant" {
                                     self.anchor_content_work(&message["content"], index, true);
+                                    if message["stopReason"] == "aborted" {
+                                        let order = self.next_work_order();
+                                        self.ensure_work().stopped = true;
+                                        self.ensure_work().stopped_order = order;
+                                    }
                                 }
                                 if role == "toolResult"
                                     && let Some(tool) = self
@@ -1722,6 +1766,37 @@ impl Thread {
                                     tool.duration_ms = message["durationMs"].as_u64();
                                 }
                             }
+                            self.anchor_compactions(messages.len());
+                            for tool in &mut self.tools {
+                                if let Some(order) = saved_orders.get(&tool.id) {
+                                    tool.order = *order;
+                                }
+                            }
+                            for thought in &mut self.thoughts {
+                                if let Some((_, _, order)) =
+                                    saved_thoughts.iter().find(|(anchor, block, _)| {
+                                        *anchor == thought.anchor && *block == thought.block
+                                    })
+                                {
+                                    thought.order = *order;
+                                }
+                            }
+                            for work in &mut self.work {
+                                if let Some(saved) = saved_work
+                                    .iter()
+                                    .find(|saved| saved.start == work.start && saved.stopped)
+                                {
+                                    work.stopped = true;
+                                    work.stopped_order = saved.stopped_order;
+                                    work.elapsed = saved.elapsed;
+                                }
+                            }
+                            for saved in saved_work.into_iter().filter(|w| w.stopped) {
+                                if !self.work.iter().any(|w| w.start == saved.start) {
+                                    self.work.push(saved);
+                                }
+                            }
+                            self.work.sort_by_key(|w| w.start);
                             // A process can accept a prompt before its response reaches us.
                             // Do not replay it if its unique delivery marker is already saved.
                             self.pending_injections.retain_mut(|injection| {
@@ -1784,6 +1859,9 @@ impl Thread {
                 self.life.last_completed_at = Some(lifecycle::now());
                 self.request = None;
                 let aborted = record["aborted"] == true;
+                if aborted {
+                    self.mark_stopped();
+                }
                 self.finish_run();
                 // A stopped run is idle, not a finished task.
                 if aborted && self.status == Status::Completed {
@@ -1862,20 +1940,30 @@ impl Thread {
                     let mut tool =
                         Tool::new(id, string(&record, "toolName"), &record["args"], anchor);
                     tool.accept_metadata(&record);
+                    tool.order = self.next_work_order();
                     tool.started = Some(Instant::now());
                     tool.parent_call = record["parentToolCallId"].as_str().map(str::to_owned);
                     self.tools.push(tool);
                 }
             }
             "auto_retry_start" => {
+                self.record_retry(&record, false);
                 self.phase = format!("Retrying, attempt {}", record["attempt"]);
                 self.diagnostic(string(&record, "errorMessage"));
             }
             "auto_retry_end" => {
+                self.record_retry(&record, true);
                 if record["success"] == true {
                     self.error = None;
+                    self.phase = "Working".into();
                 } else {
-                    self.error = Some(string(&record, "finalError").into());
+                    self.error = Some(
+                        record["finalError"]
+                            .as_str()
+                            .filter(|error| !error.is_empty())
+                            .unwrap_or("Provider error")
+                            .into(),
+                    );
                 }
             }
             "compaction_start" => {
@@ -1933,6 +2021,89 @@ impl Thread {
         self.drive_session();
     }
 
+    fn next_work_order(&self) -> u64 {
+        self.tools
+            .iter()
+            .map(|tool| tool.order)
+            .chain(self.thoughts.iter().map(|thought| thought.order))
+            .chain(self.work.iter().map(|work| work.stopped_order))
+            .chain(
+                self.native
+                    .compactions
+                    .iter()
+                    .filter_map(|c| c["order"].as_u64()),
+            )
+            .chain(
+                crate::work::retry_events(self)
+                    .iter()
+                    .filter_map(|e| e["order"].as_u64()),
+            )
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    fn mark_stopped(&mut self) {
+        let elapsed = self
+            .started
+            .map(|at| at.elapsed().as_secs())
+            .or(self.elapsed);
+        self.finish_retry(Some("Provider retry stopped"));
+        self.assistant();
+        let order = self.next_work_order();
+        let work = self.ensure_work();
+        work.stopped = true;
+        if work.stopped_order == 0 {
+            work.stopped_order = order;
+        }
+        work.elapsed = elapsed.or(work.elapsed);
+    }
+
+    fn record_retry(&mut self, record: &Value, ending: bool) {
+        let turn = self.ensure_work().start;
+        let previous = crate::work::retry_events(self)
+            .iter()
+            .position(|e| e["turn"].as_u64() == Some(turn as u64));
+        if ending && previous.is_none() {
+            return;
+        }
+        if previous.is_none() {
+            self.assistant();
+            let message = self.assistant.unwrap();
+            let event = json!({"turn":turn,"anchor":ToolAnchor {message,offset:self.messages[message].text.len()},
+                "order":self.next_work_order()});
+            if !self.harness_state["workRetries"].is_array() {
+                self.harness_state["workRetries"] = json!([]);
+            }
+            self.harness_state["workRetries"]
+                .as_array_mut()
+                .unwrap()
+                .push(event);
+        }
+        let events = self.harness_state["workRetries"].as_array_mut().unwrap();
+        let index = previous.unwrap_or(events.len() - 1);
+        let event = &mut events[index];
+        event["running"] = json!(!ending);
+        if ending {
+            event["success"] = record["success"].clone();
+            event["error"] = record["finalError"].clone();
+        } else {
+            event["attempt"] = record["attempt"].clone();
+            event["maxAttempts"] = record["maxAttempts"].clone();
+            event["error"] = record["errorMessage"].clone();
+        }
+    }
+
+    fn finish_retry(&mut self, error: Option<&str>) {
+        let turn = self.work.last().map(|w| w.start);
+        if crate::work::retry_events(self)
+            .iter()
+            .any(|e| e["turn"].as_u64() == turn.map(|start| start as u64) && e["running"] == true)
+        {
+            self.record_retry(&json!({"success":error.is_none(),"finalError":error}), true);
+        }
+    }
+
     fn record_plan(&mut self, source: &Value) {
         let turn = self.ensure_work().start;
         let id = source["_shinaPlanId"]
@@ -1955,6 +2126,7 @@ impl Thread {
                 },
             );
             tool.kind = Some(crate::work::ToolKind::Plan);
+            tool.order = self.next_work_order();
             self.tools.push(tool);
             self.tools.len() - 1
         };
@@ -2026,6 +2198,7 @@ impl Thread {
     }
 
     fn finish_run(&mut self) {
+        self.finish_retry(self.error.clone().as_deref());
         self.status = if self.error.is_some() {
             Status::Failed
         } else {
@@ -5813,6 +5986,8 @@ impl State {
         thread.elapsed = Some(42);
         thread.work.push(AssistantWork {
             start: 1,
+            stopped: false,
+            stopped_order: 0,
             expanded: true,
             elapsed: Some(42),
         });
@@ -5826,6 +6001,7 @@ impl State {
             Tool {
                 id: "example-1".into(),
                 kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
+                order: 0,
                 name: "read".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5843,6 +6019,7 @@ impl State {
             Tool {
                 id: "example-2".into(),
                 kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
+                order: 0,
                 name: "read".into(),
                 detail: "tests/reconnect.test.ts".into(),
                 done: true,
@@ -5860,6 +6037,7 @@ impl State {
             Tool {
                 id: "example-3".into(),
                 kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
+                order: 0,
                 name: "edit".into(),
                 detail: "src/transport/socket.ts".into(),
                 done: true,
@@ -5877,6 +6055,7 @@ impl State {
             Tool {
                 id: "example-4".into(),
                 kind: None, changes: vec![], input: Value::Null, raw_expanded: false,
+                order: 0,
                 name: "powershell".into(),
                 detail: "npm test -- reconnect.test.ts".into(),
                 done: true,
@@ -5893,6 +6072,7 @@ impl State {
             },
         ];
         thread.thoughts.push(Thought {
+            order: 0,
             anchor: ToolAnchor { message: 2, offset: 0 },
             block: 2,
             text: "Example thinking, not a real model response.\n\nThe listener must attach before socket.open() can emit a reconnect. Cleanup must remove the old listener before another attempt.".into(),

@@ -6,6 +6,88 @@ use serde_json::Value;
 #[path = "work_ui_tests.rs"]
 mod tests;
 
+pub(super) fn boundary_events(s: &State, p: Palette, wide: bool, message: usize) -> Option<El> {
+    let mut events = vec![];
+    for (index, item) in s.current().native.compactions.iter().enumerate() {
+        if crate::work::compaction_anchor(s.current(), item).message == message {
+            events.push((item["order"].as_u64().unwrap_or(u64::MAX), 0, index));
+        }
+    }
+    for (index, event) in crate::work::retry_events(s.current()).iter().enumerate() {
+        if event["anchor"]["message"].as_u64() == Some(message as u64) {
+            events.push((event["order"].as_u64().unwrap_or(u64::MAX), 1, index));
+        }
+    }
+    for work in &s.current().work {
+        if work.start == message
+            && work.stopped
+            && (message < s.current().messages.len() || !s.current().status.busy())
+        {
+            events.push((
+                if work.stopped_order == 0 {
+                    u64::MAX
+                } else {
+                    work.stopped_order
+                },
+                2,
+                0,
+            ));
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    events.sort_by_key(|e| e.0);
+    let mut rows = col().min_w(0.0).gap(6.0);
+    for (_, kind, index) in events {
+        rows = rows.child(match kind {
+            0 => pi_ui::compaction_activity(s, p, index),
+            1 => retry_row(s, p, index),
+            _ => assistant_turn(s, p, wide, message, message),
+        });
+    }
+    Some(rows)
+}
+
+/// KSG's providerRetryWorkLogSummary, kept as one replaceable inline event.
+pub(super) fn retry_row(s: &State, p: Palette, index: usize) -> El {
+    let event = &crate::work::retry_events(s.current())[index];
+    let title = if event["running"] == true {
+        let attempt = event["attempt"].as_u64().unwrap_or(1);
+        let progress = event["maxAttempts"]
+            .as_u64()
+            .map_or_else(|| attempt.to_string(), |max| format!("{attempt}/{max}"));
+        format!("Retrying provider ({progress})")
+    } else if event["success"] == true {
+        "Provider recovered".into()
+    } else {
+        event["error"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Provider error")
+            .into()
+    };
+    row()
+        .key(format!("provider-retry-{}-{index}", s.current().id))
+        .min_w(0.0)
+        .role("status")
+        .min_h(26.0)
+        .gap(5.0)
+        .center_y()
+        .child(el().size(24.0, 24.0).center().child(icon("clock", p.muted)))
+        .child(if event["running"] == true || event["success"] == true {
+            pixel_text(title, p.muted)
+                .min_w(0.0)
+                .shrink()
+                .wrap_anywhere()
+        } else {
+            label(title, SMALL, p.muted)
+                .min_w(0.0)
+                .shrink()
+                .wrap_anywhere()
+        })
+}
+
 pub(super) fn kind_icon(kind: ToolKind) -> &'static str {
     match kind {
         ToolKind::Command => "terminal",
@@ -221,9 +303,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         let mut content = mono(if value.is_empty() { " " } else { value }, p)
                             .key(format!("tool-diff-line-{id}-{file}-{line}"))
                             .px(12.0);
-                        let added = value.starts_with('+') && !value.starts_with("+++");
-                        let removed = value.starts_with('-') && !value.starts_with("---");
-                        if added || removed {
+                        if let Some(added) = crate::work::diff_line_kind(value) {
                             // Palette has no positive/negative pair. Use the requested
                             // monochrome fallback; the source retains its +/- gutter.
                             let ink = if added { p.ink } else { p.muted };
@@ -237,6 +317,9 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         false,
                     ));
                 }
+            }
+            if tool.failed && !tool.output.is_empty() {
+                body = body.child(rule(p)).child(output(tool, p, &id));
             }
         }
         ToolKind::FileSearch => {

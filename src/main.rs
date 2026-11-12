@@ -169,6 +169,29 @@ fn running_demo(state: &mut State) {
     tool.started = Some(std::time::Instant::now());
 }
 
+/// Offline fixtures for the typed inspector. Never opens a harness or the real profile.
+fn typed_work_demo(state: &mut State) {
+    state.populate_demo();
+    let t = state.current_mut();
+    t.messages.truncate(2);
+    t.tools.clear();
+    t.thoughts.clear();
+    t.work.clear();
+    t.apply(
+        serde_json::json!({"type":"harness_update","field":"plan","value":{
+        "steps":[{"text":"Read the transport code","status":"completed"},
+            {"text":"Move the reconnect listener before socket.open()","status":"in_progress"},
+            {"text":"Run the regression tests","status":"pending"}]}}),
+    );
+    t.apply(serde_json::json!({"type":"tool_execution_start","toolCallId":"demo-patch","toolName":"edit",
+        "args":{"path":"src/transport/socket.ts"}}));
+    t.apply(serde_json::json!({"type":"tool_execution_end","toolCallId":"demo-patch","result":{
+        "content":[],"details":{"patch":"@@ -12,2 +12,2 @@\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();"}}}));
+    t.tools[1].expanded = true;
+    t.work[0].expanded = true;
+    t.work[0].elapsed = Some(42);
+}
+
 /// An offline, read-only fleet fixture for native navigation and sidebar checks.
 fn fleet_demo(state: &mut State) {
     state.populate_demo();
@@ -406,6 +429,7 @@ Error: none".into(),
         .into_iter()
         .enumerate()
         .map(|(block, child)| model::Tool {
+            order: 0,
             raw_expanded: false,
             kind: None,
             changes: vec![],
@@ -748,6 +772,11 @@ fn main() {
             ("tool-output", |state| {
                 state.populate_demo();
                 state.current_mut().tools[3].expanded = true;
+            }),
+            ("typed-work", typed_work_demo),
+            ("typed-work-dark", |state| {
+                typed_work_demo(state);
+                state.dark = true;
             }),
             ("session-details", |state| {
                 state.populate_demo();

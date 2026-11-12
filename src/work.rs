@@ -40,13 +40,23 @@ impl FileChange {
             diff: diff.into(),
             additions: diff
                 .lines()
-                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                .filter(|l| diff_line_kind(l) == Some(true))
                 .count(),
             deletions: diff
                 .lines()
-                .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                .filter(|l| diff_line_kind(l) == Some(false))
                 .count(),
         }
+    }
+}
+
+pub fn diff_line_kind(line: &str) -> Option<bool> {
+    if line.starts_with('+') && !line.starts_with("+++ ") && !line.starts_with("+++\t") {
+        Some(true)
+    } else if line.starts_with('-') && !line.starts_with("--- ") && !line.starts_with("---\t") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -130,24 +140,13 @@ impl Tool {
     }
 }
 
-/// ACP provides old/new text, not a patch. Keep every line in a valid whole-file hunk.
+/// ACP can provide old/new text instead of a patch. Diff the supplied text only,
+/// without reading files or treating unchanged lines as additions and deletions.
 pub fn text_diff(old: &str, new: &str) -> String {
-    if old == new {
-        return String::new();
-    }
-    let mut diff = format!(
-        "@@ -1,{} +1,{} @@\n",
-        old.lines().count(),
-        new.lines().count()
-    );
-    for (prefix, text) in [('-', old), ('+', new)] {
-        for line in text.lines() {
-            diff.push(prefix);
-            diff.push_str(line);
-            diff.push('\n');
-        }
-    }
-    diff
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .to_string()
 }
 
 pub fn result_metadata(kind: ToolKind, changes: Vec<FileChange>, source: &Value) -> Value {
@@ -155,6 +154,20 @@ pub fn result_metadata(kind: ToolKind, changes: Vec<FileChange>, source: &Value)
         "toolKind":kind, "changes":changes,
         "fileSearchResults":source.get("results").filter(|_|kind == ToolKind::FileSearch),
         "webResults":source.get("results").filter(|_|kind == ToolKind::WebSearch)
+    })
+}
+
+pub fn retry_events(thread: &crate::model::Thread) -> &[Value] {
+    thread.harness_state["workRetries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+pub fn compaction_anchor(thread: &crate::model::Thread, item: &Value) -> crate::model::ToolAnchor {
+    serde_json::from_value(item["anchor"].clone()).unwrap_or(crate::model::ToolAnchor {
+        message: thread.messages.len(),
+        offset: 0,
     })
 }
 
@@ -351,6 +364,27 @@ pub fn summarize(tools: &[&Tool]) -> String {
 mod tests {
     use super::*;
     use crate::model::Thread;
+
+    #[test]
+    fn diff_counts_include_increment_decrement_lines_but_not_file_headers() {
+        let change = FileChange::new(
+            "a.rs",
+            "update",
+            "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n---old;\n+++new;\n",
+        );
+        assert_eq!((change.additions, change.deletions), (1, 1));
+    }
+
+    #[test]
+    fn text_diffs_keep_context_zero_length_ranges_and_missing_final_newlines() {
+        let diff = text_diff("same\nold\n", "same\nnew\n");
+        let change = FileChange::new("a.rs", "update", &diff);
+        assert_eq!((change.additions, change.deletions), (1, 1));
+        assert!(diff.contains(" same\n"));
+        assert!(text_diff("", "new\n").contains("-0,0"));
+        assert!(text_diff("old\n", "").contains("+0,0"));
+        assert!(text_diff("old", "new").contains("\\ No newline at end of file"));
+    }
 
     #[test]
     fn summaries_prioritize_changes_commands_and_delegations_and_count_distinct_paths() {

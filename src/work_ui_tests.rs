@@ -232,3 +232,151 @@ fn plans_fit_at_all_widths_and_updates_do_not_add_a_card() {
         }
     }
 }
+
+#[test]
+fn compactions_retries_and_tools_keep_their_order_at_the_same_text_offset() {
+    let mut thread = Thread::new(1);
+    thread
+        .apply(json!({"type":"tool_execution_start","toolCallId":"a","toolName":"read","args":{}}));
+    thread.apply(json!({"type":"compaction_start"}));
+    thread.apply(json!({"type":"compaction_end","result":{"summary":"Kept facts"}}));
+    thread.apply(json!({"type":"auto_retry_start","attempt":1,"maxAttempts":5}));
+    thread
+        .apply(json!({"type":"tool_execution_start","toolCallId":"b","toolName":"read","args":{}}));
+    assert_eq!(
+        turn_parts(&thread, 0, 1),
+        vec![
+            TranscriptPart::Tools(vec![0]),
+            TranscriptPart::Compaction(0),
+            TranscriptPart::Retry(0),
+            TranscriptPart::Tools(vec![1])
+        ]
+    );
+    let anchor = thread.native.compactions[0]["anchor"].clone();
+    thread.apply(json!({"type":"auto_retry_start","attempt":2,"maxAttempts":5}));
+    thread.apply(json!({"type":"auto_retry_end","success":true}));
+    assert_eq!(thread.native.compactions[0]["anchor"], anchor);
+    assert_eq!(crate::work::retry_events(&thread).len(), 1);
+}
+
+#[test]
+fn turn_events_fit_in_place_and_stopped_folds_keep_their_wording_at_all_widths() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        t.apply(json!({"type":"response","id":"history","command":"get_messages","success":true,"data":{"messages":[
+            {"role":"user","content":"Before"},{"role":"assistant","content":"First answer"}]}}));
+        t.apply(json!({"type":"compaction_start"}));
+        t.apply(json!({"type":"compaction_end","result":{"summary":"Kept decisions"}}));
+        t.apply(json!({"type":"message_start","message":{"role":"user","content":"After"}}));
+        t.apply(json!({"type":"agent_start"}));
+        t.apply(json!({"type":"auto_retry_start","attempt":2,"maxAttempts":5,"errorMessage":"Temporary"}));
+        t.work.last_mut().unwrap().expanded = true;
+        let id = t.id;
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let y = |rt: &rune::Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
+        assert!(y(&rt, &format!("message-{id}-0")) < y(&rt, "compaction-0"));
+        assert!(y(&rt, "compaction-0") < y(&rt, &format!("message-{id}-2")));
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Retrying provider (2/5)"))
+        );
+        let (lane, _) = rt.presented("chat-lane").unwrap();
+        for key in ["compaction-0".to_owned(), format!("provider-retry-{id}-0")] {
+            let (rect, _) = rt.presented(&key).unwrap();
+            assert!(
+                rect[0] >= lane[0] && rect[0] + rect[2] <= lane[0] + lane[2] + 0.5,
+                "{width}/{key}: {rect:?}"
+            );
+        }
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"auto_retry_end","success":true}));
+        rt.invalidate();
+        rt.frame(2.0);
+        rt.frame(3.0);
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Provider recovered"))
+        );
+        let t = rt.state.current_mut();
+        t.apply(json!({"type":"auto_retry_start","attempt":3,"maxAttempts":5}));
+        t.apply(
+            json!({"type":"auto_retry_end","success":false,"finalError":"Final provider error"}),
+        );
+        t.apply(json!({"type":"agent_settled","aborted":false}));
+        rt.invalidate();
+        rt.frame(4.0);
+        rt.frame(5.0);
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Final provider error"))
+        );
+        assert!(
+            rt.find("retry-session").is_some(),
+            "the existing Retry control remains"
+        );
+        assert_eq!(
+            rt.elements()
+                .iter()
+                .filter(|e| e
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("provider-retry-")))
+                .count(),
+            1
+        );
+        let t = rt.state.current_mut();
+        t.apply(json!({"type":"agent_settled","aborted":true}));
+        t.work.last_mut().unwrap().elapsed = Some(134);
+        rt.invalidate();
+        rt.frame(6.0);
+        rt.frame(7.0);
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("You stopped after 2m 14s"))
+        );
+        assert_eq!(
+            rt.elements()
+                .iter()
+                .filter(|e| e
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("toggle-work-")))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn positional_cards_and_events_before_prose_are_not_moved_below_the_preamble() {
+    for kind in ["plan", "compaction", "retry"] {
+        let mut rt = runtime(1280.0);
+        let t = rt.state.current_mut();
+        match kind {
+            "plan" => t.apply(json!({"type":"harness_update","field":"plan","value":{"steps":[{"text":"First","status":"pending"}]}})),
+            "compaction" => t.apply(json!({"type":"compaction_start"})),
+            _ => t.apply(json!({"type":"auto_retry_start","attempt":1})),
+        }
+        t.apply(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"After the event."}}));
+        t.apply(json!({"type":"tool_execution_start","toolCallId":"later","toolName":"read","args":{"path":"a.rs"}}));
+        t.work[0].expanded = true;
+        let id = t.id;
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let event_key = match kind {
+            "plan" => format!("plan-card-{id}-0"),
+            "compaction" => "compaction-0".into(),
+            _ => format!("provider-retry-{id}-0"),
+        };
+        let event = rt.presented(&event_key).unwrap().0;
+        let prose = rt.presented(&format!("message-{id}-0-body-0")).unwrap().0;
+        assert!(event[1] < prose[1], "{kind} moved after prose");
+    }
+}

@@ -6095,6 +6095,8 @@ enum TranscriptPart {
     },
     Tools(Vec<usize>),
     Thought(Vec<usize>),
+    Compaction(usize),
+    Retry(usize),
 }
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
@@ -6104,14 +6106,67 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
         .iter()
         .enumerate()
         .filter(|(_, tool)| (start..end).contains(&tool.anchor.message))
-        .map(|(index, tool)| (tool.anchor, tool.block, false, index))
+        .map(|(index, tool)| {
+            (
+                tool.anchor,
+                if tool.order == 0 {
+                    tool.block as u64
+                } else {
+                    tool.order
+                },
+                0,
+                index,
+            )
+        })
         .collect();
     events.extend(
         t.thoughts
             .iter()
             .enumerate()
             .filter(|(_, thought)| (start..end).contains(&thought.anchor.message))
-            .map(|(index, thought)| (thought.anchor, thought.block, true, index)),
+            .map(|(index, thought)| {
+                (
+                    thought.anchor,
+                    if thought.order == 0 {
+                        thought.block as u64
+                    } else {
+                        thought.order
+                    },
+                    1,
+                    index,
+                )
+            }),
+    );
+    events.extend(
+        t.native
+            .compactions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let anchor = crate::work::compaction_anchor(t, item);
+                (start..end).contains(&anchor.message).then_some((
+                    anchor,
+                    item["order"].as_u64().unwrap_or(u64::MAX),
+                    2,
+                    index,
+                ))
+            }),
+    );
+    events.extend(
+        crate::work::retry_events(t)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let anchor =
+                    serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
+                        .ok()?;
+                (start..end).contains(&anchor.message).then_some((
+                    anchor,
+                    item["order"].as_u64().unwrap_or(u64::MAX),
+                    3,
+                    index,
+                ))
+            }),
     );
     events.sort_by_key(|(anchor, block, _, _)| (*anchor, *block));
     let mut events = events.into_iter().peekable();
@@ -6124,7 +6179,7 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
             .peek()
             .is_some_and(|event| event.0.message == message)
         {
-            let (anchor, _, thinking, index) = events.next().unwrap();
+            let (anchor, _, kind, index) = events.next().unwrap();
             let to = if anchor.offset >= from && text.is_char_boundary(anchor.offset) {
                 anchor.offset
             } else {
@@ -6133,7 +6188,11 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
             if to > from {
                 parts.push(TranscriptPart::Text { message, from, to });
             }
-            if thinking {
+            if kind == 2 {
+                parts.push(TranscriptPart::Compaction(index));
+            } else if kind == 3 {
+                parts.push(TranscriptPart::Retry(index));
+            } else if kind == 1 {
                 if let Some(TranscriptPart::Thought(indices)) = parts.last_mut() {
                     indices.push(index);
                 } else {
@@ -6295,6 +6354,8 @@ fn transcript_part(s: &State, p: Palette, wide: bool, part: &TranscriptPart) -> 
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
         TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
+        TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
+        TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
             let message_index = *message;
@@ -6354,6 +6415,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         parts[..last]
             .iter()
             .position(|part| matches!(part, TranscriptPart::Text { .. }))
+            .filter(|index| {
+                !parts[..*index].iter().any(|part| match part {
+                    TranscriptPart::Compaction(_) | TranscriptPart::Retry(_) => true,
+                    TranscriptPart::Tools(indices) => indices
+                        .iter()
+                        .any(|i| t.tools[*i].resolved_kind() == crate::work::ToolKind::Plan),
+                    _ => false,
+                })
+            })
     });
     let live = end == t.messages.len() && t.status.busy();
     let work = t.work.iter().find(|work| work.start == start);
@@ -6442,11 +6512,16 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 ),
         );
         response = response.child(rows);
-    } else if last_work.is_some() {
+    } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let title = match work.and_then(|work| work.elapsed) {
-            Some(seconds) => format!("Worked for {}", elapsed_label(seconds)),
-            None => "Worked".into(),
+        let title = match (
+            work.is_some_and(|work| work.stopped),
+            work.and_then(|work| work.elapsed),
+        ) {
+            (true, Some(seconds)) => format!("You stopped after {}", elapsed_label(seconds)),
+            (true, None) => "You stopped this response".into(),
+            (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
+            (false, None) => "Worked".into(),
         };
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
@@ -6473,6 +6548,8 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         // records it.
                         None => t.work.push(crate::model::AssistantWork {
                             start,
+                            stopped: false,
+                            stopped_order: 0,
                             expanded: true,
                             elapsed: None,
                         }),
@@ -6521,7 +6598,11 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .tools
         .iter()
         .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
-    if t.messages.is_empty() && !visible_tools && !t.status.busy() {
+    if t.messages.is_empty()
+        && !visible_tools
+        && !t.status.busy()
+        && t.native.compactions.is_empty()
+    {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
@@ -6571,6 +6652,11 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             .saturating_sub(32);
         while index < t.messages.len() {
             let message = &t.messages[index];
+            if message.role != "Pi" {
+                if let Some(events) = work_ui::boundary_events(s, p, wide, index) {
+                    messages = messages.child(events);
+                }
+            }
             if message.role == "Pi" {
                 let end = t.messages[index..]
                     .iter()
@@ -6659,7 +6745,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             messages = messages.child(body.key(key));
             index += 1;
         }
-        messages = messages.child(pi_ui::compaction_activity(s, p));
+        if let Some(events) = work_ui::boundary_events(s, p, wide, t.messages.len()) {
+            messages = messages.child(events);
+        }
         if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
             messages = messages.child(assistant_turn(
                 s,

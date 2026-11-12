@@ -94,6 +94,77 @@ fn plan_updates_replace_the_first_card_in_live_and_replayed_history() {
     }
 }
 
+#[test]
+fn codex_compaction_replay_keeps_its_position_and_interrupted_turns_keep_the_marker() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.replay(&json!({"id":"one","status":"completed","items":[
+        {"type":"userMessage","id":"u1","content":[{"type":"text","text":"Before"}]},
+        {"type":"agentMessage","id":"a1","text":"First"},
+        {"type":"contextCompaction","id":"compact"}]}));
+    client.replay(&json!({"id":"two","status":"interrupted","items":[
+        {"type":"userMessage","id":"u2","content":[{"type":"text","text":"After"}]},
+        {"type":"commandExecution","id":"cmd","command":"pwd","status":"completed"}]}));
+    let mut thread = Thread::new(1);
+    thread.apply(
+        json!({"type":"response","id":"history","command":"get_messages","success":true,
+        "data":{"messages":client.history,"compactions":client.compactions}}),
+    );
+    assert_eq!(
+        crate::work::compaction_anchor(&thread, &thread.native.compactions[0]).message,
+        2
+    );
+    assert!(thread.work.last().unwrap().stopped);
+}
+
+#[test]
+fn codex_provider_retries_replace_one_event_and_recover_or_fail() {
+    for failed in [false, true] {
+        let mut client = Client::new(spec(SessionSource::New, "read-only"));
+        client
+            .notification("turn/started", &json!({"turn":{"id":"retry"}}))
+            .unwrap();
+        for attempt in [1, 2] {
+            client
+                .notification(
+                    "error",
+                    &json!({"willRetry":true,"attempt":attempt,"maxAttempts":5,
+                "error":{"message":"Temporary error"}}),
+                )
+                .unwrap();
+        }
+        if failed {
+            assert!(
+                client
+                    .notification(
+                        "error",
+                        &json!({"willRetry":false,"error":{"message":"Final error"}})
+                    )
+                    .is_err()
+            );
+        } else {
+            client
+                .notification(
+                    "turn/completed",
+                    &json!({"turn":{"id":"retry","status":"completed","items":[]}}),
+                )
+                .unwrap();
+        }
+        let mut thread = Thread::new(1);
+        for event in client.events {
+            thread.apply(event);
+        }
+        let events = crate::work::retry_events(&thread);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["attempt"], 2);
+        assert_eq!(events[0]["maxAttempts"], 5);
+        assert_eq!(events[0]["running"], false);
+        assert_eq!(events[0]["success"], !failed);
+        if failed {
+            assert_eq!(thread.error.as_deref(), Some("Final error"));
+        }
+    }
+}
+
 fn spec(source: SessionSource, access: &str) -> Start {
     Start {
         id: "codex".into(),

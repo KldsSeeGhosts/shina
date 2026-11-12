@@ -539,6 +539,15 @@ impl Client {
     fn settle(&mut self, aborted: bool) {
         self.running = false;
         let aborted = aborted || self.cancelling;
+        if aborted
+            && let Some(message) = self
+                .history
+                .iter_mut()
+                .rev()
+                .find(|m| m["role"] == "assistant")
+        {
+            message["stopReason"] = json!("aborted");
+        }
         self.cancelling = false;
         self.events
             .push(json!({"type":"agent_settled","aborted":aborted}));
@@ -864,14 +873,17 @@ fn tool_metadata(tool: &Value) -> Value {
         .filter(|p| p["type"] == "diff")
         .filter_map(|part| {
             let path = part["path"].as_str()?;
-            let mut change = FileChange::new(
-                path,
-                tool["kind"].as_str().unwrap_or("edit"),
-                &text_diff(
-                    part["oldText"].as_str().unwrap_or(""),
-                    part["newText"].as_str().unwrap_or(""),
-                ),
-            );
+            let diff = part["patch"]["text"]
+                .as_str()
+                .or_else(|| part["diff"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    text_diff(
+                        part["oldText"].as_str().unwrap_or(""),
+                        part["newText"].as_str().unwrap_or(""),
+                    )
+                });
+            let mut change = FileChange::new(path, tool["kind"].as_str().unwrap_or("edit"), &diff);
             change.old_path = part["oldPath"].as_str().map(str::to_owned);
             Some(change)
         })

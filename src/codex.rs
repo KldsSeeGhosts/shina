@@ -135,6 +135,8 @@ struct Client {
     turn: Option<String>,
     ready: bool,
     running: bool,
+    retry_attempt: u64,
+    retrying: bool,
     cancelling: bool,
     interrupt_sent: bool,
     compact_request: Option<Value>,
@@ -169,6 +171,8 @@ impl Client {
             turn: None,
             ready: false,
             running: false,
+            retry_attempt: 0,
+            retrying: false,
             cancelling: false,
             interrupt_sent: false,
             compact_request: None,
@@ -781,6 +785,8 @@ impl Client {
     fn notification(&mut self, method: &str, params: &Value) -> Result<(), String> {
         match method {
             "turn/started" => {
+                self.retry_attempt = 0;
+                self.retrying = false;
                 self.running = true;
                 self.turn = params["turn"]["id"].as_str().map(str::to_owned);
                 if self.cancelling && !self.interrupt_sent {
@@ -862,6 +868,20 @@ impl Client {
                 }
                 let failed = turn["status"] == "failed";
                 let aborted = self.cancelling || turn["status"] == "interrupted";
+                if self.retrying {
+                    let error = self.redact(if aborted {
+                        "Provider retry stopped"
+                    } else {
+                        turn["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex turn failed.")
+                    });
+                    self.events.push(
+                        json!({"type":"auto_retry_end","success":!failed && !aborted,
+                        "finalError":error}),
+                    );
+                    self.retrying = false;
+                }
                 for item in turn["items"].as_array().into_iter().flatten() {
                     if item["type"] == "contextCompaction" {
                         self.replay_compaction(item, turn, true);
@@ -903,6 +923,12 @@ impl Client {
                     self.prompt(record)?;
                 }
             }
+            "error" if params["willRetry"] == true => {
+                self.retry_attempt = params["attempt"].as_u64().unwrap_or(self.retry_attempt + 1);
+                self.retrying = true;
+                self.events.push(json!({"type":"auto_retry_start","attempt":self.retry_attempt,
+                    "maxAttempts":params["maxAttempts"],"errorMessage":self.redact(params["error"]["message"].as_str().unwrap_or("Codex provider error."))}));
+            }
             "error" if params["willRetry"] != true && self.compacting => {
                 self.compaction_error = Some(
                     self.redact(
@@ -913,6 +939,11 @@ impl Client {
                 );
             }
             "error" if params["willRetry"] != true => {
+                if self.retrying {
+                    self.events.push(json!({"type":"auto_retry_end","success":false,"finalError":
+                        self.redact(params["error"]["message"].as_str().unwrap_or("Codex failed."))}));
+                    self.retrying = false;
+                }
                 return Err(self.redact(
                     params["error"]["message"]
                         .as_str()
@@ -1156,7 +1187,8 @@ impl Client {
         if self.compactions.len() >= 32 {
             self.compactions.remove(0);
         }
-        self.compactions.push(json!({"running":true}));
+        self.compactions
+            .push(json!({"running":true,"historyIndex":self.history.len()}));
         if emit {
             self.events.push(json!({"type":"compaction_start"}));
         }
@@ -1171,6 +1203,7 @@ impl Client {
             .last()
             .is_some_and(|row| row["running"] == true)
         {
+            outcome["historyIndex"] = self.compactions.last().unwrap()["historyIndex"].clone();
             *self.compactions.last_mut().unwrap() = outcome.clone();
         } else {
             return;
@@ -1213,13 +1246,19 @@ impl Client {
     fn finish_history_turn(&mut self, turn: &Value) {
         // Only a successfully settled turn proves a final reply. Commentary before an
         // interrupt or crash must never make durable task recovery report success.
-        let has_message =
-            self.active_message.is_some()
-                || turn["items"].as_array().into_iter().flatten().any(|item| {
-                    matches!(item["type"].as_str(), Some("agentMessage" | "reasoning"))
-                });
+        let has_message = self.active_message.is_some()
+            || turn["items"].as_array().into_iter().flatten().any(|item| {
+                !matches!(
+                    item["type"].as_str(),
+                    Some("userMessage" | "contextCompaction")
+                )
+            });
         if has_message
-            && let Some(message) = self.history.last_mut().filter(|m| m["role"] == "assistant")
+            && let Some(message) = self
+                .history
+                .iter_mut()
+                .rev()
+                .find(|m| m["role"] == "assistant")
         {
             message["stopReason"] = json!(match turn["status"].as_str() {
                 Some("completed") => "stop",
