@@ -139,7 +139,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 continue;
             }
             let draft = !captain
-                && record["session"].is_null()
+                && (record["session"].is_null() || record["neverSent"] == true)
                 && life.pinned_at.is_none()
                 && !life.settled()
                 && life.snoozed_at.is_none()
@@ -150,7 +150,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 && status_of_view(view) == Status::Ready;
             // Match local draft-listing rules. Blank remote landing slots are not chats.
             if draft
-                && draft_text.is_empty()
+                && draft_text.trim().is_empty()
+                && !saved["richHtml"]
+                    .as_str()
+                    .is_some_and(|html| html.contains("data-pill"))
                 && record["renamed"] != true
                 && saved["images"].as_array().is_none_or(Vec::is_empty)
             {
@@ -520,7 +523,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .or_else(|| saved["text"].as_str())
         .unwrap_or("");
     let title = label(
-        if entry.draft && !draft.is_empty() {
+        if entry.draft && !draft.trim().is_empty() {
             draft.lines().next().unwrap_or(title)
         } else {
             title
