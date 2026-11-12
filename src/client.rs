@@ -79,6 +79,7 @@ pub struct Client {
     directory: PathBuf,
     device_directory: PathBuf,
     pub commands: Commands,
+    pub info: Arc<Mutex<Value>>,
     input: Option<tokio::sync::mpsc::Receiver<Command>>,
     events: mpsc::Receiver<Event>,
     output: mpsc::SyncSender<Event>,
@@ -94,6 +95,10 @@ impl Client {
         self.commands.ready.store(true, Ordering::Release);
         self.input.take().expect("unused test client")
     }
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self, projection: Value) {
+        *self.snapshot.lock().expect("client snapshot") = Some(projection);
+    }
 
     #[cfg(test)]
     pub fn test_connected(directory: PathBuf) -> (Self, tokio::sync::mpsc::Receiver<Command>) {
@@ -106,6 +111,7 @@ impl Client {
         let (sender, input) = tokio::sync::mpsc::channel(32);
         let (output, events) = mpsc::sync_channel(64);
         Self {
+            info: Arc::default(),
             remote: None,
             linked: Default::default(),
             device_directory: directory.clone(),
@@ -150,6 +156,7 @@ impl Client {
         let ready = self.commands.ready.clone();
         let history_thread = self.history_thread.clone();
         let remote = self.remote.clone();
+        let info = self.info.clone();
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -157,6 +164,7 @@ impl Client {
                 .expect("client runtime");
             runtime.block_on(supervise(
                 (directory, device_directory, history_thread, remote),
+                info,
                 input,
                 output,
                 snapshot,
@@ -210,6 +218,11 @@ impl Client {
     }
     pub fn snapshot(&self) -> Option<Value> {
         self.snapshot.lock().expect("client snapshot").take()
+    }
+    pub fn version(&self) -> Option<String> {
+        self.info.lock().expect("connection info")["binaryVersion"]
+            .as_str()
+            .map(str::to_owned)
     }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
@@ -606,6 +619,7 @@ async fn supervise(
         Arc<AtomicUsize>,
         Option<crate::peer::Link>,
     ),
+    info: Arc<Mutex<Value>>,
     mut input: tokio::sync::mpsc::Receiver<Command>,
     output: mpsc::SyncSender<Event>,
     snapshot: Arc<Mutex<Option<Value>>>,
@@ -614,6 +628,12 @@ async fn supervise(
     wake: rune::Waker,
 ) {
     let (directory, device_directory, history_thread, remote) = profile;
+    let info_file = device_directory.join("connection-info.json");
+    if let Ok(bytes) = std::fs::read(&info_file)
+        && let Ok(value) = serde_json::from_slice(&bytes)
+    {
+        *info.lock().expect("connection info") = value;
+    }
     let report = |error: String| {
         let _ = output.try_send(Event::Error(error));
         wake();
@@ -689,7 +709,12 @@ async fn supervise(
                     result = connect(&discovery, &device, &device_directory, &cache, true, remote.as_ref()) => result,
                     _ = stopped(&stop) => break,
                 } {
-                    Ok((mut connected, _hello)) => {
+                    Ok((mut connected, hello)) => {
+                        let metadata = json!({"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"]});
+                        *info.lock().expect("connection info") = metadata.clone();
+                        let _ =
+                            crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
+                        wake();
                         cache.inflight = None;
                         cache.snapshot_pages.clear();
                         if child
@@ -1277,10 +1302,20 @@ async fn remote_request(
             Some(link),
         )
         .await?;
+        if command.method == "hello" {
+            return Ok(hello);
+        }
         if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),
             );
+        }
+        if matches!(
+            command.method.as_str(),
+            "server.updateStatus" | "server.requestUpdate"
+        ) && hello["protocolMinor"].as_u64().unwrap_or(0) < 6
+        {
+            return Err("older protocol".into());
         }
         socket
             .send(wire_command(&command))

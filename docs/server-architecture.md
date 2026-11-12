@@ -82,6 +82,32 @@ Validation uses one-process loopback servers, deterministic reducer recovery tes
 
 ## Decision and evidence
 
+### Protocol 1.6, linked-machine updates and settings
+
+Minor 1.5 remains reserved for cross-machine delegation. Minor 1.6 adds `linked-updates`, `server.updateStatus` and the receipted `server.requestUpdate`. `protocol::method_grant` maps only those two methods to `update`. Paired devices do not receive it by default. `devices.grant` and `devices.revokeGrant` accept only the `update` grant, require `maintain`, reject paired callers in the runtime, and refuse remote-listener calls even with a maintenance credential. The CLI exposes `devices grant <id> update` and `devices revoke-grant <id> update`. The local authorized-device roster has the same switch. Existing grants and revocation remain unchanged.
+
+The existing `read` grant still permits `server.status`; this change does not broaden or remove it. An `update`-only credential cannot call that method or any maintenance method. Local, unpaired maintenance credentials may use the two update methods without a separate update switch.
+
+`fleet_update::ServerUpdates` owns one target-side attempt. `RuntimeState::command` validates blockers and the durable per-device rate limit, then commits the receipt and `update_audit` row before starting its worker. Schema 4's migration takes the existing verified backup first. Authenticated grant denials and other refusals also enter the audit table but do not consume the accepted-request limit. Duplicate command UUIDs return their receipt without launching another attempt. An accepted request consumes ten minutes even if checking fails or finds no newer release.
+
+The caller supplies no release selection. `update::request_latest` uses the target's existing release check, private-repository `gh` login, asset validation, checksum verification and coordinated helper. Unknown caller fields, including versions, do not affect selection. A development checkout cannot advertise self-update. Linux requires a matching service installation. The shared local/remote blocker includes thread startup, queues, approvals, routines, clones and queued/running delegated tasks. The helper checks again after download, so newly started work cancels preparation rather than being interrupted.
+
+The helper writes `updates/outcome.json` with the request ID, tag, success and specific failure reason. It records replacement failures before rollback reopens clients, then records the final result after the helper sequence. This file stays outside the matched-state backup. The server reads it at startup and while running, updates the audit record, and includes `updateStatus` and `updateNotice` in durable projections. Reconnecting clients learn success and rollback through ordinary replay/snapshot synchronization. The remembered failed-release policy remains target-local; the narrow update grant cannot clear it.
+
+If the server dies during release preparation before a detached helper takes ownership, startup marks that accepted audit entry interrupted. It reports failure rather than repeating a download or leaving a client waiting forever. Revoking a grant blocks new requests; it does not cancel an update the target already accepted.
+
+`fleet_update::Fleet` follows KSG Code's `useUpdateEverything` and `updateEverything.logic`. It plans one row per direct linked connection, skips offline or ineligible machines, and submits independent requests in parallel. It never creates a fleet endpoint, retries offline work or broadens the grant to maintenance. It follows the target's request ID through reconnect and waits for remote handoff or failure before local restart. Closing its dialog leaves accepted target-side work alone.
+
+Desktop restart checks read Local's blocker even when the open conversation belongs to another machine. A busy remote thread cannot prevent an otherwise idle local update. Unsaved rename/captain editors still block closing the window.
+
+`settings_ui.rs` ports KSG's settings navigation, search and row structure into the Pixel Voyage dialog. The machine context is independent of the open thread and starts at Local. Thread defaults and auto-settle go to that machine's receipted settings methods and existing index document. Profile and keep-awake use the selected machine's existing `profile.put` and `background.keepAwake` commands. The profile editor retains that target until closed. Desktop theme, tray behavior and confirmation preferences remain in `ui-state.json`. New persisted structs use serde defaults and validate restored values. Harness discovery, Honcho status, file reveals, update grants and failed-release retry remain Local.
+
+Built-in harness version probes run only bounded `--version` commands, never prompts or authentication commands. They remove Shina thread/MCP environment variables and do not forward prompt or server arguments. Opaque ACP binaries are not executed for version discovery; script package metadata may supply a version. ACP configuration remains read-only.
+
+No restart-continuation setting exists. Updates require empty submitted queues and no dispatchable delegated tasks before fencing new work. There is nothing to resume after validated update, and no prompt is injected into a completed turn. Crash recovery and interrupted task review retain their existing behavior.
+
+One-process multi-server fixtures use fake release and helper implementations for grant defaults, local grant changes, busy refusal, target-selected releases, rate limits, audit records, success/rollback persistence and older protocols. Headless Rune tests cover every settings section and both search outcomes at 620, 960, 1280 and 1920 px, the fleet dialog's states, and settings commands sent to a machine other than the open thread's owner. Demo scenes render light/dark settings and fleet dialogs without real updates or pairing.
+
 Run `shina serve` from the same binary as an independent per-user process. It owns execution and durable state. Rune, and later mobile, authenticate as clients. Closing every window leaves accepted work running. This is shared access to server-owned sessions, not replication of live agent processes.
 
 Research baseline: Shina `2e27d22f72e91ea63f2550a26869a78f4c560356`; KSG Code `684aebf1395fca2239dd59198668f6577daedee6` at `D:\AiStack\ksgcode`. Paths below are relative to their repository. These are source-verified findings, not deployment tests.

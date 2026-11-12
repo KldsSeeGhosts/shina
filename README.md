@@ -104,13 +104,15 @@ Create a code on the host you want to access. On the client machine, redeem that
 & "$env:LOCALAPPDATA\Programs\Shina\shina.exe" --server-client
 ```
 
-On either Mac use `/Applications/Shina.app/Contents/MacOS/shina link <host> <code>`. On Ubuntu use `shina link <host> <code>`. Replace `<host>` with `windows-pc`, `studio-mac`, `laptop-mac` or `linux-server`. Generate a fresh code for each client/server link. Linking A to B does not grant B access to A. Repeat for each direction needed; no full mesh is required. CLI links load when the desktop starts. An open desktop can link immediately through Run on > Add to another machine or Settings > Linked machines.
+On either Mac use `/Applications/Shina.app/Contents/MacOS/shina link <host> <code>`. On Ubuntu use `shina link <host> <code>`. Replace `<host>` with `windows-pc`, `studio-mac`, `laptop-mac` or `linux-server`. Generate a fresh code for each client/server link. Linking A to B does not grant B access to A. Repeat for each direction needed; no full mesh is required. CLI links load when the desktop starts. An open desktop can link immediately through Run on > Add to another machine or Settings > Machines.
 
 The dialog also creates a host code, lists authorized devices and revokes them. The CLI equivalents are:
 
 ```text
 shina devices
 shina devices revoke <device-id>
+shina devices grant <device-id> update
+shina devices revoke-grant <device-id> update
 shina links
 shina unlink <server-id-or-host>
 ```
@@ -136,6 +138,12 @@ To replace a revoked peer credential, mint a fresh peer code and repeat `peer li
 `orchestrator_capabilities` and `list_captains` report peers and their cached reachability, projects, harnesses and models. In `delegate_task`, `target.machine` selects a peer by server id, host or label. `workspace` then names a project id or path on that server. The target repository must belong to the caller's workspace scope, matched by git remote. An explicit selector chooses a target checkout without expanding that scope. Without it, the caller's git remote must match exactly one target project. A stable `client_request_id` retries an uncertain launch without creating another worker. Sleeping machines leave the task pending, with retries between two seconds and five minutes. Cancellation commits at home immediately and remains owed until the target acknowledges it. Recovered results wait for review before delivery. Questions and approvals stay on the target; memory suggestions require the home captain's explicit `remember`.
 
 The Linked machines dialog's Peers section manages the local server's outbound links. On a linked remote view it lists that server's peers without maintenance controls. A remote task opens on its owning server if the desktop also has a client link to it; otherwise it opens the cached result excerpt.
+
+The `update` grant is off for paired devices. Turn it on or off in the target machine's own terminal, or under Settings > Machines > Authorized devices on that machine. Only local maintenance credentials can change it. It permits exactly `server.updateStatus` and `server.requestUpdate`, not restart, stop, pairing, shell execution, or other maintenance methods. Ordinary local maintenance credentials can also use those two update methods.
+
+Protocol 1.6 advertises `linked-updates`. "Update all machines" reviews Local and every linked machine before sending requests. Each eligible machine resolves its own latest GitHub release with its own existing `gh` login and verifies the existing size and SHA-256 checks. The client cannot choose a release, URL, or binary. Requests go directly to each machine in parallel. Local restarts last, after the remote machines reach restart handoff or finish. Offline machines, older protocols, missing update grants, unsupported installations and busy machines are skipped with reasons. Nothing queues an offline update or retries one automatically. Closing the dialog does not cancel an accepted request.
+
+The target refuses active, queued, configuring or approval-blocked work and checks again when the helper prepares its drain. Acceptance consumes a durable ten-minute per-device limit, even if the release check later fails or finds nothing new. Schema 4 adds `update_audit` after a verified backup. Authenticated update attempts, including grant denials and other refusals, record their device, time, update ID and outcome; resolved tags and final outcomes attach to accepted requests. `updates/outcome.json` preserves helper success or the specific failure reason across restart and rollback. Clients receive the last outcome in the projection and a dismissible notice after reconnect. A remembered failed release still requires explicit Retry on the target before that tag can download again.
 
 Codes have 48 bits of OS randomness, expire after five minutes, allow five exchange attempts per minute per host, and work once. Durable tokens have 256 bits of OS randomness. Servers store hashes and scopes in SQLite; clients store secrets outside repositories in `Shina/linked/<server-id>/credential.json`. Windows uses a protected current-user-only DACL. Unix uses a private directory and mode 0600 credential file. Tokens never enter argv or logs. Only the one-time code enters `link` argv. HTTP/WebSocket traffic uses Tailscale's encrypted transport; proxies, redirects and non-tailnet destinations are refused. MCP agents receive only their existing thread-bound MCP token, never a paired user credential, so they cannot answer approvals or mint credentials.
 
@@ -169,6 +177,16 @@ For a native executable with no console window:
 cargo build --release
 .\target\release\shina.exe
 ```
+
+## Settings
+
+The sidebar gear opens a searchable, keyboard-accessible dialog with General, Threads, Harnesses, Machines, Memory, Updates and About sections. Theme stays in General. Machines contains linking, host codes, authorized devices and the update review. At 620 px the dialog fills the window and its Back control closes it.
+
+General edits the existing profile and background controls, theme, and archive/delete confirmations. Threads edits auto-settle, snooze duration and calendar presets, the default access mode and harness, and provider/model ID/effort defaults per harness. New threads still inherit the current thread's valid choices. Defaults apply when no valid selection is inherited, including the first draft after restoring a profile with no live threads. Snooze accepts comma-separated minutes or `day@HH:MM`, for example `60, tomorrow@09:00, monday@10:30`. It uses the existing DST-aware resolver, with at most eight presets and durations up to 30 days. With linked machines, the dialog shows which machine owns server settings. Its context starts at Local and does not change the open conversation. Profile, keep-awake, thread defaults and auto-settle edits go to that selected machine. The profile editor retains its target until closed. Theme, background tray behavior and confirmation preferences stay on this desktop.
+
+Harnesses shows local discovery paths and bounded `--version` results for built-in agents. Version probes remove Shina's thread credentials and do not forward prompt or server arguments. Opaque ACP binaries are not executed for version discovery; script package metadata may supply a version. ACP entries remain read-only. Shina never installs agents, signs in or edits their configuration. Memory shows Local's Honcho status, queue counts and last error. Reveal controls open the existing local `harnesses.json`, `honcho.json` or data folder in the system file manager. Updates shows the desktop version, last check in this session, and the remembered local failed release with an explicit retry. About includes the bundled licences.
+
+Server-owned settings use receipted commands and the existing index document. Device-only preferences use `ui-state.json`; no second settings store exists. There is no "Continue threads after an update" switch. The shared update guard refuses queued inputs, startup work, approvals and unfinished delegated dispatch, and the drain fences new work. A validated update therefore has no pending thread queue to resume. It never adds a continuation prompt to a finished turn.
 
 ## Install and update
 
@@ -386,6 +404,10 @@ cargo run -- --demo --scene captain-brief-dark --snap artifacts\shina-captain-br
 cargo run -- --demo --scene captain-brief --snap artifacts\shina-captain-brief-narrow.png --size 620x720 --scale 1
 cargo run -- --demo --scene settings-profile --snap artifacts\shina-settings-profile.png --size 1280x840 --scale 1
 cargo run -- --demo --scene settings-menu --snap artifacts\shina-settings-menu.png --size 1280x840 --scale 1
+cargo run -- --demo --scene settings-dark --snap artifacts\shina-settings-dark.png --size 1280x840 --scale 1
+cargo run -- --demo --scene settings-threads --snap artifacts\shina-settings-threads.png --size 620x720 --scale 1
+cargo run -- --demo --scene update-machines --snap artifacts\shina-update-machines.png --size 1280x840 --scale 1
+cargo run -- --demo --scene update-machines-dark --snap artifacts\shina-update-machines-dark.png --size 1280x840 --scale 1
 cargo run -- --demo --scene harness-picker --snap artifacts\shina-harness-picker.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-search --snap artifacts\shina-captain-search.png --size 1280x840 --scale 1
 cargo run -- --demo --scene captain-crews-dark --snap artifacts\shina-captain-crews.png --size 1280x840 --scale 1

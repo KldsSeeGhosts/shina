@@ -362,6 +362,10 @@ pub(crate) fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) ->
 }
 
 /// Resolve npm's JavaScript entry directly on Windows, avoiding cmd.exe quoting and console windows.
+pub(crate) fn discovery_command() -> Result<Command, String> {
+    command()
+}
+
 fn command() -> Result<Command, String> {
     if let Some(path) = env::var_os("SHINA_PI_CLI").or_else(|| env::var_os("STILL_PI_CLI")) {
         return command_for(&PathBuf::from(path));

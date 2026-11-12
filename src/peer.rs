@@ -582,7 +582,15 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             if receipt["status"] != "accepted" { return Err("Device revocation refused.".into()); }
             println!("Device revoked.");
         }
-        _ => return Err("Usage: shina pair [--peer] | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id>] | peer link <host> <code> | peer list | peer unlink <server-id-or-host>".into()),
+        Some("devices") if args.len() == 4 && matches!(args[1].as_str(), "grant" | "revoke-grant") && args[3] == "update" => {
+            let method = if args[1] == "grant" { "devices.grant" } else { "devices.revokeGrant" };
+            let receipt = runtime.block_on(crate::client::local_rpc(&profile, method, json!({"deviceId":args[2],"grant":"update"})))?;
+            if receipt["status"] != "accepted" {
+                return Err(receipt["result"]["error"].as_str().unwrap_or("Grant change refused.").into());
+            }
+            println!("Update grant changed.");
+        }
+        _ => return Err("Usage: shina pair [--peer] | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id> | grant <device-id> update | revoke-grant <device-id> update] | peer link <host> <code> | peer list | peer unlink <server-id-or-host>".into()),
     }
     Ok(())
 }

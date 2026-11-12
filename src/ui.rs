@@ -22,6 +22,8 @@ mod markdown_ui;
 mod pi_ui;
 #[path = "pixel_icons.rs"]
 mod pixel_icons;
+#[path = "settings_ui.rs"]
+pub(crate) mod settings_ui;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
 #[path = "work_ui.rs"]
@@ -1001,13 +1003,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(snooze_menu(s, p));
     }
     if s.settings_menu {
-        root = root.child(settings_menu(s, p));
+        root = root.child(settings_ui::dialog(s, p));
     }
     if s.machines.picker {
         root = root.child(machine_picker(s, p));
     }
     if s.machines.dialog {
         root = root.child(machine_dialog(s, p));
+    }
+    if s.fleet.open {
+        root = root.child(settings_ui::fleet_dialog(s, p));
+    }
+    if s.settings.archive.is_some() {
+        root = root.child(settings_ui::archive_dialog(s, p));
     }
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
@@ -2465,6 +2473,74 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(row) = update_row(s, p) {
         side = side.child(row);
     }
+    if s.fleet_available() {
+        side = side.child(
+            button("update-all-machines", "Update all machines", p, |s| {
+                s.open_fleet()
+            })
+            .mx(8.0)
+            .my(4.0),
+        );
+    }
+    for (server, view) in &s.machines.views {
+        let outcome = &view["updateNotice"];
+        if let Some(id) = outcome["updateId"].as_str()
+            && !s
+                .preferences
+                .dismissed_updates
+                .iter()
+                .any(|dismissed| dismissed == id)
+        {
+            let title = if outcome["success"] == true {
+                format!(
+                    "{} updated to {}",
+                    s.machine_label(server),
+                    outcome["tag"].as_str().unwrap_or("")
+                )
+            } else {
+                format!(
+                    "{} update failed: {}",
+                    s.machine_label(server),
+                    outcome["reason"].as_str().unwrap_or("Unknown failure")
+                )
+            };
+            let id = id.to_owned();
+            side = side.child(
+                row()
+                    .key(format!("update-outcome-{id}"))
+                    .gap(4.0)
+                    .px(8.0)
+                    .py(4.0)
+                    .child(
+                        label(
+                            title,
+                            SMALL,
+                            if outcome["success"] == true {
+                                p.sea
+                            } else {
+                                p.danger
+                            },
+                        )
+                        .wrap()
+                        .grow(1.0)
+                        .min_w(0.0),
+                    )
+                    .child(icon_button(
+                        &format!("dismiss-update-{id}"),
+                        "Dismiss update notice",
+                        "close",
+                        p,
+                        move |s| {
+                            s.preferences.dismissed_updates.push(id.clone());
+                            if s.preferences.dismissed_updates.len() > 64 {
+                                s.preferences.dismissed_updates.remove(0);
+                            }
+                            s.checkpoint();
+                        },
+                    )),
+            );
+        }
+    }
     if let Some(notice) = &s.machines.auto_notice
         && s.machines.notice.as_ref() == Some(notice)
     {
@@ -2525,7 +2601,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     "settings",
                     s.settings_menu,
                     p,
-                    |s| s.settings_menu = !s.settings_menu,
+                    |s| s.open_settings(),
                 )
                 .help("Settings"),
             )
@@ -2569,66 +2645,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
 /// Preferences behind the footer's gear: the "You" profile, background work, and the theme.
 /// The background rows are KSG Code's `SettingsRow` with a `Switch` (see `captain_ui`); a
 /// captain's routines live in its Brief.
-fn settings_menu(s: &State, p: Palette) -> El {
-    let mut menu = col()
-        .key("settings-menu")
-        .role("menu")
-        // Up, Down, Home and End move through the rows, Return presses one, Escape closes.
-        .focus_group()
-        .label("Settings")
-        .w(320.0)
-        .max_h(460.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .padding(4.0)
-        .gap(1.0)
-        .radius(6.0)
-        .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .child(
-            menu_item(
-                "default-harness",
-                &format!("Default harness: {}", s.default_harness),
-                "settings",
-                p,
-            )
-            .on_press(|s: &mut State| s.cycle_default_harness()),
-        )
-        .child(captain_ui::profile_item(s, p))
-        .child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
-    for item in captain_ui::background_settings(s, p) {
-        menu = menu.child(item);
-    }
-    if s.client.is_some() {
-        menu = menu.child(
-            menu_item("machine-settings", "Linked machines", "monitor", p).on_press(
-                |s: &mut State| {
-                    s.settings_menu = false;
-                    s.machines.dialog = true;
-                },
-            ),
-        );
-    }
-    menu = menu.child(el().h(0.5).mx(8.0).my(3.0).fill(p.line));
-    menu.anchored_fit("sidebar-settings", rune::Side::Top, rune::Align::Start, 6.0)
-        .modal(true, |s: &mut State| s.settings_menu = false)
-        .child(
-            menu_item(
-                "theme-toggle",
-                if s.dark { "Light theme" } else { "Dark theme" },
-                if s.dark { "sun" } else { "moon" },
-                p,
-            )
-            .on_press(|s: &mut State| {
-                s.dark = !s.dark;
-                s.settings_menu = false;
-                s.checkpoint();
-            }),
-        )
-}
-
 /// Add or restore a project. Project ownership stays on threads, not sidebar folders.
 fn project_switcher(_: &State, p: Palette) -> El {
     icon_button("project-switcher", "Add workspace", "folder-plus", p, |s| {
@@ -8551,19 +8567,30 @@ fn machine_picker(s: &State, p: Palette) -> El {
 }
 
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
-fn machine_dialog(s: &State, p: Palette) -> El {
+fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     let busy = s.machines.pending.is_some();
-    let mut card = col().key("machine-dialog").role("dialog").label("Linked machines")
-        .w((s.viewport_width-32.0).clamp(280.0,520.0)).max_h((s.viewport_height-64.0).max(240.0))
-        .scroll(ScrollSpec {stick_bottom:false}).padding(16.0).gap(12.0).radius(6.0)
-        .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .child(row().center_y().child(label("Linked machines",DIALOG_TITLE,p.ink)).child(spacer())
-            .child(icon_button("close-machines","Close","close",p,|s| {
-                s.machines.dialog=false;s.machines.code.replace_text("");s.machines.peer_code.replace_text("");s.machines.notice=None;
-            })))
-        .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
+    let mut card = col()
+        .key("machine-dialog")
+        .role(if embedded { "group" } else { "dialog" })
+        .label("Linked machines")
+        .w_full()
+        .gap(12.0);
+    if !embedded {
+        card = card.child(
+            row()
+                .center_y()
+                .child(label("Linked machines", DIALOG_TITLE, p.ink))
+                .child(spacer())
+                .child(icon_button("close-machines", "Close", "close", p, |s| {
+                    s.machines.dialog = false;
+                    s.settings_menu = false;
+                    s.machines.code.replace_text("");
+                    s.machines.peer_code.replace_text("");
+                    s.machines.notice = None;
+                })),
+        );
+    }
+    card=card.child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(pixel_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
             .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.host, p).color(p.ink)
@@ -8574,8 +8601,8 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.code))
         .child(primary_button("machine-link-submit","Link machine",p,|s| s.machine_action("link","")).disabled(busy))
         .child(row().flex_wrap().gap(8.0)
-            .child(button("machine-pair","Create a code for this host",p,|s| s.machine_action("pair","")).disabled(busy))
-            .child(button("machine-devices","Authorized devices",p,|s| s.machine_action("devices","")).disabled(busy)));
+            .child(settings_ui::settings_button("machine-pair","Create a code for this host",p,|s| s.machine_action("pair","")).disabled(busy))
+            .child(settings_ui::settings_button("machine-devices","Authorized devices",p,|s| s.machine_action("devices","")).disabled(busy)));
     if let Some(notice) = &s.machines.notice {
         card = card.child(
             label(notice, SMALL, p.muted)
@@ -8587,28 +8614,59 @@ fn machine_dialog(s: &State, p: Palette) -> El {
     if let Some(client) = &s.client {
         for (id, remote) in &client.linked {
             let server = id.clone();
+            let version = remote.version().unwrap_or_else(|| {
+                s.machines
+                    .views
+                    .get(id)
+                    .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
+                    .unwrap_or("unknown")
+                    .to_owned()
+            });
             card = card.child(
                 row()
+                    .key(format!("settings-linked-{id}"))
                     .center_y()
                     .gap(8.0)
                     .child(
-                        label(
-                            remote
-                                .remote
-                                .as_ref()
-                                .map(|link| link.host.as_str())
-                                .unwrap_or(id),
-                            SMALL,
-                            p.ink,
-                        )
-                        .grow(1.0)
-                        .truncate()
-                        .min_w(0.0),
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(4.0)
+                            .child(
+                                label(
+                                    remote
+                                        .remote
+                                        .as_ref()
+                                        .map(|link| link.host.as_str())
+                                        .unwrap_or(id),
+                                    TextStyle::new(14.0, 500.0),
+                                    p.ink,
+                                )
+                                .truncate()
+                                .min_w(0.0),
+                            )
+                            .child(
+                                row()
+                                    .gap(8.0)
+                                    .flex_wrap()
+                                    .child(pixel_text(version, p.muted))
+                                    .child(pixel_text(
+                                        if s.machine_connected(id) {
+                                            "Reachable"
+                                        } else {
+                                            "Offline"
+                                        },
+                                        p.muted,
+                                    )),
+                            ),
                     )
                     .child(
-                        button(&format!("unlink-{id}"), "Unlink and revoke", p, move |s| {
-                            s.machine_action("unlink", &server)
-                        })
+                        settings_ui::destructive_button(
+                            &format!("unlink-{id}"),
+                            "Unlink and revoke",
+                            p,
+                            move |s| s.machine_action("unlink", &server),
+                        )
                         .disabled(busy),
                     ),
             );
@@ -8619,16 +8677,51 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             continue;
         }
         let id = device["deviceId"].as_str().unwrap_or("").to_owned();
+        let grant_id = id.clone();
+        let maintenance = device["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "maintain"));
+        let update = device["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "update"));
         let title = format!("Device {}", &id[..id.len().min(8)]);
         card = card.child(
             row()
                 .center_y()
                 .gap(8.0)
                 .child(label(title, SMALL, p.muted).grow(1.0))
+                .child(pixel_text("Updates", p.muted))
                 .child(
-                    button(&format!("revoke-{id}"), "Revoke", p, move |s| {
-                        s.machine_action("revoke", &id)
-                    })
+                    captain_ui::switch(
+                        s,
+                        &format!("device-update-{id}"),
+                        if maintenance {
+                            "Local maintenance permits updates"
+                        } else {
+                            "Allow updates"
+                        },
+                        update || maintenance,
+                        p,
+                        move |s| {
+                            s.machine_action(
+                                if update {
+                                    "revoke-update"
+                                } else {
+                                    "grant-update"
+                                },
+                                &grant_id,
+                            )
+                        },
+                    )
+                    .disabled(busy || maintenance),
+                )
+                .child(
+                    settings_ui::destructive_button(
+                        &format!("revoke-{id}"),
+                        "Revoke",
+                        p,
+                        move |s| s.machine_action("revoke", &id),
+                    )
                     .disabled(busy),
                 ),
         );
@@ -8715,6 +8808,10 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             .wrap(),
         );
     }
+    card
+}
+
+fn machine_dialog(s: &State, p: Palette) -> El {
     el().key("machines-backdrop")
         .instant_changes()
         .absolute(0.0, 0.0)
@@ -8728,7 +8825,19 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             s.machines.peer_code.replace_text("");
             s.machines.notice = None;
         })
-        .child(card)
+        .child(
+            machine_panel(s, p, false)
+                .w((s.viewport_width - 32.0).clamp(280.0, 520.0))
+                .max_h((s.viewport_height - 64.0).max(240.0))
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .padding(16.0)
+                .radius(6.0)
+                .fill(p.card)
+                .border(2.0, p.frame)
+                .box_shadow(hard_shadow(p)),
+        )
 }
 
 fn activity(s: &State, p: Palette, narrow: bool) -> El {
@@ -9263,7 +9372,12 @@ pub(crate) mod tests {
             if rt.presented("sidebar-settings").is_some() {
                 tab_to(&mut rt, "sidebar-settings");
                 tap(&mut rt, rune::Key::Enter);
-                walk_menu(&mut rt, "settings-menu", true, &at("settings menu"));
+                assert_eq!(focused(&rt).key.as_deref(), Some("settings-search"));
+                tab_to(&mut rt, "settings-section-0");
+                tap(&mut rt, rune::Key::Down);
+                assert_eq!(rt.state.settings.section, 1);
+                tap(&mut rt, rune::Key::Escape);
+                assert!(!rt.state.settings_menu);
             }
 
             let mut rt = fresh();
@@ -10143,16 +10257,13 @@ pub(crate) mod tests {
             rt.state.settings_menu = true;
             rt.frame(0.0);
             let (menu, _) = rt.presented("settings-menu").unwrap();
-            for key in [
-                "default-harness",
-                "background-toggle",
-                "keep-awake-toggle",
-                "theme-toggle",
-            ] {
+            for key in ["background-toggle", "keep-awake-toggle", "theme-toggle"] {
                 let (item, _) = rt.presented(key).unwrap();
                 assert!(item[0] >= menu[0] && item[0] + item[2] <= menu[0] + menu[2] + 0.5);
                 assert!(item[1] >= 0.0 && item[1] + item[3] <= 720.5);
             }
+            press(&mut rt, "settings-section-1");
+            assert!(rt.presented("default-harness").is_some());
         }
     }
     #[test]
@@ -13065,6 +13176,8 @@ pub(crate) mod tests {
         press(&mut rt, "sidebar-settings");
         press(&mut rt, "theme-toggle");
         assert_ne!(rt.state.dark, dark);
+        assert!(rt.state.settings_menu);
+        press(&mut rt, "settings-close");
         assert!(!rt.state.settings_menu);
         // This repository ships assets/project-icon.png.
         let project = crate::projects::Project::new(99, std::env::current_dir().unwrap());

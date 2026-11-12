@@ -2367,6 +2367,10 @@ pub struct State {
     pub row_menu: Option<RowTarget>,
     /// The footer's settings menu is open.
     pub settings_menu: bool,
+    pub settings: crate::ui::settings_ui::Dialog,
+    pub preferences: crate::ui::settings_ui::Preferences,
+    pub thread_defaults: crate::ui::settings_ui::ThreadDefaults,
+    pub fleet: crate::fleet_update::Fleet,
     /// The sidebar's "N need you" popover is open.
     pub attention_menu: bool,
     /// Where a right-click opened the row menu, in window points.
@@ -2546,6 +2550,10 @@ impl State {
             thread_menu: false,
             row_menu: None,
             settings_menu: false,
+            settings: Default::default(),
+            preferences: Default::default(),
+            thread_defaults: Default::default(),
+            fleet: Default::default(),
             attention_menu: false,
             row_menu_at: None,
             hovered_row: None,
@@ -3343,6 +3351,9 @@ impl State {
         self.delete_thread = Some(id);
         self.row_menu = None;
         self.thread_menu = false;
+        if !self.preferences.confirm_delete {
+            self.confirm_delete();
+        }
     }
     pub fn deletion_ids(&self, id: usize) -> std::collections::HashSet<usize> {
         let mut ids = std::collections::HashSet::from([id]);
@@ -3569,6 +3580,22 @@ impl State {
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
+        if !self.headless
+            && self.preferences.confirm_archive
+            && self.threads.iter().any(|t| t.id == id && !t.archived())
+        {
+            if self.settings.archive.is_none() {
+                self.settings.archive_targets.clear();
+            }
+            if !self.settings.archive_targets.contains(&id) {
+                self.settings.archive_targets.push(id);
+            }
+            self.settings.archive = Some(id);
+            return;
+        }
+        self.archive_confirmed(id);
+    }
+    pub fn archive_confirmed(&mut self, id: usize) {
         self.archive_thread_record(id, false);
     }
     fn archive_thread_record(&mut self, id: usize, keep_blank: bool) {
@@ -3771,7 +3798,10 @@ impl State {
     pub fn open_snooze(&mut self, id: usize) {
         self.row_menu = None;
         self.thread_menu = false;
-        self.snooze_menu = Some((id, lifecycle::snooze_choices()));
+        self.snooze_menu = Some((
+            id,
+            lifecycle::snooze_choices_from(self.thread_defaults.snooze_presets()),
+        ));
         self.snooze_targets = if self.selected_threads.contains(&id) {
             self.selected_threads.clone()
         } else {
@@ -4159,16 +4189,39 @@ impl State {
     fn composer_seed(&self) -> Value {
         self.threads.get(self.active).map_or(Value::Null, |thread| {
             json!({"harness":thread.harness,"model":thread.selected_or_effective_model(),
-                "thinking":thread.selected_or_effective_reasoning()})
+                "thinking":thread.selected_or_effective_reasoning(),"access":thread.native.access.id()})
         })
     }
     fn inherit_composer(&mut self, index: usize, seed: &Value) {
+        if seed.is_null() {
+            let harness = self.default_harness.clone();
+            self.threads[index].harness = harness.clone();
+            self.threads[index].native.access =
+                AccessMode::parse(&self.thread_defaults.access).unwrap_or_default();
+            if let Some(selection) = self.thread_defaults.models.get(&harness)
+                && !selection.provider.is_empty()
+                && !selection.model.is_empty()
+            {
+                let thread = &mut self.threads[index];
+                thread.selected_model = Some((selection.provider.clone(), selection.model.clone()));
+                thread.model_provider = selection.provider.clone();
+                thread.model_id = selection.model.clone();
+                thread.model = selection.model.clone();
+                thread.selected_thinking =
+                    (!selection.effort.is_empty()).then(|| selection.effort.clone());
+                thread.thinking = selection.effort.clone();
+            }
+            return;
+        }
         let Some(harness) = seed["harness"]
             .as_str()
             .filter(|id| self.validate_harness(id).is_ok())
         else {
             return;
         };
+        if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
+            self.threads[index].native.access = access;
+        }
         let models = self.harness_models(harness);
         let selection: Option<(String, String)> =
             serde_json::from_value(seed["model"].clone()).ok().flatten();
@@ -4177,6 +4230,12 @@ impl State {
                 .iter()
                 .find(|m| &m.provider == provider && &m.id == id)
         }) else {
+            self.inherit_composer(index, &Value::Null);
+            // Access inheritance does not depend on model discovery. A missing model
+            // must never replace the source thread's read-only mode with a broader default.
+            if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
+                self.threads[index].native.access = access;
+            }
             return;
         };
         let thread = &mut self.threads[index];
@@ -5957,6 +6016,18 @@ impl State {
     }
     /// Projections share record validation with session restore, but never restore navigation.
     fn restore_records(&mut self, index: &Value, restore_session: bool) -> Result<(), String> {
+        self.default_harness = match index.get("defaultHarness") {
+            None => "pi".into(),
+            Some(value) => value
+                .as_str()
+                .filter(|id| crate::harness::valid_id(id))
+                .ok_or("Invalid default harness.")?
+                .into(),
+        };
+        self.thread_defaults =
+            serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
+                .map_err(|_| "Invalid thread defaults.")?;
+        self.thread_defaults.validate()?;
         self.persist_transcripts = self.headless || index["threadViews"].is_array();
         self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
         self.command_receipts =
@@ -6238,7 +6309,7 @@ impl State {
                         .max_by_key(|p| (p.updated, p.id))
                         .map(|p| p.id);
                     self.active = self.active.min(self.threads.len().saturating_sub(1));
-                    self.new_thread_in(project);
+                    self.create_thread_in(project, &[], &Value::Null);
                 }
             } else {
                 self.active = 0;
@@ -6248,14 +6319,6 @@ impl State {
             return Err("The saved index has no valid thread list.".into());
         }
         self.dark = index["dark"] == true;
-        self.default_harness = match index.get("defaultHarness") {
-            None => "pi".into(),
-            Some(value) => value
-                .as_str()
-                .filter(|id| crate::harness::valid_id(id))
-                .ok_or("Invalid default harness.")?
-                .into(),
-        };
         self.auto_settle_days = index["autoSettleAfterDays"].as_u64().unwrap_or(3).min(3650) as u32;
         if let Some(zoom) = index["zoom"].as_f64() {
             self.zoom = snap_zoom(zoom as f32);
@@ -6283,6 +6346,7 @@ impl State {
     fn ui_snapshot(&self) -> Value {
         json!({
             "background": self.background.settings,
+            "preferences": self.preferences,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -6312,6 +6376,9 @@ impl State {
             ui.get("background").cloned().unwrap_or(json!({})),
         )
         .map_err(|_| "Invalid background settings. Existing UI state has not been overwritten.")?;
+        self.preferences =
+            serde_json::from_value(ui.get("preferences").cloned().unwrap_or(json!({})))
+                .map_err(|_| "Invalid UI preferences.")?;
         // The first entry belonged to the removed Working shelf. It is still written so
         // earlier versions can read the file.
         let shelves: [bool; 3] =
@@ -6474,9 +6541,28 @@ impl State {
 
     /// Why a restart to update must wait, or `None` when nothing is active. It checks every
     /// thread, including delegated, settled and archived ones.
-    pub fn update_restart_blocker(&self) -> Option<&'static str> {
+    pub fn update_restart_blocker(&self) -> Option<&str> {
+        if self.client.is_some() && self.machines.selected != "local" {
+            if self.rename_thread.is_some() || self.captain_editor.is_some() {
+                return Some("Finish editing before restarting.");
+            }
+            // Updating this desktop concerns Local, not the remote thread being read.
+            return self
+                .machines
+                .views
+                .get("local")
+                .and_then(|view| view["updateStatus"]["blocker"].as_str());
+        }
         if self.routines_running() {
             return Some("A routine is still running. Restart when it finishes.");
+        }
+        if self.tasks.iter().any(|task| {
+            matches!(
+                task.state,
+                TaskState::Queued | TaskState::Starting | TaskState::Running
+            )
+        }) {
+            return Some("A delegated task is running or queued. Restart when it finishes.");
         }
         if self.threads.iter().any(|t| {
             t.status.busy()
@@ -6559,12 +6645,13 @@ impl State {
         Ok(())
     }
 
-    fn snapshot(&self) -> Value {
+    pub(crate) fn snapshot(&self) -> Value {
         let mut index = json!({
             "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
+            "threadDefaults": self.thread_defaults,
             "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
@@ -6812,7 +6899,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
-    let browsing = state.poll_folder_browser() | html_changed;
+    let browsing = state.poll_folder_browser() | state.poll_settings() | html_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -6825,6 +6912,7 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if state.client.is_some() {
         return state.poll_client(tx) | browsing | composer_changed;
     }
+    let browsing = browsing | state.poll_fleet();
     let background_changed = state.poll_background_start(tx);
     if state.background.quitting {
         return true;
@@ -8595,6 +8683,90 @@ mod tests {
         // A composer draft is saved, so it never blocks.
         state.threads[0].draft.replace_text("unsent");
         assert_eq!(state.update_restart_blocker(), None);
+    }
+
+    #[test]
+    fn thread_defaults_survive_the_index_and_only_apply_without_inheritance() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.default_harness = "codex".into();
+        state.thread_defaults.access = "approval-required".into();
+        state.thread_defaults.snooze_minutes = vec![30, 90];
+        state.thread_defaults.models.insert(
+            "codex".into(),
+            crate::ui::settings_ui::ModelDefault {
+                provider: "openai".into(),
+                model: "fixture-model".into(),
+                effort: "high".into(),
+            },
+        );
+        state.create_thread_in(None, &[], &Value::Null);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().native.access, AccessMode::Supervised);
+        assert_eq!(
+            state.current().selected_model,
+            Some(("openai".into(), "fixture-model".into()))
+        );
+        assert_eq!(state.current().selected_thinking.as_deref(), Some("high"));
+        let saved = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&saved).unwrap();
+        assert_eq!(restored.thread_defaults.snooze_minutes, vec![30, 90]);
+        restored.threads.push(Thread::new(99));
+        restored.threads[0].harness = "claude".into();
+        restored.threads[0].models = vec![AgentModel {
+            provider: "claude".into(),
+            id: "inherited".into(),
+            name: "Inherited".into(),
+            thinking_levels: vec!["high".into()],
+            context_window: None,
+            supports_images: None,
+            service_tiers: vec![],
+        }];
+        let index = restored.threads.len() - 1;
+        restored.inherit_composer(
+            index,
+            &json!({"harness":"claude","access":"read-only","model":null}),
+        );
+        assert_eq!(restored.threads[index].native.access, AccessMode::ReadOnly);
+        restored.inherit_composer(
+            index,
+            &json!({"harness":"claude","access":"read-only","model":["claude","inherited"],"thinking":"high"}),
+        );
+        assert_eq!(restored.threads[index].harness, "claude");
+        assert_eq!(restored.threads[index].native.access, AccessMode::ReadOnly);
+        assert_eq!(
+            restored.threads[index].selected_model,
+            Some(("claude".into(), "inherited".into()))
+        );
+        restored.preferences.confirm_archive = true;
+        restored.preferences.confirm_delete = false;
+        let ui = restored.ui_snapshot();
+        state.restore_ui(&ui).unwrap();
+        assert!(state.preferences.confirm_archive);
+        assert!(!state.preferences.confirm_delete);
+    }
+    #[test]
+    fn desktop_update_blockers_belong_to_local_even_while_reading_a_remote_thread() {
+        let mut state = ready_state();
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        state.machines.selected = "remote".into();
+        state.current_mut().status = Status::Running;
+        state
+            .machines
+            .views
+            .insert("local".into(), json!({"updateStatus":{"blocker":null}}));
+        assert_eq!(state.update_restart_blocker(), None);
+        state.machines.views.get_mut("local").unwrap()["updateStatus"]["blocker"] =
+            json!("2 local threads are running");
+        assert_eq!(
+            state.update_restart_blocker(),
+            Some("2 local threads are running")
+        );
+        state.rename_thread = Some(1);
+        assert_eq!(
+            state.update_restart_blocker(),
+            Some("Finish editing before restarting.")
+        );
     }
 
     #[test]

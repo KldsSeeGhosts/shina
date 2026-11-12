@@ -533,22 +533,28 @@ pub fn resolve_preset<T: TimeZone>(preset: Preset, now: DateTime<T>) -> Option<S
         until: wake.timestamp_millis().try_into().ok()?,
     })
 }
+#[cfg(test)]
 pub fn snooze_choices() -> Vec<SnoozeChoice> {
+    snooze_choices_with(&[60, 180])
+}
+#[cfg(test)]
+pub fn snooze_choices_with(minutes: &[u32]) -> Vec<SnoozeChoice> {
     let at = |day, hour| Preset::At {
         day,
         hour,
         minute: 0,
     };
-    let mut choices: Vec<_> = [
-        Preset::After(60),
-        Preset::After(180),
+    snooze_choices_from(minutes.iter().copied().map(Preset::After).chain([
         at(Day::Today, 18),
         at(Day::Tomorrow, 9),
         at(Day::Weekday(0), 9),
-    ]
-    .into_iter()
-    .filter_map(|p| resolve_preset(p, Local::now()))
-    .collect();
+    ]))
+}
+pub fn snooze_choices_from(presets: impl IntoIterator<Item = Preset>) -> Vec<SnoozeChoice> {
+    let mut choices: Vec<_> = presets
+        .into_iter()
+        .filter_map(|p| resolve_preset(p, Local::now()))
+        .collect();
     choices.sort_by_key(|p| p.until / 60000);
     choices.dedup_by_key(|p| p.until / 60000);
     choices

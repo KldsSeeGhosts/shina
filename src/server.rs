@@ -484,7 +484,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err("Expected a JSON-RPC 2.0 request with an id.".into())
                 } else if let Err(error) = shared.database.authorize(&device, method,
                     params.get("args").unwrap_or(params)) {
-                    Err(error)
+                    if method=="server.requestUpdate" {
+                        match shared.database.audit_update_refusal(&device,&error) {
+                            Ok(())=>Err(error),Err(audit)=>Err(audit),
+                        }
+                    } else {Err(error)}
                 } else if method == "hello" {
                     if let Err(error) = crate::maintenance::negotiate(params["protocolMajor"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0), params["protocolMinor"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0), params["projectionSchema"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0)) {
                         hello = false;
@@ -509,9 +513,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 3 { capabilities.extend(["scoped-pairing","multi-server-clients","image-uploads"]); }
                         if minor >= 4 { capabilities.push(protocol::FILESYSTEM_BROWSE); }
                         if minor >= 5 { capabilities.push(protocol::PEER_DELEGATION); }
+                        if minor >= 6 { capabilities.push(protocol::LINKED_UPDATES); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
+                            "canUpdate":shared.database.authorize(&device,"server.requestUpdate",&json!({})).is_ok(),
                             "capabilities":capabilities,"limits":{"controlBytes":protocol::MAX_CONTROL,"outstandingCommands":32,"pageBytes":protocol::MAX_PAGE_BYTES}}))
                     }
                 } else if !hello {
@@ -572,7 +578,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             Ok(page)
                         })
                 } else {
-                    let mut command = if method == "command.get" || method == "server.status" {
+                    if shared.remote && matches!(method, "devices.grant" | "devices.revokeGrant") {
+                        if !send(&mut socket, protocol::response(id, Err("Change update grants on the target machine itself.".into()))).await { break; }
+                        continue;
+                    }
+                    let mut command = if matches!(method, "command.get" | "server.status" | "server.updateStatus") {
                         Command::new(method, params.clone())
                     } else {
                         match serde_json::from_value::<Command>(json!({"commandId":params["commandId"],"method":method,"params":params["args"]})) {
@@ -953,6 +963,13 @@ mod tests {
             Self::with_minor(name, protocol::MINOR).await
         }
         async fn with_minor(name: &str, minor: u32) -> Self {
+            Self::configured(name, minor, |_| {}).await
+        }
+        async fn configured(
+            name: &str,
+            minor: u32,
+            configure: impl FnOnce(&mut RuntimeState),
+        ) -> Self {
             let directory = crate::store::directory().unwrap().join(name);
             std::fs::create_dir_all(&directory).unwrap();
             let database = crate::database::Database::open(&directory).unwrap();
@@ -963,6 +980,7 @@ mod tests {
             ).unwrap());
             let mut runtime = RuntimeState::from_state(state);
             runtime.database = Some(database.clone());
+            configure(&mut runtime);
             let (calls, mut incoming) = mpsc::channel::<Call>(32);
             let (snapshots, receive) = watch::channel(Arc::new(runtime.snapshot()));
             let (disconnect, shutdown) = watch::channel(false);
@@ -1038,6 +1056,23 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .into()
+        }
+        async fn local_command(&self, method: &str, args: Value) -> Value {
+            self.shared
+                .database
+                .issue_device("fixture-maintainer", "fixture-local-token")
+                .unwrap();
+            let (reply, response) = oneshot::channel();
+            self.shared
+                .calls
+                .send(Call {
+                    device: "fixture-maintainer".into(),
+                    command: Command::new(method, args),
+                    reply,
+                })
+                .await
+                .unwrap();
+            response.await.unwrap().unwrap()
         }
         async fn link(&self, profile: &std::path::Path) -> crate::peer::Link {
             crate::peer::link(profile, &self.address.to_string(), &self.code())
@@ -1383,6 +1418,238 @@ mod tests {
                     .insert("authorization", format!("Bearer {token}").parse().unwrap());
                 assert!(tokio_tungstenite::connect_async(request).await.is_err());
             }
+        });
+    }
+
+    struct FakeReleaseAndHelper {
+        rollback: bool,
+    }
+    impl crate::fleet_update::Host for FakeReleaseAndHelper {
+        fn run(
+            &mut self,
+            directory: &std::path::Path,
+            id: &str,
+            progress: &dyn Fn(&str, &str),
+        ) -> Result<Option<String>, String> {
+            // The release source lives on this target, not in caller arguments.
+            let tag = std::fs::read_to_string(directory.join("fake-latest-release")).unwrap();
+            progress("downloading", &tag);
+            progress("ready", &tag);
+            crate::fleet_update::save_outcome(
+                directory,
+                &crate::fleet_update::Outcome {
+                    update_id: id.into(),
+                    tag: tag.clone(),
+                    success: !self.rollback,
+                    reason: self
+                        .rollback
+                        .then(|| "Readiness validation failed. Rolled back.".into()),
+                },
+            )?;
+            Ok(Some(tag))
+        }
+    }
+    #[test]
+    fn linked_updates_are_target_owned_scoped_audited_and_survive_success_and_rollback() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for rollback in [false, true] {
+                let fixture = Fixture::configured(
+                    if rollback {
+                        "updates-rollback"
+                    } else {
+                        "updates-success"
+                    },
+                    6,
+                    |rt| {
+                        std::fs::write(rt.state.data_dir.join("fake-latest-release"), "v99.8.7")
+                            .unwrap();
+                        rt.updates.fake(FakeReleaseAndHelper { rollback });
+                    },
+                )
+                .await;
+                let profile = crate::store::directory()
+                    .unwrap()
+                    .join(format!("update-client-{rollback}"));
+                let link = fixture.link(&profile).await;
+                assert!(
+                    crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                        .await
+                        .unwrap_err()
+                        .contains("update grant")
+                );
+                assert!(
+                    crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
+                        .await
+                        .is_err()
+                );
+                let audit =
+                    rusqlite::Connection::open(fixture.shared.directory.join("state.sqlite"))
+                        .unwrap();
+                let refused: u32 = audit
+                    .query_row(
+                        "SELECT count(*) FROM update_audit WHERE device_id=?1 AND accepted=0",
+                        [&link.device_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(refused, 1);
+                drop(audit);
+                assert!(
+                    crate::client::remote_rpc(
+                        &link,
+                        "devices.grant",
+                        json!({"deviceId":link.device_id,"grant":"update"})
+                    )
+                    .await
+                    .is_err()
+                );
+                let granted = fixture
+                    .local_command(
+                        "devices.grant",
+                        json!({"deviceId":link.device_id,"grant":"update"}),
+                    )
+                    .await;
+                assert_eq!(granted["status"], "accepted");
+                for denied in [
+                    "server.stop",
+                    "server.prepareRestart",
+                    "server.cancelRestart",
+                    "server.commitRestart",
+                    "devices.pair",
+                    "devices.revokeGrant",
+                ] {
+                    assert!(
+                        crate::client::remote_rpc(&link, denied, json!({}))
+                            .await
+                            .is_err(),
+                        "{denied}"
+                    );
+                }
+                let accepted = crate::client::remote_rpc(
+                    &link,
+                    "server.requestUpdate",
+                    json!({"version":"v1.0.0","targetVersion":"v1.0.0"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(accepted["status"], "accepted");
+                let id = accepted["result"]["updateId"].as_str().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let final_status = loop {
+                    let status = crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                        .await
+                        .unwrap();
+                    if status["lastOutcome"]["updateId"] == id {
+                        break status;
+                    }
+                    assert!(Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(final_status["lastOutcome"]["tag"], "v99.8.7");
+                assert_eq!(final_status["lastOutcome"]["success"], !rollback);
+                let restored = crate::fleet_update::ServerUpdates::new(&fixture.shared.directory);
+                assert_eq!(
+                    serde_json::to_value(restored.outcome.unwrap()).unwrap(),
+                    final_status["lastOutcome"]
+                );
+                let retry = crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(retry["status"], "rejected");
+                assert!(
+                    retry["result"]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("ten minutes")
+                );
+                let db = rusqlite::Connection::open(fixture.shared.directory.join("state.sqlite"))
+                    .unwrap();
+                let (device, tag, outcome): (String, String, String) = db
+                    .query_row(
+                        "SELECT device_id,tag,outcome FROM update_audit WHERE update_id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(device, link.device_id);
+                assert_eq!(tag, "v99.8.7");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&outcome).unwrap()["success"],
+                    !rollback
+                );
+                assert!(
+                    fixture
+                        .shared
+                        .database
+                        .update_rate_limited(&link.device_id, crate::lifecycle::now())
+                        .unwrap()
+                );
+                assert!(
+                    !fixture
+                        .shared
+                        .database
+                        .update_rate_limited(&link.device_id, crate::lifecycle::now() + 600_001)
+                        .unwrap()
+                );
+                fixture
+                    .local_command(
+                        "devices.revokeGrant",
+                        json!({"deviceId":link.device_id,"grant":"update"}),
+                    )
+                    .await;
+                assert!(
+                    crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+    #[test]
+    fn linked_update_busy_and_older_protocol_targets_are_skipped_without_dispatch() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let busy = Fixture::configured("update-busy", 6, |rt| {
+                rt.updates.fake(FakeReleaseAndHelper { rollback: false });
+                rt.state.threads[0].status = crate::model::Status::Running;
+            })
+            .await;
+            let profile = crate::store::directory()
+                .unwrap()
+                .join("busy-update-client");
+            let link = busy.link(&profile).await;
+            busy.local_command(
+                "devices.grant",
+                json!({"deviceId":link.device_id,"grant":"update"}),
+            )
+            .await;
+            let status = crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                .await
+                .unwrap();
+            assert!(status["blocker"].as_str().unwrap().contains("thread"));
+            let refused = crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(refused["status"], "rejected");
+            assert_eq!(refused["result"]["error"], status["blocker"]);
+            let old = Fixture::with_minor("old-update-server", 4).await;
+            let old_link = old.link(&profile).await;
+            assert!(
+                crate::client::remote_rpc(&old_link, "server.requestUpdate", json!({}))
+                    .await
+                    .unwrap_err()
+                    .contains("older protocol")
+            );
+            let hello = crate::client::remote_rpc(&old_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::fleet_update::skip_reason(true, &hello, &Value::Null, "v99.0.0").as_deref(),
+                Some("older protocol")
+            );
+            assert_eq!(
+                crate::fleet_update::skip_reason(false, &hello, &Value::Null, "v99.0.0").as_deref(),
+                Some("offline")
+            );
         });
     }
 

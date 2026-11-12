@@ -1032,7 +1032,7 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
         json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
         json!("good-version"),
     );
-    assert_eq!(hello["result"]["protocolMinor"], 5);
+    assert_eq!(hello["result"]["protocolMinor"], 6);
     assert!(
         hello["result"]["capabilities"]
             .as_array()
