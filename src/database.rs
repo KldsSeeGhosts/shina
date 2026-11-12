@@ -38,6 +38,7 @@ struct Inner {
     dispatch_fenced: bool,
     claimed_dispatches: usize,
     history_events: Vec<Value>,
+    document_revision: u64,
 }
 
 #[derive(Clone)]
@@ -53,6 +54,9 @@ impl Drop for Dispatch {
 
 fn error(error: impl std::fmt::Display) -> String {
     format!("Shina database is unavailable. Writes are blocked; no JSON fallback was used. {error}")
+}
+fn projected_document(name: &str) -> bool {
+    matches!(name, "memory.json" | "routines.json" | "honcho-outbox.json")
 }
 
 pub fn for_path(path: &Path) -> Option<Database> {
@@ -212,6 +216,7 @@ impl Database {
             dispatch_fenced: false,
             claimed_dispatches: 0,
             history_events: Vec::new(),
+            document_revision: 0,
         })));
         if !imported {
             let backup = directory.join("state.sqlite.import-v1.bak");
@@ -346,6 +351,12 @@ impl Database {
         }
         if inner.batch.is_some() {
             inner.staged.insert(name.into(), value);
+            if projected_document(name) {
+                inner.document_revision = inner
+                    .document_revision
+                    .checked_add(1)
+                    .expect("Document revision exhausted.");
+            }
             return Ok(());
         }
         let result = (|| {
@@ -363,8 +374,19 @@ impl Database {
         })();
         if let Err(error) = &result {
             inner.failure = Some(error.clone());
+        } else if projected_document(name) {
+            inner.document_revision = inner
+                .document_revision
+                .checked_add(1)
+                .expect("Document revision exhausted.");
         }
         result
+    }
+
+    /// Stores can complete outside the reducer. Remember their invalidation
+    /// without serializing or comparing whole documents during quiet ticks.
+    pub fn document_revision(&self) -> u64 {
+        self.0.lock().expect("database").document_revision
     }
 
     pub fn begin(&self) -> Result<(), String> {

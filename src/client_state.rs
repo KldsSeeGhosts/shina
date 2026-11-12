@@ -857,19 +857,30 @@ impl State {
         ] {
             index.as_object_mut().expect("index").remove(key);
         }
-        json!({
+        let mut projection = json!({
             "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
+            "undo":self.undo,
+            "harnessIds":self.harness_ids(),
+            "clone":{"running":self.projects.cloning(),"progress":self.projects.clone_progress,"error":self.projects.clone_error},
+        });
+        projection
+            .as_object_mut()
+            .unwrap()
+            .extend(self.document_projection().as_object().unwrap().clone());
+        projection
+    }
+
+    pub(crate) fn document_projection(&self) -> Value {
+        json!({
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
             "routines":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.routines(id)))).collect::<serde_json::Map<_,_>>(),
-            "background":self.background_status(),"undo":self.undo,
+            "background":self.background_status(),
             "memoryBackend":self.memory_backend_status(),
-            "keepAwake":self.background_settings().keep_awake,
-            "harnessIds":self.harness_ids(),
-            "clone":{"running":self.projects.cloning(),"progress":self.projects.clone_progress,"error":self.projects.clone_error},
+            "keepAwake":self.background_settings().keep_awake
         })
     }
 

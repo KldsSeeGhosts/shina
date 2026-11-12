@@ -70,6 +70,7 @@ pub struct RuntimeState {
     failure: Option<String>,
     pending_effects: Vec<crate::outbox::Effect>,
     committed_history: Vec<Value>,
+    document_revision: u64,
     preparing_calls: Vec<PreparingCall>,
 }
 
@@ -131,6 +132,7 @@ impl RuntimeState {
             failure: None,
             pending_effects: Vec::new(),
             committed_history: Vec::new(),
+            document_revision: 0,
             preparing_calls: Vec::new(),
         }
     }
@@ -429,6 +431,7 @@ impl RuntimeState {
             return false;
         }
         if let Some(database) = self.database.clone() {
+            let documents_changed = database.document_revision() != self.document_revision;
             if let Err(error) = database.begin() {
                 self.failure = Some(error);
                 return false;
@@ -442,7 +445,11 @@ impl RuntimeState {
             }
             let changed = changed | recovered;
             let effects = capture.finish();
-            if !changed && !update_changed && effects.is_empty() && self.pending_effects.is_empty()
+            if !changed
+                && !update_changed
+                && !documents_changed
+                && effects.is_empty()
+                && self.pending_effects.is_empty()
             {
                 match database.finish_if_unchanged() {
                     Ok(true) => return before != self.maintenance.status(),
@@ -598,6 +605,7 @@ impl RuntimeState {
     ) -> Result<(), String> {
         let database = self.database.clone().ok_or("No runtime database.")?;
         let result = (|| {
+            let document_revision = database.document_revision();
             if effects.len() > 0
                 && self
                     .state
@@ -623,6 +631,15 @@ impl RuntimeState {
                 crate::history::stamp(before, view, next);
             }
             let mut projection = self.state.projection_from_snapshot(index.clone());
+            if projection["_partial"] == true && document_revision != self.document_revision {
+                projection.as_object_mut().unwrap().extend(
+                    self.state
+                        .document_projection()
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
             {
                 projection["updateStatus"] = self.updates.status(
                     self.state.update_restart_blocker(),
@@ -660,6 +677,7 @@ impl RuntimeState {
                 && patch.as_array().is_some_and(Vec::is_empty)
                 && database.finish_if_unchanged()?
             {
+                self.document_revision = document_revision;
                 return Ok(());
             }
             self.seq = next;
@@ -672,6 +690,7 @@ impl RuntimeState {
                     .runtime_input_snapshot(self.state.persistence_scope.as_ref()),
             )?;
             database.commit(self.seq, &projection, &patch, receipt, &effects)?;
+            self.document_revision = document_revision;
             self.committed_history.extend(history);
             self.pending_effects.extend(effects);
             if self.maintenance.fenced() || self.validation_hold {
@@ -820,6 +839,48 @@ pub const TICK: Duration = Duration::from_millis(25);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn document_writes_refresh_global_fields_without_capturing_thread_views() {
+        for staged in [false, true] {
+            let directory = crate::store::directory()
+                .unwrap()
+                .join(uuid::Uuid::new_v4().to_string());
+            let mut runtime = RuntimeState::open(directory, std::sync::Arc::new(|| {})).unwrap();
+            let database = runtime.database.clone().unwrap();
+            let before = runtime.seq;
+            if staged {
+                database.begin().unwrap();
+            }
+            let mut profile = runtime.state.user_profile();
+            profile.name = if staged {
+                "Staged profile"
+            } else {
+                "Background profile"
+            }
+            .into();
+            runtime.state.set_user_profile(profile.clone()).unwrap();
+            if !staged {
+                database.begin().unwrap();
+            }
+            runtime.state.persistence_scope = Some(Default::default());
+            runtime.persist(None, vec![]).unwrap();
+            assert!(runtime.seq > before);
+            assert!(runtime.state.persistence_scope.as_ref().unwrap().is_empty());
+            assert_eq!(runtime.snapshot()["state"]["profile"]["name"], profile.name);
+            assert_eq!(
+                database.projection().unwrap().unwrap()["profile"]["name"],
+                profile.name
+            );
+            let committed = runtime.seq;
+            database.begin().unwrap();
+            runtime.persist(None, vec![]).unwrap();
+            assert_eq!(
+                runtime.seq, committed,
+                "an unchanged document must not keep advancing the sequence"
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
     fn runtime() -> RuntimeState {
         let mut state = State::headless(crate::store::directory().unwrap());
         state.load_global_for_test();
