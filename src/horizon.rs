@@ -300,13 +300,13 @@ pub fn band(width: f32, height: f32, night: bool, subject: Subject, fleet: usize
     // The sky, in four flat steps. A captain's home keeps the day or night sky and tints only
     // the step above the sea with the portrait's backdrop, so the band still reads as the same
     // place and the captain's colour shows as a glow at the horizon.
-    let steps = 4;
-    for step in 0..steps {
+    let steps = NIGHT_STEPS.len();
+    for (step, night_color) in NIGHT_STEPS.iter().enumerate() {
         let from = waterline * step / steps;
         let to = waterline * (step + 1) / steps;
         let t = step as f32 / (steps - 1) as f32;
         let mut color = if night {
-            NIGHT_STEPS[step]
+            *night_color
         } else {
             mix(palette.sky_top, palette.sky_bottom, t)
         };
@@ -658,7 +658,8 @@ mod tests {
     }
 
     /// The cells `band` draws for each part, rebuilt from the same placements.
-    fn parts(width: f32, night: bool, subject: Subject) -> (Vec<(i32, i32)>, Vec<Vec<(i32, i32)>>) {
+    type Cells = Vec<(i32, i32)>;
+    fn parts(width: f32, night: bool, subject: Subject) -> (Cells, Vec<Cells>) {
         let grid = Grid::new(width, 108.0);
         let cols = grid.cols as i32;
         let waterline = grid.rows.saturating_sub(SEA_ROWS) as i32;

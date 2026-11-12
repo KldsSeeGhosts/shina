@@ -88,10 +88,10 @@ impl Profile {
             assert!(
                 Instant::now() < deadline,
                 "serve did not publish readiness: {}",
-                fs::read_to_string(
-                    self.root
-                        .join(format!("server-{}.log", self.children.len() - 1))
-                )
+                fs::read_to_string(self.root.join(format!(
+                    "server-{}.log",
+                    self.children.len().saturating_sub(1)
+                )))
                 .unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(25));
@@ -1075,6 +1075,254 @@ fn service_restart_keeps_sqlite_open_and_retains_atomic_receipts_and_backups() {
         );
     }
     profile.stop();
+}
+
+#[test]
+fn service_launcher_logs_start_and_spawn_failure() {
+    let profile = Profile::new();
+    let directory = profile.root.join("Shina");
+    let descriptor = directory.join("service.json");
+    fs::write(&descriptor, json!({
+        "platform":if cfg!(windows) { "Windows" } else { "Linux" },
+        "name":"Shina-failed-launch-fixture",
+        "executable":profile.root.join("missing-server"),
+        "directory":directory,"unit":directory.join("unused"),"home":profile.root,"environment":{}
+    }).to_string()).unwrap();
+    let output = profile.cli(&["--service-run", descriptor.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let log = fs::read_to_string(directory.join("service.log")).unwrap();
+    assert!(log.contains("Service launcher") && log.contains("started."));
+    assert!(log.contains("Service server failed:"));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "Creates a real temporary per-user scheduled task. Run explicitly on Windows, no elevation."]
+fn scheduled_service_coordinated_update_waits_for_task_action_and_confirms_new_launcher() {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::process::CommandExt;
+
+    // Drop this before Profile removes the fresh UUID directory, even on assertion failure.
+    struct TaskCleanup {
+        name: String,
+        root: PathBuf,
+    }
+    impl Drop for TaskCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new(env!("CARGO_BIN_EXE_shina"))
+                .args(["service", "uninstall"])
+                .env("LOCALAPPDATA", &self.root)
+                .creation_flags(0x08000000)
+                .output();
+            let _ = Command::new("schtasks.exe")
+                .args(["/Delete", "/TN", &self.name, "/F"])
+                .creation_flags(0x08000000)
+                .output();
+            // Only exact executable paths inside this UUID fixture may be terminated.
+            let script = format!(
+                "$r='{}\\'; Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.StartsWith($r, [StringComparison]::OrdinalIgnoreCase) }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue }}",
+                self.root.to_string_lossy().replace('\'', "''")
+            );
+            let _ = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(0x08000000)
+                .output();
+            assert!(
+                !Command::new("schtasks.exe")
+                    .args(["/Query", "/TN", &self.name])
+                    .creation_flags(0x08000000)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "temporary scheduled task was not removed"
+            );
+        }
+    }
+
+    let mut profile = Profile::new();
+    let name = format!("Shina-update-test-{}", uuid::Uuid::new_v4().simple());
+    let _cleanup = TaskCleanup {
+        name: name.clone(),
+        root: profile.root.clone(),
+    };
+    let directory = profile.root.join("Shina");
+    let install = profile.root.join("Programs/Shina");
+    fs::create_dir_all(&install).unwrap();
+    let exe = install.join("shina.exe");
+    fs::copy(env!("CARGO_BIN_EXE_shina"), &exe).unwrap();
+    let installed_cli = |args: &[&str]| {
+        Command::new(&exe)
+            .args(args)
+            .env("LOCALAPPDATA", &profile.root)
+            .env("PI_CODING_AGENT_DIR", profile.root.join("enrollment"))
+            .env("SHINA_PI_CLI", profile.root.join("fake_pi.js"))
+            .stdin(Stdio::null())
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap()
+    };
+    let installed = installed_cli(&["service", "install", "--name", &name]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let initial = profile.discovery();
+    assert!(installed_cli(&["service", "stop"]).status.success());
+
+    // Keep the actual task action alive after the launcher exits. This makes the
+    // release-binary race deterministic without touching any system setting.
+    let unit = directory.join("service-task.xml");
+    let bytes = fs::read(&unit).unwrap();
+    let words: Vec<_> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let xml = String::from_utf16(&words).unwrap().replace(
+        "exit $p.ExitCode",
+        "Start-Sleep -Seconds 3; exit $p.ExitCode",
+    );
+    fs::write(
+        &unit,
+        xml.encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let registered = Command::new("schtasks.exe")
+        .args([
+            "/Create",
+            "/TN",
+            &name,
+            "/XML",
+            unit.to_str().unwrap(),
+            "/F",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    assert!(installed_cli(&["service", "start"]).status.success());
+    let running = profile.discovery();
+    assert_ne!(initial["instanceId"], running["instanceId"]);
+    assert!(installed_cli(&["service", "stop"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while directory.join("service-launcher.pid").exists() {
+        assert!(Instant::now() < deadline, "old launcher did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let probe = format!(
+        "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $t=$s.GetFolder('\\').GetTask('{}'); if ($t.State -ne 4) {{ throw 'Expected the old wrapper to remain Running' }}; schtasks.exe /Run /TN '{}'; if ($LASTEXITCODE -ne 0) {{ throw 'Expected /Run to return success' }}; Write-Output 'Old launcher absent, task Running, /Run exit 0'",
+        name, name
+    );
+    let dropped = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &probe])
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(
+        dropped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&dropped.stdout));
+    assert!(
+        !directory.join("service-launcher.pid").exists(),
+        "IgnoreNew should drop the request"
+    );
+    assert!(installed_cli(&["service", "start"]).status.success());
+    let running = profile.discovery();
+    let launcher = fs::read_to_string(directory.join("service-launcher.pid")).unwrap();
+
+    // Exercise a pre-open version-change backup and the validation fence as well.
+    fs::write(
+        directory.join("server-binary-version.json"),
+        "previous-fixture-version",
+    )
+    .unwrap();
+    let updates = directory.join("updates");
+    fs::create_dir_all(&updates).unwrap();
+    let prepared = install.join("shina.new.exe");
+    let download = updates.join("download.exe");
+    fs::copy(&exe, &download).unwrap();
+    let helper = updates.join("coordinated-helper.exe");
+    fs::copy(&exe, &helper).unwrap();
+    let hash = format!("{:x}", Sha256::digest(fs::read(&download).unwrap()));
+    for tag in [format!("v{}", env!("CARGO_PKG_VERSION")), "v99.0.0".into()] {
+        fs::copy(&exe, &prepared).unwrap();
+        fs::write(
+            updates.join("ready.json"),
+            json!({
+                "version":1,"tag":tag,"asset":"shina.exe",
+                "size":fs::metadata(&download).unwrap().len(),"sha256":hash,
+                "download":download,"prepared":prepared,"target":{"windows":exe}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        profile.children.push(
+            Command::new(&helper)
+                .arg("--coordinated-update")
+                .env("LOCALAPPDATA", &profile.root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x08000000)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while profile
+            .children
+            .last_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "coordinated service update timed out"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let result = fs::read_to_string(updates.join("coordinated-result.txt")).unwrap();
+        if tag == "v99.0.0" {
+            assert!(result.contains("Readiness validation failed:"));
+            assert!(result.contains(&format!(
+                "version {}, expected v99.0.0",
+                env!("CARGO_PKG_VERSION")
+            )));
+            assert!(result.contains("Previous binary and state restored."));
+            let failure: Value =
+                serde_json::from_slice(&fs::read(updates.join("failed-release.json")).unwrap())
+                    .unwrap();
+            assert_eq!(failure["tag"], "v99.0.0");
+        } else {
+            assert_eq!(result, "Update completed.");
+        }
+        assert_ne!(
+            launcher,
+            fs::read_to_string(directory.join("service-launcher.pid")).unwrap()
+        );
+        let resumed = profile.discovery();
+        assert_ne!(running["instanceId"], resumed["instanceId"]);
+        assert_eq!(resumed["binaryVersion"], env!("CARGO_PKG_VERSION"));
+        assert!(!directory.join("update-validation").exists());
+        assert!(fs::read_dir(directory.join("backups")).unwrap().count() >= 2);
+        let mut client = profile.client(uuid::Uuid::new_v4());
+        assert!(
+            client.command("server.status", json!({}), uuid::Uuid::new_v4())["error"].is_null()
+        );
+    }
+    assert!(installed_cli(&["service", "stop"]).status.success());
 }
 
 #[test]

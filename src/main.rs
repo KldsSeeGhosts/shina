@@ -1004,6 +1004,21 @@ fn install_exit_update(exit: update::ExitUpdate) {
     }
 }
 
+/// The composer holding the long draft a user reported, as a real thread would.
+fn long_draft_demo(state: &mut State) {
+    state.populate_demo();
+    state.demo = false;
+    state.current_mut().draft = rune::TextEdit::new(
+        "Go ahead and make this an issue on GitHub, and then I want you to deeply analyze specific features from KSG Code missing from Shina. I am looking for things like:\n\
+         1. Gaps in our agent output composition. I think the way KSG formats tool calls, thinking and agent output is far superior.\n\
+         2. In the input box, we lack a lot of functionality like the $ for skills and slash commands from the ACP integrations from providers.\n\
+         3. On that note, even ACP providers.\n\
+         4. I suspect agents don't have the deep knowledge of Shina's tooling and application like they do in KSG Code.\n\
+         5. Generally speaking there appear to be bugs.",
+    );
+    state.current_mut().draft.focused = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,19 +1122,4 @@ mod tests {
         );
         assert!(!update::exit_recorded());
     }
-}
-
-/// The composer holding the long draft a user reported, as a real (not demo) thread would.
-fn long_draft_demo(state: &mut State) {
-    state.populate_demo();
-    state.demo = false;
-    state.current_mut().draft = rune::TextEdit::new(
-        "Go ahead and make this an issue on GitHub, and then I want you to deeply analyze specific features from KSG Code missing from Shina. I am looking for things like:\n\
-         1. Gaps in our agent output composition. I think the way KSG formats tool calls, thinking and agent output is far superior.\n\
-         2. In the input box, we lack a lot of functionality like the $ for skills and slash commands from the ACP integrations from providers.\n\
-         3. On that note, even ACP providers.\n\
-         4. I suspect agents don't have the deep knowledge of Shina's tooling and application like they do in KSG Code.\n\
-         5. Generally speaking there appear to be bugs.",
-    );
-    state.current_mut().draft.focused = true;
 }

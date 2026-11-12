@@ -95,7 +95,7 @@ mod tests {
         let mut rgba = Vec::new();
         for y in 0..side {
             for x in 0..side {
-                let on = (x / k + y / k) % 2 == 0;
+                let on = (x / k + y / k).is_multiple_of(2);
                 rgba.extend_from_slice(if on {
                     &[255, 0, 0, 255]
                 } else {

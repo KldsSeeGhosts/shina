@@ -3,8 +3,7 @@
 //!
 //! An installed copy checks in the background, downloads and verifies a newer build into its
 //! own staging area, and offers one restart. A plain quit keeps the prepared update.
-//! Failures stay quiet: the status returns to idle and the next interval
-//! retries.
+//! Failed installations stay blocked by release tag until an explicit retry or a newer release.
 use rune::Waker;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -176,7 +175,33 @@ pub struct Storage {
     pub root: PathBuf,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct FailedRelease {
+    tag: String,
+    reason: String,
+}
+
 impl Storage {
+    fn failed_release(&self) -> PathBuf {
+        self.root.join("failed-release.json")
+    }
+
+    fn load_failure(&self) -> Option<FailedRelease> {
+        serde_json::from_slice(&fs::read(self.failed_release()).ok()?).ok()
+    }
+
+    fn save_failure(&self, tag: &str, reason: &str) -> Result<(), String> {
+        fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
+        crate::store::write_atomic(
+            &self.failed_release(),
+            &serde_json::to_vec(&FailedRelease {
+                tag: tag.into(),
+                reason: redact(reason),
+            })
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
+    }
     /// The updater's data area, outside the repository.
     pub fn default_storage() -> Self {
         let base = crate::store::directory().unwrap_or_else(|| std::env::temp_dir().join("Shina"));
@@ -712,6 +737,7 @@ pub struct Updater {
     /// Set after a real authentication denial: no networked attempts until the next launch.
     suspended: Option<String>,
     notice: Option<String>,
+    failed_release: Option<FailedRelease>,
     diagnostics: VecDeque<String>,
     storage: Storage,
     /// Shared with the one operation that may use it at a time.
@@ -729,6 +755,7 @@ impl Default for Updater {
             next_check: None,
             suspended: None,
             notice: None,
+            failed_release: None,
             diagnostics: VecDeque::new(),
             storage: Storage::default_storage(),
             host: Arc::new(Mutex::new(Box::new(Gh))),
@@ -1550,6 +1577,19 @@ fn start_server(
     update: &PreparedUpdate,
     service: Option<&crate::service::Service>,
 ) -> Result<(), String> {
+    {
+        // Clear discovery only while no server owns the profile. A stale JSON file
+        // must never count as readiness for this start.
+        let directory = crate::store::directory().ok_or("No profile.")?;
+        let _owner = crate::server_lock::Owner::acquire(&directory)?;
+        for name in ["server.json", "server-started.pid"] {
+            match fs::remove_file(directory.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
     if let Some(service) = service {
         return service.start();
     }
@@ -1571,21 +1611,62 @@ fn start_server(
             args.extend(["--port".into(), port.to_string()]);
         }
     }
-    install::launch_with(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())
+    let child = install::launch_child(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    crate::store::write_atomic(
+        &crate::store::directory()
+            .ok_or("No profile.")?
+            .join("server-started.pid"),
+        child.id().to_string().as_bytes(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[derive(Default)]
+struct ReadinessEvidence {
+    started: bool,
+    version: Option<String>,
+    rpc_error: Option<String>,
+}
+impl ReadinessEvidence {
+    fn failure(&self, expected: &str) -> String {
+        if let Some(version) = &self.version {
+            if version != expected.trim_start_matches('v') {
+                return format!("The new server reported version {version}, expected {expected}.");
+            }
+            return format!(
+                "The new server started but did not answer server.status: {}",
+                self.rpc_error.as_deref().unwrap_or("no response")
+            );
+        }
+        if self.started {
+            "The new server started but did not publish readiness. See service.log.".into()
+        } else {
+            "The new server never started. See service.log.".into()
+        }
+    }
 }
 
 fn readiness(directory: &Path, expected: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut evidence = ReadinessEvidence::default();
     while Instant::now() < deadline {
+        evidence.started |= directory.join("server-started.pid").is_file();
         if let Ok(discovery) = crate::server_auth::Discovery::read(directory)
-            && discovery.binary_version == expected.trim_start_matches('v')
-            && crate::maintenance::rpc(directory, "server.status", serde_json::json!({})).is_ok()
+            && crate::process::is_alive(discovery.pid)
         {
-            return Ok(());
+            evidence.started = true;
+            evidence.version = Some(discovery.binary_version.clone());
+            if discovery.binary_version != expected.trim_start_matches('v') {
+                return Err(evidence.failure(expected));
+            }
+            match crate::maintenance::rpc(directory, "server.status", serde_json::json!({})) {
+                Ok(_) => return Ok(()),
+                Err(error) => evidence.rpc_error = Some(redact(&error)),
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    Err("Updated server did not become ready with the expected version.".into())
+    Err(evidence.failure(expected))
 }
 
 trait HelperSteps {
@@ -1596,18 +1677,35 @@ trait HelperSteps {
     fn validate(&mut self) -> Result<(), String>;
     fn reopen(&mut self) -> Result<(), String>;
     fn rollback(&mut self) -> Result<(), String>;
+    fn failed(&mut self, _reason: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 fn helper_sequence(host: &mut impl HelperSteps) -> Result<(), String> {
     // No replacement at all if any mapped client or server remains alive.
-    host.wait_clients()?;
-    host.wait_server()?;
-    host.replace()?;
-    if let Err(error) = host.start().and_then(|()| host.validate()) {
+    host.wait_clients()
+        .map_err(|e| format!("Wait for clients failed: {e}"))?;
+    host.wait_server()
+        .map_err(|e| format!("Wait for server failed: {e}"))?;
+    host.replace().map_err(|e| format!("Replace failed: {e}"))?;
+    if let Err(error) = host
+        .start()
+        .map_err(|e| format!("Start failed: {e}"))
+        .and_then(|()| {
+            host.validate()
+                .map_err(|e| format!("Readiness validation failed: {e}"))
+        })
+    {
+        // Persist before rollback reopens desktops, otherwise they can recover Ready
+        // and immediately offer the same broken release again.
+        let saved = host.failed(&error);
         host.rollback()
             .map_err(|rollback| format!("{error}. Rollback failed: {rollback}"))?;
+        saved.map_err(|save| format!("{error}. Previous binary and state restored. Could not remember failed release: {save}"))?;
         return Err(format!("{error}. Previous binary and state restored."));
     }
     host.reopen()
+        .map_err(|e| format!("Reopen clients failed: {e}"))
 }
 
 struct CoordinatedUpdate {
@@ -1625,6 +1723,9 @@ struct CoordinatedUpdate {
     replaced: bool,
 }
 impl HelperSteps for CoordinatedUpdate {
+    fn failed(&mut self, reason: &str) -> Result<(), String> {
+        Storage::at(self.directory.join("updates")).save_failure(&self.update.tag, reason)
+    }
     fn wait_clients(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + METADATA_TIMEOUT;
         for client in &self.clients {
@@ -1765,7 +1866,9 @@ pub fn coordinated_helper() -> Result<(), String> {
         return Err("Only the staged helper may coordinate replacement.".into());
     }
     let _lock = install::InstallLock::acquire(&storage.root)?;
-    let result = (|| {
+    let mut step = "Read update manifest";
+    let mut failed_tag = None;
+    let mut result = (|| {
         let update = PreparedUpdate::from_value(
             &serde_json::from_slice::<Value>(
                 &fs::read(storage.manifest()).map_err(|e| e.to_string())?,
@@ -1773,9 +1876,12 @@ pub fn coordinated_helper() -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         )
         .ok_or("Invalid update manifest.")?;
+        failed_tag = Some(update.tag.clone());
+        step = "Verify update";
         Gh.reverify(&update)?;
         // The manifest's target must be this helper's original installation, not a
         // path supplied by a remote command. service.json is protected with the profile.
+        step = "Check installation";
         let service = crate::service::Service::load()?;
         let installed_exe = match &update.target {
             InstalledTarget::Windows { exe } => {
@@ -1795,6 +1901,7 @@ pub fn coordinated_helper() -> Result<(), String> {
             return Err("Service points to another executable. Reconcile it with shina service install first.".into());
         }
         fs::write(storage.root.join("coordinated-started"), b"ready").map_err(|e| e.to_string())?;
+        step = "Prepare restart";
         let live = crate::server_lock::Owner::acquire(&directory).is_err();
         let prepared = if live {
             crate::maintenance::rpc(&directory, "server.prepareRestart", serde_json::json!({}))?
@@ -1815,6 +1922,7 @@ pub fn coordinated_helper() -> Result<(), String> {
             backup: None,
             replaced: false,
         };
+        step = "Commit restart";
         let prepare = (|| {
             if let Some(pid) = prepared["serverPid"]
                 .as_u64()
@@ -1870,7 +1978,11 @@ pub fn coordinated_helper() -> Result<(), String> {
             }
             return Err(error);
         }
+        step = "Update sequence";
         let result = helper_sequence(&mut host);
+        if let Err(error) = &result {
+            host.failed(error)?;
+        }
         if result.is_err() && !host.replaced {
             // A post-commit wait or pre-swap save failed. Start the unchanged server.
             let _ = fs::remove_file(directory.join("update-validation"));
@@ -1881,9 +1993,19 @@ pub fn coordinated_helper() -> Result<(), String> {
         }
         if result.is_ok() {
             let _ = fs::remove_file(storage.manifest());
+            let _ = fs::remove_file(storage.failed_release());
         }
         result
-    })();
+    })().map_err(|error| {
+        if step == "Update sequence" { error } else { format!("{step} failed: {error}") }
+    });
+    if let (Err(error), Some(tag)) = (&result, failed_tag) {
+        // Covers failures before the helper sequence as well. The sequence persists
+        // replacement failures earlier, before rollback can reopen clients.
+        if let Err(save) = storage.save_failure(&tag, error) {
+            result = Err(format!("{error} Could not remember failed release: {save}"));
+        }
+    }
     let message = match &result {
         Ok(()) => "Update completed.".into(),
         Err(error) => format!("Update did not complete: {error}"),
@@ -1922,6 +2044,15 @@ impl Updater {
 
     pub fn retry(&mut self) {
         if matches!(self.status, Status::Idle) && self.events.is_none() && self.installed {
+            match fs::remove_file(self.storage.failed_release()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.notice = Some(format!("Could not retry update: {e}"));
+                    return;
+                }
+            }
+            self.failed_release = None;
             self.suspended = None;
             self.notice = None;
             self.next_check = Some(Instant::now());
@@ -1972,6 +2103,10 @@ impl Updater {
             self.status = Status::Disabled;
             return;
         }
+        self.failed_release = self.storage.load_failure();
+        if let Some(failed) = &self.failed_release {
+            self.notice = Some(format!("Update {} failed. {}", failed.tag, failed.reason));
+        }
         if let Some(directory) = crate::store::directory() {
             let warning = directory.join("startup-warning.txt");
             if let Ok(file) = fs::File::open(&warning) {
@@ -2010,6 +2145,7 @@ impl Updater {
             .filter(|update| {
                 update_reaches_the_installed_app(update, &target)
                     && update.download.starts_with(&self.storage.root)
+                    && !self.release_blocked(&update.tag)
             });
         if let Some(update) = update {
             self.spawn(wake, move |host| {
@@ -2059,6 +2195,21 @@ impl Updater {
             Instant::now(),
         );
         updater
+    }
+
+    #[cfg(test)]
+    pub fn test_failed_release() -> Self {
+        Self {
+            installed: true,
+            notice: Some(
+                "Update v99.0.0 failed. The new server never started. See service.log.".into(),
+            ),
+            failed_release: Some(FailedRelease {
+                tag: "v99.0.0".into(),
+                reason: "The new server never started.".into(),
+            }),
+            ..Self::default()
+        }
     }
 
     /// Turns updating off for this build. `start` leaves a disabled updater alone.
@@ -2183,12 +2334,18 @@ impl Updater {
                 true
             }
             Event::Checked(Ok(Some(release))) => {
+                if self.release_blocked(&release.tag) {
+                    self.idle_from(now);
+                    return true;
+                }
                 self.notice = None;
                 self.begin_download(release, wake);
                 true
             }
             Event::Checked(Ok(None)) => {
-                self.notice = None;
+                if self.failed_release.is_none() {
+                    self.notice = None;
+                }
                 self.idle_from(now);
                 true
             }
@@ -2223,6 +2380,12 @@ impl Updater {
                 true
             }
         }
+    }
+
+    fn release_blocked(&self, tag: &str) -> bool {
+        self.failed_release
+            .as_ref()
+            .is_some_and(|failed| !is_newer(tag, &failed.tag))
     }
 
     /// A verified replacement waits for an install, so no timer runs.
@@ -2275,10 +2438,32 @@ impl Updater {
 mod tests {
     use super::*;
 
+    #[test]
+    fn readiness_failures_distinguish_start_version_and_response() {
+        let mut evidence = ReadinessEvidence::default();
+        assert!(evidence.failure("v2.0.0").contains("never started"));
+        evidence.started = true;
+        assert!(evidence.failure("v2.0.0").contains("did not publish"));
+        evidence.version = Some("1.0.0".into());
+        assert!(
+            evidence
+                .failure("v2.0.0")
+                .contains("version 1.0.0, expected v2.0.0")
+        );
+        evidence.version = Some("2.0.0".into());
+        evidence.rpc_error = Some("connection refused".into());
+        assert!(
+            evidence
+                .failure("v2.0.0")
+                .contains("did not answer server.status: connection refused")
+        );
+    }
+
     #[derive(Default)]
     struct FakeHelper {
         steps: Vec<&'static str>,
         fail: Option<&'static str>,
+        failure_reason: Option<String>,
     }
     impl FakeHelper {
         fn step(&mut self, step: &'static str) -> Result<(), String> {
@@ -2312,6 +2497,11 @@ mod tests {
         fn rollback(&mut self) -> Result<(), String> {
             self.step("rollback")
         }
+        fn failed(&mut self, reason: &str) -> Result<(), String> {
+            self.step("remember-failure")?;
+            self.failure_reason = Some(reason.into());
+            Ok(())
+        }
     }
     #[test]
     fn coordinated_helper_waits_replaces_validates_then_opens_clients() {
@@ -2333,7 +2523,9 @@ mod tests {
                 fail: Some(failure),
                 ..FakeHelper::default()
             };
-            assert!(helper_sequence(&mut helper).is_err());
+            let error = helper_sequence(&mut helper).unwrap_err();
+            assert!(error.starts_with("Wait for"));
+            assert!(error.contains(&format!("{failure} failed")));
             assert!(!helper.steps.contains(&"backup-and-replace"));
         }
         for failure in ["start", "readiness"] {
@@ -2341,12 +2533,16 @@ mod tests {
                 fail: Some(failure),
                 ..FakeHelper::default()
             };
-            assert!(
-                helper_sequence(&mut helper)
-                    .unwrap_err()
-                    .contains("restored")
-            );
+            let error = helper_sequence(&mut helper).unwrap_err();
+            assert!(error.contains("restored"));
+            assert!(error.contains(if failure == "start" {
+                "Start failed:"
+            } else {
+                "Readiness validation failed:"
+            }));
             assert_eq!(helper.steps.last(), Some(&"rollback"));
+            assert_eq!(helper.steps[helper.steps.len() - 2], "remember-failure");
+            assert!(helper.failure_reason.as_ref().unwrap().contains("failed:"));
             assert!(!helper.steps.contains(&"reopen"));
         }
     }
@@ -2634,6 +2830,55 @@ mod tests {
 
     fn newer() -> Scripted {
         Scripted::new(|| Ok(Some(release("v99.0.0"))))
+    }
+
+    #[test]
+    fn failed_release_survives_restart_and_only_manual_retry_or_newer_release_downloads() {
+        let (mut updater, checks, downloads) = installed(newer());
+        let update = saved_update(&updater, "v99.0.0");
+        updater
+            .storage
+            .save_failure(
+                &update.tag,
+                "Readiness validation failed: The new server never started.",
+            )
+            .unwrap();
+        let now = Instant::now();
+        updater.start(true, now, wake());
+        assert_eq!(
+            updater.status(),
+            &Status::Idle,
+            "failed Ready must not recover"
+        );
+        assert!(updater.notice().unwrap().contains("never started"));
+        assert!(!updater.storage.manifest().exists());
+        settle(&mut updater, now + FIRST_CHECK, |u| {
+            matches!(u.status(), Status::Idle)
+        });
+        settle(&mut updater, now + FIRST_CHECK + INTERVAL * 2, |u| {
+            matches!(u.status(), Status::Idle)
+        });
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
+        assert!(updater.notice().unwrap().contains("v99.0.0"));
+        updater.retry();
+        assert!(!updater.storage.failed_release().exists());
+        settle(&mut updater, now + FIRST_CHECK + INTERVAL * 3, |u| {
+            matches!(u.status(), Status::Ready { .. })
+        });
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+
+        let (mut updater, _, downloads) =
+            installed(Scripted::new(|| Ok(Some(release("v100.0.0")))));
+        updater
+            .storage
+            .save_failure("v99.0.0", "The new server did not answer.")
+            .unwrap();
+        updater.start(true, now, wake());
+        settle(&mut updater, now + FIRST_CHECK, |u| {
+            matches!(u.status(), Status::Ready { .. })
+        });
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
     }
 
     /// A manifest and its files, as a previous run of `updater` left them.

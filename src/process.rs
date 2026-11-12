@@ -7,6 +7,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A liveness check only. Never use this to authorize terminating a PID.
+pub fn is_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        let handle = unsafe { OpenProcess(0x00100000, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let alive = unsafe { WaitForSingleObject(handle, 0) } == 258;
+        unsafe { CloseHandle(handle) };
+        alive
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
 pub struct Process {
     child: Child,
     #[cfg(windows)]

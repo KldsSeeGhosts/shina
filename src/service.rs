@@ -4,10 +4,29 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
+
+fn confirm_launcher(
+    previous: Option<u32>,
+    mut observe: impl FnMut() -> Option<u32>,
+    mut alive: impl FnMut(u32) -> bool,
+    mut pause: impl FnMut(),
+) -> Result<(), String> {
+    for _ in 0..100 {
+        if let Some(pid) = observe()
+            && Some(pid) != previous
+            && alive(pid)
+        {
+            return Ok(());
+        }
+        pause();
+    }
+    Err("The new service launcher never started within 10 seconds. Task Scheduler may have ignored the start request. See service.log.".into())
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Platform {
@@ -46,6 +65,28 @@ fn unit_quote(value: &str) -> String {
 }
 
 impl Service {
+    fn launcher_pid(&self) -> Option<u32> {
+        fs::read_to_string(self.directory.join("service-launcher.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// IgnoreNew can discard /Run until the PowerShell task action has exited, even
+    /// after both Shina processes have gone. COM state numbers do not depend on locale.
+    fn wait_windows_task_idle(&self) -> Result<(), String> {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $t=$s.GetFolder('\\').GetTask('{}'); $w=[Diagnostics.Stopwatch]::StartNew(); while ($t.State -eq 4 -or $t.State -eq 2) {{ if ($w.Elapsed.TotalSeconds -ge 15) {{ throw 'The previous service task did not exit within 15 seconds. No new start was requested.' }}; Start-Sleep -Milliseconds 100 }}; if ($t.State -ne 3) {{ throw 'The service task is not ready to start.' }}",
+            self.name.replace('\'', "''")
+        );
+        self.run(
+            "powershell.exe",
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+        )?;
+        Ok(())
+    }
+
     pub fn descriptor(&self) -> PathBuf {
         self.directory.join("service.json")
     }
@@ -242,7 +283,15 @@ impl Service {
                 }
             }
             Platform::Windows => {
+                self.wait_windows_task_idle()?;
+                let previous = self.launcher_pid();
                 self.run("schtasks.exe", &["/Run", "/TN", &self.name])?;
+                confirm_launcher(
+                    previous,
+                    || self.launcher_pid(),
+                    crate::process::is_alive,
+                    || std::thread::sleep(Duration::from_millis(100)),
+                )?;
             }
         }
         Ok(())
@@ -443,6 +492,24 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 pub fn launch(path: &Path) -> Result<(), String> {
     let service: Service = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    let log_path = service.log_path();
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| e.to_string())?;
+    writeln!(log, "Service launcher {} started.", std::process::id()).map_err(|e| e.to_string())?;
+    let result = launch_server(&service, &log);
+    if let Err(error) = &result {
+        let _ = writeln!(log, "Service server failed: {error}");
+    }
+    result
+}
+
+fn launch_server(service: &Service, log: &fs::File) -> Result<(), String> {
     let mut command = Command::new(&service.executable);
     command
         .arg("serve")
@@ -492,18 +559,9 @@ pub fn launch(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    let log_path = service.log_path();
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| e.to_string())?;
     command
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log);
+        .stderr(log.try_clone().map_err(|e| e.to_string())?);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -512,15 +570,23 @@ pub fn launch(path: &Path) -> Result<(), String> {
     let launcher_pid = service.directory.join("service-launcher.pid");
     crate::store::write_atomic(&launcher_pid, std::process::id().to_string().as_bytes())
         .map_err(|e| e.to_string())?;
-    let status = command.status();
+    let status = (|| {
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        crate::store::write_atomic(
+            &service.directory.join("server-started.pid"),
+            child.id().to_string().as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        child.wait().map_err(|e| e.to_string())
+    })();
     let _ = fs::remove_file(launcher_pid);
-    let status = status.map_err(|e| e.to_string())?;
+    let status = status?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
             "Server exited with {status}. See {}.",
-            log_path.display()
+            service.log_path().display()
         ))
     }
 }
@@ -528,6 +594,16 @@ pub fn launch(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn start_confirmation_requires_a_changed_live_launcher() {
+        let mut pids = [Some(10), None, Some(20), Some(30)].into_iter();
+        confirm_launcher(Some(10), || pids.next().flatten(), |pid| pid == 30, || {}).unwrap();
+        for pid in [None, Some(10), Some(20)] {
+            let error = confirm_launcher(Some(10), || pid, |pid| pid == 10, || {}).unwrap_err();
+            assert!(error.contains("new service launcher never started"));
+            assert!(error.contains("ignored"));
+        }
+    }
     fn fixture(platform: Platform) -> Service {
         Service {
             platform,

@@ -3347,14 +3347,12 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         Some(icon("edit", p.muted))
     } else if thread.pinned() && !nested {
         Some(icon("pin", p.muted))
-    } else if let Some(status) = nested
-        .then(|| crew_ui::worker_task_mark(s, thread))
-        .flatten()
-    {
-        // Interrupted and queued workers carry their chip's mark, so they never look finished.
-        Some(status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
     } else {
-        None
+        // Interrupted and queued workers carry their chip's mark, so they never look finished.
+        nested
+            .then(|| crew_ui::worker_task_mark(s, thread))
+            .flatten()
+            .map(|status| status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
     }
     .map(|mark| {
         let mark = el().size(14.0, 16.0).center().child(mark.a11y_hidden());
@@ -6236,13 +6234,13 @@ fn quiet_inks(p: Palette) -> (Color, Color) {
 fn activity_line(
     key: String,
     a11y: String,
-    verb: String,
-    detail: &str,
+    action: (String, &str),
     failed: bool,
     open: bool,
     glyph: &str,
     p: Palette,
 ) -> El {
+    let (verb, detail) = action;
     let (secondary, tertiary) = quiet_inks(p);
     let mut line = row()
         .key(key)
@@ -6290,8 +6288,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                 "{} output for {title}",
                 if tool.expanded { "Hide" } else { "Show" }
             ),
-            tool_verb(tool),
-            &tool.detail,
+            (tool_verb(tool), &tool.detail),
             tool.failed,
             tool.expanded,
             match tool_kind(&tool.name) {
@@ -6429,8 +6426,7 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
             activity_line(
                 format!("toggle-tool-group-{}-{first}", t.id),
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
-                summary.clone(),
-                "",
+                (summary.clone(), ""),
                 failed > 0,
                 expanded,
                 "list",
@@ -6477,8 +6473,7 @@ fn inline_thought(s: &State, p: Palette, index: usize) -> El {
                 "{} thinking text",
                 if thought.expanded { "Hide" } else { "Show" }
             ),
-            verb.into(),
-            &detail,
+            (verb.into(), &detail),
             false,
             thought.expanded,
             "brain",
@@ -6688,8 +6683,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         "{} work section. {title}",
                         if expanded { "Collapse" } else { "Expand" }
                     ),
-                    title.clone(),
-                    "",
+                    (title.clone(), ""),
                     false,
                     expanded,
                     "clock",
@@ -8756,11 +8750,10 @@ pub(crate) mod tests {
                 let region = |e: &rune::ElementInfo| {
                     if e.rect[1] < 40.0 {
                         0
-                    } else if e.role == "separator" {
-                        1
-                    } else if rt
-                        .presented("sidebar")
-                        .is_some_and(|(r, _)| e.rect[0] < r[0] + r[2])
+                    } else if e.role == "separator"
+                        || rt
+                            .presented("sidebar")
+                            .is_some_and(|(r, _)| e.rect[0] < r[0] + r[2])
                     {
                         1
                     } else {
@@ -10217,6 +10210,25 @@ pub(crate) mod tests {
         assert!(rt.state.updater.notice().unwrap().contains("gh auth login"));
         press(&mut rt, "retry-update");
         assert!(rt.state.updater.suspended().is_none());
+    }
+
+    #[test]
+    fn a_failed_update_uses_the_existing_notice_and_manual_retry_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            rt.state.updater = crate::update::Updater::test_failed_release();
+            rt.frame(0.0);
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("The new server never started.")
+            );
+            let (bounds, _) = rt.presented("retry-update").unwrap();
+            assert!(bounds[0] >= 0.0 && bounds[0] + bounds[2] <= width);
+            press(&mut rt, "retry-update");
+            assert!(rt.state.updater.notice().is_none());
+        }
     }
 
     #[test]
@@ -12967,7 +12979,8 @@ pub(crate) mod tests {
                 open_distinct_threads(&mut rt, extra);
                 rt.set_viewport((width, 800.0), 1.0);
                 settle_frames(&mut rt);
-                let mut stages: Vec<(&str, Box<dyn Fn(&mut Runtime<State>)>)> = vec![
+                type TabStage = (&'static str, Box<dyn Fn(&mut Runtime<State>)>);
+                let mut stages: Vec<TabStage> = vec![
                     ("the last tab", Box::new(|_| {})),
                     (
                         "the first tab",
