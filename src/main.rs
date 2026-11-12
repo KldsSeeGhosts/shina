@@ -7,6 +7,7 @@ mod brand;
 mod captains;
 mod claude;
 mod client;
+mod client_history;
 mod codex;
 mod composer;
 mod composer_paste;
@@ -19,6 +20,7 @@ mod crisp;
 mod database;
 mod fleet_update;
 mod harness;
+mod history;
 mod horizon;
 mod html_fallback;
 #[cfg(any(target_os = "macos", windows, test))]

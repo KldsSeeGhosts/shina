@@ -1,4 +1,14 @@
 //! Real serve processes, real WebSockets and fake harness subprocesses. No provider calls.
+#[allow(dead_code)]
+#[path = "../src/client_history.rs"]
+mod client_history;
+#[allow(dead_code)]
+#[path = "../src/history.rs"]
+mod history;
+#[allow(dead_code)]
+#[path = "../src/protocol.rs"]
+mod protocol;
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -191,6 +201,7 @@ struct Client {
     epoch: Value,
     notifications: Vec<Value>,
     token: String,
+    history_cache: Option<client_history::ProjectionCache>,
 }
 impl Client {
     fn connect(discovery: &Value, device: uuid::Uuid) -> Self {
@@ -230,6 +241,7 @@ impl Client {
             epoch: Value::Null,
             notifications: Vec::new(),
             token,
+            history_cache: None,
         };
         let hello = client.rpc(
             "hello",
@@ -269,6 +281,9 @@ impl Client {
             }) {
                 Message::Text(text) => {
                     let value: Value = serde_json::from_str(&text).unwrap();
+                    if let Some(cache) = &mut self.history_cache {
+                        cache.receive(&value).unwrap();
+                    }
                     if value["method"] == "subscription.snapshot" {
                         self.snapshot = value["params"]["state"].clone();
                         self.seq = value["params"]["seq"].as_u64().unwrap();
@@ -1032,7 +1047,7 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
         json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
         json!("good-version"),
     );
-    assert_eq!(hello["result"]["protocolMinor"], 6);
+    assert_eq!(hello["result"]["protocolMinor"], protocol::MINOR);
     assert!(
         hello["result"]["capabilities"]
             .as_array()
@@ -1624,13 +1639,301 @@ fn committed_restart_waits_for_client_acknowledgement_then_exits_cleanly() {
 }
 
 #[test]
+fn history_version_skew_is_negotiated_or_reports_update_required() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"futureField":true}),
+        json!("future-hello"),
+    );
+    assert_eq!(hello["result"]["protocolMinor"], protocol::MINOR);
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::HISTORY_ITEMS)
+    );
+    let history = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1,"futureField":"ignored"}),
+        json!("future-history"),
+    );
+    assert!(history["error"].is_null(), "{history}");
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":6,"projectionSchema":1}),
+        json!("old-hello"),
+    );
+    assert!(
+        !hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::HISTORY_ITEMS)
+    );
+    let history = client.rpc(
+        "thread.subscribe",
+        json!({"threadId":1}),
+        json!("unsupported-history"),
+    );
+    assert_eq!(
+        history["error"]["code"],
+        protocol::HISTORY_UPDATE_REQUIRED_CODE
+    );
+    assert!(
+        history["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Update required.")
+    );
+    profile.stop();
+}
+
+#[test]
+fn streaming_history_walk_finishes_before_settlement() {
+    streaming_history_case(200_000, false);
+}
+
+#[test]
+fn streaming_history_two_mib_walk_finishes_before_settlement() {
+    streaming_history_case(2 * 1024 * 1024, false);
+}
+
+#[test]
+fn streaming_history_resumes_after_disconnect() {
+    streaming_history_case(200_000, true);
+}
+
+fn streaming_history_case(bytes: usize, disconnect: bool) {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+        json!("paging-hello"),
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::HISTORY_ITEMS)
+    );
+    client.rpc("workspace.subscribe", json!({}), json!("paging-subscribe"));
+    for chunk in (0..bytes).step_by(750_000) {
+        let receipt = client.command("thread.send",
+            json!({"threadId":1,"text":"x".repeat((bytes - chunk).min(750_000)),"attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4());
+        assert_eq!(receipt["result"]["status"], "accepted");
+        client.until_sequence(receipt["result"]["seq"].as_u64().unwrap(), |state| {
+            state["threads"][0]["status"] == "Completed"
+        });
+    }
+    let receipt = client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"history-stream-fixture","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(receipt["result"]["status"], "accepted");
+    client.until(|state| state["threads"][0]["status"] == "Running");
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    client.history_cache = Some(cache);
+    client.rpc("workspace.subscribe", json!({}), json!("history-subscribe"));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut displayed = Value::Null;
+    let mut first_live_len = None;
+    let mut live_advanced = false;
+    let mut reconnected = false;
+    let mut full_walks = 0;
+    let mut replays = 0;
+    let mut page_requests = 0;
+    let mut requests_at_completion = None;
+    let mut first_walk_complete = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "streaming history did not converge"
+        );
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(view) = cache.projected() {
+            displayed = view;
+        }
+        let installed = cache.histories.get(&1);
+        if let Some((revision, view, size)) = installed {
+            if !first_walk_complete && cache.complete(1) {
+                assert!(*size > bytes);
+                assert_eq!(
+                    cache.state["threads"][0]["status"], "Running",
+                    "walk must complete during streaming"
+                );
+                first_walk_complete = true;
+                requests_at_completion = Some(page_requests);
+            }
+            let assistant = view["messages"].as_array().unwrap().last().unwrap()["text"]
+                .as_str()
+                .unwrap();
+            if cache.state["threads"][0]["status"] == "Running" {
+                assert_eq!(
+                    displayed["threads"][0]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .unwrap()["text"],
+                    assistant
+                );
+                if let Some(first) = first_live_len {
+                    live_advanced |= assistant.len() > first;
+                } else {
+                    first_live_len = Some(assistant.len());
+                }
+            }
+            if cache.state["threads"][0]["status"] == "Completed"
+                && cache.state["threads"][0]["historyRevision"] == *revision
+                && cache.complete(1)
+            {
+                assert!(
+                    live_advanced,
+                    "displayed tail must advance before settlement"
+                );
+                let expected: String = (0..250)
+                    .map(|tick| format!("stream-{tick:03} 😀\n"))
+                    .collect();
+                assert_eq!(assistant, expected);
+                assert_eq!(displayed["threads"][0]["messages"], view["messages"]);
+                assert_eq!(
+                    displayed["threads"][0]["historyRetry"]["fullRestarts"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    0
+                );
+                break;
+            }
+        }
+        if disconnect && live_advanced && page_requests >= 3 && !reconnected {
+            let cache = client.history_cache.take().unwrap();
+            let token = client.token.clone();
+            drop(client);
+            client = Client::with_token(&profile.discovery(), token);
+            let hello = client.rpc(
+                "hello",
+                json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
+                json!("reconnect-hello"),
+            );
+            let mut cache = cache;
+            cache.reconnect(&hello["result"]).unwrap();
+            client.history_cache = Some(cache);
+            client.rpc(
+                "workspace.subscribe",
+                json!({}),
+                json!("reconnect-subscribe"),
+            );
+            reconnected = true;
+            continue;
+        }
+        let cache = client.history_cache.as_mut().unwrap();
+        if let Some(request) = cache.next_history() {
+            assert!(
+                cache.next_history().is_none(),
+                "only one history request may be in flight"
+            );
+            page_requests += 1;
+            let response = client.rpc(
+                request["method"].as_str().unwrap(),
+                request["params"].clone(),
+                json!("history"),
+            );
+            assert!(
+                response["error"].is_null(),
+                "streaming walk must not restart: {response}"
+            );
+            full_walks += usize::from(response["result"]["kind"] == "snapshot");
+            replays += usize::from(response["result"]["kind"] == "synchronized");
+            assert!(
+                response["result"]["data"]
+                    .as_str()
+                    .is_none_or(|text| text.len() <= 65536)
+            );
+            // Match the audit's page-request delay, not a delay on reading live events.
+            std::thread::sleep(Duration::from_millis(120));
+        } else {
+            client.read();
+        }
+    }
+    assert_eq!(full_walks, 1);
+    assert_eq!(replays, usize::from(disconnect));
+    assert_eq!(
+        requests_at_completion,
+        Some(page_requests),
+        "streaming must not trigger history downloads after loading"
+    );
+    assert_eq!(reconnected, disconnect);
+    // Compare all transcript/activity fields against a full walk of the final revision.
+    let final_history = read_full_history(&mut client, 65536);
+    assert_eq!(
+        client.history_cache.as_ref().unwrap().histories[&1]
+            .1
+            .to_string()
+            .as_bytes(),
+        final_history.to_string().as_bytes()
+    );
+    profile.stop();
+}
+
+fn read_full_history(client: &mut Client, budget: usize) -> Value {
+    let mut history_cursor = Value::Null;
+    let mut rows: Vec<history::Row> = Vec::new();
+    let mut fields;
+    loop {
+        let mut text = String::new();
+        let mut fragment = Value::Null;
+        loop {
+            let reply = client.rpc(
+                "thread.history",
+                json!({"threadId":1,"historyCursor":history_cursor,
+                "fragmentCursor":fragment,"byteBudget":budget}),
+                json!("verify-full"),
+            );
+            assert!(reply["error"].is_null(), "{reply}");
+            assert!(reply["result"]["data"].as_str().unwrap().len() <= budget);
+            text.push_str(reply["result"]["data"].as_str().unwrap());
+            fragment = reply["result"]["nextFragment"].clone();
+            if fragment.is_null() {
+                break;
+            }
+        }
+        let page: Value = serde_json::from_str(&text).unwrap();
+        rows.extend(serde_json::from_value::<Vec<history::Row>>(page["items"].clone()).unwrap());
+        fields = page["fields"].clone();
+        history_cursor = page["nextCursor"].clone();
+        if history_cursor.is_null() {
+            break;
+        }
+    }
+    for field in protocol::HISTORY_FIELDS {
+        if fields.get(field).is_none() {
+            fields[field] = json!([]);
+        }
+    }
+    rows.sort_by(|a, b| a.field.cmp(&b.field).then(a.ordinal.cmp(&b.ordinal)));
+    for row in rows {
+        fields[&row.field].as_array_mut().unwrap().push(row.item);
+    }
+    fields
+}
+
+#[test]
 fn history_over_two_mib_and_blobs_stream_in_bounded_pages() {
     let mut profile = Profile::new();
     profile.launch(&["serve"]);
     let mut client = profile.client(uuid::Uuid::new_v4());
     client.rpc(
         "hello",
-        json!({"protocolMajor":1,"protocolMinor":1,"projectionSchema":1}),
+        json!({"protocolMajor":1,"protocolMinor":7,"projectionSchema":1}),
         json!("paging-hello"),
     );
     client.rpc("workspace.subscribe", json!({}), json!("paging-subscribe"));
@@ -1648,25 +1951,8 @@ fn history_over_two_mib_and_blobs_stream_in_bounded_pages() {
         });
         expected.push(text);
     }
-    let mut text = String::new();
-    let mut cursor = Value::Null;
-    loop {
-        let response = client.rpc(
-            "thread.history",
-            json!({"threadId":1,"cursor":cursor,"byteBudget":262144}),
-            json!("history-page"),
-        );
-        assert!(response["error"].is_null(), "{response}");
-        let page = &response["result"];
-        assert!(page["data"].as_str().unwrap().len() <= 262144);
-        text.push_str(page["data"].as_str().unwrap());
-        cursor = page["nextCursor"].clone();
-        if cursor.is_null() {
-            break;
-        }
-    }
-    assert!(text.len() > 2 * 1024 * 1024);
-    let history: Value = serde_json::from_str(&text).unwrap();
+    let history = read_full_history(&mut client, 262144);
+    assert!(history.to_string().len() > 2 * 1024 * 1024);
     for text in expected {
         assert_eq!(
             history["messages"]
