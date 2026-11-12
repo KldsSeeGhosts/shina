@@ -55,6 +55,44 @@ impl Thread {
             || (self.session.is_some() && !self.never_sent)
             || self.run_id.is_some()
     }
+
+    pub fn thread_model_selection(&self) -> Option<crate::model_selection::ModelSelection> {
+        let model = self
+            .selected_model
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .or_else(|| (!self.model_id.is_empty()).then(|| self.model_id.clone()))?;
+        let mut options = Vec::new();
+        let reasoning_id = if self.harness == "pi" {
+            "thinking"
+        } else if self.harness == "codex" {
+            "reasoningEffort"
+        } else {
+            "effort"
+        };
+        let reasoning = self
+            .selected_thinking
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!self.thinking.is_empty()).then_some(self.thinking.as_str()));
+        if let Some(level) = reasoning {
+            options.push(crate::model_selection::ProviderOptionSelection {
+                id: reasoning_id.into(),
+                value: crate::model_selection::OptionValue::Str(level.to_owned()),
+            });
+        }
+        if let Some(tier) = self.harness_state["serviceTier"].as_str() {
+            options.push(crate::model_selection::ProviderOptionSelection {
+                id: "serviceTier".into(),
+                value: crate::model_selection::OptionValue::Str(tier.to_owned()),
+            });
+        }
+        Some(crate::model_selection::ModelSelection {
+            instance_id: self.harness.clone(),
+            model,
+            options,
+        })
+    }
 }
 
 impl State {
@@ -628,6 +666,281 @@ impl State {
             }
         }
         self.refresh_catalog();
+    }
+
+    pub fn project_default_model_selection(
+        &self,
+        harness: &str,
+    ) -> Option<crate::model_selection::ModelSelection> {
+        let def = self.thread_defaults.models.get(harness)?;
+        if def.model.trim().is_empty() {
+            return None;
+        }
+        let mut options = Vec::new();
+        if !def.effort.trim().is_empty() {
+            let reasoning_id = if harness == "pi" {
+                "thinking"
+            } else if harness == "codex" {
+                "reasoningEffort"
+            } else {
+                "effort"
+            };
+            options.push(crate::model_selection::ProviderOptionSelection {
+                id: reasoning_id.into(),
+                value: crate::model_selection::OptionValue::Str(def.effort.clone()),
+            });
+        }
+        Some(crate::model_selection::ModelSelection {
+            instance_id: harness.to_owned(),
+            model: def.model.clone(),
+            options,
+        })
+    }
+
+    pub fn resolved_composer_model_selection(
+        &self,
+    ) -> (
+        String,
+        String,
+        Vec<crate::model_selection::ProviderOptionSelection>,
+    ) {
+        let t = self.current();
+        let entries = self.provider_instance_entries();
+        let models_by_instance = self.picker_models_by_instance();
+        let locked_provider = self.locked_provider_for_current();
+        let thread_sel = t.thread_model_selection();
+        let project_sel = self.project_default_model_selection(&t.harness);
+        let draft_active = t.draft_model_state.active_provider.as_deref();
+        let runtime_id = t.has_started_session().then_some(t.harness.as_str());
+        let thread_id = thread_sel.as_ref().map(|s| s.instance_id.as_str());
+        let project_id = project_sel.as_ref().map(|s| s.instance_id.as_str());
+        let resolved_prov = crate::model_selection::resolve_composer_provider_selection(
+            &entries,
+            &[draft_active, runtime_id, thread_id, project_id],
+            locked_provider.as_deref(),
+            runtime_id.or(thread_id),
+        );
+        let selected_instance_id = resolved_prov
+            .selected_instance_id
+            .clone()
+            .unwrap_or_else(|| t.harness.clone());
+        let eff = crate::model_selection::derive_effective_composer_model_state(
+            Some(&t.draft_model_state),
+            &entries,
+            &models_by_instance,
+            &resolved_prov.requested_driver_kind,
+            Some(&selected_instance_id),
+            resolved_prov.requested_instance_id.as_deref(),
+            thread_sel.as_ref(),
+            project_sel.as_ref(),
+        );
+        let opts = eff
+            .model_options
+            .get(&selected_instance_id)
+            .cloned()
+            .unwrap_or_default();
+        (selected_instance_id, eff.selected_model, opts)
+    }
+
+    fn current_options_for_sticky(&self) -> Vec<crate::model_selection::ProviderOptionSelection> {
+        use crate::model_selection::{OptionValue, ProviderOptionSelection};
+        let t = self.current();
+        let mut opts = t
+            .draft_model_state
+            .model_selection_by_provider
+            .get(&t.harness)
+            .map(|s| s.options.clone())
+            .unwrap_or_default();
+        let reasoning_id = if t.harness == "pi" {
+            "thinking"
+        } else if t.harness == "codex" {
+            "reasoningEffort"
+        } else {
+            "effort"
+        };
+        if !t.thinking.is_empty() {
+            opts.retain(|o| o.id != reasoning_id);
+            opts.push(ProviderOptionSelection {
+                id: reasoning_id.into(),
+                value: OptionValue::Str(t.thinking.clone()),
+            });
+        }
+        if let Some(tier) = t.harness_state["serviceTier"].as_str() {
+            opts.retain(|o| o.id != "serviceTier");
+            opts.push(ProviderOptionSelection {
+                id: "serviceTier".into(),
+                value: OptionValue::Str(tier.to_owned()),
+            });
+        }
+        opts
+    }
+
+    pub fn select_model_from_picker(&mut self, instance_id: &str, model_id: &str) {
+        let entries = self.provider_instance_entries();
+        let models_by_instance = self.picker_models_by_instance();
+        let mut draft_state = self.current().draft_model_state.clone();
+        let mut sticky = self.preferences.sticky_composer.clone();
+        let Some(next) = crate::model_selection::select_model_from_picker(
+            &mut draft_state,
+            &mut sticky,
+            &entries,
+            &models_by_instance,
+            instance_id,
+            model_id,
+        ) else {
+            return;
+        };
+        if self.current().harness != instance_id {
+            self.choose_harness(instance_id);
+        }
+        let provider = if instance_id == "pi" {
+            "cpa".to_owned()
+        } else {
+            instance_id.to_owned()
+        };
+        self.current_mut().set_model(provider, next.model.clone());
+        let reasoning_id = if instance_id == "pi" {
+            "thinking"
+        } else if instance_id == "codex" {
+            "reasoningEffort"
+        } else {
+            "effort"
+        };
+        if let Some(level) = next
+            .options
+            .iter()
+            .find(|o| {
+                o.id == reasoning_id
+                    || o.id == "effort"
+                    || o.id == "reasoningEffort"
+                    || o.id == "thinking"
+            })
+            .and_then(|o| o.value.as_str())
+            .map(str::to_owned)
+        {
+            self.current_mut().set_thinking(level);
+        }
+        if let Some(tier) = next
+            .options
+            .iter()
+            .find(|o| o.id == "serviceTier")
+            .and_then(|o| o.value.as_str())
+            .map(str::to_owned)
+        {
+            self.current_mut().set_service_tier(tier);
+        }
+        self.current_mut().draft_model_state = draft_state;
+        self.preferences.sticky_composer = sticky;
+        self.checkpoint();
+    }
+
+    pub fn set_composer_thinking_sticky(&mut self, level: String) {
+        self.current_mut().set_thinking(level);
+        let instance_id = self.current().harness.clone();
+        let model = self.current().model_id.clone();
+        let opts = self.current_options_for_sticky();
+        let mut draft_state = self.current().draft_model_state.clone();
+        let mut sticky = self.preferences.sticky_composer.clone();
+        crate::model_selection::set_provider_model_options(
+            &mut draft_state,
+            &mut sticky,
+            &instance_id,
+            &instance_id,
+            (!model.is_empty()).then_some(model.as_str()),
+            opts,
+            true,
+        );
+        self.current_mut().draft_model_state = draft_state;
+        self.preferences.sticky_composer = sticky;
+        self.checkpoint();
+    }
+
+    pub fn set_composer_service_tier_sticky(&mut self, tier: String) {
+        self.current_mut().set_service_tier(tier);
+        let instance_id = self.current().harness.clone();
+        let model = self.current().model_id.clone();
+        let opts = self.current_options_for_sticky();
+        let mut draft_state = self.current().draft_model_state.clone();
+        let mut sticky = self.preferences.sticky_composer.clone();
+        crate::model_selection::set_provider_model_options(
+            &mut draft_state,
+            &mut sticky,
+            &instance_id,
+            &instance_id,
+            (!model.is_empty()).then_some(model.as_str()),
+            opts,
+            true,
+        );
+        self.current_mut().draft_model_state = draft_state;
+        self.preferences.sticky_composer = sticky;
+        self.checkpoint();
+    }
+
+    pub(super) fn apply_sticky_composer_to_draft(&mut self, index: usize) {
+        let sticky = self.preferences.sticky_composer.clone();
+        if sticky.sticky_active_provider.is_none()
+            && sticky.sticky_model_selection_by_provider.is_empty()
+        {
+            return;
+        }
+        crate::model_selection::apply_sticky_state(
+            &mut self.threads[index].draft_model_state,
+            &sticky,
+        );
+        if self.threads[index].selected_model.is_none()
+            && let Some(active) = &sticky.sticky_active_provider
+            && let Some(sel) = sticky.sticky_model_selection_by_provider.get(active)
+            && self.validate_harness(active).is_ok()
+        {
+            let provider = if active == "pi" {
+                "cpa".to_owned()
+            } else {
+                active.clone()
+            };
+            let models = self.harness_models(active);
+            if models
+                .iter()
+                .any(|m| m.provider == provider && m.id == sel.model)
+            {
+                let thread = &mut self.threads[index];
+                thread.harness = active.clone();
+                thread.models = models;
+                thread.set_model(provider, sel.model.clone());
+            }
+        }
+        let harness = self.threads[index].harness.clone();
+        let model_id = self.threads[index].model_id.clone();
+        let remembered = sticky
+            .sticky_options_by_model_by_provider
+            .get(&harness)
+            .and_then(|by_model| by_model.get(&model_id))
+            .or_else(|| {
+                sticky
+                    .sticky_model_selection_by_provider
+                    .get(&harness)
+                    .map(|sel| &sel.options)
+            });
+        if let Some(opts) = remembered {
+            let thread = &mut self.threads[index];
+            if thread.selected_thinking.is_none()
+                && let Some(level) = opts
+                    .iter()
+                    .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
+                    .and_then(|o| o.value.as_str())
+                    .map(str::to_owned)
+            {
+                thread.set_thinking(level);
+            }
+            if thread.harness_state["serviceTier"].is_null()
+                && let Some(tier) = opts
+                    .iter()
+                    .find(|o| o.id == "serviceTier")
+                    .and_then(|o| o.value.as_str())
+                    .map(str::to_owned)
+            {
+                thread.set_service_tier(tier);
+            }
+        }
     }
 }
 

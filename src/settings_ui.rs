@@ -26,6 +26,7 @@ pub struct Preferences {
     pub keybindings: Vec<crate::keybindings::KeybindingRule>,
     pub dismissed_updates: Vec<String>,
     pub model_favorites: Vec<crate::model_picker::ModelFavorite>,
+    pub sticky_composer: crate::model_selection::StickyComposerState,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -37,6 +38,7 @@ impl Default for Preferences {
             keybindings: Vec::new(),
             dismissed_updates: vec![],
             model_favorites: vec![],
+            sticky_composer: Default::default(),
         }
     }
 }

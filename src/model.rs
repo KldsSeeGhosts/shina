@@ -423,6 +423,7 @@ pub struct Thread {
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
     pub selected_thinking: Option<String>,
+    pub draft_model_state: crate::model_selection::DraftModelState,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
     startup_selection_check: Option<String>,
@@ -658,6 +659,7 @@ impl Thread {
             prewarm_attempted: false,
             selected_model: None,
             selected_thinking: None,
+            draft_model_state: Default::default(),
             startup_model_applied: false,
             startup_thinking_applied: false,
             startup_selection_check: None,
@@ -1799,6 +1801,12 @@ impl Thread {
                         self.configuring = false;
                         // Capacity and the previous percentage belonged to the old model.
                         self.refresh_context_usage();
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "set_thinking_level" => {
                         if let Some(level) = self.pending_thinking.take() {
@@ -1806,6 +1814,12 @@ impl Thread {
                         }
                         self.command("get_state", json!({}));
                         self.configuring = false;
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "get_messages" if record["id"] == "history" => {
                         if self.server_owned
@@ -4531,6 +4545,9 @@ impl State {
         }
         if reuse.is_none() || self.threads[index].selected_model.is_none() {
             self.inherit_composer(index, seed);
+            if reuse.is_none() {
+                self.apply_sticky_composer_to_draft(index);
+            }
         }
         self.select_thread(index);
     }
@@ -6704,14 +6721,29 @@ impl State {
         Ok(())
     }
 
-    fn ui_snapshot(&self) -> Value {
+    pub(crate) fn ui_snapshot(&self) -> Value {
         let mut prefs_value = serde_json::to_value(&self.preferences).unwrap_or_else(|_| json!({}));
         if let Some(map) = prefs_value.as_object_mut() {
             map.remove("keybindings");
         }
+        let draft_model_states: serde_json::Map<String, Value> = self
+            .threads
+            .iter()
+            .filter(|t| t.draft_model_state.model_selection_explicit || t.has_draft_content())
+            .filter(|t| {
+                !t.draft_model_state.model_selection_by_provider.is_empty()
+                    || t.draft_model_state.active_provider.is_some()
+            })
+            .filter_map(|t| {
+                serde_json::to_value(&t.draft_model_state)
+                    .ok()
+                    .map(|val| (t.id.to_string(), val))
+            })
+            .collect();
         json!({
             "background": self.background.settings,
             "preferences": prefs_value,
+            "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -6735,7 +6767,7 @@ impl State {
             }).collect::<serde_json::Map<_,_>>(),
         })
     }
-    fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
+    pub(crate) fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
         }
@@ -6830,6 +6862,18 @@ impl State {
                     .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
                 {
                     thread.restore_pending_inputs(value)?;
+                }
+            }
+        }
+        if let Some(draft_models) = ui.get("draftModelStates").and_then(Value::as_object) {
+            for (id, value) in draft_models {
+                if let Some(thread) = id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+                    && let Ok(state) = serde_json::from_value(value.clone())
+                {
+                    thread.draft_model_state = state;
                 }
             }
         }

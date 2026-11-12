@@ -34,6 +34,7 @@ mod maintenance;
 mod mcp;
 mod model;
 mod model_picker;
+mod model_selection;
 mod outbox;
 mod peer;
 mod portraits;

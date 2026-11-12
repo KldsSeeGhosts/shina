@@ -1158,9 +1158,29 @@ fn effort_name(level: &str) -> String {
 /// provider's mark, the model's name without its route, and the effort level.
 fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
     let t = s.current();
+    let (resolved_instance, resolved_model_id, resolved_opts) =
+        s.resolved_composer_model_selection();
+    let entries = s.provider_instance_entries();
+    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
+    let active_model_option = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
+        .or_else(|| {
+            crate::model_picker::retained_model_while_provider_locked(
+                active_entry,
+                &[],
+                &resolved_model_id,
+            )
+        });
     let (name, _) = split_model_label(&t.model);
-    let effort = effort_name(&t.thinking);
-    let both_default = name == crate::model::DEFAULT_MODEL && t.thinking.is_empty();
+    let resolved_thinking = resolved_opts
+        .iter()
+        .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
+        .and_then(|o| o.value.as_str())
+        .unwrap_or(&t.thinking);
+    let effort = effort_name(resolved_thinking);
+    let both_default = name == crate::model::DEFAULT_MODEL && resolved_thinking.is_empty();
     let mut trigger = row()
         .key("model-effort")
         .role("button")
@@ -1188,19 +1208,6 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             s.open_model_picker(SettingsPicker::Thinking);
         });
     }
-    let entries = s.provider_instance_entries();
-    let active_entry = entries.iter().find(|e| e.instance_id == t.harness);
-    let active_model_option = s
-        .picker_models_by_instance()
-        .get(&t.harness)
-        .and_then(|opts| opts.iter().find(|o| o.slug == t.model_id).cloned())
-        .or_else(|| {
-            crate::model_picker::retained_model_while_provider_locked(
-                active_entry,
-                &[],
-                &t.model_id,
-            )
-        });
     let trigger_unavailable = active_model_option
         .as_ref()
         .is_some_and(|m| m.is_unavailable);
@@ -1376,8 +1383,7 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .child(label(name, SMALL, if on { p.ink } else { p.muted }).truncate())
                 .on_press(move |s: &mut State| {
-                    s.current_mut().set_service_tier(id.clone());
-                    s.checkpoint();
+                    s.set_composer_service_tier_sticky(id.clone());
                 }),
         );
     }
@@ -1610,8 +1616,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 let next = (at + delta).clamp(0, last) as usize;
                 if next as i32 != at {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(keyed[next].clone());
-                    s.checkpoint();
+                    s.set_composer_thinking_sticky(keyed[next].clone());
                 }
             })
             .on_step_limit(move |s: &mut State, max, tx| {
@@ -1620,8 +1625,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     && level != s.current().thinking
                 {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(level);
-                    s.checkpoint();
+                    s.set_composer_thinking_sticky(level);
                 }
             })
             .on_drag(move |s: &mut State, drag, tx| {
@@ -1637,8 +1641,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     tx.motion_curve(slider_curve(false));
                     s.thinking_drag = None;
                     if dragged[index] != s.current().thinking {
-                        s.current_mut().set_thinking(dragged[index].clone());
-                        s.checkpoint();
+                        s.set_composer_thinking_sticky(dragged[index].clone());
                     }
                 } else {
                     // A press glides to the pointer; a drag follows it closely.
@@ -2303,17 +2306,8 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             item = item
                 .cursor(rune::Cursor::Pointer)
                 .on_press(move |s: &mut State| {
-                    if s.current().harness != instance_id {
-                        s.choose_harness(&instance_id);
-                    }
-                    let provider = if instance_id == "pi" {
-                        "cpa".to_owned()
-                    } else {
-                        instance_id.clone()
-                    };
-                    s.current_mut().set_model(provider, id.clone());
+                    s.select_model_from_picker(&instance_id, &id);
                     s.settings_picker = Some(SettingsPicker::Thinking);
-                    s.checkpoint();
                 });
         }
         list = list.child(item);
@@ -9632,8 +9626,7 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
     let next =
         (current as isize + direction).clamp(0, levels.len().saturating_sub(1) as isize) as usize;
     let level = levels[next].clone();
-    state.current_mut().set_thinking(level);
-    state.checkpoint();
+    state.set_composer_thinking_sticky(level);
     true
 }
 
@@ -9672,17 +9665,8 @@ pub(crate) fn jump_model_picker_index(state: &mut State, index: usize) -> bool {
     else {
         return false;
     };
-    if state.current().harness != chosen.instance_id {
-        state.choose_harness(&chosen.instance_id);
-    }
-    let provider = if chosen.instance_id == "pi" {
-        "cpa".to_owned()
-    } else {
-        chosen.instance_id
-    };
-    state.current_mut().set_model(provider, chosen.slug);
+    state.select_model_from_picker(&chosen.instance_id, &chosen.slug);
     state.settings_picker = Some(SettingsPicker::Thinking);
-    state.checkpoint();
     true
 }
 
@@ -16742,6 +16726,109 @@ pub(crate) mod tests {
             rt.frame(0.7);
             let search_tree = rt.accessibility_json().to_string();
             assert!(search_tree.contains("Claude Opus 5.5"), "{width}");
+        }
+    }
+
+    #[test]
+    fn sticky_options_restore_per_model_and_survive_ui_snapshot_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6-astra".into(),
+                    name: "GPT-6 Astra".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    is_default: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.6-sol".into(),
+                    name: "GPT-5.6 Sol".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    ..Default::default()
+                },
+            ];
+            rt.state.choose_harness("codex");
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Pick gpt-6-astra and set effort=high + serviceTier=fast
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.1);
+            press(&mut rt, "choose-thinking-2");
+            press(&mut rt, "service-tier-1");
+            assert_eq!(rt.state.current().thinking, "high");
+            assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
+
+            // Switch to gpt-5.6-sol and set effort=low
+            press(&mut rt, "open-model-list");
+            rt.invalidate();
+            rt.frame(0.2);
+            press(&mut rt, "choose-model-1");
+            rt.invalidate();
+            rt.frame(0.3);
+            press(&mut rt, "choose-thinking-0");
+            assert_eq!(rt.state.current().thinking, "low");
+
+            // Switch back to gpt-6-astra: remembered sticky options (high + fast) restore!
+            press(&mut rt, "open-model-list");
+            rt.invalidate();
+            rt.frame(0.4);
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.5);
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
+
+            // Trigger reflects resolved model & effort cleanly inside viewport
+            let (trigger, _) = rt.presented("model-effort").unwrap();
+            assert!(
+                trigger[0] >= 0.0 && trigger[0] + trigger[2] <= width + 0.5,
+                "{width}: {trigger:?}"
+            );
+
+            // Sticky composer preferences survive ui_snapshot -> restore_ui
+            let ui = rt.state.ui_snapshot();
+            let mut restored = State::new(std::path::PathBuf::new(), false);
+            restored.restore_ui(&ui).unwrap();
+            assert_eq!(
+                restored
+                    .preferences
+                    .sticky_composer
+                    .sticky_options_by_model_by_provider
+                    .get("codex")
+                    .and_then(|m| m.get("gpt-6-astra"))
+                    .map(|opts| opts.len()),
+                Some(2)
+            );
+
+            // Creating a new thread applies the sticky model and options
+            rt.state.new_thread_in(None);
+            assert_eq!(rt.state.current().harness, "codex", "{width}");
+            assert_eq!(rt.state.current().model_id, "gpt-6-astra", "{width}");
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
         }
     }
 
