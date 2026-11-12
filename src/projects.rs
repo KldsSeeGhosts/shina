@@ -712,6 +712,8 @@ impl Drop for CloneJob {
 /// The switcher menu and the clone sheet.
 #[derive(Default)]
 pub struct Projects {
+    pub browser: FolderBrowser,
+    pub return_picker: Option<crate::model::ProjectPicker>,
     pub remote_cloning: bool,
     pub entries: Vec<Project>,
     pub next_id: ProjectId,
@@ -720,11 +722,20 @@ pub struct Projects {
     pub clone_open: bool,
     pub clone_source: TextEdit,
     pub clone_parent: PathBuf,
+    pub clone_path: TextEdit,
     pub clone_progress: String,
     pub clone_error: Option<String>,
     pub clone_job: Option<CloneJob>,
     /// Shown in the Add workspace palette when adding a folder fails.
     pub menu_error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct FolderBrowser {
+    pub request: Option<(String, String)>,
+    pub pending: Option<Receiver<Result<crate::protocol::FolderListing, String>>>,
+    pub listing: Option<crate::protocol::FolderListing>,
+    pub error: Option<String>,
 }
 
 impl Projects {
@@ -746,6 +757,109 @@ impl Projects {
 }
 
 impl State {
+    /// Reopening a palette refreshes the host listing. All disk and network work is off Rune.
+    pub fn poll_folder_browser(&mut self) -> bool {
+        if self.project_picker != Some(crate::model::ProjectPicker::AddProject)
+            || !self.picker_browsing
+        {
+            return false;
+        }
+        let request = (
+            self.machines.selected.clone(),
+            self.picker_query.text.clone(),
+        );
+        let mut changed = false;
+        if self.projects.browser.request.as_ref() != Some(&request)
+            && self.projects.browser.pending.is_none()
+        {
+            self.projects.browser = FolderBrowser::default();
+            self.projects.browser.request = Some(request.clone());
+            let (send, receive) = std::sync::mpsc::channel();
+            self.projects.browser.pending = Some(receive);
+            let remote = self
+                .client
+                .as_ref()
+                .and_then(|client| client.linked.get(&request.0))
+                .and_then(|client| client.remote.clone());
+            let connected = self.client.is_none() || self.machine_connected(&request.0);
+            let wake = self.wake.clone();
+            let request = request.clone();
+            std::thread::spawn(move || {
+                let result = if !connected {
+                    Err("This machine is offline. Reconnect to browse or add a folder.".into())
+                } else if request.0 == "local" {
+                    browse_folder(&request.1, true)
+                } else if let Some(link) = remote {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| "Could not start folder browsing.".to_string())
+                        .and_then(|runtime| {
+                            runtime.block_on(async {
+                                let value = crate::client::remote_rpc(
+                                    &link,
+                                    "filesystem.browse",
+                                    json!({"path":request.1,"partial":true}),
+                                )
+                                .await?;
+                                serde_json::from_value(value)
+                                    .map_err(|_| "Invalid folder listing.".into())
+                            })
+                        })
+                } else {
+                    Err("This machine is not linked.".into())
+                };
+                let _ = send.send(result);
+                wake();
+            });
+            changed = true;
+        }
+        if let Some(result) = self
+            .projects
+            .browser
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.try_recv().ok())
+        {
+            self.projects.browser.pending = None;
+            if self.projects.browser.request.as_ref() == Some(&request) {
+                match result {
+                    Ok(listing) => self.projects.browser.listing = Some(listing),
+                    Err(error) => self.projects.browser.error = Some(error),
+                }
+            } else {
+                self.projects.browser.listing = None;
+                self.projects.browser.error = None;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn choose_project_machine(&mut self, server: &str) {
+        if self.client.is_some() && !self.machine_connected(server) {
+            return;
+        }
+        if self
+            .captain_editor
+            .as_ref()
+            .is_some_and(|editor| editor.server != server)
+            || self.projects.return_picker == Some(crate::model::ProjectPicker::CaptainScope)
+                && server != self.machines.selected
+        {
+            return;
+        }
+        let editor = self.captain_editor.take();
+        let return_picker = self.projects.return_picker;
+        self.select_machine(server);
+        self.captain_editor = editor;
+        if self.machines.selected != server {
+            return;
+        }
+        self.projects.return_picker = return_picker;
+        self.browse_for_project();
+    }
+
     pub fn open_clone_dialog(&mut self) {
         self.projects.clone_open = true;
         self.projects.clone_error = None;
@@ -761,8 +875,8 @@ impl State {
                 .clone_parent
                 .clone()
                 .unwrap_or_default();
-            self.machines
-                .project_path
+            self.projects
+                .clone_path
                 .replace_text(self.projects.clone_parent.to_string_lossy());
             return;
         }
@@ -793,13 +907,16 @@ impl State {
         let name = source.folder_name()?;
         if self.machines.selected != "local" {
             // The parent is a path on another machine, so it keeps its own separator.
-            return Ok((source, join_like(&self.projects.clone_parent, &name)));
+            return Ok((
+                source,
+                join_like(Path::new(&self.projects.clone_path.text), &name),
+            ));
         }
         Ok((source, self.projects.clone_parent.join(name)))
     }
     pub fn start_clone(&mut self) {
         if self.machines.selected != "local" {
-            self.projects.clone_parent = PathBuf::from(&self.machines.project_path.text);
+            self.projects.clone_parent = PathBuf::from(&self.projects.clone_path.text);
         }
         if self.forward("project.clone", serde_json::json!({"source":self.projects.clone_source.text,"parent":self.projects.clone_parent})) { return; }
         if self.projects.cloning() {
@@ -902,61 +1019,73 @@ pub fn expand_path(input: &str) -> PathBuf {
     }
 }
 
-/// A folder written for the browse field: under home it starts with `~`, and it ends with a
-/// separator so the list shows what is inside it.
-pub fn browse_text(dir: &Path) -> String {
-    let sep = std::path::MAIN_SEPARATOR;
-    let text = match home_dir().and_then(|home| dir.strip_prefix(&home).ok().map(Path::to_path_buf))
-    {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~{sep}{}", rest.display()),
-        None => dir.display().to_string(),
-    };
-    if text.ends_with(['/', '\\']) {
-        text
+/// Ported from KSG Code's WorkspaceEntries: resolve on the owning host and list one folder.
+/// Errors deliberately omit OS error text, which can disclose symlink targets or other paths.
+/// Partial paths filter one parent directory, as KSG's CommandPalette does.
+/// This splitting happens on the server, never on a client of another host.
+pub fn browse_folder(input: &str, partial: bool) -> Result<crate::protocol::FolderListing, String> {
+    let path = if input.is_empty() {
+        home_dir().ok_or("The server home folder is unavailable.")?
     } else {
-        format!("{text}{sep}")
-    }
-}
-
-/// Splits a browse query into the folder to list and the name typed so far inside it, as
-/// T3 Code's path field does: `~/code/sh` lists `~/code` filtered by `sh`.
-pub fn browse_split(input: &str) -> (PathBuf, String) {
-    if input.trim().is_empty() {
-        return (
-            home_dir().unwrap_or_else(|| PathBuf::from("/")),
-            String::new(),
-        );
-    }
-    if input.ends_with(['/', '\\']) || input.trim() == "~" {
-        return (expand_path(input), String::new());
-    }
-    let cut = input.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    let (dir, name) = input.split_at(cut);
-    let dir = if dir.is_empty() { "." } else { dir };
-    (expand_path(dir), name.to_string())
-}
-
-/// The folders inside `dir` whose names contain `filter`, case-insensitively, sorted with
-/// prefix matches first. Hidden folders appear once the filter starts with a dot.
-pub fn list_folders(dir: &Path, filter: &str) -> Vec<String> {
-    let Ok(read) = fs::read_dir(dir) else {
-        return vec![];
+        expand_path(input)
     };
-    let needle = filter.to_lowercase();
-    let mut names: Vec<String> = read
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.') || needle.starts_with('.'))
-        .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle))
-        .collect();
-    names.sort_by_key(|name| {
-        let lower = name.to_lowercase();
-        (!lower.starts_with(&needle), lower)
-    });
-    names.truncate(200);
-    names
+    if !path.is_absolute() {
+        return Err("Use an absolute path or ~ on this server.".into());
+    }
+    let target_exists = path.is_dir();
+    let (path, filter) = if partial && !target_exists && !input.ends_with(['/', '\\']) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        (path.parent().unwrap_or(&path).to_path_buf(), name)
+    } else {
+        (path, String::new())
+    };
+    let path = path.canonicalize().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "That folder does not exist."
+        } else {
+            "That folder could not be read."
+        }
+        .to_string()
+    })?;
+    let read = fs::read_dir(&path).map_err(|_| "That folder could not be read.")?;
+    let mut entries = std::collections::BTreeMap::new();
+    let mut truncated = false;
+    for entry in read {
+        let entry = entry.map_err(|_| "That folder could not be read.")?;
+        // Do not follow symlinks into another directory while listing.
+        if !entry
+            .file_type()
+            .map_err(|_| "That folder could not be read.")?
+            .is_dir()
+        {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !filter.is_empty() && !name.to_lowercase().starts_with(&filter) {
+            continue;
+        }
+        entries.insert(name, entry.path().to_string_lossy().into_owned());
+        if entries.len() > crate::protocol::MAX_BROWSE_ENTRIES {
+            truncated = true;
+            entries.pop_last();
+        }
+    }
+    Ok(crate::protocol::FolderListing {
+        parent: path.parent().map(|p| p.to_string_lossy().into_owned()),
+        path: path.to_string_lossy().into_owned(),
+        entries: entries
+            .into_iter()
+            .map(|(name, path)| crate::protocol::FolderEntry { name, path })
+            .collect(),
+        truncated,
+        target_exists,
+    })
 }
 
 /// The native folder picker, shared by the Add workspace palette and Ctrl+O.
@@ -1074,16 +1203,28 @@ mod tests {
         }
         fs::write(root.join("shina.txt"), "").unwrap();
         let typed = format!("{}{}sh", root.display(), std::path::MAIN_SEPARATOR);
-        let (dir, filter) = browse_split(&typed);
-        assert_eq!((dir.as_path(), filter.as_str()), (root.as_path(), "sh"));
-        assert_eq!(list_folders(&root, "sh"), ["Shared", "shina"]);
-        assert_eq!(list_folders(&root, ""), ["rune", "Shared", "shina"]);
-        assert_eq!(list_folders(&root, ".h"), [".hidden"]);
-        let (dir, filter) = browse_split(&browse_text(&root));
-        assert_eq!((dir, filter.as_str()), (root.clone(), ""));
+        let listing = browse_folder(&typed, true).unwrap();
+        assert_eq!(listing.path, root.canonicalize().unwrap().to_string_lossy());
+        assert!(!listing.target_exists);
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Shared", "shina"]
+        );
+        let listing = browse_folder(root.to_str().unwrap(), false).unwrap();
+        assert!(listing.target_exists);
+        assert_eq!(listing.entries.len(), 4);
+        assert!(
+            !listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "shina.txt")
+        );
         if let Some(home) = home_dir() {
             assert_eq!(expand_path("~"), home);
-            assert!(browse_text(&home.join("code")).starts_with('~'));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1360,7 +1501,7 @@ mod tests {
         state.current_mut().title = "Port the parser".into();
         state.current_mut().status = crate::model::Status::Running;
         state.current_mut().draft.replace_text("half a thought");
-        let id = state.add_project(std::env::temp_dir()).unwrap();
+        let id = state.add_project(std::env::temp_dir()).unwrap().unwrap();
         assert_eq!(state.projects.entries.len(), 2);
         assert_eq!(state.current().project, Some(id));
         assert_eq!(state.threads[0].status, crate::model::Status::Running);
@@ -1369,7 +1510,7 @@ mod tests {
         assert!(state.project(Some(id)).unwrap().hidden);
         assert!(std::env::temp_dir().is_dir());
         assert!(state.threads.iter().any(|t| t.project == Some(id)));
-        assert_eq!(state.add_project(std::env::temp_dir()).unwrap(), id);
+        assert_eq!(state.add_project(std::env::temp_dir()).unwrap(), Some(id));
         assert!(!state.project(Some(id)).unwrap().hidden);
     }
 

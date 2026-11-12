@@ -95,6 +95,13 @@ impl Client {
         self.input.take().expect("unused test client")
     }
 
+    #[cfg(test)]
+    pub fn test_connected(directory: PathBuf) -> (Self, tokio::sync::mpsc::Receiver<Command>) {
+        let mut client = Self::new(directory);
+        let input = client.test_commands();
+        (client, input)
+    }
+
     pub fn new(directory: PathBuf) -> Self {
         let (sender, input) = tokio::sync::mpsc::channel(32);
         let (output, events) = mpsc::sync_channel(64);
@@ -487,7 +494,7 @@ async fn connect(
     cache: &ProjectionCache,
     desktop: bool,
     remote: Option<&crate::peer::Link>,
-) -> Result<Socket, String> {
+) -> Result<(Socket, Value), String> {
     if discovery.protocol_major != crate::protocol::MAJOR {
         return Err("Protocol major mismatch. Update the server and client together.".into());
     }
@@ -589,7 +596,7 @@ async fn connect(
         .await
         .map_err(|e| e.to_string())?;
     }
-    Ok(socket)
+    Ok((socket, reply["result"].clone()))
 }
 
 async fn supervise(
@@ -682,7 +689,7 @@ async fn supervise(
                     result = connect(&discovery, &device, &device_directory, &cache, true, remote.as_ref()) => result,
                     _ = stopped(&stop) => break,
                 } {
-                    Ok(mut connected) => {
+                    Ok((mut connected, _hello)) => {
                         cache.inflight = None;
                         cache.snapshot_pages.clear();
                         if child
@@ -1071,7 +1078,7 @@ pub async fn local_rpc(
         std::fs::create_dir_all(&device_directory).map_err(|e| e.to_string())?;
         let _owner = crate::server_lock::Owner::acquire(&device_directory)?;
         let device = device_id(&device_directory)?;
-        let mut socket = connect(
+        let (mut socket, _) = connect(
             &discovery,
             &device,
             &device_directory,
@@ -1130,7 +1137,7 @@ pub async fn remote_rpc(
     args: Value,
 ) -> Result<Value, String> {
     tokio::time::timeout(Duration::from_secs(8), async {
-        let mut socket = connect(
+        let (mut socket, hello) = connect(
             &remote_discovery(link),
             &link.device_id,
             std::path::Path::new(""),
@@ -1139,6 +1146,11 @@ pub async fn remote_rpc(
             Some(link),
         )
         .await?;
+        if method == "filesystem.browse" && !supports_browse(&hello) {
+            return Err(
+                "This server needs an update to browse folders. Type a path instead.".into(),
+            );
+        }
         let command = Command::new(method, args);
         socket
             .send(wire_command(&command))
@@ -1169,6 +1181,16 @@ pub async fn remote_rpc(
     })
     .await
     .map_err(|_| "Remote request timed out.".to_string())?
+}
+
+pub fn supports_browse(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::FILESYSTEM_BROWSE)
+        })
 }
 
 fn wire_command(command: &Command) -> Message {
