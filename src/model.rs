@@ -4175,6 +4175,11 @@ impl State {
                 .find(|m| &m.provider == provider && &m.id == id)
         }) else {
             self.inherit_composer(index, &Value::Null);
+            // Access inheritance does not depend on model discovery. A missing model
+            // must never replace the source thread's read-only mode with a broader default.
+            if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
+                self.threads[index].native.access = access;
+            }
             return;
         };
         let thread = &mut self.threads[index];
@@ -8384,6 +8389,11 @@ mod tests {
             supports_images: None,
         }];
         let index = restored.threads.len() - 1;
+        restored.inherit_composer(
+            index,
+            &json!({"harness":"claude","access":"read-only","model":null}),
+        );
+        assert_eq!(restored.threads[index].native.access, AccessMode::ReadOnly);
         restored.inherit_composer(
             index,
             &json!({"harness":"claude","access":"read-only","model":["claude","inherited"],"thinking":"high"}),
