@@ -28,6 +28,9 @@ pub struct Machines {
     pub code: rune::TextEdit,
     pub project_path: rune::TextEdit,
     pub notice: Option<String>,
+    /// The text of `notice` while it is the unreachable-machines notice, so it clears itself
+    /// when the connections are ready again and never clears another message.
+    pub auto_notice: Option<String>,
     pub devices: Value,
     pub pending: Option<std::sync::mpsc::Receiver<Result<MachineResult, String>>>,
 }
@@ -55,6 +58,7 @@ impl Default for Machines {
             code: Default::default(),
             project_path: Default::default(),
             notice: None,
+            auto_notice: None,
             devices: Value::Null,
             pending: None,
         }

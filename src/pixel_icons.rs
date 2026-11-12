@@ -73,11 +73,12 @@ glyph!(
     THEME,
     r#"<path d="M4 2h16v2H4zm0 18h16v2H4zM2 4h2v16H2zm18 0h2v16h-2zM4 18h2v2H4zm0-2h4v2H4zm0-2h6v2H4zm0-2h8v2H4zm0-2h10v2H4zm0-2h12v2H4zm0-2h14v2H4zm0-2h16v2H4z"/>"#
 );
-// A gear on 2 unit cells: eight teeth around a ring and a large square hole. The Pixelarticons
-// cog is a thin 3 unit line drawing that fills in to a grey knot at 18 pt.
+// A gear on 2 unit cells: a one cell ring with an open centre, four wide teeth and four corner
+// teeth. It carries about as much ink as ARCHIVE, where the Pixelarticons cog fills in to a grey
+// knot at 18 pt.
 glyph!(
     SETTINGS,
-    r#"<path d="M8 0h8v2h-8zM2 2h4v2h-4zM8 2h8v2h-8zM18 2h4v2h-4zM2 4h20v2h-20zM4 6h2v2h-2zM18 6h2v2h-2zM0 8h6v2h-6zM18 8h6v2h-6zM0 10h6v2h-6zM18 10h6v2h-6zM0 12h6v2h-6zM18 12h6v2h-6zM0 14h6v2h-6zM18 14h6v2h-6zM4 16h2v2h-2zM18 16h2v2h-2zM2 18h20v2h-20zM2 20h4v2h-4zM8 20h8v2h-8zM18 20h4v2h-4zM8 22h8v2h-8z"/>"#
+    r#"<path d="M10 0h4v4h-4zM4 4h2v2h-2zM8 4h8v2h-8zM18 4h2v2h-2zM6 6h2v2h-2zM16 6h2v2h-2zM4 8h2v2h-2zM18 8h2v2h-2zM0 10h6v4h-6zM18 10h6v4h-6zM4 14h2v2h-2zM18 14h2v2h-2zM6 16h2v2h-2zM16 16h2v2h-2zM4 18h2v2h-2zM8 18h8v2h-8zM18 18h2v2h-2zM10 20h4v4h-4z"/>"#
 );
 glyph!(
     FILTER,
@@ -97,7 +98,7 @@ glyph!(
 );
 glyph!(
     CLOCK,
-    r#"<path d="M6 2h12v2H6zM2 6h2v12H2zm18 0h2v12h-2zm-2-2h2v2h-2zM4 4h2v2H4zm2 18h12v-2H6zm12-2h2v-2h-2zM4 20h2v-2H4zm7-14h2v7h-2zm2 7h2v2h-2zm2 2h2v2h-2z"/>"#
+    r#"<path d="M6 2h12v2h-12zM4 4h4v2h-4zM16 4h4v2h-4zM2 6h2v12h-2zM10 6h2v4h-2zM20 6h2v12h-2zM10 10h6v2h-6zM4 18h4v2h-4zM16 18h4v2h-4zM6 20h12v2h-12z"/>"#
 );
 // Three solid 4 unit squares.
 glyph!(MORE, r#"<path d="M2 10h4v4H2zm8 0h4v4h-4zm8 0h4v4h-4z"/>"#);
@@ -158,7 +159,6 @@ glyph!(
     WRENCH,
     r#"<path d="M9 22H7v-2h2v2Zm12-6h2v6h-6v-6h2v-6h2v6Zm-2 2v2h2v-2h-2ZM7 20H5v-8h2v8Zm4 0H9v-8h2v8Zm-6-8H3v-2h2v2Zm8 0h-2v-2h2v2ZM3 10H1V4h2v6Zm12 0h-2V4h2v6Zm4 0h-2V4h2v6Zm4 0h-2V4h2v6ZM7 6h2V2h4v2h-2v4H5V4H3V2h4v4Zm14-2h-2V2h2v2Z"/>"#
 );
-// The clip leans 45 degrees, which opens up its four bars so it reads at 18 pt.
 // An upright paperclip on 2 unit cells: one wire, three nested strands. A tilted clip turns to
 // a staircase of stripes at 18 pt, so this one stays vertical.
 glyph!(
@@ -176,7 +176,7 @@ glyph!(
 );
 glyph!(
     LIGHTBULB,
-    r#"<path d="M9 4h6v2H9zM7 6h2v2H7zm8 0h2v2h-2zm4-2h2v2h-2zm2-2h2v2h-2zM0 10h3v2H0zm21 0h3v2h-3zM3 4h2v2H3zM1 2h2v2H1zm6 12h2v2H7zm8 0h2v2h-2zM5 8h2v6H5zm12 0h2v6h-2zm-8 8h6v2H9zm0 4h6v2H9zm0-2h2v2H9zm4 0h2v2h-2zM11 0h2v3h-2z"/>"#
+    r#"<path d="M2 2h2v2h-2zM8 2h8v2h-8zM20 2h2v2h-2zM8 4h2v2h-2zM14 4h2v2h-2zM6 6h2v8h-2zM16 6h2v8h-2zM0 8h2v2h-2zM22 8h2v2h-2zM8 14h2v2h-2zM14 14h2v2h-2zM8 16h8v4h-8zM10 20h4v2h-4z"/>"#
 );
 glyph!(
     BOLT,
@@ -208,6 +208,17 @@ glyph!(
     PIN_ON,
     r#"<path d="M8 3h8v2H8zM9 5h6v6H9zM6 11h12v2H6zM11 13h2v8h-2z"/>"#
 );
+// Every shape below sits on whole 2 unit cells, so each edge lands on a device pixel at 2x.
+// A crescent moon for "away", solid and open to the upper right.
+glyph!(
+    CRESCENT,
+    r#"<path d="M8 2h8v2h-8zM4 4h8v2h-8zM4 6h6v2h-6zM2 8h8v6h-8zM18 12h2v2h-2zM2 14h10v2h-10zM16 14h4v2h-4zM4 16h18v2h-18zM6 18h14v2h-14z"/>"#
+);
+// A chip for a model with no vendor: a one cell outline, a 2 cell die and eight pins.
+glyph!(
+    CHIP,
+    r#"<path d="M8 2h2v2h-2zM14 2h2v2h-2zM4 4h16v2h-16zM4 6h2v2h-2zM18 6h2v2h-2zM2 8h4v2h-4zM18 8h4v2h-4zM4 10h2v2h-2zM10 10h4v4h-4zM18 10h2v2h-2zM2 12h4v2h-4zM18 12h4v2h-4zM4 14h2v2h-2zM18 14h2v2h-2zM4 16h16v2h-16zM8 18h2v2h-2zM14 18h2v2h-2z"/>"#
+);
 glyph!(DOT, r#"<path d="M8 8h8v8H8z"/>"#);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
@@ -234,6 +245,8 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "folder-plus" => &FOLDER_PLUS,
         "sun" => &SUN,
         "moon" => &MOON,
+        "crescent" => &CRESCENT,
+        "chip" => &CHIP,
         "alert" => &ALERT,
         "pin" => &PIN,
         "pin-on" => &PIN_ON,
@@ -262,5 +275,54 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "crew" => &CREW,
         "copy" => &COPY,
         _ => &CHECK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every number in `body`, for a path made only of `M`, `h`, `v` and `z` style commands.
+    fn numbers(body: &str) -> Vec<f32> {
+        let mut found = Vec::new();
+        let mut current = String::new();
+        for c in body.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_digit() || c == '.' || (c == '-' && current.is_empty()) {
+                current.push(c);
+            } else {
+                if let Ok(n) = current.parse() {
+                    found.push(n);
+                }
+                current.clear();
+                if c == '-' {
+                    current.push(c);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn strict_glyphs_are_built_from_whole_two_unit_cells() {
+        // At 18 pt on a 2x display one unit is 1.5 device pixels, so an odd coordinate lands
+        // on half a pixel and blurs. Every coordinate and length in these glyphs is even.
+        let strict: [(&str, &Icon); 8] = [
+            ("clock", &CLOCK),
+            ("lightbulb", &LIGHTBULB),
+            ("pencil", &PENCIL),
+            ("paperclip", &PAPERCLIP),
+            ("crescent", &CRESCENT),
+            ("chip", &CHIP),
+            ("settings", &SETTINGS),
+            ("moon", &MOON),
+        ];
+        for (name, glyph) in strict {
+            let all = numbers(glyph.body);
+            assert!(!all.is_empty(), "{name} has no path");
+            // The wrapper's own `<g fill="currentColor">` carries no digits.
+            for n in all {
+                assert!(n % 2.0 == 0.0, "{name} has the odd coordinate {n}");
+            }
+        }
     }
 }

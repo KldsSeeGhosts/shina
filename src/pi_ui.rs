@@ -130,6 +130,11 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .w_full()
                         .min_h(32.0)
                         .max_h(72.0)
+                        .px(8.0)
+                        .py(6.0)
+                        .radius(6.0)
+                        .fill(p.card)
+                        .field_focus(&t.reply, p)
                         .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
                         .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false)),
                 )

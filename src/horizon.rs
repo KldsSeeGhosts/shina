@@ -74,6 +74,9 @@ impl Lcg {
     }
 }
 
+/// How far a captain's backdrop pulls the lowest sky step from its own colour.
+const BACKDROP_TINT: f32 = 0.4;
+
 /// Rows of sea at the foot of a band: crest, two of water and the rest deep.
 const SEA_ROWS: usize = 8;
 
@@ -173,7 +176,8 @@ pub fn strip(width: f32, height: f32, night: bool) -> Vec<Rect> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Subject {
     Boat,
-    /// A captain's home: the sky takes this colour (a portrait's backdrop) and no boat sails.
+    /// A captain's home: no boat sails, and the sky's lowest step takes some of this colour
+    /// (a portrait's backdrop).
     Sky(Rgb),
 }
 
@@ -182,27 +186,24 @@ pub fn band(width: f32, height: f32, night: bool, subject: Subject) -> Vec<Rect>
     let palette = if night { &NIGHT } else { &DAY };
     let mut grid = Grid::new(width, height);
     let waterline = grid.rows.saturating_sub(SEA_ROWS);
-    // The sky, in four flat steps.
-    let (top, bottom) = match subject {
-        Subject::Boat => (palette.sky_top, palette.sky_bottom),
-        Subject::Sky(backdrop) => {
-            let shade = if night {
-                [0x0a, 0x0f, 0x1c]
-            } else {
-                [0xff, 0xff, 0xff]
-            };
-            (mix(backdrop, shade, 0.45), backdrop)
-        }
-    };
+    // The sky, in four flat steps. A captain's home keeps the day or night sky and tints only
+    // the step above the sea with the portrait's backdrop, so the band still reads as the same
+    // place and the captain's colour shows as a glow at the horizon.
     let steps = 4;
     for step in 0..steps {
         let from = waterline * step / steps;
         let to = waterline * (step + 1) / steps;
         let t = step as f32 / (steps - 1) as f32;
-        let color = match (night, subject) {
-            (true, Subject::Boat) => NIGHT_STEPS[step],
-            _ => mix(top, bottom, t),
+        let mut color = if night {
+            NIGHT_STEPS[step]
+        } else {
+            mix(palette.sky_top, palette.sky_bottom, t)
         };
+        if let Subject::Sky(backdrop) = subject
+            && step == steps - 1
+        {
+            color = mix(color, backdrop, BACKDROP_TINT);
+        }
         grid.fill_rows(from, to, color);
     }
     let cols = grid.cols as i32;
@@ -326,12 +327,27 @@ mod tests {
     }
 
     #[test]
-    fn a_captain_band_takes_the_backdrop_and_sails_no_boat() {
+    fn a_captain_band_keeps_the_sky_and_tints_only_its_lowest_step() {
         let backdrop = [0x6a, 0x94, 0xc0];
-        let rects = band(600.0, 108.0, false, Subject::Sky(backdrop));
-        assert!(rects.iter().any(|r| r.color == backdrop));
-        let boat = band(600.0, 108.0, false, Subject::Boat);
-        assert!(boat.len() > rects.len());
+        for night in [false, true] {
+            let tinted = band(600.0, 108.0, night, Subject::Sky(backdrop));
+            let plain = band(600.0, 108.0, night, Subject::Boat);
+            // Column 2 has no scenery in the sky: read each of the four steps there.
+            let waterline = 108.0 - SEA_ROWS as f32 * CELL;
+            let step = |rects: &[Rect], n: usize| {
+                covered(rects, 1.0, waterline * (n as f32 + 0.5) / 4.0).unwrap()
+            };
+            for n in 0..3 {
+                assert_eq!(step(&tinted, n), step(&plain, n), "night {night} step {n}");
+            }
+            let low = step(&tinted, 3);
+            assert_eq!(low, mix(step(&plain, 3), backdrop, BACKDROP_TINT));
+            assert_ne!(low, step(&plain, 3));
+            assert!(
+                plain.len() > tinted.len(),
+                "the boat is drawn only on the new-thread screen"
+            );
+        }
     }
 
     #[test]

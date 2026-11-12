@@ -107,10 +107,12 @@ fn palette(dark: bool) -> Palette {
             card: color("#1d2a45"),
             line: color("#f4efe3").alpha(0.12),
             ink: color("#f4efe3"),
-            muted: color("#9fb0cc"),
-            faint: color("#9dafca"),
+            // Muted and faint are two steps, 6.3:1 and 4.6:1 on a hovered card, so the quiet text
+            // still reads as quieter than the secondary text.
+            muted: color("#b8c7e0"),
+            faint: color("#98aac5"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
-            selected: color("#9fb0cc").alpha(0.07),
+            selected: color("#9fb0cc").alpha(0.06),
             row: color("#1d2a45").alpha(0.85),
             coral: color("#e07a54"),
             coral_bg: color("#e07a54").alpha(0.16),
@@ -255,6 +257,20 @@ const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
 /// Workers sit a step below their captain: shorter rows on the captain's rail.
 const CREW_ROW: f32 = 30.0;
 
+/// A text field's focus look, shared by every field: a coral caret, and a border that is 1 px
+/// `field_line` at rest and 2 px coral while the field has focus. Put it on the box that draws
+/// the field's edge.
+trait FieldFocus {
+    fn field_focus(self, edit: &rune::TextEdit, p: Palette) -> Self;
+}
+impl FieldFocus for El {
+    fn field_focus(self, edit: &rune::TextEdit, p: Palette) -> Self {
+        self.caret(p.coral, p.coral_bg).border(
+            if edit.focused { 2.0 } else { 1.0 },
+            if edit.focused { p.coral } else { p.field_line },
+        )
+    }
+}
 fn text_input(edit: &rune::TextEdit, style: TextStyle) -> El {
     rune::text_input(edit, style).on_input_key(|s: &mut State, event, _| s.undo_key(event, true))
 }
@@ -288,10 +304,19 @@ fn framed(el: El, p: Palette) -> El {
 fn outlined(el: El, p: Palette) -> El {
     el.border(1.0, p.frame)
 }
+/// An opaque colour from sRGB bytes, without going through a hex string.
+fn rgb_bytes([red, green, blue]: [u8; 3]) -> Color {
+    let linear = |byte: u8| rune::color::srgb_decode(f32::from(byte) / 255.0);
+    Color {
+        r: linear(red),
+        g: linear(green),
+        b: linear(blue),
+        a: 1.0,
+    }
+}
 /// A scene from `horizon` as one shape of flat rectangles.
 fn scenery(rects: &[crate::horizon::Rect]) -> Shape {
     rects.iter().fold(Shape::new(), |shape, r| {
-        let [red, green, blue] = r.color;
         shape.fill(
             vec![
                 [r.x, r.y],
@@ -299,7 +324,7 @@ fn scenery(rects: &[crate::horizon::Rect]) -> Shape {
                 [r.x + r.w, r.y + r.h],
                 [r.x, r.y + r.h],
             ],
-            color(&format!("#{red:02x}{green:02x}{blue:02x}")),
+            rgb_bytes(r.color),
         )
     })
 }
@@ -307,7 +332,7 @@ fn scenery(rects: &[crate::horizon::Rect]) -> Shape {
 /// a pixel frame. The frame is an overlay, so the scenery cannot paint over it.
 ///
 /// The scenery is rebuilt only when the width, the theme or a captain's backdrop changes. Its
-/// polygons and colour strings are the costly part, and nothing else in the view moves them.
+/// polygons are the costly part, and nothing else in the view moves them.
 fn horizon_band(width: f32, dark: bool, subject: crate::horizon::Subject, p: Palette) -> El {
     let backdrop = match subject {
         crate::horizon::Subject::Boat => (false, [0u8; 3]),
@@ -348,15 +373,26 @@ const SEA_HEIGHT: f32 = 27.0;
 /// A portrait in a pixel frame. The image sits under a border overlay, because Rune paints a
 /// clipped image over its own border. Below 30 px the frame is 1 px so the face keeps its room.
 fn pixel_portrait(pixels: &rune::Pixels, size: f32, p: Palette) -> El {
-    pixel_portrait_framed(pixels, size, p, p.portrait_frame)
+    pixel_portrait_framed(pixels, size, p, None)
 }
-/// `pixel_portrait` with its frame in another colour, for a selected portrait. The frame keeps
-/// its width, so the outer bounds do not change.
-fn pixel_portrait_framed(pixels: &rune::Pixels, size: f32, p: Palette, edge: Color) -> El {
+/// `pixel_portrait` with an accent for a selected portrait: the frame and the hard shadow both
+/// take that colour. The frame keeps its width and the shadow lies outside the box, so the
+/// outer bounds do not change.
+fn pixel_portrait_framed(
+    pixels: &rune::Pixels,
+    size: f32,
+    p: Palette,
+    accent: Option<Color>,
+) -> El {
     let (radius, frame) = if size >= 30.0 { (4.0, 2.0) } else { (2.0, 1.0) };
+    let edge = accent.unwrap_or(p.portrait_frame);
+    let mut shadow = hard_shadow(p);
+    if let Some(accent) = accent {
+        shadow.color = accent;
+    }
     el().size(size, size)
         .radius(radius)
-        .box_shadow(hard_shadow(p))
+        .box_shadow(shadow)
         .child(
             el().size(size, size)
                 .radius(radius)
@@ -593,6 +629,9 @@ fn timer_label(seconds: u64) -> String {
     }
 }
 
+/// The chat pane rounds its top corners and runs square to the window's bottom edge.
+const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
+
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
     cx.foreground(p.ink);
@@ -652,12 +691,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let padding = (leading - 8.0).max(8.0);
         // The header runs to the sidebar's edge, so the attention badge, which sits at its end,
         // has room beside the 22 px wordmark in a 232 px sidebar, with 8 px between the mark and the name.
-        let line = sidebar_width - padding - 2.0;
+        let line = sidebar_width - padding - HEADER_TAB_GAP;
         top = top.child(
             sidebar_header(s, p, compact, line)
                 .w(sidebar_width)
                 .pl(padding)
-                .pr(2.0),
+                .pr(HEADER_TAB_GAP),
         );
     } else {
         top = top.pl(leading.max(8.0));
@@ -669,7 +708,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .layout_with("thread-tabs", |r| r[2])
         .unwrap_or((s.viewport_width - 400.0).max(200.0));
     top = top.child(header(s, p, narrow, tabs_width).grow(1.0).min_w(0.0));
-    let mut workspace = row().grow(1.0).min_h(0.0).px(8.0).pb(8.0);
+    // The pane and the sidebar's sea strip both run to the window's bottom edge, so the bottom
+    // of the window is one edge, not a strip under the pane and another under the sidebar.
+    let mut workspace = row().grow(1.0).min_h(0.0).px(8.0);
     if docked {
         workspace = workspace.child(sidebar(s, p, sidebar_width));
         if !compact {
@@ -719,8 +760,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .min_h(0.0)
         .fill(p.panel)
-        .radius(6.0)
-        .clip_rounded(6.0);
+        .corners(PANE_CORNERS)
+        .clip_corners(PANE_CORNERS);
     // A captain home shows its Brief instead of session details: beside the chat, or as a
     // sheet over it on a narrow window.
     let brief = s.show_activity && captain_ui::brief_captain(s).is_some();
@@ -764,7 +805,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // The pane's 1 px `line` border sits over its content, which would otherwise paint across it.
     pane = pane.child(
         el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .radius(6.0)
+            .corners(PANE_CORNERS)
             .border(1.0, p.line)
             .a11y_hidden(),
     );
@@ -906,11 +947,6 @@ fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
         view: 257.0,
         body: r##"<path fill="#d97757" d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"/>"##,
     };
-    static CHIP: Icon = Icon {
-        name: "CHIP",
-        view: 16.0,
-        body: r#"<rect x="4" y="4" width="8" height="8" rx="1.5" fill="none" stroke="currentColor"/><path d="M6.5 2v2M9.5 2v2M6.5 12v2M9.5 12v2M2 6.5h2M2 9.5h2M12 6.5h2M12 9.5h2" stroke="currentColor" stroke-linecap="round"/>"#,
-    };
     match vendor {
         Vendor::Antigravity => el()
             .size(size, size)
@@ -918,7 +954,9 @@ fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
             .a11y_hidden(),
         Vendor::OpenAi => rune::icon(&OPENAI, size).color(p.ink).a11y_hidden(),
         Vendor::Anthropic => rune::icon(&CLAUDE, size).a11y_hidden(),
-        Vendor::Other => rune::icon(&CHIP, size).color(p.muted).a11y_hidden(),
+        Vendor::Other => rune::icon(&pixel_icons::CHIP, size)
+            .color(p.muted)
+            .a11y_hidden(),
     }
 }
 
@@ -1374,6 +1412,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 .px(10.0)
                 .radius(4.0)
                 .fill(p.selected)
+                .field_focus(&s.model_search, p)
                 .grow(1.0)
                 .min_w(0.0)
                 .child(icon("search", p.muted))
@@ -1645,6 +1684,8 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32) -> El {
         .child(spacer())
         .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
 }
+/// The space between the attention badge, at the header's end, and the first tab.
+const HEADER_TAB_GAP: f32 = 12.0;
 /// The space between the mark and the wordmark. The toggle and the mark touch their boxes.
 const WORDMARK_GAP: f32 = 8.0;
 const HEADER_TOGGLE: f32 = 24.0;
@@ -1733,10 +1774,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .grow(1.0)
                     .min_w(0.0)
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
-                    .border(
-                        if s.search.focused { 2.0 } else { 1.0 },
-                        if s.search.focused { p.coral } else { p.line },
-                    )
+                    .field_focus(&s.search, p)
                     .hover(p.selected)
                     .child(icon("search", p.muted))
                     .child(
@@ -2047,6 +2085,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(row) = update_row(s, p) {
         side = side.child(row);
     }
+    if let Some(notice) = &s.machines.auto_notice
+        && s.machines.notice.as_ref() == Some(notice)
+    {
+        side = side.child(machine_notice(notice, p));
+    }
     if let Some(error) = &s.lifecycle_error {
         side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
     }
@@ -2108,8 +2151,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .child(spacer()),
     );
     // The waterline of the app: a sea strip the footer icons sit above. It bleeds to the
-    // window's left and bottom edges (the workspace inset is 8 px) and runs the sidebar's full
-    // width, with square corners.
+    // window's left edge (the workspace inset is 8 px), sits on the window's bottom edge like
+    // the chat pane, and runs the sidebar's full width, with square corners.
     let bleed = width + 8.0;
     let dark = s.dark;
     side = side.child(rune::memo(
@@ -2120,7 +2163,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .w(bleed)
                 .h(SEA_HEIGHT)
                 .ml(-8.0)
-                .mb(-8.0)
                 .shape(scenery(&crate::horizon::strip(bleed, SEA_HEIGHT, dark)))
                 .a11y_hidden()
         },
@@ -2275,18 +2317,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(
-                            if projects.clone_source.focused {
-                                2.0
-                            } else {
-                                1.0
-                            },
-                            if projects.clone_source.focused {
-                                p.coral
-                            } else {
-                                p.field_line
-                            },
-                        )
+                        .field_focus(&projects.clone_source, p)
                         .disabled(cloning)
                         .on_edit(|s: &mut State| &mut s.projects.clone_source)
                         .on_submit(|s: &mut State, _| s.start_clone()),
@@ -2335,18 +2366,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                     .single_line()
                     .w_full()
                     .padding(8.0)
-                    .border(
-                        if s.machines.project_path.focused {
-                            2.0
-                        } else {
-                            1.0
-                        },
-                        if s.machines.project_path.focused {
-                            p.coral
-                        } else {
-                            p.field_line
-                        },
-                    )
+                    .field_focus(&s.machines.project_path, p)
                     .color(p.ink)
                     .on_edit(|s: &mut State| &mut s.machines.project_path),
             );
@@ -2407,6 +2427,27 @@ fn clone_dialog(s: &State, p: Palette) -> El {
             }
         })
         .child(card)
+}
+
+/// The one notice for linked machines this desktop cannot reach: a framed card with a brass
+/// mark and a pixel-type label. It goes away when the connections are ready again.
+fn machine_notice(text: &str, p: Palette) -> El {
+    outlined(
+        row()
+            .key("machine-unreachable")
+            .role("status")
+            .label(text)
+            .mx(8.0)
+            .mb(8.0)
+            .px(8.0)
+            .py(7.0)
+            .gap(8.0)
+            .radius(4.0)
+            .fill(p.card)
+            .child(el().size(8.0, 8.0).mt(3.0).fill(p.brass).a11y_hidden())
+            .child(pixel_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
+        p,
+    )
 }
 
 /// Shown only while an update is on its way or waits for a restart. Downloading is passive;
@@ -2529,7 +2570,7 @@ fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> E
     portrait_avatar(s, p, portrait, size, status)
 }
 fn portrait_avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
-    portrait_face(s, p, captain, size, status, p.portrait_frame)
+    portrait_face(s, p, captain, size, status, None)
 }
 fn portrait_face(
     s: &State,
@@ -2537,11 +2578,11 @@ fn portrait_face(
     captain: usize,
     size: f32,
     status: Status,
-    edge: Color,
+    accent: Option<Color>,
 ) -> El {
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let pixels = s.artwork.face_pixels(captain, face_for(status), size);
-    let portrait = pixel_portrait_framed(&pixels, size, p, edge)
+    let portrait = pixel_portrait_framed(&pixels, size, p, accent)
         .key(format!("avatar-{captain}-{}", size as u32))
         .a11y_hidden();
     status_badge(p, portrait, size, status)
@@ -2558,9 +2599,10 @@ const CAPTAIN_FACE: f32 = 40.0;
 /// badge arriving never moves the name.
 /// The widest a machine name and its connection note grow beside a workspace or a detail.
 const MACHINE_CAP: f32 = 110.0;
-/// The least a machine name keeps when a row is tight: about seven characters and the ellipsis.
-const MACHINE_FLOOR: f32 = 48.0;
 const BADGE_SLOT: f32 = 28.0;
+/// What a captain row spends beside its text: left padding, the portrait slot, the gap and the
+/// right padding.
+const CAPTAIN_TEXT_INSET: f32 = 6.0 + CAPTAIN_SLOT + 10.0 + 8.0;
 /// Room for "59m 59s" at the end of the status line.
 const TIMER_SLOT: f32 = 48.0;
 const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
@@ -2594,8 +2636,8 @@ fn sidebar_portrait(
         })
 }
 
-/// What a count badge counts. Brass is for what needs you, coral for what is unread, and sea
-/// for work in progress.
+/// What a count badge counts. Brass is for what needs you, sea for work in progress, and the
+/// neutral card fill with ink digits for what is unread. Coral stays for the one primary action.
 #[derive(Clone, Copy)]
 pub(crate) enum CountKind {
     NeedsYou,
@@ -2611,7 +2653,7 @@ fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
     };
     let (fill, ink, frame) = match kind {
         CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
-        CountKind::Unread => (p.coral, p.on_coral, p.frame),
+        CountKind::Unread => (p.card, p.ink, p.frame),
         CountKind::Working => (p.sea_bg, p.sea, p.sea),
     };
     // A square with Departure Mono digits and a 1 px frame, no shadow.
@@ -2690,14 +2732,6 @@ fn captain_row(
             format!("{detail}, {workspace}")
         };
     }
-    if s.client.is_some() {
-        let machine = machine_caption(s, &s.machines.selected);
-        detail = if detail.is_empty() {
-            machine
-        } else {
-            format!("{detail}, {machine}")
-        };
-    }
     let timer = (status == Status::Running)
         .then(|| running.iter().filter_map(|t| t.started).min())
         .flatten();
@@ -2715,13 +2749,38 @@ fn captain_row(
     if !detail.is_empty() {
         status_line = status_line.child(
             label(detail.clone(), CAPTAIN_STATUS, p.muted)
+                .key(format!("captain-detail-{id}"))
                 .truncate()
                 .shrink()
                 .grow(1.0)
-                .min_w(0.0),
+                .min_w(workspace_floor(
+                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                    // The status word, three gaps, the machine icon and the timer slot.
+                    status.label().chars().count() as f32 * 6.6
+                        + 24.0
+                        + if multiple_machines(s) { ICON } else { 0.0 }
+                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                )),
         );
     } else {
         status_line = status_line.child(spacer());
+    }
+    if multiple_machines(s) {
+        status_line = status_line.child(machine_tag(
+            s,
+            p,
+            &s.machines.selected,
+            format!("captain-machine-{id}"),
+            CAPTAIN_STATUS,
+            room_for_machine_name(
+                sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                status.label().chars().count() as f32 * 6.6
+                    + 24.0
+                    + ICON
+                    + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                &detail,
+            ),
+        ));
     }
     if let Some(start) = timer {
         status_line = status_line.child(
@@ -2773,6 +2832,9 @@ fn captain_row(
     let mut description = format!("{name}, {}", status.label());
     if !detail.is_empty() {
         description.push_str(&format!(", {detail}"));
+    }
+    if multiple_machines(s) {
+        description.push_str(&format!(", {}", machine_caption(s, &s.machines.selected)));
     }
     if unread > 0 {
         description.push_str(&format!(", {unread} unread"));
@@ -2956,7 +3018,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .as_ref()
                 .map(|w| format!(", {w}"))
                 .unwrap_or_default(),
-            if s.client.is_some() {
+            if multiple_machines(s) {
                 format!(", {}", machine_caption(s, &s.machines.selected))
             } else {
                 String::new()
@@ -3219,15 +3281,21 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                         CARD_META,
                         p.muted,
                     )
+                    .key(format!("thread-workspace-{id}"))
                     .truncate()
                     .shrink()
                     .min_w(0.0),
                 )
-                .child(if s.client.is_some() {
-                    label(machine_caption(s, &s.machines.selected), CARD_META, p.faint)
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0)
+                .child(spacer())
+                .child(if multiple_machines(s) {
+                    machine_tag(
+                        s,
+                        p,
+                        &s.machines.selected,
+                        format!("thread-machine-{id}"),
+                        CARD_META,
+                        false,
+                    )
                 } else {
                     el()
                 }),
@@ -3316,16 +3384,80 @@ fn workspace_named_by_filter(s: &State, server: &str, project: Option<usize>) ->
             ProjectScope::All => false,
         }
 }
+/// A machine's name for labels and tooltips. Whether this desktop can reach it is not part of
+/// a row; it shows as one notice and in the open thread (`State::unreachable_machines`).
 fn machine_caption(s: &State, server: &str) -> String {
-    format!(
-        "{}{}",
-        s.machine_label(server),
-        if s.machine_connected(server) {
-            ""
-        } else {
-            ", offline"
-        }
-    )
+    s.machine_label(server)
+}
+
+/// Whether more than one machine is linked, so rows say which machine they belong to.
+fn multiple_machines(s: &State) -> bool {
+    s.client
+        .as_ref()
+        .is_some_and(|client| !client.linked.is_empty())
+}
+
+/// The least width a workspace name keeps beside a status word: ten characters of 12 px text.
+const WORKSPACE_FLOOR: f32 = 64.0;
+
+/// A sidebar row's width in points, from the sidebar setting and the last window width.
+fn sidebar_row_width(s: &State) -> f32 {
+    let sidebar = if s.viewport_width < 1050.0 {
+        s.sidebar_width.min(216.0)
+    } else {
+        s.sidebar_width
+    };
+    sidebar - 8.0
+}
+
+/// The workspace floor for a row whose other items take `taken` of its `row` width: the full
+/// ten characters when the row allows, and only what is left in a narrow sidebar. Nothing is
+/// held back from the status word, the machine icon or the timer, so a row never overflows.
+fn workspace_floor(row: f32, taken: f32) -> f32 {
+    (row - taken).clamp(0.0, WORKSPACE_FLOOR)
+}
+
+/// A linked machine on a row: its icon, then its name. The name gives way first and can drop
+/// out, which leaves the icon alone. Rows never show whether the machine is reachable.
+fn machine_tag(
+    s: &State,
+    p: Palette,
+    server: &str,
+    key: String,
+    style: TextStyle,
+    show_name: bool,
+) -> El {
+    let caption = machine_caption(s, server);
+    let mut tag = row()
+        .key(key)
+        .role("img")
+        .label(caption.clone())
+        .help(caption)
+        .gap(2.0)
+        .center_y()
+        .shrink()
+        .min_w(ICON)
+        .max_w(MACHINE_CAP)
+        .child(icon("monitor", p.faint));
+    // A name with no room would show as a bare ellipsis, so it is left out instead.
+    if show_name {
+        tag = tag.child(
+            label(s.machine_label(server), style, p.faint)
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+                .a11y_hidden(),
+        );
+    }
+    tag
+}
+
+/// Whether a row has 36 points to spare for a machine name after its other items and the
+/// workspace, which takes its text (estimated at 6.2 points a character) or its floor,
+/// whichever is wider.
+fn room_for_machine_name(row: f32, taken: f32, workspace: &str) -> bool {
+    let text = workspace.chars().count() as f32 * 6.2;
+    row - taken - text.max(workspace_floor(row, taken)) >= 36.0
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -3509,8 +3641,8 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .on_press(move |s: &mut State| {
                         s.captain_editor.as_mut().unwrap().portrait = portrait;
                     })
-                    // The selected portrait's own 2 px frame turns coral. There is no ring or
-                    // wash around it, so all twelve keep the same outer bounds.
+                    // The selected portrait's own 2 px frame and hard shadow turn coral. There is
+                    // no ring or wash around it, so all twelve keep the same outer bounds.
                     .child(
                         portrait_face(
                             s,
@@ -3518,7 +3650,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                             portrait,
                             PICKER_PORTRAIT,
                             Status::Ready,
-                            if selected { p.coral } else { p.portrait_frame },
+                            selected.then_some(p.coral),
                         )
                         // The editor's header shows the chosen portrait at the same size.
                         .key(format!("captain-portrait-face-{portrait}")),
@@ -3608,14 +3740,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .padding(8.0)
                     .radius(6.0)
                     .fill(field)
-                    .border(
-                        if editor.name.focused { 2.0 } else { 1.0 },
-                        if editor.name.focused {
-                            p.coral
-                        } else {
-                            p.field_line
-                        },
-                    )
+                    .field_focus(&editor.name, p)
                     .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name),
             ),
         )
@@ -3635,14 +3760,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(
-                            if editor.role.focused { 2.0 } else { 1.0 },
-                            if editor.role.focused {
-                                p.coral
-                            } else {
-                                p.field_line
-                            },
-                        )
+                        .field_focus(&editor.role, p)
                         .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
                 ),
         )
@@ -3663,18 +3781,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .padding(8.0)
                         .radius(6.0)
                         .fill(field)
-                        .border(
-                            if editor.instructions.focused {
-                                2.0
-                            } else {
-                                1.0
-                            },
-                            if editor.instructions.focused {
-                                p.coral
-                            } else {
-                                p.field_line
-                            },
-                        )
+                        .field_focus(&editor.instructions, p)
                         .on_edit(|s: &mut State| {
                             &mut s.captain_editor.as_mut().unwrap().instructions
                         }),
@@ -3786,10 +3893,16 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
 }
 
 const TAB_GAP: f32 = 4.0;
+/// A tab is 32 pt tall, so in the 40 pt top strip its bottom frame sits 4 pt above the chat
+/// pane's top rule, the same distance as its top edge sits below the window edge.
+const TAB_HEIGHT: f32 = 32.0;
 /// Below this a tab drops its workspace prefix and keeps the title.
 const TAB_PREFIX_WIDTH: f32 = 170.0;
 /// The narrowest a tab gets before the strip scrolls.
 const TAB_MIN_WIDTH: f32 = 120.0;
+/// Tabs are packed from the left and stop growing here, so a few tabs do not sit in wide empty
+/// slots.
+const TAB_MAX_WIDTH: f32 = 260.0;
 /// Inter 13/520, the title in a tab.
 const TAB_TITLE: TextStyle = TextStyle::new(13.0, 520.0);
 /// A tab's look. The active tab is a `card` with a pixel frame (no shadow) and a 2 px coral bar
@@ -3839,7 +3952,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                         tab_frame(
                             row()
                                 .key("active-tab")
-                                .h(28.0)
+                                .h(TAB_HEIGHT)
                                 .gap(8.0)
                                 .px(8.0)
                                 .min_w(0.0)
@@ -3887,7 +4000,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
         .count()
         .max(1) as f32;
     let tab_width = ((tabs_width + TAB_GAP) / count - TAB_GAP)
-        .clamp(TAB_MIN_WIDTH, if narrow { 210.0 } else { 285.0 });
+        .clamp(TAB_MIN_WIDTH, if narrow { 210.0 } else { TAB_MAX_WIDTH });
     for &id in &s.tabs {
         let Some(index) = s.threads.iter().position(|t| t.id == id) else {
             continue;
@@ -3913,7 +4026,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .gap(8.0)
                 .pl(8.0)
                 .pr(if s.tabs.len() > 1 { 2.0 } else { 8.0 })
-                .h(28.0)
+                .h(TAB_HEIGHT)
                 .radius(4.0)
                 .w(tab_width)
                 .min_w(tab_width)
@@ -3962,7 +4075,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
         .gap(6.0)
         .child(tabs)
         .child(new_tab_button(p))
-        .child(reveal_active_tab(s, tab_width))
+        .child(reveal_active_tab(s, tab_width, tabs_width))
 }
 
 /// Scrolls the strip so the active tab shows whole, each time the selection, the tab list or
@@ -3970,12 +4083,14 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
 /// A new key is a new element, and it reports once when it first shows, which runs the scroll.
 /// (`on_visible` on the tab itself only fires once half the tab shows, too late for a tab
 /// that starts off screen.)
-fn reveal_active_tab(s: &State, tab_width: f32) -> El {
+fn reveal_active_tab(s: &State, tab_width: f32, tabs_width: f32) -> El {
     use std::hash::{Hash, Hasher};
     let mut signature = std::collections::hash_map::DefaultHasher::new();
     s.tabs.hash(&mut signature);
     s.threads.get(s.active).map(|t| t.id).hash(&mut signature);
     (tab_width.round() as i32).hash(&mut signature);
+    // Tabs stop shrinking at their minimum, so the strip's own width must change the key too.
+    (tabs_width.round() as i32).hash(&mut signature);
     el().key(format!("tab-reveal-{:x}", signature.finish()))
         .absolute(0.0, 0.0)
         .size(1.0, 1.0)
@@ -3998,7 +4113,7 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
         .px(10.0)
         .center_y()
         .gap(4.0);
-    if s.client.is_some() {
+    if multiple_machines(s) {
         let server = &s.machines.selected;
         header = header.child(
             row()
@@ -4008,22 +4123,10 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
                 .min_w(0.0)
                 .child(icon("monitor", p.muted))
                 .child(
-                    label(
-                        format!(
-                            "{}{}",
-                            s.machine_label(server),
-                            if s.machine_connected(server) {
-                                ""
-                            } else {
-                                ", offline"
-                            }
-                        ),
-                        SMALL,
-                        p.muted,
-                    )
-                    .truncate()
-                    .min_w(0.0)
-                    .shrink(),
+                    label(s.machine_label(server), SMALL, p.muted)
+                        .truncate()
+                        .min_w(0.0)
+                        .shrink(),
                 ),
         );
     }
@@ -4045,7 +4148,25 @@ fn chat_header(s: &State, p: Palette, _: bool, _: bool) -> El {
     if let Some(line) = captain_ui::away_status(s, p) {
         header = header.child(line);
     }
-    header = header.child(spacer()).child(if s.demo {
+    header = header.child(spacer());
+    // The thread on a machine this desktop cannot reach says so beside its status.
+    if let Some(machine) = s.unreachable_selected() {
+        let text = format!("{machine} is unreachable. Reconnecting.");
+        header = header.child(
+            row()
+                .key("chat-unreachable")
+                .role("status")
+                .label(text.clone())
+                .gap(6.0)
+                .center_y()
+                .min_w(0.0)
+                .shrink()
+                .mr(8.0)
+                .child(status_mark(Status::Waiting, p, 6.0))
+                .child(pixel_text(text, p.brass).truncate().shrink().min_w(0.0)),
+        );
+    }
+    header = header.child(if s.demo {
         outlined(
             row()
                 .key("demo-badge")
@@ -4415,14 +4536,7 @@ fn snooze_menu(s: &State, p: Palette) -> El {
                     .padding(8.0)
                     .radius(6.0)
                     .fill(if s.dark { p.bg } else { p.panel })
-                    .border(
-                        if s.snooze_edit.focused { 2.0 } else { 1.0 },
-                        if s.snooze_edit.focused {
-                            p.coral
-                        } else {
-                            p.field_line
-                        },
-                    )
+                    .field_focus(&s.snooze_edit, p)
                     .on_edit(|s: &mut State| &mut s.snooze_edit),
             )
             .child(button("snooze-custom-save", "Snooze", p, move |s| {
@@ -4672,14 +4786,7 @@ fn thread_dialog(s: &State, p: Palette) -> El {
                 .padding(8.0)
                 .radius(6.0)
                 .fill(if s.dark { p.bg } else { p.panel })
-                .border(
-                    if s.rename_edit.focused { 2.0 } else { 1.0 },
-                    if s.rename_edit.focused {
-                        p.coral
-                    } else {
-                        p.field_line
-                    },
-                )
+                .field_focus(&s.rename_edit, p)
                 .on_edit(|s: &mut State| &mut s.rename_edit)
                 .on_submit(|s: &mut State, _| s.save_thread_name()),
         );
@@ -4918,6 +5025,8 @@ fn project_picker(s: &State, p: Palette) -> El {
                 .px(8.0)
                 .gap(10.0)
                 .center_y()
+                .radius(4.0)
+                .field_focus(&s.picker_query, p)
                 .child(
                     el().size(16.0, 16.0)
                         .center()
@@ -5275,6 +5384,8 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .px(8.0)
         .gap(10.0)
         .center_y()
+        .radius(4.0)
+        .field_focus(&s.picker_query, p)
         .child(el().size(16.0, 16.0).center().child(icon(
             if browsing { "folder" } else { "folder-plus" },
             p.muted,
@@ -5522,18 +5633,7 @@ fn remote_project_dialog(s: &State, p: Palette) -> El {
                 .single_line()
                 .w_full()
                 .padding(8.0)
-                .border(
-                    if s.machines.project_path.focused {
-                        2.0
-                    } else {
-                        1.0
-                    },
-                    if s.machines.project_path.focused {
-                        p.coral
-                    } else {
-                        p.field_line
-                    },
-                )
+                .field_focus(&s.machines.project_path, p)
                 .color(p.ink)
                 .on_edit(|s: &mut State| &mut s.machines.project_path),
         )
@@ -6146,9 +6246,12 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             for (index, part) in parts[..=last].iter().enumerate() {
                 if Some(index) != preamble && !(lift_cards && card(part)) {
                     let row = transcript_part(s, p, wide, part);
-                    // Prose between tool rows keeps its paragraph rhythm.
+                    // Prose between tool rows keeps its paragraph rhythm and the lane's one
+                    // left margin. In an expanded turn the tool rows are indented as a group.
                     rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
                         row.py(6.0)
+                    } else if lift_cards {
+                        row.ml(14.0)
                     } else {
                         row
                     });
@@ -6236,13 +6339,9 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 }),
             );
         if expanded {
-            // The indent is deliberate: an expanded turn nests its interim prose and tool rows
-            // under the "Worked for" line, while the final reply sits on the lane.
+            // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
             section = section.child(work_rows(
-                col()
-                    .key(format!("work-rows-{}-{start}", t.id))
-                    .pl(14.0)
-                    .gap(2.0),
+                col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
                 true,
             ));
         }
@@ -6403,7 +6502,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     .py(8.0)
                     .radius(6.0)
                     .fill(p.coral_bg)
-                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.coral))
+                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
                     .child(
                         label(message.display_text(), body_style(wide), p.ink)
                             .wrap_anywhere()
@@ -6675,8 +6774,8 @@ fn image_preview(
     let mut preview = el()
         .key(key)
         .size(width, height)
-        .radius((width.min(height) / 6.0).clamp(4.0, 10.0))
-        .clip_rounded((width.min(height) / 6.0).clamp(4.0, 10.0))
+        .radius(4.0)
+        .clip_rounded(4.0)
         .border(0.5, p.line);
     if let Some(path) = crate::attachments::preview_path_for(image) {
         let handle = s.attachment_cache.file(path, width.max(height), 2.0);
@@ -7308,12 +7407,15 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     area = area.child(pi_ui::queued_messages(s, p));
     // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
     // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
-    let mut card = col()
-        .key("composer")
-        .radius(6.0)
-        .fill(p.card)
-        // The pixel frame turns coral while the composer has focus or a file is over it.
-        .border(
+    // A composer that cannot send has nothing to act on, so it drops the hard shadow and
+    // takes a 1 px `line` outline, as other things that only inform do.
+    let composer_disabled = s.demo || t.archived() || s.unreachable_selected().is_some();
+    let mut card = col().key("composer").radius(6.0).fill(p.card);
+    // The pixel frame turns coral while the composer has focus or a file is over it.
+    card = if composer_disabled {
+        card.border(1.0, p.line)
+    } else {
+        card.border(
             2.0,
             if s.attachment_drop_hover || t.draft.focused {
                 p.coral
@@ -7322,6 +7424,8 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             },
         )
         .box_shadow(hard_shadow(p))
+    };
+    card = card
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
             s.attach_paths(files);
@@ -7346,9 +7450,11 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             .label("Message Pi")
             .placeholder(
                 if s.demo {
-                    "Open a real workspace to send messages"
+                    "Open a real workspace to send messages".to_string()
+                } else if let Some(machine) = s.unreachable_selected() {
+                    format!("{machine} is unreachable. Reconnecting.")
                 } else {
-                    "Ask anything. Shift Enter for a new line"
+                    "Ask anything. Shift Enter for a new line".to_string()
                 },
                 p.muted,
             )
@@ -7529,15 +7635,7 @@ fn machine_picker(s: &State, p: Palette) -> El {
             .flat_map(|client| client.linked.keys().cloned()),
     );
     for server in servers {
-        let title = format!(
-            "{}{}",
-            s.machine_label(&server),
-            if s.machine_connected(&server) {
-                ""
-            } else {
-                ", offline"
-            }
-        );
+        let title = s.machine_label(&server);
         let key = format!("machine-option-{server}");
         menu = menu.child(
             menu_item(
@@ -7585,11 +7683,11 @@ fn machine_dialog(s: &State, p: Palette) -> El {
         .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(pixel_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).border(if s.machines.host.focused { 2.0 } else { 1.0 }, if s.machines.host.focused { p.coral } else { p.field_line }).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.host, p).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.host))
         .child(pixel_label("Pairing code",p.muted))
         .child(text_input(&s.machines.code,BODY).key("machine-code").label("Pairing code").placeholder("PAIRCODE",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).border(if s.machines.code.focused { 2.0 } else { 1.0 }, if s.machines.code.focused { p.coral } else { p.field_line }).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.code, p).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.code))
         .child(primary_button("machine-link-submit","Link machine",p,|s| s.machine_action("link","")).disabled(busy))
         .child(row().flex_wrap().gap(8.0)
@@ -7828,6 +7926,11 @@ fn dialog(s: &State, p: Palette) -> El {
                     .color(p.ink)
                     .min_h(32.0)
                     .max_h(120.0)
+                    .px(8.0)
+                    .py(6.0)
+                    .radius(6.0)
+                    .fill(p.card)
+                    .field_focus(&t.reply, p)
                     .on_edit(|s: &mut State| &mut s.current_mut().reply),
             );
             actions = actions.child(button("dialog-submit", "Submit reply", p, |s| {
@@ -7945,6 +8048,127 @@ pub(crate) mod tests {
             }
             assert!(checked > 0, "{width}: no remote captain rows");
         }
+    }
+
+    #[test]
+    fn fleet_rows_keep_the_workspace_and_end_in_a_machine_tag_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 200.0] {
+                let mut rt = runtime(width);
+                crate::fleet_demo(&mut rt.state);
+                rt.state.sidebar_width = sidebar_width;
+                rt.state.compact_sidebar = width < 760.0;
+                rt.state.dark = false;
+                rt.frame(0.0);
+                rt.frame(1.0);
+                let mut checked = 0;
+                for entry in sidebar_ui::entries(&rt.state) {
+                    let key = |kind: &str| format!("{kind}-{}-{}", entry.server, entry.id);
+                    let Some((row, _)) = rt.presented(&key("machine-thread")) else {
+                        continue;
+                    };
+                    let workspace = rt
+                        .presented(&key(if entry.captain {
+                            "machine-detail"
+                        } else {
+                            "machine-workspace"
+                        }))
+                        .map(|found| found.0);
+                    let Some(workspace) = workspace else {
+                        continue;
+                    };
+                    let (tag, _) = rt.presented(&key("machine-tag")).expect("a machine tag");
+                    // Ten characters where the sidebar is its default width; the narrowest
+                    // sidebars give up some of that but keep about four.
+                    let floor = if sidebar_row_width(&rt.state) >= 240.0 {
+                        WORKSPACE_FLOOR
+                    } else {
+                        24.0
+                    };
+                    assert!(
+                        workspace[2] >= floor - 0.5,
+                        "{width}/{sidebar_width}: the workspace is only {} wide",
+                        workspace[2]
+                    );
+                    assert!(
+                        tag[0] + tag[2] <= row[0] + row[2] + 0.5 && tag[2] >= ICON - 0.5,
+                        "{width}/{sidebar_width}: the machine tag {tag:?} leaves its row {row:?}"
+                    );
+                    assert!(
+                        workspace[0] + workspace[2] <= tag[0] + 0.5,
+                        "{width}/{sidebar_width}: the workspace runs into the machine tag"
+                    );
+                    checked += 1;
+                }
+                assert!(checked > 0, "{width}/{sidebar_width}: no fleet rows");
+            }
+        }
+    }
+
+    #[test]
+    fn demo_machines_never_read_as_offline_and_rows_carry_no_connection_state() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            for server in ["local", "example-studio", "example-laptop"] {
+                assert!(rt.state.machine_connected(server), "{server}");
+            }
+            let tree = rt.accessibility_json().to_string();
+            assert!(!tree.contains("offline"), "{width}: a label says offline");
+            assert!(!tree.contains("unreachable"), "{width}");
+            assert!(rt.presented("machine-unreachable").is_none());
+        }
+    }
+
+    #[test]
+    fn unreachable_machines_raise_one_notice_and_the_open_thread_says_so() {
+        let mut rt = runtime(1280.0);
+        crate::fleet_demo(&mut rt.state);
+        // Real machines, not demo data: their fixture clients are not connected.
+        rt.state.demo = false;
+        let poll = |rt: &mut Runtime<State>| {
+            rt.update(|state, tx| {
+                crate::model::poll(state, 0.0, tx);
+            });
+            rt.invalidate();
+            rt.frame(1.0);
+        };
+        poll(&mut rt);
+        let notice = rt.state.machines.notice.clone().expect("a notice");
+        assert!(
+            notice.contains("Studio")
+                && notice.contains("Laptop")
+                && notice.ends_with("unreachable. Reconnecting."),
+            "{notice}"
+        );
+        assert!(notice.contains(" and "), "one notice lists both: {notice}");
+        assert_eq!(
+            rt.state.machines.auto_notice.as_deref(),
+            Some(notice.as_str())
+        );
+        assert!(rt.presented("machine-unreachable").is_some());
+        // Rows still say nothing about the connection.
+        assert!(!rt.accessibility_json().to_string().contains("offline"));
+        // The open thread on an unreachable machine says so.
+        rt.state.open_machine_thread("example-studio", 3);
+        poll(&mut rt);
+        assert_eq!(rt.state.machines.selected, "example-studio");
+        let tree = rt.accessibility_json();
+        let header = find(&tree, "chat-unreachable").expect("the header says so");
+        assert_eq!(header["name"], "Studio is unreachable. Reconnecting.");
+        // Another message is never replaced or cleared by it.
+        rt.state.machines.notice = Some("Something else".into());
+        poll(&mut rt);
+        assert_eq!(rt.state.machines.notice.as_deref(), Some("Something else"));
+        // The notice clears itself once the machines are ready: none are linked any more.
+        rt.state.machines.notice = rt.state.machines.auto_notice.clone();
+        rt.state.client.as_mut().unwrap().linked.clear();
+        poll(&mut rt);
+        assert!(rt.state.machines.notice.is_none());
+        assert!(rt.presented("machine-unreachable").is_none());
     }
 
     #[test]
@@ -8751,6 +8975,8 @@ pub(crate) mod tests {
                 (p.faint, p.card.mix(p.selected, p.selected.a)),
                 (p.faint, p.code_bg),
                 (p.ink, p.message_bg),
+                // The "Shina" role label sits on the coral wash.
+                (p.ink, p.panel.mix(p.coral_bg, p.coral_bg.a)),
                 (p.muted, p.code_bg),
                 (p.muted, p.bg.mix(p.selected, p.selected.a)),
                 (p.muted, p.card.mix(p.selected, p.selected.a)),
@@ -8776,6 +9002,12 @@ pub(crate) mod tests {
                 );
             }
         }
+        // Night's two quiet inks are different steps, not one colour under two names.
+        let p = palette(true);
+        assert!(
+            (p.muted.luminance() + 0.05) / (p.faint.luminance() + 0.05) >= 1.25,
+            "dark muted and faint text read as the same colour"
+        );
     }
 
     #[test]
@@ -10946,7 +11178,7 @@ pub(crate) mod tests {
                     for id in rt.state.tabs.clone() {
                         let (tab, _) = rt.presented(&tab_key(&rt, id)).unwrap();
                         assert!(
-                            tab[2] >= TAB_MIN_WIDTH - 0.5 && tab[2] <= 285.5,
+                            tab[2] >= TAB_MIN_WIDTH - 0.5 && tab[2] <= TAB_MAX_WIDTH + 0.5,
                             "{label}: {tab:?}"
                         );
                     }
@@ -10964,6 +11196,32 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn narrowing_the_strip_scrolls_a_middle_active_tab_back_into_view() {
+        let mut rt = runtime(1280.0);
+        open_distinct_threads(&mut rt, 12);
+        let middle = rt.state.tabs[rt.state.tabs.len() / 2];
+        let index = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == middle)
+            .unwrap();
+        rt.state.select_thread(index);
+        // Tabs are already at their minimum width at these sizes, so only the strip changes.
+        for width in [1100.0, 980.0, 860.0, 760.0, 700.0] {
+            rt.set_viewport((width, 800.0), 1.0);
+            settle_frames(&mut rt);
+            let (strip, _) = rt.presented("thread-tabs").unwrap();
+            let (active, _) = rt.presented("active-tab").unwrap();
+            assert_eq!(rt.presented("active-tab").unwrap().0[2], TAB_MIN_WIDTH);
+            assert!(
+                active[0] >= strip[0] - 0.5 && active[0] + active[2] <= strip[0] + strip[2] + 0.5,
+                "{width}: the active tab {active:?} is out of view in {strip:?}"
+            );
         }
     }
 
@@ -11029,6 +11287,49 @@ pub(crate) mod tests {
             assert!(
                 (word[2] - WORDMARK_WIDTH).abs() < 1.0 || word[2] < 40.0,
                 "{width}: {word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_narrowest_docked_sidebar_keeps_the_mark_the_badge_and_the_tab_apart() {
+        let mut rt = runtime(1280.0);
+        crate::captain_workspace_demo(&mut rt.state);
+        rt.state.sidebar_width = 200.0;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (sidebar, _) = rt.presented("sidebar").unwrap();
+        assert_eq!(sidebar[2], 200.0);
+        let (logo, _) = rt.presented("shina-logo").unwrap();
+        let (badge, _) = rt.presented("attention-row").unwrap();
+        let (tab, _) = rt.presented("active-tab").unwrap();
+        assert!(logo[0] + logo[2] <= badge[0] + 0.5, "{logo:?} {badge:?}");
+        if let Some((word, _)) = rt.presented("shina-wordmark") {
+            assert!(
+                word[0] + word[2] + 8.0 <= badge[0] + 0.5,
+                "{word:?} {badge:?}"
+            );
+        }
+        assert!((tab[0] - (badge[0] + badge[2]) - HEADER_TAB_GAP).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_first_tab_clears_the_badge_by_12_and_the_pane_rule_by_4() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let rt = crew_runtime(width);
+            let (badge, _) = rt.presented("attention-row").unwrap();
+            let (tab, _) = rt.presented("active-tab").unwrap();
+            assert!(
+                (tab[0] - (badge[0] + badge[2]) - HEADER_TAB_GAP).abs() < 0.5,
+                "{width}: the badge sits {} pt before the first tab",
+                tab[0] - (badge[0] + badge[2])
+            );
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            assert!(
+                (pane[1] - (tab[1] + tab[3]) - 4.0).abs() < 0.5,
+                "{width}: the tab ends {} pt above the pane",
+                pane[1] - (tab[1] + tab[3])
             );
         }
     }

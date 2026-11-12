@@ -18,7 +18,10 @@ const PANEL_WIDTH: f32 = 320.0;
 /// Below this window width (ui.rs's `narrow`) the Brief is a sheet over the chat.
 const SHEET_BELOW: f32 = 1050.0;
 /// Rows, chips and inputs share this corner.
-const ROW_RADIUS: f32 = 10.0;
+/// Rows, buttons and chips.
+const ROW_RADIUS: f32 = 4.0;
+/// Cards.
+const CARD_RADIUS: f32 = 6.0;
 /// Essential memory enters the captain's context under this UTF-8 budget (see memory.rs).
 const ESSENTIAL_BUDGET: usize = 8 * 1024;
 /// memory.rs labels the essential block with this line, and counts it against the budget.
@@ -83,7 +86,7 @@ fn icon_action(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(6.0)
+        .radius(4.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -137,10 +140,11 @@ fn section(key: &str, title: &str, meta: Option<String>, actions: Vec<El>, p: Pa
         .gap(6.0)
         .center_y()
         .child(pixel_label(title, p.muted));
+    // The count sits at the heading's end, as the sidebar's section counts do.
+    heading = heading.child(spacer());
     if let Some(meta) = meta {
         heading = heading.child(label(meta, TIMER, p.faint));
     }
-    heading = heading.child(spacer());
     for action in actions {
         heading = heading.child(action);
     }
@@ -221,7 +225,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .px(10.0)
                 .py(8.0)
                 .gap(8.0)
-                .radius(ROW_RADIUS)
+                .radius(CARD_RADIUS)
                 .fill(p.danger.alpha(0.08))
                 .child(icon("alert", p.danger))
                 .child(label(error, META, p.danger).wrap().grow(1.0).min_w(0.0))
@@ -492,7 +496,7 @@ fn memory_backend_line(s: &State) -> Option<String> {
     }
 }
 
-fn memory_input(s: &State, p: Palette, edit: &rune::TextEdit, key: String, title: &str) -> El {
+fn memory_input(p: Palette, edit: &rune::TextEdit, key: String, title: &str) -> El {
     text_input(edit, ROW_TEXT)
         .key(key)
         .label(title)
@@ -505,14 +509,7 @@ fn memory_input(s: &State, p: Palette, edit: &rune::TextEdit, key: String, title
         .py(8.0)
         .radius(6.0)
         .fill(p.card)
-        .border(
-            1.0,
-            if s.dark {
-                p.line
-            } else {
-                p.field_line.alpha(0.6)
-            },
-        )
+        .field_focus(edit, p)
 }
 
 fn memory_editor(s: &State, p: Palette, captain: usize, id: Option<String>) -> El {
@@ -549,7 +546,7 @@ fn memory_editor(s: &State, p: Palette, captain: usize, id: Option<String>) -> E
         }
     };
     let submit = save.clone();
-    let field = memory_input(s, p, edit, key, title)
+    let field = memory_input(p, edit, key, title)
         .on_edit(move |s: &mut State| {
             if id.is_some() {
                 &mut s.brief.edit
@@ -609,7 +606,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             .focusable(true)
             .size(24.0, 24.0)
             .center()
-            .radius(6.0)
+            .radius(4.0)
             .hover(hover_wash(s, p))
             .press(active_wash(s, p))
             .on_press(move |s: &mut State| {
@@ -662,33 +659,41 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
         .radius(ROW_RADIUS)
         .hover(hover_wash(s, p))
         .hover_motion(motion(), motion())
+        // The edit and delete icons show on hover and when keyboard focus is in the row.
+        .hover_group_focus()
         .child(pin)
         .child(text)
-        .child(icon_action(
-            s,
-            format!("memory-edit-{id}"),
-            "Edit memory",
-            icon("edit", p.muted),
-            p,
-            move |s| {
-                s.brief.adding = false;
-                s.brief.editing = Some(edit_id.clone());
-                s.brief.edit = rune::TextEdit::default();
-                s.brief.edit.replace_text(&text_value);
-                s.brief.edit.focused = true;
-            },
-        ))
-        .child(icon_action(
-            s,
-            format!("memory-delete-{id}"),
-            "Delete memory",
-            glyph_icon(&super::pixel_icons::TRASH, p.muted),
-            p,
-            move |s| {
-                let result = s.delete_memory(captain, &id);
-                report(s, result);
-            },
-        ))
+        .child(
+            icon_action(
+                s,
+                format!("memory-edit-{id}"),
+                "Edit memory",
+                icon("edit", p.muted),
+                p,
+                move |s| {
+                    s.brief.adding = false;
+                    s.brief.editing = Some(edit_id.clone());
+                    s.brief.edit = rune::TextEdit::default();
+                    s.brief.edit.replace_text(&text_value);
+                    s.brief.edit.focused = true;
+                },
+            )
+            .group_opacity(0.0, 1.0),
+        )
+        .child(
+            icon_action(
+                s,
+                format!("memory-delete-{id}"),
+                "Delete memory",
+                glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                p,
+                move |s| {
+                    let result = s.delete_memory(captain, &id);
+                    report(s, result);
+                },
+            )
+            .group_opacity(0.0, 1.0),
+        )
 }
 
 fn memory_section(s: &State, p: Palette, captain: usize) -> El {
@@ -1073,7 +1078,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .py(8.0)
         .gap(10.0)
         .center_y()
-        .radius(ROW_RADIUS + 4.0)
+        .radius(CARD_RADIUS)
         .border(1.0, hairline(p))
         .child(
             rune::icon(&super::pixel_icons::LOCK, super::ICON)
@@ -1120,14 +1125,16 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         .demo_status
         .clone()
         .unwrap_or_else(|| s.background_status());
-    // A status word in pixel type, then its detail, as two labels.
-    let (word, detail) = if status.hidden_to_tray && status.working > 0 {
+    // Both texts are status words, so both are pixel type. Work running in the background is
+    // `sea`, as it is in the crew tray; paused routines are muted.
+    let (word, detail, ink) = if status.hidden_to_tray && status.working > 0 {
         (
             "Working in the background",
             Some(plural(status.working, "task", "tasks")),
+            p.sea,
         )
     } else if status.routines_paused_while_away {
-        ("Routines paused while you're away", None)
+        ("Routines paused while you're away", None, p.muted)
     } else {
         return None;
     };
@@ -1146,18 +1153,15 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         .min_w(0.0)
         .shrink()
         .opacity_motion(motion())
-        .child(icon("moon", p.faint))
-        .child(if detail.is_some() {
-            // A status word with a detail: the word in pixel type, then the detail.
-            super::pixel_text(word, p.muted)
+        .child(icon("crescent", ink))
+        .child(super::pixel_text(word, ink).truncate().shrink().min_w(0.0));
+    if let Some(detail) = detail {
+        line = line.child(
+            super::pixel_text(detail, ink)
                 .truncate()
                 .shrink()
-                .min_w(0.0)
-        } else {
-            label(word, SMALL, p.muted).truncate().shrink().min_w(0.0)
-        });
-    if let Some(detail) = detail {
-        line = line.child(label(detail, SMALL, p.muted).truncate().shrink().min_w(0.0));
+                .min_w(0.0),
+        );
     }
     Some(line)
 }
@@ -1301,7 +1305,7 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .px(8.0)
                 .grow(if choice == KeepAwake::Off { 0.0 } else { 1.0 })
                 .center()
-                .radius(6.0)
+                .radius(4.0)
                 .fill(if on { p.card } else { Color::TRANSPARENT })
                 .hover(if on { p.card } else { hover_wash(s, p) })
                 .hover_motion(motion(), motion())
@@ -1450,14 +1454,7 @@ fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title:
         .py(7.0)
         .radius(4.0)
         .fill(if s.dark { p.bg } else { p.card })
-        .border(
-            1.0,
-            if s.dark {
-                p.line
-            } else {
-                p.field_line.alpha(0.6)
-            },
-        )
+        .field_focus(edit, p)
 }
 
 /// "You": the global profile every captain reads, ported from KSG's settings panels

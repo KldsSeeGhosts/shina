@@ -327,22 +327,38 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                     status_ink(status, p)
                 },
             ))
+            // The workspace keeps `WORKSPACE_FLOOR`, so the machine name gives way first, down
+            // to its icon alone.
             .child(
                 label(detail.join(", "), CAPTAIN_STATUS, p.muted)
+                    .key(format!("machine-detail-{}-{id}", entry.server))
                     .truncate()
                     .shrink()
                     .grow(1.0)
-                    .min_w(0.0),
+                    .min_w(workspace_floor(
+                        sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                        // The status word, three gaps, the machine icon and the timer slot.
+                        status.label().chars().count() as f32 * 6.6
+                            + 24.0
+                            + ICON
+                            + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                    )),
             )
-            // The machine name keeps its width up to a cap, so the detail before it gives way
-            // first and always ends in an ellipsis.
-            .child(
-                label(machine_line.clone(), CAPTAIN_STATUS, p.faint)
-                    .truncate()
-                    .shrink()
-                    .min_w(MACHINE_FLOOR)
-                    .max_w(MACHINE_CAP),
-            );
+            .child(machine_tag(
+                s,
+                p,
+                entry.server,
+                format!("machine-tag-{}-{id}", entry.server),
+                CAPTAIN_STATUS,
+                room_for_machine_name(
+                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                    status.label().chars().count() as f32 * 6.6
+                        + 24.0
+                        + ICON
+                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
+                    &detail.join(", "),
+                ),
+            ));
         if let Some(seconds) = timer {
             status_line = status_line.child(
                 label(elapsed_label(seconds), PIXEL.features(TABULAR), p.muted)
@@ -422,18 +438,29 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 .center_y()
                 .child(
                     label(workspace, CARD_META, p.muted)
+                        .key(format!("machine-workspace-{}-{id}", entry.server))
                         .truncate()
                         .shrink()
-                        .min_w(0.0),
+                        .min_w(workspace_floor(
+                            sidebar_row_width(s) - 2.0 * ROW_INSET,
+                            // The project tile, the machine icon, the status or age text and
+                            // the gaps between them.
+                            16.0 + ICON + 78.0 + 32.0,
+                        )),
                 )
-                // The workspace truncates first; the machine name keeps its width up to a cap.
-                .child(
-                    label(machine_line.clone(), CARD_META, p.faint)
-                        .truncate()
-                        .shrink()
-                        .min_w(MACHINE_FLOOR)
-                        .max_w(MACHINE_CAP),
-                ),
+                .child(spacer())
+                .child(machine_tag(
+                    s,
+                    p,
+                    entry.server,
+                    format!("machine-tag-{}-{id}", entry.server),
+                    CARD_META,
+                    room_for_machine_name(
+                        sidebar_row_width(s) - 2.0 * ROW_INSET,
+                        16.0 + ICON + 78.0 + 32.0,
+                        workspace,
+                    ),
+                )),
         );
     let at = lifecycle::now();
     let state_label = if view["request"]["method"] == "confirm" {

@@ -584,11 +584,14 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .min_w(0.0),
             )
             .child(label(task_clock(task), TIMER, tertiary));
+        // A card fill and a 1 px `line` border in both layouts, so a chip reads as a chip.
         chip = if stacked {
             chip.w_full()
         } else {
-            chip.max_w(260.0).fill(p.card).border(1.0, hairline(p))
-        };
+            chip.max_w(260.0)
+        }
+        .fill(p.card)
+        .border(1.0, p.line);
         chips = chips.child(chip);
     }
     Some(
@@ -705,6 +708,14 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                 .fill(p.card)
                 .border(1.0, hairline(p))
                 .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
+                // A 2 px brass bar down the left edge marks a request that waits on the user.
+                .child(
+                    el().key(format!("needs-you-bar-{id}"))
+                        .pin(Some(0.0), Some(6.0), None, Some(6.0))
+                        .w(2.0)
+                        .fill(p.brass)
+                        .a11y_hidden(),
+                )
                 .child(
                     row()
                         .center_y()

@@ -101,10 +101,11 @@ pub(super) fn render(
     } else {
         Cow::Borrowed(source)
     };
-    // The dark coral wash is too faint on the code fill to read as a removed line, so dark
-    // mode mixes in more of the danger colour.
+    // The dark coral wash is too faint on the code fill to read as a removed line, but 28%
+    // was too loud. 17% of coral over `code_bg`, mixed in sRGB as a paint program would, is
+    // about #2f2126. Rune's `mix` works in linear light and would give a much brighter red.
     let removed = if dark {
-        p.code_bg.mix(p.coral, 0.28)
+        mix_srgb(p.code_bg, p.coral, 0.17)
     } else {
         p.coral_bg
     };
@@ -165,7 +166,7 @@ pub(super) fn render(
     if diffs.is_empty() {
         return ordinary(&source, &style, streaming, user, identity.into(), p);
     }
-    let diff_style = style.clone().code_block_padding(12.0, 4.0);
+    let diff_style = style.clone().code_block_padding(12.0, 6.0);
     let mut content = col().w_full().min_w(0.0).gap(12.0).selection_group(true);
     let mut from = 0;
     for (range, language, code) in diffs {
@@ -179,8 +180,8 @@ pub(super) fn render(
                 p,
             ));
         }
-        // Tinted rows run edge to edge, so the block keeps only a thin pad above the first row
-        // instead of the 12 px that would leave an empty line under the header.
+        // Tinted rows run edge to edge, so the block keeps a 6 px pad above the first row and
+        // below the last, in place of the 12 px that left an empty line under the header.
         let diff = Markdown::new(&source[range.clone()])
             .streaming(streaming)
             .selectable(true)
@@ -209,9 +210,34 @@ pub(super) fn render(
     content
 }
 
+/// `t` of the way from `a` to `b`, mixed in sRGB-encoded space.
+fn mix_srgb(a: Color, b: Color, t: f32) -> Color {
+    use rune::color::{srgb_decode, srgb_encode};
+    let channel = |a: f32, b: f32| {
+        let (a, b) = (srgb_encode(a), srgb_encode(b));
+        srgb_decode(a + (b - a) * t)
+    };
+    Color {
+        r: channel(a.r, b.r),
+        g: channel(a.g, b.g),
+        b: channel(a.b, b.b),
+        a: 1.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dark_removed_line_is_a_quiet_red_not_a_loud_one() {
+        let p = palette(true);
+        let hex = mix_srgb(p.code_bg, p.coral, 0.17).hex();
+        let channel = |at: usize| i32::from_str_radix(&hex[at..at + 2], 16).unwrap();
+        for (at, want) in [(1, 0x2f), (3, 0x21), (5, 0x26)] {
+            assert!((channel(at) - want).abs() <= 6, "{hex}");
+        }
+    }
     #[test]
     fn user_breaks_preserve_code_and_markdown_structure() {
         let source = "step one\nstep two\n\n```rust\nlet first = 1;\nlet second = 2;\n```\n\n- alpha\n- beta\n\nlast\r\nline";

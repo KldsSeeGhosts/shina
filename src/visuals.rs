@@ -283,9 +283,14 @@ pub struct Artwork {
     /// Device pixels per point, as the view last saw them (the window's scale times the app's
     /// zoom), as `f32` bits.
     scale: AtomicU32,
-    /// Pre-scaled buffers by art and device size, so each is built once.
+    /// Pre-scaled buffers by art and device size, so each is built once. They are all for the
+    /// recorded scale: a new scale empties the cache, and it never holds more than
+    /// `SCALED_CAP` buffers.
     scaled: Mutex<HashMap<(Shown, u32), Pixels>>,
 }
+
+/// The most pre-scaled buffers kept at once: every portrait face at a handful of sizes.
+const SCALED_CAP: usize = 256;
 
 impl Artwork {
     pub fn load(workspace: &Path) -> Arc<Self> {
@@ -324,10 +329,19 @@ impl Artwork {
         })
     }
 
-    /// Records the device pixels per point the view draws at.
+    /// Records the device pixels per point the view draws at. Buffers built for another scale
+    /// are of no further use, so a change of scale or zoom drops them.
     pub fn set_scale(&self, scale: f32) {
-        self.scale
-            .store(scale.max(0.25).to_bits(), Ordering::Relaxed);
+        let bits = scale.max(0.25).to_bits();
+        if self.scale.swap(bits, Ordering::Relaxed) != bits {
+            self.scaled.lock().unwrap().clear();
+        }
+    }
+
+    /// How many pre-scaled buffers the cache holds.
+    #[cfg(test)]
+    fn cached(&self) -> usize {
+        self.scaled.lock().unwrap().len()
     }
 
     /// `points` in whole device pixels at the recorded scale.
@@ -338,6 +352,10 @@ impl Artwork {
 
     fn pixels_for(&self, shown: Shown, target: u32) -> Pixels {
         let mut cache = self.scaled.lock().unwrap();
+        // A full cache starts over. The view asks again for what it still draws.
+        if cache.len() >= SCALED_CAP && !cache.contains_key(&(shown, target)) {
+            cache.clear();
+        }
         cache
             .entry((shown, target))
             .or_insert_with(|| {
@@ -622,6 +640,30 @@ mod tests {
                 format!("{face:?}"),
                 format!("{:?}", art.face_pixels(0, Face::Normal, points))
             );
+        }
+    }
+
+    #[test]
+    fn the_scaled_art_cache_keeps_only_the_current_scale_and_stays_under_its_cap() {
+        let art = Artwork::load(Path::new(""));
+        art.set_scale(2.0);
+        for captain in 0..PORTRAITS {
+            art.face_pixels(captain, Face::Normal, 40.0);
+            art.face_pixels(captain, Face::Normal, 20.0);
+        }
+        assert_eq!(art.cached(), PORTRAITS * 2);
+        // The same scale again keeps what is built.
+        art.set_scale(2.0);
+        assert_eq!(art.cached(), PORTRAITS * 2);
+        // A new zoom or display scale drops the buffers for the old one.
+        art.set_scale(2.5);
+        assert_eq!(art.cached(), 0);
+        art.face_pixels(0, Face::Normal, 40.0);
+        assert_eq!(art.cached(), 1);
+        // Many sizes at one scale never pass the cap.
+        for points in 20..20 + 2 * SCALED_CAP as u32 {
+            art.face_pixels(0, Face::Normal, points as f32);
+            assert!(art.cached() <= SCALED_CAP, "{points} pt");
         }
     }
 

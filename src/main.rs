@@ -695,9 +695,10 @@ fn main() {
                 state.new_thread_in(None);
                 state.dark = true;
             }),
+            // The narrowest docked sidebar, 200 pt, with the attention badge beside the wordmark.
             ("sidebar-narrow", |state| {
-                state.populate_demo();
-                state.compact_sidebar = true;
+                captain_workspace_demo(state);
+                state.sidebar_width = 200.0;
             }),
             ("collapsed", |state| {
                 state.populate_demo();

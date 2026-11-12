@@ -727,8 +727,9 @@ impl State {
     }
 
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
-        let changed =
-            self.poll_client_background(tx) | self.updater.poll(Instant::now(), self.wake.clone());
+        let changed = self.poll_client_background(tx)
+            | self.updater.poll(Instant::now(), self.wake.clone())
+            | self.refresh_machine_notice();
         if self.background.quitting {
             return true;
         }
@@ -805,10 +806,8 @@ impl State {
                 continue;
             }
             if server != "local" && matches!(event, crate::client::Event::Maintenance(..)) {
-                self.machines.notice = Some(format!(
-                    "{} is restarting or unavailable. Reconnecting.",
-                    self.machine_label(&server)
-                ));
+                // A restarting machine is not ready, so the unreachable notice covers it.
+                self.refresh_machine_notice();
                 continue;
             }
             match event {
@@ -1193,11 +1192,65 @@ impl State {
                 .unwrap_or_else(|| server.into())
         }
     }
+    /// Whether this desktop's connection to a machine's Shina server is ready. Demo data has no
+    /// server, so it never shows a dropped connection.
     pub fn machine_connected(&self, server: &str) -> bool {
+        if self.demo {
+            return true;
+        }
         self.client
             .as_ref()
             .and_then(|client| client.commands_for(server))
             .is_some_and(|commands| commands.connected())
+    }
+    /// The names of the linked machines whose connection is not ready.
+    pub fn unreachable_machines(&self) -> Vec<String> {
+        let Some(client) = &self.client else {
+            return Vec::new();
+        };
+        client
+            .linked
+            .keys()
+            .filter(|server| !self.machine_connected(server))
+            .map(|server| self.machine_label(server))
+            .collect()
+    }
+    /// The open thread's machine, by name, while this desktop cannot reach it.
+    pub fn unreachable_selected(&self) -> Option<String> {
+        (self.client.is_some() && !self.machine_connected(&self.machines.selected))
+            .then(|| self.machine_label(&self.machines.selected))
+    }
+    /// Raises one notice naming every linked machine that is down ("Studio and Laptop are
+    /// unreachable. Reconnecting.") and clears it when all of them are ready again. It never
+    /// replaces or clears another notice. Returns whether the notice changed.
+    pub(super) fn refresh_machine_notice(&mut self) -> bool {
+        let down = self.unreachable_machines();
+        let ours =
+            self.machines.notice.is_some() && self.machines.notice == self.machines.auto_notice;
+        if down.is_empty() {
+            if ours {
+                self.machines.notice = None;
+                self.machines.auto_notice = None;
+                return true;
+            }
+            self.machines.auto_notice = None;
+            return false;
+        }
+        if self.machines.notice.is_some() && !ours {
+            return false;
+        }
+        let names = match down.as_slice() {
+            [one] => format!("{one} is"),
+            [first @ .., last] => format!("{} and {last} are", first.join(", ")),
+            [] => unreachable!("checked above"),
+        };
+        let text = format!("{names} unreachable. Reconnecting.");
+        if self.machines.notice.as_deref() == Some(text.as_str()) {
+            return false;
+        }
+        self.machines.notice = Some(text.clone());
+        self.machines.auto_notice = Some(text);
+        true
     }
     /// Server/thread ids remain a pair. Only one server's records enter the State facade.
     pub fn select_machine(&mut self, server: &str) {
@@ -1207,7 +1260,7 @@ impl State {
         }
         let Some(projection) = self.machines.views.get(server).cloned() else {
             self.machines.notice =
-                Some("This machine is offline and has no cached workspace yet.".into());
+                Some("This machine is unreachable and has no cached workspace yet.".into());
             return;
         };
         self.machines
