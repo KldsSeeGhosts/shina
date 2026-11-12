@@ -1377,15 +1377,18 @@ fn queued_edit_commits_in_place_and_rejects_stale_removed_and_started_items() {
         first.command("queue.update", edit, uuid::Uuid::new_v4())["result"]["status"],
         "rejected"
     );
-    first.command(
+    let queued = first.command(
         "thread.send",
         json!({"threadId":1,"text":"Next queued","attachments":[],"mode":"queue"}),
         uuid::Uuid::new_v4(),
     );
-    first.until(|state| {
+    assert_eq!(queued["result"]["status"], "accepted", "{queued}");
+    // The prior edited item also made this queue length one. Command replies can
+    // arrive before the subscription catches up, so wait for this commit too.
+    first.until_sequence(queued["result"]["seq"].as_u64().unwrap(), |state| {
         state["threads"][0]["queue"]
             .as_array()
-            .is_some_and(|queue| queue.len() == 1)
+            .is_some_and(|queue| queue.len() == 1 && queue[0][1] == "Next queued")
     });
     let thread = &first.snapshot["threads"][0];
     let id = thread["queue"][0][0].clone();
