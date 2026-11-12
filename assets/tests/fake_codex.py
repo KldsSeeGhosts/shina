@@ -164,6 +164,9 @@ for line in sys.stdin:
             "inputModalities": ["text", "image"],
             "serviceTiers": [{"id": "fast", "name": "Fast", "description": "Faster responses"}]
         }], "nextCursor": "second-page" if args.paginated_models else None}})
+    elif method == "account/rateLimits/read":
+        send({"id": request_id, "result": {"rateLimits": {
+            "limitId": "codex", "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 2100000000}}}})
     elif method == "skills/list":
         assert len(params["cwds"]) == 1
         if args.skills_unsupported:

@@ -8265,7 +8265,20 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
     let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
     let field = text_input(&t.draft, composer_style)
         .key("composer-input")
-        .label("Message Pi")
+        .label(format!(
+            "Message {}",
+            match t.harness.as_str() {
+                "pi" => "Pi",
+                "codex" => "Codex",
+                "claude" => "Claude",
+                id => s
+                    .harnesses
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map_or("agent", |agent| agent.name.as_str()),
+            }
+        ))
         .placeholder(
             if s.demo {
                 "Open a real workspace to send messages".to_string()

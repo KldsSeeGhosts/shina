@@ -736,6 +736,24 @@ fn a_skill_discovery_authentication_denial_stops_startup_without_a_fallback() {
 }
 
 #[test]
+fn usage_windows_are_read_at_session_start_before_any_turn() {
+    let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
+    pump(&mut thread, |t| {
+        t.harness_state["usageLimits"]["windows"][0]["usedPercent"] == 40.0
+    });
+    assert_eq!(
+        thread.harness_state["usageLimits"]["windows"][0]["name"],
+        "5 hour"
+    );
+    assert!(thread.messages.is_empty());
+    assert!(
+        records(&log)
+            .iter()
+            .any(|record| record["method"] == "account/rateLimits/read")
+    );
+}
+
+#[test]
 fn skills_list_is_project_scoped_and_skill_mentions_remain_native_text() {
     let (mut thread, log) = fixture(SessionSource::New, "read-only", &[]);
     pump(&mut thread, |t| !t.native.skills.is_empty());

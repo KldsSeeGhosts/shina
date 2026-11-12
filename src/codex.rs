@@ -359,6 +359,10 @@ impl Client {
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
             let error = auth_guidance(&error);
+            if kind == "rateLimits" {
+                // Usage is optional. An older CLI or an API-key account has none to read.
+                return Ok(());
+            }
             if kind == "skills" {
                 let lower = error.to_ascii_lowercase();
                 if matches!(record["error"]["code"].as_i64(), Some(401 | 403))
@@ -425,11 +429,30 @@ impl Client {
                     json!({"cwds":[self.start.workspace]}),
                     json!({"type":"skills","id":"commands"}),
                 );
+                if self.probe.is_none() {
+                    // Codex pushes rate limits only when they change, so a quiet turn would
+                    // leave the usage block empty. KSG reads them the same way.
+                    self.request(
+                        "account/rateLimits/read",
+                        Value::Null,
+                        json!({"type":"rateLimits"}),
+                    );
+                }
                 if self.probe != Some(false) {
                     self.request("model/list", json!({"limit":100}), json!({"type":"models"}));
                 } else {
                     self.ready = true;
                 }
+            }
+            "rateLimits" => {
+                let read = &result["rateLimitsByLimitId"]["codex"];
+                let read = if read.is_null() {
+                    &result["rateLimits"]
+                } else {
+                    read
+                };
+                self.usage_limits = crate::usage_limits::codex(read, &self.usage_limits);
+                self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
             }
             "skills" => {
                 self.skill_commands =
