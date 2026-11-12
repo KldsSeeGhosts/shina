@@ -89,6 +89,8 @@ struct MessageView {
     role: String,
     text: String,
     images: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<crate::composer_context::MessageContext>,
 }
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -135,8 +137,12 @@ struct ThreadView {
     queue: Vec<(usize, String, Vec<Attachment>)>,
     #[serde(default)]
     queue_drafts: Vec<(usize, crate::composer_rich::Snapshot)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queue_contexts: Vec<(usize, crate::composer_context::MessageContext)>,
     #[serde(default)]
     queue_edit_supported: bool,
+    #[serde(default)]
+    composer_context_supported: bool,
     #[serde(default)]
     queue_held: bool,
     #[serde(default)]
@@ -184,6 +190,7 @@ impl ThreadView {
                     role: m.role.into(),
                     text: m.text.clone(),
                     images: m.images.clone(),
+                    context: m.context.clone(),
                 })
                 .collect(),
             tools: thread
@@ -253,7 +260,14 @@ impl ThreadView {
                 .iter()
                 .filter_map(|q| q.prompt.draft.clone().map(|draft| (q.id, draft)))
                 .collect(),
+            queue_contexts: thread
+                .native
+                .queue
+                .iter()
+                .filter_map(|q| q.prompt.context.clone().map(|ctx| (q.id, ctx)))
+                .collect(),
             queue_edit_supported: true,
+            composer_context_supported: true,
             queue_held: thread.native.queue_held,
             run_id: thread.run_id.clone(),
             resumable_run_id: thread.resumable_run_id.clone(),
@@ -300,6 +314,7 @@ impl ThreadView {
                     },
                     text: message.text,
                     images: message.images,
+                    context: message.context,
                 })
             })
             .collect::<Result<_, String>>()?;
@@ -415,10 +430,16 @@ impl ThreadView {
                     .iter()
                     .find(|(key, _)| *key == id)
                     .map(|(_, draft)| draft.clone());
+                prompt.context = self
+                    .queue_contexts
+                    .iter()
+                    .find(|(key, _)| *key == id)
+                    .map(|(_, ctx)| ctx.clone());
                 pi_session::QueuedMessage { id, prompt }
             })
             .collect();
         thread.queue_edit_supported = self.queue_edit_supported;
+        thread.composer_context_supported = self.composer_context_supported;
         thread.native.queue_held = self.queue_held;
         thread.reconcile_queued_edit();
         thread.tick_stop(Instant::now());
@@ -568,6 +589,7 @@ impl State {
             role: "Pi",
             text: "Retained archived reply".into(),
             images: vec![],
+            context: None,
         });
         state.threads.push(archived);
         state
@@ -761,19 +783,31 @@ impl State {
             if let Some(previous) = self.recovered_inputs.get(&thread.id) {
                 let images: Vec<Attachment> =
                     serde_json::from_value(previous["attachments"].clone()).unwrap_or_default();
-                let editor = serde_json::from_value::<crate::composer_rich::Snapshot>(
+                let snapshot = serde_json::from_value::<crate::composer_rich::Snapshot>(
                     previous["draft"].clone(),
                 )
-                .map(|snapshot| snapshot.editor())
                 .unwrap_or_else(|_| {
-                    crate::composer_rich::draft(previous["text"].as_str().unwrap_or(""))
+                    crate::composer_rich::Snapshot::capture(
+                        &crate::composer_rich::draft(previous["text"].as_str().unwrap_or("")),
+                        &images,
+                    )
                 });
-                thread.restore_editor(&editor, &images);
+                thread.restore_snapshot(&snapshot);
             }
-            self.recovered_inputs.insert(thread.id,json!({"text":thread.draft.text,"attachments":thread.draft_images,
-                "draft":crate::composer_rich::Snapshot::capture(&thread.draft,&thread.draft_images),"commandId":thread.recovery_command}));
+            let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                &thread.draft,
+                &thread.draft_images,
+                &thread.draft_context,
+            );
+            self.recovered_inputs.insert(
+                thread.id,
+                json!({"text":thread.draft.text,"attachments":thread.draft_images,
+                "draft":snapshot,"commandId":thread.recovery_command}),
+            );
             thread.draft.replace_text("");
             thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.retained_context = Default::default();
             changed = true;
         }
         changed
@@ -1036,7 +1070,7 @@ impl State {
                         thread
                             .remote_send
                             .as_ref()
-                            .is_some_and(|(id, _, _)| *id == command.command_id)
+                            .is_some_and(|(id, _)| *id == command.command_id)
                     })
                 }) {
                     thread.finish_remote_send(
@@ -1193,7 +1227,7 @@ impl State {
                                     value["result"]["result"]["draft"].clone(),
                                 )
                             {
-                                thread.restore_editor(&snapshot.editor(), &images);
+                                thread.restore_snapshot(&snapshot);
                             } else {
                                 thread.restore_prompt(&Prompt::new(
                                     value["result"]["result"]["text"]
@@ -1241,7 +1275,7 @@ impl State {
                         };
                         if let Some(threads) = threads {
                             for thread in threads {
-                                if let Some((id, _, _)) = &thread.remote_send {
+                                if let Some((id, _)) = &thread.remote_send {
                                     thread.finish_remote_send(*id, false);
                                     thread.error=Some("This device was paired again. Review the previous send before retrying. Your draft was kept.".into());
                                 }
@@ -1506,6 +1540,8 @@ impl State {
                             thread.id,
                             thread.draft.clone(),
                             thread.draft_images.clone(),
+                            thread.draft_context.clone(),
+                            thread.retained_context.clone(),
                             thread.attachment_error.clone(),
                         )
                     })
@@ -1514,10 +1550,12 @@ impl State {
                 vec![]
             };
             self.restore_ui(&local)?;
-            for (id, draft, images, error) in editors {
+            for (id, draft, images, context, retained, error) in editors {
                 if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
                     thread.draft = draft;
                     thread.draft_images = images;
+                    thread.draft_context = context;
+                    thread.retained_context = retained;
                     thread.attachment_error = error;
                 }
             }
@@ -1809,6 +1847,8 @@ impl State {
         let source = (self.machines.selected.clone(), self.current().id);
         let draft = self.current().draft.clone();
         let images = self.current().draft_images.clone();
+        let context = self.current().draft_context.clone();
+        let retained = self.current().retained_context.clone();
         self.select_machine(server);
         if self.machines.selected != server {
             return;
@@ -1816,6 +1856,8 @@ impl State {
         self.new_client_draft(None);
         self.current_mut().draft = draft;
         self.current_mut().draft_images = images;
+        self.current_mut().draft_context = context;
+        self.current_mut().retained_context = retained;
         if let Some(thread) = self
             .machines
             .threads
@@ -1824,6 +1866,8 @@ impl State {
         {
             thread.draft.replace_text("");
             thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.retained_context = Default::default();
         }
         // Update the old machine's saved editor too, so a later switch cannot restore a copy.
         self.machines.ui[&source.0]["drafts"][source.1.to_string()] = json!("");
@@ -1905,12 +1949,18 @@ impl State {
             "serviceTier":thread.harness_state["serviceTier"]});
         match self.remote("thread.create", params).expect("client") {
             Ok(command) => {
+                let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                    &self.current().draft,
+                    &self.current().draft_images,
+                    &self.current().draft_context,
+                );
                 let thread = self.current_mut();
                 thread.client_creating = Some(command);
-                thread.remote_send =
-                    Some((command, thread.draft.clone(), thread.draft_images.clone()));
+                thread.remote_send = Some((command, snapshot));
                 thread.draft.replace_text("");
                 thread.draft_images.clear();
+                thread.draft_context.clear();
+                thread.retained_context = Default::default();
             }
             Err(error) => self.storage_error = Some(error),
         }
@@ -1941,8 +1991,8 @@ impl State {
         draft.client_creating = None;
         let submitted = draft.remote_send.take();
         if value["result"]["status"] != "accepted" {
-            if let Some((_, edit, images)) = submitted {
-                draft.restore_editor(&edit, &images);
+            if let Some((_, snapshot)) = submitted {
+                draft.restore_snapshot(&snapshot);
             }
             let error = value["error"]["message"]
                 .as_str()
@@ -1957,7 +2007,7 @@ impl State {
             return;
         };
         draft.client_promoted = Some(id as usize);
-        let Some((_, edit, images)) = submitted else {
+        let Some((_, snapshot)) = submitted else {
             return;
         };
         let label = |machine: &str| -> String {
@@ -1978,25 +2028,31 @@ impl State {
                     .unwrap_or_else(|| machine.into())
             }
         };
-        let prompt = match crate::composer_tokens::prompt_for(&edit, &images, Some(server), &label)
-        {
+        let edit = snapshot.editor();
+        let prompt = match crate::composer_tokens::prompt_for_with_context(
+            &edit,
+            &snapshot.attachments,
+            &snapshot.context,
+            Some(server),
+            &label,
+        ) {
             Ok(prompt) => prompt,
             Err(error) => {
-                draft.restore_editor(&edit, &images);
+                draft.restore_snapshot(&snapshot);
                 draft.attachment_error = Some(error.clone());
                 self.machines.notice = Some(error);
                 return;
             }
         };
         let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-            "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+            "context":prompt.context,"draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
         let result = commands
             .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
             .and_then(|commands| commands.send("thread.send", params));
         match result {
-            Ok(id) => draft.remote_send = Some((id, edit, images)),
+            Ok(id) => draft.remote_send = Some((id, snapshot)),
             Err(error) => {
-                draft.restore_editor(&edit, &images);
+                draft.restore_snapshot(&snapshot);
                 draft.error = Some(error.clone());
                 self.machines.notice = Some(error);
             }
@@ -2018,9 +2074,13 @@ impl State {
             };
             let text = std::mem::take(&mut self.threads[draft_index].draft);
             let images = std::mem::take(&mut self.threads[draft_index].draft_images);
+            let context = std::mem::take(&mut self.threads[draft_index].draft_context);
+            let retained = std::mem::take(&mut self.threads[draft_index].retained_context);
             let sending = self.threads[draft_index].remote_send.take();
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
+            self.threads[index].draft_context = context;
+            self.threads[index].retained_context = retained;
             self.threads[index].remote_send = sending;
             let active = self.current().id;
             if self.tabs.contains(&draft_id) {
@@ -2491,8 +2551,17 @@ impl State {
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
                 attachments::validate_prompt_images(&attachments)?;
-                let prompt =
-                    crate::composer_tokens::received_prompt(text, attachments, input.draft)?;
+                let context = input
+                    .context
+                    .filter(|v| !v.is_null())
+                    .map(|v| crate::composer_context::decode_message_context(&v))
+                    .transpose()?;
+                let prompt = crate::composer_tokens::received_prompt_with_context(
+                    text,
+                    attachments,
+                    input.draft,
+                    context,
+                )?;
                 self.current_mut().draft = prompt.draft.as_ref().map_or_else(
                     || crate::composer_rich::draft(&prompt.text),
                     crate::composer_rich::Snapshot::editor,
@@ -2501,6 +2570,13 @@ impl State {
                     .draft
                     .as_ref()
                     .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
+                self.current_mut().draft_context = prompt
+                    .draft
+                    .as_ref()
+                    .filter(|d| !d.context.is_empty())
+                    .map(|d| d.context.clone())
+                    .or_else(|| prompt.context.as_ref().map(|c| c.records.clone()))
+                    .unwrap_or_default();
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
                 self.send();
@@ -2513,6 +2589,8 @@ impl State {
                         .unwrap_or("The thread cannot accept input now.".into());
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                    self.current_mut().draft_context.clear();
+                    self.current_mut().retained_context = Default::default();
                     return Err(error);
                 }
             }
@@ -2535,10 +2613,12 @@ impl State {
                 self.owe_remote_stops_for(self.current().id);
                 if self.current().has_draft_content() {
                     let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images,
-                        "draft":crate::composer_rich::Snapshot::capture(&self.current().draft,&self.current().draft_images),"commandId":command.command_id});
+                        "draft":crate::composer_rich::Snapshot::capture_with_context(&self.current().draft,&self.current().draft_images,&self.current().draft_context),"commandId":command.command_id});
                     self.recovered_inputs.insert(self.current().id, input);
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                    self.current_mut().draft_context.clear();
+                    self.current_mut().retained_context = Default::default();
                 }
             }
             "thread.resume" => {
@@ -2766,10 +2846,16 @@ impl State {
                     .iter()
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
-                let prompt = crate::composer_tokens::received_prompt(
+                let context = args
+                    .get("context")
+                    .filter(|v| !v.is_null())
+                    .map(crate::composer_context::decode_message_context)
+                    .transpose()?;
+                let prompt = crate::composer_tokens::received_prompt_with_context(
                     text("text")?,
                     images,
                     args.get("draft").cloned(),
+                    context,
                 )?;
                 self.current_mut().update_queued(
                     number("inputId")?,
@@ -2785,7 +2871,7 @@ impl State {
                     self.current_mut().command("clear_queue", json!({}));
                 }
                 let prompts: Vec<_> = self.current_mut().native.queue.drain(..).map(|q| {
-                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"draft":q.prompt.draft})
+                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"context":q.prompt.context,"draft":q.prompt.draft})
                 }).collect();
                 return Ok(json!({"prompts":prompts}));
             }
@@ -2947,10 +3033,10 @@ impl Thread {
             .cloned()
             .unwrap_or_default();
         if let Some((prompt, after)) = &self.queued_prompt {
-            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after}));
+            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after,"context":prompt.context,"draft":prompt.draft}));
         }
         if let Some((_, prompt, after)) = &self.pending_prompt {
-            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after}));
+            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after,"context":prompt.context,"draft":prompt.draft}));
         }
         json!(inputs)
     }
@@ -4598,6 +4684,7 @@ mod tests {
             role: "Pi",
             text: "durable server reply".into(),
             images: vec![],
+            context: None,
         });
         runtime.state.checkpoint_and_flush().unwrap();
         drop(runtime);
@@ -4742,5 +4829,35 @@ mod tests {
             blocked,
             "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
         );
+    }
+
+    #[test]
+    fn older_peer_without_composer_context_receives_preprojected_text_without_context_field() {
+        let mut rec = crate::composer_context::thread_context_record("local", 5, "Design doc");
+        rec.label = "Design doc".into();
+        let command = Command::new(
+            "thread.send",
+            json!({
+                "threadId": 1,
+                "text": "See [Design doc](t3-context://v1/thread/thread_5)",
+                "attachments": [],
+                "context": { "version": 1, "records": [rec] },
+                "draft": { "text": "See Design doc", "html": "<p>See <span data-pill=\"t3-context://v1/thread/thread_5\">Design doc</span></p>", "attachments": [] },
+                "mode": "prompt",
+            }),
+        );
+        let downgraded = crate::client::downgrade_composer_context_command(command.clone(), false);
+        assert!(downgraded.params.get("context").is_none());
+        assert!(downgraded.params.get("draft").is_none());
+        let projected_text = downgraded.params["text"].as_str().unwrap();
+        assert!(projected_text.contains("[Thread: Design doc; ref=thread_5]"));
+        assert!(projected_text.contains("<t3_context version=\"1\">"));
+        // Verify it deserializes into older SendInput with deny_unknown_fields.
+        assert!(serde_json::from_value::<crate::protocol::SendInput>(downgraded.params).is_ok());
+
+        // Newer peer keeps structured context intact.
+        let kept = crate::client::downgrade_composer_context_command(command, true);
+        assert!(kept.params.get("context").is_some());
+        assert!(kept.params.get("draft").is_some());
     }
 }

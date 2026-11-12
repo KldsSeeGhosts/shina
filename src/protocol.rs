@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 9;
+pub const MINOR: u32 = 10;
+pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const RUN_CONTROL: &str = "run-control";
 pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to stop or resume a specific run.";
@@ -320,6 +321,8 @@ pub struct SendInput {
     pub editor_revision: Option<uuid::Uuid>,
     #[serde(default)]
     pub draft: Option<Value>,
+    #[serde(default)]
+    pub context: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

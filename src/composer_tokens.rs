@@ -73,6 +73,14 @@ impl Token {
     }
 }
 
+pub fn collect_inline_context_ids_from_edit(edit: &TextEdit) -> std::collections::HashSet<String> {
+    edit.pills()
+        .filter_map(|(_, id)| {
+            crate::composer_context::parse_composer_context_href(id).map(|(_, cid)| cid)
+        })
+        .collect()
+}
+
 pub fn stamp_thread_owner(edit: &mut TextEdit, owner: &str) {
     let updates: Vec<_> = edit
         .pills()
@@ -111,12 +119,38 @@ pub fn prompt_for(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> Result<Prompt, String> {
+    prompt_for_with_context(edit, images, &[], target_machine, machine_name)
+}
+
+pub fn prompt_for_with_context(
+    edit: &TextEdit,
+    images: &[Attachment],
+    draft_context: &[crate::composer_context::ComposerContextRecord],
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
     validate_pill_kinds(edit)?;
     let mut attachments = images.to_vec();
+    let referenced_ids = collect_inline_context_ids_from_edit(edit);
+    for record in draft_context {
+        if referenced_ids.contains(&record.context_id)
+            && let crate::composer_context::ComposerContextData::Thread {
+                environment_id,
+                title,
+                ..
+            } = &record.data
+            && let Some(target) = target_machine
+            && environment_id != target
+        {
+            return Err(format!(
+                "Attached thread is on another machine. This machine's agent can't read \"{title}\". Remove it, or switch back to {} to send.",
+                machine_name(environment_id)
+            ));
+        }
+    }
     for (_, id) in edit.pills() {
         // Ported from KSG Code's `threadContextsOutsideEnvironment` and its use in
         // `useComposerSend.ts`: a thread the target machine's agent cannot read blocks the send.
-        // Shina has no read path to a linked machine's threads yet, so any other owner blocks.
         if let Some(Token::Thread {
             title,
             machine: Some(owner),
@@ -138,11 +172,21 @@ pub fn prompt_for(
         }
     }
     attachments::validate_prompt_images(&attachments)?;
-    let mut prompt = Prompt::new(
+    let context = crate::composer_context::build_message_context(
+        &referenced_ids,
+        draft_context,
+        &attachments,
+    );
+    let mut prompt = Prompt::with_context(
         crate::composer_rich::markdown_for(edit, target_machine, machine_name),
         attachments,
+        context,
     );
-    prompt.draft = Some(crate::composer_rich::Snapshot::capture(edit, images));
+    prompt.draft = Some(crate::composer_rich::Snapshot::capture_with_context(
+        edit,
+        images,
+        draft_context,
+    ));
     Ok(prompt)
 }
 
@@ -158,12 +202,22 @@ fn validate_pill_kinds(edit: &TextEdit) -> Result<(), String> {
 
 /// Validate the additive editor snapshot against the provider text and admitted attachments.
 /// Missing snapshots remain valid for older peers. Unknown snapshot fields are ignored.
+#[cfg(test)]
 pub fn received_prompt(
     text: String,
     images: Vec<Attachment>,
     snapshot: Option<serde_json::Value>,
 ) -> Result<Prompt, String> {
-    let mut prompt = Prompt::new(text, images);
+    received_prompt_with_context(text, images, snapshot, None)
+}
+
+pub fn received_prompt_with_context(
+    text: String,
+    images: Vec<Attachment>,
+    snapshot: Option<serde_json::Value>,
+    context: Option<crate::composer_context::MessageContext>,
+) -> Result<Prompt, String> {
+    let mut prompt = Prompt::with_context(text, images, context);
     if let Some(value) = snapshot.filter(|value| !value.is_null()) {
         let mut snapshot: crate::composer_rich::Snapshot =
             serde_json::from_value(value).map_err(|_| "Invalid composer document.")?;
@@ -184,6 +238,14 @@ pub fn received_prompt(
                     .ok_or("Composer attachment is not in the submitted message.")
             })
             .collect::<Result<_, _>>()?;
+        if prompt.context.is_none() && !snapshot.context.is_empty() {
+            let referenced = collect_inline_context_ids_from_edit(&editor);
+            prompt.context = crate::composer_context::build_message_context(
+                &referenced,
+                &snapshot.context,
+                &prompt.images,
+            );
+        }
         prompt.draft = Some(snapshot);
     }
     Ok(prompt)

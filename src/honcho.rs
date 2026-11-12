@@ -1452,6 +1452,7 @@ mod tests {
             role: "Pi",
             text: "Final reply".into(),
             images: vec![],
+            context: None,
         });
         state.current_mut().apply(json!({"type":"agent_end"}));
         assert!(backend.ledger.lock().unwrap().pending.is_empty());
@@ -1603,6 +1604,7 @@ mod tests {
             role: "Pi",
             text: "An older answer".into(),
             images: vec![],
+            context: None,
         });
         state
             .current_mut()

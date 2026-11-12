@@ -9,14 +9,20 @@ pub struct QueuedEdit {
     original: crate::composer_rich::Snapshot,
     pub(super) ordinary: TextEdit,
     pub(super) ordinary_images: Vec<Attachment>,
+    pub(super) ordinary_context: Vec<crate::composer_context::ComposerContextRecord>,
     ordinary_error: Option<String>,
 }
 
 pub(super) fn queue_revision(prompt: &Prompt) -> String {
-    crate::protocol::revision(
-        &json!({"text":prompt.text,"attachments":prompt.images.as_ref(),
-        "draft":prompt.draft}),
-    )
+    let mut value = json!({
+        "text": prompt.text,
+        "attachments": prompt.images.as_ref(),
+        "draft": prompt.draft,
+    });
+    if let Some(context) = &prompt.context {
+        value["context"] = json!(context);
+    }
+    crate::protocol::revision(&value)
 }
 
 impl State {
@@ -48,11 +54,16 @@ impl State {
                 .flatten()
                 .rev()
             {
+                let context = prompt
+                    .get("context")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| crate::composer_context::decode_message_context(v).ok());
                 if let Ok(images) = serde_json::from_value(prompt["attachments"].clone())
-                    && let Ok(prompt) = crate::composer_tokens::received_prompt(
+                    && let Ok(prompt) = crate::composer_tokens::received_prompt_with_context(
                         string(prompt, "text").into(),
                         images,
                         prompt.get("draft").cloned(),
+                        context,
                     )
                 {
                     thread.restore_prompt(&prompt);
@@ -86,15 +97,22 @@ impl Thread {
             return;
         };
         self.cancel_queued_edit();
-        let original = prompt.draft.clone().unwrap_or_else(|| {
+        let mut original = prompt.draft.clone().unwrap_or_else(|| {
             crate::composer_rich::Snapshot::capture(
                 &crate::composer_rich::draft(&prompt.text),
                 &prompt.images,
             )
         });
+        if original.context.is_empty()
+            && let Some(ctx) = &prompt.context
+        {
+            original.context = ctx.records.clone();
+        }
         let ordinary = std::mem::replace(&mut self.draft, original.editor());
         let ordinary_images =
             std::mem::replace(&mut self.draft_images, original.attachments.clone());
+        let ordinary_context = std::mem::replace(&mut self.draft_context, original.context.clone());
+        self.retained_context = Default::default();
         self.queued_edit = Some(QueuedEdit {
             input_id: id,
             identity: uuid::Uuid::new_v4(),
@@ -103,6 +121,7 @@ impl Thread {
             original,
             ordinary,
             ordinary_images,
+            ordinary_context,
             ordinary_error: self.attachment_error.take(),
         });
         self.draft.focused = true;
@@ -116,6 +135,8 @@ impl Thread {
         if let Some(edit) = self.queued_edit.take() {
             self.draft = edit.ordinary;
             self.draft_images = edit.ordinary_images;
+            self.draft_context = edit.ordinary_context;
+            self.retained_context = Default::default();
             self.attachment_error = edit.ordinary_error;
             self.draft.focused = true;
             self.prompt_history.reset();
@@ -137,18 +158,23 @@ impl Thread {
         {
             return;
         }
-        let changed = crate::composer_rich::Snapshot::capture(&self.draft, &self.draft_images)
-            != edit.original;
+        let changed = crate::composer_rich::Snapshot::capture_with_context(
+            &self.draft,
+            &self.draft_images,
+            &self.draft_context,
+        ) != edit.original;
         let recover = changed
             && self.has_draft_content()
             && edit.ordinary.text.trim().is_empty()
             && edit.ordinary_images.is_empty();
         let editor = self.draft.clone();
         let images = self.draft_images.clone();
+        let context = self.draft_context.clone();
         self.cancel_queued_edit();
         if recover {
             self.draft = editor;
             self.draft_images = images;
+            self.draft_context = context;
         }
         if changed {
             self.error = Some(format!(
@@ -211,9 +237,10 @@ impl Thread {
             .find(|q| q.id == id)
             .map(|q| q.prompt.images.iter().map(|a| a.id.clone()).collect())
             .unwrap_or_default();
-        let prompt = match crate::composer_tokens::prompt_for(
+        let prompt = match crate::composer_tokens::prompt_for_with_context(
             &self.draft,
             &self.draft_images,
+            &self.draft_context,
             Some(&self.machine),
             &str::to_owned,
         ) {
@@ -228,7 +255,7 @@ impl Thread {
                 "queue.update",
                 json!({"threadId":self.id,"inputId":id,
                 "generation":generation,"expectedRevision":revision,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"existingAttachmentIds":existing}),
+                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"existingAttachmentIds":existing}),
             ) {
                 Ok(command) => self.queued_save = Some((command, identity)),
                 Err(error) => self.error = Some(error),

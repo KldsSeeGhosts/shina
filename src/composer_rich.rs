@@ -35,14 +35,25 @@ pub struct Snapshot {
     pub text: String,
     pub html: String,
     pub attachments: Vec<crate::attachments::Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<crate::composer_context::ComposerContextRecord>,
 }
 
 impl Snapshot {
     pub fn capture(edit: &TextEdit, attachments: &[crate::attachments::Attachment]) -> Self {
+        Self::capture_with_context(edit, attachments, &[])
+    }
+
+    pub fn capture_with_context(
+        edit: &TextEdit,
+        attachments: &[crate::attachments::Attachment],
+        context: &[crate::composer_context::ComposerContextRecord],
+    ) -> Self {
         Self {
             text: edit.text.clone(),
             html: edit.to_html(),
             attachments: attachments.to_vec(),
+            context: context.to_vec(),
         }
     }
 
@@ -515,6 +526,24 @@ fn inline(
                     .any(|m| m.start <= start && end <= m.end && m.mark == *mark)
             })
             .collect();
+        let context_ref = marks.iter().find_map(|m| {
+            (m.start <= start && end <= m.end)
+                .then(|| m.mark.pill_id())
+                .flatten()
+                .and_then(crate::composer_context::parse_composer_context_href)
+        });
+        if let Some((kind, context_id)) = context_ref {
+            runs.push(Run {
+                text: crate::composer_context::format_composer_context_reference(
+                    &kind,
+                    &context_id,
+                    &edit.text[start..end],
+                ),
+                marks: active,
+                whitespace: false,
+            });
+            continue;
+        }
         let token = marks.iter().find_map(|m| {
             (m.start <= start && end <= m.end)
                 .then(|| m.mark.pill_id())

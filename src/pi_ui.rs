@@ -444,6 +444,16 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
                 s.checkpoint();
             },
         ));
+        let preview_text = crate::composer_context::replace_composer_context_references(
+            crate::composer_context::strip_attachment_only_bootstrap_prompt(&queued.prompt.text),
+            |reference| {
+                if reference.kind == "image" && !queued.prompt.images.is_empty() {
+                    String::new()
+                } else {
+                    reference.label.clone()
+                }
+            },
+        );
         let mut body = col()
             .gap(6.0)
             .px(12.0)
@@ -453,7 +463,7 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
             .max_w(580.0)
             .shrink()
             .min_w(0.0)
-            .child(label(&queued.prompt.text, BODY, p.muted).wrap_anywhere());
+            .child(label(preview_text.trim(), BODY, p.muted).wrap_anywhere());
         if !queued.prompt.images.is_empty() {
             body = body.child(message_images(
                 s,

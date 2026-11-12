@@ -659,6 +659,7 @@ pub(super) fn changed(s: &mut State) {
     let t = s.current_mut();
     t.native.slash_index = 0;
     t.composer_rules.changed(&mut t.draft);
+    t.reconcile_draft_context();
     t.typing_guard.on_type(std::time::Instant::now());
     t.update_submission_error();
     s.ensure_composer_commands();

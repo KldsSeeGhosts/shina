@@ -143,14 +143,20 @@ export default async function shinaExtension(pi: ExtensionAPI) {
     }
     // KSG Code's provider-pi/mcpExtensionSource.ts. Pi natively expands only a leading
     // /skill: command. Expand every selected $skill through Pi's own frontmatter loader.
-    if (!event.text.includes("$")) return;
+    if (!event.text.includes("$") && !event.text.includes("<context kind=\"skill\"")) return;
     const commands = pi.getCommands().filter((command) => command.source === "skill");
     const nativeSkill = /^\/skill:([^ ]+)(?: |$)/.exec(event.text)?.[1];
     const seen = new Set<string>(nativeSkill === undefined ? [] : [nativeSkill]);
     const blocks: string[] = [];
+    const skillNames = [];
     for (const match of event.text.matchAll(/(^|\s)\$([^\s]+)(?=\s|$)/g)) {
-      const name = match[2];
-      if (name === undefined || seen.has(name)) continue;
+      if (match[2] !== undefined) skillNames.push(match[2]);
+    }
+    for (const match of event.text.matchAll(/<context kind="skill"[^>]*>\nname: ([^\n]+)\n<\/context>/g)) {
+      if (match[1] !== undefined) skillNames.push(match[1].trim());
+    }
+    for (const name of skillNames) {
+      if (seen.has(name)) continue;
       const command = commands.find((candidate) => candidate.name === "skill:" + name);
       if (command === undefined) continue;
       seen.add(name);

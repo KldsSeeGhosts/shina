@@ -131,6 +131,7 @@ impl Attachment {
 pub struct Prompt {
     pub text: String,
     pub images: Arc<[Attachment]>,
+    pub context: Option<crate::composer_context::MessageContext>,
     pub draft: Option<crate::composer_rich::Snapshot>,
 }
 
@@ -139,6 +140,20 @@ impl Prompt {
         Self {
             text,
             images: images.into(),
+            context: None,
+            draft: None,
+        }
+    }
+
+    pub fn with_context(
+        text: String,
+        images: Vec<Attachment>,
+        context: Option<crate::composer_context::MessageContext>,
+    ) -> Self {
+        Self {
+            text,
+            images: images.into(),
+            context,
             draft: None,
         }
     }
@@ -511,10 +526,26 @@ pub fn validate_prompt_images(images: &[Attachment]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn provider_text(prompt: &Prompt) -> String {
+    let local_id = directory()
+        .and_then(|d| d.parent().map(Path::to_path_buf))
+        .and_then(|d| std::fs::read_to_string(d.join("server-id")).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    crate::composer_context::project_composer_context_for_provider_on(
+        &prompt.text,
+        prompt
+            .context
+            .as_ref()
+            .map_or(&[], |c| c.records.as_slice()),
+        local_id.as_deref(),
+    )
+}
+
 /// Exact KSG provider-core/attachmentPrompt format. Pi does not inline ordinary text files.
 pub fn pi_message(prompt: &Prompt) -> Result<String, String> {
     validate_prompt_images(&prompt.images)?;
-    let mut text = prompt.text.clone();
+    let mut text = provider_text(prompt);
     for attachment in prompt.images.iter() {
         let path = path_for(attachment).ok_or("Invalid attachment path.")?;
         if !text.is_empty() {
@@ -537,7 +568,8 @@ pub fn pi_message(prompt: &Prompt) -> Result<String, String> {
 /// Internal transport record. ACP chooses its content blocks after capability negotiation.
 pub fn prompt_record(prompt: &Prompt, pi: bool) -> Result<Value, String> {
     validate_prompt_images(&prompt.images)?;
-    let mut record = json!({"message": if pi { pi_message(prompt)? } else { prompt.text.clone() }});
+    let mut record =
+        json!({"message": if pi { pi_message(prompt)? } else { provider_text(prompt) }});
     let images = encode_images(&prompt.images)?;
     if !images.is_empty() {
         record["images"] = json!(images);

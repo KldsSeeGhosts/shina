@@ -159,6 +159,7 @@ pub struct Message {
     /// Images shown with this message. Only the local reference is kept; Pi gets the typed
     /// `image` parts when the prompt is submitted.
     pub images: Vec<Attachment>,
+    pub context: Option<crate::composer_context::MessageContext>,
 }
 
 impl Message {
@@ -344,7 +345,8 @@ pub struct Thread {
     client_creating: Option<uuid::Uuid>,
     client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
-    remote_send: Option<(uuid::Uuid, TextEdit, Vec<Attachment>)>,
+    remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
+    pub composer_context_supported: bool,
     request_generation: String,
     server_owned: bool,
     recovery_command: Option<uuid::Uuid>,
@@ -376,6 +378,8 @@ pub struct Thread {
     pub paste_history: crate::composer_paste::PasteHistory,
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
+    pub draft_context: Vec<crate::composer_context::ComposerContextRecord>,
+    pub retained_context: crate::composer_context::RetainedContextPayloads,
     pub attachment_error: Option<String>,
     pub submission_error: Option<String>,
     pub pi: Option<Pi>,
@@ -580,6 +584,7 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            composer_context_supported: true,
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
@@ -619,6 +624,8 @@ impl Thread {
             paste_history: crate::composer_paste::PasteHistory::default(),
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
+            draft_context: Vec::new(),
+            retained_context: Default::default(),
             attachment_error: None,
             submission_error: None,
             pi: None,
@@ -964,7 +971,13 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt(&self.draft, &self.draft_images) {
+        let prompt = match crate::composer_tokens::prompt_for_with_context(
+            &self.draft,
+            &self.draft_images,
+            &self.draft_context,
+            Some(&self.machine),
+            &str::to_owned,
+        ) {
             Ok(prompt) => prompt,
             Err(error) => {
                 self.attachment_error = Some(error);
@@ -976,8 +989,20 @@ impl Thread {
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
+        self.draft_context.clear();
+        self.retained_context = Default::default();
         self.native.queue_held = false;
         self.begin_prompt(prompt);
+    }
+
+    pub fn reconcile_draft_context(&mut self) {
+        let referenced = crate::composer_tokens::collect_inline_context_ids_from_edit(&self.draft);
+        crate::composer_context::reconcile_context_references(
+            &referenced,
+            &mut self.draft_context,
+            &mut self.draft_images,
+            &mut self.retained_context,
+        );
     }
 
     pub fn validate_prompt_length(&self, prompt: &Prompt) -> Option<String> {
@@ -990,10 +1015,16 @@ impl Thread {
         if self.submission_error.is_none() {
             return;
         }
-        let expanded = crate::composer_tokens::prompt(&self.draft, &self.draft_images)
-            .ok()
-            .and_then(|p| crate::attachments::pi_message(&p).ok())
-            .unwrap_or_else(|| crate::composer_rich::markdown(&self.draft));
+        let expanded = crate::composer_tokens::prompt_for_with_context(
+            &self.draft,
+            &self.draft_images,
+            &self.draft_context,
+            Some(&self.machine),
+            &str::to_owned,
+        )
+        .ok()
+        .and_then(|p| crate::attachments::pi_message(&p).ok())
+        .unwrap_or_else(|| crate::composer_rich::markdown(&self.draft));
         self.submission_error = crate::composer::prompt_length_validation_message(&expanded);
     }
 
@@ -1031,6 +1062,7 @@ impl Thread {
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
+            context: prompt.context.clone(),
         });
         self.attachment_error = None;
         self.status = Status::Running;
@@ -1252,6 +1284,7 @@ impl Thread {
                 role: "Shina",
                 text,
                 images: Vec::new(),
+                context: None,
             });
             self.pending_injections[0].shown = true;
         }
@@ -1481,6 +1514,7 @@ impl Thread {
                 role: "Pi",
                 text: String::new(),
                 images: Vec::new(),
+                context: None,
             });
             self.messages.len() - 1
         });
@@ -1635,6 +1669,7 @@ impl Thread {
                     role: "You",
                     text: string(&record, "text").into(),
                     images,
+                    context: None,
                 });
                 self.error = Some("ACP steering delivery could not be confirmed. The provider may have accepted this message, so Shina did not resend it.".into());
             }
@@ -1891,6 +1926,7 @@ impl Thread {
                                             },
                                             text,
                                             images,
+                                            context: None,
                                         });
                                     }
                                 }
@@ -1900,6 +1936,7 @@ impl Thread {
                                         role: "Shina",
                                         text: content_text(&message["content"]),
                                         images: content_images(&message["content"]),
+                                        context: None,
                                     });
                                 }
                                 if role == "assistant" {
@@ -2001,6 +2038,7 @@ impl Thread {
                                 role: "You",
                                 text: prompt.text.clone(),
                                 images: prompt.images.to_vec(),
+                                context: prompt.context.clone(),
                             });
                         }
                         self.recover_native_inputs();
@@ -2392,25 +2430,42 @@ impl Thread {
         // Preserve both drafts even if their combined images exceed a message limit.
         // The user can remove images before sending. Never discard a newer attachment.
         self.draft_images = images;
+        let mut context = prompt
+            .draft
+            .as_ref()
+            .filter(|draft| !draft.context.is_empty())
+            .map(|draft| draft.context.clone())
+            .or_else(|| prompt.context.as_ref().map(|c| c.records.clone()))
+            .unwrap_or_default();
+        for record in &self.draft_context {
+            if !context.iter().any(|c| c.context_id == record.context_id) {
+                context.push(record.clone());
+            }
+        }
+        self.draft_context = context;
         self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
-    fn restore_editor(&mut self, submitted: &TextEdit, attachments: &[Attachment]) {
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &crate::composer_rich::Snapshot) {
         if let Some(edit) = &mut self.queued_edit {
-            edit.ordinary = crate::composer_rich::prepend(submitted, &edit.ordinary);
-            let mut images = attachments.to_vec();
+            edit.ordinary = crate::composer_rich::prepend(&snapshot.editor(), &edit.ordinary);
+            let mut images = snapshot.attachments.clone();
             for image in &edit.ordinary_images {
                 if !images.iter().any(|existing| existing.id == image.id) {
                     images.push(image.clone());
                 }
             }
             edit.ordinary_images = images;
+            let mut context = snapshot.context.clone();
+            for record in &edit.ordinary_context {
+                if !context.iter().any(|c| c.context_id == record.context_id) {
+                    context.push(record.clone());
+                }
+            }
+            edit.ordinary_context = context;
         } else {
-            let mut prompt = Prompt::new(String::new(), attachments.to_vec());
-            prompt.draft = Some(crate::composer_rich::Snapshot::capture(
-                submitted,
-                attachments,
-            ));
+            let mut prompt = Prompt::new(String::new(), snapshot.attachments.clone());
+            prompt.draft = Some(snapshot.clone());
             self.restore_prompt(&prompt);
         }
     }
@@ -2419,13 +2474,13 @@ impl Thread {
         if !self
             .remote_send
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == command)
+            .is_some_and(|(id, _)| *id == command)
         {
             return;
         }
-        let (_, edit, images) = self.remote_send.take().unwrap();
+        let (_, snapshot) = self.remote_send.take().unwrap();
         if !accepted {
-            self.restore_editor(&edit, &images);
+            self.restore_snapshot(&snapshot);
         }
     }
 
@@ -5726,9 +5781,10 @@ impl State {
             // KSG snapshots and clears at dispatch. A refusal merges it with later edits.
             let revision = uuid::Uuid::new_v4();
             let target_machine = self.current().machine.clone();
-            let prompt = match crate::composer_tokens::prompt_for(
+            let prompt = match crate::composer_tokens::prompt_for_with_context(
                 &self.current().draft,
                 &self.current().draft_images,
+                &self.current().draft_context,
                 Some(&target_machine),
                 &|machine| self.machine_label(machine),
             ) {
@@ -5746,16 +5802,20 @@ impl State {
             }
             self.current_mut().submission_error = None;
             let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
             match result {
                 Some(Ok(id)) => {
-                    self.current_mut().remote_send = Some((
-                        id,
-                        self.current().draft.clone(),
-                        self.current().draft_images.clone(),
-                    ));
-                    self.current_mut().draft.replace_text("");
-                    self.current_mut().draft_images.clear();
+                    let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                        &self.current().draft,
+                        &self.current().draft_images,
+                        &self.current().draft_context,
+                    );
+                    let thread = self.current_mut();
+                    thread.remote_send = Some((id, snapshot));
+                    thread.draft.replace_text("");
+                    thread.draft_images.clear();
+                    thread.draft_context.clear();
+                    thread.retained_context = Default::default();
                 }
                 Some(Err(error)) => self.storage_error = Some(error),
                 None => {}
@@ -6747,15 +6807,18 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let (draft, images) = t.queued_edit.as_ref().map_or(
-                    (&t.draft, &t.draft_images), |edit| (&edit.ordinary, &edit.ordinary_images));
-                let value = if images.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
+                let (draft, images, context) = t.queued_edit.as_ref().map_or(
+                    (&t.draft, &t.draft_images, &t.draft_context),
+                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context),
+                );
+                let value = if images.is_empty() && context.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
                     json!(draft.text)
                 } else {
                     json!({
                         "text": draft.text,
                         "richHtml": draft.to_html(),
                         "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                        "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
                     })
                 };
                 (t.id.to_string(), value)
@@ -6858,6 +6921,13 @@ impl State {
                 t.draft = crate::composer_rich::restore(text, draft["richHtml"].as_str());
                 crate::composer_tokens::stamp_thread_owner(&mut t.draft, &t.machine);
                 t.draft_images = images;
+                t.draft_context = draft
+                    .get("context")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| crate::composer_context::decode_message_context(v).ok())
+                    .map(|c| c.records)
+                    .unwrap_or_default();
+                t.retained_context = Default::default();
                 t.attachment_error = if missing_images {
                     Some("Some saved draft images are missing or invalid. Attach those images again.".into())
                 } else {
@@ -7128,10 +7198,10 @@ impl State {
             elapsed: Some(42),
         });
         thread.messages = vec![
-            Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new() },
-            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into(), images: Vec::new() },
-            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into(), images: Vec::new() },
-            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into(), images: Vec::new() },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new(), context: None },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "I'll check the socket lifecycle and where the reconnect listener attaches before making the change.".into(), images: Vec::new(), context: None },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The reconnect listener attaches too late. I'll move it before `socket.open()` and cover the initialization race.".into(), images: Vec::new(), context: None },
+            Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "The listener now attaches before the socket opens. Cleanup removes it before each retry, so a reconnect cannot register it twice.\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nThe regression test passes. Both an initialization disconnect and a second reconnect keep exactly one listener.".into(), images: Vec::new(), context: None },
         ];
         thread.tools = vec![
             Tool {
@@ -8172,6 +8242,7 @@ mod tests {
             role: "Pi",
             text: "A unique worker transcript phrase".into(),
             images: vec![],
+            context: None,
         });
         state.search.replace_text("unique worker");
         assert_eq!(state.sidebar_captains(), vec![6]);
@@ -9180,6 +9251,7 @@ mod tests {
             Prompt {
                 text: "queued".into(),
                 draft: None,
+                context: None,
                 images: Default::default(),
             },
             0,
@@ -9302,6 +9374,7 @@ mod tests {
         state.threads[0].queued_prompt = Some((
             Prompt {
                 draft: None,
+                context: None,
                 text: "work".into(),
                 images: Default::default(),
             },
@@ -9883,6 +9956,7 @@ mod tests {
                 role: "Pi",
                 text: "界".repeat(6100),
                 images: Vec::new(),
+                context: None,
             });
             if exit {
                 events
@@ -10986,6 +11060,7 @@ mod tests {
                 role: "You",
                 text: prompt.into(),
                 images: Vec::new(),
+                context: None,
             });
             thread.apply(json!({"type":"agent_start"}));
             thread.started = Some(Instant::now() - Duration::from_secs(3));
@@ -11016,6 +11091,7 @@ mod tests {
             role: "You",
             text: "Try this".into(),
             images: Vec::new(),
+            context: None,
         });
         thread.pending_prompt = Some(("1-1".into(), Prompt::new("Try this".into(), vec![]), 0));
         thread.status = Status::Running;
@@ -11576,6 +11652,7 @@ mod tests {
             role: "Pi",
             text: "Previous answer".into(),
             images: Vec::new(),
+            context: None,
         });
         thread.status = Status::Completed;
         let idle = thread.last_activity + IDLE_TIMEOUT;
@@ -12811,6 +12888,7 @@ mod tests {
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
+            context: None,
         });
         thread.pending_prompt = Some(("1-1".into(), prompt, 0));
         thread.status = Status::Running;

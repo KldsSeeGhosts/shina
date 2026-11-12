@@ -225,6 +225,11 @@ glyph!(
     r#"<path d="M8 2h2v2h-2zM14 2h2v2h-2zM4 4h16v2h-16zM4 6h2v2h-2zM18 6h2v2h-2zM2 8h4v2h-4zM18 8h4v2h-4zM4 10h2v2h-2zM10 10h4v4h-4zM18 10h2v2h-2zM2 12h4v2h-4zM18 12h4v2h-4zM4 14h2v2h-2zM18 14h2v2h-2zM4 16h16v2h-16zM8 18h2v2h-2zM14 18h2v2h-2z"/>"#
 );
 glyph!(DOT, r#"<path d="M8 8h8v8H8z"/>"#);
+// Dashed circle/ring on whole 2-unit cells for unresolved composer context chips.
+glyph!(
+    UNRESOLVED,
+    r#"<path d="M8 2h4v2H8zm6 0h4v2h-4zM4 4h2v2H4zm14 0h2v2h-2zM2 8h2v4H2zm18 0h2v4h-2zM2 14h2v4H2zm18 0h2v4h-2zM4 18h2v2H4zm14 0h2v2h-2zM8 20h4v2H8zm6 0h4v2h-4z"/>"#
+);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
 pub(super) fn glyph(kind: &str) -> &'static Icon {
@@ -280,6 +285,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "wrench" => &WRENCH,
         "crew" => &CREW,
         "copy" => &COPY,
+        "unresolved" => &UNRESOLVED,
         _ => &CHECK,
     }
 }
@@ -312,7 +318,7 @@ mod tests {
     fn strict_glyphs_are_built_from_whole_two_unit_cells() {
         // At 18 pt on a 2x display one unit is 1.5 device pixels, so an odd coordinate lands
         // on half a pixel and blurs. Every coordinate and length in these glyphs is even.
-        let strict: [(&str, &Icon); 8] = [
+        let strict: [(&str, &Icon); 9] = [
             ("clock", &CLOCK),
             ("lightbulb", &LIGHTBULB),
             ("pencil", &PENCIL),
@@ -321,6 +327,7 @@ mod tests {
             ("chip", &CHIP),
             ("settings", &SETTINGS),
             ("moon", &MOON),
+            ("unresolved", &UNRESOLVED),
         ];
         for (name, glyph) in strict {
             let all = numbers(glyph.body);

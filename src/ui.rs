@@ -8743,7 +8743,7 @@ fn composer(
     )
     .color(p.ink)
     .pill_colors(p.selected, Some(p.ink))
-    .pill_icon(composer_menu::pill_icon)
+    .pill_style(composer_menu::pill_style(s, p))
     .rich_style(rune::RichStyle {
         code_fg: Some(p.ink),
         code_bg: p.code_bg,
@@ -8784,6 +8784,7 @@ fn composer(
         if t.paste_history
             .key(&mut t.draft, &mut t.draft_images, event)
         {
+            s.current_mut().reconcile_draft_context();
             s.checkpoint();
             return true;
         }
@@ -8791,6 +8792,7 @@ fn composer(
         let before = t.draft.text.clone();
         let handled = t.composer_rules.key(&mut t.draft, event);
         if handled {
+            t.reconcile_draft_context();
             if t.draft.text != before {
                 t.typing_guard.on_type(std::time::Instant::now());
             }
@@ -11217,6 +11219,7 @@ pub(crate) mod tests {
                 role: "You",
                 text: source.clone(),
                 images: vec![],
+                context: None,
             }];
             rt.frame(0.0);
             assert_eq!(rt.state.current().messages[0].text, source);
@@ -11263,12 +11266,14 @@ pub(crate) mod tests {
                     role: "You",
                     text: "Explain **this change**.".into(),
                     images: vec![],
+                    context: None,
                 },
                 crate::model::Message {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: "Pi",
                     text: "```rust\nlet ready = true;\n```".into(),
                     images: vec![],
+                    context: None,
                 },
             ];
             let clipboard = rune::clipboard::memory();
@@ -12235,9 +12240,22 @@ pub(crate) mod tests {
             });
             rt.frame(0.0);
             assert_eq!(rt.state.current().draft.pills().count(), 1);
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "[Mention target](t3-context://v1/thread/thread_42) "
+            );
+            assert_eq!(rt.state.current().draft_context.len(), 1);
+            let prompt = crate::composer_tokens::prompt_for_with_context(
+                &rt.state.current().draft,
+                &[],
+                &rt.state.current().draft_context,
+                Some("local"),
+                &|m| m.to_owned(),
+            )
+            .unwrap();
             assert!(
-                crate::composer_rich::markdown(&rt.state.current().draft)
-                    .contains("read_thread({\"thread_id\":42})")
+                crate::attachments::provider_text(&prompt)
+                    .contains(r#"read_thread({"threadId":42})"#)
             );
             rt.key(rune::KeyEvent {
                 key: rune::Key::Command('z'),
@@ -12613,6 +12631,7 @@ pub(crate) mod tests {
                         path: None,
                     })
                     .collect(),
+                context: None,
             });
         }
         rt.frame(0.0);
@@ -14047,6 +14066,7 @@ pub(crate) mod tests {
                 role: "You",
                 text: "Go".into(),
                 images: vec![],
+                context: None,
             });
             t.status = Status::Running;
             t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(721));
@@ -14312,6 +14332,7 @@ pub(crate) mod tests {
             role: "Shina",
             text: "A delegated task finished.".into(),
             images: Vec::new(),
+            context: None,
         });
         rt.frame(0.0);
         // The finished turn folds its tool into the work line, which still opens.
@@ -16826,6 +16847,7 @@ pub(crate) mod tests {
                     role: "You",
                     text: text.into(),
                     images: Vec::new(),
+                    context: None,
                 })
                 .collect();
             rt.frame(0.0);
@@ -17512,6 +17534,90 @@ pub(crate) mod tests {
             rt.frame(0.0);
             assert!(rt.state.current().draft.has_mark(&rune::Mark::Bold));
             assert!(!rt.state.show_activity);
+        }
+    }
+
+    #[test]
+    fn unresolved_chips_render_distinctly_survive_layout_and_send_as_unavailable() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let t = rt.state.current_mut();
+            t.draft = crate::composer_rich::draft("Inspect ");
+            t.draft.set_caret(t.draft.text.len());
+            let missing_href = "t3-context://v1/terminal/term_missing";
+            let future_href = "t3-context://v1/future-kind/future_1";
+            t.draft.insert_pill(missing_href, "Missing term");
+            t.draft.insert(" and ");
+            t.draft.insert_pill(future_href, "Future chip");
+            t.draft_context
+                .push(crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "future_1".into(),
+                    label: "Future chip".into(),
+                    data: crate::composer_context::ComposerContextData::Unknown {
+                        kind: "future-kind".into(),
+                        payload: json!({"v": 1}),
+                    },
+                });
+            rt.frame(0.0);
+
+            assert_eq!(
+                composer_menu::chip_status(&rt.state, missing_href),
+                composer_menu::ChipStatus::Unresolved
+            );
+            assert_eq!(
+                composer_menu::chip_status(&rt.state, future_href),
+                composer_menu::ChipStatus::Unresolved
+            );
+            let p = palette(false);
+            let t = rt.state.current();
+            let (_, fg_missing, icon_missing) = composer_menu::pill_appearance(
+                composer_menu::chip_status(&rt.state, missing_href),
+                missing_href,
+                &t.draft_context,
+                &t.draft_images,
+                &t.machine,
+                p,
+            );
+            assert_eq!(icon_missing.name, "UNRESOLVED");
+            assert_eq!(fg_missing, p.muted);
+            let (_, fg_future, icon_future) = composer_menu::pill_appearance(
+                composer_menu::chip_status(&rt.state, future_href),
+                future_href,
+                &t.draft_context,
+                &t.draft_images,
+                &t.machine,
+                p,
+            );
+            assert_eq!(icon_future.name, "UNRESOLVED");
+            assert_eq!(fg_future, p.muted);
+            let (composer_rect, _) = rt.presented("composer").unwrap();
+            let (input_rect, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input_rect[0] >= composer_rect[0] - 0.5
+                    && input_rect[0] + input_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5,
+                "{width}: input {input_rect:?} overflows composer {composer_rect:?}"
+            );
+
+            // Sending does not block on unresolved chips; missing record becomes unavailable="true".
+            rt.state.current_mut().send();
+            assert!(rt.state.current().attachment_error.is_none());
+            assert_eq!(rt.state.current().messages.len(), 1);
+            let prompt = crate::attachments::Prompt::with_context(
+                rt.state.current().messages[0].text.clone(),
+                vec![],
+                rt.state.current().messages[0].context.clone(),
+            );
+            let projected = crate::attachments::provider_text(&prompt);
+            assert!(
+                projected
+                    .contains(r#"<context kind="terminal" id="term_missing" unavailable="true"/>"#),
+                "{projected}"
+            );
+            assert!(
+                projected.contains(r#"<context kind="future-kind" id="future_1">"#),
+                "{projected}"
+            );
         }
     }
 }

@@ -559,7 +559,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -655,7 +655,11 @@ async fn supervise(
                     wake();
                     continue;
                 }
-                let prepared = match uploaded_command(&command,remote.as_ref()).await {
+                let has_composer_context = info.lock().expect("connection info")["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_CONTEXT));
+                let command_to_send = downgrade_composer_context_command(command.clone(), has_composer_context);
+                let prepared = match uploaded_command(&command_to_send,remote.as_ref()).await {
                     Ok(command) => command,
                     Err(error) => {
                         let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":error}})));
@@ -1063,6 +1067,39 @@ pub(crate) async fn cache_html(
         crate::html_render::import(&directory, &reference)?;
     }
     Ok(())
+}
+
+/// Strip the additive `context` field and pre-project `t3-context://` references into
+/// `text` when talking to an older server without `composer-context-v1` (whose `SendInput`
+/// has `deny_unknown_fields`).
+pub(crate) fn downgrade_composer_context_command(
+    mut command: Command,
+    has_composer_context: bool,
+) -> Command {
+    if has_composer_context || !matches!(command.method.as_str(), "thread.send" | "queue.update") {
+        return command;
+    }
+    if let Some(obj) = command.params.as_object_mut() {
+        let context = obj.remove("context").filter(|v| !v.is_null());
+        if let Some(text) = obj.get("text").and_then(Value::as_str).map(str::to_owned)
+            && !crate::composer_context::collect_composer_context_references(&text).is_empty()
+        {
+            let records = context
+                .and_then(|v| crate::composer_context::decode_message_context(&v).ok())
+                .map(|c| c.records)
+                .unwrap_or_default();
+            obj.insert(
+                "text".into(),
+                json!(
+                    crate::composer_context::project_composer_context_for_provider(&text, &records)
+                ),
+            );
+            // Older server validates `markdown(&editor) == prompt.text`, which would fail
+            // once `text` is projected; omit `draft` when links were pre-projected.
+            obj.remove("draft");
+        }
+    }
+    command
 }
 
 async fn uploaded_command(
