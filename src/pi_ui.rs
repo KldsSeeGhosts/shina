@@ -341,6 +341,22 @@ pub(super) fn composer_pi_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         s.current_mut().native.follow_up = previous;
         return true;
     }
+    let t = s.current_mut();
+    let menu_open = t.draft.focused
+        && t.draft.text.starts_with('/')
+        && !t.draft.text.chars().any(char::is_whitespace)
+        && t.native.slash_dismissed.as_ref() != Some(&t.draft.text);
+    let entries: Vec<_> = t
+        .messages
+        .iter()
+        .filter(|m| m.role == "You")
+        .map(|m| m.text.as_str())
+        .collect();
+    if t.prompt_history
+        .navigate(&mut t.draft, &entries, event, menu_open)
+    {
+        return true;
+    }
     false
 }
 

@@ -350,6 +350,7 @@ impl Thread {
                 delivered: false,
             });
         }
+        self.prompt_history.reset();
         self.draft.replace_text("");
         self.draft_images.clear();
         self.life.user_sent(lifecycle::now());

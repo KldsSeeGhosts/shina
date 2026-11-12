@@ -7,6 +7,7 @@ mod brand;
 mod captains;
 mod client;
 mod codex;
+mod composer;
 mod context;
 mod crisp;
 mod database;

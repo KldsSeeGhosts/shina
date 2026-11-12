@@ -312,6 +312,7 @@ pub struct Thread {
     pub work: Vec<AssistantWork>,
     pub draft: TextEdit,
     /// Images selected for the next send, kept separate from text undo history.
+    pub prompt_history: crate::composer::History,
     pub draft_images: Vec<Attachment>,
     pub attachment_error: Option<String>,
     pub pi: Option<Pi>,
@@ -524,6 +525,7 @@ impl Thread {
             thoughts: vec![],
             work: vec![],
             draft: TextEdit::default(),
+            prompt_history: crate::composer::History::default(),
             draft_images: Vec::new(),
             attachment_error: None,
             pi: None,
@@ -863,6 +865,7 @@ impl Thread {
             return;
         }
         let prompt = Prompt::new(self.draft.text.trim().to_owned(), self.draft_images.clone());
+        self.prompt_history.reset();
         self.draft.replace_text("");
         self.draft_images.clear();
         self.begin_prompt(prompt);
