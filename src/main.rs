@@ -123,7 +123,14 @@ fn key_inner(
     if ui::questionnaire_key(state, event) {
         return true;
     }
-    if state.settings_menu && state.settings.shortcut_capture.is_some() {
+    if state.settings_menu
+        && (state.settings.shortcut_capture.is_some()
+            || state
+                .settings
+                .new_keybinding
+                .as_ref()
+                .is_some_and(|d| d.recording))
+    {
         if let Some(tx) = tx {
             return ui::settings_ui::handle_shortcut_capture(state, event, tx);
         }
@@ -236,6 +243,25 @@ fn dispatch_global_command(
                 state.compact_sidebar = !state.compact_sidebar;
             } else {
                 state.sidebar = !state.sidebar;
+            }
+            state.checkpoint();
+        }
+        "threadPanel.toggle" => {
+            if key_repeat {
+                return true;
+            }
+            if state.settings_menu
+                || state.project_picker.is_some()
+                || state.captain_editor.is_some()
+                || state.machines.dialog
+                || state.fleet.open
+                || state.settings.archive.is_some()
+            {
+                return false;
+            }
+            state.show_activity = !state.show_activity;
+            if !state.show_activity {
+                state.activity_full = false;
             }
             state.checkpoint();
         }
