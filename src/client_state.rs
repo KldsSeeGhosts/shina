@@ -881,23 +881,70 @@ impl State {
             if let crate::client::Event::Receipt(command, value) = &event
                 && command.method == "thread.send"
             {
-                let threads = if server == self.machines.selected {
-                    Some(&mut self.threads)
-                } else {
-                    self.machines.threads.get_mut(&server)
-                };
-                if let Some(thread) = threads.and_then(|threads| {
-                    threads.iter_mut().find(|thread| {
-                        thread
-                            .remote_send
-                            .as_ref()
-                            .is_some_and(|(id, _, _)| *id == command.command_id)
-                    })
-                }) {
-                    thread.finish_remote_send(
-                        command.command_id,
-                        value["result"]["status"] == "accepted",
-                    );
+                let accepted = value["result"]["status"] == "accepted";
+                let mut bg_started: Option<(String, usize)> = None;
+                let mut bg_failed: Option<(String, usize, String)> = None;
+                let mut open_new_after: Option<(usize, String)> = None;
+                let mut handled_background = false;
+                {
+                    let threads = if server == self.machines.selected {
+                        Some(&mut self.threads)
+                    } else {
+                        self.machines.threads.get_mut(&server)
+                    };
+                    if let Some(thread) = threads.and_then(|threads| {
+                        threads.iter_mut().find(|thread| {
+                            thread
+                                .remote_send
+                                .as_ref()
+                                .is_some_and(|(id, _, _)| *id == command.command_id)
+                        })
+                    }) {
+                        thread.finish_remote_send(command.command_id, accepted);
+                        let bg = thread.background_send.take();
+                        let send_new = thread.pending_send_and_new_thread.take();
+                        handled_background = bg.is_some() || send_new.is_some();
+                        if !accepted {
+                            let error = value["error"]["message"]
+                                .as_str()
+                                .or(value["result"]["result"]["error"].as_str())
+                                .unwrap_or("Failed to send message.")
+                                .to_string();
+                            thread.error = Some(error.clone());
+                            if let Some(bg_server) = bg {
+                                bg_failed = Some((bg_server, thread.id, error));
+                            }
+                        } else if let Some(bg_server) = bg {
+                            bg_started = Some((bg_server, thread.id));
+                        } else if let Some((pending_cmd, pending_server)) = send_new
+                            && pending_cmd == command.command_id
+                        {
+                            open_new_after = Some((thread.id, pending_server));
+                        }
+                    }
+                }
+                if let Some((bg_server, thread_id)) = bg_started {
+                    self.notify_background_started(&bg_server, thread_id);
+                }
+                if let Some((bg_server, thread_id, error)) = bg_failed {
+                    self.notify_background_failure(&bg_server, thread_id, error);
+                }
+                if let Some((thread_id, pending_server)) = open_new_after
+                    && self.machines.selected == pending_server
+                    && self.current().id == thread_id
+                {
+                    let project = self.current().project;
+                    let seed = self.composer_seed();
+                    self.new_client_draft_with_seed(project, &seed);
+                    if !self.headless {
+                        self.restore_composer_focus(
+                            crate::ui::composer_ui::FocusReason::ThreadOpened,
+                        );
+                    }
+                    self.checkpoint_client();
+                }
+                if handled_background {
+                    continue;
                 }
             }
             if let crate::client::Event::Receipt(command, value) = &event
@@ -1185,6 +1232,14 @@ impl State {
                 changed = true;
             } else {
                 tx.wake_after(Duration::from_millis(notice.expires - at));
+            }
+        }
+        changed |= self.expire_toasts();
+        for toast in &self.toasts {
+            if let Some(expires) = toast.expires_at
+                && expires > at
+            {
+                tx.wake_after(Duration::from_millis(expires - at));
             }
         }
         if let Some(wait) = crate::ui::tick_portraits(self, Instant::now()) {
@@ -1764,6 +1819,7 @@ impl State {
                 thread.client_creating = Some(command);
                 thread.remote_send =
                     Some((command, thread.draft.clone(), thread.draft_images.clone()));
+                thread.life.last_requested_at = Some(lifecycle::now());
                 thread.draft.replace_text("");
                 thread.draft_images.clear();
             }
@@ -1778,44 +1834,7 @@ impl State {
             .as_ref()
             .and_then(|client| client.commands_for(server))
             .cloned();
-        let threads = if server == self.machines.selected {
-            &mut self.threads
-        } else {
-            let Some(threads) = self.machines.threads.get_mut(server) else {
-                return;
-            };
-            threads
-        };
-        let Some(draft) = threads.iter_mut().find(|thread| {
-            thread.client_draft
-                && json!(thread.id) == command.params["clientDraft"]
-                && thread.client_creating == Some(command.command_id)
-        }) else {
-            return;
-        };
-        draft.client_creating = None;
-        let submitted = draft.remote_send.take();
-        if value["result"]["status"] != "accepted" {
-            if let Some((_, edit, images)) = submitted {
-                draft.restore_editor(&edit, &images);
-            }
-            let error = value["error"]["message"]
-                .as_str()
-                .or(value["result"]["result"]["error"].as_str())
-                .unwrap_or("Thread creation was not confirmed. Your draft was kept.")
-                .to_string();
-            draft.error = Some(error.clone());
-            self.machines.notice = Some(error);
-            return;
-        }
-        let Some(id) = value["result"]["result"]["threadId"].as_u64() else {
-            return;
-        };
-        draft.client_promoted = Some(id as usize);
-        let Some((_, edit, images)) = submitted else {
-            return;
-        };
-        let label = |machine: &str| -> String {
+        let peer_label = |machine: &str| -> String {
             if machine == "local" {
                 "Local".into()
             } else {
@@ -1833,26 +1852,85 @@ impl State {
                     .unwrap_or_else(|| machine.into())
             }
         };
-        let prompt = match crate::composer_tokens::prompt_for(&edit, &images, Some(server), &label)
-        {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                draft.restore_editor(&edit, &images);
-                draft.attachment_error = Some(error.clone());
-                self.machines.notice = Some(error);
+        enum Outcome {
+            None,
+            Failed(Option<String>, usize, String),
+        }
+        let outcome = {
+            let threads = if server == self.machines.selected {
+                &mut self.threads
+            } else {
+                let Some(threads) = self.machines.threads.get_mut(server) else {
+                    return;
+                };
+                threads
+            };
+            let Some(draft) = threads.iter_mut().find(|thread| {
+                thread.client_draft
+                    && json!(thread.id) == command.params["clientDraft"]
+                    && thread.client_creating == Some(command.command_id)
+            }) else {
                 return;
+            };
+            draft.client_creating = None;
+            let submitted = draft.remote_send.take();
+            if value["result"]["status"] != "accepted" {
+                if let Some((_, edit, images)) = submitted {
+                    draft.restore_editor(&edit, &images);
+                }
+                let error = value["error"]["message"]
+                    .as_str()
+                    .or(value["result"]["result"]["error"].as_str())
+                    .unwrap_or("Thread creation was not confirmed. Your draft was kept.")
+                    .to_string();
+                draft.error = Some(error.clone());
+                Outcome::Failed(draft.background_send.take(), draft.id, error)
+            } else if let Some(id) = value["result"]["result"]["threadId"].as_u64() {
+                draft.client_promoted = Some(id as usize);
+                if let Some((_, edit, images)) = submitted {
+                    match crate::composer_tokens::prompt_for(
+                        &edit,
+                        &images,
+                        Some(server),
+                        &peer_label,
+                    ) {
+                        Ok(prompt) => {
+                            let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
+                                "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+                            let result = commands
+                                .ok_or_else(|| {
+                                    "This machine is not linked. Your draft was kept.".to_string()
+                                })
+                                .and_then(|commands| commands.send("thread.send", params));
+                            match result {
+                                Ok(cmd_id) => {
+                                    draft.remote_send = Some((cmd_id, edit, images));
+                                    Outcome::None
+                                }
+                                Err(error) => {
+                                    draft.restore_editor(&edit, &images);
+                                    draft.error = Some(error.clone());
+                                    Outcome::Failed(draft.background_send.take(), draft.id, error)
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            draft.restore_editor(&edit, &images);
+                            draft.attachment_error = Some(error.clone());
+                            Outcome::Failed(draft.background_send.take(), draft.id, error)
+                        }
+                    }
+                } else {
+                    Outcome::None
+                }
+            } else {
+                Outcome::None
             }
         };
-        let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-            "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
-        let result = commands
-            .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_string())
-            .and_then(|commands| commands.send("thread.send", params));
-        match result {
-            Ok(id) => draft.remote_send = Some((id, edit, images)),
-            Err(error) => {
-                draft.restore_editor(&edit, &images);
-                draft.error = Some(error.clone());
+        if let Outcome::Failed(bg, draft_id, error) = outcome {
+            if let Some(bg_server) = bg {
+                self.notify_background_failure(&bg_server, draft_id, error);
+            } else {
                 self.machines.notice = Some(error);
             }
         }
@@ -1874,9 +1952,13 @@ impl State {
             let text = std::mem::take(&mut self.threads[draft_index].draft);
             let images = std::mem::take(&mut self.threads[draft_index].draft_images);
             let sending = self.threads[draft_index].remote_send.take();
+            let background_send = self.threads[draft_index].background_send.take();
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
             self.threads[index].remote_send = sending;
+            if background_send.is_some() {
+                self.threads[index].background_send = background_send;
+            }
             let active = self.current().id;
             if self.tabs.contains(&draft_id) {
                 self.tabs.retain(|tab| *tab != id);
@@ -4596,5 +4678,170 @@ mod tests {
             blocked,
             "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
         );
+    }
+
+    #[test]
+    fn remote_send_background_promotes_opens_fresh_draft_and_handles_success_failure_and_offline() {
+        // 1. Offline machine shows warning toast and does not send or open a new draft.
+        {
+            let mut state = State::new(PathBuf::new(), false);
+            let mut client = crate::client::Client::new(state.data_dir.clone());
+            client.linked.insert(
+                "offline".into(),
+                crate::client::Client::new(state.data_dir.clone()),
+            );
+            state.client = Some(client);
+            state.machines.selected = "offline".into();
+            state.current_mut().client_draft = true;
+            state.current_mut().draft.replace_text("Should not send");
+            let id = state.current().id;
+            state.send_background();
+            assert_eq!(state.current().id, id);
+            assert_eq!(state.current().draft.text, "Should not send");
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Warning);
+            assert_eq!(state.toasts[0].title, "Not connected: message not sent");
+            assert_eq!(
+                state.toasts[0].description.as_deref(),
+                Some("Reconnecting to the environment. Try again once it is connected.")
+            );
+        }
+
+        // 2. Remote draft sendBackground: promotes in background, stays visible in sidebar while launching,
+        // opens fresh draft immediately, and shows "Started in background" once accepted.
+        {
+            let (mut state, mut server, mut commands) = tab_client();
+            state.apply_projection(server.projection()).unwrap();
+            state.new_thread_in(Some(1));
+            let draft_id = state.current().id;
+            state.current_mut().draft.replace_text("Remote bg task");
+            state.send_background();
+
+            let fresh_id = state.current().id;
+            assert_ne!(fresh_id, draft_id);
+            assert!(state.current().client_draft);
+            assert!(state.current().draft.text.is_empty());
+            assert!(
+                state
+                    .sidebar_threads()
+                    .iter()
+                    .any(|&i| state.threads[i].id == draft_id),
+                "launching background draft remains in sidebar"
+            );
+
+            let create = commands.try_recv().unwrap();
+            assert_eq!(create.method, "thread.create");
+            let created = server.execute_command(&create).unwrap();
+            let server_id = created["threadId"].as_u64().unwrap() as usize;
+            state.complete_client_creation("local", &create, &accepted(created));
+            let send = commands.try_recv().unwrap();
+            assert_eq!(send.method, "thread.send");
+            state.apply_projection(server.projection()).unwrap();
+            state.finish_client_promotions();
+            assert_eq!(state.current().id, fresh_id, "stays on fresh composer");
+
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send,
+                    json!({"result":{"status":"accepted","result":{}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_eq!(state.current().id, fresh_id);
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Success);
+            assert_eq!(state.toasts[0].title, "Started in background");
+            assert_eq!(state.toasts[0].action_label.as_deref(), Some("Open"));
+
+            let toast_id = state.toasts[0].id;
+            state.activate_toast(toast_id);
+            assert_eq!(state.current().id, server_id);
+        }
+
+        // 3. Remote background send failure on thread.create restores draft and shows "Background task failed".
+        {
+            let (mut state, server, mut commands) = tab_client();
+            state.apply_projection(server.projection()).unwrap();
+            state.new_thread_in(Some(1));
+            let draft_id = state.current().id;
+            state.current_mut().draft.replace_text("Will fail create");
+            state.send_background();
+            let fresh_id = state.current().id;
+            assert_ne!(fresh_id, draft_id);
+
+            let create = commands.try_recv().unwrap();
+            state.complete_client_creation(
+                "local",
+                &create,
+                &json!({"result":{"status":"rejected","result":{"error":"Create refused"}}}),
+            );
+            assert_eq!(state.current().id, fresh_id);
+            assert_eq!(state.toasts.len(), 1);
+            assert_eq!(state.toasts[0].kind, ToastKind::Error);
+            assert_eq!(state.toasts[0].title, "Background task failed");
+            assert_eq!(
+                state.toasts[0].description.as_deref(),
+                Some("Create refused")
+            );
+            assert_eq!(state.toasts[0].action_label.as_deref(), Some("Open draft"));
+            let toast_id = state.toasts[0].id;
+            state.activate_toast(toast_id);
+            assert_eq!(state.current().id, draft_id);
+            assert_eq!(state.current().draft.text, "Will fail create");
+            assert_eq!(state.current().error.as_deref(), Some("Create refused"));
+        }
+
+        // 4. Remote sendAndNewThread on existing thread waits for accepted receipt, and refuses to switch on failure.
+        {
+            let (mut state, mut server, mut commands) = tab_client();
+            server.threads[0].messages.push(Message {
+                role: "You",
+                text: "Prior turn".into(),
+                images: vec![],
+            });
+            state.apply_projection(server.projection()).unwrap();
+            state.select_thread(0);
+            while commands.try_recv().is_ok() {}
+            let existing_id = state.current().id;
+            assert!(!state.current().is_draft());
+            state
+                .current_mut()
+                .draft
+                .replace_text("Existing remote send");
+            state.send_background();
+            // Still on existing thread while receipt is pending.
+            assert_eq!(state.current().id, existing_id);
+            let send = commands.try_recv().unwrap();
+            assert_eq!(send.method, "thread.send");
+
+            // Rejected receipt restores draft and stays on existing thread.
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send,
+                    json!({"result":{"status":"rejected","result":{"error":"Send refused"}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_eq!(state.current().id, existing_id);
+            assert_eq!(state.current().draft.text, "Existing remote send");
+            assert_eq!(state.current().error.as_deref(), Some("Send refused"));
+
+            // Accepted receipt opens a fresh draft in the same project.
+            state.send_background();
+            let send2 = commands.try_recv().unwrap();
+            state.machines.receipts.insert(
+                "local".into(),
+                vec![crate::client::Event::Receipt(
+                    send2,
+                    json!({"result":{"status":"accepted","result":{}}}),
+                )],
+            );
+            state.poll_client(&mut Tx::default());
+            assert_ne!(state.current().id, existing_id);
+            assert!(state.current().client_draft);
+            assert!(state.toasts.is_empty());
+        }
     }
 }
