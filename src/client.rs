@@ -20,6 +20,7 @@ use std::{
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 type Worker = Mutex<Option<std::thread::JoinHandle<()>>>;
+type AssetView = Option<(usize, Arc<Value>)>;
 type Registration = (std::sync::Weak<AtomicBool>, std::sync::Weak<Worker>);
 static SUPERVISORS: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
 
@@ -487,7 +488,7 @@ async fn supervise(
     let mut server_stopped = false;
     let mut cache = ProjectionCache::default();
     let image_generation = Arc::new(AtomicUsize::new(0));
-    let (asset_changed, asset_updates) = tokio::sync::watch::channel(());
+    let (asset_changed, asset_updates) = tokio::sync::watch::channel(None);
     let image_job = remote.as_ref().map(|remote| {
         let output = output.clone();
         let error_wake = wake.clone();
@@ -694,12 +695,16 @@ async fn supervise(
                                 if let Some(writer) = &view_writer {
                                     writer.submit(json!({"schemaVersion":1,"state":projected,"seq":cache.seq,"epoch":cache.epoch}));
                                 }
-                                {
+                                let asset_view=image_job.as_ref().filter(|job|!job.is_finished()).map(|_|Arc::new(projected.clone()));
+                                let generation={
                                     let mut snapshot=snapshot.lock().expect("client snapshot");
-                                    image_generation.fetch_add(1,Ordering::AcqRel);
+                                    let generation=image_generation.fetch_add(1,Ordering::AcqRel)+1;
                                     *snapshot=Some(projected);
+                                    generation
+                                };
+                                if let Some(view)=asset_view {
+                                    asset_changed.send_replace(Some((generation,view)));
                                 }
-                                asset_changed.send_replace(());
                             }
                             if value["method"] == "subscription.ready" || value["id"] == "subscribe" {
                                 let phase = cache.maintenance["phase"].as_str().unwrap_or("ready");
@@ -772,14 +777,16 @@ async fn fetch_assets(
     profile: PathBuf,
     snapshot: Arc<Mutex<Option<Value>>>,
     generation: Arc<AtomicUsize>,
-    mut updates: tokio::sync::watch::Receiver<()>,
+    mut updates: tokio::sync::watch::Receiver<AssetView>,
     wake: rune::Waker,
     report: Arc<dyn Fn(String) + Send + Sync>,
 ) {
     while updates.changed().await.is_ok() {
-        let Some(mut projected) = snapshot.lock().expect("client snapshot").clone() else {
+        let view = updates.borrow_and_update().clone();
+        let Some((_, view)) = view else {
             continue;
         };
+        let mut projected = (*view).clone();
         if let Err(error) = cache_images(&remote, &profile, &mut projected, true).await {
             if error.starts_with("Authentication denied.") {
                 report(error);
@@ -788,11 +795,13 @@ async fn fetch_assets(
             // Asset failure does not fence state reception or create a tight retry loop.
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let (version, current) = {
-            let snapshot = snapshot.lock().expect("client snapshot");
-            (generation.load(Ordering::Acquire), snapshot.clone())
+        // The UI consumes pending snapshots with take(). Keep the latest asset
+        // source independently so a completed fetch can still wake an idle UI.
+        let latest = updates.borrow().clone();
+        let Some((version, current)) = latest else {
+            continue;
         };
-        let Some(mut current) = current else { continue };
+        let mut current = (*current).clone();
         if cache_images(&remote, &profile, &mut current, false)
             .await
             .is_ok()
@@ -1392,22 +1401,26 @@ mod tests {
             let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
             let snapshot=Arc::new(Mutex::new(Some(view(1))));
             let generation=Arc::new(AtomicUsize::new(1));
-            let (changed,updates)=tokio::sync::watch::channel(());
+            let (changed,updates)=tokio::sync::watch::channel(None);
             let worker=tokio::spawn(fetch_assets(remote,profile,snapshot.clone(),generation.clone(),updates,Arc::new(||{}),Arc::new(|_|{})));
-            changed.send_replace(());
+            changed.send_replace(Some((1,Arc::new(view(1)))));
             tokio::time::timeout(Duration::from_secs(2),started.notified()).await.unwrap();
+            let mut consumed=Value::Null;
             for seq in 2..=30 {
                 {
                     let mut snapshot=snapshot.lock().unwrap();
                     generation.store(seq,Ordering::Release);
                     *snapshot=Some(view(seq));
                 }
-                changed.send_replace(());
+                changed.send_replace(Some((seq,Arc::new(view(seq)))));
+                // Match Client::snapshot, which drains the UI's pending value.
+                if let Some(view)=snapshot.lock().unwrap().take() {consumed=view;}
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let deadline=Instant::now()+Duration::from_secs(5);
             loop {
-                if snapshot.lock().unwrap().as_ref().is_some_and(|s|s["seq"]==30 && s["attachment"]["width"]==256) {break}
+                if consumed["seq"]==30 && consumed["attachment"]["width"]==256
+                    || snapshot.lock().unwrap().as_ref().is_some_and(|s|s["seq"]==30 && s["attachment"]["width"]==256) {break}
                 assert!(Instant::now()<deadline,"asset did not hydrate the newest projection");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

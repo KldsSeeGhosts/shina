@@ -26,7 +26,18 @@ fn scopes(value: &Value) -> BTreeMap<String, Rows> {
                     .unwrap_or(json!({}));
                 let mut rows = Rows::new();
                 if field == "threadViews" || field == "threads" && item.get("messages").is_some() {
-                    for field in crate::protocol::HISTORY_FIELDS {
+                    // Auxiliary arrays such as skills must not inflate the small
+                    // header rewritten for a history sequence. Preserve their wire
+                    // location while storing their entries beside history rows.
+                    let fields = body
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, value)| value.is_array())
+                        .map(|(field, _)| field.clone())
+                        .collect::<Vec<_>>();
+                    for field in &fields {
+                        let field = field.as_str();
                         if let Some(items) = body[field].as_array().cloned() {
                             body[field] = json!([]);
                             for (ordinal, item) in items.into_iter().enumerate() {
@@ -156,13 +167,15 @@ pub fn read(connection: &Connection, document: &str) -> Result<Option<Value>, St
                     .as_array_mut()
                     .unwrap()
                     .push(value["item"].clone());
-                if !history[&field].is_array() {
-                    history[&field] = json!([]);
+                if crate::protocol::HISTORY_FIELDS.contains(&field.as_str()) {
+                    if !history[&field].is_array() {
+                        history[&field] = json!([]);
+                    }
+                    history[&field]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(value["identity"].clone());
                 }
-                history[&field]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(value["identity"].clone());
             }
             if body.is_null() {
                 return Err("Missing projection scope.".into());
@@ -267,6 +280,57 @@ pub fn write(connection: &Connection, document: &str, value: &Value) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auxiliary_arrays_do_not_expand_the_streaming_view_header() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE documents(name TEXT PRIMARY KEY,payload TEXT);")
+            .unwrap();
+        db.execute_batch(include_str!("migrations/005.sql"))
+            .unwrap();
+        let mut before = json!({"id":1,"messages":[{"id":"answer","role":"Pi","text":"a"}],
+            "queue_drafts":[[7,{"text":"queued ".repeat(40_000)}]],"skills":[{"name":"one","description":"skill ".repeat(40_000)}],"stats":{}});
+        crate::history::stamp(&Value::Null, &mut before, 1);
+        write(&db, "index.json", &json!({"threadViews":[before]})).unwrap();
+        let header:String=db.query_row("SELECT payload FROM projection_records WHERE document='index.json' AND scope='threadViews/1' AND key='$'",[],|r|r.get(0)).unwrap();
+        assert!(header.len() < 1024);
+        let mut after = before.clone();
+        after["messages"][0]["text"] = json!("ab");
+        crate::history::stamp(&before, &mut after, 2);
+        let changes = db.total_changes();
+        write(
+            &db,
+            "index.json",
+            &json!({"_partial":true,"threadViews":[after]}),
+        )
+        .unwrap();
+        assert_eq!(
+            db.total_changes() - changes,
+            2,
+            "only the message and its small view header change"
+        );
+        assert_eq!(
+            read(&db, "index.json").unwrap().unwrap()["threadViews"][0],
+            after
+        );
+
+        // Schema 1 already supports array rows and legacy inline view metadata.
+        let mut legacy = after.clone();
+        for field in crate::protocol::HISTORY_FIELDS {
+            if legacy[field].is_array() {
+                legacy[field] = json!([]);
+            }
+        }
+        legacy.as_object_mut().unwrap().remove("_history");
+        db.execute("UPDATE projection_records SET payload=?1 WHERE document='index.json' AND scope='threadViews/1' AND key='$'",[legacy.to_string()]).unwrap();
+        db.execute("DELETE FROM projection_records WHERE document='index.json' AND scope='threadViews/1' AND key LIKE 'skills/%'",[]).unwrap();
+        let restored = read(&db, "index.json").unwrap().unwrap()["threadViews"][0].clone();
+        for (field, value) in after.as_object().unwrap() {
+            assert!(
+                restored[field] == *value,
+                "legacy inline field {field} did not round-trip"
+            );
+        }
+    }
     #[test]
     fn item_identity_sequence_and_order_survive_roundtrip_and_scoped_writes() {
         let db = Connection::open_in_memory().unwrap();

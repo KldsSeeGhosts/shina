@@ -231,12 +231,14 @@ impl ThreadView {
             tool_started_at: thread
                 .tools
                 .iter()
+                .filter(|tool| !tool.done)
                 .filter_map(|t| Some((t.id.clone(), stable_timestamp(t.started?))))
                 .collect(),
             thought_started_at: Vec::new(),
             thought_clocks: thread
                 .thoughts
                 .iter()
+                .filter(|thought| !thought.done)
                 .filter_map(|t| Some((thought_clock_key(t), stable_timestamp(t.started?))))
                 .collect(),
             queue: thread
