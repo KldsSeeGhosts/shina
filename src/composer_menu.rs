@@ -171,6 +171,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                     Token::File {
                         path: entry.path.clone(),
                         directory: entry.directory,
+                        source: None,
                     },
                     label,
                 ),

@@ -10846,7 +10846,7 @@ mod tests {
         let ui = state.ui_snapshot();
         let mut restored = State::new(".".into(), false);
         restored.restore_ui(&ui).unwrap();
-        let expected = "**bold**\n1. one\n2. two\n> quote\n\n```\ncode\n```";
+        let expected = "**bold**\n1. one\n2. two\n> quote\n```\ncode\n```";
         assert_eq!(
             crate::composer_rich::markdown(&restored.current().draft),
             expected
@@ -12804,6 +12804,7 @@ mod tests {
         let token = crate::composer_tokens::Token::File {
             path: PathBuf::from("src/main.rs"),
             directory: false,
+            source: None,
         };
         state.current_mut().draft.insert_pill(token.id(), "main.rs");
         assert!(state.current().has_draft_content());

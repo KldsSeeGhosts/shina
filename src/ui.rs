@@ -8716,7 +8716,16 @@ fn composer(
                 return true;
             }
             let t = s.current_mut();
-            t.composer_rules.key(&mut t.draft, event)
+            let before = t.draft.text.clone();
+            let handled = t.composer_rules.key(&mut t.draft, event);
+            if handled {
+                if t.draft.text != before {
+                    t.typing_guard.on_type(std::time::Instant::now());
+                }
+                t.update_submission_error();
+                s.ensure_composer_commands();
+            }
+            handled
         })
         .on_input_change(|s: &mut State, _| {
             composer_menu::clear_dismissed_if_changed(s);
@@ -8735,7 +8744,10 @@ fn composer(
                 s.attach_paths(content.files());
             }
             if !content.text().is_empty() && !has_image && content.files().is_empty() {
-                return s.fold_paste(content.text());
+                if !s.fold_paste(content.text()) {
+                    crate::composer_paste::insert(s, content.text());
+                }
+                return true;
             }
             (has_image || !content.files().is_empty()) && content.text().is_empty()
         })
@@ -15516,6 +15528,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn composer_markdown_paste_and_code_enter_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .native
+                .skills
+                .push(crate::composer_skills::Skill {
+                    name: "fixture".into(),
+                    description: String::new(),
+                    path: None,
+                    user_only: false,
+                });
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.paste("**before $fixture after** $unknown");
+            rt.frame(0.0);
+            let edit = &rt.state.current().draft;
+            assert_eq!(
+                crate::composer_rich::markdown(edit),
+                "**before $fixture after** $unknown"
+            );
+            assert_eq!(edit.pills().count(), 1);
+            let (field, _) = rt.presented("composer-input").unwrap();
+            assert!(field[0] >= 0.0 && field[0] + field[2] <= width + 1.0);
+
+            let edit = &mut rt.state.current_mut().draft;
+            edit.replace_text("  code");
+            edit.set_block(rune::Block::Code);
+            edit.set_caret(edit.text.len());
+            rt.invalidate();
+            rt.frame(0.1);
+            rt.key(rune::KeyEvent::from(rune::Key::Enter));
+            rt.frame(0.2);
+            assert_eq!(rt.state.current().draft.text, "  code\n  ");
+            assert_eq!(rt.state.current().draft.active_block(), rune::Block::Code);
+        }
+    }
+
+    #[test]
     fn long_text_paste_uses_an_attachment_chip_and_undo_preserves_the_draft() {
         let mut rt = runtime(960.0);
         rt.frame(0.0);
@@ -15827,6 +15879,7 @@ pub(crate) mod tests {
             let token = crate::composer_tokens::Token::File {
                 path: std::path::PathBuf::from("src/main.rs"),
                 directory: false,
+                source: None,
             };
             rt.state
                 .current_mut()
