@@ -11,7 +11,7 @@ use std::{
 pub const PORT: u16 = 47329;
 
 /// Outbound server link metadata. This type never contains a credential.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Peer {
     pub server_id: String,
@@ -23,10 +23,25 @@ pub struct Peer {
     pub last_error: Option<String>,
 }
 impl Peer {
+    pub fn summary(&self) -> Value {
+        let mut value = serde_json::to_value(self).expect("peer metadata");
+        value["reachable"] = json!(
+            self.last_error.is_none()
+                && self
+                    .last_reached_at
+                    .is_some_and(|at| crate::lifecycle::now().saturating_sub(at) < 90_000)
+        );
+        value
+    }
     pub fn credential(&self, profile: &Path) -> Result<Link, String> {
-        let path = profile.join("peers").join(&self.server_id).join("credential.json");
-        let link: Link = serde_json::from_slice(&std::fs::read(path).map_err(|_| "Peer credential unavailable.")?)
-            .map_err(|_| "Invalid peer credential.")?;
+        let path = profile
+            .join("peers")
+            .join(&self.server_id)
+            .join("credential.json");
+        let link: Link = serde_json::from_slice(
+            &std::fs::read(path).map_err(|_| "Peer credential unavailable.")?,
+        )
+        .map_err(|_| "Invalid peer credential.")?;
         if link.server_id != self.server_id || link.host != self.host {
             return Err("Peer credential identity mismatch.".into());
         }
@@ -34,13 +49,33 @@ impl Peer {
     }
 }
 
+async fn revoke_peer(link: &Link) -> Result<Value, String> {
+    crate::client::remote_command(
+        link,
+        crate::protocol::Command::new("devices.revoke", json!({"deviceId":link.device_id})),
+    )
+    .await
+}
+
 pub async fn describe(address: SocketAddr) -> Result<Value, String> {
-    let response = http()?.get(format!("http://{address}/v1/identity")).send().await
+    let response = http()?
+        .get(format!("http://{address}/v1/identity"))
+        .send()
+        .await
         .map_err(|_| "Machine identity endpoint is unavailable.")?;
-    if !response.status().is_success() { return Err("Machine identity endpoint refused.".into()); }
-    let value: Value = response.json().await.map_err(|_| "Invalid machine identity.")?;
-    uuid::Uuid::parse_str(value["serverId"].as_str().ok_or("Missing server identity.")?)
-        .map_err(|_| "Invalid server identity.")?;
+    if !response.status().is_success() {
+        return Err("Machine identity endpoint refused.".into());
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| "Invalid machine identity.")?;
+    uuid::Uuid::parse_str(
+        value["serverId"]
+            .as_str()
+            .ok_or("Missing server identity.")?,
+    )
+    .map_err(|_| "Invalid server identity.")?;
     Ok(value)
 }
 
@@ -55,33 +90,99 @@ pub async fn pin(link: &Link) -> Result<Link, String> {
     Ok(pinned)
 }
 
-pub async fn link_peer(profile: &Path, database: &crate::database::Database, host: &str, code: &str) -> Result<Peer, String> {
+pub async fn link_peer(
+    profile: &Path,
+    database: &crate::database::Database,
+    host: &str,
+    code: &str,
+) -> Result<Peer, String> {
     let address = resolve(host)?;
     let identity = describe(address).await?;
-    if std::fs::read_to_string(profile.join("server-id")).ok().as_deref() == identity["serverId"].as_str() {
+    if std::fs::read_to_string(profile.join("server-id"))
+        .ok()
+        .as_deref()
+        == identity["serverId"].as_str()
+    {
         return Err("A server cannot link to itself.".into());
     }
-    if identity["peerDelegation"] != true { return Err("Update the target to support peer delegation.".into()); }
-    let server_id = identity["serverId"].as_str().expect("validated identity").to_owned();
-    if database.peers()?.iter().any(|p| p.server_id == server_id) {
-        return Err("This peer is already linked. Unlink it before pairing again.".into());
+    if identity["peerDelegation"] != true {
+        return Err("Update the target to support peer delegation.".into());
     }
+    let server_id = identity["serverId"]
+        .as_str()
+        .expect("validated identity")
+        .to_owned();
+    let previous = database
+        .peers()?
+        .into_iter()
+        .find(|p| p.server_id == server_id);
+    if previous.as_ref().is_some_and(|p| p.host != host) {
+        return Err(
+            "This peer is already linked at another address. Unlink it before moving the link."
+                .into(),
+        );
+    }
+    let previous = previous.map(|peer| peer.credential(profile)).transpose()?;
     let device_id = uuid::Uuid::new_v4().to_string();
-    let response = http()?.post(format!("http://{address}/v1/pair"))
-        .json(&json!({"code":code,"deviceId":device_id,"peer":true})).send().await
+    let response = http()?
+        .post(format!("http://{address}/v1/pair"))
+        .json(&json!({"code":code,"deviceId":device_id,"peer":true}))
+        .send()
+        .await
         .map_err(|_| "Machine pairing endpoint is unavailable.")?;
-    if !response.status().is_success() { return Err("Peer pairing refused. Use a fresh shina pair --peer code.".into()); }
-    let issued: Value = response.json().await.map_err(|_| "Invalid peer pairing response.")?;
-    if issued["serverId"] != server_id || issued["peer"] != true { return Err("Peer pairing identity or grant mismatch.".into()); }
-    let link = Link {server_id:server_id.clone(),host:host.into(),device_id,token:issued["token"].as_str().ok_or("Missing credential.")?.into()};
+    if !response.status().is_success() {
+        return Err("Peer pairing refused. Use a fresh shina pair --peer code.".into());
+    }
+    let issued: Value = response
+        .json()
+        .await
+        .map_err(|_| "Invalid peer pairing response.")?;
+    if issued["serverId"] != server_id || issued["peer"] != true {
+        return Err("Peer pairing identity or grant mismatch.".into());
+    }
+    let link = Link {
+        server_id: server_id.clone(),
+        host: host.into(),
+        device_id,
+        token: issued["token"]
+            .as_str()
+            .ok_or("Missing credential.")?
+            .into(),
+    };
+    if let Some(old) = previous {
+        let confirmed = match revoke_peer(&old).await {
+            Ok(receipt) => receipt["status"] == "accepted",
+            Err(error) => error.starts_with("Authentication denied"),
+        };
+        if !confirmed {
+            let _ = revoke_peer(&link).await;
+            return Err(
+                "The previous peer credential could not be revoked. Its link was kept.".into(),
+            );
+        }
+    }
     let directory = profile.join("peers").join(&server_id);
     let saved = (|| {
         crate::server_auth::protect(&profile.join("peers"))?;
         crate::server_auth::protect(&directory)?;
-        crate::server_auth::save_secret(&directory.join("credential.json"), &serde_json::to_vec(&link).map_err(|_| "Could not encode peer credential.")?)
+        crate::server_auth::save_secret(
+            &directory.join("credential.json"),
+            &serde_json::to_vec(&link).map_err(|_| "Could not encode peer credential.")?,
+        )
     })();
-    let mut peer = Peer {server_id,host:host.into(),label:identity["label"].as_str().unwrap_or(host).into(),
-        linked_at:crate::lifecycle::now(),capabilities:json!({}),last_reached_at:None,last_error:None};
+    let mut peer = Peer {
+        server_id,
+        host: host.into(),
+        label: identity["label"]
+            .as_str()
+            .filter(|label| label.len() <= 256)
+            .unwrap_or(host)
+            .into(),
+        linked_at: crate::lifecycle::now(),
+        capabilities: json!({}),
+        last_reached_at: None,
+        last_error: None,
+    };
     if saved.is_ok() {
         match crate::client::remote_rpc(&link, "peer.capabilities", json!({})).await {
             Ok(receipt) if receipt["status"] == "accepted" => {
@@ -92,20 +193,35 @@ pub async fn link_peer(profile: &Path, database: &crate::database::Database, hos
         }
     }
     if let Err(error) = saved.and_then(|_| database.put_peer(&peer)) {
-        let _ = crate::client::remote_rpc(&link,"devices.revoke",json!({"deviceId":link.device_id})).await;
+        let _ = revoke_peer(&link).await;
         return Err(error);
     }
     Ok(peer)
 }
 
-pub async fn unlink_peer(profile: &Path, database: &crate::database::Database, server: &str) -> Result<(), String> {
-    let peer = database.peers()?.into_iter().find(|p| p.server_id == server || p.host == server)
+pub async fn unlink_peer(
+    profile: &Path,
+    database: &crate::database::Database,
+    server: &str,
+) -> Result<(), String> {
+    let peer = database
+        .peers()?
+        .into_iter()
+        .find(|p| p.server_id == server || p.host == server)
         .ok_or("Unknown peer.")?;
     let link = peer.credential(profile)?;
-    let receipt = crate::client::remote_rpc(&link,"devices.revoke",json!({"deviceId":link.device_id})).await?;
-    if receipt["status"] != "accepted" { return Err("Revocation was not acknowledged. The peer link was kept.".into()); }
+    let receipt = revoke_peer(&link).await?;
+    if receipt["status"] != "accepted" {
+        return Err("Revocation was not acknowledged. The peer link was kept.".into());
+    }
     database.remove_peer(&peer.server_id)?;
-    std::fs::remove_file(profile.join("peers").join(&peer.server_id).join("credential.json")).map_err(|e| e.to_string())
+    std::fs::remove_file(
+        profile
+            .join("peers")
+            .join(&peer.server_id)
+            .join("credential.json"),
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub struct Machines {
@@ -436,7 +552,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("pair") if args.len() == 1 || args.len() == 2 && args[1] == "--peer" => {
             let value = runtime.block_on(crate::client::local_rpc(&profile, "devices.pair", json!({"peer":args.len()==2})))?;
-            println!("Pairing code: {}\nExpires in 5 minutes. Use once with shina link <host> <code>.", value["code"].as_str().ok_or("Missing pairing code.")?);
+            println!("Pairing code: {}\nExpires in 5 minutes. Use once with shina {}link <host> <code>.", value["code"].as_str().ok_or("Missing pairing code.")?,if args.len()==2 {"peer "}else{""});
         }
         Some("peer") => {
             let value = match args.get(1).map(String::as_str) {
@@ -466,7 +582,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             if receipt["status"] != "accepted" { return Err("Device revocation refused.".into()); }
             println!("Device revoked.");
         }
-        _ => return Err("Usage: shina pair | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id>]".into()),
+        _ => return Err("Usage: shina pair [--peer] | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id>] | peer link <host> <code> | peer list | peer unlink <server-id-or-host>".into()),
     }
     Ok(())
 }

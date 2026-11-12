@@ -324,9 +324,10 @@ async fn pair(
         crate::lifecycle::now(),
     );
     match result {
-        Ok(token) => {
-            Json(json!({"serverId":shared.discovery.server_id,"token":token,"peer":body["peer"]==true})).into_response()
-        }
+        Ok(token) => Json(
+            json!({"serverId":shared.discovery.server_id,"token":token,"peer":body["peer"]==true}),
+        )
+        .into_response(),
         Err(_) => StatusCode::FORBIDDEN.into_response(),
     }
 }
@@ -525,13 +526,18 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                 } else if matches!(method, "peer.link" | "peer.list" | "peer.unlink") {
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
-                    match method {
+                    let dispatch=if method=="peer.list" {Ok(None)} else {
+                        shared.database.claim_dispatch().and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
+                    };
+                    match dispatch {
+                        Err(error)=>Err(error),
+                        Ok(_dispatch)=>match method {
                         "peer.link" => crate::peer::link_peer(&shared.directory,&shared.database,
                             args["host"].as_str().unwrap_or(""),args["code"].as_str().unwrap_or("")).await.and_then(|peer|serde_json::to_value(peer).map_err(|e|e.to_string())),
                         "peer.unlink" => crate::peer::unlink_peer(&shared.directory,&shared.database,
                             args["server"].as_str().unwrap_or("")).await.map(|_| json!({})),
-                        _ => shared.database.peers().and_then(|peers|serde_json::to_value(peers).map_err(|e|e.to_string())),
-                    }
+                        _ => shared.database.peers().map(|peers|json!(peers.iter().map(crate::peer::Peer::summary).collect::<Vec<_>>())),
+                    }}
                 } else if method == "filesystem.browse" {
                     let args = params.get("args").unwrap_or(params);
                     let path = args["path"].as_str().unwrap_or("").to_string();
@@ -895,17 +901,28 @@ fn router(shared: Shared) -> Router {
 }
 
 async fn identity(State(shared): State<Shared>, headers: HeaderMap) -> Response {
-    if headers.contains_key("origin") { return StatusCode::FORBIDDEN.into_response(); }
-    Json(json!({"serverId":shared.discovery.server_id,"label":machine_label(),
-        "peerDelegation":shared.discovery.protocol_minor >= 5})).into_response()
+    if headers.contains_key("origin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(
+        json!({"serverId":shared.discovery.server_id,"label":machine_label(),
+        "peerDelegation":shared.discovery.protocol_minor >= 5}),
+    )
+    .into_response()
 }
 
 pub fn machine_label() -> String {
-    std::env::var("COMPUTERNAME").or_else(|_|std::env::var("HOSTNAME")).unwrap_or_else(|_| {
-        std::process::Command::new("hostname").output().ok()
-            .filter(|o|o.status.success()).and_then(|o|String::from_utf8(o.stdout).ok())
-            .map(|s|s.trim().to_owned()).unwrap_or_else(||"Shina".into())
-    })
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_else(|| "Shina".into())
+        })
 }
 
 #[cfg(test)]
@@ -1077,7 +1094,7 @@ mod tests {
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;
-            let target=Fixture::new("peer-target").await;
+            let mut target=Fixture::new("peer-target").await;
             let user=target.link(&target.shared.directory.join("client")).await;
             let workspace=target.shared.directory.join("workspace");
             std::fs::create_dir_all(&workspace).unwrap();
@@ -1112,6 +1129,18 @@ mod tests {
             assert!(crate::client::remote_command(&link,changed).await.unwrap_err().contains("different payload"));
             let mut wrong=link.clone(); wrong.server_id=home.shared.discovery.server_id.clone();
             assert!(crate::client::remote_rpc(&wrong,"peer.capabilities",json!({})).await.unwrap_err().contains("No credential was sent"));
+            let delayed=Command::new("peer.thread.send",json!({"threadId":id,"message":"A delayed follow-up"}));
+            let stop=Command::new("peer.thread.stop",json!({"threadId":id,"sendCommandId":delayed.command_id}));
+            let stopped=crate::client::remote_command(&link,stop.clone()).await.unwrap();
+            assert_eq!(stopped,crate::client::remote_command(&link,stop).await.unwrap());
+            let cancelled=crate::client::remote_command(&link,delayed).await.unwrap();
+            assert_eq!(cancelled["result"]["cancelled"],true);
+            target.listener.abort();target.disconnect.send_replace(true);
+            tokio::task::yield_now().await;
+            assert!(crate::peer::unlink_peer(&home.shared.directory,&home.shared.database,&peer.server_id).await.is_err());
+            assert_eq!(home.shared.database.peers().unwrap().len(),1);
+            assert!(peer.credential(&home.shared.directory).is_ok());
+            target.listen().await;
             target.shared.database.revoke(&link.device_id).unwrap();
             assert!(crate::client::remote_rpc(&link,"peer.thread.status",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
         });

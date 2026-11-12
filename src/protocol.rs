@@ -40,7 +40,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "filesystem.browse" => "read",
         "request.respond" => "approve",
         "devices.list"
-        | "peer.link" | "peer.list" | "peer.unlink"
+        | "peer.link"
+        | "peer.list"
+        | "peer.unlink"
         | "devices.pair"
         | "devices.revoke"
         | "server.validateRestart"
@@ -49,8 +51,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.clientReady"
         | "server.commitRestart"
         | "server.stop" => "maintain",
-        "peer.capabilities" | "peer.thread.launch" | "peer.thread.status"
-        | "peer.thread.read" | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
+        "peer.capabilities" | "peer.thread.launch" | "peer.thread.status" | "peer.thread.read"
+        | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
         "thread.send"
         | "thread.stop"
         | "thread.configure"
@@ -386,9 +388,15 @@ mod tests {
             "uploads.write",
             "devices.revoke",
             "command.get",
-            "peer.link", "peer.list", "peer.unlink", "peer.capabilities",
-            "peer.thread.launch", "peer.thread.status", "peer.thread.read",
-            "peer.thread.send", "peer.thread.stop",
+            "peer.link",
+            "peer.list",
+            "peer.unlink",
+            "peer.capabilities",
+            "peer.thread.launch",
+            "peer.thread.status",
+            "peer.thread.read",
+            "peer.thread.send",
+            "peer.thread.stop",
         ]);
         for source in [reducer, runtime, server] {
             let pieces: Vec<_> = source.split('"').collect();
@@ -425,7 +433,9 @@ mod tests {
                 | "filesystem.browse" => "read",
                 "request.respond" => "approve",
                 "devices.list"
-                | "peer.link" | "peer.list" | "peer.unlink"
+                | "peer.link"
+                | "peer.list"
+                | "peer.unlink"
                 | "devices.pair"
                 | "devices.revoke"
                 | "server.validateRestart"

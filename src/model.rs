@@ -50,6 +50,9 @@ mod scope;
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 #[path = "codex_model.rs"]
 mod codex_model;
+#[path = "remote_tasks.rs"]
+mod remote_tasks;
+pub use remote_tasks::{PeerOrigin, RemoteState, RemoteTask};
 
 struct Injection {
     text: String,
@@ -308,6 +311,8 @@ pub struct BriefUi {
 }
 
 pub struct Thread {
+    pub peer_origin: Option<PeerOrigin>,
+    pub stop_serial: u64,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
     client_creating: Option<uuid::Uuid>,
@@ -542,6 +547,8 @@ impl Thread {
             harness_state: json!({}),
             project: None,
             machine: "local".into(),
+            peer_origin: None,
+            stop_serial: 0,
             updated: crate::projects::now(),
             title: "New thread".into(),
             renamed: false,
@@ -941,6 +948,7 @@ impl Thread {
     }
 
     pub fn stop(&mut self) {
+        self.stop_serial = self.stop_serial.saturating_add(1);
         if self.forward("thread.stop", json!({})) {
             return;
         }
@@ -2285,6 +2293,8 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
 pub struct State {
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
+    pub peers: Vec<crate::peer::Peer>,
+    peer_runtime: remote_tasks::PeerRuntime,
     headless: bool,
     command_receipts: Vec<crate::protocol::Receipt>,
     command_intents: std::collections::BTreeMap<String, crate::protocol::Command>,
@@ -2461,6 +2471,8 @@ impl State {
         let mut state = Self {
             client: None,
             machines: Default::default(),
+            peers: Vec::new(),
+            peer_runtime: Default::default(),
             headless: false,
             owner: None,
             command_receipts: Vec::new(),
@@ -4575,7 +4587,7 @@ impl State {
                 "running_children_per_coordinator": tasks::RUNNING_LIMIT,
                 "unfinished_tasks_per_coordinator": tasks::UNFINISHED_LIMIT,
                 "direct_providers": false,
-                "remote_hosts": false,
+                "remote_hosts": true,
                 "model_ids": "exact ids only",
                 "reasoning_levels": "exact levels only, never clamped",
             },
@@ -4585,19 +4597,34 @@ impl State {
             "models": model_values,
             "notes": [
                 "Pi uses CPA. Codex and ACP use their own configured providers and login.",
-                "Only the local machine is supported. Captain workers use a selected workspace in the captain's scope and inherit its captain.",
+                "Linked peers run workers on their own projects and credentials. Workers cannot delegate further.",
                 "Pass exact model ids and reasoning levels. Unknown or unsupported choices are rejected before the child is created and are never silently substituted or clamped.",
                 "Omit target to inherit inherit_selection. Given target fields override the inherited selection.",
                 "When ready is false, discovery has not produced a usable catalog. Do not invent model ids or levels."
             ],
         });
         self.add_harness_capabilities(&mut capabilities);
+        capabilities["peers"] = json!(
+            self.peers
+                .iter()
+                .map(crate::peer::Peer::summary)
+                .collect::<Vec<_>>()
+        );
         capabilities
     }
 
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
     pub fn connect_thread(&mut self, index: usize) {
+        if index < self.threads.len()
+            && self
+                .tasks
+                .iter()
+                .any(|task| task.child_thread_id == self.threads[index].id && task.remote.is_some())
+        {
+            return;
+        }
         if self.demo
+            || !self.runtime_enabled
             || self.client.is_some()
             || self.ownership_denied
             || index >= self.threads.len()
@@ -4675,6 +4702,20 @@ impl State {
     }
     /// Answers a Shina MCP tool call on the UI thread. `caller` is the calling thread's id.
     fn mcp_call(&mut self, caller: usize, tool: &str, args: &Value) -> Result<Value, String> {
+        if self
+            .threads
+            .iter()
+            .any(|t| t.id == caller && t.peer_origin.is_some())
+            && !(matches!(
+                tool,
+                "propose_memory"
+                    | "list_memories"
+                    | "search_memories"
+                    | "orchestrator_capabilities"
+            ) || matches!(tool, "read_thread" | "task_status") && args["thread_id"] == caller)
+        {
+            return Err("A remote worker may read only its own thread and memories, and cannot delegate or control other work.".into());
+        }
         if matches!(
             tool,
             "create_routine" | "list_routines" | "pause_routine" | "delete_routine"
@@ -4744,8 +4785,8 @@ impl State {
                         json!({
                             "thread_id": t.id,
                             "title": t.title,
-                            "project": self.project(t.project).map(Project::to_value),
-                            "machine": t.machine,
+                            "project": self.task_project_value(t),
+                            "machine":self.remote_task(t.id).map(|remote|remote.server_id.as_str()).unwrap_or(&t.machine),
                             "captain": captain_name(self, t.captain),
                             "scope": self.scope_value(t.captain),
                             "captain_home": self.is_captain_home(t),
@@ -4776,8 +4817,8 @@ impl State {
                 Ok(json!({
                     "thread_id": thread.id,
                     "title": thread.title,
-                    "project": self.project(thread.project).map(Project::to_value),
-                    "machine": thread.machine,
+                    "project": self.task_project_value(thread),
+                    "machine":self.remote_task(thread.id).map(|remote|remote.server_id.as_str()).unwrap_or(&thread.machine),
                     "status": status_word(thread.status),
                     "selection": selection_value(thread),
                     "message_count": thread.messages.len(),
@@ -4802,16 +4843,21 @@ impl State {
                         })
                     })
                     .collect();
-                Ok(json!({ "captains": captains }))
+                Ok(
+                    json!({ "captains": captains, "peers":self.peers.iter().map(crate::peer::Peer::summary).collect::<Vec<_>>() }),
+                )
             }
             "delegate_task" => {
-                self.check_task_capacity(caller)?;
                 if self.threads[caller_index].delegated {
                     return Err(
                         "Delegated threads cannot delegate further. Do the work in this thread."
                             .into(),
                     );
                 }
+                if args["target"].get("machine").is_some() && args["target"]["machine"] != "local" {
+                    return self.delegate_remote(caller_index, args);
+                }
+                self.check_task_capacity(caller)?;
                 let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
                 if prompt.is_empty() {
                     return Err("prompt must describe the task.".into());
@@ -4953,10 +4999,13 @@ impl State {
                     }
                 });
                 Ok(json!({
+                    "remote":task.and_then(|task|task.remote.as_ref()),
+                    "remote_state":task.and_then(|task|task.remote.as_ref()).map(|remote|remote.state.word()),
+                    "needs_you_on":task.and_then(|task|task.remote.as_ref()).filter(|remote|remote.needs_you).map(|remote|&remote.label),
                     "thread_id": thread.id,
                     "title": thread.title,
-                    "project": self.project(thread.project).map(Project::to_value),
-                    "machine": thread.machine,
+                    "project": self.task_project_value(thread),
+                    "machine":task.and_then(|task|task.remote.as_ref()).map(|remote|remote.server_id.as_str()).unwrap_or(&thread.machine),
                     "parent": thread.parent,
                     "captain": captain_name(self, thread.captain),
                     "status": task.map(|task| task.state.id()).unwrap_or(status),
@@ -5483,6 +5532,9 @@ impl State {
 
     fn prewarm_current(&mut self) -> bool {
         let thread = self.current();
+        if self.remote_task(thread.id).is_some() {
+            return false;
+        }
         if self.runtime_enabled
             && !self.demo
             && !thread.archived()
@@ -5909,6 +5961,13 @@ impl State {
                     };
                     thread.captain_home = record["captainHome"] == true;
                     thread.delegated = record["delegated"] == true;
+                    thread.peer_origin = record
+                        .get("peerOrigin")
+                        .filter(|v| !v.is_null())
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()
+                        .ok()?;
+                    thread.stop_serial = record["stopSerial"].as_u64().unwrap_or(0);
                     thread.parent = if record["parent"].is_null() {
                         None
                     } else {
@@ -5920,7 +5979,7 @@ impl State {
             let ids: std::collections::HashSet<_> = restored.iter().map(|t| t.id).collect();
             let parents_valid = restored.iter().all(|thread| {
                 (!thread.captain_home || thread.captain.is_some() && !thread.delegated)
-                    && thread.delegated == thread.parent.is_some()
+                    && thread.delegated == (thread.parent.is_some() || thread.peer_origin.is_some())
                     && thread.parent.is_none_or(|parent| {
                         thread.delegated
                             && parent != thread.id
@@ -6353,6 +6412,7 @@ impl State {
                 "previousSession":thread.native.previous_session,"accessMode":thread.native.access.id(),
                 "captain":thread.captain, "captainHome":thread.captain_home, "delegated":thread.delegated,
                 "parent":thread.parent,
+                "peerOrigin":thread.peer_origin,"stopSerial":thread.stop_serial,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
                 "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking
             })).collect::<Vec<_>>()
@@ -6617,7 +6677,16 @@ pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut run_ended = false;
     let mut crew_questions = Vec::new();
     let mut event_budget_exhausted = false;
+    let remote_children: std::collections::HashSet<_> = state
+        .tasks
+        .iter()
+        .filter(|t| t.remote.is_some())
+        .map(|t| t.child_thread_id)
+        .collect();
     for (index, thread) in state.threads.iter_mut().enumerate() {
+        if remote_children.contains(&thread.id) {
+            continue;
+        }
         changed |= thread.poll_memory_command();
         // Batch incoming deltas into one view update, with a bounded per-frame drain.
         for event_index in 0..256 {
@@ -6880,10 +6949,12 @@ fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, Str
     let object = target.as_object().ok_or(
         "target must be an object with harness or model, and optional provider and options.",
     )?;
-    if let Some(key) = object
-        .keys()
-        .find(|key| !matches!(key.as_str(), "harness" | "provider" | "model" | "options"))
-    {
+    if let Some(key) = object.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "machine" | "harness" | "provider" | "model" | "options"
+        )
+    }) {
         return Err(format!(
             "Unknown target setting {key}. Use harness, provider, model and options."
         ));
@@ -6898,7 +6969,7 @@ fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, Str
                 .ok_or("target.harness must be pi, codex, claude, or an installed ACP id.")
         })
         .transpose()?;
-    if !object.contains_key("model") && harness.is_none() {
+    if !object.contains_key("model") && harness.is_none() && !object.contains_key("machine") {
         return Err("target.model is required when target is set without a harness.".into());
     }
     let model = object
@@ -9378,7 +9449,7 @@ mod tests {
         assert_eq!(capabilities["runtime"]["machine"], "local");
         assert_eq!(capabilities["runtime"]["host_supported"], true);
         assert_eq!(capabilities["constraints"]["direct_providers"], false);
-        assert_eq!(capabilities["constraints"]["remote_hosts"], false);
+        assert_eq!(capabilities["constraints"]["remote_hosts"], true);
     }
 
     #[test]

@@ -531,7 +531,7 @@ async fn connect(
         token
     };
     let endpoint = match remote {
-        Some(link) => format!("ws://{}/v1/ws", crate::peer::pin(link).await?.host),
+        Some(link) => format!("ws://{}/v1/ws", link.address()?),
         None => format!("ws://127.0.0.1:{}/v1/ws", discovery.port),
     };
     let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
@@ -1136,11 +1136,32 @@ pub async fn remote_rpc(
     method: &str,
     args: Value,
 ) -> Result<Value, String> {
-    remote_command(link, Command::new(method, args)).await
+    remote_request(
+        link,
+        Command::new(method, args),
+        method.starts_with("peer."),
+    )
+    .await
 }
 
 pub async fn remote_command(link: &crate::peer::Link, command: Command) -> Result<Value, String> {
+    remote_request(link, command, true).await
+}
+
+async fn remote_request(
+    link: &crate::peer::Link,
+    command: Command,
+    peer: bool,
+) -> Result<Value, String> {
     tokio::time::timeout(Duration::from_secs(8), async {
+        // Protocol 1.5 peers require a pre-credential identity check. Ordinary client
+        // connections retain compatibility with older additive protocol minors.
+        let pinned = if peer {
+            Some(crate::peer::pin(link).await?)
+        } else {
+            None
+        };
+        let link = pinned.as_ref().unwrap_or(link);
         let (mut socket, hello) = connect(
             &remote_discovery(link),
             &link.device_id,

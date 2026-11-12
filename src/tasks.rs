@@ -40,6 +40,8 @@ impl TaskState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Task {
+    #[serde(default)]
+    pub remote: Option<RemoteTask>,
     pub id: String,
     pub parent_thread_id: usize,
     pub child_thread_id: usize,
@@ -79,6 +81,7 @@ struct ResultDelivery {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskView {
+    pub remote: Option<RemoteTask>,
     pub id: String,
     pub child_id: usize,
     pub title: String,
@@ -149,8 +152,12 @@ fn valid_id(id: &str) -> bool {
 impl Task {
     pub(super) fn new(thread: &Thread, brief: &str, model_target: Option<Value>) -> Self {
         let id = unique_id();
-        let parent = thread.parent.expect("delegated thread parent");
+        let parent = thread
+            .parent
+            .or_else(|| thread.peer_origin.as_ref().map(|o| o.parent_thread_id))
+            .expect("delegated thread parent");
         Self {
+            remote: None,
             attempt_message: delivery_text(
                 &format!("{id}-brief"),
                 &format!("Shina: task from parent #{parent}\n\n{brief}"),
@@ -178,7 +185,7 @@ impl Task {
         }
     }
 
-    fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
+    pub(super) fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
         self.state = state;
         self.result_excerpt = excerpt(reply, 6000);
         self.error_excerpt = excerpt(error, 2000);
@@ -216,7 +223,7 @@ impl Task {
         )
     }
 
-    fn reconcile(&mut self, record: &Value) {
+    pub(super) fn reconcile(&mut self, record: &Value) {
         self.recovering = false;
         // A persisted failure/cancellation is already a conclusive local decision.
         if matches!(self.state, TaskState::Failed | TaskState::Cancelled) {
@@ -343,18 +350,27 @@ impl State {
                     .iter()
                     .find(|thread| thread.id == task.child_thread_id);
                 TaskView {
+                    remote: task.remote.clone(),
                     id: task.id.clone(),
                     child_id: task.child_thread_id,
                     title: task.title.clone(),
-                    workspace_label: self
-                        .project(task.project_id)
-                        .map(|p| p.name.clone())
+                    workspace_label: task
+                        .remote
+                        .as_ref()
+                        .and_then(|remote| remote.project["name"].as_str())
+                        .map(str::to_owned)
+                        .or_else(|| self.project(task.project_id).map(|p| p.name.clone()))
                         .unwrap_or_else(|| "No project".into()),
                     model_label: thread
                         .map(|t| t.model.clone())
                         .unwrap_or_else(|| DEFAULT_MODEL.into()),
                     state: task.state,
-                    last_activity_line: if !task.error_excerpt.is_empty() {
+                    last_activity_line: if task.remote.as_ref().is_some_and(|r| r.needs_you) {
+                        format!(
+                            "Needs you on {}",
+                            task.remote.as_ref().expect("remote").label
+                        )
+                    } else if !task.error_excerpt.is_empty() {
                         truncate(&task.error_excerpt, 160)
                     } else if let Some(thread) = thread.filter(|t| t.status.busy()) {
                         truncate(&thread.phase, 160)
@@ -491,8 +507,11 @@ impl State {
             return Err("This task has already finished.".into());
         }
         let child = self.tasks[index].child_thread_id;
+        self.tasks[index].owe_remote_stop();
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == child) {
-            thread.stop_task()?;
+            if self.tasks[index].remote.is_none() {
+                thread.stop_task()?;
+            }
             thread.disconnect();
             thread.recovering_task = false;
         }
@@ -638,10 +657,13 @@ impl State {
             return Ok(false);
         };
         if tool == "task_cancel" {
+            self.tasks[task_index].owe_remote_stop();
             if self.tasks[task_index].state.finished() {
                 return Ok(true);
             }
-            self.threads[index].stop_task()?;
+            if self.tasks[task_index].remote.is_none() {
+                self.threads[index].stop_task()?;
+            }
             self.threads[index].task_result = Some("cancelled");
             self.threads[index].completion_notified = true;
             self.tasks[task_index].recovering = false;
@@ -664,6 +686,31 @@ impl State {
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .ok_or("message must contain a correction or follow-up brief.")?;
+        if self.tasks[task_index].remote.is_some() {
+            if self.tasks[task_index]
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.stop_owed)
+            {
+                return Err(
+                    "Wait for the target to acknowledge the owed stop before sending more work."
+                        .into(),
+                );
+            }
+            if !self.tasks[task_index].state.finished() {
+                return self.queue_remote_send(task_index, message).map(|_| true);
+            }
+            self.queue_task_attempt(task_index, message)?;
+            let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
+            remote.send_command = Some(crate::protocol::Command::new(
+                "peer.thread.send",
+                json!({"threadId":remote.thread_id,"message":message}),
+            ));
+            remote.state = RemoteState::Launching;
+            remote.next_retry_at = 0;
+            self.start_queued_tasks();
+            return Ok(true);
+        }
         if self.tasks[task_index].state.occupies_slot() {
             let text = delivery_text(
                 &format!("{}-brief-{}", self.tasks[task_index].id, unique_id()),
@@ -724,6 +771,10 @@ impl State {
             }
             self.tasks[index].state = TaskState::Starting;
             self.tasks[index].started_at = Some(lifecycle::now());
+            if self.tasks[index].remote.is_some() {
+                changed = true;
+                continue;
+            }
             // Persist intent before any prompt can reach Pi. Failure leaves work stopped.
             if self.runtime_enabled
                 && let Err(error) = self.checkpoint_and_flush()
@@ -768,6 +819,24 @@ impl State {
         let mut children = std::collections::HashSet::new();
         let mut deliveries = std::collections::HashSet::new();
         for task in &mut tasks {
+            if let Some(remote) = &task.remote
+                && (uuid::Uuid::parse_str(&remote.server_id).is_err()
+                    || remote.launch_command.method != "peer.thread.launch"
+                    || remote.launch_command.params["origin"]["taskId"] != task.id
+                    || remote.stop_owed && remote.stop_command_id.is_none()
+                    || remote.thread_id == Some(0)
+                    || remote.label.len() > 256
+                    || remote
+                        .client_request_id
+                        .as_ref()
+                        .is_some_and(|id| id.is_empty() || id.len() > 256)
+                    || remote.send_command.as_ref().is_some_and(|command| {
+                        command.method != "peer.thread.send"
+                            || command.params["threadId"] != json!(remote.thread_id)
+                    }))
+            {
+                return Err("The saved index contains an invalid remote task.".into());
+            }
             if let Some(target) = &task.model_target {
                 parse_delegation_target(&json!({"target":target}))?;
             }
@@ -819,7 +888,7 @@ impl State {
         for thread in self
             .threads
             .iter()
-            .filter(|t| t.delegated && !children.contains(&t.id))
+            .filter(|t| t.delegated && t.peer_origin.is_none() && !children.contains(&t.id))
         {
             let mut task = Task::new(thread, "", None);
             task.state = TaskState::Interrupted;
@@ -832,6 +901,9 @@ impl State {
 
     pub(super) fn prepare_task_recovery(&mut self) {
         for task in &mut self.tasks {
+            if let Some(remote) = &mut task.remote {
+                remote.next_retry_at = 0;
+            }
             for delivery in &mut task.prior_deliveries {
                 delivery.hold = true;
             }
@@ -839,6 +911,9 @@ impl State {
                 continue;
             }
             task.hold_delivery = true;
+            if task.remote.is_some() {
+                continue;
+            }
             task.recovering = true;
             if let Some(thread) = self
                 .threads
@@ -868,13 +943,16 @@ impl State {
     }
 
     pub(super) fn poll_tasks(&mut self, now: Instant) -> bool {
-        let mut changed = false;
+        let mut changed = self.poll_remote_tasks();
         let routes: std::collections::HashMap<_, _> = self
             .threads
             .iter()
             .map(|t| (t.id, self.effective_home(t.id)))
             .collect();
         for task in &mut self.tasks {
+            if task.remote.is_some() {
+                continue;
+            }
             let Some(thread) = self
                 .threads
                 .iter_mut()
@@ -1039,6 +1117,25 @@ impl State {
             task.error_excerpt = error.into();
         }
         self.tasks.push(task);
+    }
+}
+
+impl Task {
+    pub(super) fn owe_remote_stop(&mut self) {
+        if let Some(remote) = &mut self.remote {
+            if self.state == TaskState::Queued
+                && self.started_at.is_none()
+                && remote.thread_id.is_none()
+            {
+                remote.state = RemoteState::Done;
+                return;
+            }
+            remote.stop_owed = true;
+            remote
+                .stop_command_id
+                .get_or_insert_with(uuid::Uuid::new_v4);
+            remote.next_retry_at = 0;
+        }
     }
 }
 

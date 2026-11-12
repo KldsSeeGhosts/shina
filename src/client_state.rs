@@ -54,6 +54,8 @@ struct ThreadView {
     commands_loaded: bool,
     #[serde(default)]
     commands_error: Option<String>,
+    #[serde(default)]
+    memory_suggestions: Vec<String>,
 }
 
 impl ThreadView {
@@ -143,10 +145,12 @@ impl ThreadView {
             harness_choice: thread.can_choose_harness(),
             commands_loaded: thread.native.commands_loaded,
             commands_error: thread.native.commands_error.clone(),
+            memory_suggestions: thread.memory_suggestions.clone(),
         }
     }
 
     fn apply(self, thread: &mut Thread) -> Result<(), String> {
+        thread.memory_suggestions = self.memory_suggestions;
         if thread.remote.is_some() {
             thread.request_generation = self.generation;
         }
@@ -462,6 +466,15 @@ impl State {
         if let Some(views) = views {
             self.install_thread_views(views)?;
         }
+        for thread in &mut self.threads {
+            if thread
+                .peer_origin
+                .as_ref()
+                .is_some_and(|origin| origin.result.is_none())
+            {
+                thread.recovering_task = true;
+            }
+        }
         self.setup_headless_background();
         if let Some(error) = &self.background.routines.error {
             return Err(error.clone());
@@ -521,13 +534,22 @@ impl State {
     pub fn begin_runtime_shutdown(&mut self) {
         self.runtime_enabled = false;
         self.projects.clone_job.take();
+        let remote_children: std::collections::HashSet<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.remote.is_some())
+            .map(|task| task.child_thread_id)
+            .collect();
         for thread in &mut self.threads {
+            if remote_children.contains(&thread.id) {
+                continue;
+            }
             if thread.status.busy()
                 || thread.configuring
                 || thread.queued()
                 || thread.request.is_some()
             {
-                thread.stop();
+                let _ = thread.stop_task();
             }
         }
     }
@@ -639,6 +661,7 @@ impl State {
         }
         json!({
             "index":index,"threads":self.thread_views(),"recoveryNotice":self.recovery_notice,
+            "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
@@ -1000,6 +1023,9 @@ impl State {
                     );
                 }
                 Ok(crate::peer::MachineResult::Devices(value)) => self.machines.devices = value,
+                Ok(crate::peer::MachineResult::Peers) => {
+                    self.machines.notice = Some("Peer links updated.".into())
+                }
                 Err(error) => self.machines.notice = Some(error),
             }
         }
@@ -1098,6 +1124,7 @@ impl State {
         let mut old = std::mem::take(&mut self.threads);
         // Validate server records without session restoration's navigation or draft creation.
         self.restore_records(&projection["index"], false)?;
+        self.peers = serde_json::from_value(projection["peers"].clone()).unwrap_or_default();
         let metadata = std::mem::take(&mut self.threads);
         for mut thread in metadata {
             if let Some(index) = old.iter().position(|old| old.id == thread.id) {
@@ -1115,6 +1142,8 @@ impl State {
                 local.captain_home = thread.captain_home;
                 local.delegated = thread.delegated;
                 local.parent = thread.parent;
+                local.peer_origin = thread.peer_origin;
+                local.stop_serial = thread.stop_serial;
                 local.native.access = thread.native.access;
                 local.selected_model = thread.selected_model;
                 local.selected_thinking = thread.selected_thinking;
@@ -1265,6 +1294,19 @@ impl State {
                 .and_then(|client| client.linked.get(server))
                 .and_then(|client| client.remote.as_ref())
                 .map(|link| link.host.clone())
+                .or_else(|| {
+                    self.peers
+                        .iter()
+                        .find(|p| p.server_id == server)
+                        .map(|p| p.label.clone())
+                })
+                .or_else(|| {
+                    self.threads
+                        .iter()
+                        .filter_map(|t| t.peer_origin.as_ref())
+                        .find(|o| o.server_id == server)
+                        .map(|o| o.server_label.clone())
+                })
                 .unwrap_or_else(|| server.into())
         }
     }
@@ -1771,6 +1813,9 @@ impl State {
             return;
         }
         let profile = self.data_dir.clone();
+        let peer_host = self.machines.peer_host.text.clone();
+        let peer_code = self.machines.peer_code.text.clone();
+        self.machines.peer_code.replace_text("");
         let host = self.machines.host.text.clone();
         let code = self.machines.code.text.clone();
         self.machines.code.replace_text("");
@@ -1787,6 +1832,20 @@ impl State {
                     runtime.block_on(async {
                         use crate::peer::MachineResult;
                         match action.as_str() {
+                            "peer-link" => crate::client::local_rpc(
+                                &profile,
+                                "peer.link",
+                                json!({"host":peer_host,"code":peer_code}),
+                            )
+                            .await
+                            .map(|_| MachineResult::Peers),
+                            "peer-unlink" => crate::client::local_rpc(
+                                &profile,
+                                "peer.unlink",
+                                json!({"server":target}),
+                            )
+                            .await
+                            .map(|_| MachineResult::Peers),
                             "link" => crate::peer::link(&profile, &host, &code)
                                 .await
                                 .map(MachineResult::Linked),
@@ -2046,6 +2105,15 @@ impl State {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("{key} must be text."))
         };
+        if self.remote_task(self.current().id).is_some()
+            && command.method.starts_with("thread.")
+            && !matches!(
+                command.method.as_str(),
+                "thread.stop" | "thread.visit" | "thread.lifecycle" | "thread.create"
+            )
+        {
+            return Err("This is a remote task result. Open its thread on the target machine, or send a follow-up from its parent.".into());
+        }
         let number = |key: &str| {
             args[key]
                 .as_u64()
@@ -2102,6 +2170,7 @@ impl State {
             "thread.stop" => {
                 self.current_mut().recovery_command = Some(command.command_id);
                 self.current_mut().stop();
+                self.owe_remote_stops_for(self.current().id);
                 if self.current().has_draft_content() {
                     let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images,"commandId":command.command_id});
                     self.recovered_inputs.insert(self.current().id, input);

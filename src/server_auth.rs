@@ -13,7 +13,9 @@ pub struct Pairing {
     peer: bool,
 }
 impl Pairing {
-    pub fn is_peer(&self) -> bool { self.peer }
+    pub fn is_peer(&self) -> bool {
+        self.peer
+    }
     #[cfg(test)]
     pub fn create(&mut self, now: u64) -> Result<serde_json::Value, String> {
         self.create_scoped(now, false)
@@ -63,7 +65,11 @@ impl Pairing {
         self.code_hash.clear();
         self.expires = 0;
         let token = secret();
-        let scopes: &[&str] = if self.peer { &["read", "peer-delegate"] } else { &["paired", "read", "operate", "approve"] };
+        let scopes: &[&str] = if self.peer {
+            &["read", "peer-delegate"]
+        } else {
+            &["paired", "read", "operate", "approve"]
+        };
         database.issue_scoped_device(device, &token, scopes)?;
         Ok(token)
     }

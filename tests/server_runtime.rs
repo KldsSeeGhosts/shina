@@ -14,6 +14,24 @@ struct Profile {
     root: PathBuf,
     children: Vec<Child>,
 }
+#[cfg(unix)]
+struct PausedProcess(u32);
+#[cfg(unix)]
+impl PausedProcess {
+    fn new(child: &Child) -> Self {
+        // Drop resumes this fixture-owned serve process even when an assertion fails.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) }, 0);
+        Self(child.id())
+    }
+}
+#[cfg(unix)]
+impl Drop for PausedProcess {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0 as i32, libc::SIGCONT);
+        }
+    }
+}
 impl Profile {
     fn new() -> Self {
         let root =
@@ -243,7 +261,12 @@ impl Client {
     }
     fn read(&mut self) -> Value {
         loop {
-            match self.socket.read().unwrap() {
+            match self.socket.read().unwrap_or_else(|error| {
+                panic!(
+                    "Socket read failed: {error}. Last snapshot: {}",
+                    self.snapshot
+                )
+            }) {
                 Message::Text(text) => {
                     let value: Value = serde_json::from_str(&text).unwrap();
                     if value["method"] == "subscription.snapshot" {
@@ -321,6 +344,241 @@ impl Client {
             self.read();
         }
     }
+}
+
+#[test]
+fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    let workspace = target.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/peer-fixture.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let output = String::from_utf8(code.stdout).unwrap();
+    let code = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let listing = home.cli(&["peer", "list"]);
+    assert!(listing.status.success());
+    let secret: Value = serde_json::from_slice(
+        &fs::read(
+            home.root
+                .join("Shina/peers")
+                .join(target_discovery["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains(secret["token"].as_str().unwrap()));
+    let mut client = home.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent=client.command("thread.create",json!({"project":1}),uuid::Uuid::new_v4())["result"]["result"]["threadId"].as_u64().unwrap();
+    let args = json!({"prompt":"remote-peer-fixture","workspace":1,"client_request_id":"one-launch",
+        "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
+    let delegated = client.command(
+        "task.delegate",
+        json!({"threadId":parent,"args":args}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    let retry = client.command(
+        "task.delegate",
+        json!({"threadId":parent,"args":args}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(retry["result"]["result"]["thread_id"], child);
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["remote"]["threadId"].is_number())
+    });
+    let launch =
+        client.snapshot["index"]["tasks"][0]["remote"]["launchCommand"]["commandId"].clone();
+    #[cfg(unix)]
+    let pause = PausedProcess::new(&target.children[0]);
+    // Stop only the home server. The accepted target thread remains owned by the target.
+    drop(client);
+    home.stop();
+    home.launch(&["serve"]);
+    let mut client = home.client(uuid::Uuid::new_v4());
+    #[cfg(unix)]
+    {
+        client.until(|state| state["index"]["tasks"][0]["remote"]["state"] == "target_offline");
+        assert_ne!(client.snapshot["index"]["tasks"][0]["state"], "failed");
+        drop(pause);
+    }
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    assert_eq!(
+        client.snapshot["index"]["tasks"][0]["remote"]["launchCommand"]["commandId"],
+        launch
+    );
+    assert_eq!(
+        client.snapshot["index"]["tasks"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(client.snapshot["index"]["tasks"][0]["delivered"], false);
+    let release = client.command(
+        "task.resumeResults",
+        json!({"threadId":parent}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(release["result"]["status"], "accepted", "{release}");
+    client.until(|state| state["index"]["tasks"][0]["delivered"] == true);
+    client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == parent)
+            .is_some_and(|t| t["status"] == "Completed")
+    });
+    let messages = client.snapshot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == parent)
+        .unwrap()["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("Shina: task #")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        client.snapshot["index"]["tasks"][0]["result_excerpt"],
+        "Fixture complete"
+    );
+    let result_thread = client.snapshot["index"]["tasks"][0]["remote"]["threadId"].clone();
+    target_client.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("resubscribe-peer-result"),
+    );
+    let rows = target_client.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|t| t["peerOrigin"]["taskId"].is_string())
+            .count(),
+        1
+    );
+    assert!(
+        rows.iter().find(|t| t["id"] == result_thread).unwrap()["peerOrigin"]["acknowledged"]
+            == true
+    );
+    #[cfg(unix)]
+    {
+        let followup = client.command(
+            "task.send",
+            json!({"threadId":parent,"args":{"thread_id":child,"message":"A second remote turn"}}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(followup["result"]["status"], "accepted", "{followup}");
+        let pause = PausedProcess::new(&target.children[0]);
+        let cancelled = client.command(
+            "task.cancel",
+            json!({"threadId":parent,"args":{"thread_id":child}}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(cancelled["result"]["status"], "accepted", "{cancelled}");
+        client.until(|state| {
+            state["index"]["tasks"][0]["state"] == "cancelled"
+                && state["index"]["tasks"][0]["remote"]["stopOwed"] == true
+        });
+        drop(client);
+        home.stop();
+        home.launch(&["serve"]);
+        client = home.client(uuid::Uuid::new_v4());
+        assert_eq!(
+            client.snapshot["index"]["tasks"][0]["remote"]["stopOwed"],
+            true
+        );
+        drop(pause);
+        client.until(|state| state["index"]["tasks"][0]["remote"]["stopOwed"] == false);
+        assert_eq!(client.snapshot["index"]["tasks"][0]["state"], "cancelled");
+    }
+    let unlink = home.cli(&[
+        "peer",
+        "unlink",
+        target_discovery["serverId"].as_str().unwrap(),
+    ]);
+    assert!(
+        unlink.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlink.stderr)
+    );
+    drop(client);
+    drop(target_client);
+    home.stop();
+    target.stop();
 }
 
 #[test]
@@ -774,7 +1032,14 @@ fn restart_negotiation_fences_and_cancels_without_losing_the_server() {
         json!({"protocolMajor":1,"protocolMinor":999,"projectionSchema":1,"clientPid":4242}),
         json!("good-version"),
     );
-    assert_eq!(hello["result"]["protocolMinor"], 4);
+    assert_eq!(hello["result"]["protocolMinor"], 5);
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "peer-delegation")
+    );
     let prepared =
         client.command("server.prepareRestart", json!({}), uuid::Uuid::new_v4())["result"].clone();
     assert_eq!(prepared["phase"], "draining");
