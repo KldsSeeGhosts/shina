@@ -24,6 +24,28 @@ struct Profile {
     root: PathBuf,
     children: Vec<Child>,
 }
+
+fn read_fixture_thread(workspace: &std::path::Path, args: Value) -> Value {
+    let response = call_fixture_tool(workspace, "read_thread", args);
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+fn call_fixture_tool(workspace: &std::path::Path, tool: &str, args: Value) -> Value {
+    let host: Value =
+        serde_json::from_slice(&fs::read(workspace.join("fixture-mcp.json")).unwrap()).unwrap();
+    let url = reqwest::Url::parse(host["url"].as_str().unwrap()).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string();
+    write!(stream, "POST {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", url.path(), host["token"].as_str().unwrap(), body.len(), body).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let response: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    response
+}
 #[cfg(unix)]
 struct PausedProcess(u32);
 #[cfg(unix)]
@@ -362,11 +384,152 @@ impl Client {
 }
 
 #[test]
-fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result() {
+fn linked_thread_reads_disambiguate_machine_ids_and_page_unrelated_threads() {
     let mut home = Profile::new();
     let mut target = Profile::new();
     home.launch(&["serve"]);
     target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut home_client = home.client(uuid::Uuid::new_v4());
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    for client in [&mut home_client, &mut target_client] {
+        for id in 2..=7 {
+            let created = client.command(
+                "thread.create",
+                json!({"occupiedDrafts":[1,2,3,4,5,6,7]}),
+                uuid::Uuid::new_v4(),
+            );
+            assert_eq!(created["result"]["result"]["threadId"], id, "{created}");
+        }
+    }
+    for (client, text) in [
+        (&mut home_client, "HOME SEVENTH THREAD"),
+        (&mut target_client, "remote-long-fixture-unrelated"),
+    ] {
+        let sent = client.command(
+            "thread.send",
+            json!({"threadId":7,"text":text,"attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+        client.until(|state| {
+            state["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["id"] == 7 && thread["status"] == "Completed")
+        });
+    }
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(code.status.success());
+    let output = String::from_utf8(code.stdout).unwrap();
+    let code = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    // Refresh peer metadata before making the model's request.
+    home_client.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("refresh-linked-reads"),
+    );
+    let home_directory = home.root.join("Shina/chats/7");
+    let target_directory = target.root.join("Shina/chats/7");
+    let home_prompts = fs::read(home_directory.join("fixture-prompts.jsonl")).unwrap();
+    let target_prompts = fs::read(target_directory.join("fixture-prompts.jsonl")).unwrap();
+    let local = read_fixture_thread(&home_directory, json!({"threadId":7}));
+    assert!(
+        local["items"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("HOME SEVENTH THREAD")
+    );
+    let remote = read_fixture_thread(
+        &home_directory,
+        json!({"machine":target_discovery["serverId"],
+        "threadId":7,"limit":1,"afterPosition":0,"maxCharsPerItem":6000}),
+    );
+    let capabilities = call_fixture_tool(&home_directory, "orchestrator_capabilities", json!({}));
+    let capabilities: Value = serde_json::from_str(
+        capabilities["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(capabilities["peers"][0]["threadReads"], true);
+    assert_eq!(capabilities["peers"][0]["threadLists"], true);
+    assert_eq!(remote["thread"]["threadId"], 7);
+    assert_eq!(remote["thread"]["machine"], target_discovery["serverId"]);
+    let item = &remote["items"][0];
+    assert_eq!(item["textTruncated"], true);
+    assert_eq!(
+        item["continuation"]["machine"],
+        target_discovery["serverId"]
+    );
+    let rest = read_fixture_thread(&home_directory, item["continuation"].clone());
+    let text = format!(
+        "{}{}",
+        item["text"].as_str().unwrap(),
+        rest["items"][0]["text"].as_str().unwrap()
+    );
+    for fact in ["START FACT", "MIDDLE FACT", "END FACT"] {
+        assert!(text.contains(fact));
+    }
+    assert!(!text.contains("HOME SEVENTH THREAD"));
+    let refused = call_fixture_tool(
+        &home_directory,
+        "read_thread",
+        json!({"machine":"not-linked-fixture","threadId":7}),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not-linked-fixture")
+    );
+    let listing = call_fixture_tool(
+        &home_directory,
+        "list_threads",
+        json!({"machine":target_discovery["serverId"],"allProjects":true,"titleContains":"remote-long","limit":1}),
+    );
+    assert_ne!(listing["result"]["isError"], true, "{listing}");
+    let listing: Value =
+        serde_json::from_str(listing["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(listing["threads"][0]["threadId"], 7);
+    assert_eq!(
+        listing["threads"][0]["machine"],
+        target_discovery["serverId"]
+    );
+    assert_eq!(
+        fs::read(home_directory.join("fixture-prompts.jsonl")).unwrap(),
+        home_prompts
+    );
+    assert_eq!(
+        fs::read(target_directory.join("fixture-prompts.jsonl")).unwrap(),
+        target_prompts
+    );
+    drop(home_client);
+    drop(target_client);
+    home.stop();
+    target.stop();
+}
+
+#[test]
+fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch_with_fault(&["serve"], Some("peer-ack"));
     let target_discovery = target.discovery();
     let mut target_client = target.client(uuid::Uuid::new_v4());
     let workspace = target.root.join("workspace");
@@ -447,7 +610,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
         "accepted"
     );
     let parent=client.command("thread.create",json!({"project":1}),uuid::Uuid::new_v4())["result"]["result"]["threadId"].as_u64().unwrap();
-    let args = json!({"prompt":"remote-peer-fixture","workspace":1,"client_request_id":"one-launch",
+    let args = json!({"prompt":"remote-long-fixture","workspace":1,"client_request_id":"one-launch",
         "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
     let delegated = client.command(
         "task.delegate",
@@ -484,6 +647,28 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
         assert_ne!(client.snapshot["index"]["tasks"][0]["state"], "failed");
         drop(pause);
     }
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while target.children[0].try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            client.rpc("workspace.subscribe", json!({}), json!("diagnose-follower"));
+            target_client.rpc("workspace.subscribe", json!({}), json!("diagnose-target"));
+            panic!(
+                "target did not reach the acknowledgement crash boundary. Home tasks {}, target threads {}",
+                client.snapshot["index"]["tasks"], target_client.snapshot["index"]["threads"]
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        target.children[0].try_wait().unwrap().unwrap().code(),
+        Some(86)
+    );
+    drop(target_client);
+    // The injected crash leaves discovery behind. Do not authenticate with its
+    // old bootstrap token while the restarted listener reuses the same port.
+    fs::remove_file(target.root.join("Shina/server.json")).unwrap();
+    target.launch(&["serve", "--port", &target_discovery["port"].to_string()]);
+    target_client = target.client(uuid::Uuid::new_v4());
     client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
     assert_eq!(
         client.snapshot["index"]["tasks"][0]["remote"]["launchCommand"]["commandId"],
@@ -526,10 +711,55 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
             .count(),
         1
     );
-    assert_eq!(
-        client.snapshot["index"]["tasks"][0]["result_excerpt"],
-        "Fixture complete"
-    );
+    let excerpt = client.snapshot["index"]["tasks"][0]["result_excerpt"]
+        .as_str()
+        .unwrap();
+    assert!(excerpt.contains("START FACT"));
+    assert!(!excerpt.contains("END FACT"));
+    let completion = messages
+        .iter()
+        .find(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("Shina: task #"))
+        })
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    assert!(completion.lines().last().unwrap().contains("read_thread"));
+    for restarted in [false, true] {
+        if restarted {
+            drop(target_client);
+            target.stop();
+            target.launch(&["serve", "--port", &target_discovery["port"].to_string()]);
+            target_client = target.client(uuid::Uuid::new_v4());
+        }
+        let first = read_fixture_thread(
+            &home_workspace,
+            json!({"threadId":client.snapshot["index"]["tasks"][0]["remote"]["threadId"],
+                "machine":target_discovery["serverId"],"maxCharsPerItem":6000}),
+        );
+        let item = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(item["textTruncated"], true);
+        let second = read_fixture_thread(&home_workspace, item["continuation"].clone());
+        let text = format!(
+            "{}{}",
+            item["text"].as_str().unwrap(),
+            second["items"][0]["text"].as_str().unwrap()
+        );
+        for fact in ["START FACT", "MIDDLE FACT", "END FACT"] {
+            assert!(
+                text.contains(fact),
+                "{fact} missing after restart={restarted}"
+            );
+        }
+        assert_eq!(second["items"][0]["textTruncated"], false);
+    }
     let result_thread = client.snapshot["index"]["tasks"][0]["remote"]["threadId"].clone();
     target_client.rpc(
         "workspace.subscribe",
@@ -549,6 +779,81 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
         rows.iter().find(|t| t["id"] == result_thread).unwrap()["peerOrigin"]["acknowledged"]
             == true
     );
+    let followup = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-long-fixture-again"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(followup["result"]["status"], "accepted", "{followup}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "running");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let target_finished: u64 = fs::read_to_string(workspace.join("fixture-finished-at"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let home_finished = client.snapshot["index"]["tasks"][0]["finished_at"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        home_finished.saturating_sub(target_finished) < 1500,
+        "completion took {}ms, an extra polling interval",
+        home_finished.saturating_sub(target_finished)
+    );
+    assert!(
+        client.snapshot["index"]["tasks"][0]["result"]
+            .as_str()
+            .unwrap()
+            .contains("END FACT")
+    );
+    let confirmation = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-confirm-fixture"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(
+        confirmation["result"]["status"], "accepted",
+        "{confirmation}"
+    );
+    client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == child && t["request"]["id"] == "remote-confirm")
+    });
+    let pending = client.snapshot["index"]["tasks"][0]["remote"]["request"].clone();
+    assert_eq!(pending["threadId"], result_thread);
+    assert_eq!(pending["kind"], "confirm");
+    assert_eq!(pending["payload"]["title"], "Run fixture command?");
+    let stale = target_client.command(
+        "request.respond",
+        json!({"threadId":result_thread,"requestId":pending["requestId"],
+        "generation":"stale-generation","response":{"confirmed":true}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(stale["result"]["status"], "rejected", "{stale}");
+    target_client.rpc("workspace.subscribe", json!({}), json!("check-stale"));
+    assert!(
+        target_client.snapshot["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == result_thread && t["request"]["id"] == "remote-confirm")
+    );
+    let approved = target_client.command(
+        "request.respond",
+        json!({"threadId":result_thread,"requestId":pending["requestId"],
+            "generation":pending["generation"],"response":{"confirmed":true}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(approved["result"]["status"], "accepted", "{approved}");
+    client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == child && t["request"].is_null())
+    });
     #[cfg(unix)]
     {
         let followup = client.command(
@@ -557,7 +862,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
             uuid::Uuid::new_v4(),
         );
         assert_eq!(followup["result"]["status"], "accepted", "{followup}");
-        let pause = PausedProcess::new(&target.children[0]);
+        let pause = PausedProcess::new(target.children.last().unwrap());
         let cancelled = client.command(
             "task.cancel",
             json!({"threadId":parent,"args":{"thread_id":child}}),

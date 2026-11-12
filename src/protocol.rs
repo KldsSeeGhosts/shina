@@ -11,6 +11,8 @@ pub const HISTORY_LEASE_GONE: &str =
     "History fragment lease expired or evicted. Reload the scoped snapshot.";
 pub const HISTORY_LEASE_GONE_CODE: i64 = -32010;
 pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
+pub const PEER_TASKS: &str = "peer-tasks-v2";
+pub const THREAD_READ: &str = "thread-read-v2";
 pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
@@ -62,8 +64,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.clientReady"
         | "server.commitRestart"
         | "server.stop" => "maintain",
-        "peer.capabilities" | "peer.thread.launch" | "peer.thread.status" | "peer.thread.read"
-        | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
+        "peer.capabilities" | "peer.thread.launch" | "peer.thread.wait" | "peer.task.ack"
+        | "peer.thread.read" | "peer.thread.list" | "peer.thread.send" | "peer.thread.stop" => {
+            "peer-delegate"
+        }
         "thread.send"
         | "thread.stop"
         | "thread.configure"
@@ -310,7 +314,7 @@ pub enum SendMode {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestResponse {
     pub thread_id: usize,
     pub request_id: Value,
@@ -323,7 +327,7 @@ pub struct RequestResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Command {
     pub command_id: uuid::Uuid,
     pub method: String,
@@ -421,8 +425,10 @@ mod tests {
             "peer.unlink",
             "peer.capabilities",
             "peer.thread.launch",
-            "peer.thread.status",
+            "peer.thread.wait",
+            "peer.task.ack",
             "peer.thread.read",
+            "peer.thread.list",
             "peer.thread.send",
             "peer.thread.stop",
         ]);
@@ -475,8 +481,9 @@ mod tests {
                 | "server.clientReady"
                 | "server.commitRestart"
                 | "server.stop" => "maintain",
-                "peer.capabilities" | "peer.thread.launch" | "peer.thread.status"
-                | "peer.thread.read" | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
+                "peer.capabilities" | "peer.thread.launch" | "peer.thread.wait"
+                | "peer.task.ack" | "peer.thread.read" | "peer.thread.list"
+                | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
                 _ => "operate",
             };
             assert_eq!(method_grant(method), Some(expected), "{method}");

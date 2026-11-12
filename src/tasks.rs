@@ -54,6 +54,7 @@ pub(super) struct Task {
     pub delivered: bool,
     pub delivery_id: String,
     pub result_excerpt: String,
+    pub result: String,
     pub error_excerpt: String,
     #[serde(default)]
     pub memory_suggestions: Vec<String>,
@@ -133,6 +134,18 @@ fn excerpt(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
+const REPORT_CUT: &str = "\n[Report truncated. Use read_thread to continue.]";
+pub(super) fn report_excerpt(text: &str) -> String {
+    if text.chars().count() <= 6000 {
+        text.into()
+    } else {
+        format!(
+            "{}{REPORT_CUT}",
+            excerpt(text, 6000 - REPORT_CUT.chars().count())
+        )
+    }
+}
+
 fn delivery_id(text: &str) -> Option<&str> {
     text.strip_prefix(INJECTION_PREFIX)?
         .lines()
@@ -175,6 +188,7 @@ impl Task {
             state: TaskState::Queued,
             delivered: false,
             result_excerpt: String::new(),
+            result: String::new(),
             error_excerpt: String::new(),
             memory_suggestions: Vec::new(),
             created_at: lifecycle::now(),
@@ -187,7 +201,8 @@ impl Task {
 
     pub(super) fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
         self.state = state;
-        self.result_excerpt = excerpt(reply, 6000);
+        self.result_excerpt = report_excerpt(reply);
+        self.result = reply.into();
         self.error_excerpt = excerpt(error, 2000);
         self.finished_at = Some(lifecycle::now());
     }
@@ -201,10 +216,22 @@ impl Task {
                 serde_json::to_string(&self.memory_suggestions).expect("suggestion serialization")
             )
         };
+        let continuation = if self.result_excerpt.ends_with(REPORT_CUT) {
+            let target = self
+                .remote
+                .as_ref()
+                .map(|remote| json!({"machine":remote.server_id,"threadId":remote.thread_id}))
+                .unwrap_or_else(|| json!({"threadId":self.child_thread_id}));
+            format!(
+                "\nReport truncated. Read the rest with read_thread({target}); follow items[].continuation."
+            )
+        } else {
+            String::new()
+        };
         delivery_text(
             &self.delivery_id,
             &format!(
-                "Shina: task #{} finished\nTask id: {}\nTitle: {}\nStatus: {}\nLast reply:\n{}\nError: {}{suggestions}",
+                "Shina: task #{} finished\nTask id: {}\nTitle: {}\nStatus: {}\nLast reply:\n{}\nError: {}{suggestions}{continuation}",
                 self.child_thread_id,
                 self.id,
                 self.title,
@@ -365,7 +392,16 @@ impl State {
                         .map(|t| t.model.clone())
                         .unwrap_or_else(|| DEFAULT_MODEL.into()),
                     state: task.state,
-                    last_activity_line: if task.remote.as_ref().is_some_and(|r| r.needs_you) {
+                    last_activity_line: if task
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.state == RemoteState::UpdateRequired)
+                    {
+                        task.remote
+                            .as_ref()
+                            .and_then(|r| r.last_error.clone())
+                            .unwrap_or_else(|| "Update required.".into())
+                    } else if task.remote.as_ref().is_some_and(|r| r.needs_you) {
                         format!(
                             "Needs you on {}",
                             task.remote.as_ref().expect("remote").label
@@ -433,6 +469,21 @@ impl State {
 
     /// User-only entry point. The response has the same shape as Thread::respond.
     pub fn respond_to_request(&mut self, thread_id: usize, response: Value) -> Result<(), String> {
+        if let Some(remote) = self.remote_task(thread_id) {
+            let reference = remote.request.as_ref().ok_or("This request has expired.")?;
+            let commands = self
+                .client
+                .as_ref()
+                .and_then(|c| c.commands_for(&remote.server_id))
+                .ok_or_else(|| format!("Link this desktop to {} to answer.", remote.label))?;
+            commands.send(
+                "request.respond",
+                json!({"threadId":remote.thread_id,
+                "requestId":reference["requestId"],"generation":reference["generation"],
+                "session":response["allowForSession"] == true,"response":response}),
+            )?;
+            return Ok(());
+        }
         if self.client.is_some() {
             self.threads
                 .iter_mut()
@@ -459,7 +510,14 @@ impl State {
                 if response["value"].is_string() || response["cancelled"] == true => {}
             _ => return Err("The response does not match the pending request.".into()),
         }
-        thread.respond(response);
+        if response["allowForSession"] == true {
+            if request["method"] != "confirm" {
+                return Err("Session approval requires a confirmation request.".into());
+            }
+            thread.approve_for_session();
+        } else {
+            thread.respond(response);
+        }
         if thread.request.is_some() {
             return Err(thread
                 .error
@@ -627,6 +685,7 @@ impl State {
             &format!("Shina: message from parent #{parent}\n\n{message}"),
         );
         task.result_excerpt.clear();
+        task.result.clear();
         task.error_excerpt.clear();
         task.memory_suggestions.clear();
         task.started_at = None;
@@ -678,7 +737,7 @@ impl State {
             return Err("This task was interrupted by a restart. The user must resume or dismiss it in Shina after checking partial work.".into());
         }
         // Preserve the existing input/editor/select response path. Confirmations remain user-only.
-        if self.threads[index].request.is_some() {
+        if self.threads[index].request.is_some() && self.tasks[task_index].remote.is_none() {
             return Ok(false);
         }
         let message = args["message"]

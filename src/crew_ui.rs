@@ -109,6 +109,9 @@ fn open_thread(s: &mut State, id: usize) {
 /// asking for something needs the user whatever its task record says.
 fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
     if let Some(remote) = &task.remote {
+        if remote.state == crate::model::RemoteState::UpdateRequired {
+            return (Status::Waiting, "Update required");
+        }
         if remote.stop_owed && remote.state != crate::model::RemoteState::TargetOffline {
             return (Status::Waiting, "Stop pending");
         }
@@ -124,6 +127,7 @@ fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
                     crate::model::RemoteState::Done
                     | crate::model::RemoteState::ResultPendingDelivery => Status::Completed,
                     crate::model::RemoteState::TargetOffline => Status::Paused,
+                    crate::model::RemoteState::UpdateRequired => Status::Waiting,
                     _ => Status::Running,
                 },
                 remote.state.word(),
@@ -769,9 +773,38 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
         };
         let id = item.thread_id;
         let approval = item.kind == AttentionKind::Approval;
+        let remote = s.remote_task(id);
+        let linked = remote.is_none_or(|remote| {
+            s.client
+                .as_ref()
+                .is_some_and(|client| client.commands_for(&remote.server_id).is_some())
+        });
+        let known = remote.is_none_or(|remote| {
+            remote.request.as_ref().is_some_and(|r| {
+                matches!(
+                    r["kind"].as_str(),
+                    Some("confirm" | "input" | "editor" | "select")
+                )
+            })
+        });
+        let can_answer =
+            known && linked && remote.is_none_or(|remote| s.machine_connected(&remote.server_id));
         let title = crate::model::string(request, "title");
         let message = crate::model::string(request, "message");
         let mut detail = col().gap(3.0);
+        if !known && let Some(remote) = remote {
+            detail = detail.child(
+                label(
+                    format!(
+                        "Update required on {} to answer this request.",
+                        remote.label
+                    ),
+                    SMALL,
+                    p.muted,
+                )
+                .wrap(),
+            );
+        }
         if !title.is_empty() {
             detail = detail.child(label(title, TextStyle::new(13.0, 500.0), p.ink).wrap());
         }
@@ -785,23 +818,18 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
         let mut actions = row().gap(6.0).flex_wrap().center_y();
         actions = if approval {
             actions
-                .child(solid_button(
-                    format!("approve-{id}"),
-                    "Approve",
-                    p,
-                    move |s| {
+                .child(
+                    solid_button(format!("approve-{id}"), "Approve", p, move |s| {
                         let _ = s.respond_to_request(id, json!({"confirmed": true}));
-                    },
-                ))
-                .child(ghost_button(
-                    s,
-                    format!("decline-{id}"),
-                    "Decline",
-                    p,
-                    move |s| {
+                    })
+                    .disabled(!can_answer),
+                )
+                .child(
+                    ghost_button(s, format!("decline-{id}"), "Decline", p, move |s| {
                         let _ = s.respond_to_request(id, json!({"confirmed": false}));
-                    },
-                ))
+                    })
+                    .disabled(!can_answer),
+                )
                 .child(ghost_button(
                     s,
                     format!("open-request-{id}"),
@@ -810,16 +838,36 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                     move |s| open_thread(s, id),
                 ))
         } else {
-            actions.child(solid_button(
-                format!("answer-{id}"),
-                "Open to answer",
-                p,
-                move |s| {
+            actions.child(
+                solid_button(format!("answer-{id}"), "Open to answer", p, move |s| {
                     open_thread(s, id);
                     s.current_mut().reply.focused = true;
-                },
-            ))
+                })
+                .disabled(!can_answer),
+            )
         };
+        // KSG ChildThreadApprovals disables answers without permission. Shina also
+        // offers its existing machine-linking flow when this desktop has no device link.
+        if !linked && let Some(remote) = remote {
+            detail = detail.child(
+                label(
+                    format!("Link this desktop to {} to answer.", remote.label),
+                    SMALL,
+                    p.muted,
+                )
+                .key(format!("link-request-notice-{id}"))
+                .wrap(),
+            );
+            actions = actions.child(ghost_button(
+                s,
+                format!("link-request-{id}"),
+                "Link machine",
+                p,
+                |s| {
+                    s.machines.dialog = true;
+                },
+            ));
+        }
         stack = stack.child(
             col()
                 .key(format!("needs-you-{id}"))

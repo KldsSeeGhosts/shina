@@ -592,7 +592,8 @@ impl Database {
             serde_json::from_str(&text.ok_or("Authentication denied. Device unknown or revoked.")?)
                 .map_err(error)?;
         // A peer's read grant is not a client subscription or host-filesystem grant.
-        // Its only thread access goes through the runtime's same-device origin fence.
+        // Reads may inspect this machine's threads. Mutations still pass the
+        // runtime's same-device origin fence, and this grant never approves.
         if scopes.iter().any(|scope| scope == "peer-delegate")
             && !matches!(
                 method,
@@ -600,8 +601,10 @@ impl Database {
                     | "command.get"
                     | "peer.capabilities"
                     | "peer.thread.launch"
-                    | "peer.thread.status"
+                    | "peer.thread.wait"
+                    | "peer.task.ack"
                     | "peer.thread.read"
+                    | "peer.thread.list"
                     | "peer.thread.send"
                     | "peer.thread.stop"
             )

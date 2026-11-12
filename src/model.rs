@@ -52,7 +52,7 @@ pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 mod codex_model;
 #[path = "remote_tasks.rs"]
 mod remote_tasks;
-pub use remote_tasks::{PeerOrigin, RemoteState, RemoteTask};
+pub use remote_tasks::{PeerOrigin, RemoteState, RemoteTask, wait_for_peer_thread};
 
 struct Injection {
     text: String,
@@ -4787,8 +4787,11 @@ impl State {
             ],
         });
         self.add_harness_capabilities(&mut capabilities);
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .and_then(|database| database.peers().ok())
+            .unwrap_or_else(|| self.peers.clone());
         capabilities["peers"] = json!(
-            self.peers
+            peers
                 .iter()
                 .map(crate::peer::Peer::summary)
                 .collect::<Vec<_>>()
@@ -4895,9 +4898,11 @@ impl State {
                     | "list_memories"
                     | "search_memories"
                     | "orchestrator_capabilities"
-            ) || matches!(tool, "read_thread" | "task_status") && args["thread_id"] == caller)
+                    | "list_threads"
+                    | "read_thread"
+            ) || tool == "task_status" && args["thread_id"] == caller)
         {
-            return Err("A remote worker may read only its own thread and memories, and cannot delegate or control other work.".into());
+            return Err("A remote worker may read threads and memories, but cannot delegate or control unrelated work.".into());
         }
         if matches!(
             tool,
@@ -4933,80 +4938,18 @@ impl State {
             "remember" | "forget_memory" | "list_memories" | "search_memories"
             | "propose_memory" => self.memory_call(caller_index, tool, args),
             "orchestrator_capabilities" => Ok(self.orchestrator_capabilities(caller_index)),
-            "list_threads" => {
-                let archived = args["include_archived"] == true;
-                let all = args["all_projects"] == true;
-                let project = self.threads[caller_index].project;
-                let coordinator = if self.threads[caller_index].captain_home {
-                    Some(self.effective_home(caller))
-                } else {
-                    self.threads[caller_index]
-                        .parent
-                        .map(|parent| self.effective_home(parent))
-                };
-                let threads: Vec<Value> = self
+            "list_threads" => self.readable_threads(Some(caller), args),
+            "read_thread" => {
+                let id = args["threadId"].as_u64().ok_or("threadId is required.")?;
+                let thread = self
                     .threads
                     .iter()
-                    .filter(|t| {
-                        (archived || !t.archived())
-                            && (all
-                                || match coordinator {
-                                    Some(home) => {
-                                        t.id == home
-                                            || t.parent.is_some_and(|parent| {
-                                                self.effective_home(parent) == home
-                                            })
-                                    }
-                                    None => {
-                                        t.project == project
-                                            && !t.captain_home
-                                            && (!t.delegated || t.parent == Some(caller))
-                                    }
-                                })
-                    })
-                    .map(|t| {
-                        json!({
-                            "thread_id": t.id,
-                            "title": t.title,
-                            "project": self.task_project_value(t),
-                            "machine":self.remote_task(t.id).map(|remote|remote.server_id.as_str()).unwrap_or(&t.machine),
-                            "captain": captain_name(self, t.captain),
-                            "scope": self.scope_value(t.captain),
-                            "captain_home": self.is_captain_home(t),
-                            "status": status_word(t.status),
-                            "archived": t.archived(),
-                            "delegated": t.delegated,
-                            "parent": t.parent,
-                            "selection": selection_value(t),
-                            "is_caller": t.id == caller,
-                        })
-                    })
-                    .collect();
-                Ok(json!({ "threads": threads }))
-            }
-            "read_thread" => {
-                let thread = &self.threads[find(self)?];
-                let limit = args["max_messages"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-                let start = thread.messages.len().saturating_sub(limit);
-                let messages: Vec<Value> = thread.messages[start..]
-                    .iter()
-                    .map(|m| {
-                        json!({
-                            "role": match m.role { "You" => "user", "Shina" => "system", _ => "assistant" },
-                            "text": truncate(m.display_text(), 6000),
-                        })
-                    })
-                    .collect();
-                Ok(json!({
-                    "thread_id": thread.id,
-                    "title": thread.title,
-                    "project": self.task_project_value(thread),
-                    "machine":self.remote_task(thread.id).map(|remote|remote.server_id.as_str()).unwrap_or(&thread.machine),
-                    "status": status_word(thread.status),
-                    "selection": selection_value(thread),
-                    "message_count": thread.messages.len(),
-                    "messages": messages,
-                }))
+                    .find(|t| t.id as u64 == id)
+                    .ok_or("Unknown thread.")?;
+                let mut page = remote_tasks::transcript_page(thread, args)?;
+                page["thread"]["project"] = json!(self.task_project_value(thread));
+                page["thread"]["machine"] = json!("local");
+                Ok(page)
             }
             "list_captains" => {
                 let captains: Vec<Value> = self
@@ -5275,6 +5218,11 @@ impl State {
     }
 
     fn mcp_request(&mut self, request: crate::mcp::Request) {
+        if matches!(request.tool.as_str(), "read_thread" | "list_threads")
+            && self.remote_transcript_request(&request)
+        {
+            return;
+        }
         if matches!(request.tool.as_str(), "html_render" | "html_preview") {
             let Some(thread) = self.threads.iter().find(|t| t.id == request.thread) else {
                 let _ = request
@@ -7620,7 +7568,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|thread| thread["thread_id"] == state.threads[index].id)
+                .any(|thread| thread["threadId"] == state.threads[index].id)
         );
     }
 
@@ -9600,17 +9548,17 @@ mod tests {
         assert_eq!(status["selection"]["model"], "deep");
         assert_eq!(status["selection"]["options"]["reasoning"], "max");
         let read = state
-            .mcp_call(1, "read_thread", &json!({"thread_id":child_id}))
+            .mcp_call(1, "read_thread", &json!({"threadId":child_id}))
             .unwrap();
-        assert_eq!(read["selection"]["model"], "deep");
+        assert_eq!(read["thread"]["selection"]["model"], "deep");
         let list = state
-            .mcp_call(1, "list_threads", &json!({"all_projects":true}))
+            .mcp_call(1, "list_threads", &json!({"allProjects":true}))
             .unwrap();
         let listed = list["threads"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|thread| thread["thread_id"] == json!(child_id))
+            .find(|thread| thread["threadId"] == json!(child_id))
             .unwrap();
         assert_eq!(listed["selection"]["model"], "deep");
         assert_eq!(listed["selection"]["options"]["reasoning"], "max");
@@ -11560,7 +11508,7 @@ mod tests {
     }
 
     #[test]
-    fn captains_share_projects_and_mcp_lists_only_the_callers_crew() {
+    fn mcp_lists_the_callers_project_without_changing_captain_ownership() {
         let mut state = State::new(".".into(), false);
         // Rosters start empty; these tests exercise the earlier named presets.
         state.captains = crate::captains::Captain::presets();
@@ -11586,7 +11534,14 @@ mod tests {
         assert!(state.current().captain_home);
         // Active UI project must not affect the authenticated caller's scope.
         let list = state.mcp_call(first, "list_threads", &json!({})).unwrap();
-        assert_eq!(list["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list["threads"].as_array().unwrap().len(),
+            state
+                .threads
+                .iter()
+                .filter(|t| t.project == Some(1))
+                .count()
+        );
         assert!(
             list["threads"]
                 .as_array()
@@ -11595,14 +11550,17 @@ mod tests {
                 .all(|t| t["project"]["id"] == 1 && t["machine"] == "local")
         );
         let all = state
-            .mcp_call(first, "list_threads", &json!({"all_projects":true}))
+            .mcp_call(first, "list_threads", &json!({"allProjects":true}))
             .unwrap();
         assert_eq!(
             all["threads"].as_array().unwrap().len(),
             state.threads.len()
         );
         let scratch_list = state.mcp_call(scratch, "list_threads", &json!({})).unwrap();
-        assert_eq!(scratch_list["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            scratch_list["threads"].as_array().unwrap().len(),
+            state.threads.iter().filter(|t| t.project.is_none()).count()
+        );
         state.demo = true; // Do not launch Pi in a unit test.
         let task = state
             .mcp_call(first, "delegate_task", &json!({"prompt":"A task"}))

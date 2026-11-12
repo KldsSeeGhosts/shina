@@ -1109,9 +1109,14 @@ async fn remote_request(
     command: Command,
     peer: bool,
 ) -> Result<Value, String> {
-    tokio::time::timeout(Duration::from_secs(8), async {
-        // Protocol 1.5 peers require a pre-credential identity check. Ordinary client
-        // connections retain compatibility with older additive protocol minors.
+    let timeout = if command.method == "peer.thread.wait" {
+        58
+    } else {
+        8
+    };
+    tokio::time::timeout(Duration::from_secs(timeout), async {
+        // Pin identity before sending a peer credential, then negotiate the
+        // required contracts. Later additive protocol minors remain compatible.
         let pinned = if peer {
             Some(crate::peer::pin(link).await?)
         } else {
@@ -1129,6 +1134,21 @@ async fn remote_request(
         .await?;
         if command.method == "hello" {
             return Ok(hello);
+        }
+        if peer
+            && command.method != "peer.capabilities"
+            && !hello["capabilities"].as_array().is_some_and(|caps| {
+                caps.iter().any(|cap| cap == protocol::THREAD_READ)
+                    && (matches!(
+                        command.method.as_str(),
+                        "peer.thread.read" | "peer.thread.list"
+                    ) || caps.iter().any(|cap| cap == protocol::PEER_TASKS))
+            })
+        {
+            return Err(format!(
+                "Update required on {}. Run shina update --yes on that machine.",
+                link.host
+            ));
         }
         if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(

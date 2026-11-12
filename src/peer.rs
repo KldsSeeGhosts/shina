@@ -31,6 +31,15 @@ impl Peer {
                     .last_reached_at
                     .is_some_and(|at| crate::lifecycle::now().saturating_sub(at) < 90_000)
         );
+        let reads = self.capabilities["contracts"]
+            .as_array()
+            .is_some_and(|contracts| {
+                contracts
+                    .iter()
+                    .any(|contract| contract == crate::protocol::THREAD_READ)
+            });
+        value["threadReads"] = json!(reads);
+        value["threadLists"] = json!(reads);
         value
     }
     pub fn credential(&self, profile: &Path) -> Result<Link, String> {

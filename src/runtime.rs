@@ -167,9 +167,9 @@ impl RuntimeState {
         }
         if matches!(
             command.method.as_str(),
-            "peer.capabilities" | "peer.thread.status"
+            "peer.capabilities" | "peer.thread.read" | "peer.thread.list"
         ) {
-            // Read polls do not grow the durable mutation-receipt history.
+            // Transcript reads do not acknowledge results or grow mutation receipts.
             return self
                 .state
                 .execute_peer_command(device, &command)
