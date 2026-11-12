@@ -246,6 +246,222 @@ impl TypingGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DismissedTrigger {
+    pub marker: char,
+    pub range_start: usize,
+}
+
+impl DismissedTrigger {
+    pub fn matches(&self, trigger: &Trigger) -> bool {
+        self.marker == trigger.marker && self.range_start == trigger.range.start
+    }
+}
+
+/// Ported from KSG Code's `normalizeSearchQuery`, `scoreSubsequenceMatch`, `scoreQueryMatch`,
+/// `scoreSlashCommandItem`, `searchSlashCommandItems`, and `scoreProviderSkill`.
+pub fn normalize_search_query(input: &str, trim_leading_slashes: bool) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let stripped = if trim_leading_slashes {
+        trimmed.trim_start_matches('/')
+    } else {
+        trimmed
+    };
+    stripped.to_lowercase()
+}
+
+pub fn score_subsequence_match(value: &str, query: &str, ignore_position: bool) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q_chars: Vec<char> = query.chars().collect();
+    let v_chars: Vec<char> = value.chars().collect();
+    let mut q_idx = 0usize;
+    let mut first_match: Option<usize> = None;
+    let mut prev_match: Option<usize> = None;
+    let mut gap_penalty = 0usize;
+    for (v_idx, &ch) in v_chars.iter().enumerate() {
+        if ch != q_chars[q_idx] {
+            continue;
+        }
+        if first_match.is_none() {
+            first_match = Some(v_idx);
+        }
+        if let Some(prev) = prev_match {
+            gap_penalty += v_idx - prev - 1;
+        }
+        prev_match = Some(v_idx);
+        q_idx += 1;
+        if q_idx == q_chars.len() {
+            let first = first_match.unwrap_or(0);
+            let span_penalty = v_idx - first + 1 - q_chars.len();
+            if ignore_position {
+                return Some(gap_penalty * 3 + span_penalty);
+            }
+            let length_penalty = (v_chars.len().saturating_sub(q_chars.len())).min(64);
+            return Some(first * 2 + gap_penalty * 3 + span_penalty + length_penalty);
+        }
+    }
+    None
+}
+
+fn find_boundary_match_index(value: &str, query: &str, markers: &[&str]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for marker in markers {
+        let needle = format!("{marker}{query}");
+        if let Some(byte_idx) = value.find(&needle) {
+            let match_char_idx = value[..byte_idx].chars().count() + marker.chars().count();
+            if best.is_none_or(|b| match_char_idx < b) {
+                best = Some(match_char_idx);
+            }
+        }
+    }
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn score_query_match(
+    value: &str,
+    query: &str,
+    exact_base: usize,
+    prefix_base: Option<usize>,
+    boundary_base: Option<usize>,
+    includes_base: Option<usize>,
+    fuzzy_base: Option<usize>,
+    boundary_markers: &[&str],
+) -> Option<usize> {
+    if value.is_empty() || query.is_empty() {
+        return None;
+    }
+    if value == query {
+        return Some(exact_base);
+    }
+    let val_len = value.chars().count();
+    let q_len = query.chars().count();
+    let penalty = val_len.saturating_sub(q_len).min(64);
+    if let Some(base) = prefix_base
+        && value.starts_with(query)
+    {
+        return Some(base + penalty);
+    }
+    if let Some(base) = boundary_base
+        && let Some(boundary_idx) = find_boundary_match_index(value, query, boundary_markers)
+    {
+        return Some(base + boundary_idx * 2 + penalty);
+    }
+    if let Some(base) = includes_base
+        && let Some(byte_idx) = value.find(query)
+    {
+        let char_idx = value[..byte_idx].chars().count();
+        return Some(base + char_idx * 2 + penalty);
+    }
+    if let Some(base) = fuzzy_base
+        && let Some(fuzzy_score) = score_subsequence_match(value, query, false)
+    {
+        return Some(base + fuzzy_score);
+    }
+    None
+}
+
+pub fn score_slash_command(
+    name: &str,
+    description: &str,
+    query: &str,
+    is_skill: bool,
+) -> Option<usize> {
+    if is_skill {
+        if query == "skill" {
+            return Some(0);
+        }
+        let skill_query = query.strip_prefix("skill:").unwrap_or(query);
+        let skill_name = name.strip_prefix("skill:").unwrap_or(name).to_lowercase();
+        let desc = description.to_lowercase();
+        if skill_query.is_empty() {
+            return Some(0);
+        }
+        let s1 = score_query_match(
+            &skill_name,
+            skill_query,
+            0,
+            Some(2),
+            Some(4),
+            Some(6),
+            Some(100),
+            &["-", "_", "/"],
+        );
+        let s2 = score_query_match(
+            &desc,
+            skill_query,
+            30,
+            Some(32),
+            Some(34),
+            Some(36),
+            None,
+            &[" ", "-", "_", "/"],
+        );
+        let best = [s1, s2].into_iter().flatten().min();
+        if best.is_some() {
+            return best;
+        }
+        return "skill".starts_with(query).then_some(usize::MAX);
+    }
+
+    let primary = name.to_lowercase();
+    let desc = description.to_lowercase();
+    let s1 = score_query_match(
+        &primary,
+        query,
+        0,
+        Some(2),
+        Some(4),
+        Some(6),
+        Some(100),
+        &["-", "_", "/"],
+    );
+    let s2 = score_query_match(
+        &desc,
+        query,
+        20,
+        Some(22),
+        Some(24),
+        Some(26),
+        None,
+        &[" ", "-", "_", "/"],
+    );
+    [s1, s2].into_iter().flatten().min()
+}
+
+pub fn rank_slash_commands(
+    commands: Vec<crate::model::pi_session::SlashCommand>,
+    query: &str,
+) -> Vec<crate::model::pi_session::SlashCommand> {
+    let normalized = normalize_search_query(query, true);
+    if normalized.is_empty() {
+        return commands;
+    }
+    let mut ranked: Vec<(usize, String, crate::model::pi_session::SlashCommand)> = commands
+        .into_iter()
+        .filter_map(|cmd| {
+            let is_skill = cmd.name.starts_with("skill:") || cmd.source == "skill";
+            let score = score_slash_command(&cmd.name, &cmd.description, &normalized, is_skill)?;
+            let kind_rank = if cmd.source == "Shina" {
+                '0'
+            } else if !is_skill {
+                '1'
+            } else {
+                '2'
+            };
+            let tie = format!("{kind_rank}\0{}\0{}", cmd.name, cmd.source);
+            Some((score, tie, cmd))
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.into_iter().map(|(_, _, cmd)| cmd).collect()
+}
+
 /// Per-thread browsing state. Keep the whole edit so recall also preserves the caret and marks.
 #[derive(Default)]
 pub struct History {
@@ -779,5 +995,76 @@ mod tests {
             t1 + std::time::Duration::from_millis(COMPOSER_TYPING_IDLE_MS),
         );
         assert!(!guard.is_held("req-4"));
+    }
+
+    #[test]
+    fn slash_command_ranking_matches_ksg_order_and_tie_breaks() {
+        let cmd =
+            |name: &str, description: &str, source: &str| crate::model::pi_session::SlashCommand {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                source: source.to_owned(),
+            };
+        let commands = vec![
+            cmd("my-review-helper", "Unrelated", "ACP"),
+            cmd("code-review", "Unrelated", "ACP"),
+            cmd("review-all", "Unrelated", "ACP"),
+            cmd("review", "Exact match", "ACP"),
+            cmd("other", "Run review now", "ACP"),
+            cmd("r_e_v_i_e_w", "Fuzzy match", "ACP"),
+        ];
+        let ranked: Vec<String> = rank_slash_commands(commands, "review")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                "review",           // exact (0)
+                "review-all",       // prefix (2 + 4 = 6)
+                "code-review",      // word boundary after '-' (4 + 10 + 5 = 19)
+                "my-review-helper", // word boundary after '-' (4 + 6 + 10 = 20)
+                "other",            // description word boundary (24 + 8 + 8 = 40)
+                "r_e_v_i_e_w",      // fuzzy subsequence (100 + ...)
+            ]
+        );
+
+        // Tie-break order: Shina built-in < provider slash command < skill, then alphabetical.
+        let tied = vec![
+            cmd("skill:alpha", "", "skill"),
+            cmd("beta", "", "ACP"),
+            cmd("alpha", "", "ACP"),
+            cmd("model", "", "Shina"),
+        ];
+        let tied_empty: Vec<String> = rank_slash_commands(tied, "")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(tied_empty, vec!["skill:alpha", "beta", "alpha", "model"]);
+    }
+
+    #[test]
+    fn dismissed_trigger_persists_across_edits_until_identity_changes() {
+        let dismissed = DismissedTrigger {
+            marker: '/',
+            range_start: 0,
+        };
+        let mut edit = TextEdit::new("/mod");
+        let t1 = trigger(&edit).unwrap();
+        assert!(dismissed.matches(&t1));
+
+        // Typing more in the same trigger keeps it dismissed.
+        edit.replace_text("/model");
+        let t2 = trigger(&edit).unwrap();
+        assert!(dismissed.matches(&t2));
+
+        // Moving to a different trigger position or marker clears dismissal.
+        edit.replace_text("hi /mod");
+        let t3 = trigger(&edit).unwrap();
+        assert!(!dismissed.matches(&t3));
+
+        edit.replace_text("@mod");
+        let t4 = trigger(&edit).unwrap();
+        assert!(!dismissed.matches(&t4));
     }
 }

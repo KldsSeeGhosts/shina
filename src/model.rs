@@ -23,7 +23,7 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
 const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 #[path = "pi_session.rs"]
-mod pi_session;
+pub(crate) mod pi_session;
 pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.

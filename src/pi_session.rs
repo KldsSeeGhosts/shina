@@ -152,7 +152,7 @@ pub struct PiSession {
     pub commands_error: Option<String>,
     pub(super) pending_command: Option<Value>,
     pub slash_index: usize,
-    pub slash_dismissed: Option<String>,
+    pub slash_dismissed: Option<crate::composer::DismissedTrigger>,
     pub follow_up: bool,
     pub steering: Vec<String>,
     pub follow_ups: Vec<String>,
@@ -256,17 +256,25 @@ impl Thread {
                 && self.harness_state["codexHistoryMode"] == "paginated"
     }
     pub fn slash_trigger(&self) -> Option<crate::composer::Trigger> {
-        if !self.draft.focused || self.native.slash_dismissed.as_ref() == Some(&self.draft.text) {
+        if !self.draft.focused {
             return None;
         }
-        crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')
+        let trigger = crate::composer::trigger(&self.draft).filter(|t| t.marker == '/')?;
+        if self
+            .native
+            .slash_dismissed
+            .as_ref()
+            .is_some_and(|d| d.matches(&trigger))
+        {
+            return None;
+        }
+        Some(trigger)
     }
 
     pub fn slash_matches(&self) -> Vec<SlashCommand> {
         let Some(trigger) = self.slash_trigger() else {
             return vec![];
         };
-        let query = trigger.query.to_lowercase();
         let mut commands = vec![SlashCommand {
             name: "model".into(),
             description: "Switch response model for this thread".into(),
@@ -303,10 +311,7 @@ impl Thread {
                 })
                 .cloned(),
         );
-        commands.retain(|c| {
-            c.name.to_lowercase().contains(&query) || c.description.to_lowercase().contains(&query)
-        });
-        commands
+        crate::composer::rank_slash_commands(commands, &trigger.query)
     }
 
     pub fn can_compact(&self) -> bool {

@@ -8590,6 +8590,7 @@ fn composer(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) ->
             t.composer_rules.key(&mut t.draft, event)
         })
         .on_input_change(|s: &mut State, _| {
+            composer_menu::clear_dismissed_if_changed(s);
             let t = s.current_mut();
             t.composer_rules.changed(&mut t.draft);
             t.typing_guard.on_type(std::time::Instant::now());
@@ -15791,6 +15792,51 @@ pub(crate) mod tests {
                 rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
                 "{width}: {rect:?}"
             );
+        }
+    }
+
+    #[test]
+    fn command_menu_escape_dismissal_persists_until_trigger_changes_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("/mo".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            let (menu_rect, _) = rt
+                .presented("composer-menu")
+                .unwrap_or_else(|| panic!("{width}: composer-menu"));
+            assert!(
+                menu_rect[0] >= 0.0 && menu_rect[0] + menu_rect[2] <= width + 0.5,
+                "{width}: {menu_rect:?}"
+            );
+
+            // Escape dismisses the menu for this trigger identity.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.find("composer-menu").is_none());
+
+            // Typing further into the same trigger keeps it dismissed.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("d".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.find("composer-menu").is_none());
+
+            // A new trigger at a new range_start re-opens the menu.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text(" /mo".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(rt.presented("composer-menu").is_some());
         }
     }
 }
