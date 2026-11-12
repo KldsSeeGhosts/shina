@@ -6,6 +6,21 @@ use serde_json::Value;
 #[path = "work_ui_tests.rs"]
 mod tests;
 
+pub(super) fn has_boundary_events(t: &Thread, message: usize) -> bool {
+    t.native
+        .compactions
+        .iter()
+        .any(|item| crate::work::compaction_anchor(t, item).message == message)
+        || crate::work::retry_events(t)
+            .iter()
+            .any(|event| event["anchor"]["message"].as_u64() == Some(message as u64))
+        || t.work.iter().any(|work| {
+            work.start == message
+                && work.stopped
+                && (message < t.messages.len() || !t.status.busy())
+        })
+}
+
 pub(super) fn boundary_events(s: &State, p: Palette, wide: bool, message: usize) -> Option<El> {
     let mut events = vec![];
     for (index, item) in s.current().native.compactions.iter().enumerate() {
@@ -189,6 +204,14 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
     let t = s.current();
     let first = indices[0];
     let expanded = t.thoughts[first].expanded;
+    let block = t.thoughts[first].block;
+    let offset = t.thoughts[first].anchor.offset;
+    let anchor_msg_id = t
+        .messages
+        .get(t.thoughts[first].anchor.message)
+        .map(|m| m.id.clone());
+    let key = format!("inline-thought-{}-{first}", t.id);
+    let press_key = key.clone();
     let title = if indices.len() == 1 {
         "Thought".into()
     } else {
@@ -196,7 +219,7 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
     };
     let mut content = col().min_w(0.0).gap(4.0).child(
         activity_line(
-            format!("inline-thought-{}-{first}", t.id),
+            key,
             format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
             (title, ""),
             false,
@@ -204,9 +227,19 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
             "brain",
             p,
         )
-        .on_press(move |s: &mut State| {
-            let thought = &mut s.current_mut().thoughts[first];
-            thought.expanded = !thought.expanded;
+        .on_press_tx(move |s: &mut State, tx| {
+            tx.keep_on_screen(press_key.clone());
+            let t = s.current_mut();
+            let msg_idx = anchor_msg_id
+                .as_deref()
+                .and_then(|id| t.messages.iter().position(|m| m.id == id));
+            if let Some(thought) = t.thoughts.iter_mut().find(|th| {
+                th.block == block
+                    && th.anchor.offset == offset
+                    && msg_idx.is_none_or(|idx| th.anchor.message == idx)
+            }) {
+                thought.expanded = !thought.expanded;
+            }
         }),
     );
     if expanded {

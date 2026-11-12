@@ -7007,9 +7007,12 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         return work_ui::plan_card(s, p, index);
     }
     let title = tool_title(tool);
+    let tool_id = tool.id.clone();
+    let line_key = format!("inline-tool-{}-{index}", t.id);
+    let press_key = line_key.clone();
     let mut content = col().gap(4.0).child(
         activity_line(
-            format!("inline-tool-{}-{index}", t.id),
+            line_key,
             format!(
                 "{} output for {title}",
                 if tool.expanded { "Hide" } else { "Show" }
@@ -7020,9 +7023,16 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
             work_ui::kind_icon(tool.resolved_kind()),
             p,
         )
-        .on_press(move |s: &mut State| {
-            let tool = &mut s.current_mut().tools[index];
-            tool.expanded = !tool.expanded;
+        .on_press_tx(move |s: &mut State, tx| {
+            tx.keep_on_screen(press_key.clone());
+            if let Some(tool) = s
+                .current_mut()
+                .tools
+                .iter_mut()
+                .find(|tool| tool.id == tool_id)
+            {
+                tool.expanded = !tool.expanded;
+            }
         }),
     );
     if !tool.subagents.is_empty() {
@@ -7041,15 +7051,18 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     let t = s.current();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
+    let first_id = tools[0].id.clone();
     let expanded = tools[0].group_expanded;
     let failed = tools.iter().filter(|tool| tool.failed).count();
     let summary = tool_summary(&tools);
+    let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
+    let press_key = toggle_key.clone();
     let mut group = col()
         .key(format!("tool-group-{}-{first}", t.id))
         .gap(2.0)
         .child(
             activity_line(
-                format!("toggle-tool-group-{}-{first}", t.id),
+                toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
                 (summary.clone(), ""),
                 failed > 0,
@@ -7057,9 +7070,16 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
                 "list",
                 p,
             )
-            .on_press(move |s: &mut State| {
-                let tool = &mut s.current_mut().tools[first];
-                tool.group_expanded = !tool.group_expanded;
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.keep_on_screen(press_key.clone());
+                if let Some(tool) = s
+                    .current_mut()
+                    .tools
+                    .iter_mut()
+                    .find(|tool| tool.id == first_id)
+                {
+                    tool.group_expanded = !tool.group_expanded;
+                }
             }),
         );
     if expanded {
@@ -7253,12 +7273,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
             (false, None) => "Worked".into(),
         };
+        let toggle_key = format!("toggle-work-{}-{start}", t.id);
+        let press_key = toggle_key.clone();
+        let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
         let mut section = col()
             .key(format!("work-section-{}-{start}", t.id))
             .gap(4.0)
             .child(
                 activity_line(
-                    format!("toggle-work-{}-{start}", t.id),
+                    toggle_key,
                     format!(
                         "{} work section. {title}",
                         if expanded { "Collapse" } else { "Expand" }
@@ -7269,14 +7292,19 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     "clock",
                     p,
                 )
-                .on_press(move |s: &mut State| {
+                .on_press_tx(move |s: &mut State, tx| {
+                    tx.keep_on_screen(press_key.clone());
                     let t = s.current_mut();
-                    match t.work.iter_mut().find(|work| work.start == start) {
+                    let current_start = turn_msg_id
+                        .as_deref()
+                        .and_then(|id| t.messages.iter().position(|m| m.id == id))
+                        .unwrap_or(start);
+                    match t.work.iter_mut().find(|work| work.start == current_start) {
                         Some(work) => work.expanded = !work.expanded,
                         // Turns from before work records existed fold too; opening one
                         // records it.
                         None => t.work.push(crate::model::AssistantWork {
-                            start,
+                            start: current_start,
                             stopped: false,
                             stopped_order: 0,
                             expanded: true,
@@ -7360,24 +7388,194 @@ fn history_control(s: &State, p: Palette) -> Option<El> {
     Some(section)
 }
 
-/// The transcript, laid out in KSG Code's chat lane (`MessagesTimeline`'s
-/// `.chat-content-lane` inside `.messages-timeline-scroll`): 46 rem of content, centred, with
-/// 0.75 rem gutters below 640 px and 3 rem from there up. `pane_width` is the chat column's.
+#[derive(Clone)]
+enum TimelineRow {
+    HistoryControl {
+        key: String,
+    },
+    Boundary {
+        message_index: usize,
+        key: String,
+    },
+    UserOrSystem {
+        index: usize,
+        message_id: String,
+        key: String,
+    },
+    AssistantTurn {
+        start: usize,
+        end: usize,
+        key: String,
+    },
+    LiveTurn {
+        start: usize,
+        key: String,
+    },
+}
+
+impl TimelineRow {
+    fn key(&self) -> &str {
+        match self {
+            Self::HistoryControl { key }
+            | Self::Boundary { key, .. }
+            | Self::UserOrSystem { key, .. }
+            | Self::AssistantTurn { key, .. }
+            | Self::LiveTurn { key, .. } => key,
+        }
+    }
+}
+
+fn push_unique_row_key(seen: &mut std::collections::HashSet<String>, base: String) -> String {
+    if seen.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if t.history_has_more || t.history_error.is_some() {
+        rows.push(TimelineRow::HistoryControl {
+            key: push_unique_row_key(&mut seen, format!("history-control-{}", t.id)),
+        });
+    }
+    let mut index = 0usize;
+    while index < t.messages.len() {
+        let message = &t.messages[index];
+        if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
+            rows.push(TimelineRow::Boundary {
+                message_index: index,
+                key: push_unique_row_key(&mut seen, format!("boundary-{}-{}", t.id, message.id)),
+            });
+        }
+        if message.role == "Pi" {
+            let end = t.messages[index..]
+                .iter()
+                .position(|message| message.role != "Pi")
+                .map_or(t.messages.len(), |offset| index + offset);
+            rows.push(TimelineRow::AssistantTurn {
+                start: index,
+                end,
+                key: push_unique_row_key(&mut seen, format!("turn-{}-{}", t.id, message.id)),
+            });
+            index = end;
+            continue;
+        }
+        rows.push(TimelineRow::UserOrSystem {
+            index,
+            message_id: message.id.clone(),
+            key: push_unique_row_key(&mut seen, format!("row-{}-{}", t.id, message.id)),
+        });
+        index += 1;
+    }
+    if work_ui::has_boundary_events(t, t.messages.len()) {
+        rows.push(TimelineRow::Boundary {
+            message_index: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("boundary-end-{}", t.id)),
+        });
+    }
+    if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
+        rows.push(TimelineRow::LiveTurn {
+            start: t.messages.len(),
+            key: push_unique_row_key(&mut seen, format!("turn-live-{}", t.id)),
+        });
+    }
+    rows
+}
+
+fn build_user_or_system_row(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    pane_width: f32,
+    index: usize,
+    message_id: &str,
+) -> El {
+    let t = s.current();
+    let message = &t.messages[index];
+    let key = format!("message-{}-{index}", t.id);
+    let body = if message.role == "You" {
+        // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
+        let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
+        let mut user = col()
+            .items_end()
+            .gap(6.0)
+            .max_w(max_width)
+            .shrink()
+            .min_w(0.0);
+        if !message.images.is_empty() {
+            user = user.child(message_images(s, p, &message.images, &key));
+        }
+        if !message.text.trim().is_empty() {
+            user = user.child(
+                memo(
+                    format!("msg-md-{}-{message_id}", t.id),
+                    (&message.text, s.dark, wide),
+                    || {
+                        markdown_ui::render(
+                            &message.text,
+                            p,
+                            s.dark,
+                            wide,
+                            true,
+                            false,
+                            &format!("user-{}-{index}", t.id),
+                        )
+                    },
+                )
+                .key(format!("{key}-text"))
+                .max_w(max_width)
+                .min_w(0.0)
+                .padding(12.0)
+                .radius(6.0)
+                .fill(p.message_bg)
+                // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
+                // `line` colour disappeared on the `message_bg` fill). No shadow.
+                .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
+            );
+        }
+        row().justify_end().child(user)
+    } else if let Some(completion) = s
+        .is_captain_home(t)
+        .then(|| crew_ui::parse_completion(message.display_text()))
+        .flatten()
+    {
+        crew_ui::result_block(s, p, wide, &completion)
+    } else if let Some(brief) = (message.role == "Shina" && t.delegated)
+        .then(|| crew_ui::parse_brief(message.display_text()))
+        .flatten()
+    {
+        crew_ui::brief_block(s, p, wide, brief)
+    } else {
+        col()
+            .gap(4.0)
+            .px(12.0)
+            .py(8.0)
+            .radius(6.0)
+            .fill(p.coral_bg)
+            .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
+            .child(
+                label(message.display_text(), body_style(wide), p.ink)
+                    .wrap_anywhere()
+                    .selectable(true),
+            )
+    };
+    col().w_full().child(body.key(key))
+}
+
+/// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
+/// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let gutter = lane_gutter(pane_width);
-    let mut messages = col()
-        .key("chat-lane")
-        .on_layout_tx(|s: &mut State, rect, tx| {
-            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
-            tx.live_only();
-        })
-        .w_full()
-        .max_w(measure(wide))
-        // 24 pt above the first message, counting the cap.
-        .pt(24.0 - TRANSCRIPT_CAP)
-        .pb(24.0)
-        .gap(20.0);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
     let visible_tools = t
@@ -7422,117 +7620,58 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             introduction = introduction.child(label("Restoring conversation...", SMALL, p.muted));
         }
         return introduction;
-    } else {
-        if let Some(control) = history_control(s, p) {
-            messages = messages.child(control);
-        }
-        let mut index = 0;
-        while index < t.messages.len() {
-            let message = &t.messages[index];
-            if message.role != "Pi" {
-                if let Some(events) = work_ui::boundary_events(s, p, wide, index) {
-                    messages = messages.child(events);
-                }
-            }
-            if message.role == "Pi" {
-                let end = t.messages[index..]
-                    .iter()
-                    .position(|message| message.role != "Pi")
-                    .map_or(t.messages.len(), |offset| index + offset);
-                messages = messages.child(assistant_turn(s, p, wide, index, end));
-                index = end;
-                continue;
-            }
-            let key = format!("message-{}-{index}", t.id);
-            let body = if message.role == "You" {
-                // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
-                let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
-                let mut user = col()
-                    .items_end()
-                    .gap(6.0)
-                    .max_w(max_width)
-                    .shrink()
-                    .min_w(0.0);
-                if !message.images.is_empty() {
-                    user = user.child(message_images(s, p, &message.images, &key));
-                }
-                if !message.text.trim().is_empty() {
-                    user = user.child(
-                        memo(
-                            format!("{key}-markdown"),
-                            (&message.text, s.dark, wide),
-                            || {
-                                markdown_ui::render(
-                                    &message.text,
-                                    p,
-                                    s.dark,
-                                    wide,
-                                    true,
-                                    false,
-                                    &format!("user-{}-{index}", t.id),
-                                )
-                            },
-                        )
-                        .key(format!("{key}-text"))
-                        .max_w(max_width)
-                        .min_w(0.0)
-                        .padding(12.0)
-                        .radius(6.0)
-                        .fill(p.message_bg)
-                        // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
-                        // `line` colour disappeared on the `message_bg` fill). No shadow.
-                        .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
-                    );
-                }
-                row().justify_end().child(user)
-            } else if let Some(completion) = s
-                .is_captain_home(t)
-                .then(|| crew_ui::parse_completion(message.display_text()))
-                .flatten()
-            {
-                crew_ui::result_block(s, p, wide, &completion)
-            } else if let Some(brief) = (message.role == "Shina" && t.delegated)
-                .then(|| crew_ui::parse_brief(message.display_text()))
-                .flatten()
-            {
-                crew_ui::brief_block(s, p, wide, brief)
-            } else {
-                col()
-                    .gap(4.0)
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(6.0)
-                    .fill(p.coral_bg)
-                    .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
-                    .child(
-                        label(message.display_text(), body_style(wide), p.ink)
-                            .wrap_anywhere()
-                            .selectable(true),
-                    )
-            };
-            messages = messages.child(body.key(key));
-            index += 1;
-        }
-        if let Some(events) = work_ui::boundary_events(s, p, wide, t.messages.len()) {
-            messages = messages.child(events);
-        }
-        if t.status.busy() && t.messages.last().is_none_or(|message| message.role != "Pi") {
-            messages = messages.child(assistant_turn(
-                s,
-                p,
-                wide,
-                t.messages.len(),
-                t.messages.len(),
-            ));
-        }
     }
-    col()
-        .key(format!("conversation-{}", t.id))
+
+    let thread_id = t.id;
+    let rows = std::rc::Rc::new(build_timeline_rows(t));
+    let key_rows = rows.clone();
+    let build_rows = rows.clone();
+    let lane = col()
+        .key("chat-lane")
+        .on_layout_tx(|s: &mut State, rect, tx| {
+            s.html_lane_width = rect[2].round().clamp(240.0, 1600.0) as u32;
+            tx.live_only();
+        })
+        .w_full()
+        .max_w(measure(wide))
+        // 24 pt above the first message, counting the cap.
+        .pt(24.0 - TRANSCRIPT_CAP)
+        .pb(24.0)
+        .gap(20.0)
+        .growth(rune::GrowthSpec::default())
+        .virtual_rows(
+            rows.len(),
+            90.0,
+            move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
+            move |s: &State, index| match &build_rows[index] {
+                TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                TimelineRow::Boundary { message_index, .. } => {
+                    work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
+                }
+                TimelineRow::UserOrSystem {
+                    index: msg_idx,
+                    message_id,
+                    ..
+                } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                TimelineRow::AssistantTurn { start, end, .. } => {
+                    assistant_turn(s, p, wide, *start, *end)
+                }
+                TimelineRow::LiveTurn { start, .. } => assistant_turn(s, p, wide, *start, *start),
+            },
+        );
+
+    let stick_bottom = !t.messages.is_empty() || !t.tools.is_empty();
+    let scroller = col()
+        .key(format!("conversation-{thread_id}"))
         .animated_changes()
         .grow(1.0)
         .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
+        .scroll(ScrollSpec { stick_bottom })
+        .on_far_from_bottom(40.0, move |s: &mut State, far| {
+            s.set_timeline_far_from_bottom(thread_id, far);
+        })
+        .on_at_bottom(move |s: &mut State, at| {
+            s.set_timeline_at_bottom(thread_id, at);
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
         // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
@@ -7549,7 +7688,47 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 .sticky_top(0.0)
                 .a11y_hidden(),
         )
-        .child(messages)
+        .child(lane);
+
+    let mut wrapper = col()
+        .key(format!("conversation-wrap-{thread_id}"))
+        .grow(1.0)
+        .min_h(0.0)
+        .child(scroller);
+
+    if s.timeline_is_far_from_bottom(thread_id) {
+        let pill = framed(
+            row()
+                .key("scroll-to-end")
+                .role("button")
+                .label("Scroll to end")
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .radius(6.0)
+                .fill(p.card)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press_tx(move |s: &mut State, tx| {
+                    s.set_timeline_far_from_bottom(thread_id, false);
+                    tx.scroll_to_bottom(format!("conversation-{thread_id}"));
+                })
+                .child(icon("chevron", p.muted))
+                .child(label("Scroll to end", SMALL, p.ink)),
+            p,
+        );
+        wrapper = wrapper.child(
+            row()
+                .pin(Some(0.0), None, Some(0.0), Some(12.0))
+                .justify_center()
+                .child(pill),
+        );
+    }
+
+    wrapper
 }
 
 /// The opaque strip under the chat header's rule, inside the transcript viewport.
@@ -12725,6 +12904,334 @@ pub(crate) mod tests {
             assert!(
                 rt.find("history-load-error").is_none(),
                 "{width}: error cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn virtualised_timeline_mounts_only_viewport_window_and_overscan_for_long_threads() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..500usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt number {turn} with some wrapping prose."),
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply number {turn} with detailed explanation."),
+                        images: vec![],
+                    });
+                }
+            }
+            rt.frame(0.0);
+            let mounted_rows: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|e| {
+                    e.key
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("row-") || k.starts_with("turn-"))
+                })
+                .collect();
+            assert!(
+                !mounted_rows.is_empty() && mounted_rows.len() < 80,
+                "{width}: expected virtualised window, mounted {} rows",
+                mounted_rows.len()
+            );
+            assert!(
+                rt.find("row-1-u-0").is_none(),
+                "{width}: oldest row must be unmounted when pinned at bottom"
+            );
+            assert!(
+                rt.presented("turn-1-a-499").is_some(),
+                "{width}: newest row must be presented"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_anchor_preserves_visible_row_on_prepend_expand_image_load_and_width_change() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            {
+                let t = rt.state.current_mut();
+                t.history_has_more = true;
+                for turn in 0..80usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Question {turn}: keeping anchor steady."),
+                        images: if turn == 35 {
+                            vec![Attachment {
+                                id: "img-35.png".into(),
+                                name: "img-35.png".into(),
+                                mime: "image/png".into(),
+                                width: 400,
+                                height: 120,
+                                bytes: 1,
+                                path: None,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    });
+                    let a_idx = t.messages.len();
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Answer {turn}: extra text to take vertical space."),
+                        images: vec![],
+                    });
+                    if turn == 45 {
+                        t.tools.push(crate::model::Tool {
+                            id: "tool-45".into(),
+                            name: "read".into(),
+                            kind: Some(crate::work::ToolKind::Read),
+                            changes: vec![],
+                            input: serde_json::json!({"path": "src/ui.rs"}),
+                            detail: "src/ui.rs".into(),
+                            done: true,
+                            failed: false,
+                            output: "line 1\nline 2\nline 3\nline 4".into(),
+                            images: vec![],
+                            structured: serde_json::Value::Null,
+                            parent_call: None,
+                            exit_code: Some(0),
+                            subagents: vec![],
+                            anchor: crate::model::ToolAnchor {
+                                message: a_idx,
+                                offset: 0,
+                            },
+                            block: 0,
+                            order: 1,
+                            expanded: false,
+                            raw_expanded: false,
+                            group_expanded: false,
+                            started: None,
+                            duration_ms: Some(10),
+                        });
+                        t.work.push(crate::model::AssistantWork {
+                            start: a_idx,
+                            stopped: false,
+                            stopped_order: 0,
+                            expanded: false,
+                            elapsed: Some(3),
+                        });
+                    }
+                }
+            }
+            rt.frame(0.0);
+            // Scroll into the middle around turn 45 (scroll_center_in_instant mounts unrealized rows).
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-u-45"));
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let anchor_before = rt.presented("row-1-u-45").expect("u-45 visible").0;
+
+            // (a) Prepending older turns + clearing history_has_more preserves visible row y.
+            {
+                let t = rt.state.current_mut();
+                let mut prepended = Vec::new();
+                for older in 0..20usize {
+                    prepended.push(crate::model::Message {
+                        id: format!("old-u-{older}"),
+                        role: "You",
+                        text: format!("Older question {older}."),
+                        images: vec![],
+                    });
+                    prepended.push(crate::model::Message {
+                        id: format!("old-a-{older}"),
+                        role: "Pi",
+                        text: format!("Older answer {older}."),
+                        images: vec![],
+                    });
+                }
+                let shift = prepended.len();
+                prepended.append(&mut t.messages);
+                t.messages = prepended;
+                for tool in &mut t.tools {
+                    tool.anchor.message += shift;
+                }
+                for work in &mut t.work {
+                    work.start += shift;
+                }
+                t.history_has_more = false;
+            }
+            rt.invalidate();
+            rt.frame(1.0 / 60.0);
+            let anchor_after_prepend = rt.presented("row-1-u-45").expect("u-45 still visible").0;
+            assert!(
+                (anchor_after_prepend[1] - anchor_before[1]).abs() < 1.0,
+                "{width}: prepend moved anchor from {} to {}",
+                anchor_before[1],
+                anchor_after_prepend[1]
+            );
+
+            // (b) Expanding a work section preserves its toggle row's position.
+            let toggle_key = rt
+                .elements()
+                .into_iter()
+                .find_map(|e| {
+                    e.key
+                        .filter(|k| k.starts_with("toggle-work-"))
+                        .filter(|k| rt.presented(k).is_some())
+                })
+                .expect("toggle-work visible");
+            let toggle_before = rt.presented(&toggle_key).unwrap().0[1];
+            press(&mut rt, &toggle_key);
+            rt.frame(1.0);
+            let toggle_after = rt.presented(&toggle_key).unwrap().0[1];
+            assert!(
+                (toggle_after - toggle_before).abs() < 1.0,
+                "{width}: work expand moved toggle from {toggle_before} to {toggle_after}"
+            );
+
+            // (c) Image height change above the visible anchor preserves the visible anchor.
+            let before_img = rt.presented("row-1-u-45").unwrap().0[1];
+            {
+                let t = rt.state.current_mut();
+                let u35 = t.messages.iter_mut().find(|m| m.id == "u-35").unwrap();
+                u35.images[0].height = 600;
+            }
+            rt.invalidate();
+            rt.frame(1.0);
+            let after_img = rt.presented("row-1-u-45").unwrap().0[1];
+            assert!(
+                (after_img - before_img).abs() < 1.0,
+                "{width}: image load moved anchor from {before_img} to {after_img}"
+            );
+
+            // (d) Width change keeps the visible anchor in view at the same offset.
+            let before_resize = rt.presented("row-1-u-45").unwrap().0[1];
+            rt.set_viewport((width + 160.0, 720.0), 1.0);
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            let after_resize = rt
+                .presented("row-1-u-45")
+                .expect("u-45 still presented after resize")
+                .0[1];
+            assert!(
+                (after_resize - before_resize).abs() < 2.0,
+                "{width}: resize moved anchor from {before_resize} to {after_resize}"
+            );
+        }
+    }
+
+    #[test]
+    fn stick_to_bottom_follows_streaming_and_unpins_when_user_scrolls_up() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                for turn in 0..40usize {
+                    t.messages.push(crate::model::Message {
+                        id: format!("u-{turn}"),
+                        role: "You",
+                        text: format!("Prompt {turn}"),
+                        images: vec![],
+                    });
+                    t.messages.push(crate::model::Message {
+                        id: format!("a-{turn}"),
+                        role: "Pi",
+                        text: format!("Reply {turn}"),
+                        images: vec![],
+                    });
+                }
+                t.status = Status::Running;
+            }
+            rt.frame(0.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: starts at bottom"
+            );
+
+            // Streaming growth while pinned keeps bottom in view.
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nMore streamed lines\n\nEven more");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: stays pinned while streaming"
+            );
+
+            // Scrolling up unpins and shows Scroll to end; further streaming does NOT yank back down.
+            let (conv, _) = rt.presented("conversation-1").unwrap();
+            for _ in 0..20 {
+                rt.wheel(conv[0] + conv[2] * 0.5, conv[1] + conv[3] * 0.5, 400.0);
+                rt.frame(1.0 / 60.0);
+            }
+            for _ in 0..120 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39")
+                    .is_none_or(|(r, _)| r[1] >= conv[1] + conv[3]),
+                "{width}: scrolled away from bottom: {:?} vs conv {:?}",
+                rt.presented("turn-1-a-39"),
+                conv
+            );
+            assert!(
+                rt.presented("scroll-to-end").is_some(),
+                "{width}: scroll-to-end pill visible"
+            );
+            let scrolled_row = rt
+                .elements()
+                .into_iter()
+                .find(|e| {
+                    e.key.as_deref().is_some_and(|k| k.starts_with("row-1-u-"))
+                        && rt.presented(e.key.as_deref().unwrap()).is_some()
+                })
+                .map(|e| (e.key.unwrap(), e.rect[1]))
+                .unwrap();
+
+            rt.state
+                .current_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("\n\nTail chunk while reading history");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                (rt.presented(&scrolled_row.0).unwrap().0[1] - scrolled_row.1).abs() < 1.0,
+                "{width}: streaming must not pull scrolled-up reader back down"
+            );
+
+            // Clicking scroll-to-end jumps back to bottom and hides the pill.
+            press(&mut rt, "scroll-to-end");
+            for _ in 0..240 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                rt.presented("turn-1-a-39").is_some(),
+                "{width}: returned to bottom"
+            );
+            assert!(
+                rt.find("scroll-to-end").is_none(),
+                "{width}: pill hides at bottom"
             );
         }
     }

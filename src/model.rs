@@ -2635,6 +2635,8 @@ pub struct State {
     /// (highest). The level is chosen on release.
     pub thinking_drag: Option<f32>,
     pub model_search: TextEdit,
+    pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
+    pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub updater: crate::update::Updater,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
@@ -2826,6 +2828,8 @@ impl State {
             settings_picker: None,
             thinking_drag: None,
             model_search: TextEdit::default(),
+            timeline_far_from_bottom: std::collections::HashMap::new(),
+            timeline_at_bottom: std::collections::HashMap::new(),
             updater: Default::default(),
             restart_for_update: false,
             restart_approved: false,
@@ -2957,6 +2961,24 @@ impl State {
     }
     pub fn project(&self, id: Option<ProjectId>) -> Option<&Project> {
         self.projects.entries.iter().find(|p| Some(p.id) == id)
+    }
+    pub fn set_timeline_far_from_bottom(&mut self, thread_id: usize, far: bool) {
+        let key = (self.machines.selected.clone(), thread_id);
+        if far {
+            self.timeline_far_from_bottom.insert(key, true);
+        } else {
+            self.timeline_far_from_bottom.remove(&key);
+        }
+    }
+    pub fn timeline_is_far_from_bottom(&self, thread_id: usize) -> bool {
+        self.timeline_far_from_bottom
+            .get(&(self.machines.selected.clone(), thread_id))
+            .copied()
+            .unwrap_or(false)
+    }
+    pub fn set_timeline_at_bottom(&mut self, thread_id: usize, at: bool) {
+        self.timeline_at_bottom
+            .insert((self.machines.selected.clone(), thread_id), at);
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
         thread.captain_home && !thread.delegated
