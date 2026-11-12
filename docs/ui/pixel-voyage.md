@@ -418,12 +418,12 @@ These replace the earlier text where they differ.
 
 **Scenery**
 
-- **Captain band.** The two lowest sky steps take 60% and 30% of the portrait's backdrop. The
+- **Captain band.** The two lowest sky steps take 60% and 30% of the portrait's backdrop (superseded in section 13: 75% and 40%). The
   boat now sails here too, a quarter of the way along and clear of the portrait. Its flag is a
-  3 by 2 cell pennant in the backdrop colour.
+  3 by 2 cell pennant in the backdrop colour (superseded in section 13).
 - **Fleet on the horizon.** The new-thread band and the captain band draw one distant sail per
   working thread, up to four. A sail is 7 by 8 cells in the boat's colours, at fixed
-  positions (70%, 12%, 90% and 80% of the width). It is memoised on the count, with no timer.
+  positions (70%, 12%, 90% and 80% of the width; superseded in section 13). It is memoised on the count, with no timer.
   Nothing shows when nothing works.
 - **Empty lists.** A search with no results, an empty sidebar and an empty Brief memory section
   show the ship mark at 32 pt (two device pixels per cell at 2x) above the explanation.
@@ -433,3 +433,61 @@ These replace the earlier text where they differ.
 - 26 Pixelarticons glyphs use odd offsets (a 1 unit step inside the 24 unit grid), so some
   edges fall on half device pixels at 2x. The `PI` and `AGENT` harness marks are smooth SVGs and
   the OpenAI and Claude marks are vendor logos.
+
+## 13. Round 5 fixes
+
+**Bugs**
+
+- **Empty captain with no goal.** A captain home with no messages and no tool rows other than
+  delegations now counts as empty, so the hero draws above the crew tray.
+- **Zoom.** The sidebar content column takes its minimum height from the scroll area's layout
+  size, read every frame in layout units. The old cache held a window measurement, which at
+  1.25x was taller than the area.
+- **Recovery banner.** The dismiss control sits at the top right of the text, and the Review
+  button is on its own row below.
+- **Attention popover.** It opens under the badge (6 px gap, start aligned, 340 px wide, kept
+  inside the window). Reason words use `status_ink`. It can now cover the chat header's away
+  status while open.
+- **Band sails.** The captain band and the header's "Working in the background N tasks" both
+  read `background_status().working`.
+- **Switches.** On is a coral track with the thumb at the right. Off is a `line` track with the
+  thumb at the left. At night the on thumb has an `on_coral` border.
+- **Headline.** With no workspace the empty thread reads "What should we build?" above the picker.
+- **Narrow sidebar.** The wordmark drops to 11 px at 216 px or less when a badge is shown, on
+  every platform.
+- **Clone.** The dialog shows its working state. A remote machine's path keeps that machine's
+  separator.
+
+**Layout**
+
+- Transcript: 24 px top padding and a 28 px fade.
+- Routine rows: the switch sits on the title row, the schedule and next run fill the second
+  line, and delete shows on hover or focus. The calendar dot appears only while running (sea) or
+  after a failure, on a panel backing.
+- Sidebar captain tree: every child row has the same 14 by 16 status slot.
+- Crew tray: two equal columns from a 560 px lane (8 px between columns, 6 px between rows). The
+  timer never shrinks. Below 560 px it is one column.
+- Fleet rows: 4 px between icon and name. The name gives way before the 8 px group gap.
+- Palettes: 4 px card padding, search row and rows inset 4 px more, search box filled with
+  `field_fill`, no hairline under a focused search. The browse "Add" button has a 4 px radius,
+  a 1 px frame and a pixel-type shortcut.
+- Snooze popover: 4 px padding, with the pixel title inset to line up with the rows.
+- New captain dialog: 48 px portrait cells, the project choice as tall as the inputs, and no
+  extra rule above the footer.
+- Clone dialog: the destination box and "Choose..." are both 32 px tall.
+- Harness picker: a rule and a "Models" pixel label above "No CPA models are available."
+- `result_block`: "Finished" is pixel type in `status_ink`.
+- Brief and Session drawer headers end with the same rule as the chat header.
+- "Working in the background" uses the bolt. The moon stays for paused routines.
+- Captain chat avatar: a 24 pt window of the bust with a 1 px frame. It is crisp at 1x (1 px per
+  cell) and 2x (2 px per cell), not at 1.5x.
+
+**Scenery**
+
+- The pennant is four cells over two, tapered, with a one-cell outline (ink by day, star colour
+  by night). The captain band tints its two lowest sky steps 75% and 40%. There is no per-captain
+  colour table.
+- Distant sails mix 25% toward the lowest sky band, have one hull row, and sit at 70%, 14%, 88%
+  and 38% of the width. At bands narrower than about 800 px the sail at 38% can touch the boat.
+- The Brief header flies the same outlined pennant beside the captain's name, at 2 pt cells
+  (12 by 8 pt), which land on whole device pixels at 1x and 2x.

@@ -699,6 +699,8 @@ fn main() {
             // The narrowest docked sidebar, 200 pt, with the attention badge beside the wordmark.
             ("sidebar-narrow", |state| {
                 captain_workspace_demo(state);
+                // At 620 pt the sidebar docks only in compact mode.
+                state.compact_sidebar = true;
                 state.sidebar_width = 200.0;
             }),
             ("collapsed", |state| {
@@ -759,6 +761,9 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             }),
             ("captain-attention", |state| {
                 captain_workspace_demo(state);
+                // Two workers were running when Shina closed. Their tasks come back stopped, and
+                // the banner counts them from the tasks, so its number is what Review lists.
+                state.demo_stop(19);
                 state.recovery_notice = Some("Shina was closed while 2 tasks were running. Check their partial work, then resume or dismiss them.".into());
                 state.attention_menu = true;
             }),
@@ -767,6 +772,7 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 let home = state.current_mut();
                 home.title = "Polish the Shina workspace and keyboard navigation".into();
                 home.messages.clear();
+                home.tools.clear();
             }),
             ("captain-brief", captain_brief_demo),
             ("captain-brief-dark", |state| {
@@ -821,6 +827,8 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 state.populate_demo();
                 state.open_clone_dialog();
                 state.projects.clone_source.replace_text("anomalyco/rune");
+                // The dialog in its working state: the actions read Stop and Cloning.
+                state.projects.remote_cloning = true;
                 state.projects.clone_progress = "Receiving objects:  42% (1234/2938), 3.10 MiB | 4.20 MiB/s".into();
             }),
             ("clone-dark", |state| {

@@ -1007,6 +1007,16 @@ impl State {
 
     /// A task record for demo scenes and layout tests. It never starts a process: the child
     /// must already exist as a delegated thread, and `started_ago` is in milliseconds.
+    /// Marks a demo task as stopped by a restart, as recovery does for a task that was running.
+    pub fn demo_stop(&mut self, child_id: usize) {
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.child_thread_id == child_id)
+        {
+            task.state = TaskState::Interrupted;
+        }
+    }
     pub fn demo_task(
         &mut self,
         child_id: usize,

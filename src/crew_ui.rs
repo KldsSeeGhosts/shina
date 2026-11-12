@@ -132,7 +132,7 @@ fn mark_slot(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 7.0))
 }
 
-fn is_delegation(tool: &Tool) -> bool {
+pub(super) fn is_delegation(tool: &Tool) -> bool {
     tool.name == "delegate_task" || tool.name.ends_with("__delegate_task")
 }
 
@@ -378,7 +378,7 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
         .hover_motion(motion(), motion())
         .on_press(move |s: &mut State| open_thread(s, child))
         .child(mark_slot(status, p))
-        .child(label(word, ACTIVITY, secondary))
+        .child(super::pixel_text(word, super::status_ink(status, p)))
         .child(
             label(completion.title, ACTIVITY, tertiary)
                 .truncate()
@@ -550,16 +550,17 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
     if queued > 0 {
         summary = summary.child(label(format!("{queued} queued"), TIMER, tertiary));
     }
+    // One column below 560 px. From there on two equal columns, 8 px apart with 6 px between
+    // rows, so a title keeps the room beside it and only the longest ones truncate.
     let stacked = lane < TRAY_STACK_WIDTH;
-    let mut chips = if stacked {
-        col().gap(2.0)
-    } else {
-        row().gap(6.0).flex_wrap()
-    };
+    let mut chips = col().gap(if stacked { 2.0 } else { 6.0 });
+    let mut pair: Vec<El> = Vec::new();
     for task in &tasks {
         let (status, word) = task_status(s, task);
         let child = task.child_id;
-        let mut chip = row()
+        let clock = task_clock(task);
+        let clock_width = super::text_width(&clock) + 4.0;
+        let chip = row()
             .key(format!("crew-chip-{child}"))
             .role("button")
             .cursor(rune::Cursor::Pointer)
@@ -583,16 +584,31 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .shrink()
                     .min_w(0.0),
             )
-            .child(label(task_clock(task), TIMER, tertiary));
-        // A card fill and a 1 px `line` border in both layouts, so a chip reads as a chip.
-        chip = if stacked {
-            chip.w_full()
+            // The timer never shrinks: the title gives way first.
+            .child(
+                label(clock, TIMER, tertiary)
+                    .min_w(clock_width)
+                    .key(format!("crew-chip-clock-{child}")),
+            )
+            // A card fill and a 1 px `line` border, so a chip reads as a chip.
+            .fill(p.card)
+            .border(1.0, p.line);
+        if stacked {
+            chips = chips.child(chip.w_full());
         } else {
-            chip.max_w(260.0)
+            pair.push(chip.w(0.0).grow(1.0).min_w(0.0));
+            if pair.len() == 2 {
+                let mut line = row().gap(8.0);
+                for chip in pair.drain(..) {
+                    line = line.child(chip);
+                }
+                chips = chips.child(line);
+            }
         }
-        .fill(p.card)
-        .border(1.0, p.line);
-        chips = chips.child(chip);
+    }
+    if let Some(last) = pair.pop() {
+        // An odd chip takes the left column; an empty cell keeps it half width.
+        chips = chips.child(row().gap(8.0).child(last).child(el().w(0.0).grow(1.0)));
     }
     Some(
         col()
@@ -950,18 +966,13 @@ const ATTENTION_REASON_WIDTH: f32 = 80.0;
 /// It is 340 pt wide, or the window less 16 pt, and keeps 80 pt at the end of each row for the
 /// reason, so a title truncates before the reason does. With `below_header` it hangs from the
 /// chat header's rule instead of the badge, clear of the header's status text.
-pub(super) fn attention_menu(s: &State, p: Palette, below_header: bool) -> El {
-    let (anchor, gap) = if below_header {
-        ("chat-header-rule", 4.0)
-    } else {
-        ("attention-row", 6.0)
-    };
+pub(super) fn attention_menu(s: &State, p: Palette) -> El {
     let mut menu = popover("attention-menu", "Needs you", s, p)
         .role("menu")
         .w((s.viewport_width - 16.0).min(ATTENTION_MENU_WIDTH))
-        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, gap)
+        // Under the badge that opened it, where the eye already is.
+        .anchored_fit("attention-row", rune::Side::Bottom, rune::Align::Start, 6.0)
         .modal(true, |s: &mut State| s.attention_menu = false);
-    let (_, tertiary) = quiet_inks(p);
     for item in s.attention() {
         let id = item.thread_id;
         let status = attention_status(item.kind);
@@ -996,18 +1007,11 @@ pub(super) fn attention_menu(s: &State, p: Palette, below_header: bool) -> El {
                 )
                 .child(spacer())
                 .child(
-                    pixel_text(
-                        attention_word(item.kind),
-                        if status == Status::Failed {
-                            p.danger
-                        } else {
-                            tertiary
-                        },
-                    )
-                    .key(format!("attention-reason-{id}"))
-                    .w(ATTENTION_REASON_WIDTH)
-                    .min_w(ATTENTION_REASON_WIDTH)
-                    .align(rune::Align::End),
+                    pixel_text(attention_word(item.kind), super::status_ink(status, p))
+                        .key(format!("attention-reason-{id}"))
+                        .w(ATTENTION_REASON_WIDTH)
+                        .min_w(ATTENTION_REASON_WIDTH)
+                        .align(rune::Align::End),
                 ),
         );
     }
@@ -1050,13 +1054,7 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
             },
         ));
     }
-    actions = actions.child(spacer()).child(icon_button(
-        "dismiss-recovery",
-        "Dismiss notice",
-        "close",
-        p,
-        |s| s.recovery_notice = None,
-    ));
+    // The dismiss control sits at the top right of the text, where a card's close control is.
     Some(
         col()
             .key("recovery-notice")
@@ -1078,6 +1076,13 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
                             .wrap()
                             .grow(1.0)
                             .min_w(0.0),
+                    )
+                    .child(
+                        icon_button("dismiss-recovery", "Dismiss notice", "close", p, |s| {
+                            s.recovery_notice = None
+                        })
+                        .mt(-3.0)
+                        .mr(-3.0),
                     ),
             )
             .child(actions),

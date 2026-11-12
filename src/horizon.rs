@@ -76,14 +76,16 @@ impl Lcg {
 
 /// How far a captain's backdrop pulls the two lowest sky steps from their own colours: the step
 /// above the sea first, then the one above it.
-const BACKDROP_TINT: [f32; 2] = [0.6, 0.3];
+const BACKDROP_TINT: [f32; 2] = [0.75, 0.40];
 
 /// Most distant sails on a horizon, one per working thread or crew task.
 pub const FLEET_MAX: usize = 4;
-/// Where each distant sail's mast stands, as a fraction of the band's width. The first sail
-/// is the one nearest the right edge of the captain's portrait. None crosses the boat (at a
-/// third or a quarter along) or the portrait that overlaps the middle of a captain's band.
-const FLEET_AT: [f32; FLEET_MAX] = [0.70, 0.12, 0.90, 0.80];
+/// Where each distant sail's mast stands, as a fraction of the band's width. None sits under
+/// the sun or the moon (at four fifths), on the portrait that overlaps the middle of a captain's
+/// band, or on the boat (a third or a quarter along), and they do not bunch on one side.
+/// A distant sail's colours are mixed this far toward the sky behind it.
+const FLEET_HAZE: f32 = 0.25;
+const FLEET_AT: [f32; FLEET_MAX] = [0.70, 0.14, 0.88, 0.38];
 
 /// Rows of sea at the foot of a band: crest, two of water and the rest deep.
 const SEA_ROWS: usize = 8;
@@ -187,6 +189,56 @@ pub enum Subject {
     /// A captain's home: the boat flies a pennant in this colour (a portrait's backdrop), and
     /// the two lowest sky steps take some of it.
     Sky(Rgb),
+}
+
+/// The outline of a pennant: ink by day, the star colour by night.
+const DAY_INK: Rgb = [0x1f, 0x25, 0x38];
+
+/// A tapered pennant of four cells on its top row and two below, in `colour`, with a one cell
+/// outline all round (`mast` leaves out the outline cells where a mast stands to its left). The
+/// cells are (column, row) from the pennant's top-left cell, and the outline has negative ones.
+/// The outline keeps a pale or pastel colour readable on any sky.
+pub fn pennant(night: bool, colour: Rgb, mast: bool) -> Vec<(i32, i32, Rgb)> {
+    const BODY: [(i32, i32); 6] = [(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (1, 1)];
+    let ink = if night { NIGHT.star } else { DAY_INK };
+    let mut cells = Vec::new();
+    for y in -1..=2 {
+        for x in -1..=4 {
+            if BODY.contains(&(x, y)) {
+                cells.push((x, y, colour));
+                continue;
+            }
+            let touches = BODY
+                .iter()
+                .any(|&(bx, by)| (bx - x).abs() <= 1 && (by - y).abs() <= 1);
+            // The mast stands where the outline's left side would be.
+            if touches && !(mast && x == -1 && y >= 0) {
+                cells.push((x, y, ink));
+            }
+        }
+    }
+    cells
+}
+
+/// The pennant as flat rectangles `cell` points to a cell, for a flag drawn outside a band. The
+/// rectangles start at the outline's top-left corner.
+pub fn pennant_rects(night: bool, colour: Rgb, cell: f32) -> Vec<Rect> {
+    pennant(night, colour, false)
+        .into_iter()
+        .map(|(x, y, color)| Rect {
+            x: (x + 1) as f32 * cell,
+            y: (y + 1) as f32 * cell,
+            w: cell,
+            h: cell,
+            color,
+        })
+        .collect()
+}
+
+/// The colour of the sky's lowest step above the sea, which distant things fade toward.
+fn mix_toward_sky(grid: &Grid, waterline: usize) -> Rgb {
+    let row = waterline.saturating_sub(1);
+    grid.cells[row * grid.cols].unwrap_or([0x80, 0x90, 0xa0])
 }
 
 /// The horizon band, `width` by `height` points, with one distant sail for each of `fleet`
@@ -296,22 +348,29 @@ pub fn band(width: f32, height: f32, night: bool, subject: Subject, fleet: usize
     };
     let rise = waterline as i32 - 25;
     brand::boat(night, |x, y, color| {
+        // The boat's own flag gives way to the captain's pennant.
         if matches!(subject, Subject::Sky(_)) && y <= 5 && x >= 16 {
             return;
         }
         grid.put(x as i32 - 16 + centre, y as i32 + rise, color);
     });
-    if let Subject::Sky(pennant) = subject {
-        for (x, y) in [(16, 4), (17, 4), (18, 4), (16, 5), (17, 5), (18, 5)] {
-            grid.put(x - 16 + centre, y + rise, pennant);
+    if let Subject::Sky(pennant_colour) = subject {
+        for (x, y, color) in pennant(night, pennant_colour, true) {
+            grid.put(16 + x + centre - 16, 4 + y + rise, color);
         }
     }
-    // Distant sails keel-down on the waterline, in fixed places, so they never move.
+    // Distant sails, hull-down on the horizon in fixed places, so they never move. Their colours
+    // are mixed toward the lowest sky step, so they sit back from the boat.
+    let haze = mix_toward_sky(&grid, waterline);
     for fraction in FLEET_AT.iter().take(fleet.min(FLEET_MAX)) {
         let mast = (cols as f32 * fraction) as i32;
-        let rise = waterline as i32 - 8;
+        let rise = waterline as i32 - 7;
         brand::distant_sail(night, |x, y, color| {
-            grid.put(mast - 2 + x as i32, rise + y as i32, color);
+            grid.put(
+                mast - 2 + x as i32,
+                rise + y as i32,
+                mix(color, haze, FLEET_HAZE),
+            );
         });
     }
     grid.rects(width)
@@ -370,42 +429,77 @@ mod tests {
             for n in 0..2 {
                 assert_eq!(step(&tinted, n), step(&plain, n), "night {night} step {n}");
             }
-            assert_eq!(step(&tinted, 2), mix(step(&plain, 2), backdrop, 0.3));
-            assert_eq!(step(&tinted, 3), mix(step(&plain, 3), backdrop, 0.6));
+            assert_eq!(step(&tinted, 2), mix(step(&plain, 2), backdrop, 0.40));
+            assert_eq!(step(&tinted, 3), mix(step(&plain, 3), backdrop, 0.75));
             assert_ne!(step(&tinted, 3), step(&plain, 3));
         }
     }
 
     #[test]
-    fn a_captain_boat_flies_a_three_by_two_pennant_in_the_captains_colour() {
-        let backdrop = [0x6a, 0x94, 0xc0];
-        let rects = band(600.0, 108.0, false, Subject::Sky(backdrop), 0);
-        let flag = [0xe0, 0x7a, 0x54];
-        // The hull has the same coral, but sits in the lower half of the band.
-        assert!(
-            rects.iter().all(|r| r.color != flag || r.y >= 60.0),
-            "the boat's own flag is gone"
-        );
-        let cells: Vec<_> = rects.iter().filter(|r| r.color == backdrop).collect();
-        // Two rows, one run of three cells each.
-        assert_eq!(cells.len(), 2);
-        assert!(cells.iter().all(|r| r.w == 3.0 * CELL && r.h == CELL));
-        assert_eq!(cells[1].y - cells[0].y, CELL);
-        assert_eq!(cells[0].x, cells[1].x);
+    fn a_captain_boat_flies_a_tapered_outlined_pennant_in_the_captains_colour() {
+        let backdrop = [0x6a, 0x92, 0xb8];
+        for night in [false, true] {
+            let rects = band(600.0, 108.0, night, Subject::Sky(backdrop), 0);
+            let flag = [0xe0, 0x7a, 0x54];
+            // The hull has the same coral, but sits in the lower half of the band.
+            assert!(
+                rects.iter().all(|r| r.color != flag || r.y >= 60.0),
+                "the boat's own flag is gone"
+            );
+            // Four cells on the top row, two below, as one run each.
+            let body: Vec<_> = rects.iter().filter(|r| r.color == backdrop).collect();
+            assert_eq!(body.len(), 2, "night {night}");
+            assert_eq!((body[0].w, body[1].w), (4.0 * CELL, 2.0 * CELL));
+            assert_eq!(body[0].x, body[1].x);
+            assert_eq!(body[1].y - body[0].y, CELL);
+            // A one cell outline in ink by day and the star colour at night.
+            let ink = if night { NIGHT.star } else { DAY_INK };
+            let (x, y) = (body[0].x, body[0].y);
+            for (dx, dy) in [
+                (0.0, -CELL),
+                (-CELL, -CELL),
+                (4.0 * CELL, 0.0),
+                (2.0 * CELL, CELL),
+            ] {
+                assert_eq!(
+                    covered(&rects, x + dx + 0.5, y + dy + 0.5),
+                    Some(ink),
+                    "night {night} outline at {dx},{dy}"
+                );
+            }
+        }
     }
 
-    /// The cells a distant sail draws, as (column, row) from the band's top-left.
-    fn sail_cells(rects: &[Rect], night: bool) -> Vec<(i32, i32)> {
+    #[test]
+    fn the_pennant_has_four_by_two_cells_inside_a_one_cell_outline() {
+        let cells = pennant(false, [1, 2, 3], false);
+        assert_eq!(cells.iter().filter(|c| c.2 == [1, 2, 3]).count(), 6);
+        let (xs, ys): (Vec<_>, Vec<_>) = cells.iter().map(|c| (c.0, c.1)).unzip();
+        assert_eq!((xs.iter().min(), xs.iter().max()), (Some(&-1), Some(&4)));
+        assert_eq!((ys.iter().min(), ys.iter().max()), (Some(&-1), Some(&2)));
+        // With a mast to its left the left outline is left out.
+        let with_mast = pennant(false, [1, 2, 3], true);
+        assert!(with_mast.iter().all(|c| !(c.0 == -1 && c.1 >= 0)));
+    }
+
+    /// The sky's lowest step at column 0, which distant sails fade toward.
+    fn haze(rects: &[Rect], height: f32) -> Rgb {
+        let waterline = height - SEA_ROWS as f32 * CELL;
+        covered(rects, 1.0, waterline - 1.0).unwrap()
+    }
+
+    /// The cells a distant sail's mast draws, as (column, row) from the band's top-left.
+    fn sail_cells(rects: &[Rect], night: bool, haze: Rgb) -> Vec<(i32, i32)> {
         let mut mast = Vec::new();
         brand::distant_sail(night, |x, y, color| {
             if x == 2 && y == 0 {
                 mast.push(color);
             }
         });
-        let mast = mast[0];
+        let mast = mix(mast[0], haze, FLEET_HAZE);
         let mut found = Vec::new();
         for r in rects.iter().filter(|r| r.color == mast) {
-            // A mast run is one cell wide. The boat's mast is much taller and is skipped.
+            // A mast run is one cell wide.
             if r.w == CELL {
                 found.push(((r.x / CELL) as i32, (r.y / CELL) as i32));
             }
@@ -417,29 +511,72 @@ mod tests {
     fn one_distant_sail_flies_for_each_working_thread_up_to_four() {
         for night in [false, true] {
             let bare = band(600.0, 108.0, night, Subject::Boat, 0);
+            let sky = haze(&bare, 108.0);
+            let before = sail_cells(&bare, night, sky).len();
             let mut last = bare.clone();
             for (fleet, want) in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (9, 4)] {
                 let rects = band(600.0, 108.0, night, Subject::Boat, fleet);
-                let added = sail_cells(&rects, night).len() - sail_cells(&bare, night).len();
-                // Each sail's mast is six cells tall, one cell wide, in rows of one run each.
+                let added = sail_cells(&rects, night, sky).len() - before;
+                // Each sail's mast is six cells tall and one wide.
                 assert_eq!(added, want * 6, "night {night}, fleet {fleet}");
-                if fleet <= 4 {
-                    // Every sail is on the 3 point grid, inside the band and above the sea.
-                    for r in rects.iter().filter(|r| !bare.contains(r)) {
-                        assert_eq!(r.x % CELL, 0.0);
-                        assert_eq!(r.y % CELL, 0.0);
-                        assert!(r.x >= 0.0 && r.x + r.w <= 600.0);
-                        assert!(r.y + r.h <= 108.0 - (SEA_ROWS as f32 - 1.0) * CELL + 0.1);
-                    }
+                // Every sail is on the 3 point grid, inside the band and above the sea.
+                for r in rects.iter().filter(|r| !bare.contains(r)) {
+                    assert_eq!(r.x % CELL, 0.0);
+                    assert_eq!(r.y % CELL, 0.0);
+                    assert!(r.x >= 0.0 && r.x + r.w <= 600.0);
+                    assert!(r.y + r.h <= 108.0 - (SEA_ROWS as f32 - 1.0) * CELL + 0.1);
                 }
                 last = rects;
             }
             // Fixed places: the first sail stays where it is when more join it.
-            let one = sail_cells(&band(600.0, 108.0, night, Subject::Boat, 1), night);
-            let four = sail_cells(&band(600.0, 108.0, night, Subject::Boat, 4), night);
+            let one = sail_cells(&band(600.0, 108.0, night, Subject::Boat, 1), night, sky);
+            let four = sail_cells(&band(600.0, 108.0, night, Subject::Boat, 4), night, sky);
             assert!(one.iter().all(|cell| four.contains(cell)), "night {night}");
             assert_eq!(band(600.0, 108.0, night, Subject::Boat, 4), last);
         }
+    }
+
+    #[test]
+    fn distant_sails_sit_hull_down_and_apart_from_the_boat_and_the_sun() {
+        for night in [false, true] {
+            let bare = band(1440.0, 108.0, night, Subject::Boat, 0);
+            let sky = haze(&bare, 108.0);
+            let masts = sail_cells(&band(1440.0, 108.0, night, Subject::Boat, 4), night, sky);
+            let waterline = ((108.0 - SEA_ROWS as f32 * CELL) / CELL) as i32;
+            // Six mast rows and one row of hull end at the waterline, so the hull is one row.
+            let top = masts.iter().map(|c| c.1).min().unwrap();
+            assert_eq!(top, waterline - 7);
+            let cols = (1440.0 / CELL) as i32;
+            let mut columns: Vec<i32> = masts.iter().map(|c| c.0).collect();
+            columns.sort();
+            columns.dedup();
+            assert_eq!(columns.len(), 4);
+            let boat = cols / 3;
+            let sun = cols * 4 / 5;
+            for column in columns {
+                assert!((column - boat).abs() > 12, "{column} is on the boat");
+                assert!(
+                    (column - sun).abs() > 12,
+                    "{column} is under the sun or moon"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distant_sails_are_mixed_toward_the_sky() {
+        let bare = band(600.0, 108.0, false, Subject::Boat, 0);
+        let sky = haze(&bare, 108.0);
+        let rects = band(600.0, 108.0, false, Subject::Boat, 1);
+        let mut sail = None;
+        brand::distant_sail(false, |x, y, color| {
+            if (x, y) == (3, 1) {
+                sail = Some(color);
+            }
+        });
+        let want = mix(sail.unwrap(), sky, FLEET_HAZE);
+        assert!(rects.iter().any(|r| r.color == want));
+        assert_ne!(want, sail.unwrap());
     }
 
     #[test]

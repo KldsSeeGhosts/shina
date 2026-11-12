@@ -386,6 +386,11 @@ fn horizon_band(
         },
     )
 }
+/// The number of distant sails: the working count the captain header shows ("Working in the
+/// background, 2 tasks"), so the scenery and the words never disagree. `horizon_band` caps it.
+fn fleet_size(s: &State) -> usize {
+    s.background_status().working
+}
 /// Height of the horizon band, 36 cells of 3 pt.
 const HORIZON_HEIGHT: f32 = 108.0;
 /// Height of the sea strip at the foot of the sidebar, 9 cells of 3 pt.
@@ -714,8 +719,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // The header runs to the sidebar's edge, so the attention badge, which sits at its end,
         // has room beside the 22 px wordmark in a 232 px sidebar, even with the traffic lights.
         let line = sidebar_width - padding - HEADER_TAB_GAP;
+        // The wordmark's size depends on the sidebar's width, not on the platform: a title strip
+        // without window buttons still sizes it as if 72 pt were reserved, so a 216 px sidebar
+        // with a badge drops to 11 px everywhere.
+        let wordmark_line = line.min(sidebar_width - TITLE_CONTROLS - HEADER_TAB_GAP);
         top = top.child(
-            sidebar_header(s, p, compact, line)
+            sidebar_header(s, p, compact, line, wordmark_line)
                 .w(sidebar_width)
                 .pl(padding)
                 .pr(HEADER_TAB_GAP),
@@ -806,7 +815,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
         {
-            main.child(empty_thread(s, p, narrow, wide, main_width))
+            // Sizes from the last layout: the hero keeps its height only while the composer
+            // and its crew tray still fit under it.
+            let pane = cx.layout_with("empty-thread", |r| r[3]);
+            let lane = cx.layout_with("composer-lane", |r| r[3]);
+            let hero_fits = match (pane, lane) {
+                (Some(pane), Some(lane)) => pane - lane >= CAPTAIN_HERO_HEIGHT,
+                _ => true,
+            };
+            main.child(empty_thread(s, p, narrow, wide, main_width, hero_fits))
         } else {
             main.child(conversation(s, p, wide, main_width))
                 .child(composer(s, p, narrow, wide, main_width))
@@ -905,10 +922,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(pill);
     }
     if s.attention_menu && !s.attention().is_empty() {
-        // The popover hangs from the chat header's rule, so it never covers the header's own
-        // status text. Without a chat header (the full-width activity view) it hangs from the badge.
-        let below_header = cx.layout_with("chat-header-rule", |_| ()).is_some();
-        root = root.child(crew_ui::attention_menu(s, p, below_header));
+        root = root.child(crew_ui::attention_menu(s, p));
     }
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
@@ -1625,24 +1639,35 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         list = list.child(item);
     }
     if count == 0 {
-        list = list.child(
-            label(
-                if t.harness != "pi" && t.models.is_empty() {
-                    "This harness uses its configured model until it reports available models."
-                } else if t.models.is_empty() && s.catalog.remaining().is_some() {
-                    "Reading the CPA catalog..."
-                } else if t.models.is_empty() {
-                    "No CPA models are available."
-                } else {
-                    "No matching models."
-                },
-                SMALL,
-                p.muted,
+        // The harnesses end here and the models begin: a rule and a heading, so the note is
+        // plainly about models and not about the last harness.
+        list = list
+            .child(rule(p).mt(6.0))
+            .child(
+                pixel_label("Models", p.muted)
+                    .key("models-group")
+                    .px(16.0)
+                    .pt(8.0)
+                    .pb(4.0),
             )
-            .wrap()
-            .px(16.0)
-            .py(10.0),
-        );
+            .child(
+                label(
+                    if t.harness != "pi" && t.models.is_empty() {
+                        "This harness uses its configured model until it reports available models."
+                    } else if t.models.is_empty() && s.catalog.remaining().is_some() {
+                        "Reading the CPA catalog..."
+                    } else if t.models.is_empty() {
+                        "No CPA models are available."
+                    } else {
+                        "No matching models."
+                    },
+                    SMALL,
+                    p.muted,
+                )
+                .wrap()
+                .px(16.0)
+                .py(10.0),
+            );
     }
     card.child(header).child(rule(p)).child(list)
 }
@@ -1730,6 +1755,10 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
 /// The wordmark's size in Departure Mono points, for a header `line` points wide after the
 /// native controls and the gap before the tabs. 22 px whenever it clears the attention badge,
 /// 11 px (the face's other native size) in a narrow sidebar, and none in a truly narrow one.
+/// Width a macOS title strip reserves for the window buttons, which every platform assumes when
+/// it sizes the wordmark.
+const TITLE_CONTROLS: f32 = 72.0;
+
 fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
     let badge = if badge {
         BADGE_CLEARANCE + HEADER_BADGE
@@ -1748,11 +1777,11 @@ fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
 
 /// The sidebar's half of the title strip, left-aligned as T3 Code lays it out: the sidebar
 /// toggle, then Shina's mark and name. Search and actions sit in the sidebar below.
-fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32) -> El {
+fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line: f32) -> El {
     let mut header = row().h(36.0).center_y().child(sidebar_toggle(p, compact));
     if line >= HEADER_TOGGLE + HEADER_MARK {
         header = header.child(shina_mark(s, p));
-        if let Some(size) = wordmark_size(line, !s.attention().is_empty()) {
+        if let Some(size) = wordmark_size(wordmark_line, !s.attention().is_empty()) {
             header = header.child(
                 label("Shina", pixel(size), p.ink)
                     .key("shina-wordmark")
@@ -1959,7 +1988,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 ),
         );
     }
-    let mut content = col().pb(2.0).gap(2.0).min_h(s.sidebar_viewport_height);
+    // The content fills the scroll area so the shelves sit at the bottom. The area's size is read
+    // from layout in the same units the content is laid out in, so zoom cannot skew it.
+    let viewport = rune::memo::layout_size("sidebar-scroll").map_or(0.0, |size| size[1]);
+    let mut content = col()
+        .key("sidebar-content")
+        .pb(2.0)
+        .gap(2.0)
+        .min_h(viewport);
     let entries = sidebar_ui::entries(s);
     let captains: Vec<_> = entries.iter().filter(|entry| entry.captain).collect();
     if !s.show_archive || !captains.is_empty() {
@@ -2169,7 +2205,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     side = side.child(
         col()
             .key("sidebar-scroll")
-            .on_layout(|s: &mut State, rect| s.sidebar_viewport_height = rect[3])
             .grow(1.0)
             .min_h(0.0)
             .scroll(ScrollSpec {
@@ -2461,7 +2496,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                         .center_y()
                         .child(
                             row()
-                                .h(34.0)
+                                .h(32.0)
                                 .px(8.0)
                                 .center_y()
                                 .grow(1.0)
@@ -2693,6 +2728,20 @@ fn face_for(status: Status) -> crate::visuals::Face {
         Status::Failed | Status::Paused => Face::Dizzy,
     }
 }
+/// The captain's face beside its name in the transcript: 24 pt of the upper bust, a window of
+/// 24 cells that is one pixel a cell at 1x and two at 2x, with a 1 px frame. The 20 pt head crop
+/// it replaces had 28 cells, so it cropped or padded at both scales and lost Ember's goggles.
+fn speaker_avatar(s: &State, p: Palette, captain: usize) -> El {
+    const SIZE: f32 = 24.0;
+    let portrait = s.captains.get(captain).map(|c| c.portrait).unwrap_or(0);
+    let portrait = portrait.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
+    let pixels = s
+        .artwork
+        .bust_window_pixels(portrait, crate::visuals::Face::Normal, SIZE);
+    pixel_portrait_framed(&pixels, SIZE, p, None)
+        .key(format!("speaker-avatar-{portrait}"))
+        .a11y_hidden()
+}
 fn avatar(s: &State, p: Palette, captain: usize, size: f32, status: Status) -> El {
     let portrait = s.captains.get(captain).map(|c| c.portrait).unwrap_or(0);
     portrait_avatar(s, p, portrait, size, status)
@@ -2729,7 +2778,7 @@ const CAPTAIN_FACE: f32 = 40.0;
 const MACHINE_CAP: f32 = 110.0;
 /// The least room left for a machine's name beside the workspace. Under it the tag is the icon
 /// alone, because a name cut to two letters and an ellipsis says nothing.
-const MACHINE_NAME_ROOM: f32 = 28.0;
+const MACHINE_NAME_ROOM: f32 = 32.0;
 const BADGE_SLOT: f32 = 28.0;
 /// What a captain row spends beside its text: left padding, the portrait slot, the gap and the
 /// right padding.
@@ -3259,9 +3308,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             .pr(8.0)
             .gap(8.0)
             .center_y();
-        if let Some(mark) = mark {
-            line = line.child(mark);
-        }
+        // Every worker row has the status slot, empty or not, so all titles share one left edge
+        // and none looks nested under the row above.
+        line = line.child(mark.unwrap_or_else(|| el().size(14.0, 16.0)));
         return item.child(line.child(title));
     }
 
@@ -3568,7 +3617,7 @@ fn slot_width(text: Option<&str>) -> f32 {
 }
 
 /// About how wide `text` is at the sidebar's 12.5 px.
-fn text_width(text: &str) -> f32 {
+pub(super) fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * 6.2
 }
 
@@ -3599,7 +3648,9 @@ fn machine_tag(
         .role("img")
         .label(caption.clone())
         .help(caption)
-        .gap(2.0)
+        // 4 px between the icon and the name. The name is left out when the row lacks room for
+        // it (see `room_for_machine_name`), so the 8 px between the row's groups never shrinks.
+        .gap(4.0)
         .center_y()
         .shrink()
         .min_w(ICON)
@@ -3800,7 +3851,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .w(0.0)
                     .grow(1.0)
                     .min_w(0.0)
-                    .h(64.0)
+                    .h(48.0)
                     .center()
                     .radius(4.0)
                     .hover(p.selected)
@@ -3850,7 +3901,8 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .unwrap_or("No workspace")
                         ))
                         .focusable(!editing)
-                        .h(38.0)
+                        // The same height as the text inputs below it.
+                        .h(37.0)
                         .px(8.0)
                         .gap(10.0)
                         .center_y()
@@ -4007,7 +4059,6 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 )),
         )
         .child(body)
-        .child(rule(p))
         .child(
             row()
                 .gap(8.0)
@@ -4636,16 +4687,22 @@ fn snooze_menu(s: &State, p: Palette) -> El {
     let mut card = col()
         .key("snooze-menu")
         .w(280.0)
-        .padding(12.0)
-        .gap(4.0)
+        .padding(4.0)
+        .gap(1.0)
         .radius(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
-        .child(label("Snooze thread", LABEL, p.ink));
+        // The title is a pixel label, inset 8 px so it lines up with the rows' icons.
+        .child(
+            pixel_label("Snooze thread", p.muted)
+                .px(8.0)
+                .pt(6.0)
+                .pb(4.0),
+        );
     if s.custom_snooze_open {
         card = card
-            .child(label("Local date and time, or duration", SMALL, p.muted))
+            .child(label("Local date and time, or duration", SMALL, p.muted).px(8.0))
             .child(
                 text_input(&s.snooze_edit, LABEL)
                     .key("snooze-custom-input")
@@ -4655,6 +4712,7 @@ fn snooze_menu(s: &State, p: Palette) -> El {
                     .color(p.ink)
                     .w_full()
                     .padding(8.0)
+                    .mx(4.0)
                     .radius(4.0)
                     .fill(field_fill(s, p))
                     .field_focus(&s.snooze_edit, p)
@@ -5134,16 +5192,19 @@ fn project_picker(s: &State, p: Palette) -> El {
         .role("dialog")
         .w(520.0)
         .max_h(460.0)
-        .padding(6.0)
+        .padding(4.0)
         .radius(6.0)
         .on_press(|_: &mut State| {})
         .child(
             row()
                 .h(46.0)
+                // The search box and the rows below share one inset from the card's edge.
+                .mx(4.0)
                 .px(8.0)
                 .gap(10.0)
                 .center_y()
                 .radius(4.0)
+                .fill(field_fill(s, p))
                 .field_focus(&s.picker_query, p)
                 .child(
                     el().size(16.0, 16.0)
@@ -5195,7 +5256,8 @@ fn project_picker(s: &State, p: Palette) -> El {
                         }),
                 ),
         )
-        .child(el().h(0.5).w_full().mb(4.0).fill(p.line));
+        // No hairline under the search box: its own frame already ends the field.
+        .child(el().h(4.0));
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
@@ -5442,6 +5504,8 @@ fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p
         .label(title)
         .focusable(true)
         .min_h(44.0)
+        // Inset 4 px from the card's padding, in line with the search row above it.
+        .mx(4.0)
         .px(8.0)
         .py(6.0)
         .gap(10.0)
@@ -5502,10 +5566,12 @@ fn add_project_palette(s: &State, p: Palette) -> El {
     };
     let mut field = row()
         .h(46.0)
+        .mx(4.0)
         .px(8.0)
         .gap(10.0)
         .center_y()
         .radius(4.0)
+        .fill(field_fill(s, p))
         .field_focus(&s.picker_query, p)
         .child(el().size(16.0, 16.0).center().child(icon(
             if browsing { "folder" } else { "folder-plus" },
@@ -5592,19 +5658,18 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(6.0)
-                .border(0.5, p.line)
+                .radius(4.0)
+                .border(1.0, p.frame)
                 .hover(p.selected)
                 .on_press(|s: &mut State| s.add_browsed_project())
                 .child(label(submit, TextStyle::new(12.5, 560.0), p.ink))
                 .child(
-                    label(
+                    pixel_text(
                         if folders.is_empty() {
                             "Enter"
                         } else {
                             SUBMIT_CHORD
                         },
-                        TextStyle::new(11.0, 520.0),
                         p.muted,
                     )
                     .px(4.0)
@@ -5617,11 +5682,11 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .role("dialog")
         .w(560.0)
         .max_h(480.0)
-        .padding(6.0)
+        .padding(4.0)
         .radius(6.0)
         .on_press(|_: &mut State| {})
         .child(field)
-        .child(el().h(0.5).w_full().mb(4.0).fill(p.line));
+        .child(el().h(4.0));
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
@@ -6351,7 +6416,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 .gap(8.0)
                 // The captain's resting face, as its sidebar portrait shows when idle. A turn's
                 // own status ("Done", "Working") would change the expression and the mark.
-                .child(avatar(s, p, captain, 20.0, Status::Ready))
+                .child(speaker_avatar(s, p, captain))
                 .child(label(
                     format!("Captain {}", s.captains[captain].name),
                     TextStyle::new(14.0, 600.0),
@@ -6494,10 +6559,16 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .key("chat-lane")
         .w_full()
         .max_w(measure(wide))
-        .pt(20.0)
+        .pt(24.0)
         .pb(24.0)
         .gap(20.0);
-    if t.messages.is_empty() && t.tools.is_empty() && !t.status.busy() {
+    // A captain's delegations show as task cards inside a turn, so with no messages they have
+    // nothing to hang from. The home counts as empty and greets above its crew tray.
+    let visible_tools = t
+        .tools
+        .iter()
+        .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
+    if t.messages.is_empty() && !visible_tools && !t.status.busy() {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
@@ -6520,10 +6591,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     lane_width(pane_width, wide),
                     s.dark,
                     crate::horizon::Subject::Boat,
-                    s.threads
-                        .iter()
-                        .filter(|thread| !thread.archived() && thread.status == Status::Running)
-                        .count(),
+                    fleet_size(s),
                     p,
                 ))
                 .child(draft_headline(s, p, pane_width));
@@ -6657,8 +6725,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             stick_bottom: !t.messages.is_empty() || !t.tools.is_empty(),
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
-        // under the header's rule. The top fades over 16 pt instead of cutting through a line.
-        .scroll_edge_fade(16.0)
+        // under the header's rule. The top fades over 28 pt, with 24 pt of padding above the first
+        // message, so no sliver of a card or bubble shows under the rule.
+        .scroll_edge_fade(28.0)
         .px(gutter)
         .items_center()
         .child(messages)
@@ -6667,6 +6736,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
 /// The sidebar portraits' animation stage also plays the captain hero, under this row id.
 pub(crate) const HERO_PORTRAIT_ROW: usize = usize::MAX;
 const HERO_PORTRAIT: f32 = 72.0;
+/// The captain hero with a one-line heading: band, portrait overlap, heading, role and status.
+const CAPTAIN_HERO_HEIGHT: f32 = 272.0;
 
 /// An empty captain home greets like KSG Code's draft hero (`DraftHeroHeadline`: centred
 /// `text-3xl font-normal tracking-tight`, `text-2xl` on a narrow pane), with the captain's
@@ -6747,7 +6818,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
         lane_width(pane_width, wide),
         s.dark,
         crate::horizon::Subject::Sky(crate::visuals::portrait_backdrop(portrait_index)),
-        working,
+        fleet_size(s),
         p,
     );
     col()
@@ -6801,12 +6872,28 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
 /// vertical centre of the pane and the headline rests 16 px above it. Two equal zero-height
 /// boxes do the centring, so attachments or a long draft grow the composer without moving
 /// the headline off it.
-fn empty_thread(s: &State, p: Palette, narrow: bool, wide: bool, pane_width: f32) -> El {
+fn empty_thread(
+    s: &State,
+    p: Palette,
+    narrow: bool,
+    wide: bool,
+    pane_width: f32,
+    hero_fits: bool,
+) -> El {
+    // A captain's hero keeps its height above a tall crew tray and takes the room from the
+    // space below the composer. In a window too short for both, the composer stays on screen
+    // and the clip keeps the hero out of the header.
+    let floor = if s.current().captain.is_some() && hero_fits {
+        CAPTAIN_HERO_HEIGHT
+    } else {
+        0.0
+    };
     let above = col()
         .w_full()
         .h(0.0)
         .grow(1.0)
-        .min_h(0.0)
+        .min_h(floor)
+        .clip_rounded(0.0)
         .justify_end()
         .items_center()
         .child(conversation(s, p, wide, pane_width));
@@ -6832,7 +6919,11 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
         .unwrap_or_else(|| "No workspace".into());
     // Sans at 30 px averages about 15 px a character, and the line stays inside the lane.
     let available = lane_width(pane_width, true);
-    let inline = pane_width > 0.0
+    // With no workspace there is nothing to build "in", so the sentence stays whole and the
+    // picker sits under it.
+    let has_workspace = s.project(s.current().project).is_some();
+    let inline = has_workspace
+        && pane_width > 0.0
         && ("What should we build in ?".len() + name.chars().count()) as f32 * 15.0 <= available;
     let picker = |style: TextStyle| {
         let mut picker = row()
@@ -7943,6 +8034,8 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                 },
             )),
     );
+    // The same closing rule as the chat header, so one line runs across the pane.
+    pane = pane.child(rule(p).key("session-header-rule"));
     let mut details = col()
         .padding(16.0)
         .gap(16.0)
@@ -9604,6 +9697,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_sidebar_content_fits_the_viewport_at_every_zoom() {
+        // The content column once took the scroll area's height from an earlier frame, measured
+        // in window points rather than layout points. At 1.25x that was taller than the area.
+        for zoom in [1.0, 1.25, 1.5] {
+            let mut rt = runtime(1440.0);
+            rt.state.zoom = zoom;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            rt.frame(2.0);
+            let (scroll, _) = rt.presented("sidebar-scroll").unwrap();
+            let (content, _) = rt.presented("sidebar-content").unwrap();
+            assert!(
+                content[3] <= scroll[3] + 0.5,
+                "zoom {zoom}: content {} in a viewport of {}",
+                content[3],
+                scroll[3]
+            );
+        }
+    }
+
+    #[test]
     fn the_snooze_menu_is_a_popover_with_no_scrim_or_cancel_row() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -9664,6 +9778,19 @@ pub(crate) mod tests {
             let (note, _) = rt.presented("sidebar-empty").unwrap();
             assert!(mark[1] >= note[1] && mark[1] + mark[3] <= note[1] + note[3]);
         }
+    }
+
+    #[test]
+    fn the_captain_editor_packs_its_portraits_and_matches_its_field_heights() {
+        let mut rt = runtime(1280.0);
+        rt.state.begin_new_captain();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let height = |key: &str| rt.presented(key).unwrap().0[3];
+        assert_eq!(height("captain-portrait-0"), 48.0);
+        assert_eq!(height("captain-portrait-face-0"), 40.0);
+        assert_eq!(height("captain-project-choice"), height("captain-name"));
+        assert_eq!(height("captain-role"), height("captain-name"));
     }
 
     #[test]
@@ -11123,7 +11250,10 @@ pub(crate) mod tests {
                     cell[0] >= card[0] && cell[0] + cell[2] <= card[0] + card[2] + 0.5,
                     "portrait {i} leaves the card at {width}: {cell:?}"
                 );
-                assert!(cell[2] >= 60.0 && cell[3] >= 60.0, "portrait {i}: {cell:?}");
+                assert!(
+                    cell[2] >= 60.0 && (cell[3] - 48.0).abs() < 0.5,
+                    "portrait {i}: {cell:?}"
+                );
                 assert!((cell[2] - cells[0][2]).abs() < 0.5, "equal columns");
                 assert!(
                     (cell[1] - cells[row * 6][1]).abs() < 0.5,
@@ -11418,22 +11548,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_crew_tray_stacks_on_a_narrow_lane() {
+    fn the_crew_tray_is_two_equal_columns_from_560_and_one_column_below() {
+        let chips = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
+            ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
+                .iter()
+                .map(|key| rt.presented(key).unwrap().0)
+                .collect()
+        };
         let rt = crew_runtime(1280.0);
-        let first = rt.presented("crew-chip-16").unwrap().0;
-        let second = rt.presented("crew-chip-17").unwrap().0;
+        let wide = chips(&rt);
+        // Three chips fill two rows of two columns, so two of them share a row.
+        let mut rows: Vec<f32> = wide.iter().map(|c| c[1]).collect();
+        rows.sort_by(f32::total_cmp);
+        rows.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        assert_eq!(rows.len(), 2, "two rows: {wide:?}");
+        let mut columns: Vec<f32> = wide.iter().map(|c| c[0]).collect();
+        columns.sort_by(f32::total_cmp);
+        columns.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        assert_eq!(columns.len(), 2, "two columns: {wide:?}");
+        for chip in &wide {
+            assert!(
+                (chip[2] - wide[0][2]).abs() < 1.0,
+                "equal columns: {wide:?}"
+            );
+        }
         assert!(
-            (first[1] - second[1]).abs() < 1.0,
-            "wide lanes keep one row"
+            (columns[1] - columns[0] - wide[0][2] - 8.0).abs() < 1.0,
+            "8 px between columns"
         );
+        assert!(
+            (rows[1] - rows[0] - 30.0 - 6.0).abs() < 1.0,
+            "6 px between rows"
+        );
+        // The timer keeps its width beside the longest title.
+        for chip in ["16", "17", "19"] {
+            let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
+            assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
+        }
         let rt = crew_runtime(560.0);
-        let first = rt.presented("crew-chip-16").unwrap().0;
-        let second = rt.presented("crew-chip-17").unwrap().0;
-        assert!(second[1] > first[1] + 20.0, "narrow lanes stack");
-        assert!(
-            (first[2] - second[2]).abs() < 1.0,
-            "stacked chips share a width"
-        );
+        let narrow = chips(&rt);
+        for pair in narrow.windows(2) {
+            assert!(
+                (pair[0][0] - pair[1][0]).abs() < 1.0 && (pair[0][1] - pair[1][1]).abs() > 20.0,
+                "narrow lanes stack in one column: {narrow:?}"
+            );
+            assert!(
+                (pair[0][2] - pair[1][2]).abs() < 1.0,
+                "stacked chips share a width"
+            );
+        }
     }
 
     #[test]
@@ -11488,6 +11651,117 @@ pub(crate) mod tests {
             press(&mut rt, "dismiss-recovery");
             assert!(rt.state.recovery_notice.is_none());
         }
+    }
+
+    #[test]
+    fn the_recovery_notice_puts_dismiss_at_the_top_right_and_counts_what_review_shows() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state.recovery_notice = Some("Shina was closed while 2 tasks were running.".into());
+            rt.invalidate();
+            rt.frame(0.0);
+            let (card, _) = rt.presented("recovery-notice").unwrap();
+            let (dismiss, _) = rt.presented("dismiss-recovery").unwrap();
+            let (review, _) = rt.presented("review-recovery").unwrap();
+            assert!(
+                dismiss[1] < card[1] + 20.0 && dismiss[0] + dismiss[2] > card[0] + card[2] - 20.0,
+                "{width}: dismiss {dismiss:?} is not at the top right of {card:?}"
+            );
+            assert!(
+                review[1] > dismiss[1],
+                "{width}: Review is below the text row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_goal_less_captain_with_no_tools_shows_the_hero_above_the_crew_tray() {
+        let mut rt = runtime(1280.0);
+        crate::captain_workspace_demo(&mut rt.state);
+        let home = rt.state.current_mut();
+        home.messages.clear();
+        home.tools.clear();
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (hero, _) = rt
+            .presented("captain-hero-portrait")
+            .expect("the hero draws");
+        let (tray, _) = rt.presented("crew-tray").expect("the crew tray draws");
+        assert!(hero[1] + hero[3] <= tray[1], "{hero:?} {tray:?}");
+    }
+
+    #[test]
+    fn the_empty_thread_headline_without_a_workspace_reads_what_should_we_build() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.state.new_thread_in(None);
+        rt.frame(0.0);
+        let labels: Vec<String> = rt
+            .elements()
+            .into_iter()
+            .filter_map(|element| element.text)
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|text| text.contains("What should we build?")),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_narrow_scene_docks_the_compact_sidebar_with_the_small_wordmark() {
+        let mut rt = runtime(620.0);
+        crate::captain_workspace_demo(&mut rt.state);
+        rt.state.compact_sidebar = true;
+        rt.state.sidebar_width = 200.0;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (side, _) = rt.presented("sidebar").expect("the sidebar is docked");
+        assert!(side[2] <= 216.5, "{side:?}");
+        let (word, _) = rt.presented("shina-wordmark").unwrap();
+        assert!(word[2] < 40.0, "the wordmark drops to 11 px: {word:?}");
+    }
+
+    #[test]
+    fn the_clone_destination_and_its_button_are_both_32_tall() {
+        for width in [620.0, 960.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.open_clone_dialog();
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (choose, _) = rt.presented("clone-choose-parent").unwrap();
+            assert!((choose[3] - 32.0).abs() < 0.5, "{width}: {choose:?}");
+        }
+    }
+
+    #[test]
+    fn the_snooze_popover_has_four_pixels_of_padding_and_a_titled_first_row() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        let id = rt.state.threads[0].id;
+        rt.state.open_snooze(id);
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (menu, _) = rt.presented("snooze-menu").unwrap();
+        assert!(menu[2] > 0.0 && menu[3] > 0.0, "{menu:?}");
+    }
+
+    #[test]
+    fn the_session_drawer_header_has_a_rule_on_the_chat_headers_line() {
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        rt.state.show_activity = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (rule, _) = rt.presented("session-header-rule").unwrap();
+        let (chat, _) = rt.presented("chat-header-rule").unwrap();
+        assert!((rule[1] - chat[1]).abs() < 1.0, "{rule:?} {chat:?}");
     }
 
     #[test]
@@ -11773,7 +12047,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_attention_popover_is_340_wide_keeps_its_reasons_and_clears_the_header_status() {
+    fn the_attention_popover_is_340_wide_keeps_its_reasons_and_sits_under_its_badge() {
         for width in [620.0, 960.0, 1280.0] {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
@@ -11791,14 +12065,16 @@ pub(crate) mod tests {
                 (menu[2] - 340.0f32.min(width - 16.0)).abs() < 0.5,
                 "{width}: {menu:?}"
             );
-            let (rule, _) = rt.presented("chat-header-rule").unwrap();
-            assert!(menu[1] >= rule[1] + rule[3], "{width}: {menu:?} {rule:?}");
-            if let Some((status, _)) = rt.presented("captain-away-status") {
-                assert!(
-                    menu[1] >= status[1] + status[3],
-                    "{width}: covers the status"
-                );
-            }
+            // The popover opens under the badge, 6 px below it, and stays inside the window.
+            let (badge, _) = rt.presented("attention-row").unwrap();
+            assert!(
+                (menu[1] - (badge[1] + badge[3] + 6.0)).abs() < 1.0,
+                "{width}: {menu:?} {badge:?}"
+            );
+            assert!(
+                menu[0] >= 0.0 && menu[0] + menu[2] <= width + 0.5,
+                "{width}: {menu:?}"
+            );
             for item in rt.state.attention() {
                 let (reason, _) = rt
                     .presented(&format!("attention-reason-{}", item.thread_id))
@@ -11813,7 +12089,7 @@ pub(crate) mod tests {
     fn the_wordmark_keeps_22_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
         // A macOS title strip reserves about 72 pt for the window buttons on the left, and the
         // header keeps HEADER_TAB_GAP at its end.
-        let line = |sidebar: f32| sidebar - 72.0 - HEADER_TAB_GAP;
+        let line = |sidebar: f32| sidebar - TITLE_CONTROLS - HEADER_TAB_GAP;
         assert_eq!(wordmark_size(line(232.0), true), Some(22.0));
         assert_eq!(wordmark_size(line(232.0), false), Some(22.0));
         assert_eq!(wordmark_size(line(216.0), true), Some(11.0));

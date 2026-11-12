@@ -269,7 +269,30 @@ type Set = [Art; Face::COUNT];
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Shown {
     Face(usize, usize, bool),
+    /// The upper bust: a `BUST_WINDOW` square of cells cut from the full bust.
+    Window(usize, usize),
     Mark(bool),
+}
+
+/// The upper-bust window, in cells of the 40 cell bust: x 8..32 and y 4..28. It keeps what makes
+/// a captain recognisable (Ember's goggles, Bram's cap, Jett's mohawk), and its 24 cells divide
+/// a 24 pt tile exactly at 1x (1 px a cell) and 2x (2 px).
+pub const BUST_WINDOW: (u32, u32, u32, u32) = (8, 4, 32, 28);
+
+/// The cells `window` of an RGBA image drawn `k` pixels to a cell, as a new image.
+fn cut_cells(
+    rgba: &[u8],
+    width: u32,
+    k: u32,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+) -> (Vec<u8>, u32, u32) {
+    let (w, h) = ((x1 - x0) * k, (y1 - y0) * k);
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in y0 * k..y1 * k {
+        let start = ((y * width + x0 * k) * 4) as usize;
+        out.extend_from_slice(&rgba[start..start + (w * 4) as usize]);
+    }
+    (out, w, h)
 }
 
 pub struct Artwork {
@@ -367,6 +390,10 @@ impl Artwork {
                             crate::crisp::fit(&art.rgba, art.width, art.height, art.cell, target)
                         })
                     }
+                    Shown::Window(captain, face) => self.crew[captain][face].decoded().map(|art| {
+                        let (rgba, w, h) = cut_cells(&art.rgba, art.width, art.cell, BUST_WINDOW);
+                        crate::crisp::fit(&rgba, w, h, art.cell, target)
+                    }),
                     Shown::Mark(night) => {
                         let size = crate::brand::SIZE as u32;
                         Some(crate::crisp::fit(
@@ -395,6 +422,16 @@ impl Artwork {
         let captain = captain.min(PORTRAITS - 1);
         self.pixels_for(
             Shown::Face(captain, face.index(), points < 30.0),
+            self.device_size(points),
+        )
+    }
+
+    /// The upper bust (`BUST_WINDOW`) for a tile `points` wide, in whole device pixels when
+    /// `points` times the scale is a multiple of 24.
+    pub fn bust_window_pixels(&self, captain: usize, face: Face, points: f32) -> Pixels {
+        let captain = captain.min(PORTRAITS - 1);
+        self.pixels_for(
+            Shown::Window(captain, face.index()),
             self.device_size(points),
         )
     }
@@ -617,6 +654,37 @@ pub fn portrait_backdrop(portrait: usize) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_upper_bust_lands_on_whole_device_pixels_at_one_and_two_x() {
+        let art = Artwork::load(Path::new(""));
+        let decoded = art.crew[0][Face::Normal.index()].decoded().unwrap();
+        let (rgba, w, h) = cut_cells(&decoded.rgba, decoded.width, decoded.cell, BUST_WINDOW);
+        assert_eq!((w, h), (24 * decoded.cell, 24 * decoded.cell));
+        for (scale, factor) in [(1.0, 1u32), (2.0, 2)] {
+            art.set_scale(scale);
+            let target = art.device_size(24.0);
+            assert_eq!(target, 24 * factor);
+            let fitted = crate::crisp::fit(&rgba, w, h, decoded.cell, target);
+            // Every cell is a factor by factor block of one colour.
+            let side = target as usize;
+            for cy in 0..24usize {
+                for cx in 0..24usize {
+                    let first = (cy * factor as usize * side + cx * factor as usize) * 4;
+                    for dy in 0..factor as usize {
+                        for dx in 0..factor as usize {
+                            let at =
+                                ((cy * factor as usize + dy) * side + cx * factor as usize + dx)
+                                    * 4;
+                            assert_eq!(fitted[at..at + 4], fitted[first..first + 4], "{scale}x");
+                        }
+                    }
+                }
+            }
+            let pixels = art.bust_window_pixels(0, Face::Normal, 24.0);
+            assert_eq!(pixels.size(), (target, target));
+        }
+    }
 
     #[test]
     fn faces_and_the_mark_are_scaled_to_whole_device_pixels_and_cached() {

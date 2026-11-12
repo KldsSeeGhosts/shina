@@ -98,7 +98,7 @@ fn icon_action(
 /// padding, a 14 px thumb that travels 12 px in 0.15 s, the primary color when on and the
 /// input color when off.
 pub(super) fn switch(
-    _: &State,
+    s: &State,
     key: &str,
     title: &str,
     on: bool,
@@ -106,9 +106,11 @@ pub(super) fn switch(
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     let travel = rune::Curve::tween(0.15, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0));
-    // A square, framed switch: coral with a card-coloured thumb and a 1 px frame when on, a card
-    // with a muted thumb off. Near-black on coral read as a hole.
+    // A square, framed switch. On is a coral track with the thumb at the right, in the card
+    // colour with a 1 px outline (`frame` by day, `on_coral` at night, where a light `frame` read
+    // as a hole). Off is a `line` track with a muted thumb at the left.
     let thumb = if on { p.card } else { p.muted };
+    let outline = if s.dark { p.on_coral } else { p.frame };
     el().key(key)
         .role("switch")
         .checked(on)
@@ -121,13 +123,14 @@ pub(super) fn switch(
         .padding(4.0)
         .center_y()
         .border(2.0, p.frame)
-        .fill(if on { p.coral } else { p.card })
+        .fill(if on { p.coral } else { p.line })
         .motion(rune::Spring::new(0.2, 0.0))
         .on_press(action)
         .child(
-            el().size(12.0, 12.0)
+            el().key(format!("{key}-thumb"))
+                .size(12.0, 12.0)
                 .fill(thumb)
-                .border(if on { 1.0 } else { 0.0 }, p.frame)
+                .border(if on { 1.0 } else { 0.0 }, outline)
                 .offset(if on { 14.0 } else { 0.0 }, 0.0)
                 .offset_motion(travel),
         )
@@ -164,6 +167,9 @@ fn section(key: &str, title: &str, meta: Option<String>, actions: Vec<El>, p: Pa
 fn quiet_note(text: impl Into<String>, p: Palette) -> El {
     label(text, META, p.muted).wrap().px(10.0).py(4.0)
 }
+
+/// One cell of the Brief header's pennant, in points.
+const PENNANT_CELL: f32 = 2.0;
 
 /// The Brief: a captain's standing instructions to Shina, beside its home conversation.
 pub(super) fn brief_panel(s: &State, p: Palette) -> El {
@@ -213,7 +219,30 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .grow(1.0)
                 .min_w(0.0)
                 .gap(1.0)
-                .child(label(&profile.name, CAPTAIN_SERIF, p.ink).truncate())
+                .child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            label(&profile.name, CAPTAIN_SERIF, p.ink)
+                                .truncate()
+                                .shrink()
+                                .min_w(0.0),
+                        )
+                        // The pennant from the home band, in the captain's tile colour, so the
+                        // colour over the horizon belongs to a named captain. Six by four cells
+                        // of 2 pt: whole device pixels at 1x and 2x.
+                        .child(
+                            el().key("brief-pennant")
+                                .size(PENNANT_CELL * 6.0, PENNANT_CELL * 4.0)
+                                .shape(super::scenery(&crate::horizon::pennant_rects(
+                                    s.dark,
+                                    crate::visuals::portrait_backdrop(profile.portrait),
+                                    PENNANT_CELL,
+                                )))
+                                .a11y_hidden(),
+                        ),
+                )
                 .child(label(role, META, p.muted).truncate()),
         );
     let mut body = col().key("brief-sections").pb(8.0);
@@ -260,6 +289,8 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         .min_h(0.0)
         .h_full()
         .child(header)
+        // The same closing rule as the chat header, so one line runs across the pane.
+        .child(rule(p).key("brief-header-rule"))
         .child(
             col()
                 .grow(1.0)
@@ -798,12 +829,13 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         let status = routine.last_status.to_lowercase();
         status.contains("fail") || status.contains("interrupted") || status.contains("error")
     };
+    // The corner dot says something only while the routine runs (sea) or its last run failed.
     let dot = if routine.running {
-        p.coral
+        Some(p.sea)
     } else if failed {
-        p.danger
+        Some(p.danger)
     } else {
-        p.muted.alpha(0.45)
+        None
     };
     let schedule = schedule_words(&routine.schedule);
     // The schedule is Inter; its state is a pixel status word beside it, 8 px apart.
@@ -818,6 +850,27 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         )
     };
     let line = format!("{schedule}, {state}");
+    let mut calendar = el()
+        .size(16.0, 16.0)
+        .mt(2.0)
+        .center()
+        .child(glyph_icon(&super::pixel_icons::CALENDAR, p.muted));
+    if let Some(dot) = dot {
+        // A panel-coloured square under the dot keeps it from smearing the glyph's lines.
+        calendar = calendar.child(
+            el().size(8.0, 8.0)
+                .fill(p.panel)
+                .center()
+                .pin(None, Some(-2.0), Some(-2.0), None)
+                .a11y_hidden()
+                .child(el().size(6.0, 6.0).fill(dot)),
+        );
+    }
+    let wash = hover_wash(s, p);
+    let backing = p.panel.mix(wash, wash.a);
+    // The switch sits on the title row. The schedule and the next run take the full width of the
+    // line under it, and delete shows over that line's end on hover or focus, as a memory's
+    // controls do.
     row()
         .key(format!("routine-{id}"))
         .label(format!(
@@ -827,36 +880,49 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         .px(10.0)
         .py(6.0)
         .gap(10.0)
-        .center_y()
         .radius(ROW_RADIUS)
         .hover(hover_wash(s, p))
         .hover_motion(motion(), motion())
-        .child(
-            el().size(16.0, 16.0)
-                .center()
-                .child(glyph_icon(&super::pixel_icons::CALENDAR, p.muted))
-                .child(
-                    el().size(6.0, 6.0)
-                        .fill(dot)
-                        .pin(None, Some(-1.0), Some(-1.0), None)
-                        .a11y_hidden(),
-                ),
-        )
+        .hover_group_focus()
+        .child(calendar)
         .child(
             col()
                 .grow(1.0)
                 .min_w(0.0)
-                .gap(1.0)
+                .gap(2.0)
                 .child(
-                    label(
-                        &routine.name,
-                        ROW_TEXT,
-                        if paused { p.muted } else { p.ink },
-                    )
-                    .truncate(),
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            label(
+                                &routine.name,
+                                ROW_TEXT,
+                                if paused { p.muted } else { p.ink },
+                            )
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                        )
+                        .child(switch(
+                            s,
+                            &format!("routine-pause-{id}"),
+                            &if paused {
+                                format!("Resume {}", routine.name)
+                            } else {
+                                format!("Pause {}", routine.name)
+                            },
+                            !paused,
+                            p,
+                            move |s| {
+                                let result = s.set_routine_paused(id, !paused);
+                                report(s, result);
+                            },
+                        )),
                 )
                 .child(
                     row()
+                        .key(format!("routine-meta-{id}"))
                         .gap(8.0)
                         .center_y()
                         .min_w(0.0)
@@ -873,32 +939,26 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
                         ),
                 ),
         )
-        .child(icon_action(
-            s,
-            format!("routine-delete-{id}"),
-            &format!("Delete {}", routine.name),
-            glyph_icon(&super::pixel_icons::TRASH, p.muted),
-            p,
-            move |s| {
-                let result = s.delete_routine(id);
-                report(s, result);
-            },
-        ))
-        .child(switch(
-            s,
-            &format!("routine-pause-{id}"),
-            &if paused {
-                format!("Resume {}", routine.name)
-            } else {
-                format!("Pause {}", routine.name)
-            },
-            !paused,
-            p,
-            move |s| {
-                let result = s.set_routine_paused(id, !paused);
-                report(s, result);
-            },
-        ))
+        .child(
+            row()
+                .key(format!("routine-actions-{id}"))
+                .pin(None, None, Some(8.0), Some(4.0))
+                .px(2.0)
+                .radius(ROW_RADIUS)
+                .fill(backing)
+                .child(icon_action(
+                    s,
+                    format!("routine-delete-{id}"),
+                    &format!("Delete {}", routine.name),
+                    glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                    p,
+                    move |s| {
+                        let result = s.delete_routine(id);
+                        report(s, result);
+                    },
+                ))
+                .group_opacity(0.0, 1.0),
+        )
 }
 
 fn routines_section(s: &State, p: Palette, captain: usize) -> El {
@@ -1173,7 +1233,11 @@ pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
         .min_w(0.0)
         .shrink()
         .opacity_motion(motion())
-        .child(icon("crescent", ink))
+        // The moon is for paused routines only. Work that runs on in the background gets the bolt.
+        .child(icon(
+            if detail.is_some() { "bolt" } else { "crescent" },
+            ink,
+        ))
         .child(super::pixel_text(word, ink).truncate().shrink().min_w(0.0));
     if let Some(detail) = detail {
         line = line.child(
@@ -1819,6 +1883,80 @@ mod tests {
             assert!(!rt.state.routines(0)[0].paused, "{width}");
             press(&mut rt, &format!("routine-delete-{routine}"));
             assert!(rt.state.routines(0).is_empty(), "{width}");
+        }
+    }
+
+    #[test]
+    fn a_switch_is_on_at_the_right_in_coral_and_off_at_the_left_in_both_themes() {
+        for dark in [false, true] {
+            let (mut rt, routine) = brief_runtime(1280.0);
+            rt.state.dark = dark;
+            rt.invalidate();
+            rt.frame(1.0);
+            let key = format!("routine-pause-{routine}");
+            let thumb_key = format!("{key}-thumb");
+            let offset = |rt: &Runtime<State>| {
+                let (track, _) = rt.presented(&key).unwrap();
+                let (thumb, _) = rt.presented(&thumb_key).unwrap();
+                thumb[0] - track[0]
+            };
+            // On: the routine runs, so the thumb sits at the right of its 34 px track.
+            let on = offset(&rt);
+            press(&mut rt, &key);
+            rt.frame(1.0);
+            rt.frame(2.0);
+            let off = offset(&rt);
+            assert!(on > off + 10.0, "dark {dark}: on {on}, off {off}");
+            assert!(
+                off < 8.0,
+                "dark {dark}: the off thumb is at the left ({off})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_routine_row_puts_the_switch_on_the_title_row_and_the_schedule_below() {
+        for width in WIDTHS {
+            let (rt, routine) = brief_runtime(width);
+            let (switch, _) = rt.presented(&format!("routine-pause-{routine}")).unwrap();
+            let (meta, _) = rt.presented(&format!("routine-meta-{routine}")).unwrap();
+            let (schedule, _) = rt
+                .presented(&format!("routine-schedule-{routine}"))
+                .unwrap();
+            assert!(
+                meta[1] >= switch[1] + switch[3] - 0.5,
+                "{width}: the schedule {meta:?} shares the switch's row {switch:?}"
+            );
+            assert!(inside(meta, schedule), "{width}: the schedule is cut");
+            // The delete button is an overlay: it takes no room in the row and shows on hover.
+            let (actions, _) = rt.presented(&format!("routine-actions-{routine}")).unwrap();
+            assert!(
+                actions[0] + actions[2] <= switch[0] + switch[2] + 10.0,
+                "{width}: {actions:?}"
+            );
+            assert!(rt.find(&format!("routine-delete-{routine}")).is_some());
+        }
+    }
+
+    #[test]
+    fn the_brief_header_has_the_same_rule_under_it_as_the_chat_header() {
+        for width in [960.0, 1280.0, 1920.0] {
+            let (rt, _) = brief_runtime(width);
+            let (rule, _) = rt.presented("brief-header-rule").unwrap();
+            let (panel, _) = rt.presented("captain-brief").unwrap();
+            assert!((rule[3] - 1.0).abs() < 0.1, "{width}: {rule:?}");
+            assert!(
+                (rule[2] - panel[2]).abs() < 1.0 && (rule[0] - panel[0]).abs() < 1.0,
+                "{width}: the rule {rule:?} spans the panel {panel:?}"
+            );
+            // It lines up with the chat header's rule, and the identity row sits below it.
+            let (chat, _) = rt.presented("chat-header-rule").unwrap();
+            assert!(
+                (rule[1] - chat[1]).abs() < 1.0,
+                "{width}: {rule:?} {chat:?}"
+            );
+            let (flag, _) = rt.presented("brief-pennant").unwrap();
+            assert!(flag[1] >= rule[1] + rule[3], "{width}: {flag:?} {rule:?}");
         }
     }
 

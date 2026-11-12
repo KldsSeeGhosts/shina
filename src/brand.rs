@@ -124,9 +124,9 @@ pub fn boat(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
     }
 }
 
-/// A distant sail, about a third of the boat's size, on a 7 by 8 grid: a mast, a mainsail, a
-/// jib and a hull in the boat's own colours. The keel is on row 7. Only the app draws it; the
-/// build script that shares this file does not.
+/// A distant sail, about a third of the boat's size, on a 7 by 7 grid: a mast, a mainsail, a
+/// jib and a single row of hull, so it sits hull-down on the horizon. The keel is on row 6. Only
+/// the app draws it; the build script that shares this file does not.
 #[allow(dead_code)]
 pub fn distant_sail(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
     let scene = if night { &NIGHT } else { &DAY };
@@ -143,9 +143,6 @@ pub fn distant_sail(night: bool, mut put: impl FnMut(usize, usize, Rgb)) {
     }
     for x in 0..=6 {
         put(x, 6, scene.hull);
-    }
-    for x in 1..=5 {
-        put(x, 7, scene.hull_shade);
     }
 }
 

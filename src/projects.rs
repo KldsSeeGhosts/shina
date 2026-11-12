@@ -457,6 +457,19 @@ pub fn redact(text: &str) -> String {
 
 /// Where a clone of `name` into `parent` goes, refusing anything git would refuse or that
 /// would mix the clone with existing files.
+/// `name` under `parent`, joined with the separator `parent` already uses. A path from a Windows
+/// machine keeps `\`, one from a Unix machine keeps `/`, whatever this machine is.
+pub fn join_like(parent: &Path, name: &str) -> PathBuf {
+    let text = parent.to_string_lossy();
+    let separator = if text.contains('\\') && !text.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    PathBuf::from(format!("{trimmed}{separator}{name}"))
+}
+
 pub fn destination(parent: &Path, name: &str) -> Result<PathBuf, String> {
     if !parent.is_dir() {
         return Err(format!(
@@ -718,7 +731,12 @@ impl Projects {
     /// A fixed list for headless renders.
     pub fn demo() -> Self {
         Self {
-            clone_parent: PathBuf::from(r"D:\AiStack"),
+            // A folder in the host's own form, so the demo never shows two separators.
+            clone_parent: PathBuf::from(if cfg!(windows) {
+                r"D:\AiStack"
+            } else {
+                "/Users/demo/Code"
+            }),
             ..Default::default()
         }
     }
@@ -773,6 +791,10 @@ impl State {
     pub fn clone_target(&self) -> Result<(Source, PathBuf), String> {
         let source = parse_source(&self.projects.clone_source.text)?;
         let name = source.folder_name()?;
+        if self.machines.selected != "local" {
+            // The parent is a path on another machine, so it keeps its own separator.
+            return Ok((source, join_like(&self.projects.clone_parent, &name)));
+        }
         Ok((source, self.projects.clone_parent.join(name)))
     }
     pub fn start_clone(&mut self) {
@@ -1248,6 +1270,20 @@ mod tests {
             Source::Url("https://tok@host/a/b".into()).display(),
             "https://host/a/b"
         );
+    }
+
+    #[test]
+    fn a_path_from_another_machine_keeps_its_own_separator() {
+        let joined = |parent: &str| {
+            join_like(Path::new(parent), "rune")
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(joined(r"D:\AiStack"), r"D:\AiStack\rune");
+        assert_eq!(joined(r"D:\AiStack\"), r"D:\AiStack\rune");
+        assert_eq!(joined("/home/kid/Code"), "/home/kid/Code/rune");
+        assert_eq!(joined("/home/kid/Code/"), "/home/kid/Code/rune");
+        assert_eq!(joined("C:/Users/kid"), "C:/Users/kid/rune");
     }
 
     #[test]
