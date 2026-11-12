@@ -389,13 +389,80 @@ impl Client {
             return Err("Claude cannot enforce Shina's blocking tool policy. Update Claude Code outside Shina.".into());
         }
         self.planning = data["current_permission_mode"] == "plan";
-        self.models = data["models"].as_array().into_iter().flatten().filter_map(|model| {
-            let id = model["value"].as_str()?;
-            Some(json!({"provider":"claude","id":id,
+        self.models =
+            data["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| {
+                    let id = model["value"].as_str()?;
+                    let manifest = crate::descriptors::claude_manifest_model_entry(id);
+                    let raw_levels: Vec<String> = model
+                        .get("supportedEffortLevels")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                    let capabilities =
+                        manifest
+                            .as_ref()
+                            .map(|m| m.capabilities.clone())
+                            .unwrap_or_else(|| {
+                                if raw_levels.is_empty() {
+                                    Default::default()
+                                } else {
+                                    crate::descriptors::ModelCapabilities {
+                                        option_descriptors: vec![
+                            crate::descriptors::ProviderOptionDescriptor::Select {
+                                id: "effort".into(),
+                                label: "Reasoning".into(),
+                                description: None,
+                                options: std::iter::once(crate::descriptors::ProviderOptionChoice {
+                                    id: "default".into(),
+                                    label: "Default".into(),
+                                    description: None,
+                                    is_default: true,
+                                })
+                                .chain(raw_levels.iter().map(|lvl| {
+                                    crate::descriptors::ProviderOptionChoice {
+                                        id: lvl.clone(),
+                                        label: lvl.clone(),
+                                        description: None,
+                                        is_default: false,
+                                    }
+                                }))
+                                .collect(),
+                                current_value: None,
+                                prompt_injected_values: vec![],
+                                role: Some(crate::descriptors::ProviderOptionRole::Reasoning),
+                            },
+                        ],
+                                    }
+                                }
+                            });
+                    let thinking_levels: Vec<String> = capabilities
+                        .option_descriptors
+                        .iter()
+                        .find(|d| d.id() == "effort")
+                        .map(|d| {
+                            crate::descriptors::selectable_provider_option_choices(d)
+                                .into_iter()
+                                .map(|c| c.id)
+                                .filter(|id| id != "default")
+                                .collect()
+                        })
+                        .unwrap_or(raw_levels);
+                    Some(json!({"provider":"claude","id":id,
                 "name":model["displayName"].as_str().unwrap_or(id),
-                "thinkingLevels":model.get("supportedEffortLevels").cloned().unwrap_or_else(||json!([])),
+                "shortName":manifest.as_ref().and_then(|m| m.short_name.clone()),
+                "aliases":manifest.as_ref().map(|m| m.aliases.clone()).unwrap_or_default(),
+                "isLegacy":manifest.as_ref().is_some_and(|m| m.is_legacy),
+                "thinkingLevels":thinking_levels,
+                "capabilities":capabilities,
                 "input":["text","image"]}))
-        }).collect();
+                })
+                .collect();
         // Documented CLI aliases supplement the live catalog, without invented effort levels.
         for alias in [
             "default",
@@ -407,9 +474,30 @@ impl Client {
             "sonnet[1m]",
         ] {
             if !self.models.iter().any(|m| m["id"] == alias) {
+                let manifest = crate::descriptors::claude_manifest_model_entry(alias);
+                let capabilities = manifest
+                    .as_ref()
+                    .map(|m| m.capabilities.clone())
+                    .unwrap_or_default();
+                let thinking_levels: Vec<String> = capabilities
+                    .option_descriptors
+                    .iter()
+                    .find(|d| d.id() == "effort")
+                    .map(|d| {
+                        crate::descriptors::selectable_provider_option_choices(d)
+                            .into_iter()
+                            .map(|c| c.id)
+                            .filter(|id| id != "default")
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.models
                     .push(json!({"provider":"claude","id":alias,"name":alias,
-                    "thinkingLevels":[],"input":["text","image"]}));
+                    "shortName":manifest.as_ref().and_then(|m| m.short_name.clone()),
+                    "isLegacy":manifest.as_ref().is_some_and(|m| m.is_legacy),
+                    "thinkingLevels":thinking_levels,
+                    "capabilities":capabilities,
+                    "input":["text","image"]}));
             }
         }
         self.model = self
@@ -1005,6 +1093,62 @@ impl Client {
                     self.reject(&record, "Choose an advertised Claude effort while idle.");
                 } else {
                     self.request(json!({"subtype":"apply_flag_settings","settings":{"effortLevel":record["level"]}}), record);
+                }
+            }
+            "set_option" => {
+                if self.running {
+                    self.reject(
+                        &record,
+                        "Wait for Claude to finish before changing options.",
+                    );
+                } else if let Some(option_id) = record["optionId"].as_str() {
+                    let val = &record["value"];
+                    match option_id {
+                        "effort" => {
+                            let effort = val.as_str().unwrap_or("");
+                            let mapped = match effort {
+                                "ultracode" => "xhigh",
+                                "ultrathink" => "",
+                                other => other,
+                            };
+                            self.request(
+                                json!({"subtype":"apply_flag_settings","settings":{"effortLevel":mapped}}),
+                                record,
+                            );
+                        }
+                        "fastMode" => {
+                            self.request(
+                                json!({"subtype":"apply_flag_settings","settings":{"fastMode":val}}),
+                                record,
+                            );
+                        }
+                        "ultracode" => {
+                            self.request(
+                                json!({"subtype":"apply_flag_settings","settings":{"ultracode":val}}),
+                                record,
+                            );
+                        }
+                        "thinking" => {
+                            self.request(
+                                json!({"subtype":"apply_flag_settings","settings":{"alwaysThinkingEnabled":val}}),
+                                record,
+                            );
+                        }
+                        "contextWindow" => {
+                            if let Some(base_id) = self.model["id"].as_str() {
+                                let base = base_id.strip_suffix("[1m]").unwrap_or(base_id);
+                                let api_id = if val.as_str() == Some("1m") {
+                                    format!("{base}[1m]")
+                                } else {
+                                    base.to_owned()
+                                };
+                                self.request(json!({"subtype":"set_model","model":api_id}), record);
+                            } else {
+                                self.reply(&record, json!({}));
+                            }
+                        }
+                        _ => self.reply(&record, json!({})),
+                    }
                 }
             }
             "set_access_mode" => {

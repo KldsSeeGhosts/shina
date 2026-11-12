@@ -40,6 +40,8 @@ pub struct AgentModel {
     pub is_legacy: bool,
     #[serde(default)]
     pub is_unavailable: bool,
+    #[serde(default)]
+    pub capabilities: crate::descriptors::ModelCapabilities,
 }
 
 impl AgentModel {
@@ -50,40 +52,133 @@ impl AgentModel {
         if model["provider"] != harness {
             return None;
         }
+        let id = model["id"].as_str()?;
+        let thinking_levels: Vec<String> = model["thinkingLevels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|level| level.as_str().map(str::to_owned))
+            .collect();
+        let service_tiers = model["serviceTiers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let parsed_caps: Option<crate::descriptors::ModelCapabilities> = model
+            .get("capabilities")
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .filter(|c: &crate::descriptors::ModelCapabilities| !c.option_descriptors.is_empty());
+        let manifest_claude = if harness == "claude" {
+            crate::descriptors::claude_manifest_model_entry(id)
+        } else {
+            None
+        };
+        let capabilities = if let Some(caps) = parsed_caps {
+            caps
+        } else if harness == "codex" {
+            if model.get("supportedReasoningEfforts").is_some() {
+                crate::descriptors::map_codex_model_capabilities(model, None)
+            } else {
+                let mut synthesized = serde_json::Map::new();
+                synthesized.insert("model".into(), serde_json::json!(id));
+                synthesized.insert(
+                    "supportedReasoningEfforts".into(),
+                    serde_json::json!(
+                        thinking_levels
+                            .iter()
+                            .map(|l| serde_json::json!({"reasoningEffort": l}))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                if let Some(d) = model.get("defaultReasoningEffort") {
+                    synthesized.insert("defaultReasoningEffort".into(), d.clone());
+                }
+                if !service_tiers.is_empty() {
+                    synthesized.insert("serviceTiers".into(), serde_json::json!(service_tiers));
+                }
+                if let Some(d) = model.get("defaultServiceTier") {
+                    synthesized.insert("defaultServiceTier".into(), d.clone());
+                }
+                crate::descriptors::map_codex_model_capabilities(&Value::Object(synthesized), None)
+            }
+        } else if let Some(entry) = &manifest_claude {
+            entry.capabilities.clone()
+        } else if harness == "claude" && !thinking_levels.is_empty() {
+            crate::descriptors::ModelCapabilities {
+                option_descriptors: vec![crate::descriptors::ProviderOptionDescriptor::Select {
+                    id: "effort".into(),
+                    label: "Reasoning".into(),
+                    description: None,
+                    options: std::iter::once(crate::descriptors::ProviderOptionChoice {
+                        id: "default".into(),
+                        label: "Default".into(),
+                        description: None,
+                        is_default: true,
+                    })
+                    .chain(thinking_levels.iter().map(|lvl| {
+                        crate::descriptors::ProviderOptionChoice {
+                            id: lvl.clone(),
+                            label: match lvl.as_str() {
+                                "low" => "Low".into(),
+                                "medium" => "Medium".into(),
+                                "high" => "High".into(),
+                                "xhigh" => "Extra High".into(),
+                                "max" => "Max".into(),
+                                other => other.to_owned(),
+                            },
+                            description: None,
+                            is_default: false,
+                        }
+                    }))
+                    .collect(),
+                    current_value: None,
+                    prompt_injected_values: vec![],
+                    role: Some(crate::descriptors::ProviderOptionRole::Reasoning),
+                }],
+            }
+        } else {
+            Default::default()
+        };
         Some(Self {
             provider: harness.into(),
-            id: model["id"].as_str()?.into(),
+            id: id.into(),
             name: model["name"]
                 .as_str()
                 .or_else(|| model["id"].as_str())?
                 .into(),
-            thinking_levels: model["thinkingLevels"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|level| level.as_str().map(str::to_owned))
-                .collect(),
+            thinking_levels,
             context_window: model["contextWindow"].as_u64().filter(|window| *window > 0),
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
-            service_tiers: model["serviceTiers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            short_name: model["shortName"].as_str().map(str::to_owned),
+            service_tiers,
+            short_name: model["shortName"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| manifest_claude.as_ref().and_then(|m| m.short_name.clone())),
             sub_provider: model["subProvider"].as_str().map(str::to_owned),
             aliases: model["aliases"]
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|a| a.as_str().map(str::to_owned))
-                .collect(),
-            badge: model["badge"].as_str().map(str::to_owned),
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    manifest_claude
+                        .as_ref()
+                        .map(|m| m.aliases.clone())
+                        .unwrap_or_default()
+                }),
+            badge: model["badge"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| manifest_claude.as_ref().and_then(|m| m.badge.clone())),
             is_default: model["isDefault"] == true,
             is_custom: model["isCustom"] == true,
-            is_legacy: model["isLegacy"] == true,
+            is_legacy: model["isLegacy"] == true
+                || manifest_claude.as_ref().is_some_and(|m| m.is_legacy),
             is_unavailable: model["isUnavailable"] == true,
+            capabilities,
         })
     }
     pub fn from_value(model: &Value) -> Option<Self> {
@@ -106,6 +201,7 @@ impl AgentModel {
         } else {
             vec!["off".into()]
         };
+        let capabilities = crate::descriptors::pi_model_capabilities(model, None);
         Some(Self {
             provider: "cpa".into(),
             id: id.into(),
@@ -132,6 +228,7 @@ impl AgentModel {
             is_custom: model["isCustom"] == true,
             is_legacy: model["isLegacy"] == true,
             is_unavailable: model["isUnavailable"] == true,
+            capabilities,
         })
     }
 }

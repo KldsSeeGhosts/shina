@@ -24,6 +24,8 @@ struct ThreadView {
     model_provider: String,
     model_id: String,
     thinking: String,
+    #[serde(default)]
+    model_options: Vec<crate::model_selection::ProviderOptionSelection>,
     models: Vec<AgentModel>,
     thinking_levels: Vec<String>,
     supports_images: Option<bool>,
@@ -126,6 +128,7 @@ impl ThreadView {
             model_provider: thread.model_provider.clone(),
             model_id: thread.model_id.clone(),
             thinking: thread.thinking.clone(),
+            model_options: thread.model_options.clone(),
             models: thread.models.clone(),
             thinking_levels: thread.thinking_levels.clone(),
             supports_images: thread.supports_images,
@@ -252,6 +255,7 @@ impl ThreadView {
         thread.model_provider = self.model_provider;
         thread.model_id = self.model_id;
         thread.thinking = self.thinking;
+        thread.model_options = self.model_options;
         thread.models = self.models;
         thread.thinking_levels = self.thinking_levels;
         thread.supports_images = self.supports_images;
@@ -2440,6 +2444,14 @@ impl State {
                 }
                 if let Some(tier) = args["serviceTier"].as_str() {
                     self.current_mut().set_service_tier(tier.into());
+                }
+                if !args["options"].is_null() {
+                    let opts: Vec<crate::model_selection::ProviderOptionSelection> =
+                        serde_json::from_value(args["options"].clone())
+                            .map_err(|e| format!("Invalid options: {e}"))?;
+                    for opt in opts {
+                        self.current_mut().set_option(opt.id, opt.value);
+                    }
                 }
                 if let Some(access) = args["access"].as_str() {
                     self.set_access_mode(AccessMode::parse(access).ok_or("Unknown access mode.")?);
@@ -4714,5 +4726,73 @@ mod tests {
         assert_eq!(retry.method, "catalog.refresh");
         assert_eq!(retry.params["force"], true);
         assert!(retry.params.get("modelCatalogOnly").is_none());
+    }
+
+    #[test]
+    fn model_options_gate_on_capability_and_fall_back_for_older_peers() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.select_thread(0);
+        while commands.try_recv().is_ok() {}
+        server.threads[0].harness = "claude".into();
+        server.threads[0].models = vec![crate::session::AgentModel {
+            provider: "claude".into(),
+            id: "claude-opus-5-5".into(),
+            name: "Claude Opus 5.5".into(),
+            thinking_levels: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+            capabilities: crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .map(|m| m.capabilities)
+                .unwrap_or_default(),
+            ..Default::default()
+        }];
+        server.threads[0].set_model("claude".into(), "claude-opus-5-5".into());
+        state.apply_projection(server.projection()).unwrap();
+
+        // Older peer without MODEL_OPTIONS falls back to `thinking` / `serviceTier` and refuses descriptor-only options.
+        assert!(!state.supports_model_options());
+        state.set_composer_option_sticky(
+            "effort".into(),
+            crate::model_selection::OptionValue::Str("high".into()),
+        );
+        let fallback_effort = commands.try_recv().unwrap();
+        assert_eq!(fallback_effort.method, "thread.configure");
+        assert_eq!(fallback_effort.params["thinking"], "high");
+        assert!(fallback_effort.params.get("options").is_none());
+
+        state.set_composer_option_sticky(
+            "serviceTier".into(),
+            crate::model_selection::OptionValue::Str("fast".into()),
+        );
+        let fallback_tier = commands.try_recv().unwrap();
+        assert_eq!(fallback_tier.method, "thread.configure");
+        assert_eq!(fallback_tier.params["serviceTier"], "fast");
+
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().error.is_some());
+
+        // Capable peer advertising MODEL_OPTIONS forwards descriptor `options` via thread.configure.
+        state.current_mut().error = None;
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_OPTIONS]});
+        assert!(state.supports_model_options());
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        let cmd = commands.try_recv().unwrap();
+        assert_eq!(cmd.method, "thread.configure");
+        assert_eq!(cmd.params["options"][0]["id"], "fastMode");
+        assert_eq!(cmd.params["options"][0]["value"], true);
+        server.execute_command(&cmd).unwrap();
+        assert_eq!(
+            server.threads[0].model_options,
+            vec![crate::model_selection::ProviderOptionSelection {
+                id: "fastMode".into(),
+                value: crate::model_selection::OptionValue::Bool(true),
+            }]
+        );
     }
 }

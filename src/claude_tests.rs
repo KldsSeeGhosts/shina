@@ -920,3 +920,37 @@ fn real_claude_pong_smoke() {
     );
     assert!(thread.messages.iter().any(|m| m.text.contains("PONG")));
 }
+
+#[test]
+fn claude_reports_manifest_descriptors_and_applies_options_and_1m_suffix() {
+    let mut client = client("full-access");
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "models": [
+                {"value": "claude-opus-5-5", "displayName": "Claude Opus 5.5", "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+                {"value": "claude-opus-4-6", "displayName": "Claude Opus 4.6", "supportedEffortLevels": ["low", "medium", "high", "max"]}
+            ]
+        }))
+        .unwrap();
+    let opus55 = client
+        .models
+        .iter()
+        .find(|m| m["id"] == "claude-opus-5-5")
+        .unwrap();
+    let ids: Vec<&str> = opus55["capabilities"]["optionDescriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["effort", "ultracode", "fastMode"]);
+    client
+        .command(json!({"type":"set_option","id":"o1","optionId":"fastMode","value":true}))
+        .unwrap();
+    let req = client.wire.last().unwrap();
+    assert_eq!(req["request"]["subtype"], "apply_flag_settings");
+    assert_eq!(req["request"]["settings"]["fastMode"], true);
+}

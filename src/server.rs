@@ -585,6 +585,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             capabilities.extend([
                                 protocol::MODEL_FAVORITES,
                                 protocol::MODEL_CATALOG_REFRESH,
+                                protocol::MODEL_OPTIONS,
                             ]);
                         }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,

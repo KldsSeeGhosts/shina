@@ -226,6 +226,10 @@ glyph!(
 );
 glyph!(DOT, r#"<path d="M8 8h8v8H8z"/>"#);
 glyph!(
+    WORKFLOW,
+    r#"<path d="M2 2h8v8H2zM14 2h8v8h-8zM14 14h8v8h-8zM4 4v4h4V4zM16 4v4h4V4zM16 16v4h4v-4zM10 5h4v2h-4zM5 10h2v8H5zM7 17h7v2H7z"/>"#
+);
+glyph!(
     STAR,
     r#"<path d="M10 2h4v4h-4zM8 6h8v2H8zM2 8h20v2H2zM4 10h16v2H4zM6 12h12v4H6zM4 16h6v4H4zM14 16h6v4h-6zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
 );
@@ -290,6 +294,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "copy" => &COPY,
         "star" => &STAR,
         "star-off" => &STAR_OFF,
+        "workflow" => &WORKFLOW,
         _ => &CHECK,
     }
 }

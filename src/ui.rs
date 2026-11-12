@@ -1155,7 +1155,7 @@ fn effort_name(level: &str) -> String {
 }
 
 /// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
-/// provider's mark, the model's name without its route, and the effort level.
+/// provider's mark, the model's name without its route, and descriptor-driven traits.
 fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
     let t = s.current();
     let (resolved_instance, resolved_model_id, resolved_opts) =
@@ -1174,13 +1174,56 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             )
         });
     let (name, _) = split_model_label(&t.model);
-    let resolved_thinking = resolved_opts
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let primary_is_prompt_controlled = descriptors
+        .iter()
+        .find(|d| {
+            matches!(
+                d,
+                crate::descriptors::ProviderOptionDescriptor::Select { .. }
+            )
+        })
+        .is_some_and(|d| match d {
+            crate::descriptors::ProviderOptionDescriptor::Select {
+                prompt_injected_values,
+                ..
+            } => !prompt_injected_values.is_empty(),
+            _ => false,
+        })
+        && prompt_ultrathink != crate::descriptors::PromptUltrathink::None;
+    let selection = crate::model_selection::ModelSelection {
+        instance_id: resolved_instance.clone(),
+        model: resolved_model_id.clone(),
+        options: resolved_opts.clone(),
+    };
+    let display = crate::descriptors::build_traits_trigger_display(
+        &descriptors,
+        primary_is_prompt_controlled,
+        Some(&selection),
+        None,
+    );
+    let fallback_thinking = resolved_opts
         .iter()
         .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
         .and_then(|o| o.value.as_str())
         .unwrap_or(&t.thinking);
-    let effort = effort_name(resolved_thinking);
-    let both_default = name == crate::model::DEFAULT_MODEL && resolved_thinking.is_empty();
+    let effort = if !display.label.is_empty() && controls.effort.is_some() {
+        display
+            .effort_label
+            .clone()
+            .unwrap_or_else(|| effort_name(fallback_thinking))
+    } else if primary_is_prompt_controlled {
+        "Ultrathink".into()
+    } else {
+        effort_name(fallback_thinking)
+    };
+    let both_default = name == crate::model::DEFAULT_MODEL
+        && fallback_thinking.is_empty()
+        && display.speed_label.is_none()
+        && !display.ultracode
+        && display.context_window.is_none();
     let mut trigger = row()
         .key("model-effort")
         .role("button")
@@ -1234,13 +1277,19 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
                 .truncate()
                 .shrink()
                 .min_w(0.0),
-        )
-        // "Default model" and a "Default" level say the same thing twice, so the level drops out.
-        .child(if both_default {
-            el()
-        } else {
-            pixel_text(effort, p.muted).truncate().shrink().min_w(0.0)
-        });
+        );
+    if !both_default {
+        trigger = trigger.child(pixel_text(effort, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if display.speed_label.is_some() {
+        trigger = trigger.child(icon("bolt", p.brass));
+    }
+    if display.ultracode {
+        trigger = trigger.child(icon("workflow", p.sea));
+    }
+    if let Some(cw) = &display.context_window {
+        trigger = trigger.child(pixel_text(cw, p.muted).truncate().shrink().min_w(0.0));
+    }
     if trigger_unavailable {
         trigger = trigger.child(outlined(
             pixel_text("Unavailable", p.muted)
@@ -1255,16 +1304,62 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
 
 const PICKER_WIDTH: f32 = 320.0;
 
-/// The model and reasoning popover. Its effort half is Codex's slider in Shina's colours; its
-/// model half drills into KSG Code's searchable, provider-grouped list in place.
+/// Ported from KSG Code's `ProviderModelPicker` + `ComposerModelEffort`: docked model list on
+/// the left, effort slider and descriptor options on the right, and speed/ultracode/permissions
+/// in the footer. Stacks vertically below 640 px.
 fn settings_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let is_model = s.settings_picker == Some(SettingsPicker::Model);
     let can_choose = !t.status.busy() && !t.configuring;
-    let width = if is_model {
-        360.0_f32.min((s.viewport_width - 16.0).max(280.0))
+    let stacked = s.viewport_width <= 640.0;
+    let width = if stacked {
+        (s.viewport_width - 16.0).clamp(280.0, 380.0)
     } else {
-        PICKER_WIDTH
+        544.0_f32.min((s.viewport_width - 16.0).max(320.0))
+    };
+    let list_max_h = if stacked { 180.0 } else { 296.0 };
+
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
+    let model_label = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
+        .map(|m| {
+            crate::model_picker::get_display_model_name(
+                &m.name,
+                m.short_name.as_deref(),
+                m.sub_provider.as_deref(),
+                true,
+            )
+        })
+        .unwrap_or_else(|| split_model_label(&t.model).0.to_owned());
+
+    let left_col = model_list(
+        s,
+        p,
+        can_choose,
+        list_max_h,
+        col().key("model-picker-list-col").grow(1.0).min_w(0.0),
+        is_model,
+    );
+    let right_col = effort_column(s, p, can_choose, stacked, &model_label, &controls);
+
+    let body = if stacked {
+        col()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(rule(p))
+            .child(right_col)
+    } else {
+        row()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(el().w(1.0).h_full().fill(p.line))
+            .child(right_col)
     };
     let mut card = col()
         .key("pi-settings-picker")
@@ -1279,15 +1374,8 @@ fn settings_picker(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
-        .on_press(|_: &mut State| {});
-    card = if is_model {
-        model_list(s, p, can_choose, 320.0, card)
-    } else {
-        card.child(effort_slider(t, s.thinking_drag, p, can_choose))
-            .child(service_tier_picker(t, p, can_choose))
-            .child(rule(p))
-            .child(model_row(s, p))
-    };
+        .on_press(|_: &mut State| {})
+        .child(body);
     if let Some(error) = &t.error {
         card = card.child(
             label(error, SMALL, p.danger)
@@ -1296,33 +1384,594 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 .pb(10.0),
         );
     }
-    if !is_model {
-        if t.harness == "pi"
-            && let Some(error) = &s.catalog.error
-        {
-            card = card.child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0));
-            card = card.child(
-                button("retry-catalog", "Retry", p, |s| s.force_refresh_catalog())
-                    .ml(10.0)
-                    .mb(8.0),
-            );
-        }
-        if let (_, Some(error)) = s.native_catalog_status(&t.harness) {
-            card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
-                SMALL, p.muted).key("native-catalog-error").wrap_anywhere().px(16.0).py(8.0));
-        }
-    }
     card = card
         .child(rule(p))
-        .child(composer_ui::permissions_section(s, p));
+        .child(composer_picker_footer(s, p, can_choose, &controls));
+    if let Some(open_id) = &s.open_option_menu
+        && let Some(
+            desc @ crate::descriptors::ProviderOptionDescriptor::Select {
+                id,
+                options,
+                current_value,
+                ..
+            },
+        ) = controls.others.iter().find(|d| d.id() == open_id)
+    {
+        let choices = crate::descriptors::selectable_provider_option_choices(desc);
+        let current_id = current_value
+            .as_deref()
+            .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+            .unwrap_or("");
+        let mut choice_col = col()
+            .key(format!("option-popup-{id}"))
+            .w(220.0)
+            .padding(4.0)
+            .gap(2.0)
+            .radius(6.0)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .box_shadow(hard_shadow(p));
+        for choice in choices {
+            let selected = choice.id == current_id;
+            let oid = id.clone();
+            let cid = choice.id.clone();
+            let mut crow = row()
+                .key(format!("option-choice-{id}-{}", choice.id))
+                .role("menuitemradio")
+                .checked(selected)
+                .focusable(can_choose)
+                .px(8.0)
+                .py(5.0)
+                .gap(6.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Str(cid.clone()),
+                    );
+                    s.open_option_menu = None;
+                })
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(label(&choice.label, SMALL, p.ink).truncate())
+                        .child(if let Some(d) = &choice.description {
+                            label(d, TextStyle::new(11.0, 400.0), p.muted).wrap()
+                        } else {
+                            el()
+                        }),
+                );
+            if choice.is_default {
+                crow = crow.child(pixel_text("Default", p.muted));
+            }
+            if selected {
+                crow = crow.child(icon("check", p.sea));
+            }
+            choice_col = choice_col.child(crow);
+        }
+        card = card.child(choice_col.anchored_fit(
+            format!("option-menu-{id}"),
+            if stacked {
+                rune::Side::Bottom
+            } else {
+                rune::Side::Right
+            },
+            rune::Align::Start,
+            6.0,
+        ));
+    }
     // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
     // layer draws over the page and shifts the card to stay inside the window.
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
             s.settings_picker = None;
+            s.open_option_menu = None;
             s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
         })
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerEffortColumn`).
+fn effort_column(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    stacked: bool,
+    model_label: &str,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let header_title = controls
+        .effort
+        .as_ref()
+        .map(|d| d.label().to_owned())
+        .unwrap_or_else(|| {
+            if controls.others.is_empty() {
+                "Effort".into()
+            } else {
+                "Options".into()
+            }
+        });
+
+    let mut column = col()
+        .key("model-picker-effort")
+        .w(if stacked { f32::NAN } else { 196.0 })
+        .w_full()
+        .shrink()
+        .min_w(0.0);
+    if !stacked {
+        column = column.w(196.0);
+    }
+    column = column
+        .child(
+            row()
+                .center_y()
+                .gap(8.0)
+                .px(12.0)
+                .py(10.0)
+                .child(label(&header_title, SMALL, p.muted))
+                .child(spacer())
+                .child(
+                    label(model_label, SMALL, p.muted)
+                        .key("effort-model-label")
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        )
+        .child(rule(p));
+
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let ultrathink_in_body = controls.effort.as_ref().is_some_and(|d| match d {
+        crate::descriptors::ProviderOptionDescriptor::Select {
+            prompt_injected_values,
+            ..
+        } => !prompt_injected_values.is_empty(),
+        _ => false,
+    }) && prompt_ultrathink == crate::descriptors::PromptUltrathink::Body;
+
+    let mut body = col()
+        .w_full()
+        .gap(4.0)
+        .pb(8.0)
+        .max_h(if stacked { 256.0 } else { 300.0 })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+
+    let mut rendered_effort = false;
+    match &controls.effort {
+        Some(crate::descriptors::ProviderOptionDescriptor::Select {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let choices = crate::descriptors::selectable_provider_option_choices(
+                controls.effort.as_ref().unwrap(),
+            );
+            let levels: Vec<String> = if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            };
+            let current = current_value
+                .clone()
+                .filter(|v| levels.iter().any(|l| l == v))
+                .unwrap_or_else(|| t.thinking.clone());
+            if ultrathink_in_body {
+                body = body.child(
+                    label(crate::descriptors::ULTRATHINK_IN_BODY_NOTE, SMALL, p.muted)
+                        .key("ultrathink-lock-note")
+                        .wrap()
+                        .px(12.0)
+                        .pt(8.0),
+                );
+            }
+            body = body.child(effort_slider_with_levels(
+                &levels,
+                &current,
+                s.thinking_drag,
+                p,
+                can_choose && !ultrathink_in_body,
+                desc_id,
+            ));
+            rendered_effort = true;
+        }
+        Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let on = *current_value == Some(true);
+            for (label_text, val) in [("On", true), ("Off", false)] {
+                let checked = on == val;
+                let oid = desc_id.clone();
+                body = body.child(
+                    row()
+                        .key(format!("effort-bool-{desc_id}-{val}"))
+                        .role("radio")
+                        .checked(checked)
+                        .focusable(can_choose)
+                        .disabled(!can_choose)
+                        .h(30.0)
+                        .mx(6.0)
+                        .px(8.0)
+                        .center_y()
+                        .radius(4.0)
+                        .fill(if checked {
+                            p.selected
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .hover(p.selected)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_press(move |s: &mut State| {
+                            s.set_composer_option_sticky(
+                                oid.clone(),
+                                crate::model_selection::OptionValue::Bool(val),
+                            );
+                        })
+                        .child(label(label_text, SMALL, p.ink).grow(1.0))
+                        .child(if checked { icon("check", p.sea) } else { el() }),
+                );
+            }
+            rendered_effort = true;
+        }
+        None if !t.thinking_levels.is_empty() => {
+            let fallback_id = match t.harness.as_str() {
+                "pi" => "thinking",
+                "codex" => "reasoningEffort",
+                _ => "effort",
+            };
+            body = body.child(effort_slider_with_levels(
+                &t.thinking_levels,
+                &t.thinking,
+                s.thinking_drag,
+                p,
+                can_choose,
+                fallback_id.into(),
+            ));
+            rendered_effort = true;
+        }
+        None => {}
+    }
+
+    if !rendered_effort && controls.others.is_empty() {
+        body = body.child(
+            label("No effort levels", SMALL, p.muted)
+                .key("no-effort-levels")
+                .px(12.0)
+                .py(10.0),
+        );
+    }
+
+    if !controls.others.is_empty() {
+        if rendered_effort {
+            body = body.child(rule(p).mx(8.0));
+        }
+        for desc in &controls.others {
+            match desc {
+                crate::descriptors::ProviderOptionDescriptor::Boolean {
+                    id,
+                    label: opt_label,
+                    current_value,
+                    ..
+                } => {
+                    let on = *current_value == Some(true);
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-switch-{id}"))
+                            .role("switch")
+                            .checked(on)
+                            .label(format!("{opt_label}: {}", if on { "On" } else { "Off" }))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(8.0)
+                            .center_y()
+                            .radius(4.0)
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                s.set_composer_option_sticky(
+                                    oid.clone(),
+                                    crate::model_selection::OptionValue::Bool(!on),
+                                );
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(label(
+                                        if on { "On" } else { "Off" },
+                                        TextStyle::new(13.0, 450.0),
+                                        p.ink,
+                                    )),
+                            )
+                            .child({
+                                let mut track = row()
+                                    .w(28.0)
+                                    .h(16.0)
+                                    .radius(8.0)
+                                    .padding(2.0)
+                                    .center_y()
+                                    .fill(if on { p.coral } else { p.line });
+                                if on {
+                                    track = track.justify_end();
+                                }
+                                track.child(el().size(12.0, 12.0).radius(6.0).fill(p.card))
+                            }),
+                    );
+                }
+                crate::descriptors::ProviderOptionDescriptor::Select {
+                    id,
+                    label: opt_label,
+                    options,
+                    current_value,
+                    ..
+                } => {
+                    let choices = crate::descriptors::selectable_provider_option_choices(desc);
+                    let current_id = current_value
+                        .as_deref()
+                        .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+                        .unwrap_or("");
+                    let current_label = choices
+                        .iter()
+                        .find(|c| c.id == current_id)
+                        .map(|c| c.label.as_str())
+                        .unwrap_or(current_id);
+                    let is_open = s.open_option_menu.as_deref() == Some(id.as_str());
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-menu-{id}"))
+                            .role("button")
+                            .label(format!("{opt_label}: {current_label}"))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(6.0)
+                            .center_y()
+                            .radius(4.0)
+                            .fill(if is_open {
+                                p.selected
+                            } else {
+                                Color::TRANSPARENT
+                            })
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                if s.open_option_menu.as_deref() == Some(oid.as_str()) {
+                                    s.open_option_menu = None;
+                                } else {
+                                    s.open_option_menu = Some(oid.clone());
+                                }
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(
+                                        label(current_label, TextStyle::new(13.0, 450.0), p.ink)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(icon(if is_open { "chevron" } else { "open" }, p.muted)),
+                    );
+                }
+            }
+        }
+    }
+
+    column.child(body)
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerPickerFooter`, `SpeedControl`, `UltracodeControl`).
+fn composer_picker_footer(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let mut footer = row()
+        .key("picker-footer")
+        .w_full()
+        .center_y()
+        .flex_wrap()
+        .gap(8.0)
+        .px(12.0)
+        .py(8.0);
+
+    // SpeedControl: serviceTier select descriptor, legacy model.service_tiers, or fastMode boolean
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Select {
+        options,
+        current_value,
+        ..
+    }) = &controls.speed_select
+    {
+        let selected = t.harness_state["serviceTier"]
+            .as_str()
+            .or_else(|| current_value.as_deref())
+            .unwrap_or("default");
+        let mut group = row()
+            .key("service-tier-picker")
+            .role("radiogroup")
+            .label("Service Tier")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line);
+        for (index, opt) in options.iter().enumerate() {
+            let on = selected == opt.id;
+            let oid = opt.id.clone();
+            let mut seg = row()
+                .key(format!("service-tier-{index}"))
+                .role("radio")
+                .label(&opt.label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(24.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if on { p.selected } else { Color::TRANSPARENT })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_service_tier_sticky(oid.clone());
+                });
+            if let Some(desc) = &opt.description {
+                seg = seg.help(desc);
+            }
+            if opt.label == "Fast" || opt.label == "Ultrafast" {
+                seg = seg.child(icon("bolt", if on { p.brass } else { p.muted }));
+            }
+            seg = seg.child(label(&opt.label, SMALL, if on { p.ink } else { p.muted }));
+            group = group.child(seg);
+        }
+        footer = footer.child(group);
+    } else if !t
+        .models
+        .iter()
+        .find(|m| m.id == t.model_id && m.provider == "codex")
+        .is_none_or(|m| m.service_tiers.is_empty())
+    {
+        footer = footer.child(service_tier_picker(t, p, can_choose));
+    } else if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        current_value,
+        ..
+    }) = &controls.fast_toggle
+    {
+        let is_fast = *current_value == Some(true);
+        let group = row()
+            .key("fast-mode-picker")
+            .role("radiogroup")
+            .label("Fast Mode")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line)
+            .child(
+                row()
+                    .key("fast-mode-off")
+                    .role("radio")
+                    .label("Standard")
+                    .checked(!is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if !is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(false),
+                        );
+                    })
+                    .child(label(
+                        "Standard",
+                        SMALL,
+                        if !is_fast { p.ink } else { p.muted },
+                    )),
+            )
+            .child(
+                row()
+                    .key("fast-mode-on")
+                    .role("radio")
+                    .label("Fast")
+                    .checked(is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(true),
+                        );
+                    })
+                    .child(icon("bolt", if is_fast { p.brass } else { p.muted }))
+                    .child(label("Fast", SMALL, if is_fast { p.ink } else { p.muted })),
+            );
+        footer = footer.child(group);
+    }
+
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        id,
+        label: ultra_label,
+        current_value,
+        ..
+    }) = &controls.ultracode_toggle
+    {
+        let on = *current_value == Some(true);
+        let oid = id.clone();
+        footer = footer.child(
+            row()
+                .key("ultracode-toggle")
+                .role("button")
+                .label(ultra_label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(28.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(6.0)
+                .fill(if on { p.selected } else { p.bg })
+                .border(1.0, p.line)
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Bool(!on),
+                    );
+                })
+                .child(icon("workflow", if on { p.sea } else { p.muted }))
+                .child(label(ultra_label, SMALL, if on { p.ink } else { p.muted })),
+        );
+    }
+
+    footer = footer.child(composer_ui::permissions_section(s, p));
+    footer
 }
 
 /// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
@@ -1456,10 +2105,17 @@ fn slider_curve(dragging: bool) -> rune::Curve {
     )
 }
 
-fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool) -> El {
-    let levels = t.thinking_levels.clone();
+fn effort_slider_with_levels(
+    levels: &[String],
+    active_level: &str,
+    dragging: Option<f32>,
+    p: Palette,
+    can_choose: bool,
+    option_id: String,
+) -> El {
+    let levels = levels.to_vec();
     let count = levels.len();
-    let current = levels.iter().position(|level| *level == t.thinking);
+    let current = levels.iter().position(|level| *level == active_level);
     // While held, the thumb follows the pointer and the title names the nearest level.
     let held = dragging.filter(|_| count > 1).map(|f| f.clamp(0.0, 1.0));
     let shown = held
@@ -1467,7 +2123,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .or(current);
     let title = shown
         .and_then(|index| levels.get(index))
-        .map_or_else(|| effort_name(&t.thinking), |level| effort_name(level));
+        .map_or_else(|| effort_name(active_level), |level| effort_name(level));
     let mut section = col()
         .key("effort-section")
         .px(16.0)
@@ -1509,7 +2165,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .key("effort-slider")
         .role("slider")
         .label("Reasoning effort")
-        .a11y_value(effort_name(&t.thinking))
+        .a11y_value(effort_name(active_level))
         .h(SLIDER_H)
         .w_full()
         .motion(rune::Spring::new(0.3, 0.0))
@@ -1605,6 +2261,9 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         let keyed = levels.clone();
         let dragged = levels.clone();
         let ends = levels.clone();
+        let oid_step = option_id.clone();
+        let oid_limit = option_id.clone();
+        let oid_drag = option_id;
         slider = slider
             // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
             .on_step(move |s: &mut State, delta, tx| {
@@ -1616,7 +2275,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 let next = (at + delta).clamp(0, last) as usize;
                 if next as i32 != at {
                     tx.motion_curve(slider_curve(false));
-                    s.set_composer_thinking_sticky(keyed[next].clone());
+                    s.set_composer_option_sticky(
+                        oid_step.clone(),
+                        crate::model_selection::OptionValue::Str(keyed[next].clone()),
+                    );
                 }
             })
             .on_step_limit(move |s: &mut State, max, tx| {
@@ -1625,7 +2287,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     && level != s.current().thinking
                 {
                     tx.motion_curve(slider_curve(false));
-                    s.set_composer_thinking_sticky(level);
+                    s.set_composer_option_sticky(
+                        oid_limit.clone(),
+                        crate::model_selection::OptionValue::Str(level),
+                    );
                 }
             })
             .on_drag(move |s: &mut State, drag, tx| {
@@ -1641,7 +2306,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     tx.motion_curve(slider_curve(false));
                     s.thinking_drag = None;
                     if dragged[index] != s.current().thinking {
-                        s.set_composer_thinking_sticky(dragged[index].clone());
+                        s.set_composer_option_sticky(
+                            oid_drag.clone(),
+                            crate::model_selection::OptionValue::Str(dragged[index].clone()),
+                        );
                     }
                 } else {
                     // A press glides to the pointer; a drag follows it closely.
@@ -1664,43 +2332,6 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 p.muted,
             )),
     )
-}
-
-fn model_row(s: &State, p: Palette) -> El {
-    let t = s.current();
-    let (name, route) = split_model_label(&t.model);
-    let mut text = col().gap(1.0).grow(1.0).min_w(0.0).child(
-        label(name, TextStyle::new(13.5, 500.0), p.ink)
-            .truncate()
-            .min_w(0.0),
-    );
-    if let Some(route) = route {
-        text = text.child(label(route, SMALL, p.muted).truncate().min_w(0.0));
-    }
-    row()
-        .key("open-model-list")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("Model: {}. Choose another model", t.model))
-        .focusable(true)
-        .center_y()
-        .gap(10.0)
-        .pl(16.0)
-        .pr(12.0)
-        .py(10.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(|s: &mut State| {
-            s.open_model_picker(SettingsPicker::Model);
-        })
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&t.model_id, &t.model),
-            18.0,
-        ))
-        .child(text)
-        .child(icon("open", p.muted))
 }
 
 struct PickerSnapshot {
@@ -1960,7 +2591,14 @@ fn picker_snapshot(s: &State) -> PickerSnapshot {
 }
 
 /// Ported from KSG Code's `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`, and `ModelListRow.tsx`.
-fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> El {
+fn model_list(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    max_h: f32,
+    card: El,
+    autofocus_search: bool,
+) -> El {
     use crate::model_picker::{
         ModelPickerTab, describe_unavailable_instance, get_display_model_name,
         get_provider_status_message, is_provider_instance_picker_ready, provider_model_key,
@@ -1970,64 +2608,52 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
     let snap = picker_snapshot(s);
     let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
 
-    let header = row()
-        .center_y()
-        .gap(8.0)
-        .px(12.0)
-        .py(10.0)
-        .child(icon_button(
-            "back-to-effort",
-            "Back to reasoning",
-            "back",
-            p,
-            |s| s.settings_picker = Some(SettingsPicker::Thinking),
-        ))
-        .child(
-            row()
-                .center_y()
-                .gap(6.0)
-                .h(30.0)
-                .px(10.0)
-                .radius(4.0)
-                .fill(p.selected)
-                .field_focus(&s.model_search, p)
-                .grow(1.0)
-                .min_w(0.0)
-                .child(icon("search", p.muted))
-                .child(
-                    text_input(&s.model_search, TextStyle::new(13.0, 420.0))
-                        .key("model-search")
-                        .label("Search models")
-                        .placeholder("Search models...", p.muted)
-                        .autofocus()
-                        .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .on_edit(|s: &mut State| &mut s.model_search)
-                        // Down from the search field goes into the list, as in KSG Code's
-                        // combobox; the list's own group takes the arrows from there.
-                        .on_input_key(|s: &mut State, event, tx| {
-                            if (event.mods.cmd || event.mods.ctrl || event.mods.alt)
-                                && crate::key(s, event, tx)
-                            {
-                                return true;
-                            }
-                            if matches!(event.key, rune::Key::Down)
-                                && !event.mods.cmd
-                                && !event.mods.ctrl
-                                && !event.mods.alt
-                                && !event.mods.shift
-                            {
-                                // The field's own focus flag would win over `tx.focus`.
-                                s.model_search.focused = false;
-                                tx.focus("model-list", true);
-                                return true;
-                            }
-                            false
-                        }),
-                ),
-        );
+    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+        .key("model-search")
+        .label("Search models")
+        .placeholder("Search models...", p.muted)
+        .color(p.ink)
+        .caret(p.coral, p.coral_bg)
+        .grow(1.0)
+        .min_w(0.0)
+        .on_edit(|s: &mut State| &mut s.model_search)
+        // Down from the search field goes into the list, as in KSG Code's
+        // combobox; the list's own group takes the arrows from there.
+        .on_input_key(|s: &mut State, event, tx| {
+            if (event.mods.cmd || event.mods.ctrl || event.mods.alt) && crate::key(s, event, tx) {
+                return true;
+            }
+            if matches!(event.key, rune::Key::Down)
+                && !event.mods.cmd
+                && !event.mods.ctrl
+                && !event.mods.alt
+                && !event.mods.shift
+            {
+                // The field's own focus flag would win over `tx.focus`.
+                s.model_search.focused = false;
+                tx.focus("model-list", true);
+                return true;
+            }
+            false
+        });
+    if autofocus_search {
+        search_field = search_field.autofocus();
+    }
+
+    let header = row().center_y().gap(8.0).px(12.0).py(10.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.model_search, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(search_field),
+    );
 
     let mut sidebar = col()
         .key("harness-group")
@@ -9642,11 +10268,27 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
         || t.configuring
         || t.archived()
         || t.request.is_some()
-        || t.thinking_levels.is_empty()
+        || crate::descriptors::read_prompt_ultrathink(&t.draft.text)
+            == crate::descriptors::PromptUltrathink::Body
     {
         return false;
     }
-    let levels = &t.thinking_levels;
+    let descriptors = state.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let levels = match &controls.effort {
+        Some(desc @ crate::descriptors::ProviderOptionDescriptor::Select { .. }) => {
+            let choices = crate::descriptors::selectable_provider_option_choices(desc);
+            if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            }
+        }
+        _ => t.thinking_levels.clone(),
+    };
+    if levels.is_empty() {
+        return false;
+    }
     let current = levels
         .iter()
         .position(|level| level == &t.thinking)
@@ -16489,8 +17131,6 @@ pub(crate) mod tests {
         assert!(rt.find("disconnect-pi").is_none());
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         assert!(rt.state.current().pi.is_none());
         assert_eq!(
@@ -16524,8 +17164,6 @@ pub(crate) mod tests {
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("pi-settings-picker").is_some());
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         let model = commands.try_recv().unwrap();
         assert_eq!(model["type"], "set_model");
@@ -16584,13 +17222,7 @@ pub(crate) mod tests {
                 card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
                 "popover leaves the window at {width}: {card:?}"
             );
-            press(&mut rt, "open-model-list");
-            rt.frame(2.0);
-            let (list, _) = rt.presented("pi-settings-picker").unwrap();
-            assert!(
-                list[1] >= 0.0,
-                "model list leaves the window at {width}: {list:?}"
-            );
+            assert!(rt.presented("model-list").is_some(), "{width}");
         }
     }
 
@@ -16602,8 +17234,6 @@ pub(crate) mod tests {
         rt.state.current_mut().models.clear();
         rt.frame(0.0);
         press(&mut rt, "model-effort");
-        rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("models-group").is_some());
         assert!(rt.find("models-empty-note").is_some());
@@ -16802,7 +17432,6 @@ pub(crate) mod tests {
             assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
 
             // Switch to gpt-5.6-sol and set effort=low
-            press(&mut rt, "open-model-list");
             rt.invalidate();
             rt.frame(0.2);
             press(&mut rt, "choose-model-1");
@@ -16812,7 +17441,6 @@ pub(crate) mod tests {
             assert_eq!(rt.state.current().thinking, "low");
 
             // Switch back to gpt-6-astra: remembered sticky options (high + fast) restore!
-            press(&mut rt, "open-model-list");
             rt.invalidate();
             rt.frame(0.4);
             press(&mut rt, "choose-model-0");
@@ -16913,6 +17541,179 @@ pub(crate) mod tests {
             // Clicking retry-catalog clears error and invokes force refresh
             press(&mut rt, "retry-catalog");
             assert!(rt.state.catalog.error.is_none());
+        }
+    }
+
+    #[test]
+    fn descriptor_driven_docked_picker_options_ultrathink_lock_and_footer_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            let opus_caps = crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .unwrap()
+                .capabilities;
+            let acp_caps = crate::descriptors::ModelCapabilities {
+                option_descriptors: crate::descriptors::acp_provider_option_descriptors(
+                    Some(&[
+                        json!({"id": "thought_level", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": "medium", "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
+                        json!({"id": "auto_approve", "name": "Auto-approve", "type": "boolean", "currentValue": false}),
+                    ]),
+                    Some(&json!({
+                        "currentModeId": "code",
+                        "availableModes": [
+                            {"id": "code", "name": "Code"},
+                            {"id": "plan", "name": "Plan"}
+                        ]
+                    })),
+                ),
+            };
+            rt.state.claude_catalog.models = vec![crate::session::AgentModel {
+                provider: "claude".into(),
+                id: "claude-opus-5-5".into(),
+                name: "Claude Opus 5.5".into(),
+                thinking_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                capabilities: opus_caps,
+                ..Default::default()
+            }];
+            rt.state.choose_harness("claude");
+            rt.state
+                .current_mut()
+                .set_model("claude".into(), "claude-opus-5-5".into());
+            rt.frame(0.0);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.05);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (list, _) = rt.presented("model-list").unwrap();
+            let (effort_col, _) = rt.presented("model-picker-effort").unwrap();
+            let (footer, _) = rt.presented("picker-footer").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+            if width > 640.0 {
+                assert!(
+                    effort_col[0] >= list[0] + list[2] - 1.0,
+                    "{width}: effort column sits beside list: {list:?} {effort_col:?}"
+                );
+            } else {
+                assert!(
+                    effort_col[1] >= list[1] + list[3] - 1.0,
+                    "{width}: effort column stacks below list: {list:?} {effort_col:?}"
+                );
+            }
+            assert!(
+                footer[1] >= effort_col[1] + effort_col[3] - 1.0,
+                "{width}: footer sits at bottom: {effort_col:?} {footer:?}"
+            );
+
+            // Fast/Standard and Ultracode controls exist in footer and toggle
+            assert!(rt.presented("fast-mode-picker").is_some(), "{width}");
+            assert!(rt.presented("ultracode-toggle").is_some(), "{width}");
+            press(&mut rt, "fast-mode-on");
+            press(&mut rt, "ultracode-toggle");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "fastMode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: fastMode enabled"
+            );
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "ultracode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: ultracode enabled"
+            );
+
+            // Typing "ultrathink" in prompt body locks effort slider and shows note
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("Please ultrathink about this");
+            rt.invalidate();
+            rt.frame(0.2);
+            assert!(rt.presented("ultrathink-lock-note").is_some(), "{width}");
+            assert_eq!(
+                find(&rt.accessibility_json(), "ultrathink-lock-note")
+                    .and_then(|n| n["name"].as_str()),
+                Some(crate::descriptors::ULTRATHINK_IN_BODY_NOTE),
+                "{width}"
+            );
+
+            // ACP model shows select and boolean option rows in effort column
+            rt.state.current_mut().draft.replace_text("");
+            rt.state.harnesses.agents = vec![crate::harness::Agent {
+                id: "devin".into(),
+                name: "Devin".into(),
+                command: "devin".into(),
+                args: vec![],
+                env: vec![],
+            }];
+            rt.state.choose_harness("devin");
+            rt.state.current_mut().draft_model_state = Default::default();
+            rt.state.current_mut().models = vec![crate::session::AgentModel {
+                provider: "devin".into(),
+                id: "fusion".into(),
+                name: "Fusion".into(),
+                thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                capabilities: acp_caps,
+                ..Default::default()
+            }];
+            rt.state
+                .current_mut()
+                .set_model("devin".into(), "fusion".into());
+            rt.invalidate();
+            rt.frame(0.3);
+            assert!(
+                rt.presented("option-menu-_t3/session-mode").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("option-switch-auto_approve").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "option-switch-auto_approve");
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "auto_approve"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}"
+            );
+            press(&mut rt, "option-menu-_t3/session-mode");
+            rt.invalidate();
+            rt.frame(0.5);
+            press(&mut rt, "option-choice-_t3/session-mode-plan");
+            rt.invalidate();
+            rt.frame(0.6);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "_t3/session-mode"
+                        && o.value == crate::model_selection::OptionValue::Str("plan".into())),
+                "{width}"
+            );
         }
     }
 

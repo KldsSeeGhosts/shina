@@ -93,6 +93,55 @@ impl Thread {
             options,
         })
     }
+
+    pub fn set_option(&mut self, id: String, value: crate::model_selection::OptionValue) {
+        if self.forward(
+            "thread.configure",
+            json!({"options": [{"id": id, "value": value}]}),
+        ) {
+            return;
+        }
+        if self.status.busy() || self.configuring {
+            return;
+        }
+        self.model_options.retain(|o| o.id != id);
+        self.model_options
+            .push(crate::model_selection::ProviderOptionSelection {
+                id: id.clone(),
+                value: value.clone(),
+            });
+        if matches!(
+            id.as_str(),
+            "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+        ) && let Some(level) = value.as_str()
+            && matches!(self.harness.as_str(), "pi" | "codex" | "claude")
+        {
+            self.selected_thinking = Some(level.to_owned());
+            if self.pi.is_none() || self.initializing {
+                self.thinking = level.to_owned();
+            } else if self.command("set_thinking_level", json!({"level": level})) {
+                self.configuring = true;
+                self.pending_thinking = Some(level.to_owned());
+            }
+            return;
+        }
+        if id == "serviceTier"
+            && let Some(tier) = value.as_str()
+        {
+            self.harness_state["serviceTier"] = json!(tier);
+            if self.harness == "codex" && self.pi.is_some() && !self.initializing {
+                self.command("set_service_tier", json!({"tier": tier}));
+            }
+            return;
+        }
+        if self.pi.is_some() && !self.initializing {
+            let val_json = match &value {
+                crate::model_selection::OptionValue::Bool(b) => json!(b),
+                crate::model_selection::OptionValue::Str(s) => json!(s),
+            };
+            self.command("set_option", json!({"optionId": id, "value": val_json}));
+        }
+    }
 }
 
 impl State {
@@ -647,6 +696,7 @@ impl State {
 
     pub fn open_model_picker(&mut self, picker: SettingsPicker) {
         self.settings_picker = Some(picker);
+        self.open_option_menu = None;
         self.thinking_drag = None;
         if picker == SettingsPicker::Model {
             self.model_search.replace_text("");
@@ -764,6 +814,10 @@ impl State {
             .get(&t.harness)
             .map(|s| s.options.clone())
             .unwrap_or_default();
+        for opt in &t.model_options {
+            opts.retain(|o| o.id != opt.id);
+            opts.push(opt.clone());
+        }
         let reasoning_id = if t.harness == "pi" {
             "thinking"
         } else if t.harness == "codex" {
@@ -812,35 +866,9 @@ impl State {
             instance_id.to_owned()
         };
         self.current_mut().set_model(provider, next.model.clone());
-        let reasoning_id = if instance_id == "pi" {
-            "thinking"
-        } else if instance_id == "codex" {
-            "reasoningEffort"
-        } else {
-            "effort"
-        };
-        if let Some(level) = next
-            .options
-            .iter()
-            .find(|o| {
-                o.id == reasoning_id
-                    || o.id == "effort"
-                    || o.id == "reasoningEffort"
-                    || o.id == "thinking"
-            })
-            .and_then(|o| o.value.as_str())
-            .map(str::to_owned)
-        {
-            self.current_mut().set_thinking(level);
-        }
-        if let Some(tier) = next
-            .options
-            .iter()
-            .find(|o| o.id == "serviceTier")
-            .and_then(|o| o.value.as_str())
-            .map(str::to_owned)
-        {
-            self.current_mut().set_service_tier(tier);
+        for opt in &next.options {
+            self.current_mut()
+                .set_option(opt.id.clone(), opt.value.clone());
         }
         self.current_mut().draft_model_state = draft_state;
         self.preferences.sticky_composer = sticky;
@@ -848,6 +876,15 @@ impl State {
     }
 
     pub fn set_composer_thinking_sticky(&mut self, level: String) {
+        let prompt_ultrathink =
+            crate::descriptors::read_prompt_ultrathink(&self.current().draft.text);
+        if prompt_ultrathink == crate::descriptors::PromptUltrathink::Body {
+            return;
+        }
+        if prompt_ultrathink == crate::descriptors::PromptUltrathink::Prefix {
+            let stripped = crate::descriptors::strip_ultrathink_prefix(&self.current().draft.text);
+            self.current_mut().draft.replace_text(&stripped);
+        }
         self.current_mut().set_thinking(level);
         let instance_id = self.current().harness.clone();
         let model = self.current().model_id.clone();
@@ -869,7 +906,58 @@ impl State {
     }
 
     pub fn set_composer_service_tier_sticky(&mut self, tier: String) {
-        self.current_mut().set_service_tier(tier);
+        self.set_composer_option_sticky(
+            "serviceTier".into(),
+            crate::model_selection::OptionValue::Str(tier),
+        );
+    }
+
+    pub fn supports_model_options(&self) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(&self.current().machine, crate::protocol::MODEL_OPTIONS)
+        })
+    }
+
+    pub fn set_composer_option_sticky(
+        &mut self,
+        id: String,
+        value: crate::model_selection::OptionValue,
+    ) {
+        let descriptors = self.active_model_descriptors();
+        let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+        let is_primary_reasoning = controls.effort.as_ref().is_some_and(|e| e.id() == id)
+            || matches!(
+                id.as_str(),
+                "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+            );
+        if self.current().remote.is_some() && !self.supports_model_options() {
+            if is_primary_reasoning && let Some(level) = value.as_str() {
+                self.set_composer_thinking_sticky(level.to_owned());
+            } else if id == "serviceTier"
+                && let Some(tier) = value.as_str()
+            {
+                self.current_mut().set_service_tier(tier.to_owned());
+            } else {
+                self.current_mut().error = Some(
+                    "This machine does not support model options yet. Update it to use this setting."
+                        .into(),
+                );
+            }
+            return;
+        }
+        if is_primary_reasoning {
+            let prompt_ultrathink =
+                crate::descriptors::read_prompt_ultrathink(&self.current().draft.text);
+            if prompt_ultrathink == crate::descriptors::PromptUltrathink::Body {
+                return;
+            }
+            if prompt_ultrathink == crate::descriptors::PromptUltrathink::Prefix {
+                let stripped =
+                    crate::descriptors::strip_ultrathink_prefix(&self.current().draft.text);
+                self.current_mut().draft.replace_text(&stripped);
+            }
+        }
+        self.current_mut().set_option(id, value);
         let instance_id = self.current().harness.clone();
         let model = self.current().model_id.clone();
         let opts = self.current_options_for_sticky();
@@ -887,6 +975,59 @@ impl State {
         self.current_mut().draft_model_state = draft_state;
         self.preferences.sticky_composer = sticky;
         self.checkpoint();
+    }
+
+    pub fn active_model_descriptors(&self) -> Vec<crate::descriptors::ProviderOptionDescriptor> {
+        let t = self.current();
+        let (resolved_instance, resolved_model_id, resolved_opts) =
+            self.resolved_composer_model_selection();
+        let provider = if resolved_instance == "pi" {
+            "cpa"
+        } else {
+            resolved_instance.as_str()
+        };
+        let mut models = if resolved_instance == t.harness && !t.models.is_empty() {
+            t.models.clone()
+        } else {
+            self.harness_models(&resolved_instance)
+        };
+        let mut caps = models
+            .iter_mut()
+            .find(|m| m.provider == provider && m.id == resolved_model_id)
+            .map(|m| m.capabilities.clone())
+            .unwrap_or_default();
+        if resolved_instance == "pi"
+            && resolved_instance == t.harness
+            && resolved_model_id == t.model_id
+            && !t.thinking_levels.is_empty()
+            && let Some(crate::descriptors::ProviderOptionDescriptor::Select { options, .. }) = caps
+                .option_descriptors
+                .iter_mut()
+                .find(|d| d.id() == "thinking")
+        {
+            let existing: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+            let live: Vec<&str> = t.thinking_levels.iter().map(String::as_str).collect();
+            if existing != live {
+                *options = t
+                    .thinking_levels
+                    .iter()
+                    .map(|lvl| crate::descriptors::ProviderOptionChoice {
+                        id: lvl.clone(),
+                        label: crate::descriptors::pi_thinking_label(lvl).into(),
+                        description: None,
+                        is_default: lvl == "medium",
+                    })
+                    .collect();
+            }
+        }
+        let mut selections =
+            crate::descriptors::with_implicit_fast_mode_default(&caps, Some(&resolved_opts));
+        for opt in &t.model_options {
+            if !selections.iter().any(|s| s.id == opt.id) {
+                selections.push(opt.clone());
+            }
+        }
+        crate::descriptors::get_provider_option_descriptors(&caps, &selections)
     }
 
     pub(super) fn apply_sticky_composer_to_draft(&mut self, index: usize) {

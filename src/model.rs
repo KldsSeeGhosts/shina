@@ -423,6 +423,7 @@ pub struct Thread {
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
     pub selected_thinking: Option<String>,
+    pub model_options: Vec<crate::model_selection::ProviderOptionSelection>,
     pub draft_model_state: crate::model_selection::DraftModelState,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
@@ -659,6 +660,7 @@ impl Thread {
             prewarm_attempted: false,
             selected_model: None,
             selected_thinking: None,
+            model_options: vec![],
             draft_model_state: Default::default(),
             startup_model_applied: false,
             startup_thinking_applied: false,
@@ -782,8 +784,11 @@ impl Thread {
             return;
         }
         self.attachment_error = None;
-        if self.model_id != model_id && self.harness == "codex" {
-            self.harness_state["serviceTier"] = Value::Null;
+        if self.model_id != model_id {
+            self.model_options.clear();
+            if self.harness == "codex" {
+                self.harness_state["serviceTier"] = Value::Null;
+            }
         }
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
@@ -1420,6 +1425,38 @@ impl Thread {
             self.reject_images(&prompt, index, error);
             return;
         }
+        let mut prompt = prompt;
+        if self.harness == "claude" {
+            let effort = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "effort")
+                .and_then(|o| o.value.as_str());
+            let caps = self
+                .models
+                .iter()
+                .find(|m| m.provider == self.model_provider && m.id == self.model_id)
+                .map(|m| m.capabilities.clone())
+                .unwrap_or_default();
+            let injected = crate::descriptors::resolve_prompt_injected_effort(&caps, effort);
+            prompt.text = crate::descriptors::apply_claude_prompt_effort_prefix(
+                &prompt.text,
+                injected.as_deref().or(effort),
+            );
+        }
+        if self.harness == "pi"
+            && let Some(tier) = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "serviceTier")
+                .and_then(|o| o.value.as_str())
+                .filter(|&t| t != "default" && !t.is_empty())
+        {
+            let _ = self.command(
+                "prompt",
+                json!({"message": format!("/shina-service-tier {tier}")}),
+            );
+        }
         let record = match attachments::prompt_record(&prompt, self.harness == "pi") {
             Ok(record) => record,
             Err(error) => {
@@ -1445,6 +1482,18 @@ impl Thread {
             .iter()
             .find(|m| m.provider == self.model_provider && m.id == self.model_id)
         {
+            if let Some(reasoning) = model
+                .capabilities
+                .option_descriptors
+                .iter()
+                .find(|d| crate::descriptors::is_reasoning_control(d))
+            {
+                let choices = crate::descriptors::selectable_provider_option_choices(reasoning);
+                if !choices.is_empty() {
+                    self.thinking_levels = choices.into_iter().map(|c| c.id).collect();
+                    return;
+                }
+            }
             self.thinking_levels = model.thinking_levels.clone();
         }
     }
@@ -1640,6 +1689,16 @@ impl Thread {
                     self.harness_context_sent = record["value"] == true;
                 } else if let Some(field) = record["field"].as_str() {
                     self.harness_state[field] = record["value"].clone();
+                    if field == "optionDescriptors"
+                        && let Ok(descriptors) = serde_json::from_value::<
+                            Vec<crate::descriptors::ProviderOptionDescriptor>,
+                        >(record["value"].clone())
+                    {
+                        for model in &mut self.models {
+                            model.capabilities.option_descriptors = descriptors.clone();
+                        }
+                        self.refresh_thinking_levels();
+                    }
                     if matches!(field, "plan" | "plan_update") {
                         self.record_plan(&record["value"]);
                     }
@@ -2599,6 +2658,7 @@ pub struct State {
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
     pub settings_picker: Option<SettingsPicker>,
+    pub open_option_menu: Option<String>,
     pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
     pub expanded_legacy_instances: std::collections::HashSet<String>,
     pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
@@ -2795,6 +2855,7 @@ impl State {
             captain_editor: None,
             brief: BriefUi::default(),
             settings_picker: None,
+            open_option_menu: None,
             model_picker_tab: None,
             expanded_legacy_instances: Default::default(),
             model_favorites: None,
@@ -5926,7 +5987,7 @@ impl State {
         }
         if !self.demo && self.runtime_enabled {
             self.catalog
-                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
+                .refresh(self.data_dir.clone(), self.wake.clone());
         }
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
@@ -6540,6 +6601,13 @@ impl State {
                         thread.model = model.into();
                     }
                     thread.selected_thinking = record["thinking"].as_str().map(str::to_owned);
+                    if let Some(options) = record.get("options")
+                        && let Ok(parsed) = serde_json::from_value::<
+                            Vec<crate::model_selection::ProviderOptionSelection>,
+                        >(options.clone())
+                    {
+                        thread.model_options = parsed;
+                    }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
                     }
@@ -7147,6 +7215,7 @@ impl State {
                 "peerOrigin":thread.peer_origin,"stopSerial":thread.stop_serial,
                 "project":thread.project, "machine":thread.machine, "updated":thread.updated,
                 "model":thread.selected_model.as_ref().map(|(_, id)|id), "thinking":thread.selected_thinking,
+                "options":thread.model_options,
                 "serviceTier":thread.harness_state["serviceTier"]
                 }).as_object().unwrap().clone());
                 record

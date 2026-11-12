@@ -487,6 +487,27 @@ impl Client {
                         .filter(|m| m["hidden"] != true)
                         .filter_map(model_value)
                         .collect();
+                    let preferred = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]
+                        .iter()
+                        .find_map(|target| {
+                            self.models
+                                .iter()
+                                .find(|m| {
+                                    let id = m["id"].as_str().unwrap_or("");
+                                    let fam = id
+                                        .strip_prefix("openai.")
+                                        .filter(|s| s.starts_with("gpt-"))
+                                        .unwrap_or(id);
+                                    fam == *target
+                                })
+                                .and_then(|m| m["id"].as_str())
+                                .map(str::to_owned)
+                        });
+                    if let Some(preferred_slug) = preferred {
+                        for m in &mut self.models {
+                            m["isDefault"] = json!(m["id"] == preferred_slug);
+                        }
+                    }
                     if self.ready && self.probe.is_none() {
                         if let Some(model) = self
                             .models
@@ -1169,6 +1190,21 @@ impl Client {
                     self.reply(&record, json!({"thinkingLevel":self.effort}));
                 }
             }
+            "set_option" => match record["optionId"].as_str() {
+                Some("reasoningEffort") => {
+                    let mut synth = record.clone();
+                    synth["type"] = json!("set_thinking_level");
+                    synth["level"] = record["value"].clone();
+                    return self.command(synth);
+                }
+                Some("serviceTier") => {
+                    let mut synth = record.clone();
+                    synth["type"] = json!("set_service_tier");
+                    synth["tier"] = record["value"].clone();
+                    return self.command(synth);
+                }
+                _ => self.reply(&record, json!({})),
+            },
             _ => self.reject(&record, format!("Codex does not support {kind} in Shina.")),
         }
         Ok(())
@@ -1944,11 +1980,14 @@ fn model_value(model: &Value) -> Option<Value> {
         .flatten()
         .filter_map(|level| level["reasoningEffort"].as_str())
         .collect();
+    let capabilities = crate::descriptors::map_codex_model_capabilities(model, None);
     Some(
         json!({"provider":"codex","id":id,"name":model["displayName"].as_str().unwrap_or(id),
         "thinkingLevels":levels,"input":model.get("inputModalities").cloned().unwrap_or_else(||json!(["text","image"])),
         "contextWindow":model["contextWindow"],"serviceTiers":service_tiers(model),
-        "defaultServiceTier":model["defaultServiceTier"]}),
+        "defaultServiceTier":model["defaultServiceTier"],
+        "isDefault":model["isDefault"] == true,
+        "capabilities":capabilities}),
     )
 }
 

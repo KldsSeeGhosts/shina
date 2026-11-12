@@ -18,6 +18,7 @@ mod composer_tokens;
 mod context;
 mod crisp;
 mod database;
+mod descriptors;
 mod fleet_update;
 mod harness;
 mod history;

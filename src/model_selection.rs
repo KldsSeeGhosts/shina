@@ -23,6 +23,13 @@ impl OptionValue {
             Self::Bool(_) => None,
         }
     }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            Self::Str(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +468,7 @@ pub fn derive_effective_composer_model_state(
     }
 }
 
+#[cfg(test)]
 fn canonical_options(sel: &ModelSelection) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = sel
         .options
@@ -477,12 +485,14 @@ fn canonical_options(sel: &ModelSelection) -> Vec<(String, String)> {
     pairs
 }
 
+#[cfg(test)]
 pub fn model_selections_equal(left: &ModelSelection, right: &ModelSelection) -> bool {
     left.instance_id == right.instance_id
         && left.model == right.model
         && canonical_options(left) == canonical_options(right)
 }
 
+#[cfg(test)]
 /// Ported from `packages/shared/src/model.ts` (`draftModelPickMatchesThread`).
 pub fn draft_model_pick_matches_thread(pick: &ModelSelection, thread: &ModelSelection) -> bool {
     let strip_fast_off = |sel: &ModelSelection| ModelSelection {
