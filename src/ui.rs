@@ -1302,7 +1302,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
         {
             card = card.child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0));
             card = card.child(
-                button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
+                button("retry-catalog", "Retry", p, |s| s.force_refresh_catalog())
                     .ml(10.0)
                     .mb(8.0),
             );
@@ -2346,13 +2346,18 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         ModelPickerTab::Instance(id) => Some(id.as_str()),
         ModelPickerTab::Favorites => None,
     };
+    let active_harness = selected_id.unwrap_or(&t.harness);
+    let (pi_loading, pi_error) = if active_harness == "pi" {
+        s.pi_catalog_status()
+    } else {
+        (false, None)
+    };
+    let (native_loading, native_error) = s.native_catalog_status(active_harness);
+    let catalog_loading =
+        pi_loading || (matches!(active_harness, "codex" | "claude") && native_loading);
+    let catalog_error = pi_error.or(native_error);
 
     if snap.visible_models.is_empty() && snap.setup_entries.is_empty() {
-        let active_harness = selected_id.unwrap_or(&t.harness);
-        let pi_error = (active_harness == "pi")
-            .then_some(s.catalog.error.as_deref())
-            .flatten();
-        let (native_loading, native_error) = s.native_catalog_status(active_harness);
         let empty_text = if snap.is_searching {
             "No models found"
         } else if snap.selected_tab == ModelPickerTab::Favorites {
@@ -2406,7 +2411,7 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 label(
                     empty_text,
                     SMALL,
-                    if pi_error.is_some() || native_error.is_some() {
+                    if catalog_error.is_some() {
                         p.danger
                     } else {
                         p.muted
@@ -2417,9 +2422,9 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
                 .px(16.0)
                 .py(10.0),
             );
-        if pi_error.is_some() || native_error.is_some() {
+        if catalog_error.is_some() {
             list = list.child(
-                button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
+                button("retry-catalog", "Retry", p, |s| s.force_refresh_catalog())
                     .ml(12.0)
                     .mb(8.0),
             );
@@ -2432,6 +2437,29 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         .child(header)
         .child(rule(p))
         .child(list);
+
+    if catalog_loading && !snap.visible_models.is_empty() {
+        right_col = right_col.child(rule(p)).child(
+            label("Refreshing models...", SMALL, p.muted)
+                .key("catalog-loading")
+                .px(12.0)
+                .py(6.0),
+        );
+    }
+    if let Some(error) = catalog_error
+        && !snap.visible_models.is_empty()
+    {
+        right_col = right_col.child(rule(p)).child(
+            col()
+                .gap(4.0)
+                .px(12.0)
+                .py(6.0)
+                .child(label(error, SMALL, p.danger).wrap_anywhere())
+                .child(button("retry-catalog", "Retry", p, |s| {
+                    s.force_refresh_catalog()
+                })),
+        );
+    }
 
     if !snap.setup_entries.is_empty() {
         let mut setup_box = col()
@@ -16829,6 +16857,62 @@ pub(crate) mod tests {
                 "fast",
                 "{width}"
             );
+        }
+    }
+
+    #[test]
+    fn model_picker_refresh_on_open_loading_error_and_retry_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            // Loading state while cached models exist shows refreshing indicator inside card
+            rt.state.catalog.models = vec![crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "gpt-6-astra".into(),
+                name: "GPT-6 Astra".into(),
+                ..Default::default()
+            }];
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.state.catalog.set_loading_for_test(true);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (loading, _) = rt
+                .presented("catalog-loading")
+                .expect("catalog-loading shown while refreshing");
+            assert!(
+                loading[0] >= card[0] && loading[0] + loading[2] <= card[0] + card[2] + 0.5,
+                "{width}: {loading:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Refreshing models...")
+            );
+
+            // Error state alongside cached models still exposes retry-catalog and error message
+            rt.state.catalog.set_loading_for_test(false);
+            rt.state.catalog.error = Some("CPA gateway unreachable.".into());
+            rt.invalidate();
+            rt.frame(0.1);
+            let (retry, _) = rt
+                .presented("retry-catalog")
+                .expect("retry-catalog shown on error");
+            assert!(
+                retry[0] >= card[0] && retry[0] + retry[2] <= card[0] + card[2] + 0.5,
+                "{width}: {retry:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("CPA gateway unreachable.")
+            );
+
+            // Clicking retry-catalog clears error and invokes force refresh
+            press(&mut rt, "retry-catalog");
+            assert!(rt.state.catalog.error.is_none());
         }
     }
 

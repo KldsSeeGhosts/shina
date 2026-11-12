@@ -10,6 +10,7 @@ use std::{
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
+const CATALOG_RETRY_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentModel {
@@ -155,6 +156,8 @@ pub struct NativeCatalog {
     models_loaded: bool,
     commands_loaded: bool,
     started: Option<Instant>,
+    loaded: Option<Instant>,
+    last_attempt: Option<Instant>,
 }
 
 impl NativeCatalog {
@@ -172,11 +175,32 @@ impl NativeCatalog {
         if self.pi.is_some() {
             return;
         }
+        let now = Instant::now();
         let changed = self.cwd.as_ref() != Some(&workspace);
-        if !force && self.attempted && (!changed || self.error.is_some()) {
-            return;
+        if !force {
+            if self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_TTL)
+                && !changed
+            {
+                return;
+            }
+            if self.error.is_some()
+                && self
+                    .last_attempt
+                    .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_RETRY_TTL)
+            {
+                return;
+            }
+            if self.attempted && !changed && self.loaded.is_none() && self.error.is_none() {
+                return;
+            }
         }
-        let models = force || !self.attempted;
+        let models = force
+            || !self.attempted
+            || self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) >= CATALOG_TTL);
         self.attempted = true;
         self.revision += 1;
         self.cwd = Some(workspace.clone());
@@ -185,7 +209,8 @@ impl NativeCatalog {
         self.models_loaded = !models;
         self.complete = false;
         self.error = None;
-        self.started = Some(Instant::now());
+        self.started = Some(now);
+        self.last_attempt = Some(now);
         let result = match harness {
             "codex" => crate::codex::discover(workspace, wake, models),
             "claude" => crate::claude::discover(workspace, wake),
@@ -243,6 +268,7 @@ impl NativeCatalog {
                     if self.models_loaded && self.commands_loaded {
                         self.pi = None;
                         self.started = None;
+                        self.loaded = Some(Instant::now());
                         self.complete = true;
                         self.revision += 1;
                         break;
@@ -287,27 +313,71 @@ pub struct Catalog {
     pi: Option<Pi>,
     started: Option<Instant>,
     loaded: Option<Instant>,
+    last_attempt: Option<Instant>,
     state_loaded: bool,
     models_loaded: bool,
 }
 
 impl Catalog {
+    pub fn loading(&self) -> bool {
+        self.pi.is_some()
+    }
+
     pub fn remaining(&self) -> Option<Duration> {
         self.started
             .map(|at| START_TIMEOUT.saturating_sub(at.elapsed()))
     }
 
-    pub fn refresh(&mut self, workspace: PathBuf, wake: Waker) {
-        if self.pi.is_some()
-            || (self.error.is_none() && self.loaded.is_some_and(|at| at.elapsed() < CATALOG_TTL))
+    pub fn should_refresh(&self, force: bool, now: Instant) -> bool {
+        if self.pi.is_some() {
+            return false;
+        }
+        if force {
+            return true;
+        }
+        if self.error.is_none()
+            && self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_TTL)
         {
+            return false;
+        }
+        if self
+            .last_attempt
+            .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_RETRY_TTL)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub fn refresh(&mut self, workspace: PathBuf, wake: Waker) {
+        self.refresh_with_mode(workspace, wake, false);
+    }
+
+    pub fn refresh_with_mode(&mut self, workspace: PathBuf, wake: Waker, force: bool) {
+        let now = Instant::now();
+        if !self.should_refresh(force, now) {
             return;
         }
         self.error = None;
         self.state_loaded = false;
         self.models_loaded = false;
-        self.started = Some(Instant::now());
+        self.started = Some(now);
+        self.last_attempt = Some(now);
         self.pi = Some(Pi::discover(workspace, wake));
+    }
+
+    #[cfg(test)]
+    pub fn set_loading_for_test(&mut self, loading: bool) {
+        if loading {
+            let (pi, _, _) = Pi::test_connection();
+            self.pi = Some(pi);
+            self.started = Some(Instant::now());
+        } else {
+            self.pi = None;
+            self.started = None;
+        }
     }
 
     pub fn poll(&mut self) -> bool {
@@ -509,5 +579,36 @@ mod tests {
         assert!(catalog.pi.is_none());
         assert_eq!(catalog.models[0].id, "cached");
         assert!(catalog.remaining().is_none());
+    }
+
+    #[test]
+    fn catalog_on_demand_throttles_success_and_failure_while_force_bypasses_backoff() {
+        let now = Instant::now();
+        let mut catalog = Catalog::default();
+        // Recently loaded within 5 minutes -> on-demand should skip
+        catalog.loaded = Some(now - Duration::from_secs(60));
+        assert!(!catalog.should_refresh(false, now));
+        assert!(catalog.should_refresh(true, now));
+
+        // Stale > 5 minutes -> on-demand should refresh
+        catalog.loaded = Some(now - Duration::from_secs(301));
+        assert!(catalog.should_refresh(false, now));
+
+        // Failed within 5 minutes -> on-demand backs off, force retries immediately
+        catalog.loaded = None;
+        catalog.error = Some("Offline".into());
+        catalog.last_attempt = Some(now - Duration::from_secs(60));
+        assert!(!catalog.should_refresh(false, now));
+        assert!(catalog.should_refresh(true, now));
+
+        // Failed > 5 minutes ago -> on-demand may retry
+        catalog.last_attempt = Some(now - Duration::from_secs(301));
+        assert!(catalog.should_refresh(false, now));
+
+        // Single-flight: in-flight probe blocks both on-demand and force
+        let (pi, _, _) = Pi::test_connection();
+        catalog.pi = Some(pi);
+        assert!(!catalog.should_refresh(false, now));
+        assert!(!catalog.should_refresh(true, now));
     }
 }

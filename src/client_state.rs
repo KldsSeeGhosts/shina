@@ -725,6 +725,7 @@ impl State {
         }
         json!({
             "index":index,"threads":self.thread_views(),"recoveryNotice":self.recovery_notice,
+            "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error},
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
@@ -2724,7 +2725,15 @@ impl State {
                 }
             }
             "project.cancelClone" => self.close_clone_dialog(),
-            "catalog.refresh" => self.refresh_catalog(),
+            "catalog.refresh" => {
+                if args["modelCatalogOnly"] == true {
+                    self.refresh_catalog_on_open();
+                } else if args["force"] == true {
+                    self.force_refresh_catalog();
+                } else {
+                    self.refresh_catalog();
+                }
+            }
             "commands.refresh" => {
                 if self.current().pi.is_none()
                     && self.current().error.is_none()
@@ -4679,5 +4688,31 @@ mod tests {
         server.execute_command(&add_cmd).unwrap();
         state.apply_projection(server.projection()).unwrap();
         assert_eq!(state.effective_model_favorites().len(), 2);
+    }
+
+    #[test]
+    fn catalog_refresh_on_open_gates_on_capability_and_sends_model_catalog_only() {
+        let (mut state, mut server, mut commands) = tab_client();
+        // Older peer without MODEL_CATALOG_REFRESH: opening picker skips modelCatalogOnly RPC.
+        assert!(!state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        assert!(commands.try_recv().is_err());
+
+        // Capable peer: opening picker sends catalog.refresh { modelCatalogOnly: true }.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_CATALOG_REFRESH]});
+        assert!(state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        let on_open = commands.try_recv().unwrap();
+        assert_eq!(on_open.method, "catalog.refresh");
+        assert_eq!(on_open.params["modelCatalogOnly"], true);
+        server.execute_command(&on_open).unwrap();
+
+        // Explicit retry-catalog sends catalog.refresh { force: true } (not modelCatalogOnly).
+        state.force_refresh_catalog();
+        let retry = commands.try_recv().unwrap();
+        assert_eq!(retry.method, "catalog.refresh");
+        assert_eq!(retry.params["force"], true);
+        assert!(retry.params.get("modelCatalogOnly").is_none());
     }
 }

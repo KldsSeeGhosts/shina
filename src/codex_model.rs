@@ -96,6 +96,19 @@ impl Thread {
 }
 
 impl State {
+    pub(crate) fn pi_catalog_status(&self) -> (bool, Option<&str>) {
+        if self.client.is_some() {
+            let catalog = &self.client_views["catalog"];
+            return (
+                catalog["loading"] == true || self.catalog.loading(),
+                self.catalog
+                    .error
+                    .as_deref()
+                    .or_else(|| catalog["error"].as_str()),
+            );
+        }
+        (self.catalog.loading(), self.catalog.error.as_deref())
+    }
     pub(crate) fn native_catalog_status(&self, harness: &str) -> (bool, Option<&str>) {
         if self.client.is_some() {
             let catalog = &self.client_views["nativeCatalogs"][harness];
@@ -665,7 +678,7 @@ impl State {
                 self.expanded_legacy_instances.insert(active_instance);
             }
         }
-        self.refresh_catalog();
+        self.refresh_catalog_on_open();
     }
 
     pub fn project_default_model_selection(

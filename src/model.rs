@@ -5926,7 +5926,61 @@ impl State {
         }
         if !self.demo && self.runtime_enabled {
             self.catalog
-                .refresh(self.data_dir.clone(), self.wake.clone());
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    pub fn supports_model_catalog_refresh(&self) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(
+                &self.machines.selected,
+                crate::protocol::MODEL_CATALOG_REFRESH,
+            )
+        })
+    }
+
+    /// Ported from KSG Code's `ProviderModelPicker.tsx`: opening the picker refreshes the model
+    /// catalog through the capability-gated `modelCatalogOnly` path, throttled by 5 minutes.
+    pub fn refresh_catalog_on_open(&mut self) {
+        if self.client.is_some() {
+            if !self.supports_model_catalog_refresh() {
+                return;
+            }
+            self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(false);
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    /// Explicit retry button bypasses the on-demand throttle and retry backoff.
+    pub fn force_refresh_catalog(&mut self) {
+        self.catalog.error = None;
+        if self.forward("catalog.refresh", json!({"force": true})) {
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(true);
+        if matches!(self.current().harness.as_str(), "codex" | "claude")
+            && self.current().pi.is_some()
+        {
+            self.current_mut()
+                .command("get_available_models", json!({}));
+            self.current_mut().refresh_commands();
+        }
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), true);
         }
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
