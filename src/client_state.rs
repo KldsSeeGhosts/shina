@@ -645,6 +645,7 @@ impl State {
             "routines":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.routines(id)))).collect::<serde_json::Map<_,_>>(),
             "background":self.background_status(),"undo":self.undo,
             "memoryBackend":self.memory_backend_status(),
+            "keepAwake":self.background_settings().keep_awake,
             "harnessIds":self.harness_ids(),
             "clone":{"running":self.projects.cloning(),"progress":self.projects.clone_progress,"error":self.projects.clone_error},
         })
@@ -789,7 +790,11 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
-                && command.method.starts_with("settings.")
+                && (command.method.starts_with("settings.")
+                    || matches!(
+                        command.method.as_str(),
+                        "profile.put" | "background.keepAwake"
+                    ))
                 && server == self.settings.machine
             {
                 self.settings.notice = if value["status"] == "accepted" {

@@ -1372,10 +1372,10 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
             .disabled(!supported && !keep_working)
             .opacity(if supported || keep_working { 1.0 } else { 0.5 }),
         );
-    let policy = settings.keep_awake;
+    let policy = s.settings_keep_awake();
     let note = match policy {
-        KeepAwake::Off => "This PC sleeps as usual.",
-        KeepAwake::WhileRunning => "This PC stays awake while tasks run.",
+        KeepAwake::Off => "This machine sleeps as usual.",
+        KeepAwake::WhileRunning => "This machine stays awake while tasks run.",
         KeepAwake::OnAcPower => "Awake while tasks run and plugged in.",
     };
     let mut group = row()
@@ -1420,7 +1420,7 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
                 .hover(if on { p.card } else { hover_wash(s, p) })
                 .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| s.set_keep_awake(choice))
+                .on_press(move |s: &mut State| s.set_settings_keep_awake(choice))
                 .child(label(
                     match choice {
                         KeepAwake::Off => "Off",
@@ -1459,7 +1459,11 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
 
 /// The settings menu's entry for the profile editor.
 pub(super) fn profile_item(s: &State, p: Palette) -> El {
-    let profile = s.user_profile();
+    let profile = if s.settings_menu {
+        s.settings_profile()
+    } else {
+        s.user_profile()
+    };
     let detail = if profile.name.trim().is_empty() {
         "Add your name and preferences".to_string()
     } else {
@@ -1506,7 +1510,12 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
 }
 
 pub(super) fn open_profile(s: &mut State) {
-    let profile = s.user_profile();
+    let profile = if s.settings_menu {
+        s.settings_profile()
+    } else {
+        s.user_profile()
+    };
+    s.settings.profile_target = s.settings_menu.then(|| s.settings.machine.clone());
     s.settings_menu = false;
     s.brief.profile_open = true;
     s.brief.error = None;
@@ -1540,7 +1549,11 @@ fn close_profile(s: &mut State) {
 
 fn save_profile(s: &mut State) {
     let profile = draft_profile(s);
-    let result = s.set_user_profile(profile);
+    let result = if s.settings.profile_target.is_some() {
+        s.save_settings_profile(profile)
+    } else {
+        s.set_user_profile(profile)
+    };
     if report(s, result) {
         s.brief.profile_open = false;
     }
@@ -1579,8 +1592,8 @@ fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title:
 }
 
 /// "You": the global profile every captain reads, ported from KSG's settings panels
-/// (`settings/settingsLayout.tsx` rows inside a `SettingsGroup` card) as a dialog, since Shina's
-/// settings live in a menu. A live count holds it to 1 KiB.
+/// (`settings/settingsLayout.tsx` rows inside a `SettingsGroup` card) as an editor dialog.
+/// A live count holds it to 1 KiB.
 fn profile_dialog(s: &State, p: Palette) -> Option<El> {
     if !s.brief.profile_open {
         return None;
@@ -1652,7 +1665,14 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
                         .gap(4.0)
                         .grow(1.0)
                         .min_w(0.0)
-                        .child(label("You", super::DIALOG_TITLE, p.ink))
+                        .child(label(
+                            s.settings.profile_target.as_ref().map_or_else(
+                                || "You".into(),
+                                |machine| format!("You on {}", s.machine_label(machine)),
+                            ),
+                            super::DIALOG_TITLE,
+                            p.ink,
+                        ))
                         .child(
                             label(
                                 "Every captain reads this with its memory. It is data about you, not instructions.",

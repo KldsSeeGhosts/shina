@@ -177,6 +177,7 @@ pub struct Dialog {
     pub section: usize,
     pub search: rune::TextEdit,
     pub machine: String,
+    pub profile_target: Option<String>,
     pub snooze: rune::TextEdit,
     pub model: rune::TextEdit,
     pub provider: rune::TextEdit,
@@ -195,6 +196,7 @@ impl Default for Dialog {
             section: 0,
             search: Default::default(),
             machine: "local".into(),
+            profile_target: None,
             snooze: Default::default(),
             model: Default::default(),
             provider: Default::default(),
@@ -288,6 +290,51 @@ impl State {
     }
     fn settings_defaults(&self) -> ThreadDefaults {
         serde_json::from_value(self.settings_index()["threadDefaults"].clone()).unwrap_or_default()
+    }
+    pub(crate) fn settings_profile(&self) -> crate::model::UserProfile {
+        if self.client.is_none() {
+            return self.user_profile();
+        }
+        self.machines
+            .views
+            .get(&self.settings.machine)
+            .and_then(|view| serde_json::from_value(view["profile"].clone()).ok())
+            .unwrap_or_default()
+    }
+    pub(crate) fn save_settings_profile(
+        &mut self,
+        profile: crate::model::UserProfile,
+    ) -> Result<(), String> {
+        if let Some(client) = &self.client {
+            let server = self
+                .settings
+                .profile_target
+                .as_deref()
+                .unwrap_or(&self.settings.machine);
+            return client
+                .commands_for(server)
+                .ok_or("Machine is unavailable.")?
+                .send("profile.put", json!({"profile":profile}))
+                .map(|_| ());
+        }
+        self.set_user_profile(profile)
+    }
+    pub(crate) fn settings_keep_awake(&self) -> crate::power::KeepAwake {
+        if self.client.is_none() {
+            return self.background_settings().keep_awake;
+        }
+        self.machines
+            .views
+            .get(&self.settings.machine)
+            .and_then(|view| serde_json::from_value(view["keepAwake"].clone()).ok())
+            .unwrap_or_default()
+    }
+    pub(crate) fn set_settings_keep_awake(&mut self, policy: crate::power::KeepAwake) {
+        if self.client.is_some() {
+            self.settings_command("background.keepAwake", json!({"policy":policy}));
+        } else {
+            self.set_keep_awake(policy);
+        }
     }
     fn settings_harness_ids(&self) -> Vec<String> {
         if self.client.is_none() {
@@ -705,6 +752,15 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
     let mut found = titles.iter().any(|t| matches(s, t));
     match section {
         0 => {
+            if s.client.as_ref().is_some_and(|c| !c.linked.is_empty()) {
+                pane = pane.child(pixel_text(
+                    format!(
+                        "Server settings on {}",
+                        s.machine_label(&s.settings.machine)
+                    ),
+                    p.muted,
+                ));
+            }
             pane = add(
                 pane,
                 s,
@@ -1023,7 +1079,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 pane = pane.child(
                     row()
                         .gap(8.0)
-                        .child(pixel_label("Thread settings context", p.muted))
+                        .child(pixel_label("Server settings context", p.muted))
                         .child(pixel_text(s.machine_label(&s.settings.machine), p.ink)),
                 );
                 let mut context = row().gap(4.0).flex_wrap();
@@ -1441,6 +1497,40 @@ mod tests {
         state.settings.machine = "remote".into();
         state.settings_command("settings.autoSettle", json!({"days":7}));
         assert_eq!(remote_calls.try_recv().unwrap().params["days"], 7);
+        state.machines.views.insert(
+            "remote".into(),
+            json!({
+                "profile":{"name":"Remote user","time_zone":"UTC","preferences":"Remote preferences"},
+                "keepAwake":"on_ac_power"
+            }),
+        );
+        assert_eq!(state.settings_profile().name, "Remote user");
+        assert_eq!(
+            state.settings_keep_awake(),
+            crate::power::KeepAwake::OnAcPower
+        );
+        state.set_settings_keep_awake(crate::power::KeepAwake::WhileRunning);
+        let call = remote_calls.try_recv().unwrap();
+        assert_eq!(call.method, "background.keepAwake");
+        assert_eq!(
+            call.params["policy"],
+            json!(crate::power::KeepAwake::WhileRunning)
+        );
+        state.settings_menu = true;
+        captain_ui::open_profile(&mut state);
+        assert_eq!(state.brief.profile_name.text, "Remote user");
+        assert_eq!(state.settings.profile_target.as_deref(), Some("remote"));
+        // The editor keeps its target even if the settings context changes meanwhile.
+        state.settings.machine = "local".into();
+        state
+            .save_settings_profile(crate::model::UserProfile {
+                name: "Updated remote user".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let call = remote_calls.try_recv().unwrap();
+        assert_eq!(call.method, "profile.put");
+        assert_eq!(call.params["profile"]["name"], "Updated remote user");
         assert!(local_calls.try_recv().is_err());
         state.open_settings();
         assert_eq!(state.settings.machine, "local");
