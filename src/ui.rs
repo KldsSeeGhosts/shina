@@ -8231,15 +8231,29 @@ fn machine_picker(s: &State, p: Palette) -> El {
 }
 
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
-fn machine_panel(s: &State, p: Palette) -> El {
+fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     let busy = s.machines.pending.is_some();
-    let mut card = col().key("machine-dialog").role("dialog").label("Linked machines")
-        .w_full().gap(12.0)
-        .child(row().center_y().child(label("Linked machines",DIALOG_TITLE,p.ink)).child(spacer())
-            .child(icon_button("close-machines","Close","close",p,|s| {
-                s.machines.dialog=false;s.settings_menu=false;s.machines.code.replace_text("");s.machines.notice=None;
-            })))
-        .child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
+    let mut card = col()
+        .key("machine-dialog")
+        .role(if embedded { "group" } else { "dialog" })
+        .label("Linked machines")
+        .w_full()
+        .gap(12.0);
+    if !embedded {
+        card = card.child(
+            row()
+                .center_y()
+                .child(label("Linked machines", DIALOG_TITLE, p.ink))
+                .child(spacer())
+                .child(icon_button("close-machines", "Close", "close", p, |s| {
+                    s.machines.dialog = false;
+                    s.settings_menu = false;
+                    s.machines.code.replace_text("");
+                    s.machines.notice = None;
+                })),
+        );
+    }
+    card=card.child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(pixel_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
             .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.host, p).color(p.ink)
@@ -8263,23 +8277,51 @@ fn machine_panel(s: &State, p: Palette) -> El {
     if let Some(client) = &s.client {
         for (id, remote) in &client.linked {
             let server = id.clone();
+            let version = remote.version().unwrap_or_else(|| {
+                s.machines
+                    .views
+                    .get(id)
+                    .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
+                    .unwrap_or("unknown")
+                    .to_owned()
+            });
             card = card.child(
                 row()
+                    .key(format!("settings-linked-{id}"))
                     .center_y()
                     .gap(8.0)
                     .child(
-                        label(
-                            remote
-                                .remote
-                                .as_ref()
-                                .map(|link| link.host.as_str())
-                                .unwrap_or(id),
-                            SMALL,
-                            p.ink,
-                        )
-                        .grow(1.0)
-                        .truncate()
-                        .min_w(0.0),
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(4.0)
+                            .child(
+                                label(
+                                    remote
+                                        .remote
+                                        .as_ref()
+                                        .map(|link| link.host.as_str())
+                                        .unwrap_or(id),
+                                    TextStyle::new(14.0, 500.0),
+                                    p.ink,
+                                )
+                                .truncate()
+                                .min_w(0.0),
+                            )
+                            .child(
+                                row()
+                                    .gap(8.0)
+                                    .flex_wrap()
+                                    .child(pixel_text(version, p.muted))
+                                    .child(pixel_text(
+                                        if s.machine_connected(id) {
+                                            "Reachable"
+                                        } else {
+                                            "Offline"
+                                        },
+                                        p.muted,
+                                    )),
+                            ),
                     )
                     .child(
                         settings_ui::destructive_button(
@@ -8364,7 +8406,7 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             s.machines.notice = None;
         })
         .child(
-            machine_panel(s, p)
+            machine_panel(s, p, false)
                 .w((s.viewport_width - 32.0).clamp(280.0, 520.0))
                 .max_h((s.viewport_height - 64.0).max(240.0))
                 .scroll(ScrollSpec {

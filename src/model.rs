@@ -6311,7 +6311,18 @@ impl State {
 
     /// Why a restart to update must wait, or `None` when nothing is active. It checks every
     /// thread, including delegated, settled and archived ones.
-    pub fn update_restart_blocker(&self) -> Option<&'static str> {
+    pub fn update_restart_blocker(&self) -> Option<&str> {
+        if self.client.is_some() && self.machines.selected != "local" {
+            if self.rename_thread.is_some() || self.captain_editor.is_some() {
+                return Some("Finish editing before restarting.");
+            }
+            // Updating this desktop concerns Local, not the remote thread being read.
+            return self
+                .machines
+                .views
+                .get("local")
+                .and_then(|view| view["updateStatus"]["blocker"].as_str());
+        }
         if self.routines_running() {
             return Some("A routine is still running. Restart when it finishes.");
         }
@@ -8410,6 +8421,29 @@ mod tests {
         state.restore_ui(&ui).unwrap();
         assert!(state.preferences.confirm_archive);
         assert!(!state.preferences.confirm_delete);
+    }
+    #[test]
+    fn desktop_update_blockers_belong_to_local_even_while_reading_a_remote_thread() {
+        let mut state = ready_state();
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        state.machines.selected = "remote".into();
+        state.current_mut().status = Status::Running;
+        state
+            .machines
+            .views
+            .insert("local".into(), json!({"updateStatus":{"blocker":null}}));
+        assert_eq!(state.update_restart_blocker(), None);
+        state.machines.views.get_mut("local").unwrap()["updateStatus"]["blocker"] =
+            json!("2 local threads are running");
+        assert_eq!(
+            state.update_restart_blocker(),
+            Some("2 local threads are running")
+        );
+        state.rename_thread = Some(1);
+        assert_eq!(
+            state.update_restart_blocker(),
+            Some("Finish editing before restarting.")
+        );
     }
 
     #[test]

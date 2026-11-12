@@ -1005,7 +1005,12 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
         }
         3 => {
             if s.client.as_ref().is_some_and(|c| !c.linked.is_empty()) {
-                pane = pane.child(pixel_label("Thread settings context", p.muted));
+                pane = pane.child(
+                    row()
+                        .gap(8.0)
+                        .child(pixel_label("Thread settings context", p.muted))
+                        .child(pixel_text(s.machine_label(&s.settings.machine), p.ink)),
+                );
                 let mut context = row().gap(4.0).flex_wrap();
                 for machine in machine_options(s) {
                     let id = machine.clone();
@@ -1028,30 +1033,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                     }),
                     p,
                 ));
-                pane = pane.child(machine_panel(s, p));
-                if let Some(client) = &s.client {
-                    for (id, remote) in &client.linked {
-                        let version = remote.version().unwrap_or_else(|| {
-                            s.machines
-                                .views
-                                .get(id)
-                                .and_then(|v| v["updateStatus"]["runningVersion"].as_str())
-                                .unwrap_or("unknown")
-                                .to_owned()
-                        });
-                        pane = pane.child(info(
-                            &format!("settings-linked-{id}"),
-                            &s.machine_label(id),
-                            &version,
-                            if s.machine_connected(id) {
-                                "Reachable"
-                            } else {
-                                "Offline"
-                            },
-                            p,
-                        ));
-                    }
-                }
+                pane = pane.child(machine_panel(s, p, true));
             }
             pane = add(
                 pane,
