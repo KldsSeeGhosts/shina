@@ -225,6 +225,14 @@ glyph!(
     r#"<path d="M8 2h2v2h-2zM14 2h2v2h-2zM4 4h16v2h-16zM4 6h2v2h-2zM18 6h2v2h-2zM2 8h4v2h-4zM18 8h4v2h-4zM4 10h2v2h-2zM10 10h4v4h-4zM18 10h2v2h-2zM2 12h4v2h-4zM18 12h4v2h-4zM4 14h2v2h-2zM18 14h2v2h-2zM4 16h16v2h-16zM8 18h2v2h-2zM14 18h2v2h-2z"/>"#
 );
 glyph!(DOT, r#"<path d="M8 8h8v8H8z"/>"#);
+glyph!(
+    STAR,
+    r#"<path d="M10 2h4v4h-4zM8 6h8v2H8zM2 8h20v2H2zM4 10h16v2H4zM6 12h12v4H6zM4 16h6v4H4zM14 16h6v4h-6zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
+);
+glyph!(
+    STAR_OFF,
+    r#"<path d="M10 2h4v2h-4zM8 4h2v4H8zM14 4h2v4h-2zM2 8h6v2H2zM16 8h6v2h-6zM4 10h2v2H4zM18 10h2v2h-2zM6 12h2v4H6zM16 12h2v4h-2zM10 14h4v2h-4zM4 16h4v4H4zM16 16h4v4h-4zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
+);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
 pub(super) fn glyph(kind: &str) -> &'static Icon {
@@ -280,6 +288,8 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "wrench" => &WRENCH,
         "crew" => &CREW,
         "copy" => &COPY,
+        "star" => &STAR,
+        "star-off" => &STAR_OFF,
         _ => &CHECK,
     }
 }

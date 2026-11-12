@@ -11,7 +11,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,
@@ -23,6 +23,22 @@ pub struct AgentModel {
     pub supports_images: Option<bool>,
     #[serde(default)]
     pub service_tiers: Vec<Value>,
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub sub_provider: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub badge: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub is_custom: bool,
+    #[serde(default)]
+    pub is_legacy: bool,
+    #[serde(default)]
+    pub is_unavailable: bool,
 }
 
 impl AgentModel {
@@ -54,6 +70,19 @@ impl AgentModel {
                 .as_array()
                 .cloned()
                 .unwrap_or_default(),
+            short_name: model["shortName"].as_str().map(str::to_owned),
+            sub_provider: model["subProvider"].as_str().map(str::to_owned),
+            aliases: model["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect(),
+            badge: model["badge"].as_str().map(str::to_owned),
+            is_default: model["isDefault"] == true,
+            is_custom: model["isCustom"] == true,
+            is_legacy: model["isLegacy"] == true,
+            is_unavailable: model["isUnavailable"] == true,
         })
     }
     pub fn from_value(model: &Value) -> Option<Self> {
@@ -85,7 +114,23 @@ impl AgentModel {
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
-            service_tiers: vec![],
+            service_tiers: model["serviceTiers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            short_name: model["shortName"].as_str().map(str::to_owned),
+            sub_provider: model["subProvider"].as_str().map(str::to_owned),
+            aliases: model["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect(),
+            badge: model["badge"].as_str().map(str::to_owned),
+            is_default: model["isDefault"] == true,
+            is_custom: model["isCustom"] == true,
+            is_legacy: model["isLegacy"] == true,
+            is_unavailable: model["isUnavailable"] == true,
         })
     }
 }
@@ -100,6 +145,10 @@ pub struct NativeCatalog {
     pub extensions: bool,
     pub cwd: Option<PathBuf>,
     pub revision: u64,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub auth_status: Option<String>,
+    pub update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
     pi: Option<Pi>,
     attempted: bool,
     complete: bool,
@@ -111,7 +160,9 @@ pub struct NativeCatalog {
 impl NativeCatalog {
     pub fn snapshot(&self) -> Value {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
-            "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading()})
+            "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
+            "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
+            "updateRequiredModels":self.update_required_models})
     }
     pub fn loading(&self) -> bool {
         self.pi.is_some()

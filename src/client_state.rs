@@ -1401,6 +1401,18 @@ impl State {
         }
         self.client_recover
             .retain(|id, _| self.threads.iter().any(|thread| thread.id == *id));
+        if !self.demo
+            && self.supports_model_favorites()
+            && !self.model_favorites_migrated
+            && self.model_favorites.is_none()
+            && !self.preferences.model_favorites.is_empty()
+        {
+            self.model_favorites_migrated = true;
+            self.forward(
+                "settings.modelFavorites",
+                json!({"migrateFavorites": self.preferences.model_favorites}),
+            );
+        }
         self.capture_opened_draft();
         self.storage_error = None;
         if let Some(path) = self.launch_project.take()
@@ -2566,6 +2578,35 @@ impl State {
                     return Err(format!("Unknown harness {harness}."));
                 }
                 self.default_harness = harness;
+                self.checkpoint();
+            }
+            "settings.modelFavorites" => {
+                if let Some(migrated) = args.get("migrateFavorites").and_then(|v| v.as_array()) {
+                    if self.model_favorites.is_none() {
+                        let parsed: Vec<crate::model_picker::ModelFavorite> =
+                            serde_json::from_value(Value::Array(migrated.clone()))
+                                .map_err(|_| "Invalid model favorites.")?;
+                        self.model_favorites = Some(parsed);
+                        self.checkpoint();
+                    }
+                    return Ok(json!({"threadId":self.current().id}));
+                }
+                let provider = text("provider")?;
+                let model = text("model")?;
+                let favorite = args["favorite"]
+                    .as_bool()
+                    .ok_or("favorite must be a boolean.")?;
+                let list = self.model_favorites.get_or_insert_with(Vec::new);
+                let exists = list
+                    .iter()
+                    .any(|item| item.provider == provider && item.model == model);
+                if favorite {
+                    if !exists {
+                        list.push(crate::model_picker::ModelFavorite { provider, model });
+                    }
+                } else {
+                    list.retain(|item| item.provider != provider || item.model != model);
+                }
                 self.checkpoint();
             }
             "background.keepAwake" => self.set_keep_awake(
@@ -4596,5 +4637,47 @@ mod tests {
             blocked,
             "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
         );
+    }
+
+    #[test]
+    fn model_favorites_negotiates_capability_and_falls_back_to_client_preferences_when_peer_lacks_it()
+     {
+        let (mut state, mut server, mut commands) = tab_client();
+        // When peer lacks MODEL_FAVORITES capability, favorites live locally in Preferences.
+        assert!(!state.supports_model_favorites());
+        state.toggle_model_favorite("codex", "gpt-5.6-sol");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            state.effective_model_favorites(),
+            &[crate::model_picker::ModelFavorite {
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+            }]
+        );
+        // Persistence roundtrip in Preferences (ui_snapshot)
+        let ui = state.ui_snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_ui(&ui).unwrap();
+        assert_eq!(restored.preferences.model_favorites.len(), 1);
+
+        // When peer advertises MODEL_FAVORITES capability, favorites migrate and sync via settings.modelFavorites.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_FAVORITES]});
+        assert!(state.supports_model_favorites());
+        state.apply_projection(server.projection()).unwrap();
+        let migrate = commands.try_recv().unwrap();
+        assert_eq!(migrate.method, "settings.modelFavorites");
+        server.execute_command(&migrate).unwrap();
+        assert_eq!(server.model_favorites.as_ref().unwrap().len(), 1);
+
+        state.toggle_model_favorite("pi", "cpa/opus");
+        let add_cmd = commands.try_recv().unwrap();
+        assert_eq!(add_cmd.method, "settings.modelFavorites");
+        assert_eq!(add_cmd.params["provider"], "pi");
+        assert_eq!(add_cmd.params["model"], "cpa/opus");
+        assert_eq!(add_cmd.params["favorite"], true);
+        server.execute_command(&add_cmd).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.effective_model_favorites().len(), 2);
     }
 }

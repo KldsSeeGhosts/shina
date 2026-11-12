@@ -2585,6 +2585,10 @@ pub struct State {
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
     pub settings_picker: Option<SettingsPicker>,
+    pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
+    pub expanded_legacy_instances: std::collections::HashSet<String>,
+    pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
+    model_favorites_migrated: bool,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
     /// (highest). The level is chosen on release.
     pub thinking_drag: Option<f32>,
@@ -2777,6 +2781,10 @@ impl State {
             captain_editor: None,
             brief: BriefUi::default(),
             settings_picker: None,
+            model_picker_tab: None,
+            expanded_legacy_instances: Default::default(),
+            model_favorites: None,
+            model_favorites_migrated: false,
             thinking_drag: None,
             model_search: TextEdit::default(),
             updater: Default::default(),
@@ -6295,6 +6303,12 @@ impl State {
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
         self.thread_defaults.validate()?;
+        self.model_favorites = match index.get("modelFavorites") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone()).map_err(|_| "Invalid model favorites.")?,
+            ),
+        };
         self.persist_transcripts = self.headless || index["threadViews"].is_array();
         self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
         self.command_receipts =
@@ -7006,6 +7020,7 @@ impl State {
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
             "threadDefaults": self.thread_defaults,
+            "modelFavorites": self.model_favorites,
             "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
@@ -8771,6 +8786,7 @@ mod tests {
             context_window: Some(100),
             supports_images: Some(true),
             service_tiers: vec![],
+            ..Default::default()
         };
         state.current_mut().harness = "codex".into();
         state.current_mut().models = vec![model];
@@ -9112,6 +9128,7 @@ mod tests {
             context_window: None,
             supports_images: None,
             service_tiers: vec![],
+            ..Default::default()
         }];
         let index = restored.threads.len() - 1;
         restored.inherit_composer(

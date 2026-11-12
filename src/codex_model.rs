@@ -46,6 +46,15 @@ impl Thread {
             text.into()
         }
     }
+
+    pub fn has_started_session(&self) -> bool {
+        !self.messages.is_empty()
+            || self.life.latest_user_message_at.is_some()
+            || self.native.fork_source.is_some()
+            || self.native.previous_session.is_some()
+            || (self.session.is_some() && !self.never_sent)
+            || self.run_id.is_some()
+    }
 }
 
 impl State {
@@ -274,6 +283,351 @@ impl State {
         let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
         ids
+    }
+
+    pub fn supports_model_favorites(&self) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(&self.machines.selected, crate::protocol::MODEL_FAVORITES)
+        })
+    }
+
+    pub fn effective_model_favorites(&self) -> &[crate::model_picker::ModelFavorite] {
+        if self.supports_model_favorites() {
+            self.model_favorites
+                .as_deref()
+                .unwrap_or(&self.preferences.model_favorites)
+        } else {
+            &self.preferences.model_favorites
+        }
+    }
+
+    pub fn toggle_model_favorite(&mut self, provider: &str, model: &str) {
+        let currently_favorite = self
+            .effective_model_favorites()
+            .iter()
+            .any(|fav| fav.provider == provider && fav.model == model);
+        let next = !currently_favorite;
+        if self.client.is_some() && self.supports_model_favorites() {
+            if let Some(list) = &mut self.model_favorites {
+                crate::model_picker::toggle_model_favorite_in_list(list, provider, model);
+            } else {
+                let mut list = self.preferences.model_favorites.clone();
+                crate::model_picker::toggle_model_favorite_in_list(&mut list, provider, model);
+                self.model_favorites = Some(list);
+            }
+            self.forward(
+                "settings.modelFavorites",
+                json!({"provider": provider, "model": model, "favorite": next}),
+            );
+            return;
+        }
+        if self.client.is_some() {
+            crate::model_picker::toggle_model_favorite_in_list(
+                &mut self.preferences.model_favorites,
+                provider,
+                model,
+            );
+            self.checkpoint();
+            return;
+        }
+        if self.model_favorites.is_none() && !self.preferences.model_favorites.is_empty() {
+            self.model_favorites = Some(self.preferences.model_favorites.clone());
+        }
+        let list = self.model_favorites.get_or_insert_with(Vec::new);
+        crate::model_picker::toggle_model_favorite_in_list(list, provider, model);
+        self.checkpoint();
+    }
+
+    pub fn locked_provider_for_current(&self) -> Option<String> {
+        let t = self.current();
+        if t.has_started_session() {
+            Some(t.harness.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn model_disabled_reason_for(&self, instance_id: &str, _model: &str) -> Option<String> {
+        let t = self.current();
+        crate::model_picker::get_model_disabled_reason(
+            t.has_started_session(),
+            false,
+            &t.harness,
+            instance_id,
+        )
+    }
+
+    pub fn provider_instance_entries(&self) -> Vec<crate::model_picker::ProviderInstanceEntry> {
+        use crate::model_picker::{ProviderAuthStatus, ProviderInstanceEntry, ProviderStatusKind};
+        let mut entries = Vec::new();
+        let mut seen: Vec<(String, String)> = Vec::new();
+
+        // Pi
+        seen.push(("pi".into(), "Pi".into()));
+        let pi_error = self.catalog.error.clone();
+        let pi_auth = if pi_error
+            .as_deref()
+            .is_some_and(crate::usage_limits::authentication_error)
+        {
+            ProviderAuthStatus::Unauthenticated
+        } else if !self.catalog.models.is_empty() {
+            ProviderAuthStatus::Authenticated
+        } else {
+            ProviderAuthStatus::Unknown
+        };
+        entries.push(ProviderInstanceEntry {
+            instance_id: "pi".into(),
+            driver_kind: "pi".into(),
+            display_name: "Pi".into(),
+            continuation_group_key: None,
+            enabled: true,
+            installed: true,
+            status: if pi_error.is_some() {
+                ProviderStatusKind::Error
+            } else {
+                ProviderStatusKind::Ready
+            },
+            auth_status: pi_auth,
+            can_setup: false,
+            is_available: true,
+            is_acp: false,
+            message: pi_error,
+            compatibility_broken_message: None,
+            update_required_models: vec![],
+        });
+
+        // Codex & Claude
+        for (id, name) in [("codex", "Codex"), ("claude", "Claude")] {
+            seen.push((id.into(), name.into()));
+            let (installed, error, auth_status, update_required_models, has_models) =
+                if self.client.is_some() {
+                    let snap = &self.client_views["nativeCatalogs"][id];
+                    let models_empty = snap["models"].as_array().is_none_or(Vec::is_empty);
+                    let err = snap["error"].as_str().map(str::to_owned);
+                    let installed = snap["installed"]
+                        .as_bool()
+                        .unwrap_or_else(|| id != "claude" || crate::claude::process().is_ok());
+                    let auth = snap["authStatus"]
+                        .as_str()
+                        .map(ProviderAuthStatus::parse)
+                        .unwrap_or_else(|| {
+                            if err
+                                .as_deref()
+                                .is_some_and(crate::usage_limits::authentication_error)
+                            {
+                                ProviderAuthStatus::Unauthenticated
+                            } else if !models_empty {
+                                ProviderAuthStatus::Authenticated
+                            } else {
+                                ProviderAuthStatus::Unknown
+                            }
+                        });
+                    let updates: Vec<crate::model_picker::UpdateRequiredModel> =
+                        serde_json::from_value(snap["updateRequiredModels"].clone())
+                            .unwrap_or_default();
+                    (installed, err, auth, updates, !models_empty)
+                } else {
+                    let catalog = if id == "codex" {
+                        &self.codex_catalog
+                    } else {
+                        &self.claude_catalog
+                    };
+                    let installed = if id == "claude" {
+                        catalog.installed || crate::claude::process().is_ok()
+                    } else {
+                        true
+                    };
+                    let err = catalog.error.clone().or_else(|| {
+                        (id == "claude" && !installed).then(|| crate::claude::MISSING.into())
+                    });
+                    let auth = catalog
+                        .auth_status
+                        .as_deref()
+                        .map(ProviderAuthStatus::parse)
+                        .unwrap_or_else(|| {
+                            if err
+                                .as_deref()
+                                .is_some_and(crate::usage_limits::authentication_error)
+                            {
+                                ProviderAuthStatus::Unauthenticated
+                            } else if !catalog.models.is_empty() {
+                                ProviderAuthStatus::Authenticated
+                            } else {
+                                ProviderAuthStatus::Unknown
+                            }
+                        });
+                    (
+                        installed,
+                        err,
+                        auth,
+                        catalog.update_required_models.clone(),
+                        !catalog.models.is_empty(),
+                    )
+                };
+            let is_available = id != "claude" || installed;
+            let status = if let Some(explicit) = (self.client.is_some())
+                .then(|| self.client_views["nativeCatalogs"][id]["status"].as_str())
+                .flatten()
+            {
+                ProviderStatusKind::parse(explicit)
+            } else if !installed || error.is_some() {
+                if error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("timed out") || e.contains("not available"))
+                    && has_models
+                {
+                    ProviderStatusKind::Warning
+                } else if !installed || error.is_some() {
+                    ProviderStatusKind::Error
+                } else {
+                    ProviderStatusKind::Ready
+                }
+            } else {
+                ProviderStatusKind::Ready
+            };
+            entries.push(ProviderInstanceEntry {
+                instance_id: id.into(),
+                driver_kind: id.into(),
+                display_name: name.into(),
+                continuation_group_key: None,
+                enabled: true,
+                installed,
+                status,
+                auth_status,
+                can_setup: false,
+                is_available,
+                is_acp: false,
+                message: error,
+                compatibility_broken_message: None,
+                update_required_models,
+            });
+        }
+
+        // ACP agents
+        for agent in &self.harnesses.agents {
+            if seen.iter().any(|(earlier_id, earlier_name)| {
+                earlier_id == &agent.id && earlier_name == &agent.name
+            }) {
+                continue;
+            }
+            seen.push((agent.id.clone(), agent.name.clone()));
+            entries.push(ProviderInstanceEntry {
+                instance_id: agent.id.clone(),
+                driver_kind: agent.id.clone(),
+                display_name: agent.name.clone(),
+                continuation_group_key: None,
+                enabled: true,
+                installed: true,
+                status: ProviderStatusKind::Ready,
+                auth_status: ProviderAuthStatus::Unknown,
+                can_setup: false,
+                is_available: true,
+                is_acp: true,
+                message: None,
+                compatibility_broken_message: None,
+                update_required_models: vec![],
+            });
+        }
+
+        entries
+    }
+
+    pub fn picker_models_by_instance(
+        &self,
+    ) -> std::collections::BTreeMap<String, Vec<crate::model_picker::PickerModelOption>> {
+        use crate::model_picker::PickerModelOption;
+        let t = self.current();
+        let mut map = std::collections::BTreeMap::new();
+        for entry in self.provider_instance_entries() {
+            let mut models = if entry.instance_id == t.harness && !t.models.is_empty() {
+                t.models.clone()
+            } else {
+                self.harness_models(&entry.instance_id)
+            };
+            if entry.is_acp && models.is_empty() {
+                models.push(AgentModel {
+                    provider: entry.instance_id.clone(),
+                    id: "default".into(),
+                    name: "Default".into(),
+                    is_default: true,
+                    ..Default::default()
+                });
+            }
+            // Retain active thread's model if unavailable / uncatalogued
+            if entry.instance_id == t.harness
+                && !t.model_id.is_empty()
+                && !models.iter().any(|m| m.id == t.model_id)
+            {
+                models.push(AgentModel {
+                    provider: if t.harness == "pi" {
+                        "cpa".into()
+                    } else {
+                        t.harness.clone()
+                    },
+                    id: t.model_id.clone(),
+                    name: if t.model.is_empty() {
+                        t.model_id.clone()
+                    } else {
+                        t.model.clone()
+                    },
+                    is_unavailable: true,
+                    ..Default::default()
+                });
+            }
+            let options = models
+                .into_iter()
+                .map(|m| PickerModelOption {
+                    slug: m.id,
+                    name: m.name,
+                    short_name: m.short_name,
+                    sub_provider: m.sub_provider,
+                    aliases: m.aliases,
+                    badge: m.badge,
+                    is_default: m.is_default,
+                    is_custom: m.is_custom,
+                    is_legacy: m.is_legacy,
+                    is_unavailable: m.is_unavailable,
+                })
+                .collect();
+            map.insert(entry.instance_id, options);
+        }
+        map
+    }
+
+    pub fn open_model_picker(&mut self, picker: SettingsPicker) {
+        self.settings_picker = Some(picker);
+        self.thinking_drag = None;
+        if picker == SettingsPicker::Model {
+            self.model_search.replace_text("");
+            let entries = self.provider_instance_entries();
+            let options_by_instance = self.picker_models_by_instance();
+            let favorites = self.effective_model_favorites().to_vec();
+            let t = self.current();
+            let active_instance = t.harness.clone();
+            let active_model = t.model_id.clone();
+            let locked = self.locked_provider_for_current();
+            let initial_tab = crate::model_picker::initial_model_picker_tab(
+                &entries,
+                &options_by_instance,
+                &favorites,
+                &active_instance,
+                &active_model,
+                locked.as_deref(),
+            );
+            self.model_picker_tab = Some(initial_tab);
+            self.expanded_legacy_instances.clear();
+            let active_is_legacy = options_by_instance
+                .get(&active_instance)
+                .and_then(|opts| opts.iter().find(|o| o.slug == active_model))
+                .is_some_and(|o| o.is_legacy);
+            let active_is_fav = favorites
+                .iter()
+                .any(|f| f.provider == active_instance && f.model == active_model);
+            if active_is_legacy && !active_is_fav {
+                self.expanded_legacy_instances.insert(active_instance);
+            }
+        }
+        self.refresh_catalog();
     }
 }
 

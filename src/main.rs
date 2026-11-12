@@ -33,6 +33,7 @@ mod lifecycle;
 mod maintenance;
 mod mcp;
 mod model;
+mod model_picker;
 mod outbox;
 mod peer;
 mod portraits;
@@ -317,10 +318,7 @@ fn dispatch_global_command(
             if state.settings_picker == Some(model::SettingsPicker::Model) {
                 state.settings_picker = None;
             } else {
-                state.model_search.replace_text("");
-                state.settings_picker = Some(model::SettingsPicker::Model);
-                state.thinking_drag = None;
-                state.refresh_catalog();
+                state.open_model_picker(model::SettingsPicker::Model);
             }
         }
         "composer.effort" => {
@@ -339,9 +337,7 @@ fn dispatch_global_command(
             if state.settings_picker == Some(model::SettingsPicker::Thinking) {
                 state.settings_picker = None;
             } else {
-                state.settings_picker = Some(model::SettingsPicker::Thinking);
-                state.thinking_drag = None;
-                state.refresh_catalog();
+                state.open_model_picker(model::SettingsPicker::Thinking);
             }
         }
         "composer.increaseEffort" => {
