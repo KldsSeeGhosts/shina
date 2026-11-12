@@ -230,6 +230,18 @@ impl Client {
             .as_str()
             .map(str::to_owned)
     }
+    pub fn supports_capability(&self, server: &str, capability: &str) -> bool {
+        let info = if server == "local" {
+            &self.info
+        } else if let Some(remote) = self.linked.get(server) {
+            &remote.info
+        } else {
+            return false;
+        };
+        info.lock().expect("connection info")["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
+    }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
     }

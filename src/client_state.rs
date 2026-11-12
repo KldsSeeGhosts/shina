@@ -109,6 +109,8 @@ struct ThreadView {
     model_provider: String,
     model_id: String,
     thinking: String,
+    #[serde(default)]
+    model_options: Vec<crate::model_selection::ProviderOptionSelection>,
     models: Vec<AgentModel>,
     thinking_levels: Vec<String>,
     supports_images: Option<bool>,
@@ -210,6 +212,7 @@ impl ThreadView {
             model_provider: thread.model_provider.clone(),
             model_id: thread.model_id.clone(),
             thinking: thread.thinking.clone(),
+            model_options: thread.model_options.clone(),
             models: thread.models.clone(),
             thinking_levels: thread.thinking_levels.clone(),
             supports_images: thread.supports_images,
@@ -362,6 +365,7 @@ impl ThreadView {
         thread.model_provider = self.model_provider;
         thread.model_id = self.model_id;
         thread.thinking = self.thinking;
+        thread.model_options = self.model_options;
         thread.models = self.models;
         thread.thinking_levels = self.thinking_levels;
         thread.supports_images = self.supports_images;
@@ -859,6 +863,7 @@ impl State {
         }
         let mut projection = json!({
             "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
+            "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error},
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
@@ -1601,6 +1606,18 @@ impl State {
         }
         self.client_recover
             .retain(|id, _| self.threads.iter().any(|thread| thread.id == *id));
+        if !self.demo
+            && self.supports_model_favorites()
+            && !self.model_favorites_migrated
+            && self.model_favorites.is_none()
+            && !self.preferences.model_favorites.is_empty()
+        {
+            self.model_favorites_migrated = true;
+            self.forward(
+                "settings.modelFavorites",
+                json!({"migrateFavorites": self.preferences.model_favorites}),
+            );
+        }
         self.capture_opened_draft();
         self.storage_error = None;
         if let Some(path) = self.launch_project.take()
@@ -2655,6 +2672,14 @@ impl State {
                 if let Some(tier) = args["serviceTier"].as_str() {
                     self.current_mut().set_service_tier(tier.into());
                 }
+                if !args["options"].is_null() {
+                    let opts: Vec<crate::model_selection::ProviderOptionSelection> =
+                        serde_json::from_value(args["options"].clone())
+                            .map_err(|e| format!("Invalid options: {e}"))?;
+                    for opt in opts {
+                        self.current_mut().set_option(opt.id, opt.value);
+                    }
+                }
                 if let Some(access) = args["access"].as_str() {
                     self.set_access_mode(AccessMode::parse(access).ok_or("Unknown access mode.")?);
                 }
@@ -2795,6 +2820,35 @@ impl State {
                 self.default_harness = harness;
                 self.checkpoint();
             }
+            "settings.modelFavorites" => {
+                if let Some(migrated) = args.get("migrateFavorites").and_then(|v| v.as_array()) {
+                    if self.model_favorites.is_none() {
+                        let parsed: Vec<crate::model_picker::ModelFavorite> =
+                            serde_json::from_value(Value::Array(migrated.clone()))
+                                .map_err(|_| "Invalid model favorites.")?;
+                        self.model_favorites = Some(parsed);
+                        self.checkpoint();
+                    }
+                    return Ok(json!({"threadId":self.current().id}));
+                }
+                let provider = text("provider")?;
+                let model = text("model")?;
+                let favorite = args["favorite"]
+                    .as_bool()
+                    .ok_or("favorite must be a boolean.")?;
+                let list = self.model_favorites.get_or_insert_with(Vec::new);
+                let exists = list
+                    .iter()
+                    .any(|item| item.provider == provider && item.model == model);
+                if favorite {
+                    if !exists {
+                        list.push(crate::model_picker::ModelFavorite { provider, model });
+                    }
+                } else {
+                    list.retain(|item| item.provider != provider || item.model != model);
+                }
+                self.checkpoint();
+            }
             "background.keepAwake" => self.set_keep_awake(
                 serde_json::from_value(args["policy"].clone()).map_err(|e| e.to_string())?,
             ),
@@ -2910,7 +2964,15 @@ impl State {
                 }
             }
             "project.cancelClone" => self.close_clone_dialog(),
-            "catalog.refresh" => self.refresh_catalog(),
+            "catalog.refresh" => {
+                if args["modelCatalogOnly"] == true {
+                    self.refresh_catalog_on_open();
+                } else if args["force"] == true {
+                    self.force_refresh_catalog();
+                } else {
+                    self.refresh_catalog();
+                }
+            }
             "commands.refresh" => {
                 if self.current().pi.is_none()
                     && self.current().error.is_none()
@@ -4990,5 +5052,141 @@ mod tests {
             assert!(state.current().client_draft);
             assert!(state.toasts.is_empty());
         }
+    }
+
+    #[test]
+    fn model_favorites_negotiates_capability_and_falls_back_to_client_preferences_when_peer_lacks_it()
+     {
+        let (mut state, mut server, mut commands) = tab_client();
+        // When peer lacks MODEL_FAVORITES capability, favorites live locally in Preferences.
+        assert!(!state.supports_model_favorites());
+        state.toggle_model_favorite("codex", "gpt-5.6-sol");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            state.effective_model_favorites(),
+            &[crate::model_picker::ModelFavorite {
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+            }]
+        );
+        // Persistence roundtrip in Preferences (ui_snapshot)
+        let ui = state.ui_snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_ui(&ui).unwrap();
+        assert_eq!(restored.preferences.model_favorites.len(), 1);
+
+        // When peer advertises MODEL_FAVORITES capability, favorites migrate and sync via settings.modelFavorites.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_FAVORITES]});
+        assert!(state.supports_model_favorites());
+        state.apply_projection(server.projection()).unwrap();
+        let migrate = commands.try_recv().unwrap();
+        assert_eq!(migrate.method, "settings.modelFavorites");
+        server.execute_command(&migrate).unwrap();
+        assert_eq!(server.model_favorites.as_ref().unwrap().len(), 1);
+
+        state.toggle_model_favorite("pi", "cpa/opus");
+        let add_cmd = commands.try_recv().unwrap();
+        assert_eq!(add_cmd.method, "settings.modelFavorites");
+        assert_eq!(add_cmd.params["provider"], "pi");
+        assert_eq!(add_cmd.params["model"], "cpa/opus");
+        assert_eq!(add_cmd.params["favorite"], true);
+        server.execute_command(&add_cmd).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.effective_model_favorites().len(), 2);
+    }
+
+    #[test]
+    fn catalog_refresh_on_open_gates_on_capability_and_sends_model_catalog_only() {
+        let (mut state, mut server, mut commands) = tab_client();
+        // Older peer without MODEL_CATALOG_REFRESH: opening picker skips modelCatalogOnly RPC.
+        assert!(!state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        assert!(commands.try_recv().is_err());
+
+        // Capable peer: opening picker sends catalog.refresh { modelCatalogOnly: true }.
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_CATALOG_REFRESH]});
+        assert!(state.supports_model_catalog_refresh());
+        state.open_model_picker(SettingsPicker::Model);
+        let on_open = commands.try_recv().unwrap();
+        assert_eq!(on_open.method, "catalog.refresh");
+        assert_eq!(on_open.params["modelCatalogOnly"], true);
+        server.execute_command(&on_open).unwrap();
+
+        // Explicit retry-catalog sends catalog.refresh { force: true } (not modelCatalogOnly).
+        state.force_refresh_catalog();
+        let retry = commands.try_recv().unwrap();
+        assert_eq!(retry.method, "catalog.refresh");
+        assert_eq!(retry.params["force"], true);
+        assert!(retry.params.get("modelCatalogOnly").is_none());
+    }
+
+    #[test]
+    fn model_options_gate_on_capability_and_fall_back_for_older_peers() {
+        let (mut state, mut server, mut commands) = tab_client();
+        state.select_thread(0);
+        while commands.try_recv().is_ok() {}
+        server.threads[0].harness = "claude".into();
+        server.threads[0].models = vec![crate::session::AgentModel {
+            provider: "claude".into(),
+            id: "claude-opus-5-5".into(),
+            name: "Claude Opus 5.5".into(),
+            thinking_levels: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+            capabilities: crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .map(|m| m.capabilities)
+                .unwrap_or_default(),
+            ..Default::default()
+        }];
+        server.threads[0].set_model("claude".into(), "claude-opus-5-5".into());
+        state.apply_projection(server.projection()).unwrap();
+
+        // Older peer without MODEL_OPTIONS falls back to `thinking` / `serviceTier` and refuses descriptor-only options.
+        assert!(!state.supports_model_options());
+        state.set_composer_option_sticky(
+            "effort".into(),
+            crate::model_selection::OptionValue::Str("high".into()),
+        );
+        let fallback_effort = commands.try_recv().unwrap();
+        assert_eq!(fallback_effort.method, "thread.configure");
+        assert_eq!(fallback_effort.params["thinking"], "high");
+        assert!(fallback_effort.params.get("options").is_none());
+
+        state.set_composer_option_sticky(
+            "serviceTier".into(),
+            crate::model_selection::OptionValue::Str("fast".into()),
+        );
+        let fallback_tier = commands.try_recv().unwrap();
+        assert_eq!(fallback_tier.method, "thread.configure");
+        assert_eq!(fallback_tier.params["serviceTier"], "fast");
+
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().error.is_some());
+
+        // Capable peer advertising MODEL_OPTIONS forwards descriptor `options` via thread.configure.
+        state.current_mut().error = None;
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities": [crate::protocol::MODEL_OPTIONS]});
+        assert!(state.supports_model_options());
+        state.set_composer_option_sticky(
+            "fastMode".into(),
+            crate::model_selection::OptionValue::Bool(true),
+        );
+        let cmd = commands.try_recv().unwrap();
+        assert_eq!(cmd.method, "thread.configure");
+        assert_eq!(cmd.params["options"][0]["id"], "fastMode");
+        assert_eq!(cmd.params["options"][0]["value"], true);
+        server.execute_command(&cmd).unwrap();
+        assert_eq!(
+            server.threads[0].model_options,
+            vec![crate::model_selection::ProviderOptionSelection {
+                id: "fastMode".into(),
+                value: crate::model_selection::OptionValue::Bool(true),
+            }]
+        );
     }
 }

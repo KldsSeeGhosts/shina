@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 9;
+pub const MINOR: u32 = 10;
+pub const MODEL_FAVORITES: &str = "model-favorites";
+pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
+pub const MODEL_OPTIONS: &str = "model-options";
 pub const RUN_CONTROL: &str = "run-control";
 pub const RUN_CONTROL_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to stop or resume a specific run.";
@@ -94,6 +97,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "settings.autoSettle"
         | "settings.defaultHarness"
         | "settings.threadDefaults"
+        | "settings.modelFavorites"
         | "background.keepAwake"
         | "queue.remove"
         | "queue.sendNow"

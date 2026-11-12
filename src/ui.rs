@@ -1158,12 +1158,75 @@ fn effort_name(level: &str) -> String {
 }
 
 /// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
-/// provider's mark, the model's name without its route, and the effort level.
+/// provider's mark, the model's name without its route, and descriptor-driven traits.
 fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
     let t = s.current();
+    let (resolved_instance, resolved_model_id, resolved_opts) =
+        s.resolved_composer_model_selection();
+    let entries = s.provider_instance_entries();
+    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
+    let active_model_option = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
+        .or_else(|| {
+            crate::model_picker::retained_model_while_provider_locked(
+                active_entry,
+                &[],
+                &resolved_model_id,
+            )
+        });
     let (name, _) = split_model_label(&t.model);
-    let effort = effort_name(&t.thinking);
-    let both_default = name == crate::model::DEFAULT_MODEL && t.thinking.is_empty();
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let primary_is_prompt_controlled = descriptors
+        .iter()
+        .find(|d| {
+            matches!(
+                d,
+                crate::descriptors::ProviderOptionDescriptor::Select { .. }
+            )
+        })
+        .is_some_and(|d| match d {
+            crate::descriptors::ProviderOptionDescriptor::Select {
+                prompt_injected_values,
+                ..
+            } => !prompt_injected_values.is_empty(),
+            _ => false,
+        })
+        && prompt_ultrathink != crate::descriptors::PromptUltrathink::None;
+    let selection = crate::model_selection::ModelSelection {
+        instance_id: resolved_instance.clone(),
+        model: resolved_model_id.clone(),
+        options: resolved_opts.clone(),
+    };
+    let display = crate::descriptors::build_traits_trigger_display(
+        &descriptors,
+        primary_is_prompt_controlled,
+        Some(&selection),
+        None,
+    );
+    let fallback_thinking = resolved_opts
+        .iter()
+        .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
+        .and_then(|o| o.value.as_str())
+        .unwrap_or(&t.thinking);
+    let effort = if !display.label.is_empty() && controls.effort.is_some() {
+        display
+            .effort_label
+            .clone()
+            .unwrap_or_else(|| effort_name(fallback_thinking))
+    } else if primary_is_prompt_controlled {
+        "Ultrathink".into()
+    } else {
+        effort_name(fallback_thinking)
+    };
+    let both_default = name == crate::model::DEFAULT_MODEL
+        && fallback_thinking.is_empty()
+        && display.speed_label.is_none()
+        && !display.ultracode
+        && display.context_window.is_none();
     let mut trigger = row()
         .key("model-effort")
         .role("button")
@@ -1188,12 +1251,24 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
     if !locked {
         trigger = trigger.on_press(|s: &mut State| {
             s.begin_composer_menu();
-            s.settings_picker = Some(SettingsPicker::Thinking);
-            s.thinking_drag = None;
-            s.refresh_catalog();
+            s.open_model_picker(SettingsPicker::Thinking);
         });
     }
-    trigger
+    let trigger_unavailable = active_model_option
+        .as_ref()
+        .is_some_and(|m| m.is_unavailable);
+    let display_name = active_model_option
+        .as_ref()
+        .map(|m| {
+            crate::model_picker::get_display_model_name(
+                &m.name,
+                m.short_name.as_deref(),
+                m.sub_provider.as_deref(),
+                true,
+            )
+        })
+        .unwrap_or_else(|| name.to_owned());
+    let mut trigger = trigger
         .child(provider_icon(
             s,
             p,
@@ -1201,27 +1276,94 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             14.0,
         ))
         .child(
-            label(name, TextStyle::new(13.0, 600.0), p.ink)
+            label(&display_name, TextStyle::new(13.0, 600.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
-        )
-        // "Default model" and a "Default" level say the same thing twice, so the level drops out.
-        .child(if both_default {
-            el()
-        } else {
-            pixel_text(effort, p.muted).truncate().shrink().min_w(0.0)
-        })
+        );
+    if !both_default {
+        trigger = trigger.child(pixel_text(effort, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if display.speed_label.is_some() {
+        trigger = trigger.child(icon("bolt", p.brass));
+    }
+    if display.ultracode {
+        trigger = trigger.child(icon("workflow", p.sea));
+    }
+    if let Some(cw) = &display.context_window {
+        trigger = trigger.child(pixel_text(cw, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if trigger_unavailable {
+        trigger = trigger.child(outlined(
+            pixel_text("Unavailable", p.muted)
+                .px(4.0)
+                .py(1.0)
+                .radius(4.0),
+            p,
+        ));
+    }
+    trigger
 }
 
 const PICKER_WIDTH: f32 = 320.0;
 
-/// The model and reasoning popover. Its effort half is Codex's slider in Shina's colours; its
-/// model half drills into KSG Code's searchable, provider-grouped list in place.
+/// Ported from KSG Code's `ProviderModelPicker` + `ComposerModelEffort`: docked model list on
+/// the left, effort slider and descriptor options on the right, and speed/ultracode/permissions
+/// in the footer. Stacks vertically below 640 px.
 fn settings_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let is_model = s.settings_picker == Some(SettingsPicker::Model);
     let can_choose = !t.status.busy() && !t.configuring;
+    let stacked = s.viewport_width <= 640.0;
+    let width = if stacked {
+        (s.viewport_width - 16.0).clamp(280.0, 380.0)
+    } else {
+        544.0_f32.min((s.viewport_width - 16.0).max(320.0))
+    };
+    let list_max_h = if stacked { 180.0 } else { 296.0 };
+
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
+    let model_label = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
+        .map(|m| {
+            crate::model_picker::get_display_model_name(
+                &m.name,
+                m.short_name.as_deref(),
+                m.sub_provider.as_deref(),
+                true,
+            )
+        })
+        .unwrap_or_else(|| split_model_label(&t.model).0.to_owned());
+
+    let left_col = model_list(
+        s,
+        p,
+        can_choose,
+        list_max_h,
+        col().key("model-picker-list-col").grow(1.0).min_w(0.0),
+        is_model,
+    );
+    let right_col = effort_column(s, p, can_choose, stacked, &model_label, &controls);
+
+    let body = if stacked {
+        col()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(rule(p))
+            .child(right_col)
+    } else {
+        row()
+            .w_full()
+            .min_w(0.0)
+            .child(left_col)
+            .child(el().w(1.0).h_full().fill(p.line))
+            .child(right_col)
+    };
     let mut card = col()
         .key("pi-settings-picker")
         .role("dialog")
@@ -1230,20 +1372,13 @@ fn settings_picker(s: &State, p: Palette) -> El {
         } else {
             "Model and reasoning"
         })
-        .w(PICKER_WIDTH)
+        .w(width)
         .radius(6.0)
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
-        .on_press(|_: &mut State| {});
-    card = if is_model {
-        model_list(s, p, can_choose, 320.0, card)
-    } else {
-        card.child(effort_slider(t, s.thinking_drag, p, can_choose))
-            .child(service_tier_picker(t, p, can_choose))
-            .child(rule(p))
-            .child(model_row(s, p))
-    };
+        .on_press(|_: &mut State| {})
+        .child(body);
     if let Some(error) = &t.error {
         card = card.child(
             label(error, SMALL, p.danger)
@@ -1252,33 +1387,594 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 .pb(10.0),
         );
     }
-    if t.harness == "pi"
-        && let Some(error) = &s.catalog.error
-    {
-        if !is_model {
-            card = card.child(label(error, SMALL, p.danger).wrap_anywhere().px(16.0));
-        }
-        card = card.child(
-            button("retry-catalog", "Retry", p, |s| s.refresh_catalog())
-                .ml(10.0)
-                .mb(8.0),
-        );
-    }
-    if let (_, Some(error)) = s.native_catalog_status(&t.harness) {
-        card = card.child(label(format!("{error}\nModels will be read when a session starts. Refresh models to retry discovery."),
-            SMALL, p.muted).key("native-catalog-error").wrap_anywhere().px(16.0).py(8.0));
-    }
     card = card
         .child(rule(p))
-        .child(composer_ui::permissions_section(s, p));
+        .child(composer_picker_footer(s, p, can_choose, &controls));
+    if let Some(open_id) = &s.open_option_menu
+        && let Some(
+            desc @ crate::descriptors::ProviderOptionDescriptor::Select {
+                id,
+                options,
+                current_value,
+                ..
+            },
+        ) = controls.others.iter().find(|d| d.id() == open_id)
+    {
+        let choices = crate::descriptors::selectable_provider_option_choices(desc);
+        let current_id = current_value
+            .as_deref()
+            .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+            .unwrap_or("");
+        let mut choice_col = col()
+            .key(format!("option-popup-{id}"))
+            .w(220.0)
+            .padding(4.0)
+            .gap(2.0)
+            .radius(6.0)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .box_shadow(hard_shadow(p));
+        for choice in choices {
+            let selected = choice.id == current_id;
+            let oid = id.clone();
+            let cid = choice.id.clone();
+            let mut crow = row()
+                .key(format!("option-choice-{id}-{}", choice.id))
+                .role("menuitemradio")
+                .checked(selected)
+                .focusable(can_choose)
+                .px(8.0)
+                .py(5.0)
+                .gap(6.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Str(cid.clone()),
+                    );
+                    s.open_option_menu = None;
+                })
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(label(&choice.label, SMALL, p.ink).truncate())
+                        .child(if let Some(d) = &choice.description {
+                            label(d, TextStyle::new(11.0, 400.0), p.muted).wrap()
+                        } else {
+                            el()
+                        }),
+                );
+            if choice.is_default {
+                crow = crow.child(pixel_text("Default", p.muted));
+            }
+            if selected {
+                crow = crow.child(icon("check", p.sea));
+            }
+            choice_col = choice_col.child(crow);
+        }
+        card = card.child(choice_col.anchored_fit(
+            format!("option-menu-{id}"),
+            if stacked {
+                rune::Side::Bottom
+            } else {
+                rune::Side::Right
+            },
+            rune::Align::Start,
+            6.0,
+        ));
+    }
     // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
     // layer draws over the page and shifts the card to stay inside the window.
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
             s.settings_picker = None;
+            s.open_option_menu = None;
             s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
         })
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerEffortColumn`).
+fn effort_column(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    stacked: bool,
+    model_label: &str,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let header_title = controls
+        .effort
+        .as_ref()
+        .map(|d| d.label().to_owned())
+        .unwrap_or_else(|| {
+            if controls.others.is_empty() {
+                "Effort".into()
+            } else {
+                "Options".into()
+            }
+        });
+
+    let mut column = col()
+        .key("model-picker-effort")
+        .w(if stacked { f32::NAN } else { 196.0 })
+        .w_full()
+        .shrink()
+        .min_w(0.0);
+    if !stacked {
+        column = column.w(196.0);
+    }
+    column = column
+        .child(
+            row()
+                .center_y()
+                .gap(8.0)
+                .px(12.0)
+                .py(10.0)
+                .child(label(&header_title, SMALL, p.muted))
+                .child(spacer())
+                .child(
+                    label(model_label, SMALL, p.muted)
+                        .key("effort-model-label")
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        )
+        .child(rule(p));
+
+    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
+    let ultrathink_in_body = controls.effort.as_ref().is_some_and(|d| match d {
+        crate::descriptors::ProviderOptionDescriptor::Select {
+            prompt_injected_values,
+            ..
+        } => !prompt_injected_values.is_empty(),
+        _ => false,
+    }) && prompt_ultrathink == crate::descriptors::PromptUltrathink::Body;
+
+    let mut body = col()
+        .w_full()
+        .gap(4.0)
+        .pb(8.0)
+        .max_h(if stacked { 256.0 } else { 300.0 })
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+
+    let mut rendered_effort = false;
+    match &controls.effort {
+        Some(crate::descriptors::ProviderOptionDescriptor::Select {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let choices = crate::descriptors::selectable_provider_option_choices(
+                controls.effort.as_ref().unwrap(),
+            );
+            let levels: Vec<String> = if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            };
+            let current = current_value
+                .clone()
+                .filter(|v| levels.iter().any(|l| l == v))
+                .unwrap_or_else(|| t.thinking.clone());
+            if ultrathink_in_body {
+                body = body.child(
+                    label(crate::descriptors::ULTRATHINK_IN_BODY_NOTE, SMALL, p.muted)
+                        .key("ultrathink-lock-note")
+                        .wrap()
+                        .px(12.0)
+                        .pt(8.0),
+                );
+            }
+            body = body.child(effort_slider_with_levels(
+                &levels,
+                &current,
+                s.thinking_drag,
+                p,
+                can_choose && !ultrathink_in_body,
+                desc_id,
+            ));
+            rendered_effort = true;
+        }
+        Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+            id, current_value, ..
+        }) => {
+            let desc_id = id.clone();
+            let on = *current_value == Some(true);
+            for (label_text, val) in [("On", true), ("Off", false)] {
+                let checked = on == val;
+                let oid = desc_id.clone();
+                body = body.child(
+                    row()
+                        .key(format!("effort-bool-{desc_id}-{val}"))
+                        .role("radio")
+                        .checked(checked)
+                        .focusable(can_choose)
+                        .disabled(!can_choose)
+                        .h(30.0)
+                        .mx(6.0)
+                        .px(8.0)
+                        .center_y()
+                        .radius(4.0)
+                        .fill(if checked {
+                            p.selected
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .hover(p.selected)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_press(move |s: &mut State| {
+                            s.set_composer_option_sticky(
+                                oid.clone(),
+                                crate::model_selection::OptionValue::Bool(val),
+                            );
+                        })
+                        .child(label(label_text, SMALL, p.ink).grow(1.0))
+                        .child(if checked { icon("check", p.sea) } else { el() }),
+                );
+            }
+            rendered_effort = true;
+        }
+        None if !t.thinking_levels.is_empty() => {
+            let fallback_id = match t.harness.as_str() {
+                "pi" => "thinking",
+                "codex" => "reasoningEffort",
+                _ => "effort",
+            };
+            body = body.child(effort_slider_with_levels(
+                &t.thinking_levels,
+                &t.thinking,
+                s.thinking_drag,
+                p,
+                can_choose,
+                fallback_id.into(),
+            ));
+            rendered_effort = true;
+        }
+        None => {}
+    }
+
+    if !rendered_effort && controls.others.is_empty() {
+        body = body.child(
+            label("No effort levels", SMALL, p.muted)
+                .key("no-effort-levels")
+                .px(12.0)
+                .py(10.0),
+        );
+    }
+
+    if !controls.others.is_empty() {
+        if rendered_effort {
+            body = body.child(rule(p).mx(8.0));
+        }
+        for desc in &controls.others {
+            match desc {
+                crate::descriptors::ProviderOptionDescriptor::Boolean {
+                    id,
+                    label: opt_label,
+                    current_value,
+                    ..
+                } => {
+                    let on = *current_value == Some(true);
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-switch-{id}"))
+                            .role("switch")
+                            .checked(on)
+                            .label(format!("{opt_label}: {}", if on { "On" } else { "Off" }))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(8.0)
+                            .center_y()
+                            .radius(4.0)
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                s.set_composer_option_sticky(
+                                    oid.clone(),
+                                    crate::model_selection::OptionValue::Bool(!on),
+                                );
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(label(
+                                        if on { "On" } else { "Off" },
+                                        TextStyle::new(13.0, 450.0),
+                                        p.ink,
+                                    )),
+                            )
+                            .child({
+                                let mut track = row()
+                                    .w(28.0)
+                                    .h(16.0)
+                                    .radius(8.0)
+                                    .padding(2.0)
+                                    .center_y()
+                                    .fill(if on { p.coral } else { p.line });
+                                if on {
+                                    track = track.justify_end();
+                                }
+                                track.child(el().size(12.0, 12.0).radius(6.0).fill(p.card))
+                            }),
+                    );
+                }
+                crate::descriptors::ProviderOptionDescriptor::Select {
+                    id,
+                    label: opt_label,
+                    options,
+                    current_value,
+                    ..
+                } => {
+                    let choices = crate::descriptors::selectable_provider_option_choices(desc);
+                    let current_id = current_value
+                        .as_deref()
+                        .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+                        .unwrap_or("");
+                    let current_label = choices
+                        .iter()
+                        .find(|c| c.id == current_id)
+                        .map(|c| c.label.as_str())
+                        .unwrap_or(current_id);
+                    let is_open = s.open_option_menu.as_deref() == Some(id.as_str());
+                    let oid = id.clone();
+                    body = body.child(
+                        row()
+                            .key(format!("option-menu-{id}"))
+                            .role("button")
+                            .label(format!("{opt_label}: {current_label}"))
+                            .focusable(can_choose)
+                            .disabled(!can_choose)
+                            .mx(6.0)
+                            .px(8.0)
+                            .py(6.0)
+                            .gap(6.0)
+                            .center_y()
+                            .radius(4.0)
+                            .fill(if is_open {
+                                p.selected
+                            } else {
+                                Color::TRANSPARENT
+                            })
+                            .hover(p.selected)
+                            .cursor(rune::Cursor::Pointer)
+                            .on_press(move |s: &mut State| {
+                                if s.open_option_menu.as_deref() == Some(oid.as_str()) {
+                                    s.open_option_menu = None;
+                                } else {
+                                    s.open_option_menu = Some(oid.clone());
+                                }
+                            })
+                            .child(
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .child(label(opt_label, SMALL, p.muted).truncate())
+                                    .child(
+                                        label(current_label, TextStyle::new(13.0, 450.0), p.ink)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(icon(if is_open { "chevron" } else { "open" }, p.muted)),
+                    );
+                }
+            }
+        }
+    }
+
+    column.child(body)
+}
+
+/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerPickerFooter`, `SpeedControl`, `UltracodeControl`).
+fn composer_picker_footer(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
+    let mut footer = row()
+        .key("picker-footer")
+        .w_full()
+        .center_y()
+        .flex_wrap()
+        .gap(8.0)
+        .px(12.0)
+        .py(8.0);
+
+    // SpeedControl: serviceTier select descriptor, legacy model.service_tiers, or fastMode boolean
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Select {
+        options,
+        current_value,
+        ..
+    }) = &controls.speed_select
+    {
+        let selected = t.harness_state["serviceTier"]
+            .as_str()
+            .or_else(|| current_value.as_deref())
+            .unwrap_or("default");
+        let mut group = row()
+            .key("service-tier-picker")
+            .role("radiogroup")
+            .label("Service Tier")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line);
+        for (index, opt) in options.iter().enumerate() {
+            let on = selected == opt.id;
+            let oid = opt.id.clone();
+            let mut seg = row()
+                .key(format!("service-tier-{index}"))
+                .role("radio")
+                .label(&opt.label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(24.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .fill(if on { p.selected } else { Color::TRANSPARENT })
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_service_tier_sticky(oid.clone());
+                });
+            if let Some(desc) = &opt.description {
+                seg = seg.help(desc);
+            }
+            if opt.label == "Fast" || opt.label == "Ultrafast" {
+                seg = seg.child(icon("bolt", if on { p.brass } else { p.muted }));
+            }
+            seg = seg.child(label(&opt.label, SMALL, if on { p.ink } else { p.muted }));
+            group = group.child(seg);
+        }
+        footer = footer.child(group);
+    } else if !t
+        .models
+        .iter()
+        .find(|m| m.id == t.model_id && m.provider == "codex")
+        .is_none_or(|m| m.service_tiers.is_empty())
+    {
+        footer = footer.child(service_tier_picker(t, p, can_choose));
+    } else if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        current_value,
+        ..
+    }) = &controls.fast_toggle
+    {
+        let is_fast = *current_value == Some(true);
+        let group = row()
+            .key("fast-mode-picker")
+            .role("radiogroup")
+            .label("Fast Mode")
+            .gap(2.0)
+            .padding(2.0)
+            .radius(6.0)
+            .fill(p.bg)
+            .border(1.0, p.line)
+            .child(
+                row()
+                    .key("fast-mode-off")
+                    .role("radio")
+                    .label("Standard")
+                    .checked(!is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if !is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(false),
+                        );
+                    })
+                    .child(label(
+                        "Standard",
+                        SMALL,
+                        if !is_fast { p.ink } else { p.muted },
+                    )),
+            )
+            .child(
+                row()
+                    .key("fast-mode-on")
+                    .role("radio")
+                    .label("Fast")
+                    .checked(is_fast)
+                    .focusable(can_choose)
+                    .disabled(!can_choose)
+                    .h(24.0)
+                    .px(8.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(4.0)
+                    .fill(if is_fast {
+                        p.selected
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(p.selected)
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(|s: &mut State| {
+                        s.set_composer_option_sticky(
+                            "fastMode".into(),
+                            crate::model_selection::OptionValue::Bool(true),
+                        );
+                    })
+                    .child(icon("bolt", if is_fast { p.brass } else { p.muted }))
+                    .child(label("Fast", SMALL, if is_fast { p.ink } else { p.muted })),
+            );
+        footer = footer.child(group);
+    }
+
+    if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
+        id,
+        label: ultra_label,
+        current_value,
+        ..
+    }) = &controls.ultracode_toggle
+    {
+        let on = *current_value == Some(true);
+        let oid = id.clone();
+        footer = footer.child(
+            row()
+                .key("ultracode-toggle")
+                .role("button")
+                .label(ultra_label)
+                .checked(on)
+                .focusable(can_choose)
+                .disabled(!can_choose)
+                .h(28.0)
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .radius(6.0)
+                .fill(if on { p.selected } else { p.bg })
+                .border(1.0, p.line)
+                .hover(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_composer_option_sticky(
+                        oid.clone(),
+                        crate::model_selection::OptionValue::Bool(!on),
+                    );
+                })
+                .child(icon("workflow", if on { p.sea } else { p.muted }))
+                .child(label(ultra_label, SMALL, if on { p.ink } else { p.muted })),
+        );
+    }
+
+    footer = footer.child(composer_ui::permissions_section(s, p));
+    footer
 }
 
 /// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
@@ -1339,8 +2035,7 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .child(label(name, SMALL, if on { p.ink } else { p.muted }).truncate())
                 .on_press(move |s: &mut State| {
-                    s.current_mut().set_service_tier(id.clone());
-                    s.checkpoint();
+                    s.set_composer_service_tier_sticky(id.clone());
                 }),
         );
     }
@@ -1413,10 +2108,17 @@ fn slider_curve(dragging: bool) -> rune::Curve {
     )
 }
 
-fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool) -> El {
-    let levels = t.thinking_levels.clone();
+fn effort_slider_with_levels(
+    levels: &[String],
+    active_level: &str,
+    dragging: Option<f32>,
+    p: Palette,
+    can_choose: bool,
+    option_id: String,
+) -> El {
+    let levels = levels.to_vec();
     let count = levels.len();
-    let current = levels.iter().position(|level| *level == t.thinking);
+    let current = levels.iter().position(|level| *level == active_level);
     // While held, the thumb follows the pointer and the title names the nearest level.
     let held = dragging.filter(|_| count > 1).map(|f| f.clamp(0.0, 1.0));
     let shown = held
@@ -1424,7 +2126,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .or(current);
     let title = shown
         .and_then(|index| levels.get(index))
-        .map_or_else(|| effort_name(&t.thinking), |level| effort_name(level));
+        .map_or_else(|| effort_name(active_level), |level| effort_name(level));
     let mut section = col()
         .key("effort-section")
         .px(16.0)
@@ -1466,7 +2168,7 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         .key("effort-slider")
         .role("slider")
         .label("Reasoning effort")
-        .a11y_value(effort_name(&t.thinking))
+        .a11y_value(effort_name(active_level))
         .h(SLIDER_H)
         .w_full()
         .motion(rune::Spring::new(0.3, 0.0))
@@ -1562,6 +2264,9 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
         let keyed = levels.clone();
         let dragged = levels.clone();
         let ends = levels.clone();
+        let oid_step = option_id.clone();
+        let oid_limit = option_id.clone();
+        let oid_drag = option_id;
         slider = slider
             // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
             .on_step(move |s: &mut State, delta, tx| {
@@ -1573,8 +2278,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                 let next = (at + delta).clamp(0, last) as usize;
                 if next as i32 != at {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(keyed[next].clone());
-                    s.checkpoint();
+                    s.set_composer_option_sticky(
+                        oid_step.clone(),
+                        crate::model_selection::OptionValue::Str(keyed[next].clone()),
+                    );
                 }
             })
             .on_step_limit(move |s: &mut State, max, tx| {
@@ -1583,8 +2290,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     && level != s.current().thinking
                 {
                     tx.motion_curve(slider_curve(false));
-                    s.current_mut().set_thinking(level);
-                    s.checkpoint();
+                    s.set_composer_option_sticky(
+                        oid_limit.clone(),
+                        crate::model_selection::OptionValue::Str(level),
+                    );
                 }
             })
             .on_drag(move |s: &mut State, drag, tx| {
@@ -1600,8 +2309,10 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
                     tx.motion_curve(slider_curve(false));
                     s.thinking_drag = None;
                     if dragged[index] != s.current().thinking {
-                        s.current_mut().set_thinking(dragged[index].clone());
-                        s.checkpoint();
+                        s.set_composer_option_sticky(
+                            oid_drag.clone(),
+                            crate::model_selection::OptionValue::Str(dragged[index].clone()),
+                        );
                     }
                 } else {
                     // A press glides to the pointer; a drag follows it closely.
@@ -1626,110 +2337,457 @@ fn effort_slider(t: &Thread, dragging: Option<f32>, p: Palette, can_choose: bool
     )
 }
 
-fn model_row(s: &State, p: Palette) -> El {
-    let t = s.current();
-    let (name, route) = split_model_label(&t.model);
-    let mut text = col().gap(1.0).grow(1.0).min_w(0.0).child(
-        label(name, TextStyle::new(13.5, 500.0), p.ink)
-            .truncate()
-            .min_w(0.0),
-    );
-    if let Some(route) = route {
-        text = text.child(label(route, SMALL, p.muted).truncate().min_w(0.0));
-    }
-    row()
-        .key("open-model-list")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("Model: {}. Choose another model", t.model))
-        .focusable(true)
-        .center_y()
-        .gap(10.0)
-        .pl(16.0)
-        .pr(12.0)
-        .py(10.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(|s: &mut State| {
-            s.model_search.replace_text("");
-            s.settings_picker = Some(SettingsPicker::Model);
-        })
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&t.model_id, &t.model),
-            18.0,
-        ))
-        .child(text)
-        .child(icon("open", p.muted))
+struct PickerSnapshot {
+    entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    sidebar_entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    selected_tab: crate::model_picker::ModelPickerTab,
+    is_searching: bool,
+    locked_disabled_ids: std::collections::HashSet<String>,
+    selectable_unavailable_ids: std::collections::HashSet<String>,
+    favorites_set: std::collections::HashSet<String>,
+    visible_models: Vec<crate::model_picker::ModelPickerItem>,
+    legacy_section: Option<(String, bool)>,
+    setup_entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    update_required_notices: Vec<(String, String)>,
 }
 
-/// Harness rows reuse KSG Code's ModelPickerContent groups and ModelListRow proportions.
-fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> El {
+fn picker_snapshot(s: &State) -> PickerSnapshot {
+    use crate::model_picker::{
+        ModelPickerItem, ModelPickerSearchableModel, ModelPickerTab,
+        is_provider_instance_picker_ready, is_provider_instance_picker_visible,
+        matches_locked_provider, provider_model_key, rank_model_picker_search,
+        should_include_model_picker_option, should_offer_model_picker_setup,
+        sort_provider_model_items, split_legacy_models,
+    };
+
     let t = s.current();
-    let header = row()
-        .center_y()
-        .gap(8.0)
-        .px(12.0)
-        .py(10.0)
-        .child(icon_button(
-            "back-to-effort",
-            "Back to reasoning",
-            "back",
-            p,
-            |s| s.settings_picker = Some(SettingsPicker::Thinking),
-        ))
+    let entries = s.provider_instance_entries();
+    let options_by_instance = s.picker_models_by_instance();
+    let favorites = s.effective_model_favorites();
+    let favorites_set: std::collections::HashSet<String> = favorites
+        .iter()
+        .map(|f| provider_model_key(&f.provider, &f.model))
+        .collect();
+    let locked_provider = s.locked_provider_for_current();
+    let is_searching = !s.model_search.text.trim().is_empty();
+
+    let selected_tab = s
+        .model_picker_tab
+        .clone()
+        .unwrap_or_else(|| ModelPickerTab::Instance(t.harness.clone()));
+
+    let mut locked_disabled_ids = std::collections::HashSet::new();
+    if locked_provider.is_some() {
+        for entry in &entries {
+            if !matches_locked_provider(entry, locked_provider.as_deref(), None) {
+                locked_disabled_ids.insert(entry.instance_id.clone());
+            }
+        }
+    }
+
+    let mut selectable_unavailable_ids = std::collections::HashSet::new();
+    if let Some(active_entry) = entries.iter().find(|e| e.instance_id == t.harness)
+        && !is_provider_instance_picker_ready(active_entry)
+        && options_by_instance.get(&t.harness).is_some_and(|opts| {
+            opts.iter().any(|opt| {
+                should_include_model_picker_option(active_entry, opt, &t.harness, &t.model_id)
+            })
+        })
+    {
+        selectable_unavailable_ids.insert(t.harness.clone());
+    }
+    for entry in &entries {
+        let opts = options_by_instance
+            .get(&entry.instance_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if should_offer_model_picker_setup(entry, opts) {
+            selectable_unavailable_ids.insert(entry.instance_id.clone());
+        }
+    }
+
+    let sidebar_entries = {
+        let visible: Vec<_> = entries
+            .iter()
+            .filter(|e| is_provider_instance_picker_visible(e))
+            .cloned()
+            .collect();
+        if locked_provider.is_none() {
+            visible
+        } else {
+            let mut available = Vec::new();
+            let mut disabled = Vec::new();
+            for entry in visible {
+                if matches_locked_provider(&entry, locked_provider.as_deref(), None) {
+                    available.push(entry);
+                } else {
+                    disabled.push(entry);
+                }
+            }
+            available.extend(disabled);
+            available
+        }
+    };
+
+    let mut flat_models = Vec::new();
+    for entry in &entries {
+        let opts = options_by_instance
+            .get(&entry.instance_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (catalog_index, model) in opts.iter().enumerate() {
+            if !should_include_model_picker_option(entry, model, &t.harness, &t.model_id) {
+                continue;
+            }
+            flat_models.push(ModelPickerItem {
+                slug: model.slug.clone(),
+                name: model.name.clone(),
+                short_name: model.short_name.clone(),
+                sub_provider: model.sub_provider.clone(),
+                badge: model.badge.clone(),
+                is_legacy: model.is_legacy,
+                is_unavailable: model.is_unavailable,
+                instance_id: entry.instance_id.clone(),
+                driver_kind: entry.driver_kind.clone(),
+                instance_display_name: entry.display_name.clone(),
+                continuation_group_key: entry.continuation_group_key.clone(),
+                catalog_index,
+            });
+        }
+    }
+
+    let instance_order: Vec<String> = entries.iter().map(|e| e.instance_id.clone()).collect();
+    let entry_by_id: std::collections::HashMap<&str, &crate::model_picker::ProviderInstanceEntry> =
+        entries
+            .iter()
+            .map(|e| (e.instance_id.as_str(), e))
+            .collect();
+
+    let filtered_models: Vec<ModelPickerItem> = if is_searching {
+        let candidates: Vec<ModelPickerItem> = if locked_provider.is_some() {
+            flat_models
+                .into_iter()
+                .filter(|m| {
+                    entry_by_id.get(m.instance_id.as_str()).is_some_and(|e| {
+                        matches_locked_provider(e, locked_provider.as_deref(), None)
+                    })
+                })
+                .collect()
+        } else {
+            flat_models
+        };
+        rank_model_picker_search(&candidates, &s.model_search.text, |m| {
+            ModelPickerSearchableModel {
+                driver_kind: &m.driver_kind,
+                provider_display_name: &m.instance_display_name,
+                name: &m.name,
+                short_name: m.short_name.as_deref(),
+                sub_provider: m.sub_provider.as_deref(),
+                is_favorite: favorites_set.contains(&provider_model_key(&m.instance_id, &m.slug)),
+            }
+        })
+        .into_iter()
+        .cloned()
+        .collect()
+    } else {
+        let scoped: Vec<ModelPickerItem> = flat_models
+            .into_iter()
+            .filter(|m| {
+                if locked_provider.is_some()
+                    && !entry_by_id.get(m.instance_id.as_str()).is_some_and(|e| {
+                        matches_locked_provider(e, locked_provider.as_deref(), None)
+                    })
+                {
+                    return false;
+                }
+                match &selected_tab {
+                    ModelPickerTab::Favorites => {
+                        favorites_set.contains(&provider_model_key(&m.instance_id, &m.slug))
+                    }
+                    ModelPickerTab::Instance(id) => &m.instance_id == id,
+                }
+            })
+            .collect();
+        let is_fav_tab = matches!(selected_tab, ModelPickerTab::Favorites);
+        sort_provider_model_items(
+            &scoped,
+            |m| &m.instance_id,
+            |m| &m.slug,
+            &favorites_set,
+            !is_fav_tab,
+            if is_fav_tab { &instance_order } else { &[] },
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    };
+
+    let is_fav_tab = matches!(selected_tab, ModelPickerTab::Favorites);
+    let (current_models, legacy_models) =
+        split_legacy_models(filtered_models, is_searching, is_fav_tab, &favorites_set);
+    let legacy_section = match &selected_tab {
+        ModelPickerTab::Instance(id) if !legacy_models.is_empty() => {
+            Some((id.clone(), s.expanded_legacy_instances.contains(id)))
+        }
+        _ => None,
+    };
+    let mut visible_models = current_models;
+    if let Some((_, true)) = legacy_section {
+        visible_models.extend(legacy_models);
+    }
+
+    let selected_instance_id = match &selected_tab {
+        ModelPickerTab::Instance(id) => Some(id.as_str()),
+        ModelPickerTab::Favorites => None,
+    };
+    let setup_entries: Vec<_> = if !is_searching {
+        entries
+            .iter()
+            .filter(|entry| {
+                let opts = options_by_instance
+                    .get(&entry.instance_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                matches_locked_provider(entry, locked_provider.as_deref(), None)
+                    && should_offer_model_picker_setup(entry, opts)
+                    && selected_instance_id.is_none_or(|id| entry.instance_id == id)
+                    && (selected_instance_id.is_some() || visible_models.is_empty())
+            })
+            .cloned()
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let mut update_required_notices = Vec::new();
+    for entry in &entries {
+        let shown = if is_searching {
+            matches_locked_provider(entry, locked_provider.as_deref(), None)
+        } else {
+            selected_instance_id == Some(entry.instance_id.as_str())
+        };
+        if shown
+            && let Some(notice) = crate::model_picker::format_provider_update_required_notice(
+                &entry.driver_kind,
+                &entry.display_name,
+                &entry.update_required_models,
+                &s.model_search.text,
+            )
+        {
+            update_required_notices.push((entry.instance_id.clone(), notice));
+        }
+    }
+
+    PickerSnapshot {
+        entries,
+        sidebar_entries,
+        selected_tab,
+        is_searching,
+        locked_disabled_ids,
+        selectable_unavailable_ids,
+        favorites_set,
+        visible_models,
+        legacy_section,
+        setup_entries,
+        update_required_notices,
+    }
+}
+
+/// Ported from KSG Code's `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`, and `ModelListRow.tsx`.
+fn model_list(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    max_h: f32,
+    card: El,
+    autofocus_search: bool,
+) -> El {
+    use crate::model_picker::{
+        ModelPickerTab, describe_unavailable_instance, get_display_model_name,
+        get_provider_status_message, is_provider_instance_picker_ready, provider_model_key,
+    };
+
+    let t = s.current();
+    let snap = picker_snapshot(s);
+    let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
+
+    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+        .key("model-search")
+        .label("Search models")
+        .placeholder("Search models...", p.muted)
+        .color(p.ink)
+        .caret(p.coral, p.coral_bg)
+        .grow(1.0)
+        .min_w(0.0)
+        .on_edit(|s: &mut State| &mut s.model_search)
+        // Down from the search field goes into the list, as in KSG Code's
+        // combobox; the list's own group takes the arrows from there.
+        .on_input_key(|s: &mut State, event, tx| {
+            if (event.mods.cmd || event.mods.ctrl || event.mods.alt) && crate::key(s, event, tx) {
+                return true;
+            }
+            if matches!(event.key, rune::Key::Down)
+                && !event.mods.cmd
+                && !event.mods.ctrl
+                && !event.mods.alt
+                && !event.mods.shift
+            {
+                // The field's own focus flag would win over `tx.focus`.
+                s.model_search.focused = false;
+                tx.focus("model-list", true);
+                return true;
+            }
+            false
+        });
+    if autofocus_search {
+        search_field = search_field.autofocus();
+    }
+
+    let header = row().center_y().gap(8.0).px(12.0).py(10.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.model_search, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(search_field),
+    );
+
+    let mut sidebar = col()
+        .key("harness-group")
+        .role("toolbar")
+        .label("Providers")
+        .w(44.0)
+        .shrink()
+        .padding(4.0)
+        .gap(4.0)
+        .border(0.0, Color::TRANSPARENT);
+    let fav_selected = snap.selected_tab == ModelPickerTab::Favorites;
+    sidebar = sidebar
         .child(
             row()
-                .center_y()
-                .gap(6.0)
-                .h(30.0)
-                .px(10.0)
+                .key("choose-harness-favorites")
+                .role("button")
+                .label("Favorites")
+                .help("Favorites")
+                .cursor(rune::Cursor::Pointer)
+                .w_full()
+                .h(36.0)
+                .center()
                 .radius(4.0)
-                .fill(p.selected)
-                .field_focus(&s.model_search, p)
-                .grow(1.0)
-                .min_w(0.0)
-                .child(icon("search", p.muted))
-                .child(
-                    text_input(&s.model_search, TextStyle::new(13.0, 420.0))
-                        .key("model-search")
-                        .label("Search models")
-                        .placeholder("Search models", p.muted)
-                        .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .on_edit(|s: &mut State| &mut s.model_search)
-                        // Down from the search field goes into the list, as in KSG Code's
-                        // combobox; the list's own group takes the arrows from there.
-                        .on_input_key(|s: &mut State, event, tx| {
-                            if (event.mods.cmd || event.mods.ctrl || event.mods.alt)
-                                && crate::key(s, event, tx)
-                            {
-                                return true;
-                            }
-                            if matches!(event.key, rune::Key::Down)
-                                && !event.mods.cmd
-                                && !event.mods.ctrl
-                                && !event.mods.alt
-                                && !event.mods.shift
-                            {
-                                // The field's own focus flag would win over `tx.focus`.
-                                s.model_search.focused = false;
-                                tx.focus("model-list", true);
-                                return true;
-                            }
-                            false
-                        }),
-                ),
-        );
-    let query = s.model_search.text.to_lowercase();
+                .fill(if fav_selected {
+                    p.selected
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.selected)
+                .on_press(|s: &mut State| {
+                    s.model_picker_tab = Some(ModelPickerTab::Favorites);
+                })
+                .child(icon("star", if fav_selected { p.brass } else { p.muted }))
+                .child(el().w(2.0).h(18.0).fill(if fav_selected {
+                    p.coral
+                } else {
+                    Color::TRANSPARENT
+                })),
+        )
+        .child(rule(p));
+
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for entry in &snap.sidebar_entries {
+        if seen.iter().any(|(earlier_id, earlier_name)| {
+            earlier_id == &entry.instance_id && earlier_name == &entry.display_name
+        }) {
+            continue;
+        }
+        let repeats = seen
+            .iter()
+            .filter(|(earlier_id, _)| earlier_id == &entry.instance_id)
+            .count();
+        seen.push((entry.instance_id.clone(), entry.display_name.clone()));
+        let key = if repeats == 0 {
+            format!("choose-harness-{}", entry.instance_id)
+        } else {
+            format!("choose-harness-{}-{}", entry.instance_id, repeats + 1)
+        };
+
+        let is_unavailable = !is_provider_instance_picker_ready(entry);
+        let is_context_disabled = snap.locked_disabled_ids.contains(&entry.instance_id);
+        let unavailable_reachable = snap.selectable_unavailable_ids.contains(&entry.instance_id);
+        let is_disabled = (is_unavailable && !unavailable_reachable) || is_context_disabled;
+        let is_selected = snap.selected_tab == ModelPickerTab::Instance(entry.instance_id.clone());
+        let tooltip = if is_unavailable {
+            describe_unavailable_instance(entry)
+        } else if is_context_disabled {
+            format!(
+                "{} is unavailable in this thread. Start a new thread to switch providers.",
+                entry.display_name
+            )
+        } else {
+            entry.display_name.clone()
+        };
+
+        let mut btn_content = col()
+            .items_center()
+            .justify_center()
+            .gap(1.0)
+            .grow(1.0)
+            .child(harness_icon(s, p, &entry.instance_id, &entry.display_name));
+        if entry.is_acp {
+            btn_content = btn_content.child(outlined(
+                pixel_text("ACP", p.muted)
+                    .key(format!("harness-tag-{}", entry.instance_id))
+                    .px(2.0)
+                    .radius(2.0),
+                p,
+            ));
+        }
+
+        let mut item = row()
+            .key(key)
+            .role("button")
+            .label(&tooltip)
+            .help(&tooltip)
+            .checked(is_selected)
+            .disabled(is_disabled)
+            .opacity(if is_disabled { 0.5 } else { 1.0 })
+            .w_full()
+            .h(if entry.is_acp { 42.0 } else { 36.0 })
+            .center_y()
+            .radius(4.0)
+            .fill(if is_selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            });
+        if !is_disabled {
+            let target_id = entry.instance_id.clone();
+            item = item
+                .cursor(rune::Cursor::Pointer)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    s.model_picker_tab = Some(ModelPickerTab::Instance(target_id.clone()));
+                });
+        }
+        item = item
+            .child(btn_content)
+            .child(el().w(2.0).h(18.0).fill(if is_selected {
+                p.coral
+            } else {
+                Color::TRANSPARENT
+            }));
+        sidebar = sidebar.child(item);
+    }
+
     let mut list = col()
         .key("model-list")
         .role("listbox")
         .label("Models")
-        // Up, Down, Home and End move through the harnesses and models, Return chooses.
         .focus_group()
         .w_full()
         .max_h(max_h)
@@ -1737,143 +2795,117 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
-    let mut group: Option<String> = None;
-    let mut count = 0;
-    list = list.child(
-        pixel_label("Harness", p.muted)
-            .key("harness-group")
-            .px(16.0)
-            .pt(8.0)
-            .pb(4.0),
-    );
-    let harnesses = [
-        ("pi", "Pi", false),
-        ("codex", "Codex", false),
-        ("claude", "Claude", false),
-    ]
-    .into_iter()
-    .chain(
-        s.harnesses
-            .agents
-            .iter()
-            .map(|agent| (agent.id.as_str(), agent.name.as_str(), true)),
-    );
-    let mut seen: Vec<(&str, &str)> = Vec::new();
-    for (id, name, acp) in harnesses {
-        let selected = t.harness == id;
-        let available = id != "claude" || acp || crate::claude::process().is_ok();
-        let enabled = t.can_choose_harness() && available;
-        let chosen = id.to_owned();
-        // An ACP agent can share an id with a built-in harness. One with the same name too is
-        // the same entry and is not listed twice. One with another name is listed with its
-        // ACP tag, and its key gets a suffix so keys stay unique.
-        if seen.contains(&(id, name)) {
-            continue;
-        }
-        let repeats = seen.iter().filter(|&&(earlier, _)| earlier == id).count();
-        seen.push((id, name));
-        let key = if repeats == 0 {
-            format!("choose-harness-{id}")
+
+    if let Some(error) = &s.harnesses.error {
+        list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
+    }
+
+    let mut jump_num = 0usize;
+    for (index, model) in snap.visible_models.iter().enumerate() {
+        let disabled_reason = if !can_choose {
+            Some("Model picker is disabled".to_owned())
         } else {
-            format!("choose-harness-{id}-{}", repeats + 1)
+            s.model_disabled_reason_for(&model.instance_id, &model.slug)
         };
-        let mut item = row()
-            .key(key)
-            .role("option")
-            .label(name)
-            .checked(selected)
-            .focusable(enabled)
-            .center_y()
-            .gap(10.0)
-            .h(34.0)
-            // Inset 4 px from the frame, with the same 16 px text edge as the headings.
-            .mx(4.0)
-            .pl(12.0)
-            .pr(8.0)
-            .radius(4.0)
-            .fill(if selected {
-                p.coral_bg
-            } else {
-                Color::TRANSPARENT
-            })
-            .hover(if selected { p.coral_bg } else { p.selected })
-            // Arrow keys show where they are with the hover wash.
-            .focus_fill(p.selected)
-            .focus_selected(selected)
-            .disabled(!enabled)
-            .child(harness_icon(s, p, id, name))
-            .child(
-                label(name, TextStyle::new(13.5, 450.0), p.ink)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            );
-        if acp {
-            // KSG Code's `ModelListRow` "New" tag, here naming the protocol the agent speaks.
-            item = item.child(outlined(
-                pixel_text("ACP", p.muted)
-                    .key(format!("harness-tag-{id}"))
+        let enabled = disabled_reason.is_none();
+        let jump_label = if enabled && jump_num < 9 {
+            jump_num += 1;
+            Some(format!("⌘{jump_num}"))
+        } else {
+            None
+        };
+        let is_favorite = snap
+            .favorites_set
+            .contains(&provider_model_key(&model.instance_id, &model.slug));
+        let selected = t.harness == model.instance_id && t.model_id == model.slug;
+        let display_name = get_display_model_name(
+            &model.name,
+            model.short_name.as_deref(),
+            model.sub_provider.as_deref(),
+            false,
+        );
+
+        let mut name_row = row().center_y().gap(6.0).grow(1.0).min_w(0.0).child(
+            label(&display_name, TextStyle::new(13.5, 450.0), p.ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+        if selected {
+            name_row = name_row.child(icon("check", p.sea));
+        }
+        if let Some(sub) = &model.sub_provider {
+            name_row = name_row.child(label(sub, SMALL, p.muted).truncate().shrink().min_w(0.0));
+        }
+        if model.badge.as_deref() == Some("new") {
+            name_row = name_row.child(outlined(
+                pixel_text("New", p.coral)
+                    .label("New model")
                     .px(4.0)
                     .py(1.0)
                     .radius(4.0),
                 p,
             ));
         }
-        item = item.child(spacer());
-        if selected {
-            item = item.child(icon("check", p.sea));
+        if model.is_unavailable {
+            name_row = name_row.child(outlined(
+                pixel_text("Unavailable", p.muted)
+                    .px(4.0)
+                    .py(1.0)
+                    .radius(4.0),
+                p,
+            ));
         }
+
+        let fav_provider = model.instance_id.clone();
+        let fav_slug = model.slug.clone();
+        let mut star_btn = row()
+            .key(format!("toggle-favorite-{index}"))
+            .role("button")
+            .label(if is_favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            })
+            .help(if is_favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            })
+            .focusable(false)
+            .size(22.0, 22.0)
+            .center()
+            .radius(4.0)
+            .disabled(!enabled)
+            .child(icon(
+                if is_favorite { "star" } else { "star-off" },
+                if is_favorite { p.brass } else { p.muted },
+            ));
         if enabled {
-            item = item
+            star_btn = star_btn
                 .cursor(rune::Cursor::Pointer)
+                .hover(p.selected)
                 .on_press(move |s: &mut State| {
-                    s.choose_harness(&chosen);
+                    s.toggle_model_favorite(&fav_provider, &fav_slug);
                 });
         }
-        list = list.child(item);
-        if !available {
-            list = list.child(
-                label(crate::claude::MISSING, SMALL, p.muted)
-                    .key("claude-unavailable")
-                    .wrap()
-                    .px(16.0)
-                    .py(4.0),
-            );
+
+        let mut trailing = row().center_y().gap(6.0).shrink().child(star_btn);
+        if let Some(jump) = jump_label {
+            trailing = trailing.child(keycap_chip(&jump, p));
         }
-    }
-    if let Some(error) = &s.harnesses.error {
-        list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
-    }
-    for (index, model) in t.models.iter().enumerate().filter(|(_, m)| {
-        format!("{} {} {}", m.provider, m.id, m.name)
-            .to_lowercase()
-            .contains(&query)
-    }) {
-        count += 1;
-        let (name, route) = split_model_label(&model.name);
-        let heading = route.map_or_else(|| model.provider.to_uppercase(), str::to_string);
-        if group.as_deref() != Some(heading.as_str()) {
-            list = list.child(
-                label(&heading, TextStyle::new(11.5, 600.0), p.muted)
-                    .px(16.0)
-                    .pt(8.0)
-                    .pb(4.0),
-            );
-            group = Some(heading);
-        }
-        let provider = model.provider.clone();
-        let id = model.id.clone();
-        let selected = t.model_provider == model.provider && t.model_id == model.id;
+
         let mut item = row()
             .key(format!("choose-model-{index}"))
             .role("option")
-            .label(&model.name)
+            .label(format!("{display_name}, {}", model.instance_display_name))
             .checked(selected)
-            .focusable(can_choose)
+            .focusable(enabled)
+            .disabled(!enabled)
+            .opacity(if enabled { 1.0 } else { 0.55 })
             .center_y()
-            .gap(10.0)
+            .gap(8.0)
             .h(34.0)
-            // Inset 4 px from the frame, with the same 16 px text edge as the headings.
             .mx(4.0)
             .pl(12.0)
             .pr(8.0)
@@ -1886,39 +2918,115 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             .hover(if selected { p.coral_bg } else { p.selected })
             .focus_fill(p.selected)
             .focus_selected(selected)
-            .disabled(!can_choose)
             .child(provider_icon(
                 s,
                 p,
-                model_vendor(&model.id, &model.name),
+                model_vendor(&model.slug, &model.name),
                 16.0,
             ))
-            .child(
-                label(name, TextStyle::new(13.5, 450.0), p.ink)
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            );
-        if selected {
-            item = item.child(icon("check", p.sea));
+            .child(name_row)
+            .child(trailing);
+        if let Some(reason) = &disabled_reason {
+            item = item.help(reason);
         }
-        if can_choose {
+        if enabled {
+            let instance_id = model.instance_id.clone();
+            let id = model.slug.clone();
             item = item
                 .cursor(rune::Cursor::Pointer)
                 .on_press(move |s: &mut State| {
-                    s.current_mut().set_model(provider.clone(), id.clone());
+                    s.select_model_from_picker(&instance_id, &id);
                     s.settings_picker = Some(SettingsPicker::Thinking);
-                    s.checkpoint();
                 });
         }
         list = list.child(item);
     }
-    if count == 0 {
-        let pi_error = (t.harness == "pi" && t.models.is_empty())
-            .then_some(s.catalog.error.as_deref())
-            .flatten();
-        // The harnesses end here and the models begin: a rule and a heading, so the note is
-        // plainly about models and not about the last harness.
+
+    if let Some((instance_id, expanded)) = &snap.legacy_section {
+        let toggle_id = instance_id.clone();
+        list = list.child(
+            row()
+                .key(format!("legacy-models-{instance_id}"))
+                .role("option")
+                .label(if *expanded { "Show less" } else { "Show more" })
+                .focusable(true)
+                .center_y()
+                .h(32.0)
+                .mx(4.0)
+                .px(12.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .focus_fill(p.selected)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    if !s.expanded_legacy_instances.remove(&toggle_id) {
+                        s.expanded_legacy_instances.insert(toggle_id.clone());
+                    }
+                })
+                .child(label(
+                    if *expanded { "Show less" } else { "Show more" },
+                    TextStyle::new(13.0, 450.0),
+                    p.muted,
+                )),
+        );
+    }
+
+    let selected_id = match &snap.selected_tab {
+        ModelPickerTab::Instance(id) => Some(id.as_str()),
+        ModelPickerTab::Favorites => None,
+    };
+    let active_harness = selected_id.unwrap_or(&t.harness);
+    let (pi_loading, pi_error) = if active_harness == "pi" {
+        s.pi_catalog_status()
+    } else {
+        (false, None)
+    };
+    let (native_loading, native_error) = s.native_catalog_status(active_harness);
+    let catalog_loading =
+        pi_loading || (matches!(active_harness, "codex" | "claude") && native_loading);
+    let catalog_error = pi_error.or(native_error);
+
+    if snap.visible_models.is_empty() && snap.setup_entries.is_empty() {
+        let empty_text = if snap.is_searching {
+            "No models found"
+        } else if snap.selected_tab == ModelPickerTab::Favorites {
+            "No favorites yet"
+        } else if active_harness == "claude"
+            && snap
+                .entries
+                .iter()
+                .find(|e| e.instance_id == "claude")
+                .is_some_and(|e| !e.installed)
+        {
+            crate::claude::MISSING
+        } else if matches!(active_harness, "codex" | "claude") {
+            if native_loading {
+                "Reading the harness catalog..."
+            } else if let Some(err) = native_error {
+                err
+            } else {
+                "Catalog not available. Models will be read when a session starts."
+            }
+        } else if active_harness != "pi" {
+            "This harness uses its configured model until it reports available models."
+        } else if let Some(error) = pi_error {
+            error
+        } else if s.catalog.remaining().is_some() {
+            "Reading the CPA catalog..."
+        } else {
+            "No CPA models are available."
+        };
+        let note_key = if active_harness == "claude"
+            && snap
+                .entries
+                .iter()
+                .find(|e| e.instance_id == "claude")
+                .is_some_and(|e| !e.installed)
+        {
+            "claude-unavailable"
+        } else {
+            "models-empty-note"
+        };
         list = list
             .child(rule(p).mt(6.0))
             .child(
@@ -1930,37 +3038,117 @@ fn model_list(s: &State, p: Palette, can_choose: bool, max_h: f32, card: El) -> 
             )
             .child(
                 label(
-                    if matches!(t.harness.as_str(), "codex" | "claude") && t.models.is_empty() {
-                        if s.native_catalog_status(&t.harness).0 {
-                            "Reading the harness catalog..."
-                        } else {
-                            "Catalog not available. Models will be read when a session starts."
-                        }
-                    } else if t.harness != "pi" && t.models.is_empty() {
-                        "This harness uses its configured model until it reports available models."
-                    } else if let Some(error) = pi_error {
-                        error
-                    } else if t.models.is_empty() && s.catalog.remaining().is_some() {
-                        "Reading the CPA catalog..."
-                    } else if t.models.is_empty() {
-                        "No CPA models are available."
-                    } else {
-                        "No matching models."
-                    },
+                    empty_text,
                     SMALL,
-                    if pi_error.is_some() {
+                    if catalog_error.is_some() {
                         p.danger
                     } else {
                         p.muted
                     },
                 )
-                .key("models-empty-note")
+                .key(note_key)
                 .wrap()
                 .px(16.0)
                 .py(10.0),
             );
+        if catalog_error.is_some() {
+            list = list.child(
+                button("retry-catalog", "Retry", p, |s| s.force_refresh_catalog())
+                    .ml(12.0)
+                    .mb(8.0),
+            );
+        }
     }
-    card.child(header).child(rule(p)).child(list)
+
+    let mut right_col = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .child(header)
+        .child(rule(p))
+        .child(list);
+
+    if catalog_loading && !snap.visible_models.is_empty() {
+        right_col = right_col.child(rule(p)).child(
+            label("Refreshing models...", SMALL, p.muted)
+                .key("catalog-loading")
+                .px(12.0)
+                .py(6.0),
+        );
+    }
+    if let Some(error) = catalog_error
+        && !snap.visible_models.is_empty()
+    {
+        right_col = right_col.child(rule(p)).child(
+            col()
+                .gap(4.0)
+                .px(12.0)
+                .py(6.0)
+                .child(label(error, SMALL, p.danger).wrap_anywhere())
+                .child(button("retry-catalog", "Retry", p, |s| {
+                    s.force_refresh_catalog()
+                })),
+        );
+    }
+
+    if !snap.setup_entries.is_empty() {
+        let mut setup_box = col()
+            .gap(6.0)
+            .px(12.0)
+            .py(8.0)
+            .border(0.0, Color::TRANSPARENT);
+        let multi = snap.setup_entries.len() > 1;
+        for entry in &snap.setup_entries {
+            let btn_label = if multi {
+                format!("Set up {}", entry.display_name)
+            } else {
+                "Open provider setup".to_owned()
+            };
+            setup_box = setup_box.child(
+                col()
+                    .gap(4.0)
+                    .child(label(get_provider_status_message(entry), SMALL, p.muted).wrap())
+                    .child(button(
+                        &format!("open-provider-setup-{}", entry.instance_id),
+                        &btn_label,
+                        p,
+                        |s| {
+                            s.settings_picker = None;
+                            s.open_settings();
+                            s.settings.section = 2;
+                        },
+                    )),
+            );
+        }
+        right_col = right_col.child(rule(p)).child(setup_box);
+    }
+
+    for (instance_id, notice) in &snap.update_required_notices {
+        right_col = right_col.child(rule(p)).child(
+            col()
+                .key(format!("update-required-notice-{instance_id}"))
+                .gap(4.0)
+                .px(12.0)
+                .py(8.0)
+                .child(label(notice, SMALL, p.muted).wrap())
+                .child(button(
+                    &format!("provider-settings-{instance_id}"),
+                    "Provider settings",
+                    p,
+                    |s| {
+                        s.settings_picker = None;
+                        s.open_settings();
+                        s.settings.section = 2;
+                    },
+                )),
+        );
+    }
+
+    let mut body = row().w_full().min_w(0.0);
+    if show_sidebar {
+        body = body.child(sidebar).child(el().w(1.0).h_full().fill(p.line));
+    }
+    body = body.child(right_col);
+    card.child(body)
 }
 
 /// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
@@ -9153,11 +10341,27 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
         || t.configuring
         || t.archived()
         || t.request.is_some()
-        || t.thinking_levels.is_empty()
+        || crate::descriptors::read_prompt_ultrathink(&t.draft.text)
+            == crate::descriptors::PromptUltrathink::Body
     {
         return false;
     }
-    let levels = &t.thinking_levels;
+    let descriptors = state.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let levels = match &controls.effort {
+        Some(desc @ crate::descriptors::ProviderOptionDescriptor::Select { .. }) => {
+            let choices = crate::descriptors::selectable_provider_option_choices(desc);
+            if choices.is_empty() {
+                t.thinking_levels.clone()
+            } else {
+                choices.into_iter().map(|c| c.id).collect()
+            }
+        }
+        _ => t.thinking_levels.clone(),
+    };
+    if levels.is_empty() {
+        return false;
+    }
     let current = levels
         .iter()
         .position(|level| level == &t.thinking)
@@ -9165,43 +10369,24 @@ pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool
     let next =
         (current as isize + direction).clamp(0, levels.len().saturating_sub(1) as isize) as usize;
     let level = levels[next].clone();
-    state.current_mut().set_thinking(level);
-    state.checkpoint();
+    state.set_composer_thinking_sticky(level);
     true
 }
 
 pub(crate) fn cycle_model_picker_harness(state: &mut State, direction: isize) -> bool {
-    let t = state.current();
-    if !t.can_choose_harness() {
+    let snap = picker_snapshot(state);
+    if snap.sidebar_entries.is_empty() {
         return false;
     }
-    let mut available_ids: Vec<String> = Vec::new();
-    for (id, acp) in [("pi", false), ("codex", false), ("claude", false)]
-        .into_iter()
-        .chain(
-            state
-                .harnesses
-                .agents
-                .iter()
-                .map(|agent| (agent.id.as_str(), true)),
-        )
-    {
-        let available = id != "claude" || acp || crate::claude::process().is_ok();
-        if available && !available_ids.iter().any(|existing| existing == id) {
-            available_ids.push(id.to_owned());
-        }
-    }
-    if available_ids.is_empty() {
-        return false;
-    }
-    let current = available_ids
-        .iter()
-        .position(|id| id == &t.harness)
-        .unwrap_or(0);
-    let len = available_ids.len() as isize;
-    let next = (current as isize + direction).rem_euclid(len) as usize;
-    let chosen = available_ids[next].clone();
-    state.choose_harness(&chosen);
+    let next = crate::model_picker::adjacent_model_picker_provider(
+        &snap.sidebar_entries,
+        &snap.selected_tab,
+        direction,
+        &snap.locked_disabled_ids,
+        &snap.selectable_unavailable_ids,
+    );
+    state.model_search.replace_text("");
+    state.model_picker_tab = Some(next);
     true
 }
 
@@ -9210,23 +10395,21 @@ pub(crate) fn jump_model_picker_index(state: &mut State, index: usize) -> bool {
     if t.status.busy() || t.configuring {
         return false;
     }
-    let query = state.model_search.text.to_lowercase();
-    let chosen = t
-        .models
-        .iter()
+    let snap = picker_snapshot(state);
+    let Some(chosen) = snap
+        .visible_models
+        .into_iter()
         .filter(|m| {
-            format!("{} {} {}", m.provider, m.id, m.name)
-                .to_lowercase()
-                .contains(&query)
+            state
+                .model_disabled_reason_for(&m.instance_id, &m.slug)
+                .is_none()
         })
         .nth(index)
-        .map(|m| (m.provider.clone(), m.id.clone()));
-    let Some((provider, id)) = chosen else {
+    else {
         return false;
     };
-    state.current_mut().set_model(provider, id);
+    state.select_model_from_picker(&chosen.instance_id, &chosen.slug);
     state.settings_picker = Some(SettingsPicker::Thinking);
-    state.checkpoint();
     true
 }
 
@@ -11938,14 +13121,37 @@ pub(crate) mod tests {
             assert!(rt.presented("harness-tag-claude").is_none());
             if crate::claude::process().is_ok() {
                 press(&mut rt, "choose-harness-claude");
-                assert_eq!(rt.state.current().harness, "claude");
+                assert_eq!(
+                    rt.state.model_picker_tab,
+                    Some(crate::model_picker::ModelPickerTab::Instance(
+                        "claude".into()
+                    ))
+                );
             } else {
+                assert!(
+                    find(&rt.accessibility_json(), "choose-harness-claude")
+                        .and_then(|node| node["states"].as_array().cloned())
+                        .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                    "{width}: claude should be disabled when missing"
+                );
+                rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
+                    "claude".into(),
+                ));
+                rt.invalidate();
+                rt.frame(0.0);
                 assert!(rt.presented("claude-unavailable").is_some());
             }
             press(&mut rt, "choose-harness-fixture");
+            assert_eq!(
+                rt.state.model_picker_tab,
+                Some(crate::model_picker::ModelPickerTab::Instance(
+                    "fixture".into()
+                ))
+            );
+            press(&mut rt, "choose-model-0");
             assert_eq!(rt.state.current().harness, "fixture");
-            assert!(rt.state.current().selected_model.is_none());
             rt.state.current_mut().life.latest_user_message_at = Some(1);
+            rt.state.open_model_picker(SettingsPicker::Model);
             rt.invalidate();
             rt.frame(0.0);
             press(&mut rt, "choose-harness-pi");
@@ -11953,6 +13159,12 @@ pub(crate) mod tests {
                 rt.state.current().harness,
                 "fixture",
                 "harness is fixed after first send"
+            );
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-pi")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: pi is disabled after first send"
             );
         }
     }
@@ -15998,8 +17210,6 @@ pub(crate) mod tests {
         assert!(rt.find("disconnect-pi").is_none());
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         assert!(rt.state.current().pi.is_none());
         assert_eq!(
@@ -16033,8 +17243,6 @@ pub(crate) mod tests {
         press(&mut rt, "model-effort");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("pi-settings-picker").is_some());
-        press(&mut rt, "open-model-list");
-        rt.frame(1.0 / 60.0);
         press(&mut rt, "choose-model-0");
         let model = commands.try_recv().unwrap();
         assert_eq!(model["type"], "set_model");
@@ -16093,13 +17301,7 @@ pub(crate) mod tests {
                 card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
                 "popover leaves the window at {width}: {card:?}"
             );
-            press(&mut rt, "open-model-list");
-            rt.frame(2.0);
-            let (list, _) = rt.presented("pi-settings-picker").unwrap();
-            assert!(
-                list[1] >= 0.0,
-                "model list leaves the window at {width}: {list:?}"
-            );
+            assert!(rt.presented("model-list").is_some(), "{width}");
         }
     }
 
@@ -16111,8 +17313,6 @@ pub(crate) mod tests {
         rt.state.current_mut().models.clear();
         rt.frame(0.0);
         press(&mut rt, "model-effort");
-        rt.frame(1.0 / 60.0);
-        press(&mut rt, "open-model-list");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("models-group").is_some());
         assert!(rt.find("models-empty-note").is_some());
@@ -16126,6 +17326,474 @@ pub(crate) mod tests {
             "generic fallback should not appear when catalog.error is set: {tree}"
         );
         assert!(rt.find("retry-catalog").is_some());
+    }
+
+    #[test]
+    fn model_picker_supports_favorites_legacy_collapse_unavailable_continuation_and_notices_at_all_widths()
+     {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "claude-opus-5-5".into(),
+                    name: "Anthropic / Claude Opus 5.5".into(),
+                    sub_provider: Some("Anthropic".into()),
+                    badge: Some("new".into()),
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: "claude-opus-4-5".into(),
+                    name: "Claude Opus 4.5".into(),
+                    is_legacy: true,
+                    ..Default::default()
+                },
+            ];
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6-astra".into(),
+                    name: "GPT-6 Astra".into(),
+                    is_default: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.4".into(),
+                    name: "GPT-5.4".into(),
+                    is_legacy: true,
+                    ..Default::default()
+                },
+            ];
+            rt.state.codex_catalog.update_required_models =
+                vec![crate::model_picker::UpdateRequiredModel {
+                    slug: "gpt-6-luna".into(),
+                    name: "GPT-6 Luna".into(),
+                    badge: None,
+                    min_version: "0.155.0".into(),
+                }];
+            rt.state.current_mut().harness = "pi".into();
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.state.current_mut().model_provider = "cpa".into();
+            rt.state.current_mut().model_id = "missing-dynamic".into();
+            rt.state.current_mut().model = "missing-dynamic".into();
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Card fits inside viewport
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+
+            // Favorites tab exists, legacy section collapses behind "Show more", unavailable row badge shows
+            assert!(
+                rt.presented("choose-harness-favorites").is_some(),
+                "{width}"
+            );
+            assert!(rt.presented("legacy-models-pi").is_some(), "{width}");
+            assert!(rt.find("toggle-favorite-0").is_some(), "{width}");
+            let tree = rt.accessibility_json().to_string();
+            assert!(tree.contains("Unavailable"), "{width}: {tree}");
+            assert!(tree.contains("New"), "{width}: {tree}");
+            assert!(tree.contains("Show more"), "{width}: {tree}");
+
+            // Expanding legacy shows the legacy model and flips to "Show less"
+            press(&mut rt, "legacy-models-pi");
+            rt.invalidate();
+            rt.frame(0.1);
+            let expanded_tree = rt.accessibility_json().to_string();
+            assert!(expanded_tree.contains("Claude Opus 4.5"), "{width}");
+            assert!(expanded_tree.contains("Show less"), "{width}");
+
+            // Toggling favorite switches and puts model in Favorites tab
+            press(&mut rt, "toggle-favorite-0");
+            rt.invalidate();
+            rt.frame(0.2);
+            assert_eq!(rt.state.effective_model_favorites().len(), 1);
+            press(&mut rt, "choose-harness-favorites");
+            rt.invalidate();
+            rt.frame(0.3);
+            let fav_tree = rt.accessibility_json().to_string();
+            assert!(fav_tree.contains("Claude Opus 5.5"), "{width}: {fav_tree}");
+
+            // Switching to Codex shows update-required notice
+            press(&mut rt, "choose-harness-codex");
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(
+                rt.presented("update-required-notice-codex").is_some(),
+                "{width}"
+            );
+            let codex_tree = rt.accessibility_json().to_string();
+            assert!(
+                codex_tree.contains("Update the Codex CLI to v0.155.0 or newer to use GPT-6 Luna."),
+                "{width}: {codex_tree}"
+            );
+
+            // Pick GPT-6 Astra on Codex, then mark thread as started and verify continuation restriction
+            press(&mut rt, "choose-model-0");
+            assert_eq!(rt.state.current().harness, "codex");
+            assert_eq!(rt.state.current().model_id, "gpt-6-astra");
+            rt.state.current_mut().life.latest_user_message_at = Some(1);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.5);
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-pi")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: pi should be disabled on started codex thread"
+            );
+            // Searching across providers respects continuation lock on a started thread
+            rt.state.model_search.replace_text("opus");
+            rt.invalidate();
+            rt.frame(0.6);
+            let locked_search_tree = rt.accessibility_json().to_string();
+            assert!(!locked_search_tree.contains("Claude Opus 5.5"), "{width}");
+            assert!(locked_search_tree.contains("No models found"), "{width}");
+
+            // On an unstarted thread, searching across providers ranks matches globally
+            rt.state.current_mut().life.latest_user_message_at = None;
+            rt.invalidate();
+            rt.frame(0.7);
+            let search_tree = rt.accessibility_json().to_string();
+            assert!(search_tree.contains("Claude Opus 5.5"), "{width}");
+        }
+    }
+
+    #[test]
+    fn sticky_options_restore_per_model_and_survive_ui_snapshot_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6-astra".into(),
+                    name: "GPT-6 Astra".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    is_default: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.6-sol".into(),
+                    name: "GPT-5.6 Sol".into(),
+                    thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                    service_tiers: vec![
+                        json!({"id":"default","name":"Standard"}),
+                        json!({"id":"fast","name":"Fast"}),
+                    ],
+                    ..Default::default()
+                },
+            ];
+            rt.state.choose_harness("codex");
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Pick gpt-6-astra and set effort=high + serviceTier=fast
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.1);
+            press(&mut rt, "choose-thinking-2");
+            press(&mut rt, "service-tier-1");
+            assert_eq!(rt.state.current().thinking, "high");
+            assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
+
+            // Switch to gpt-5.6-sol and set effort=low
+            rt.invalidate();
+            rt.frame(0.2);
+            press(&mut rt, "choose-model-1");
+            rt.invalidate();
+            rt.frame(0.3);
+            press(&mut rt, "choose-thinking-0");
+            assert_eq!(rt.state.current().thinking, "low");
+
+            // Switch back to gpt-6-astra: remembered sticky options (high + fast) restore!
+            rt.invalidate();
+            rt.frame(0.4);
+            press(&mut rt, "choose-model-0");
+            rt.invalidate();
+            rt.frame(0.5);
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
+
+            // Trigger reflects resolved model & effort cleanly inside viewport
+            let (trigger, _) = rt.presented("model-effort").unwrap();
+            assert!(
+                trigger[0] >= 0.0 && trigger[0] + trigger[2] <= width + 0.5,
+                "{width}: {trigger:?}"
+            );
+
+            // Sticky composer preferences survive ui_snapshot -> restore_ui
+            let ui = rt.state.ui_snapshot();
+            let mut restored = State::new(std::path::PathBuf::new(), false);
+            restored.restore_ui(&ui).unwrap();
+            assert_eq!(
+                restored
+                    .preferences
+                    .sticky_composer
+                    .sticky_options_by_model_by_provider
+                    .get("codex")
+                    .and_then(|m| m.get("gpt-6-astra"))
+                    .map(|opts| opts.len()),
+                Some(2)
+            );
+
+            // Creating a new thread applies the sticky model and options
+            rt.state.new_thread_in(None);
+            assert_eq!(rt.state.current().harness, "codex", "{width}");
+            assert_eq!(rt.state.current().model_id, "gpt-6-astra", "{width}");
+            assert_eq!(rt.state.current().thinking, "high", "{width}");
+            assert_eq!(
+                rt.state.current().harness_state["serviceTier"],
+                "fast",
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_picker_refresh_on_open_loading_error_and_retry_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            // Loading state while cached models exist shows refreshing indicator inside card
+            rt.state.catalog.models = vec![crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "gpt-6-astra".into(),
+                name: "GPT-6 Astra".into(),
+                ..Default::default()
+            }];
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.state.catalog.set_loading_for_test(true);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (loading, _) = rt
+                .presented("catalog-loading")
+                .expect("catalog-loading shown while refreshing");
+            assert!(
+                loading[0] >= card[0] && loading[0] + loading[2] <= card[0] + card[2] + 0.5,
+                "{width}: {loading:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Refreshing models...")
+            );
+
+            // Error state alongside cached models still exposes retry-catalog and error message
+            rt.state.catalog.set_loading_for_test(false);
+            rt.state.catalog.error = Some("CPA gateway unreachable.".into());
+            rt.invalidate();
+            rt.frame(0.1);
+            let (retry, _) = rt
+                .presented("retry-catalog")
+                .expect("retry-catalog shown on error");
+            assert!(
+                retry[0] >= card[0] && retry[0] + retry[2] <= card[0] + card[2] + 0.5,
+                "{width}: {retry:?} in {card:?}"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("CPA gateway unreachable.")
+            );
+
+            // Clicking retry-catalog clears error and invokes force refresh
+            press(&mut rt, "retry-catalog");
+            assert!(rt.state.catalog.error.is_none());
+        }
+    }
+
+    #[test]
+    fn descriptor_driven_docked_picker_options_ultrathink_lock_and_footer_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            let opus_caps = crate::descriptors::claude_manifest_model_entry("claude-opus-5-5")
+                .unwrap()
+                .capabilities;
+            let acp_caps = crate::descriptors::ModelCapabilities {
+                option_descriptors: crate::descriptors::acp_provider_option_descriptors(
+                    Some(&[
+                        json!({"id": "thought_level", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": "medium", "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
+                        json!({"id": "auto_approve", "name": "Auto-approve", "type": "boolean", "currentValue": false}),
+                    ]),
+                    Some(&json!({
+                        "currentModeId": "code",
+                        "availableModes": [
+                            {"id": "code", "name": "Code"},
+                            {"id": "plan", "name": "Plan"}
+                        ]
+                    })),
+                ),
+            };
+            rt.state.claude_catalog.models = vec![crate::session::AgentModel {
+                provider: "claude".into(),
+                id: "claude-opus-5-5".into(),
+                name: "Claude Opus 5.5".into(),
+                thinking_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                capabilities: opus_caps,
+                ..Default::default()
+            }];
+            rt.state.choose_harness("claude");
+            rt.state
+                .current_mut()
+                .set_model("claude".into(), "claude-opus-5-5".into());
+            rt.frame(0.0);
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.05);
+
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (list, _) = rt.presented("model-list").unwrap();
+            let (effort_col, _) = rt.presented("model-picker-effort").unwrap();
+            let (footer, _) = rt.presented("picker-footer").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+            if width > 640.0 {
+                assert!(
+                    effort_col[0] >= list[0] + list[2] - 1.0,
+                    "{width}: effort column sits beside list: {list:?} {effort_col:?}"
+                );
+            } else {
+                assert!(
+                    effort_col[1] >= list[1] + list[3] - 1.0,
+                    "{width}: effort column stacks below list: {list:?} {effort_col:?}"
+                );
+            }
+            assert!(
+                footer[1] >= effort_col[1] + effort_col[3] - 1.0,
+                "{width}: footer sits at bottom: {effort_col:?} {footer:?}"
+            );
+
+            // Fast/Standard and Ultracode controls exist in footer and toggle
+            assert!(rt.presented("fast-mode-picker").is_some(), "{width}");
+            assert!(rt.presented("ultracode-toggle").is_some(), "{width}");
+            press(&mut rt, "fast-mode-on");
+            press(&mut rt, "ultracode-toggle");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "fastMode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: fastMode enabled"
+            );
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "ultracode"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}: ultracode enabled"
+            );
+
+            // Typing "ultrathink" in prompt body locks effort slider and shows note
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("Please ultrathink about this");
+            rt.invalidate();
+            rt.frame(0.2);
+            assert!(rt.presented("ultrathink-lock-note").is_some(), "{width}");
+            assert_eq!(
+                find(&rt.accessibility_json(), "ultrathink-lock-note")
+                    .and_then(|n| n["name"].as_str()),
+                Some(crate::descriptors::ULTRATHINK_IN_BODY_NOTE),
+                "{width}"
+            );
+
+            // ACP model shows select and boolean option rows in effort column
+            rt.state.current_mut().draft.replace_text("");
+            rt.state.harnesses.agents = vec![crate::harness::Agent {
+                id: "devin".into(),
+                name: "Devin".into(),
+                command: "devin".into(),
+                args: vec![],
+                env: vec![],
+            }];
+            rt.state.choose_harness("devin");
+            rt.state.current_mut().draft_model_state = Default::default();
+            rt.state.current_mut().models = vec![crate::session::AgentModel {
+                provider: "devin".into(),
+                id: "fusion".into(),
+                name: "Fusion".into(),
+                thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+                capabilities: acp_caps,
+                ..Default::default()
+            }];
+            rt.state
+                .current_mut()
+                .set_model("devin".into(), "fusion".into());
+            rt.invalidate();
+            rt.frame(0.3);
+            assert!(
+                rt.presented("option-menu-_t3/session-mode").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("option-switch-auto_approve").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "option-switch-auto_approve");
+            rt.invalidate();
+            rt.frame(0.4);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "auto_approve"
+                        && o.value == crate::model_selection::OptionValue::Bool(true)),
+                "{width}"
+            );
+            press(&mut rt, "option-menu-_t3/session-mode");
+            rt.invalidate();
+            rt.frame(0.5);
+            press(&mut rt, "option-choice-_t3/session-mode-plan");
+            rt.invalidate();
+            rt.frame(0.6);
+            assert!(
+                rt.state
+                    .current()
+                    .model_options
+                    .iter()
+                    .any(|o| o.id == "_t3/session-mode"
+                        && o.value == crate::model_selection::OptionValue::Str("plan".into())),
+                "{width}"
+            );
+        }
     }
 
     #[test]
@@ -17037,6 +18705,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
                 crate::session::AgentModel {
                     provider: "cpa".into(),
@@ -17046,6 +18715,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
             ];
             t.model_provider = "cpa".into();
@@ -17070,7 +18740,7 @@ pub(crate) mod tests {
         assert!(rt.presented("pi-settings-picker").is_some());
         assert!(rt.presented("model-list").is_some());
 
-        // Mod+Shift+ArrowDown steps harness in the open model picker.
+        // Mod+Shift+ArrowDown steps provider tab in the open model picker.
         rt.key(rune::KeyEvent {
             key: rune::Key::Down,
             mods: rune::Mods {
@@ -17080,9 +18750,14 @@ pub(crate) mod tests {
             },
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.current().harness, "codex");
+        assert_eq!(
+            rt.state.model_picker_tab,
+            Some(crate::model_picker::ModelPickerTab::Instance(
+                "codex".into()
+            ))
+        );
 
-        // Mod+Shift+ArrowUp steps harness back.
+        // Mod+Shift+ArrowUp steps provider tab back.
         rt.key(rune::KeyEvent {
             key: rune::Key::Up,
             mods: rune::Mods {
@@ -17092,7 +18767,10 @@ pub(crate) mod tests {
             },
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.current().harness, "pi");
+        assert_eq!(
+            rt.state.model_picker_tab,
+            Some(crate::model_picker::ModelPickerTab::Instance("pi".into()))
+        );
 
         // Re-populate models after harness switch and jump to the 2nd model with Mod+2.
         {
@@ -17106,6 +18784,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
                 crate::session::AgentModel {
                     provider: "cpa".into(),
@@ -17115,6 +18794,7 @@ pub(crate) mod tests {
                     supports_images: Some(true),
                     thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
                     service_tiers: vec![],
+                    ..Default::default()
                 },
             ];
         }

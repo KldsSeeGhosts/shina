@@ -1711,7 +1711,7 @@ impl State {
         });
         edit.focused = true;
         if name == "model" {
-            self.settings_picker = Some(SettingsPicker::Model);
+            self.open_model_picker(SettingsPicker::Model);
         }
     }
 

@@ -737,3 +737,56 @@ fn replayed_awareness_is_hidden_and_not_repeated_after_resume() {
         1
     );
 }
+
+#[test]
+fn acp_reports_option_descriptors_and_applies_config_and_mode_options() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client.session = Some("acp-session".into());
+    client.configure_models(&json!({
+        "models": {
+            "currentModelId": "m1",
+            "availableModels": [{"modelId": "m1", "name": "Model 1"}]
+        },
+        "configOptions": [
+            {
+                "id": "thought_level",
+                "name": "Thinking",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": "low",
+                "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]
+            }
+        ],
+        "modes": {
+            "currentModeId": "code",
+            "availableModes": [{"id": "code", "name": "Code"}, {"id": "plan", "name": "Plan"}]
+        }
+    }));
+    assert!(
+        !client.models[0]["capabilities"]["optionDescriptors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    client
+        .command(
+            json!({"type":"set_option","id":"opt-1","optionId":"_t3/session-mode","value":"plan"}),
+        )
+        .unwrap();
+    assert_eq!(client.wire.last().unwrap()["method"], "session/set_mode");
+    assert_eq!(client.wire.last().unwrap()["params"]["modeId"], "plan");
+
+    client
+        .command(json!({"type":"set_thinking_level","id":"opt-2","level":"high"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["method"],
+        "session/set_config_option"
+    );
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["configId"],
+        "thought_level"
+    );
+    assert_eq!(client.wire.last().unwrap()["params"]["value"], "high");
+}

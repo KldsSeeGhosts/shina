@@ -10,8 +10,9 @@ use std::{
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
+const CATALOG_RETRY_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,
@@ -23,6 +24,24 @@ pub struct AgentModel {
     pub supports_images: Option<bool>,
     #[serde(default)]
     pub service_tiers: Vec<Value>,
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub sub_provider: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub badge: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub is_custom: bool,
+    #[serde(default)]
+    pub is_legacy: bool,
+    #[serde(default)]
+    pub is_unavailable: bool,
+    #[serde(default)]
+    pub capabilities: crate::descriptors::ModelCapabilities,
 }
 
 impl AgentModel {
@@ -33,27 +52,133 @@ impl AgentModel {
         if model["provider"] != harness {
             return None;
         }
+        let id = model["id"].as_str()?;
+        let thinking_levels: Vec<String> = model["thinkingLevels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|level| level.as_str().map(str::to_owned))
+            .collect();
+        let service_tiers = model["serviceTiers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let parsed_caps: Option<crate::descriptors::ModelCapabilities> = model
+            .get("capabilities")
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .filter(|c: &crate::descriptors::ModelCapabilities| !c.option_descriptors.is_empty());
+        let manifest_claude = if harness == "claude" {
+            crate::descriptors::claude_manifest_model_entry(id)
+        } else {
+            None
+        };
+        let capabilities = if let Some(caps) = parsed_caps {
+            caps
+        } else if harness == "codex" {
+            if model.get("supportedReasoningEfforts").is_some() {
+                crate::descriptors::map_codex_model_capabilities(model, None)
+            } else {
+                let mut synthesized = serde_json::Map::new();
+                synthesized.insert("model".into(), serde_json::json!(id));
+                synthesized.insert(
+                    "supportedReasoningEfforts".into(),
+                    serde_json::json!(
+                        thinking_levels
+                            .iter()
+                            .map(|l| serde_json::json!({"reasoningEffort": l}))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                if let Some(d) = model.get("defaultReasoningEffort") {
+                    synthesized.insert("defaultReasoningEffort".into(), d.clone());
+                }
+                if !service_tiers.is_empty() {
+                    synthesized.insert("serviceTiers".into(), serde_json::json!(service_tiers));
+                }
+                if let Some(d) = model.get("defaultServiceTier") {
+                    synthesized.insert("defaultServiceTier".into(), d.clone());
+                }
+                crate::descriptors::map_codex_model_capabilities(&Value::Object(synthesized), None)
+            }
+        } else if let Some(entry) = &manifest_claude {
+            entry.capabilities.clone()
+        } else if harness == "claude" && !thinking_levels.is_empty() {
+            crate::descriptors::ModelCapabilities {
+                option_descriptors: vec![crate::descriptors::ProviderOptionDescriptor::Select {
+                    id: "effort".into(),
+                    label: "Reasoning".into(),
+                    description: None,
+                    options: std::iter::once(crate::descriptors::ProviderOptionChoice {
+                        id: "default".into(),
+                        label: "Default".into(),
+                        description: None,
+                        is_default: true,
+                    })
+                    .chain(thinking_levels.iter().map(|lvl| {
+                        crate::descriptors::ProviderOptionChoice {
+                            id: lvl.clone(),
+                            label: match lvl.as_str() {
+                                "low" => "Low".into(),
+                                "medium" => "Medium".into(),
+                                "high" => "High".into(),
+                                "xhigh" => "Extra High".into(),
+                                "max" => "Max".into(),
+                                other => other.to_owned(),
+                            },
+                            description: None,
+                            is_default: false,
+                        }
+                    }))
+                    .collect(),
+                    current_value: None,
+                    prompt_injected_values: vec![],
+                    role: Some(crate::descriptors::ProviderOptionRole::Reasoning),
+                }],
+            }
+        } else {
+            Default::default()
+        };
         Some(Self {
             provider: harness.into(),
-            id: model["id"].as_str()?.into(),
+            id: id.into(),
             name: model["name"]
                 .as_str()
                 .or_else(|| model["id"].as_str())?
                 .into(),
-            thinking_levels: model["thinkingLevels"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|level| level.as_str().map(str::to_owned))
-                .collect(),
+            thinking_levels,
             context_window: model["contextWindow"].as_u64().filter(|window| *window > 0),
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
-            service_tiers: model["serviceTiers"]
+            service_tiers,
+            short_name: model["shortName"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| manifest_claude.as_ref().and_then(|m| m.short_name.clone())),
+            sub_provider: model["subProvider"].as_str().map(str::to_owned),
+            aliases: model["aliases"]
                 .as_array()
-                .cloned()
-                .unwrap_or_default(),
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    manifest_claude
+                        .as_ref()
+                        .map(|m| m.aliases.clone())
+                        .unwrap_or_default()
+                }),
+            badge: model["badge"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| manifest_claude.as_ref().and_then(|m| m.badge.clone())),
+            is_default: model["isDefault"] == true,
+            is_custom: model["isCustom"] == true,
+            is_legacy: model["isLegacy"] == true
+                || manifest_claude.as_ref().is_some_and(|m| m.is_legacy),
+            is_unavailable: model["isUnavailable"] == true,
+            capabilities,
         })
     }
     pub fn from_value(model: &Value) -> Option<Self> {
@@ -76,6 +201,7 @@ impl AgentModel {
         } else {
             vec!["off".into()]
         };
+        let capabilities = crate::descriptors::pi_model_capabilities(model, None);
         Some(Self {
             provider: "cpa".into(),
             id: id.into(),
@@ -85,7 +211,24 @@ impl AgentModel {
             supports_images: model["input"]
                 .as_array()
                 .map(|input| input.iter().any(|kind| kind == "image")),
-            service_tiers: vec![],
+            service_tiers: model["serviceTiers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            short_name: model["shortName"].as_str().map(str::to_owned),
+            sub_provider: model["subProvider"].as_str().map(str::to_owned),
+            aliases: model["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect(),
+            badge: model["badge"].as_str().map(str::to_owned),
+            is_default: model["isDefault"] == true,
+            is_custom: model["isCustom"] == true,
+            is_legacy: model["isLegacy"] == true,
+            is_unavailable: model["isUnavailable"] == true,
+            capabilities,
         })
     }
 }
@@ -100,18 +243,26 @@ pub struct NativeCatalog {
     pub extensions: bool,
     pub cwd: Option<PathBuf>,
     pub revision: u64,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub auth_status: Option<String>,
+    pub update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
     pi: Option<Pi>,
     attempted: bool,
     complete: bool,
     models_loaded: bool,
     commands_loaded: bool,
     started: Option<Instant>,
+    loaded: Option<Instant>,
+    last_attempt: Option<Instant>,
 }
 
 impl NativeCatalog {
     pub fn snapshot(&self) -> Value {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
-            "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading()})
+            "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
+            "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
+            "updateRequiredModels":self.update_required_models})
     }
     pub fn loading(&self) -> bool {
         self.pi.is_some()
@@ -121,11 +272,32 @@ impl NativeCatalog {
         if self.pi.is_some() {
             return;
         }
+        let now = Instant::now();
         let changed = self.cwd.as_ref() != Some(&workspace);
-        if !force && self.attempted && (!changed || self.error.is_some()) {
-            return;
+        if !force {
+            if self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_TTL)
+                && !changed
+            {
+                return;
+            }
+            if self.error.is_some()
+                && self
+                    .last_attempt
+                    .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_RETRY_TTL)
+            {
+                return;
+            }
+            if self.attempted && !changed && self.loaded.is_none() && self.error.is_none() {
+                return;
+            }
         }
-        let models = force || !self.attempted;
+        let models = force
+            || !self.attempted
+            || self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) >= CATALOG_TTL);
         self.attempted = true;
         self.revision += 1;
         self.cwd = Some(workspace.clone());
@@ -134,7 +306,8 @@ impl NativeCatalog {
         self.models_loaded = !models;
         self.complete = false;
         self.error = None;
-        self.started = Some(Instant::now());
+        self.started = Some(now);
+        self.last_attempt = Some(now);
         let result = match harness {
             "codex" => crate::codex::discover(workspace, wake, models),
             "claude" => crate::claude::discover(workspace, wake),
@@ -192,6 +365,7 @@ impl NativeCatalog {
                     if self.models_loaded && self.commands_loaded {
                         self.pi = None;
                         self.started = None;
+                        self.loaded = Some(Instant::now());
                         self.complete = true;
                         self.revision += 1;
                         break;
@@ -236,27 +410,71 @@ pub struct Catalog {
     pi: Option<Pi>,
     started: Option<Instant>,
     loaded: Option<Instant>,
+    last_attempt: Option<Instant>,
     state_loaded: bool,
     models_loaded: bool,
 }
 
 impl Catalog {
+    pub fn loading(&self) -> bool {
+        self.pi.is_some()
+    }
+
     pub fn remaining(&self) -> Option<Duration> {
         self.started
             .map(|at| START_TIMEOUT.saturating_sub(at.elapsed()))
     }
 
-    pub fn refresh(&mut self, workspace: PathBuf, wake: Waker) {
-        if self.pi.is_some()
-            || (self.error.is_none() && self.loaded.is_some_and(|at| at.elapsed() < CATALOG_TTL))
+    pub fn should_refresh(&self, force: bool, now: Instant) -> bool {
+        if self.pi.is_some() {
+            return false;
+        }
+        if force {
+            return true;
+        }
+        if self.error.is_none()
+            && self
+                .loaded
+                .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_TTL)
         {
+            return false;
+        }
+        if self
+            .last_attempt
+            .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_RETRY_TTL)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub fn refresh(&mut self, workspace: PathBuf, wake: Waker) {
+        self.refresh_with_mode(workspace, wake, false);
+    }
+
+    pub fn refresh_with_mode(&mut self, workspace: PathBuf, wake: Waker, force: bool) {
+        let now = Instant::now();
+        if !self.should_refresh(force, now) {
             return;
         }
         self.error = None;
         self.state_loaded = false;
         self.models_loaded = false;
-        self.started = Some(Instant::now());
+        self.started = Some(now);
+        self.last_attempt = Some(now);
         self.pi = Some(Pi::discover(workspace, wake));
+    }
+
+    #[cfg(test)]
+    pub fn set_loading_for_test(&mut self, loading: bool) {
+        if loading {
+            let (pi, _, _) = Pi::test_connection();
+            self.pi = Some(pi);
+            self.started = Some(Instant::now());
+        } else {
+            self.pi = None;
+            self.started = None;
+        }
     }
 
     pub fn poll(&mut self) -> bool {
@@ -458,5 +676,36 @@ mod tests {
         assert!(catalog.pi.is_none());
         assert_eq!(catalog.models[0].id, "cached");
         assert!(catalog.remaining().is_none());
+    }
+
+    #[test]
+    fn catalog_on_demand_throttles_success_and_failure_while_force_bypasses_backoff() {
+        let now = Instant::now();
+        let mut catalog = Catalog::default();
+        // Recently loaded within 5 minutes -> on-demand should skip
+        catalog.loaded = Some(now - Duration::from_secs(60));
+        assert!(!catalog.should_refresh(false, now));
+        assert!(catalog.should_refresh(true, now));
+
+        // Stale > 5 minutes -> on-demand should refresh
+        catalog.loaded = Some(now - Duration::from_secs(301));
+        assert!(catalog.should_refresh(false, now));
+
+        // Failed within 5 minutes -> on-demand backs off, force retries immediately
+        catalog.loaded = None;
+        catalog.error = Some("Offline".into());
+        catalog.last_attempt = Some(now - Duration::from_secs(60));
+        assert!(!catalog.should_refresh(false, now));
+        assert!(catalog.should_refresh(true, now));
+
+        // Failed > 5 minutes ago -> on-demand may retry
+        catalog.last_attempt = Some(now - Duration::from_secs(301));
+        assert!(catalog.should_refresh(false, now));
+
+        // Single-flight: in-flight probe blocks both on-demand and force
+        let (pi, _, _) = Pi::test_connection();
+        catalog.pi = Some(pi);
+        assert!(!catalog.should_refresh(false, now));
+        assert!(!catalog.should_refresh(true, now));
     }
 }

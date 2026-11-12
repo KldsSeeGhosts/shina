@@ -450,6 +450,8 @@ pub struct Thread {
     prewarm_attempted: bool,
     pub selected_model: Option<(String, String)>,
     pub selected_thinking: Option<String>,
+    pub model_options: Vec<crate::model_selection::ProviderOptionSelection>,
+    pub draft_model_state: crate::model_selection::DraftModelState,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
     startup_selection_check: Option<String>,
@@ -691,6 +693,8 @@ impl Thread {
             prewarm_attempted: false,
             selected_model: None,
             selected_thinking: None,
+            model_options: vec![],
+            draft_model_state: Default::default(),
             startup_model_applied: false,
             startup_thinking_applied: false,
             startup_selection_check: None,
@@ -813,8 +817,11 @@ impl Thread {
             return;
         }
         self.attachment_error = None;
-        if self.model_id != model_id && self.harness == "codex" {
-            self.harness_state["serviceTier"] = Value::Null;
+        if self.model_id != model_id {
+            self.model_options.clear();
+            if self.harness == "codex" {
+                self.harness_state["serviceTier"] = Value::Null;
+            }
         }
         self.selected_model = Some((provider.clone(), model_id.clone()));
         if self.pi.is_none() || self.initializing {
@@ -1453,6 +1460,38 @@ impl Thread {
             self.reject_images(&prompt, index, error);
             return;
         }
+        let mut prompt = prompt;
+        if self.harness == "claude" {
+            let effort = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "effort")
+                .and_then(|o| o.value.as_str());
+            let caps = self
+                .models
+                .iter()
+                .find(|m| m.provider == self.model_provider && m.id == self.model_id)
+                .map(|m| m.capabilities.clone())
+                .unwrap_or_default();
+            let injected = crate::descriptors::resolve_prompt_injected_effort(&caps, effort);
+            prompt.text = crate::descriptors::apply_claude_prompt_effort_prefix(
+                &prompt.text,
+                injected.as_deref().or(effort),
+            );
+        }
+        if self.harness == "pi"
+            && let Some(tier) = self
+                .model_options
+                .iter()
+                .find(|o| o.id == "serviceTier")
+                .and_then(|o| o.value.as_str())
+                .filter(|&t| t != "default" && !t.is_empty())
+        {
+            let _ = self.command(
+                "prompt",
+                json!({"message": format!("/shina-service-tier {tier}")}),
+            );
+        }
         let record = match attachments::prompt_record(&prompt, self.harness == "pi") {
             Ok(record) => record,
             Err(error) => {
@@ -1478,6 +1517,18 @@ impl Thread {
             .iter()
             .find(|m| m.provider == self.model_provider && m.id == self.model_id)
         {
+            if let Some(reasoning) = model
+                .capabilities
+                .option_descriptors
+                .iter()
+                .find(|d| crate::descriptors::is_reasoning_control(d))
+            {
+                let choices = crate::descriptors::selectable_provider_option_choices(reasoning);
+                if !choices.is_empty() {
+                    self.thinking_levels = choices.into_iter().map(|c| c.id).collect();
+                    return;
+                }
+            }
             self.thinking_levels = model.thinking_levels.clone();
         }
     }
@@ -1675,6 +1726,16 @@ impl Thread {
                     self.harness_context_sent = record["value"] == true;
                 } else if let Some(field) = record["field"].as_str() {
                     self.harness_state[field] = record["value"].clone();
+                    if field == "optionDescriptors"
+                        && let Ok(descriptors) = serde_json::from_value::<
+                            Vec<crate::descriptors::ProviderOptionDescriptor>,
+                        >(record["value"].clone())
+                    {
+                        for model in &mut self.models {
+                            model.capabilities.option_descriptors = descriptors.clone();
+                        }
+                        self.refresh_thinking_levels();
+                    }
                     if matches!(field, "plan" | "plan_update") {
                         self.record_plan(&record["value"]);
                     }
@@ -1836,6 +1897,12 @@ impl Thread {
                         self.configuring = false;
                         // Capacity and the previous percentage belonged to the old model.
                         self.refresh_context_usage();
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "set_thinking_level" => {
                         if let Some(level) = self.pending_thinking.take() {
@@ -1843,6 +1910,12 @@ impl Thread {
                         }
                         self.command("get_state", json!({}));
                         self.configuring = false;
+                        if let Some(confirmed) = self.thread_model_selection() {
+                            crate::model_selection::release_model_selection(
+                                &mut self.draft_model_state,
+                                &confirmed,
+                            );
+                        }
                     }
                     "get_messages" if record["id"] == "history" => {
                         if self.server_owned
@@ -2660,6 +2733,11 @@ pub struct State {
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
     pub settings_picker: Option<SettingsPicker>,
+    pub open_option_menu: Option<String>,
+    pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
+    pub expanded_legacy_instances: std::collections::HashSet<String>,
+    pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
+    model_favorites_migrated: bool,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
     /// (highest). The level is chosen on release.
     pub thinking_drag: Option<f32>,
@@ -2855,6 +2933,11 @@ impl State {
             captain_editor: None,
             brief: BriefUi::default(),
             settings_picker: None,
+            open_option_menu: None,
+            model_picker_tab: None,
+            expanded_legacy_instances: Default::default(),
+            model_favorites: None,
+            model_favorites_migrated: false,
             thinking_drag: None,
             model_search: TextEdit::default(),
             updater: Default::default(),
@@ -4616,6 +4699,9 @@ impl State {
         }
         if reuse.is_none() || self.threads[index].selected_model.is_none() {
             self.inherit_composer(index, seed);
+            if reuse.is_none() {
+                self.apply_sticky_composer_to_draft(index);
+            }
         }
         self.select_thread(index);
     }
@@ -6231,6 +6317,60 @@ impl State {
         }
     }
 
+    pub fn supports_model_catalog_refresh(&self) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(
+                &self.machines.selected,
+                crate::protocol::MODEL_CATALOG_REFRESH,
+            )
+        })
+    }
+
+    /// Ported from KSG Code's `ProviderModelPicker.tsx`: opening the picker refreshes the model
+    /// catalog through the capability-gated `modelCatalogOnly` path, throttled by 5 minutes.
+    pub fn refresh_catalog_on_open(&mut self) {
+        if self.client.is_some() {
+            if !self.supports_model_catalog_refresh() {
+                return;
+            }
+            self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(false);
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
+    /// Explicit retry button bypasses the on-demand throttle and retry backoff.
+    pub fn force_refresh_catalog(&mut self) {
+        self.catalog.error = None;
+        if self.forward("catalog.refresh", json!({"force": true})) {
+            return;
+        }
+        self.harnesses = crate::harness::Registry::read();
+        self.refresh_native_catalogs(true);
+        if matches!(self.current().harness.as_str(), "codex" | "claude")
+            && self.current().pi.is_some()
+        {
+            self.current_mut()
+                .command("get_available_models", json!({}));
+            self.current_mut().refresh_commands();
+        }
+        if !self.demo && self.runtime_enabled {
+            self.catalog
+                .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), true);
+        }
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
+
     /// Warm metadata on a command/skill trigger without sending a prompt. A failed startup
     /// or denied login stays failed until the user takes an explicit recovery action.
     pub fn ensure_composer_commands(&mut self) {
@@ -6618,6 +6758,12 @@ impl State {
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
         self.thread_defaults.validate()?;
+        self.model_favorites = match index.get("modelFavorites") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone()).map_err(|_| "Invalid model favorites.")?,
+            ),
+        };
         self.persist_transcripts = self.headless || index["threadViews"].is_array();
         self.server_seq = index["serverSeq"].as_u64().unwrap_or(0);
         self.command_receipts =
@@ -6778,6 +6924,13 @@ impl State {
                         thread.model = model.into();
                     }
                     thread.selected_thinking = record["thinking"].as_str().map(str::to_owned);
+                    if let Some(options) = record.get("options")
+                        && let Ok(parsed) = serde_json::from_value::<
+                            Vec<crate::model_selection::ProviderOptionSelection>,
+                        >(options.clone())
+                    {
+                        thread.model_options = parsed;
+                    }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
                     }
@@ -7013,14 +7166,29 @@ impl State {
         Ok(())
     }
 
-    fn ui_snapshot(&self) -> Value {
+    pub(crate) fn ui_snapshot(&self) -> Value {
         let mut prefs_value = serde_json::to_value(&self.preferences).unwrap_or_else(|_| json!({}));
         if let Some(map) = prefs_value.as_object_mut() {
             map.remove("keybindings");
         }
+        let draft_model_states: serde_json::Map<String, Value> = self
+            .threads
+            .iter()
+            .filter(|t| t.draft_model_state.model_selection_explicit || t.has_draft_content())
+            .filter(|t| {
+                !t.draft_model_state.model_selection_by_provider.is_empty()
+                    || t.draft_model_state.active_provider.is_some()
+            })
+            .filter_map(|t| {
+                serde_json::to_value(&t.draft_model_state)
+                    .ok()
+                    .map(|val| (t.id.to_string(), val))
+            })
+            .collect();
         json!({
             "background": self.background.settings,
             "preferences": prefs_value,
+            "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -7060,7 +7228,7 @@ impl State {
             json!({"version":1,"pendingMessages":pending,"background":{"keep_awake":self.background_settings().keep_awake}})
         }
     }
-    fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
+    pub(crate) fn restore_ui(&mut self, ui: &Value) -> Result<(), String> {
         if ui["version"] != 1 {
             return Err("Unsupported UI state. Existing files have not been overwritten.".into());
         }
@@ -7155,6 +7323,18 @@ impl State {
                     .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
                 {
                     thread.restore_pending_inputs(value)?;
+                }
+            }
+        }
+        if let Some(draft_models) = ui.get("draftModelStates").and_then(Value::as_object) {
+            for (id, value) in draft_models {
+                if let Some(thread) = id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
+                    && let Ok(state) = serde_json::from_value(value.clone())
+                {
+                    thread.draft_model_state = state;
                 }
             }
         }
@@ -7363,6 +7543,7 @@ impl State {
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
             "threadDefaults": self.thread_defaults,
+            "modelFavorites": self.model_favorites,
             "tasks": self.tasks,
             "projects": self.projects.entries.iter().map(Project::to_value).collect::<Vec<_>>(),
             "cloneParent": self.projects.recents.clone_parent,
@@ -7593,6 +7774,7 @@ impl Thread {
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
+            "options":self.model_options,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
         record
@@ -9223,6 +9405,7 @@ mod tests {
             context_window: Some(100),
             supports_images: Some(true),
             service_tiers: vec![],
+            ..Default::default()
         };
         state.current_mut().harness = "codex".into();
         state.current_mut().models = vec![model];
@@ -9564,6 +9747,7 @@ mod tests {
             context_window: None,
             supports_images: None,
             service_tiers: vec![],
+            ..Default::default()
         }];
         let index = restored.threads.len() - 1;
         restored.inherit_composer(
@@ -13454,6 +13638,7 @@ mod tests {
                 json!({"id":"default","name":"Standard"}),
                 json!({"id":"fast","name":"Fast"}),
             ],
+            ..Default::default()
         };
         state.codex_catalog.models = vec![model.clone()];
         let (pi, _cmds, _events) = Pi::test_connection();
