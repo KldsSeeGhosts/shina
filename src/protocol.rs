@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 4;
+pub const MINOR: u32 = 6;
+pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
 pub const FILESYSTEM_BROWSE: &str = "filesystem-browse";
 
@@ -38,9 +39,12 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "blobs.read"
         | "filesystem.browse" => "read",
         "request.respond" => "approve",
+        "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "devices.pair"
         | "devices.revoke"
+        | "devices.grant"
+        | "devices.revokeGrant"
         | "server.validateRestart"
         | "server.prepareRestart"
         | "server.cancelRestart"
@@ -65,6 +69,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.forkPoints"
         | "settings.autoSettle"
         | "settings.defaultHarness"
+        | "settings.threadDefaults"
         | "background.keepAwake"
         | "queue.remove"
         | "queue.sendNow"
@@ -382,6 +387,10 @@ mod tests {
             "blobs.read",
             "uploads.write",
             "devices.revoke",
+            "devices.grant",
+            "devices.revokeGrant",
+            "server.updateStatus",
+            "server.requestUpdate",
             "command.get",
         ]);
         for source in [reducer, runtime, server] {
@@ -418,9 +427,12 @@ mod tests {
                 | "blobs.read"
                 | "filesystem.browse" => "read",
                 "request.respond" => "approve",
+                "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"
                 | "devices.pair"
                 | "devices.revoke"
+                | "devices.grant"
+                | "devices.revokeGrant"
                 | "server.validateRestart"
                 | "server.prepareRestart"
                 | "server.cancelRestart"

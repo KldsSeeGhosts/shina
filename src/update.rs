@@ -744,6 +744,7 @@ pub struct Updater {
     host: Arc<Mutex<Box<dyn UpdateHost>>>,
     /// This process runs from an installed app, so it may update itself.
     installed: bool,
+    last_check: Option<String>,
 }
 
 impl Default for Updater {
@@ -760,6 +761,7 @@ impl Default for Updater {
             storage: Storage::default_storage(),
             host: Arc::new(Mutex::new(Box::new(Gh))),
             installed: false,
+            last_check: None,
         }
     }
 }
@@ -1434,6 +1436,9 @@ fn coordinated_path() -> PathBuf {
 }
 
 pub fn start_coordinated_helper(update: &PreparedUpdate) -> Result<(), String> {
+    start_coordinated_helper_id(update, &uuid::Uuid::new_v4().to_string())
+}
+fn start_coordinated_helper_id(update: &PreparedUpdate, id: &str) -> Result<(), String> {
     Gh.reverify(update)?;
     let storage = Storage::default_storage();
     fs::create_dir_all(&storage.root).map_err(|e| e.to_string())?;
@@ -1447,6 +1452,13 @@ pub fn start_coordinated_helper(update: &PreparedUpdate) -> Result<(), String> {
     crate::store::write_atomic(
         &storage.manifest(),
         update.to_value().to_string().as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    crate::store::write_atomic(
+        &storage.root.join("request.json"),
+        serde_json::json!({"updateId":id,"tag":update.tag})
+            .to_string()
+            .as_bytes(),
     )
     .map_err(|e| e.to_string())?;
     let handshake = storage.root.join("coordinated-started");
@@ -1500,6 +1512,47 @@ pub fn cli_update(args: &[String]) -> Result<(), String> {
         update.tag
     );
     Ok(())
+}
+
+/// Resolve and verify on the target with its own existing gh login. Never accepts a tag.
+pub fn request_latest(
+    directory: &Path,
+    id: &str,
+    progress: &dyn Fn(&str, &str),
+) -> Result<Option<String>, String> {
+    let target = crate::fleet_update::self_update_target(directory)
+        .ok_or("This install cannot self-update.")?;
+    let Some(release) = Gh.fetch_release(&target).map_err(|e| failure_text(&e))? else {
+        return Ok(None);
+    };
+    let storage = Storage::at(directory.join("updates"));
+    if let Some(failure) = storage.load_failure()
+        && failure.tag == release.tag
+    {
+        return Err(format!(
+            "{} previously failed: {}. Retry on the target machine first.",
+            failure.tag, failure.reason
+        ));
+    }
+    progress("downloading", &release.tag);
+    let (download, sha256) = Gh
+        .download_release(&release, &target, &storage.attempt())
+        .map_err(|e| failure_text(&e))?;
+    let prepared = Gh
+        .prepare(&release, &target, &download)
+        .map_err(|e| failure_text(&e))?;
+    let update = PreparedUpdate {
+        tag: release.tag,
+        target,
+        asset: release.asset.name,
+        size: release.asset.size,
+        sha256,
+        download,
+        prepared,
+    };
+    progress("ready", &update.tag);
+    start_coordinated_helper_id(&update, id)?;
+    Ok(Some(update.tag))
 }
 
 /// Hold a real process handle on Windows before committing the drain. Never kill a PID.
@@ -1724,7 +1777,23 @@ struct CoordinatedUpdate {
 }
 impl HelperSteps for CoordinatedUpdate {
     fn failed(&mut self, reason: &str) -> Result<(), String> {
-        Storage::at(self.directory.join("updates")).save_failure(&self.update.tag, reason)
+        Storage::at(self.directory.join("updates")).save_failure(&self.update.tag, reason)?;
+        let request: Value = fs::read(self.directory.join("updates/request.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        if let Some(id) = request["updateId"].as_str() {
+            crate::fleet_update::save_outcome(
+                &self.directory,
+                &crate::fleet_update::Outcome {
+                    update_id: id.into(),
+                    tag: self.update.tag.clone(),
+                    success: false,
+                    reason: Some(redact(reason)),
+                },
+            )?;
+        }
+        Ok(())
     }
     fn wait_clients(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + METADATA_TIMEOUT;
@@ -1868,6 +1937,14 @@ pub fn coordinated_helper() -> Result<(), String> {
     let _lock = install::InstallLock::acquire(&storage.root)?;
     let mut step = "Read update manifest";
     let mut failed_tag = None;
+    let request: Value = fs::read(storage.root.join("request.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let outcome_id = request["updateId"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut result = (|| {
         let update = PreparedUpdate::from_value(
             &serde_json::from_slice::<Value>(
@@ -1999,6 +2076,18 @@ pub fn coordinated_helper() -> Result<(), String> {
     })().map_err(|error| {
         if step == "Update sequence" { error } else { format!("{step} failed: {error}") }
     });
+    if let Some(tag) = &failed_tag {
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: outcome_id,
+                tag: tag.clone(),
+                success: result.is_ok(),
+                reason: result.as_ref().err().cloned(),
+            },
+        )?;
+        let _ = fs::remove_file(storage.root.join("request.json"));
+    }
     if let (Err(error), Some(tag)) = (&result, failed_tag) {
         // Covers failures before the helper sequence as well. The sequence persists
         // replacement failures earlier, before rollback can reopen clients.
@@ -2022,6 +2111,28 @@ pub fn coordinated_helper() -> Result<(), String> {
 }
 
 impl Updater {
+    pub fn last_check_label(&self) -> &str {
+        self.last_check
+            .as_deref()
+            .unwrap_or("Not checked this session")
+    }
+    pub fn failed_release_detail(&self) -> Option<(String, String)> {
+        self.storage
+            .load_failure()
+            .or_else(|| self.failed_release.clone())
+            .map(|f| (f.tag, f.reason))
+    }
+    pub fn retry_failed_release(&mut self) -> Result<(), String> {
+        match fs::remove_file(self.storage.failed_release()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Could not retry update: {error}")),
+        }
+        self.failed_release = None;
+        self.notice = None;
+        self.retry();
+        Ok(())
+    }
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -2334,6 +2445,7 @@ impl Updater {
                 true
             }
             Event::Checked(Ok(Some(release))) => {
+                self.last_check = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                 if self.release_blocked(&release.tag) {
                     self.idle_from(now);
                     return true;
@@ -2343,6 +2455,7 @@ impl Updater {
                 true
             }
             Event::Checked(Ok(None)) => {
+                self.last_check = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                 if self.failed_release.is_none() {
                     self.notice = None;
                 }
@@ -2350,6 +2463,7 @@ impl Updater {
                 true
             }
             Event::Checked(Err(failure)) => {
+                self.last_check = Some(chrono::Local::now().format("%H:%M:%S").to_string());
                 self.failed(failure, now);
                 true
             }
@@ -2879,6 +2993,21 @@ mod tests {
             matches!(u.status(), Status::Ready { .. })
         });
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn settings_observes_a_helper_failure_written_after_start_and_can_clear_it_locally() {
+        let mut updater = Updater::default();
+        updater
+            .storage
+            .save_failure("v99.0.0", "Readiness failed. Rolled back.")
+            .unwrap();
+        assert!(updater.failed_release.is_none());
+        assert_eq!(
+            updater.failed_release_detail(),
+            Some(("v99.0.0".into(), "Readiness failed. Rolled back.".into()))
+        );
+        updater.retry_failed_release().unwrap();
+        assert!(updater.failed_release_detail().is_none());
     }
 
     /// A manifest and its files, as a previous run of `updater` left them.

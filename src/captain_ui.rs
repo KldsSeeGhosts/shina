@@ -1341,14 +1341,13 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
     let settings = s.background_settings();
     let keep_working = settings.keep_working;
     let supported = cfg!(windows);
-    let row_title = |title: &str| label(title, TextStyle::new(13.0, 500.0), p.ink);
-    let row_note = |note: &str| label(note, TextStyle::new(12.0, 420.0).lh(16.0), p.muted).wrap();
+    let row_title = |title: &str| label(title, TextStyle::new(14.0, 500.0), p.ink);
+    let row_note = |note: &str| label(note, TextStyle::new(13.0, 400.0).lh(18.0), p.muted).wrap();
     let working = row()
         .key("background-row")
-        .px(10.0)
-        .py(8.0)
+        .py(12.0)
         .gap(12.0)
-        .center_y()
+        .items_start()
         .child(
             col()
                 .grow(1.0)
@@ -1423,25 +1422,35 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .hover_motion(motion(), motion())
                 .on_press(move |s: &mut State| s.set_keep_awake(choice))
                 .child(label(
-                    title,
+                    match choice {
+                        KeepAwake::Off => "Off",
+                        KeepAwake::WhileRunning => "While working",
+                        KeepAwake::OnAcPower => "AC only",
+                    },
                     TextStyle::new(12.0, 500.0),
                     if on { p.ink } else { p.muted },
                 )),
         );
     }
-    let awake = col()
+    let awake = row()
         .key("keep-awake-row")
-        .px(10.0)
-        .py(8.0)
-        .gap(8.0)
+        .py(12.0)
+        .gap(12.0)
+        .items_start()
         .child(
             col()
+                .grow(1.0)
+                .min_w(0.0)
                 .gap(2.0)
                 .child(row_title("Keep awake"))
                 .child(row_note(note)),
         )
-        .child(group);
-    let mut rows = vec![working, awake];
+        .child(group.w(244.0).min_w(244.0));
+    let rule = || el().w_full().h(1.0).fill(p.line);
+    let mut rows = vec![
+        col().child(working).child(rule()),
+        col().child(awake).child(rule()),
+    ];
     if let Some(error) = s.background_status().error {
         rows.push(label(error, SMALL, p.danger).wrap().px(10.0).pb(6.0));
     }

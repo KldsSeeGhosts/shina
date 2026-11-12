@@ -11,6 +11,7 @@ mod codex;
 mod context;
 mod crisp;
 mod database;
+mod fleet_update;
 mod harness;
 mod horizon;
 mod install;
@@ -63,6 +64,13 @@ fn init() -> State {
             .and_then(|value| value.parse::<f32>().ok())
     {
         state.zoom = zoom.clamp(0.5, 2.0);
+    }
+    // A still renders its first frame before on_layout can report the window size.
+    // Use Rune's declared snapshot viewport, including UI zoom, for modal sizing.
+    if let Some(run) = rune::tooling::headless_run() {
+        let (width, height) = run.size();
+        state.viewport_width = width / state.zoom;
+        state.viewport_height = height / state.zoom;
     }
     state
 }
@@ -844,6 +852,25 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             ("settings-menu", |state| {
                 state.populate_demo();
                 state.settings_menu = true;
+            }),
+            ("settings-dark", |state| {
+                state.populate_demo(); state.open_settings(); state.dark=true;
+            }),
+            ("update-machines", |state| {state.populate_demo();state.demo_fleet();}),
+            ("update-machines-dark", |state| {state.populate_demo();state.dark=true;state.demo_fleet();}),
+            ("settings-threads", |state| {
+                state.populate_demo(); state.open_settings(); state.settings.section=1;
+            }),
+            ("settings-machines", |state| {
+                fleet_demo(state);
+                if let Some(client)=&state.client {
+                    for remote in client.linked.values() {*remote.info.lock().unwrap()=serde_json::json!({"binaryVersion":env!("CARGO_PKG_VERSION"),"protocolMinor":6});}
+                }
+                state.open_settings(); state.settings.section=3;
+                state.machines.devices=serde_json::json!([
+                    {"deviceId":"demo-client-one","revokedAt":null,"scopes":["paired","read","operate","approve"]},
+                    {"deviceId":"demo-client-two","revokedAt":null,"scopes":["paired","read","operate","approve","update"]}
+                ]);
             }),
             ("captain-crews", captain_crews_demo),
             ("captain-crews-dark", |state| {

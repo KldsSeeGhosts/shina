@@ -96,7 +96,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 2 {
+        if version > 3 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         connection
@@ -125,6 +125,13 @@ impl Database {
             crate::maintenance::backup_state(directory)?;
             let tx = connection.transaction().map_err(error)?;
             tx.execute_batch(include_str!("migrations/002.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
+        if version < 3 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/003.sql"))
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -362,6 +369,32 @@ impl Database {
             }
             if let Some(receipt) = receipt {
                 put_receipt(&tx, receipt)?;
+                if let Some(id) = receipt.result["updateAuditId"].as_str() {
+                    tx.execute(
+                        "INSERT INTO update_audit(update_id,device_id,requested_at,accepted,outcome) VALUES(?1,?2,?3,?4,?5)",
+                        params![id, receipt.device_id, receipt.result["requestedAt"].as_u64().unwrap_or(0) as i64,
+                            receipt.result["updateAccepted"] == true, receipt.result.to_string()],
+                    ).map_err(error)?;
+                }
+                if let Some(id) = receipt.result["grantDevice"].as_str() {
+                    let text: String = tx
+                        .query_row(
+                            "SELECT scopes FROM device_grants WHERE device_id=?1",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .map_err(error)?;
+                    let mut scopes: Vec<String> = serde_json::from_str(&text).map_err(error)?;
+                    scopes.retain(|s| s != "update");
+                    if receipt.result["enabled"] == true {
+                        scopes.push("update".into());
+                    }
+                    tx.execute(
+                        "UPDATE device_grants SET scopes=?2 WHERE device_id=?1",
+                        params![id, serde_json::to_string(&scopes).map_err(error)?],
+                    )
+                    .map_err(error)?;
+                }
             }
             for effect in effects {
                 tx.execute(
@@ -556,7 +589,16 @@ impl Database {
         } else {
             crate::protocol::method_grant(method).ok_or("Unknown protocol method.")?
         };
-        if scopes.iter().any(|granted| granted == scope) {
+        if matches!(method, "devices.grant" | "devices.revokeGrant")
+            && scopes.iter().any(|s| s == "paired")
+        {
+            return Err("Change update grants on the target machine itself.".into());
+        }
+        if scopes.iter().any(|granted| granted == scope)
+            || (scope == "update"
+                && scopes.iter().any(|s| s == "maintain")
+                && !scopes.iter().any(|s| s == "paired"))
+        {
             Ok(())
         } else {
             Err(format!(
@@ -578,6 +620,72 @@ impl Database {
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
             .is_some_and(|scopes| scopes.iter().any(|scope| scope == "paired"))
+    }
+
+    pub fn update_rate_limited(&self, device: &str, now: u64) -> Result<bool, String> {
+        self.0.lock().expect("database").connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM update_audit WHERE device_id=?1 AND accepted=1 AND requested_at>?2)",
+            params![device, now.saturating_sub(600_000) as i64], |r| r.get(0),
+        ).map_err(error)
+    }
+    /// Authenticated authorization failures are attempts too, but never consume the limit.
+    pub fn audit_update_refusal(&self, device: &str, reason: &str) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        inner.connection.execute(
+            "INSERT INTO update_audit(update_id,device_id,requested_at,accepted,outcome) VALUES(?1,?2,?3,0,?4)",
+            params![id,device,crate::lifecycle::now() as i64,json!({"updateId":id,"success":false,"reason":reason}).to_string()],
+        ).map_err(error)?;
+        Ok(())
+    }
+
+    pub fn update_outcome(&self, outcome: &Value) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("database")
+            .connection
+            .execute(
+                "UPDATE update_audit SET tag=?2,outcome=?3 WHERE update_id=?1",
+                params![
+                    outcome["updateId"].as_str(),
+                    outcome["tag"].as_str(),
+                    outcome.to_string()
+                ],
+            )
+            .map_err(error)?;
+        Ok(())
+    }
+    pub fn update_progress(&self, id: &str, tag: &str, phase: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("database")
+            .connection
+            .execute(
+                "UPDATE update_audit SET tag=?2,outcome=?3 WHERE update_id=?1",
+                params![
+                    id,
+                    tag,
+                    json!({"updateId":id,"tag":tag,"state":phase}).to_string()
+                ],
+            )
+            .map_err(error)?;
+        Ok(())
+    }
+    pub fn unfinished_update(&self) -> Result<Option<(String, String)>, String> {
+        let row:Option<(String,Option<String>,String)>=self.0.lock().expect("database").connection.query_row(
+            "SELECT update_id,tag,outcome FROM update_audit WHERE accepted=1 ORDER BY requested_at DESC LIMIT 1",[],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(error)?;
+        match row {
+            Some((id, tag, payload))
+                if serde_json::from_str::<Value>(&payload).map_err(error)?["success"].is_null() =>
+            {
+                Ok(Some((id, tag.unwrap_or_default())))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub fn device(&self, token: &str) -> Result<Option<String>, String> {
@@ -785,6 +893,60 @@ mod tests {
         let directory = crate::store::directory().unwrap().join(name);
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn update_audit_migration_has_a_verified_schema_two_backup_and_a_narrow_grant() {
+        let directory = directory("update-audit-migration");
+        let old = Connection::open(directory.join("state.sqlite")).unwrap();
+        old.execute_batch(include_str!("migrations/001.sql"))
+            .unwrap();
+        old.execute_batch(include_str!("migrations/002.sql"))
+            .unwrap();
+        drop(old);
+        let database = Database::open(&directory).unwrap();
+        let mut backed_up = false;
+        for entry in std::fs::read_dir(directory.join("backups")).unwrap() {
+            let file = entry.unwrap().path().join("state.sqlite");
+            if !file.is_file() {
+                continue;
+            }
+            let backup = Connection::open(file).unwrap();
+            let schema: u32 = backup
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            let integrity: String = backup
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            backed_up |= schema == 2 && integrity == "ok";
+        }
+        assert!(backed_up);
+        database
+            .issue_scoped_device("update-only", "test-secret", &["update"])
+            .unwrap();
+        for method in ["server.updateStatus", "server.requestUpdate"] {
+            database
+                .authorize("update-only", method, &json!({}))
+                .unwrap();
+        }
+        for method in [
+            "server.status",
+            "server.stop",
+            "server.prepareRestart",
+            "server.cancelRestart",
+            "server.commitRestart",
+            "server.validateRestart",
+            "devices.grant",
+            "devices.pair",
+            "thread.send",
+        ] {
+            assert!(
+                database
+                    .authorize("update-only", method, &json!({}))
+                    .is_err(),
+                "{method}"
+            );
+        }
     }
 
     #[test]

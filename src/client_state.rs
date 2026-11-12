@@ -645,6 +645,7 @@ impl State {
             "routines":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.routines(id)))).collect::<serde_json::Map<_,_>>(),
             "background":self.background_status(),"undo":self.undo,
             "memoryBackend":self.memory_backend_status(),
+            "harnessIds":self.harness_ids(),
             "clone":{"running":self.projects.cloning(),"progress":self.projects.clone_progress,"error":self.projects.clone_error},
         })
     }
@@ -724,6 +725,7 @@ impl State {
             "sidebarWidth",
             "shelves",
             "background",
+            "preferences",
             "scope",
             "scopeAdditional",
             "scopeServer",
@@ -786,6 +788,22 @@ impl State {
                 break;
             };
             changed = true;
+            if let crate::client::Event::Receipt(command, value) = &event
+                && command.method.starts_with("settings.")
+                && server == self.settings.machine
+            {
+                self.settings.notice = if value["status"] == "accepted" {
+                    None
+                } else {
+                    Some(
+                        value["result"]["error"]
+                            .as_str()
+                            .unwrap_or("Setting was not saved.")
+                            .into(),
+                    )
+                };
+                continue;
+            }
             if let crate::client::Event::Receipt(command, value) = &event
                 && command.method == "thread.create"
                 && command.params["clientDraft"].is_u64()
@@ -1396,6 +1414,7 @@ impl State {
             self.sidebar_width,
             self.shelves,
             self.background.settings.clone(),
+            self.preferences.clone(),
         );
         self.client_views = json!({"localUi":self.machines.ui[server]});
         if let Some(projection) = projection {
@@ -1443,6 +1462,7 @@ impl State {
             self.sidebar_width,
             self.shelves,
             self.background.settings,
+            self.preferences,
         ) = device;
         (
             self.project_scope,
@@ -1767,6 +1787,17 @@ impl State {
         }
     }
     pub fn machine_action(&mut self, action: &str, target: &str) {
+        if self.demo {
+            self.machines.notice =
+                Some("Demo machines never pair, revoke devices or request updates.".into());
+            return;
+        }
+        if self.client.is_none() {
+            self.machines.notice = Some(
+                "Linking requires server-client mode. Start Shina with --server-client.".into(),
+            );
+            return;
+        }
         if self.machines.pending.is_some() {
             return;
         }
@@ -1801,11 +1832,15 @@ impl State {
                                     .await
                                     .map(MachineResult::Devices)
                             }
-                            "revoke" => {
+                            "revoke" | "grant-update" | "revoke-update" => {
                                 let receipt = crate::client::local_rpc(
                                     &profile,
-                                    "devices.revoke",
-                                    json!({"deviceId":target}),
+                                    match action.as_str() {
+                                        "grant-update" => "devices.grant",
+                                        "revoke-update" => "devices.revokeGrant",
+                                        _ => "devices.revoke",
+                                    },
+                                    json!({"deviceId":target,"grant":"update"}),
                                 )
                                 .await?;
                                 if receipt["status"] != "accepted" {
@@ -2241,6 +2276,13 @@ impl State {
                     .ok_or("Invalid inactivity interval.")?
                     as u32;
                 self.sweep_lifecycle(lifecycle::now());
+            }
+            "settings.threadDefaults" => {
+                let defaults: crate::ui::settings_ui::ThreadDefaults =
+                    serde_json::from_value(args.clone()).map_err(|_| "Invalid thread defaults.")?;
+                defaults.validate()?;
+                self.thread_defaults = defaults;
+                self.checkpoint();
             }
             "settings.defaultHarness" => {
                 let harness = text("harness")?;
@@ -3690,6 +3732,7 @@ mod tests {
         state.sidebar_width = 312.0;
         state.sidebar = false;
         state.shelves = [true, false];
+        state.preferences.confirm_delete = false;
         state.current_mut().draft.replace_text("local unsent text");
         state.checkpoint_client();
         let mut remote_ui = state.machines.ui["local"].clone();
@@ -3698,6 +3741,7 @@ mod tests {
         remote_ui["sidebar"] = json!(true);
         remote_ui["sidebarWidth"] = json!(200.0);
         remote_ui["shelves"] = json!([false, false, true]);
+        remote_ui["preferences"]["confirm_delete"] = json!(true);
         remote_ui["drafts"]["1"] = json!("remote unsent text");
         state.machines.ui["remote"] = remote_ui;
         for server in ["remote", "local", "remote", "local"] {
@@ -3708,6 +3752,7 @@ mod tests {
             assert_eq!(state.sidebar_width, 312.0);
             assert!(!state.sidebar);
             assert_eq!(state.shelves, [true, false]);
+            assert!(!state.preferences.confirm_delete);
             assert_eq!(
                 state.current().draft.text,
                 if server == "local" {

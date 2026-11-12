@@ -58,6 +58,7 @@ pub struct RuntimeState {
     pub seq: u64,
     last_projection: Value,
     pub maintenance: crate::maintenance::Maintenance,
+    pub updates: crate::fleet_update::ServerUpdates,
     validation_hold: bool,
     pub database: Option<crate::database::Database>,
     failure: Option<String>,
@@ -78,12 +79,41 @@ impl RuntimeState {
             runtime.last_projection = previous;
         }
         runtime.database = Some(database);
+        if let Some(outcome) = &runtime.updates.outcome {
+            runtime
+                .database
+                .as_ref()
+                .unwrap()
+                .update_outcome(&json!(outcome))?;
+        }
+        if let Some((id, tag)) = runtime.database.as_ref().unwrap().unfinished_update()?
+            && runtime.updates.id.as_deref() != Some(id.as_str())
+        {
+            // No detached helper owns this accepted attempt. Never repeat its work.
+            let outcome = crate::fleet_update::Outcome {
+                update_id: id,
+                tag,
+                success: false,
+                reason: Some(
+                    "Update preparation was interrupted before restart. Retry explicitly.".into(),
+                ),
+            };
+            crate::fleet_update::save_outcome(&runtime.state.data_dir, &outcome)?;
+            runtime
+                .database
+                .as_ref()
+                .unwrap()
+                .update_outcome(&json!(outcome))?;
+            runtime.updates.outcome = Some(outcome);
+            runtime.updates.phase = "failed".into();
+        }
         let effects = capture.finish();
         runtime.persist(None, effects)?;
         Ok(runtime)
     }
     pub fn from_state(state: State) -> Self {
         Self {
+            updates: crate::fleet_update::ServerUpdates::new(&state.data_dir),
             validation_hold: state.data_dir.join("update-validation").exists(),
             seq: state.server_sequence(),
             last_projection: state.projection(),
@@ -105,12 +135,32 @@ impl RuntimeState {
             return Err("Authentication denied. This device is unknown or revoked.".into());
         }
         if let Some(database) = &self.database {
-            database.authorize(device, &command.method, &command.params)?;
+            if let Err(error) = database.authorize(device, &command.method, &command.params) {
+                if command.method == "server.requestUpdate" {
+                    database.audit_update_refusal(device, &error)?;
+                }
+                return Err(error);
+            }
+        }
+        if command.method == "server.updateStatus" {
+            if self.updates.poll(&self.state.data_dir) {
+                self.record_update()?;
+                if let Some(db) = &self.database {
+                    db.begin()?;
+                    self.persist(None, Vec::new())?;
+                }
+            }
+            return Ok(self.updates.status(
+                self.state.update_restart_blocker(),
+                &self.maintenance.status(),
+            ));
         }
         if let Some(result) = self.maintenance_command(&command) {
             return result;
         }
-        if self.maintenance.fenced() || self.validation_hold {
+        if (self.maintenance.fenced() || self.validation_hold)
+            && command.method != "server.requestUpdate"
+        {
             return Err(
                 "Server is draining for an update. Retry after restart or cancellation.".into(),
             );
@@ -132,7 +182,39 @@ impl RuntimeState {
                 result: Value::Null,
                 seq: self.seq + 1,
             };
-            let result = if command.method == "devices.revoke" {
+            let result = if matches!(
+                command.method.as_str(),
+                "devices.grant" | "devices.revokeGrant"
+            ) {
+                let id = command.params["deviceId"].as_str().unwrap_or("");
+                if command.params["grant"] != "update" {
+                    Err("Only the update grant can be changed here.".into())
+                } else if !database.device_active(id)? {
+                    Err("Unknown or revoked device.".into())
+                } else {
+                    Ok(json!({"grantDevice":id,"enabled":command.method == "devices.grant"}))
+                }
+            } else if command.method == "server.requestUpdate" {
+                let now = crate::lifecycle::now();
+                if self.maintenance.fenced() || self.validation_hold {
+                    Err(
+                        "Server is draining for an update. Retry after restart or cancellation."
+                            .into(),
+                    )
+                } else if let Some(blocker) = self.state.update_restart_blocker() {
+                    Err(blocker.into())
+                } else if !self.updates.capable {
+                    Err("This install cannot self-update.".into())
+                } else if self.updates.active() {
+                    Err("An update is already in progress.".into())
+                } else if database.update_rate_limited(device, now)? {
+                    Err("One accepted update per device per ten minutes. Try again later.".into())
+                } else {
+                    Ok(
+                        json!({"updateAccepted":true,"updateId":uuid::Uuid::new_v4(),"requestedAt":now}),
+                    )
+                }
+            } else if command.method == "devices.revoke" {
                 command.params["deviceId"]
                     .as_str()
                     .filter(|id| uuid::Uuid::parse_str(id).is_ok())
@@ -149,8 +231,23 @@ impl RuntimeState {
                     receipt.result = json!({"error":error});
                 }
             }
+            if command.method == "server.requestUpdate" {
+                receipt.result["requestedAt"] = json!(crate::lifecycle::now());
+                receipt.result["updateAuditId"] = receipt
+                    .result
+                    .get("updateId")
+                    .cloned()
+                    .unwrap_or_else(|| json!(uuid::Uuid::new_v4()));
+            }
             self.state.record_command(receipt.clone(), None);
             self.persist(Some(&receipt), capture.finish())?;
+            if command.method == "server.requestUpdate" && receipt.result["updateAccepted"] == true
+            {
+                self.updates.start(
+                    self.state.data_dir.clone(),
+                    receipt.result["updateId"].as_str().unwrap().into(),
+                );
+            }
             return Ok(json!(receipt));
         }
         if let Some(receipt) = self
@@ -193,7 +290,24 @@ impl RuntimeState {
         serde_json::to_value(receipt).map_err(|e| e.to_string())
     }
 
+    fn record_update(&self) -> Result<(), String> {
+        if let Some(db) = &self.database {
+            if self.updates.active()
+                && let Some(id) = &self.updates.id
+            {
+                db.update_progress(id, &self.updates.tag, &self.updates.phase)?;
+            }
+            if let Some(outcome) = &self.updates.outcome {
+                db.update_outcome(&json!(outcome))?;
+            }
+        }
+        Ok(())
+    }
     pub fn tick(&mut self) -> bool {
+        let update_changed = self.updates.poll(&self.state.data_dir);
+        if update_changed && let Err(error) = self.record_update() {
+            self.failure = Some(error);
+        }
         let before = self.maintenance.status();
         if self.maintenance.advance(std::time::Instant::now()) {
             self.state.runtime_stop_requested = true;
@@ -202,7 +316,7 @@ impl RuntimeState {
             database.fence_dispatch(self.maintenance.fenced() || self.validation_hold);
         }
         if self.maintenance.fenced() || self.validation_hold {
-            return before != self.maintenance.status();
+            return update_changed || before != self.maintenance.status();
         }
         if self.failure.is_some() {
             return false;
@@ -216,7 +330,8 @@ impl RuntimeState {
             let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
                 | self.state.collect_recovered_inputs();
             let effects = capture.finish();
-            if !changed && effects.is_empty() && self.pending_effects.is_empty() {
+            if !changed && !update_changed && effects.is_empty() && self.pending_effects.is_empty()
+            {
                 match database.finish_if_unchanged() {
                     Ok(true) => return before != self.maintenance.status(),
                     Ok(false) => {}
@@ -258,7 +373,12 @@ impl RuntimeState {
         if self.state.runtime_stop_requested && !self.maintenance.fenced() {
             maintenance["phase"] = json!("stopping");
         }
-        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":self.last_projection,"historyCursor":null,"maintenance":maintenance})
+        let mut state = self.last_projection.clone();
+        state["updateStatus"] = self
+            .updates
+            .status(self.state.update_restart_blocker(), &maintenance);
+        state["updateNotice"] = json!(self.updates.outcome);
+        json!({"epoch":self.state.server_epoch(),"seq":self.seq,"state":state,"historyCursor":null,"maintenance":maintenance})
     }
 
     fn maintenance_command(&mut self, command: &Command) -> Option<Result<Value, String>> {
@@ -354,7 +474,12 @@ impl RuntimeState {
         let database = self.database.clone().ok_or("No runtime database.")?;
         let result = (|| {
             self.state.checkpoint_and_flush()?;
-            let projection = self.state.projection();
+            let mut projection = self.state.projection();
+            projection["updateStatus"] = self.updates.status(
+                self.state.update_restart_blocker(),
+                &self.maintenance.status(),
+            );
+            projection["updateNotice"] = json!(self.updates.outcome);
             if receipt.is_none()
                 && effects.is_empty()
                 && self.pending_effects.is_empty()
@@ -477,6 +602,42 @@ mod tests {
             .issue_device("maintainer", "fixture-token")
             .unwrap();
         runtime
+    }
+    #[test]
+    fn startup_reports_an_accepted_update_interrupted_before_helper_handoff() {
+        let directory = crate::store::directory().unwrap();
+        let db = crate::database::Database::open(&directory).unwrap();
+        db.issue_device("interrupted-device", "not-a-real-token")
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
+        connection.execute("INSERT INTO update_audit(update_id,device_id,requested_at,accepted,tag,outcome) VALUES(?1,'interrupted-device',1,1,'v99.0.0',?2)",
+            rusqlite::params![id,json!({"updateAccepted":true}).to_string()]).unwrap();
+        drop(connection);
+        drop(db);
+        let mut runtime =
+            RuntimeState::open(directory.clone(), std::sync::Arc::new(|| {})).unwrap();
+        let outcome = runtime.updates.outcome.as_ref().unwrap();
+        assert_eq!(outcome.update_id, id);
+        assert_eq!(outcome.tag, "v99.0.0");
+        assert!(!outcome.success);
+        assert!(outcome.reason.as_deref().unwrap().contains("interrupted"));
+        assert!(
+            runtime
+                .database
+                .as_ref()
+                .unwrap()
+                .unfinished_update()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::fleet_update::read_outcome(&directory)
+                .unwrap()
+                .update_id,
+            id
+        );
+        runtime.shutdown().unwrap();
     }
     #[test]
     fn outbox_pauses_during_drain_and_resumes_only_after_cancellation() {
