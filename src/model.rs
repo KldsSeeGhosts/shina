@@ -2471,7 +2471,7 @@ pub struct State {
     pub machines: crate::peer::Machines,
     pub peers: Vec<crate::peer::Peer>,
     peer_runtime: remote_tasks::PeerRuntime,
-    headless: bool,
+    pub(crate) headless: bool,
     command_receipts: Vec<crate::protocol::Receipt>,
     command_intents: std::collections::BTreeMap<String, crate::protocol::Command>,
     server_epoch: String,
@@ -2571,6 +2571,7 @@ pub struct State {
     pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
+    pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
     pub captain_picker_highlight: usize,
@@ -2753,6 +2754,7 @@ impl State {
             artwork,
             attachment_cache,
             attachment_drop_hover: false,
+            composer_ui: Default::default(),
             captain_picker: false,
             captain_picker_query: TextEdit::default(),
             captain_picker_highlight: 0,
@@ -2862,6 +2864,9 @@ impl State {
             self.capture_opened_draft();
         }
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
+        if !self.headless {
+            self.composer_thread_opened();
+        }
         if !self.in_scope(self.current()) {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
@@ -3350,7 +3355,7 @@ impl State {
         match target {
             Some(project) => {
                 self.new_thread_in(project);
-                self.current_mut().draft.focused = true;
+                self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Explicit);
             }
             None => self.open_picker(ProjectPicker::NewThread),
         }
@@ -4333,7 +4338,7 @@ impl State {
         self.captain_picker_query = TextEdit::default();
         self.captain_picker_query.focused = true;
         self.captain_picker_highlight = 0;
-        self.current_mut().draft.focused = true;
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Explicit);
     }
 
     pub fn choose_project_captain(&mut self, id: ProjectId) {
@@ -4348,7 +4353,7 @@ impl State {
             self.captain_picker_query = TextEdit::default();
             self.captain_picker_query.focused = true;
             self.captain_picker_highlight = 0;
-            self.current_mut().draft.focused = true;
+            self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Explicit);
         }
     }
     pub fn toggle_thread_auto_settle(&mut self, id: usize) {
@@ -4735,7 +4740,7 @@ impl State {
         };
         self.captain_editor = None;
         self.open_captain(id);
-        self.current_mut().draft.focused = true;
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::MenuClosed);
     }
     /// The captain's most urgent live thread. Archived conversations do not vote.
     pub fn captain_status(&self, captain: usize) -> Status {
@@ -5604,6 +5609,11 @@ impl State {
             Some(errors.join(" "))
         };
         if attached > 0 {
+            if index == self.active {
+                self.restore_composer_focus(
+                    crate::ui::composer_ui::FocusReason::AttachmentInserted,
+                );
+            }
             self.checkpoint();
         }
     }
@@ -5624,6 +5634,11 @@ impl State {
             Ok(image) => {
                 let result = self.current_mut().add_attachment(image);
                 self.current_mut().attachment_error = result.err();
+                if self.current().attachment_error.is_none() {
+                    self.restore_composer_focus(
+                        crate::ui::composer_ui::FocusReason::AttachmentInserted,
+                    );
+                }
             }
             Err(error) => self.current_mut().attachment_error = Some(error),
         }
@@ -7135,8 +7150,9 @@ impl State {
     }
 }
 
-pub fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    let composer_changed = state.composer_sources.take_changed();
+pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
+    let composer_changed =
+        state.composer_sources.take_changed() | crate::ui::composer_ui::tick(state, now, tx);
     let mut html_changed = false;
     while let Some(outcome) = state.html_windows.next() {
         html_changed = true;

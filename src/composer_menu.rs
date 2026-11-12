@@ -218,7 +218,7 @@ fn select(s: &mut State, action: Action) {
                 edit.replace_with_pill(trigger.range, token.id(), &label);
                 edit.insert(" ");
             });
-            edit.focused = true;
+            s.restore_composer_focus(composer_ui::FocusReason::Inserted);
             s.checkpoint();
         }
     }
@@ -333,6 +333,7 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
                 .hover(p.selected)
                 .on_press_tx(move |s: &mut State, tx| {
                     select(s, item.action.clone());
+                    s.restore_composer_focus(composer_ui::FocusReason::Inserted);
                     tx.focus("composer-input", false);
                 })
                 .child(

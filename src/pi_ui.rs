@@ -778,14 +778,20 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
                 .hover(p.selected)
                 .child(label(mode.label(), LABEL, p.ink))
                 .child(label(description, SMALL, p.muted).wrap())
-                .on_press(move |s: &mut State| s.set_access_mode(mode)),
+                .on_press(move |s: &mut State| {
+                    s.set_access_mode(mode);
+                    s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+                }),
         );
     }
     card = card.child(label("Tool approvals do not sandbox the process. Trusted extensions retain your account's permissions.",SMALL,p.muted).wrap().padding(8.0));
     modal_frame(
         "access-modal",
         s,
-        |s| s.current_mut().native.access_picker = false,
+        |s| {
+            s.current_mut().native.access_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        },
         card,
     )
 }
