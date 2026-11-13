@@ -248,6 +248,10 @@ pub struct Machines {
     pub project_selection: std::collections::HashMap<String, (usize, String, Option<usize>)>,
     /// The project picker opened by a draft retarget, restricted to this machine.
     pub draft_picker: Option<String>,
+    /// One in-flight draft machine change. KSG's `environmentChangeRef` +
+    /// `busyEnvironmentChange`: the record is the request's identity, so only
+    /// its own result can apply or clear it and a second change replaces it.
+    pub draft_retarget: Option<DraftRetarget>,
     pub picker: bool,
     pub dialog: bool,
     pub host: rune::TextEdit,
@@ -261,6 +265,22 @@ pub struct Machines {
     pub devices: Value,
     pub pending: Option<std::sync::mpsc::Receiver<Result<MachineResult, String>>>,
 }
+/// A manual draft machine switch that has not resolved yet: the draft stays on
+/// `source` until its own request (a scratch-project open, or the target's
+/// project list arriving) applies it. KSG's scoped `environmentChangeRef`.
+pub struct DraftRetarget {
+    /// Machine the draft is moving to.
+    pub server: String,
+    /// Machine the draft was on when the change was requested.
+    pub source: String,
+    /// The draft thread id this change belongs to.
+    pub draft: usize,
+    /// The draft's project when the change was requested.
+    pub project: Option<usize>,
+    /// The `project.ensureScratch` request in flight, once one was needed.
+    pub command: Option<uuid::Uuid>,
+}
+
 pub enum MachineResult {
     Linked(Link),
     Paired(Value),
@@ -281,6 +301,7 @@ impl Default for Machines {
             recover: Default::default(),
             project_selection: Default::default(),
             draft_picker: None,
+            draft_retarget: None,
             picker: false,
             dialog: false,
             host: Default::default(),

@@ -2,6 +2,16 @@
 use super::*;
 use crate::protocol::{Command, Receipt};
 
+/// Where a draft machine change can land without blocking on more data.
+enum RouteTarget {
+    /// A matching logical project on the target machine.
+    Project(usize),
+    /// No match: KSG opens the target's scratch project.
+    Scratch,
+    /// The target's project list is not loaded yet.
+    Unresolved,
+}
+
 // A fixed monotonic/wall-clock pair makes a start timestamp stable across captures.
 fn stable_timestamp(at: Instant) -> u64 {
     static CLOCK: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
@@ -1054,6 +1064,21 @@ impl State {
         ] {
             index.as_object_mut().expect("index").remove(key);
         }
+        // Logical-project matching needs each project's repository identity,
+        // like `peer.capabilities["projects"][].gitRemote`. A cold lookup
+        // reports null, exactly like KSG's unresolved enrichment, and the
+        // next published snapshot carries the resolved remote.
+        if let Some(projects) = index["projects"].as_array_mut() {
+            for project in projects.iter_mut() {
+                if project.get("gitRemote").is_some() || project["machine"] != "local" {
+                    continue;
+                }
+                let remote = project["path"]
+                    .as_str()
+                    .and_then(|path| remote_tasks::repository(std::path::Path::new(path)));
+                project["gitRemote"] = remote.map(Value::from).unwrap_or(Value::Null);
+            }
+        }
         let mut projection = json!({
             "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
             "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error},
@@ -1210,6 +1235,12 @@ impl State {
             {
                 self.storage_error = Some(error);
             }
+        }
+        // A pending draft change resolves once the target's project list
+        // arrives, and abandons when the target disconnects mid-change.
+        if self.machines.draft_retarget.is_some() {
+            self.resolve_draft_retarget();
+            changed = true;
         }
         if let Some(client) = &self.client {
             if self.machines.selected == "local" {
@@ -1394,6 +1425,12 @@ impl State {
                             .into(),
                     )
                 };
+                continue;
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
+                && command.method == "project.ensureScratch"
+            {
+                self.apply_draft_routing_receipt(&server, command, value);
                 continue;
             }
             if let crate::client::Event::Receipt(command, value) = &event
@@ -2279,6 +2316,16 @@ impl State {
         self.requested_tab_restore = None;
         self.close_thread_find();
         self.machines.selected = server.into();
+        // A draft change pending on the machine we just left is abandoned, like
+        // KSG abandoning an in-flight environmentChange on a scope change.
+        if self
+            .machines
+            .draft_retarget
+            .as_ref()
+            .is_some_and(|pending| pending.source != self.machines.selected)
+        {
+            self.machines.draft_retarget = None;
+        }
         let cached = self.machines.threads.remove(server);
         let cached_editors = cached.is_some();
         self.threads = cached.unwrap_or_else(|| vec![Thread::new(1)]);
@@ -2384,14 +2431,364 @@ impl State {
     }
 
     /// Retarget only the unsent editor. No command runs on either host until Send.
+    /// Ported from KSG Code's `useDraftEnvironmentRouting.onEnvironmentChange`:
+    /// the draft moves to the matching logical project on the target machine, or
+    /// to its scratch project when nothing matches.
     pub fn retarget_draft(&mut self, server: &str) {
         if !self.can_retarget_draft() || !self.machine_connected(server) {
             return;
         }
+        self.machines.picker = false;
         if server == self.machines.selected {
-            self.machines.picker = false;
             return;
         }
+        // A second change supersedes the first: the pending record is the
+        // request's identity, so dropping it discards the earlier change.
+        self.machines.draft_retarget = None;
+        let server = server.to_owned();
+        let source = self.machines.selected.clone();
+        let draft = self.current().id;
+        let project = self.current().project;
+        match self.draft_route_target(&server, project) {
+            RouteTarget::Project(project) => self.apply_draft_retarget(&server, Some(project)),
+            RouteTarget::Unresolved => {
+                if self.draft_routing_capable(&server) {
+                    // The target's project list is not loaded yet; the pending
+                    // state resolves it when the workspace view arrives.
+                    self.machines.draft_retarget = Some(crate::peer::DraftRetarget {
+                        server,
+                        source,
+                        draft,
+                        project,
+                        command: None,
+                    });
+                } else {
+                    self.retarget_draft_choose(&server);
+                }
+            }
+            RouteTarget::Scratch => {
+                if !self.request_scratch_project(&server, &source, draft, project) {
+                    self.retarget_draft_choose(&server);
+                }
+            }
+        }
+    }
+
+    /// Whether the target machine can open a scratch project for a retarget.
+    fn draft_routing_capable(&self, server: &str) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|client| client.supports_capability(server, crate::protocol::DRAFT_ROUTING))
+    }
+
+    /// Where the draft should land on `server`: the matching logical project,
+    /// its scratch project, or `Unresolved` while the project list is not loaded.
+    fn draft_route_target(&self, server: &str, project: Option<usize>) -> RouteTarget {
+        let Some(project) = project else {
+            // KSG's scratch draft offers every machine's scratch project.
+            return RouteTarget::Scratch;
+        };
+        let Some(view) = self.machines.views.get(server) else {
+            return RouteTarget::Unresolved;
+        };
+        let Some(source) = self.route_source_project(project) else {
+            return RouteTarget::Scratch;
+        };
+        let candidates: Vec<crate::model::draft_routing::RouteProject> = view["index"]["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(crate::model::draft_routing::RouteProject::from_record)
+            .collect();
+        crate::model::draft_routing::match_logical_project(&source, &candidates)
+            .map_or(RouteTarget::Scratch, RouteTarget::Project)
+    }
+
+    /// The draft's project as a matching candidate, with the repository identity
+    /// that machine already reported (or a local lookup for this machine).
+    fn route_source_project(&self, project: usize) -> Option<crate::model::draft_routing::RouteProject> {
+        let entry = self.project(Some(project))?;
+        let remote = self
+            .machines
+            .views
+            .get(&self.machines.selected)
+            .and_then(|view| view["index"]["projects"].as_array())
+            .and_then(|projects| {
+                projects
+                    .iter()
+                    .find(|p| p["id"].as_u64() == Some(project as u64))
+            })
+            .and_then(|p| p["gitRemote"].as_str().map(str::to_owned))
+            .or_else(|| {
+                (self.machines.selected == "local")
+                    .then(|| remote_tasks::repository(&entry.path))
+                    .flatten()
+            });
+        Some(crate::model::draft_routing::RouteProject {
+            id: entry.id,
+            path: entry.path.to_string_lossy().into_owned(),
+            git_remote: remote,
+            hidden: entry.hidden,
+            updated: entry.updated,
+        })
+    }
+
+    /// Resolve a pending change once the target's project list is loaded, or
+    /// abandon it when the target disconnected or the draft's scope moved on —
+    /// KSG abandons an in-flight change on a scope change.
+    fn resolve_draft_retarget(&mut self) {
+        let Some(pending) = &self.machines.draft_retarget else {
+            return;
+        };
+        let server = pending.server.clone();
+        let source = pending.source.clone();
+        let draft = pending.draft;
+        let project = pending.project;
+        if pending.command.is_some() || !self.machines.views.contains_key(&server) {
+            if !self.machine_connected(&server) {
+                self.machines.draft_retarget = None;
+                let label = self.machine_label(&server);
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Could not switch machine",
+                    Some(format!("{label} disconnected before the draft could move.")),
+                    None,
+                    Some(6_000),
+                );
+            }
+            return;
+        }
+        let draft_still_current = self.machines.selected == source
+            && self.current().id == draft
+            && self.current().project == project
+            && self.current().client_draft;
+        if !draft_still_current {
+            self.machines.draft_retarget = None;
+            return;
+        }
+        self.machines.draft_retarget = None;
+        match self.draft_route_target(&server, project) {
+            RouteTarget::Project(project) => self.apply_draft_retarget(&server, Some(project)),
+            RouteTarget::Scratch => {
+                if !self.request_scratch_project(&server, &source, draft, project) {
+                    self.retarget_draft_choose(&server);
+                }
+            }
+            RouteTarget::Unresolved => {}
+        }
+    }
+
+    /// KSG's `openScratchProject`: ask the target server for its scratch project
+    /// and leave the draft on its own machine until the request resolves.
+    fn request_scratch_project(
+        &mut self,
+        server: &str,
+        source: &str,
+        draft: usize,
+        project: Option<usize>,
+    ) -> bool {
+        if !self.draft_routing_capable(server) {
+            return false;
+        }
+        let sent = self
+            .client
+            .as_ref()
+            .and_then(|client| client.commands_for(server))
+            .and_then(|commands| commands.send("project.ensureScratch", json!({})).ok());
+        match sent {
+            Some(command) => {
+                self.machines.draft_retarget = Some(crate::peer::DraftRetarget {
+                    server: server.to_owned(),
+                    source: source.to_owned(),
+                    draft,
+                    project,
+                    command: Some(command),
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A scratch-request receipt applies only while it still names the current
+    /// pending change; anything else is a late or superseded result.
+    fn apply_draft_routing_receipt(&mut self, server: &str, command: &Command, value: &Value) {
+        let Some(pending) = &self.machines.draft_retarget else {
+            return;
+        };
+        if pending.server != server || pending.command != Some(command.command_id) {
+            return;
+        }
+        let pending = self.machines.draft_retarget.take().expect("checked");
+        // KSG's retarget closure: the draft must still exist, unpromoted, on the
+        // same machine and project it had when the change was requested.
+        let draft_still_current = self.machines.selected == pending.source
+            && self.current().id == pending.draft
+            && self.current().project == pending.project
+            && self.current().client_draft
+            && self.current().remote_send.is_none()
+            && self.current().client_creating.is_none()
+            && self.current().client_promoted.is_none();
+        if !draft_still_current {
+            return;
+        }
+        if value["result"]["status"] == "accepted"
+            && let Some(project) = value["result"]["result"]["projectId"].as_u64()
+        {
+            self.apply_draft_retarget(server, Some(project as usize));
+            return;
+        }
+        // KSG reports the scratch open with "Could not switch machine".
+        let message = value["error"]["message"]
+            .as_str()
+            .or(value["result"]["result"]["error"].as_str())
+            .unwrap_or("The target machine could not open a scratch project.")
+            .to_string();
+        self.push_toast(
+            ToastKind::Error,
+            "Could not switch machine",
+            Some(message),
+            None,
+            Some(6_000),
+        );
+    }
+
+    /// Move the draft thread to `server`'s workspace addressed to `project`.
+    /// KSG's `setDraftThreadContext`: the same draft keeps its body; checkout
+    /// state resets on a project change.
+    fn apply_draft_retarget(&mut self, server: &str, project: Option<usize>) {
+        if !self.can_retarget_draft() {
+            return;
+        }
+        let source = self.machines.selected.clone();
+        let draft = self.current().id;
+        let Some(index) = self.threads.iter().position(|t| t.id == draft) else {
+            return;
+        };
+        let mut thread = self.threads.remove(index);
+        if self.threads.is_empty() {
+            self.active = 0;
+        } else {
+            self.active = self.active.min(self.threads.len() - 1);
+        }
+        self.capture_opened_draft();
+        self.select_machine(server);
+        if self.machines.selected != server {
+            self.threads.push(thread);
+            self.select_thread(self.threads.len() - 1);
+            return;
+        }
+        // Client draft ids descend from usize::MAX; a draft already on the
+        // target with the same id would collide, so take the next free one.
+        if self.threads.iter().any(|t| t.id == thread.id) {
+            let id = self
+                .threads
+                .iter()
+                .filter(|t| t.client_draft)
+                .map(|t| t.id)
+                .min()
+                .unwrap_or(usize::MAX)
+                .min(self.next_client_draft)
+                .saturating_sub(1);
+            self.next_client_draft = id;
+            thread.id = id;
+        }
+        thread.project = project;
+        thread.remote = self
+            .client
+            .as_ref()
+            .and_then(|client| client.commands_for(server))
+            .cloned();
+        thread.background_send = None;
+        thread.pending_send_and_new_thread = None;
+        // A saved copy on the source machine would resurrect the draft there.
+        self.drop_saved_client_draft(&source, draft);
+        self.threads.push(thread);
+        self.select_thread(self.threads.len() - 1);
+        self.apply_retarget_rules();
+        self.checkpoint();
+    }
+
+    /// Remove a client draft's saved editor/tab entries from another machine's
+    /// UI store so switching back does not restore a copy.
+    fn drop_saved_client_draft(&mut self, server: &str, draft: usize) {
+        let ui = &mut self.machines.ui[server];
+        if let Some(drafts) = ui["drafts"].as_object_mut() {
+            drafts.remove(&draft.to_string());
+        }
+        for key in ["clientDrafts", "tabs"] {
+            if let Some(list) = ui[key].as_array_mut() {
+                list.retain(|entry| {
+                    if key == "clientDrafts" {
+                        entry["id"].as_u64() != Some(draft as u64)
+                    } else {
+                        entry.as_u64() != Some(draft as u64)
+                    }
+                });
+            }
+        }
+        if ui["active"].as_u64() == Some(draft as u64) {
+            ui["active"] = Value::Null;
+        }
+        self.checkpoint_client();
+    }
+
+    /// KSG's `setDraftThreadContext` keep/drop rules applied after the move:
+    /// the draft body, images, context, reply and model selections carry over;
+    /// checkout state (worktree path, branch) resets on a project change, and a
+    /// worktree setup only survives a target that is itself a repository.
+    fn apply_retarget_rules(&mut self) {
+        let target_repo = self
+            .current()
+            .project
+            .and_then(|project| {
+                self.machines.views.get(&self.machines.selected)?["index"]["projects"]
+                    .as_array()?
+                    .iter()
+                    .find(|p| p["id"].as_u64() == Some(project as u64))
+            })
+            .is_some_and(|p| p["gitRemote"].is_string());
+        // The model survives only when the target offers the same provider
+        // instance and model; KSG's fallback is the target's default selection.
+        let keep_model = match &self.current().selected_model {
+            Some((instance, model)) => {
+                self.model_disabled_reason_for(instance, model).is_none()
+                    && (self.catalog.models.is_empty()
+                        || self.catalog.models.iter().any(|m| m.id == *model))
+            }
+            None => true,
+        };
+        let thread = self.current_mut();
+        let mut resets = crate::model::draft_routing::RetargetResets::default();
+        if thread.worktree_path.is_some() || thread.branch.is_some() {
+            resets.worktree = true;
+        }
+        thread.worktree_path = None;
+        thread.branch = None;
+        if !target_repo && (thread.env_mode.is_some() || thread.base_branch.is_some()) {
+            thread.env_mode = None;
+            thread.base_branch = None;
+            thread.start_from_origin = None;
+            resets.worktree = true;
+        }
+        if !keep_model {
+            thread.selected_model = None;
+            thread.selected_thinking = None;
+            thread.draft_model_state = Default::default();
+            resets.model = true;
+        }
+        if !resets.model && !resets.worktree {
+            return;
+        }
+        let label = self.machine_label(&self.machines.selected.clone());
+        if let Some(notice) = resets.notice(&label) {
+            self.push_toast(ToastKind::Warning, notice, None, None, Some(6_000));
+        }
+    }
+
+    /// Today's fallback when the target cannot take the draft in place: a fresh
+    /// draft on the target machine plus the project picker.
+    fn retarget_draft_choose(&mut self, server: &str) {
         let source = (self.machines.selected.clone(), self.current().id);
         let draft = self.current().draft.clone();
         let images = self.current().draft_images.clone();
@@ -3688,6 +4085,34 @@ impl State {
                 let id = self
                     .add_project(path)?
                     .ok_or("The owning server did not register the project.")?;
+                return Ok(json!({"projectId":id}));
+            }
+            // Ported from KSG Code's `projects.ensureScratch` (ManagedProjectFolders):
+            // find or create the server's scratch workspace and answer its project id.
+            "project.ensureScratch" => {
+                let path = self.data_dir.join("scratch");
+                std::fs::create_dir_all(&path)
+                    .map_err(|_| "The scratch folder could not be created.")?;
+                let path = crate::projects::clean_path(&path);
+                let existing = self
+                    .projects
+                    .entries
+                    .iter_mut()
+                    .find(|p| p.machine == "local" && crate::projects::same_path(&p.path, &path));
+                let id = match existing {
+                    Some(project) => {
+                        project.hidden = false;
+                        project.updated = crate::projects::now();
+                        project.id
+                    }
+                    None => {
+                        let id = self.projects.next_id.max(1);
+                        self.projects.next_id = id + 1;
+                        self.projects.entries.push(Project::new(id, path));
+                        id
+                    }
+                };
+                self.checkpoint();
                 return Ok(json!({"projectId":id}));
             }
             "project.remove" => self.remove_project(number("projectId")?),

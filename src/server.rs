@@ -692,6 +692,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if vcs_worktrees {
                             capabilities.push(protocol::VCS_WORKTREES);
                         }
+                        if minor >= 21 {
+                            capabilities.push(protocol::DRAFT_ROUTING);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),

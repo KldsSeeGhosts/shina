@@ -130,6 +130,8 @@ mod background;
 pub use background::{BackgroundSettings, BackgroundStatus};
 #[path = "client_state.rs"]
 mod client_state;
+#[path = "draft_routing.rs"]
+mod draft_routing;
 #[path = "queued_edit.rs"]
 mod queued_edit;
 #[path = "run_control.rs"]
