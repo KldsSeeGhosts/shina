@@ -583,10 +583,11 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_target(
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
+            self.draft_reply_to.as_ref(),
             Some(&self.machine),
             target_server_id,
             peers,
@@ -623,6 +624,7 @@ impl Thread {
         self.draft.replace_text("");
         self.draft_images.clear();
         self.draft_context.clear();
+        self.draft_reply_to = None;
         self.retained_context = Default::default();
         self.life.user_sent(lifecycle::now());
         self.drive_native();

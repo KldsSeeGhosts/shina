@@ -13,6 +13,7 @@ pub const ASSISTANT_CITATION_MAX_TEXT_LENGTH: usize = 8_000;
 pub const ASSISTANT_CITATION_CONTEXT_LENGTH: usize = 32;
 pub const ASSISTANT_CITATION_MAX_ID_LENGTH: usize = 4_096;
 pub const ASSISTANT_CITATION_LABEL_MAX_CHARS: usize = 64;
+pub const RESPONSE_OPENING_LENGTH: usize = 300;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssistantTextSelector {
@@ -371,6 +372,60 @@ pub fn citation_context_record(
     }
 }
 
+/// Ported from KSG Code's `captureAssistantMessageOpening` (`assistantTextSelection.ts`).
+pub fn capture_assistant_message_opening(message_text: &str) -> Option<AssistantTextSelector> {
+    let rendered = markdown_rendered_text(message_text);
+    let text = if rendered.trim().is_empty() {
+        message_text
+    } else {
+        rendered.as_str()
+    };
+    let trimmed_start = text.trim_start();
+    if trimmed_start.trim().is_empty() {
+        return None;
+    }
+    let raw_start = text.len() - trimmed_start.len();
+    let trimmed_end = text.trim_end().len();
+    let max_span = utf16_to_byte(
+        &text[raw_start..trimmed_end],
+        RESPONSE_OPENING_LENGTH,
+        false,
+    );
+    let raw_end = (raw_start + max_span).min(trimmed_end);
+    create_assistant_text_selector(text, raw_start, raw_end)
+}
+
+/// Ported from KSG Code's `responseContextRecord` (`composerContextRecords.ts`).
+/// One record per response, so replying to it again reuses the same reference.
+pub fn response_context_record(
+    citation: AssistantCitation,
+    item_id: &str,
+    subagents: Option<Vec<ResponseSubagentRef>>,
+) -> ComposerContextRecord {
+    let context_id = to_kind_scoped_composer_context_id("response", &citation.message_id);
+    let preview = slice_utf16(&citation.text, 0, ASSISTANT_CITATION_LABEL_MAX_CHARS);
+    let label = sanitize_composer_context_label(preview, "response");
+    ComposerContextRecord {
+        version: 1,
+        context_id,
+        label,
+        data: ComposerContextData::Response {
+            citation,
+            item_id: item_id.to_owned(),
+            subagents: subagents.filter(|list| !list.is_empty()).map(|list| {
+                list.into_iter()
+                    .take(20)
+                    .map(|s| ResponseSubagentRef {
+                        thread_id: s.thread_id,
+                        title: sanitize_composer_context_label(&s.title, "response"),
+                        environment_id: s.environment_id,
+                    })
+                    .collect()
+            }),
+        },
+    }
+}
+
 fn parse_assistant_body_path(path: &str, thread_id: usize) -> Option<(usize, usize)> {
     let prefix = format!("message-{thread_id}-");
     for segment in path.split('/') {
@@ -506,6 +561,37 @@ mod tests {
         let too_long = "é".repeat(ASSISTANT_CITATION_MAX_TEXT_LENGTH + 1);
         let err = build_assistant_citation("env-1", "1", "msg-1", &too_long, 0, too_long.len());
         assert_eq!(err, Err(CitationBuildError::TooLong));
+    }
+
+    #[test]
+    fn opening_capture_trims_to_300_utf16_units_and_builds_response_record() {
+        let long = format!("  {}  ", "x".repeat(400));
+        let opening = capture_assistant_message_opening(&long).unwrap();
+        assert_eq!(utf16_len(&opening.text), RESPONSE_OPENING_LENGTH);
+        assert_eq!(opening.start, 0);
+        assert_eq!(opening.end, RESPONSE_OPENING_LENGTH as u64);
+
+        let code = format!("```\n  {}  \n```", "y".repeat(400));
+        let code_opening = capture_assistant_message_opening(&code).unwrap();
+        assert_eq!(utf16_len(&code_opening.text), RESPONSE_OPENING_LENGTH);
+        assert_eq!(code_opening.start, 1);
+        assert_eq!(code_opening.end, 1 + RESPONSE_OPENING_LENGTH as u64);
+
+        let citation = AssistantCitation {
+            version: 1,
+            environment_id: "local".into(),
+            thread_id: "1".into(),
+            message_id: "m1".into(),
+            text: opening.text,
+            comment: None,
+            start: opening.start,
+            end: opening.end,
+            prefix: opening.prefix,
+            suffix: opening.suffix,
+        };
+        let record = response_context_record(citation, "m1", None);
+        assert_eq!(record.context_id, "response_m1");
+        assert_eq!(record.label, "x".repeat(ASSISTANT_CITATION_LABEL_MAX_CHARS));
     }
 
     #[test]

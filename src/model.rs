@@ -504,6 +504,7 @@ pub struct Thread {
     pub remote: Option<crate::client::Commands>,
     pub(crate) remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
     pub(crate) remote_send_fresh_arm: Option<u64>,
+    pub(crate) remote_send_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     pub fresh_session_arm: Option<u64>,
     pub fresh_session_messages: Vec<String>,
     pub fallback_active: Option<crate::usage_limits::FallbackInfo>,
@@ -544,6 +545,7 @@ pub struct Thread {
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
     pub draft_context: Vec<crate::composer_context::ComposerContextRecord>,
+    pub draft_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     pub retained_context: crate::composer_context::RetainedContextPayloads,
     pub attachment_error: Option<String>,
     pub submission_error: Option<String>,
@@ -732,6 +734,7 @@ impl Thread {
         !self.draft.text.trim().is_empty()
             || self.draft.pills().next().is_some()
             || !self.draft_images.is_empty()
+            || self.draft_reply_to.is_some()
     }
     /// Add a validated attachment while preserving the text draft and its undo history.
     pub(crate) fn insert_attachment_chips(
@@ -880,6 +883,7 @@ impl Thread {
             remote: None,
             remote_send: None,
             remote_send_fresh_arm: None,
+            remote_send_reply_to: None,
             fresh_session_arm: None,
             fresh_session_messages: Vec::new(),
             composer_context_supported: true,
@@ -930,6 +934,7 @@ impl Thread {
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
             draft_context: Vec::new(),
+            draft_reply_to: None,
             retained_context: Default::default(),
             attachment_error: None,
             submission_error: None,
@@ -1340,10 +1345,11 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_target(
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
+            self.draft_reply_to.as_ref(),
             Some(&self.machine),
             target_server_id,
             peers,
@@ -1361,6 +1367,7 @@ impl Thread {
         self.draft.replace_text("");
         self.draft_images.clear();
         self.draft_context.clear();
+        self.draft_reply_to = None;
         self.retained_context = Default::default();
         self.native.queue_held = false;
         self.native.access = resolve_compatible_access_mode(
@@ -3030,6 +3037,13 @@ impl Thread {
     }
 
     fn restore_prompt(&mut self, prompt: &Prompt) {
+        let split_reply = prompt.draft.as_ref().and_then(|draft| {
+            crate::composer_tokens::split_leading_reply_reference(
+                &prompt.text,
+                Some(&draft.editor()),
+                prompt.context.as_ref(),
+            )
+        });
         let submitted = prompt.draft.as_ref().map_or_else(
             || crate::composer_rich::draft(&prompt.text),
             crate::composer_rich::Snapshot::editor,
@@ -3062,6 +3076,11 @@ impl Thread {
             }
         }
         self.draft_context = context;
+        if self.draft_reply_to.is_none()
+            && let Some((reply_record, _)) = split_reply
+        {
+            self.draft_reply_to = Some(reply_record);
+        }
         self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
@@ -3099,6 +3118,7 @@ impl Thread {
         }
         let (_, snapshot) = self.remote_send.take().unwrap();
         let sent_arm = self.remote_send_fresh_arm.take();
+        let sent_reply_to = self.remote_send_reply_to.take();
         if accepted {
             if let Some(arm) = sent_arm
                 && self.fresh_session_arm == Some(arm)
@@ -3107,6 +3127,9 @@ impl Thread {
             }
         } else {
             self.restore_snapshot(&snapshot);
+            if self.draft_reply_to.is_none() {
+                self.draft_reply_to = sent_reply_to;
+            }
         }
         true
     }
@@ -4164,6 +4187,90 @@ impl State {
         });
         tx.scroll_center_in(format!("conversation-{id}"), row_key);
         true
+    }
+
+    pub(crate) fn reply_to_message(&mut self, message_id: &str) -> bool {
+        if self.demo {
+            return false;
+        }
+        let current = self.current();
+        if current.archived() || current.request.is_some() || current.native.questionnaire.is_some()
+        {
+            return false;
+        }
+        let Some(msg_idx) = current
+            .messages
+            .iter()
+            .position(|m| m.id == message_id && m.role == "Pi" && !m.text.trim().is_empty())
+        else {
+            return false;
+        };
+        let message = &current.messages[msg_idx];
+        let Some(opening) =
+            crate::assistant_citation::capture_assistant_message_opening(&message.text)
+        else {
+            return false;
+        };
+        let env_id = self.machine_identity(&current.machine);
+        let thread_id_str = current.id.to_string();
+        let citation = crate::composer_context::AssistantCitation {
+            version: 1,
+            environment_id: env_id,
+            thread_id: thread_id_str,
+            message_id: message.id.clone(),
+            text: opening.text,
+            comment: None,
+            start: opening.start,
+            end: opening.end,
+            prefix: opening.prefix,
+            suffix: opening.suffix,
+        };
+        let subagents = if self.is_captain_home(current) {
+            let turn_start = current.messages[..=msg_idx]
+                .iter()
+                .rposition(|m| m.role != "Pi")
+                .map_or(0, |i| i + 1);
+            let tasks = self.tasks_for(current.id);
+            let mut refs = Vec::new();
+            let mut seen_threads = std::collections::HashSet::new();
+            for tool in &current.tools {
+                if !(turn_start..=msg_idx).contains(&tool.anchor.message)
+                    || (tool.name != "delegate_task" && !tool.name.ends_with("__delegate_task"))
+                {
+                    continue;
+                }
+                let child_id = serde_json::from_str::<Value>(&tool.output)
+                    .ok()
+                    .and_then(|v| v["thread_id"].as_u64())
+                    .or_else(|| tool.structured["thread_id"].as_u64());
+                if let Some(child_id) = child_id
+                    && let Some(task) = tasks.iter().find(|task| task.child_id == child_id as usize)
+                    && seen_threads.insert(task.child_id)
+                {
+                    refs.push(crate::composer_context::ResponseSubagentRef {
+                        thread_id: task.child_id.to_string(),
+                        title: task.title.clone(),
+                        environment_id: task.remote.as_ref().map(|r| r.server_id.clone()),
+                    });
+                }
+            }
+            (!refs.is_empty()).then_some(refs)
+        } else {
+            None
+        };
+        let record =
+            crate::assistant_citation::response_context_record(citation, &message.id, subagents);
+        self.current_mut().draft_reply_to = Some(record);
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Explicit);
+        self.checkpoint();
+        true
+    }
+
+    pub(crate) fn clear_reply_to(&mut self) {
+        if self.current().draft_reply_to.is_some() {
+            self.current_mut().draft_reply_to = None;
+            self.checkpoint();
+        }
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
         thread.captain_home && !thread.delegated
@@ -8754,6 +8861,7 @@ impl State {
             || t.draft.pills().next().is_some()
             || !t.draft_images.is_empty()
             || !t.draft_context.is_empty()
+            || t.draft_reply_to.is_some()
             || !crate::harness::supports_prompt_suggestions(&t.harness)
         {
             return None;
@@ -8856,6 +8964,7 @@ impl State {
         let draft_markdown = crate::composer_rich::markdown(&self.current().draft);
         let composer_holds_only_text = self.current().draft_images.is_empty()
             && self.current().draft_context.is_empty()
+            && self.current().draft_reply_to.is_none()
             && self.current().draft.pills().next().is_none();
         if forced_fresh_context.is_none()
             && fresh_session_available
@@ -8932,10 +9041,11 @@ impl State {
             let revision = uuid::Uuid::new_v4();
             let target_machine = self.machines.selected.clone();
             let target_server_id = self.machine_identity(&target_machine);
-            let prompt = match crate::composer_tokens::prompt_for_target(
+            let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
                 Some(&target_machine),
                 Some(&target_server_id),
                 &self.peers,
@@ -8995,6 +9105,7 @@ impl State {
                     let thread = self.current_mut();
                     thread.remote_send = Some((id, snapshot));
                     thread.remote_send_fresh_arm = fresh_arm;
+                    thread.remote_send_reply_to = thread.draft_reply_to.take();
                     thread.draft.replace_text("");
                     thread.draft_images.clear();
                     thread.draft_context.clear();
@@ -9139,10 +9250,11 @@ impl State {
                 .iter()
                 .map(|p| (p.server_id.clone(), p.label.clone()))
                 .collect();
-            let prompt = match crate::composer_tokens::prompt_for_target(
+            let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
                 Some(&self.current().machine),
                 Some(&local_server_id),
                 &peers,
@@ -9178,6 +9290,7 @@ impl State {
             thread.draft.replace_text("");
             thread.draft_images.clear();
             thread.draft_context.clear();
+            thread.draft_reply_to = None;
             thread.retained_context = Default::default();
             thread.native.queue_held = false;
             thread.serial += 1;
@@ -9197,10 +9310,11 @@ impl State {
         }
         if self.current().status.busy() {
             if !self.headless {
-                if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
+                if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                     &self.current().draft,
                     &self.current().draft_images,
                     &self.current().draft_context,
+                    self.current().draft_reply_to.as_ref(),
                     Some(&self.current().machine),
                     Some(&self.machine_identity(&self.machines.selected)),
                     &self.peers,
@@ -9250,10 +9364,11 @@ impl State {
             return dispatched;
         }
         if !self.headless {
-            if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
+            if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
                 Some(&self.current().machine),
                 Some(&self.machine_identity(&self.machines.selected)),
                 &self.peers,
@@ -10256,12 +10371,13 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let (draft, images, context) = t.queued_edit.as_ref().map_or(
-                    (&t.draft, &t.draft_images, &t.draft_context),
-                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context),
+                let (draft, images, context, reply_to) = t.queued_edit.as_ref().map_or(
+                    (&t.draft, &t.draft_images, &t.draft_context, &t.draft_reply_to),
+                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context, &edit.ordinary_reply_to),
                 );
                 let value = if images.is_empty()
                     && context.is_empty()
+                    && reply_to.is_none()
                     && !crate::composer_rich::has_format(draft)
                     && draft.pills().next().is_none()
                     && t.fresh_session_arm.is_none()
@@ -10274,6 +10390,9 @@ impl State {
                         "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                         "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
                     });
+                    if let Some(reply) = reply_to {
+                        obj["replyTo"] = json!(reply);
+                    }
                     if let Some(arm) = t.fresh_session_arm {
                         obj["freshSession"] = json!(true);
                         obj["freshSessionArm"] = json!(arm);
@@ -10386,6 +10505,21 @@ impl State {
                     .and_then(|v| crate::composer_context::decode_message_context(v).ok())
                     .map(|c| c.records)
                     .unwrap_or_default();
+                t.draft_reply_to = draft
+                    .get("replyTo")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| {
+                        serde_json::from_value::<crate::composer_context::ComposerContextRecord>(
+                            v.clone(),
+                        )
+                        .ok()
+                    })
+                    .filter(|r| {
+                        matches!(
+                            r.data,
+                            crate::composer_context::ComposerContextData::Response { .. }
+                        )
+                    });
                 t.retained_context = Default::default();
                 if draft["freshSession"] == true {
                     let arm = draft["freshSessionArm"].as_u64().unwrap_or_else(|| {

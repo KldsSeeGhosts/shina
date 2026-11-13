@@ -8845,6 +8845,35 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             response = response.child(render_part(index));
         }
     }
+    if !live
+        && !s.demo
+        && !t.archived()
+        && let Some(reply_msg) = t.messages[start..end]
+            .iter()
+            .rev()
+            .find(|m| m.role == "Pi" && !m.text.trim().is_empty())
+    {
+        let reply_id = reply_msg.id.clone();
+        let on_press_id = reply_id.clone();
+        response = response.child(
+            row()
+                .key(format!("assistant-actions-{}-{reply_id}", t.id))
+                .gap(8.0)
+                .center_y()
+                .child(
+                    icon_button(
+                        &format!("reply-message-{reply_id}"),
+                        "Reply to this response",
+                        "back",
+                        p,
+                        move |s| {
+                            s.reply_to_message(&on_press_id);
+                        },
+                    )
+                    .help("Reply to this response"),
+                ),
+        );
+    }
     response
 }
 
@@ -11351,6 +11380,102 @@ fn composer_caret_edges(cx: &Cx<State>, zoom: f32) -> Option<[bool; 2]> {
     Some([first, last])
 }
 
+/// Ported from KSG Code's `replyBannerItems` (`chat/ChatComposer.tsx`) and `ComposerBanner`
+/// (`chat/ComposerBanner.tsx`, `px-1 py-1.25 min-h-6 gap-x-1 text-xs/4`).
+fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
+    let reply_to = t.draft_reply_to.as_ref()?;
+    let crate::composer_context::ComposerContextData::Response {
+        citation,
+        subagents,
+        ..
+    } = &reply_to.data
+    else {
+        return None;
+    };
+    let title = match subagents.as_deref() {
+        Some(list) if !list.is_empty() => format!(
+            "Replying to {}",
+            list.iter()
+                .map(|subagent| subagent.title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => "Replying to".to_owned(),
+    };
+    let target_label = crate::assistant_citation::assistant_citation_label(citation);
+    let nav_citation = citation.clone();
+    let text_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let aria_label = format!("{title} {target_label}");
+    let has_subagents = subagents.as_deref().is_some_and(|list| !list.is_empty());
+    let title_el = if has_subagents {
+        label(title, title_style, p.muted)
+            .truncate()
+            .min_w(0.0)
+            .shrink()
+    } else {
+        label(title, title_style, p.muted)
+    };
+    Some(
+        row()
+            .key("composer-reply-banner")
+            .keeps_text_selection()
+            .on_key(composer_ui::control_key)
+            .w_full()
+            .min_h(24.0)
+            .px(4.0)
+            .py(5.0)
+            .gap(4.0)
+            .center_y()
+            .child(
+                el().size(24.0, 24.0)
+                    .center()
+                    .child(icon("back", p.muted).size(12.0, 12.0)),
+            )
+            .child(
+                row()
+                    .role("button")
+                    .label(aria_label)
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(4.0)
+                    .hover(p.selected)
+                    .press(p.selected)
+                    .on_press_tx(move |s: &mut State, tx| {
+                        s.navigate_to_citation(&nav_citation, tx);
+                    })
+                    .child(title_el)
+                    .child(
+                        label(target_label, text_style, p.muted)
+                            .truncate()
+                            .min_w(0.0)
+                            .grow(1.0),
+                    ),
+            )
+            .child(
+                el().key("composer-reply-remove")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Remove reply")
+                    .focusable(true)
+                    .size(20.0, 20.0)
+                    .center()
+                    .radius(4.0)
+                    .hover(p.selected)
+                    .press(p.selected)
+                    .on_press(|s: &mut State| {
+                        s.clear_reply_to();
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                    })
+                    .child(icon("close", p.muted).size(12.0, 12.0)),
+            ),
+    )
+}
+
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
@@ -11625,6 +11750,9 @@ fn composer(
             tray = tray.child(attachment_chip(s, p, image));
         }
         card = card.child(tray);
+    }
+    if let Some(banner) = composer_reply_banner(t, p) {
+        card = card.child(banner).child(rule(p));
     }
     // Ported from KSG Code's composer body (`px-4 pt-4 pb-2`, `ChatComposer.tsx`) and its
     // editor (`max-h-52 overflow-y-auto p-1 -m-1`, `ComposerPromptEditorTiptap.tsx`): the field
@@ -23432,5 +23560,235 @@ pub(crate) mod tests {
         assert_eq!(reloaded.current().draft.pills().count(), 1);
         assert_eq!(reloaded.current().draft_context, vec![saved_record]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_set_replace_remove_persists_and_handles_accepted_and_failed_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-reply-persist-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().messages = vec![
+            crate::model::Message {
+                id: "msg-a1".into(),
+                role: "Pi",
+                text: "First assistant response opening.".into(),
+                images: Vec::new(),
+                context: None,
+            },
+            crate::model::Message {
+                id: "msg-u2".into(),
+                role: "You",
+                text: "Follow up".into(),
+                images: Vec::new(),
+                context: None,
+            },
+            crate::model::Message {
+                id: "msg-a2".into(),
+                role: "Pi",
+                text: "Second assistant response opening.".into(),
+                images: Vec::new(),
+                context: None,
+            },
+        ];
+        rt.state.new_thread();
+        rt.state.select_thread(0);
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        // Set reply on first response, replace with second, then remove.
+        press(&mut rt, "reply-message-msg-a1");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft.focused);
+        assert!(rt.state.current().has_draft_content());
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a1")
+        );
+
+        press(&mut rt, "reply-message-msg-a2");
+        rt.frame(1.0);
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a2")
+        );
+
+        press(&mut rt, "composer-reply-remove");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft_reply_to.is_none());
+        assert!(!rt.state.current().has_draft_content());
+
+        // Set again, persist across thread switch and save/reload in temp dir.
+        press(&mut rt, "reply-message-msg-a1");
+        rt.frame(1.0);
+        rt.state.select_thread(1);
+        assert!(rt.state.current().draft_reply_to.is_none());
+        rt.state.select_thread(0);
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a1")
+        );
+
+        let saved_reply = rt.state.current().draft_reply_to.clone().unwrap();
+        let mut saver = State::new(dir.clone(), false);
+        saver.load_global_for_test();
+        saver.current_mut().draft_reply_to = Some(saved_reply.clone());
+        saver.checkpoint_and_flush().unwrap();
+        let mut reloaded = State::new(dir.clone(), false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft_reply_to, Some(saved_reply.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Local failed send keeps draft_reply_to.
+        {
+            let t = rt.state.current_mut();
+            t.harness = "pi".into();
+            t.model_provider = "direct-disallowed".into();
+        }
+        rt.state.send();
+        assert_eq!(rt.state.current().draft_reply_to, Some(saved_reply.clone()));
+
+        // Remote failed send restores draft_reply_to; remote accepted send clears it.
+        let mut remote_rt = runtime(1280.0);
+        let (client, _local_rx) =
+            crate::client::Client::test_connected(remote_rt.state.data_dir.clone());
+        remote_rt.state.client = Some(client);
+        remote_rt.state.current_mut().draft_reply_to = Some(saved_reply.clone());
+        remote_rt.state.send();
+        let cmd_id = remote_rt.state.current().remote_send.as_ref().unwrap().0;
+        assert!(remote_rt.state.current().draft_reply_to.is_none());
+        assert!(
+            remote_rt
+                .state
+                .current_mut()
+                .finish_remote_send(cmd_id, false)
+        );
+        assert_eq!(
+            remote_rt.state.current().draft_reply_to,
+            Some(saved_reply.clone())
+        );
+        remote_rt.state.send();
+        let cmd_id_ok = remote_rt.state.current().remote_send.as_ref().unwrap().0;
+        assert!(
+            remote_rt
+                .state
+                .current_mut()
+                .finish_remote_send(cmd_id_ok, true)
+        );
+        assert!(remote_rt.state.current().draft_reply_to.is_none());
+
+        // Local accepted send attaches the response reference + context record and clears draft_reply_to.
+        let (pi, commands, _) = crate::backend::Pi::test_connection();
+        {
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.error = None;
+            t.draft.replace_text("");
+        }
+        rt.state.send();
+        assert!(rt.state.current().draft_reply_to.is_none());
+        let sent_msg = rt.state.current().messages.last().unwrap();
+        assert_eq!(sent_msg.role, "You");
+        assert!(sent_msg.text.starts_with(
+            "[First assistant response opening.](t3-context://v1/response/response_msg-a1)"
+        ));
+        assert!(
+            sent_msg
+                .context
+                .as_ref()
+                .is_some_and(|c| c.records.contains(&saved_reply))
+        );
+        let sent_cmd = commands
+            .try_iter()
+            .find(|cmd| cmd["type"] == "prompt")
+            .expect("prompt command dispatched");
+        assert!(
+            sent_cmd["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("The user is replying to this earlier response of yours.")
+        );
+    }
+
+    #[test]
+    fn reply_banner_and_selection_toolbar_layout_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "msg-layout".into(),
+                role: "Pi",
+                text: "Assistant response text available for selection and reply.".into(),
+                images: Vec::new(),
+                context: None,
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            press(&mut rt, "reply-message-msg-layout");
+            rt.frame(1.0);
+            rt.frame(1.0);
+
+            let (composer_rect, _) = rt.presented("composer").expect("composer");
+            let (banner_rect, _) = rt
+                .presented("composer-reply-banner")
+                .expect("composer-reply-banner");
+            let (remove_rect, _) = rt
+                .presented("composer-reply-remove")
+                .expect("composer-reply-remove");
+            let (input_rect, _) = rt.presented("composer-input").expect("composer-input");
+
+            assert!(
+                banner_rect[0] >= composer_rect[0] - 0.5
+                    && banner_rect[0] + banner_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5
+                    && banner_rect[1] >= composer_rect[1] - 0.5,
+                "{width}: banner inside composer: banner={banner_rect:?} composer={composer_rect:?}"
+            );
+            assert!(
+                banner_rect[1] + banner_rect[3] <= input_rect[1] + 0.5,
+                "{width}: banner above composer text: banner={banner_rect:?} input={input_rect:?}"
+            );
+            assert!(
+                remove_rect[0] + remove_rect[2] <= banner_rect[0] + banner_rect[2] + 0.5
+                    && (remove_rect[2] - 20.0).abs() < 0.5
+                    && (remove_rect[3] - 20.0).abs() < 0.5,
+                "{width}: remove button at right of banner: remove={remove_rect:?} banner={banner_rect:?}"
+            );
+
+            // Now select text on the assistant message and verify the selection toolbar fits.
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text("message-1-0-body-0");
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let (toolbar_rect, _) = rt
+                .presented("assistant-selection-toolbar")
+                .expect("assistant-selection-toolbar");
+            assert!(
+                rt.presented("assistant-selection-cite").is_some(),
+                "{width}: cite button"
+            );
+            assert!(
+                toolbar_rect[0] >= 0.0 && toolbar_rect[0] + toolbar_rect[2] <= width + 1.0,
+                "{width}: toolbar fits width: {toolbar_rect:?}"
+            );
+        }
     }
 }
