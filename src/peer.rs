@@ -157,6 +157,7 @@ pub async fn link_peer(
             .as_str()
             .ok_or("Missing credential.")?
             .into(),
+        enabled: true,
     };
     if let Some(old) = previous {
         let confirmed = match revoke_peer(&old).await {
@@ -377,6 +378,10 @@ pub fn tailscale_addresses() -> Result<Vec<IpAddr>, String> {
         .collect()
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Link {
@@ -384,6 +389,8 @@ pub struct Link {
     pub host: String,
     pub device_id: String,
     pub token: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 impl Link {
@@ -504,6 +511,7 @@ pub async fn link(profile: &Path, host: &str, code: &str) -> Result<Link, String
             .as_str()
             .ok_or("Missing device credential.")?
             .into(),
+        enabled: true,
     };
     if let Some(previous) = previous_links
         .into_iter()

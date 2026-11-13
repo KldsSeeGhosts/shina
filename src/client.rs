@@ -158,6 +158,7 @@ pub enum Event {
 
 pub struct Client {
     pub remote: Option<crate::peer::Link>,
+    enabled: bool,
     pub linked: std::collections::BTreeMap<String, Client>,
     directory: PathBuf,
     device_directory: PathBuf,
@@ -204,6 +205,56 @@ impl Client {
             self.linked.get(server).map(Client::connection_state)
         }
     }
+    pub fn enabled(&self) -> bool {
+        self.remote
+            .as_ref()
+            .map_or(self.enabled, |link| link.enabled)
+    }
+    pub fn set_enabled(&mut self, enabled: bool, wake: rune::Waker) -> Result<(), String> {
+        if let Some(link) = &self.remote {
+            let mut updated = link.clone();
+            updated.enabled = enabled;
+            updated.save(&self.directory)?;
+            self.remote = Some(updated);
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.shutdown();
+            self.commands.ready.store(false, Ordering::Release);
+            *self.connection.lock().expect("connection state") = ConnectionState::default();
+            return Ok(());
+        }
+        let running = self.worker.lock().expect("client worker").is_some()
+            && !self.worker_finished.load(Ordering::Acquire);
+        if running {
+            let _ = self.retry_now();
+        } else {
+            self.shutdown();
+            if self.input.is_none() {
+                let (sender, input) = tokio::sync::mpsc::channel(32);
+                let (output, events) = mpsc::sync_channel(64);
+                self.commands = Commands {
+                    sender,
+                    ready: Arc::default(),
+                };
+                self.input = Some(input);
+                self.output = output;
+                self.events = events;
+            }
+            self.stop.store(false, Ordering::Release);
+            self.worker_finished.store(false, Ordering::Release);
+            {
+                let mut state = self.connection.lock().expect("connection state");
+                state.phase = ConnectionPhase::Connecting;
+                state.attempt = 0;
+                state.attempt_seq = state.attempt_seq.saturating_add(1);
+                state.last_failure = None;
+                state.last_error = None;
+            }
+            self.start(wake);
+        }
+        Ok(())
+    }
     pub fn retry_now(&self) -> Result<(), String> {
         let mut state = self.connection.lock().expect("connection state");
         if self.worker_finished.load(Ordering::Acquire)
@@ -246,6 +297,7 @@ impl Client {
         Self {
             info: Arc::default(),
             remote: None,
+            enabled: true,
             linked: Default::default(),
             device_directory: directory.clone(),
             directory,
@@ -271,6 +323,9 @@ impl Client {
         self.device_directory = directory;
     }
     pub fn start(&mut self, wake: rune::Waker) {
+        if !self.enabled() {
+            return;
+        }
         if self.remote.is_none() {
             match crate::peer::Link::load_all(&self.directory) {
                 Ok(links) => {
@@ -338,8 +393,12 @@ impl Client {
             .device_directory
             .join("linked-views")
             .join(&link.server_id);
+        client.enabled = link.enabled;
+        let enabled = link.enabled;
         client.remote = Some(link.clone());
-        client.start(wake);
+        if enabled {
+            client.start(wake);
+        }
         self.linked.insert(link.server_id, client);
     }
     pub fn commands_for(&self, server: &str) -> Option<&Commands> {
@@ -355,7 +414,9 @@ impl Client {
             views.push(("local".into(), value));
         }
         for (id, client) in &self.linked {
-            if let Some(value) = client.snapshot() {
+            if client.enabled()
+                && let Some(value) = client.snapshot()
+            {
                 views.push((id.clone(), value));
             }
         }
@@ -1985,7 +2046,7 @@ mod tests {
             let host=listener.local_addr().unwrap();
             let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
             let profile=crate::store::directory().unwrap().join("stable-blob-test");
-            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into()};
+            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into(),enabled:true};
             let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
             let snapshot=Arc::new(Mutex::new(Some(view(1))));
             let generation=Arc::new(AtomicUsize::new(1));

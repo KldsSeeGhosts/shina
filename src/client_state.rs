@@ -1032,6 +1032,9 @@ impl State {
             .unwrap_or_default();
         let mut changed = changed || !projections.is_empty() || self.poll_context_imports();
         for (server, projection) in projections {
+            if !self.machine_enabled(&server) {
+                continue;
+            }
             self.machines
                 .views
                 .insert(server.clone(), projection.clone());
@@ -1814,6 +1817,16 @@ impl State {
             .and_then(|client| client.commands_for(server))
             .is_some_and(|commands| commands.connected())
     }
+    /// Whether a machine is enabled (local is always enabled; linked machines can be
+    /// disconnected and re-enabled in settings or on retry).
+    pub fn machine_enabled(&self, server: &str) -> bool {
+        server == "local"
+            || self
+                .client
+                .as_ref()
+                .and_then(|client| client.linked.get(server))
+                .is_none_or(crate::client::Client::enabled)
+    }
     /// The names of the linked machines whose connection is not ready.
     pub fn unreachable_machines(&self) -> Vec<String> {
         let Some(client) = &self.client else {
@@ -1822,7 +1835,7 @@ impl State {
         client
             .linked
             .keys()
-            .filter(|server| !self.machine_connected(server))
+            .filter(|server| self.machine_enabled(server) && !self.machine_connected(server))
             .map(|server| self.machine_label(server))
             .collect()
     }
@@ -1882,6 +1895,7 @@ impl State {
                     server_id: server.clone(),
                     label: self.machine_label(server),
                     connection,
+                    can_disconnect: server != "local",
                 })
             } else {
                 None
@@ -1899,6 +1913,8 @@ impl State {
                 .as_ref()
                 .ok_or_else(|| "This machine is not linked.".to_owned())
                 .and_then(|client| client.retry_now())
+        } else if !self.machine_enabled(server) {
+            self.set_machine_enabled(server, true)
         } else {
             self.client
                 .as_ref()
@@ -1916,6 +1932,60 @@ impl State {
             );
         }
         self.tick_composer_notices_at(Instant::now(), None);
+    }
+    pub fn set_machine_enabled(&mut self, server: &str, enabled: bool) -> Result<(), String> {
+        if server == "local" {
+            return Ok(());
+        }
+        let wake = self.wake.clone();
+        let remote = self
+            .client
+            .as_mut()
+            .and_then(|client| client.linked.get_mut(server))
+            .ok_or_else(|| "This machine is not linked.".to_owned())?;
+        remote.set_enabled(enabled, wake)?;
+        if !enabled {
+            self.machines.views.remove(server);
+            self.machines.threads.remove(server);
+            self.machines.recover.remove(server);
+            self.refresh_machine_notice();
+            if self.machines.selected == server {
+                self.select_machine("local");
+                self.new_client_draft(None);
+            }
+        }
+        self.tick_composer_notices_at(Instant::now(), None);
+        Ok(())
+    }
+    pub fn disconnect_server(&mut self, server: &str) {
+        if server == "local" {
+            return;
+        }
+        if let Err(error) = self.set_machine_enabled(server, false) {
+            self.push_toast(
+                ToastKind::Error,
+                "Could not disconnect server",
+                Some(error),
+                None,
+                None,
+            );
+        }
+    }
+    pub fn toggle_machine_enabled(&mut self, server: &str) {
+        let next = !self.machine_enabled(server);
+        if let Err(error) = self.set_machine_enabled(server, next) {
+            self.push_toast(
+                ToastKind::Error,
+                if next {
+                    "Could not reconnect environment"
+                } else {
+                    "Could not disconnect server"
+                },
+                Some(error),
+                None,
+                None,
+            );
+        }
     }
     /// Server/thread ids remain a pair. Only one server's records enter the State facade.
     pub fn select_machine(&mut self, server: &str) {
@@ -5233,6 +5303,7 @@ mod tests {
             host: format!("127.0.0.1:{port}"),
             device_id: uuid::Uuid::new_v4().to_string(),
             token: "test-token".into(),
+            enabled: true,
         });
         client
             .linked
@@ -5826,5 +5897,99 @@ mod tests {
             state.toasts[0].description.as_deref(),
             Some("Authentication denied.")
         );
+    }
+
+    #[test]
+    fn disconnect_disables_persists_hides_threads_returns_home_and_retry_reenables() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-disconnect-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = uuid::Uuid::new_v4().to_string();
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let link = crate::peer::Link {
+            server_id: server_id.clone(),
+            host: "127.0.0.1:9".into(),
+            device_id,
+            token: "test-token".into(),
+            enabled: true,
+        };
+        link.save(&dir).unwrap();
+
+        let mut state = State::headless(dir.clone());
+        let (mut client, _) = crate::client::Client::test_connected(dir.clone());
+        let mut remote = crate::client::Client::new(dir.clone());
+        remote.remote = Some(link);
+        client.linked.insert(server_id.clone(), remote);
+        state.client = Some(client);
+
+        let mut remote_proj = State::headless(dir.clone());
+        remote_proj.threads[0].title = "Remote thread".into();
+        remote_proj.threads[0].messages.push(Message {
+            id: "m1".into(),
+            role: "You",
+            text: "hi".into(),
+            images: vec![],
+            context: None,
+        });
+        state
+            .machines
+            .views
+            .insert(server_id.clone(), remote_proj.projection());
+        state.open_machine_thread(&server_id, 1);
+        assert_eq!(state.machines.selected, server_id);
+        assert!(!state.current().messages.is_empty());
+
+        // Disconnect server disables the machine, hides its threads, and returns to the home screen.
+        state.disconnect_server(&server_id);
+        assert!(!state.machine_enabled(&server_id));
+        assert!(!state.machines.views.contains_key(&server_id));
+        assert_eq!(state.machines.selected, "local");
+        assert!(state.current().messages.is_empty());
+
+        // The enabled flag survives a save and reload using the temporary data directory.
+        let reloaded = crate::peer::Link::load_all(&dir).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(!reloaded[0].enabled);
+
+        // Retry on a disabled machine re-enables it first and persists enabled = true.
+        state.retry_machine(&server_id);
+        assert!(state.machine_enabled(&server_id));
+        let reloaded = crate::peer::Link::load_all(&dir).unwrap();
+        assert!(reloaded[0].enabled);
+        state
+            .client
+            .as_mut()
+            .unwrap()
+            .linked
+            .get_mut(&server_id)
+            .unwrap()
+            .shutdown();
+
+        // Persistence failure notifies "Could not disconnect server".
+        let bad_dir =
+            std::env::temp_dir().join(format!("shina-disconnect-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&bad_dir, b"not-a-directory").unwrap();
+        let mut bad_state = State::headless(bad_dir.clone());
+        let (mut bad_client, _) = crate::client::Client::test_connected(bad_dir.clone());
+        let mut bad_remote = crate::client::Client::new(bad_dir.clone());
+        bad_remote.remote = Some(crate::peer::Link {
+            server_id: server_id.clone(),
+            host: "127.0.0.1:9".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+            enabled: true,
+        });
+        bad_client.linked.insert(server_id.clone(), bad_remote);
+        bad_state.client = Some(bad_client);
+        bad_state.machines.selected = server_id.clone();
+        bad_state.disconnect_server(&server_id);
+        assert_eq!(bad_state.machines.selected, server_id);
+        assert!(bad_state.machine_enabled(&server_id));
+        assert_eq!(bad_state.toasts.len(), 1);
+        assert_eq!(bad_state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(bad_state.toasts[0].title, "Could not disconnect server");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&bad_dir);
     }
 }

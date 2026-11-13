@@ -11496,6 +11496,8 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     if let Some(client) = &s.client {
         for (id, remote) in &client.linked {
             let server = id.clone();
+            let toggle_id = id.clone();
+            let enabled = remote.enabled();
             let version = remote.version().unwrap_or_else(|| {
                 s.machines
                     .views
@@ -11505,51 +11507,76 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                     .to_owned()
             });
             card = card.child(
-                row()
+                col()
                     .key(format!("settings-linked-{id}"))
-                    .center_y()
-                    .gap(8.0)
+                    .gap(6.0)
                     .child(
-                        col()
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .gap(4.0)
+                        row()
+                            .center_y()
+                            .gap(8.0)
                             .child(
-                                label(
-                                    remote
-                                        .remote
-                                        .as_ref()
-                                        .map(|link| link.host.as_str())
-                                        .unwrap_or(id),
-                                    TextStyle::new(14.0, 500.0),
-                                    p.ink,
-                                )
-                                .truncate()
-                                .min_w(0.0),
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .gap(4.0)
+                                    .child(
+                                        label(
+                                            remote
+                                                .remote
+                                                .as_ref()
+                                                .map(|link| link.host.as_str())
+                                                .unwrap_or(id),
+                                            TextStyle::new(14.0, 500.0),
+                                            p.ink,
+                                        )
+                                        .truncate()
+                                        .min_w(0.0),
+                                    )
+                                    .child(
+                                        row()
+                                            .gap(8.0)
+                                            .flex_wrap()
+                                            .child(pixel_text(version, p.muted))
+                                            .child(pixel_text(
+                                                if !enabled {
+                                                    "Disabled"
+                                                } else if s.machine_connected(id) {
+                                                    "Reachable"
+                                                } else {
+                                                    "Offline"
+                                                },
+                                                p.muted,
+                                            )),
+                                    ),
                             )
                             .child(
-                                row()
-                                    .gap(8.0)
-                                    .flex_wrap()
-                                    .child(pixel_text(version, p.muted))
-                                    .child(pixel_text(
-                                        if s.machine_connected(id) {
-                                            "Reachable"
-                                        } else {
-                                            "Offline"
-                                        },
-                                        p.muted,
-                                    )),
+                                settings_ui::destructive_button(
+                                    &format!("unlink-{id}"),
+                                    "Unlink and revoke",
+                                    p,
+                                    move |s| s.machine_action("unlink", &server),
+                                )
+                                .disabled(busy),
                             ),
                     )
                     .child(
-                        settings_ui::destructive_button(
-                            &format!("unlink-{id}"),
-                            "Unlink and revoke",
-                            p,
-                            move |s| s.machine_action("unlink", &server),
-                        )
-                        .disabled(busy),
+                        row()
+                            .key(format!("settings-linked-enabled-row-{id}"))
+                            .center_y()
+                            .gap(8.0)
+                            .child(pixel_text("Enabled", p.muted))
+                            .child(spacer())
+                            .child(
+                                captain_ui::switch(
+                                    s,
+                                    &format!("linked-enabled-{id}"),
+                                    "Enabled",
+                                    enabled,
+                                    p,
+                                    move |s| s.toggle_machine_enabled(&toggle_id),
+                                )
+                                .disabled(busy),
+                            ),
                     ),
             );
         }
@@ -13777,6 +13804,7 @@ pub(crate) mod tests {
                 host: "studio-mac".into(),
                 device_id: "fixture-device".into(),
                 token: "fixture".into(),
+                enabled: true,
             });
             client.linked.insert("fixture-server".into(), remote);
             rt.state.client = Some(client);

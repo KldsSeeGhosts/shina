@@ -599,6 +599,7 @@ fn fleet_demo(state: &mut State) {
                 host: host.into(),
                 device_id: "example".into(),
                 token: "unused-offline-fixture".into(),
+                enabled: true,
             });
             client.linked.insert(server.into(), remote);
         }

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 /// Ported from KSG Code's `ENVIRONMENT_RECONNECT_WARNING_GRACE_MS` in `ChatView.logic.ts`.
 pub const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS: u64 = 2_000;
+/// Ported from KSG Code's `DISCONNECT_DELAY_MS` in `useEnvironmentDisconnectDelay.ts`.
+pub const DISCONNECT_DELAY_MS: u64 = 20_000;
 
 /// Ported from KSG Code's `presentConnectionDiagnosis` (`locate` + `headline`) in
 /// `packages/client-runtime/src/connection/diagnosis.ts` for direct connections.
@@ -40,15 +42,23 @@ pub fn connection_diagnosis(host_label: &str, state: &ConnectionState) -> Option
     }
 }
 
+#[derive(Clone)]
 pub struct EnvironmentStatus {
     pub server_id: String,
     pub label: String,
     pub connection: ConnectionState,
+    pub can_disconnect: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReconnectGrace {
     key: (String, u64),
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisconnectHold {
+    server_id: String,
     started_at: Instant,
 }
 
@@ -183,6 +193,7 @@ pub struct Store {
     dismissed: HashSet<String>,
     details_open: Option<String>,
     grace: Option<ReconnectGrace>,
+    disconnect_hold: Option<DisconnectHold>,
 }
 
 #[allow(dead_code)]
@@ -294,9 +305,32 @@ impl Store {
 
         let Some(env) = active else {
             self.grace = None;
+            self.disconnect_hold = None;
             return (changed, None);
         };
         let notice_id = format!("{PREFIX}{}", env.server_id);
+        let (disconnect_elapsed, disconnect_wake) = if env.can_disconnect {
+            let started_at = match &self.disconnect_hold {
+                Some(existing) if existing.server_id == env.server_id => existing.started_at,
+                _ => {
+                    self.disconnect_hold = Some(DisconnectHold {
+                        server_id: env.server_id.clone(),
+                        started_at: now,
+                    });
+                    now
+                }
+            };
+            let delay = Duration::from_millis(DISCONNECT_DELAY_MS);
+            let held = now.saturating_duration_since(started_at);
+            if held >= delay {
+                (true, None)
+            } else {
+                (false, Some(delay - held))
+            }
+        } else {
+            self.disconnect_hold = None;
+            (false, None)
+        };
         let reconnecting = matches!(
             env.connection.phase,
             ConnectionPhase::Connecting | ConnectionPhase::Reconnecting
@@ -317,7 +351,8 @@ impl Store {
             let elapsed = now.saturating_duration_since(started_at);
             if elapsed < grace {
                 changed |= self.remove(&notice_id);
-                return (changed, Some(grace - elapsed));
+                let wake = min_wake(Some(grace - elapsed), disconnect_wake);
+                return (changed, wake);
             }
         } else {
             self.grace = None;
@@ -340,17 +375,26 @@ impl Store {
         let description = connection_diagnosis(&env.label, &env.connection);
         let mut actions = Vec::new();
         if env.connection.phase != ConnectionPhase::Connecting {
-            let server = env.server_id;
+            let server = env.server_id.clone();
             actions.push(NoticeAction::new("Retry", move |s| {
                 s.retry_machine(&server);
             }));
+        }
+        if disconnect_elapsed && env.can_disconnect {
+            let server = env.server_id;
+            actions.push(
+                NoticeAction::new("Disconnect server", move |s| {
+                    s.disconnect_server(&server);
+                })
+                .with_tooltip("Hide this server's threads. Switch it on again in Environments."),
+            );
         }
         let notice = Notice::new(notice_id.clone(), variant, "alert", title)
             .group(Group::Environment)
             .description(description)
             .actions(actions);
         changed |= self.sync(&notice_id, Some(notice));
-        (changed, None)
+        (changed, disconnect_wake)
     }
 
     /// All visible notices in KSG order: `Environment` first, then `Attention`, preserving
@@ -365,6 +409,14 @@ impl Store {
                     .filter(move |item| item.group == group && !self.dismissed.contains(&item.id))
             })
             .collect()
+    }
+}
+
+fn min_wake(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
     }
 }
 
@@ -433,6 +485,7 @@ mod tests {
                 last_failure: Some(FailureKind::ServerNotAnswering),
                 last_error: Some("Server listener is unavailable.".into()),
             },
+            can_disconnect: true,
         };
 
         let (_, wake) = store.sync_environment(Some(env(1)), t0);
@@ -452,7 +505,12 @@ mod tests {
             Some(env(1)),
             t0 + Duration::from_millis(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS),
         );
-        assert_eq!(wake, None);
+        assert_eq!(
+            wake,
+            Some(Duration::from_millis(
+                DISCONNECT_DELAY_MS - ENVIRONMENT_RECONNECT_WARNING_GRACE_MS
+            ))
+        );
         let notices = store.ordered();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].title, "Studio is reconnecting");
@@ -477,5 +535,75 @@ mod tests {
             t_retry + Duration::from_millis(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS),
         );
         assert_eq!(store.ordered().len(), 1);
+    }
+
+    #[test]
+    fn disconnect_delay_gates_action_and_never_shows_for_local() {
+        let mut store = Store::default();
+        let t0 = Instant::now();
+        let offline_remote = |id: &str| EnvironmentStatus {
+            server_id: id.into(),
+            label: "Studio".into(),
+            connection: ConnectionState {
+                phase: ConnectionPhase::Offline,
+                ..Default::default()
+            },
+            can_disconnect: true,
+        };
+
+        let (_, wake) = store.sync_environment(Some(offline_remote("studio")), t0);
+        assert_eq!(wake, Some(Duration::from_millis(DISCONNECT_DELAY_MS)));
+        assert_eq!(
+            store.ordered()[0]
+                .actions
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Retry"]
+        );
+
+        store.sync_environment(
+            Some(offline_remote("studio")),
+            t0 + Duration::from_millis(DISCONNECT_DELAY_MS - 1),
+        );
+        assert_eq!(store.ordered()[0].actions.len(), 1);
+
+        let (_, wake) = store.sync_environment(
+            Some(offline_remote("studio")),
+            t0 + Duration::from_millis(DISCONNECT_DELAY_MS),
+        );
+        assert_eq!(wake, None);
+        assert_eq!(
+            store.ordered()[0]
+                .actions
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Retry", "Disconnect server"]
+        );
+
+        // Local machine never offers "Disconnect server", even after the delay.
+        let local = EnvironmentStatus {
+            server_id: "local".into(),
+            label: "Local".into(),
+            connection: ConnectionState {
+                phase: ConnectionPhase::Offline,
+                ..Default::default()
+            },
+            can_disconnect: false,
+        };
+        store.sync_environment(Some(local.clone()), t0);
+        store.sync_environment(
+            Some(local),
+            t0 + Duration::from_millis(DISCONNECT_DELAY_MS * 2),
+        );
+        assert_eq!(
+            store.ordered()[0]
+                .actions
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Retry"]
+        );
     }
 }
