@@ -236,6 +236,12 @@ struct ThreadView {
         skip_serializing_if = "Option::is_none"
     )]
     submission_error: Option<String>,
+    #[serde(
+        rename = "worktreeSetup",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    worktree_setup: Option<crate::model::WorktreeSetupState>,
 }
 
 impl ThreadView {
@@ -379,6 +385,7 @@ impl ThreadView {
             env_mode: thread.env_mode,
             start_from_origin: thread.start_from_origin,
             submission_error: thread.submission_error.clone(),
+            worktree_setup: thread.worktree_setup.clone(),
         }
     }
 
@@ -389,6 +396,14 @@ impl ThreadView {
         thread.env_mode = self.env_mode;
         thread.start_from_origin = self.start_from_origin;
         thread.submission_error = self.submission_error;
+        if let Some(setup) = self.worktree_setup.as_ref()
+            && setup.phase == crate::model::WorktreeSetupPhase::Failed
+            && thread.worktree_setup.as_ref().map(|s| s.phase)
+                != Some(crate::model::WorktreeSetupPhase::Failed)
+        {
+            thread.worktree_setup_output_open = true;
+        }
+        thread.worktree_setup = self.worktree_setup;
         if thread.worktree_path.is_some() {
             thread.remote_bootstrap_snapshot = None;
         } else if let Some(ref _err) = thread.submission_error
@@ -1741,6 +1756,7 @@ impl State {
                 local.base_branch = thread.base_branch;
                 local.env_mode = thread.env_mode;
                 local.start_from_origin = thread.start_from_origin;
+                local.worktree_setup = thread.worktree_setup;
                 local.machine = thread.machine;
                 local.updated = thread.updated;
                 local.captain = thread.captain;
@@ -3332,6 +3348,11 @@ impl State {
                 }
             }
             "thread.retry" => self.retry(),
+            "thread.worktreeSetup" => match args["action"].as_str() {
+                Some("retry") => self.retry_worktree_setup(),
+                Some("skip") => self.skip_worktree_setup(),
+                _ => return Err("action must be retry or skip.".into()),
+            },
             "thread.visit" => self.current_mut().life.last_visited_at = Some(lifecycle::now()),
             "thread.create" => {
                 let project = args["project"].as_u64().map(|id| id as usize);

@@ -144,6 +144,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.fork"
         | "thread.rewind"
         | "thread.forkPoints"
+        | "thread.worktreeSetup"
         | "settings.autoSettle"
         | "settings.defaultHarness"
         | "settings.threadDefaults"

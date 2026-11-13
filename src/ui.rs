@@ -918,6 +918,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         } else if s.current().messages.is_empty()
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
+            && s.current().worktree_setup.is_none()
             && !s.current().history_has_more
             && s.current().history_error.is_none()
         {
@@ -8942,6 +8943,9 @@ enum TimelineRow {
     HistoryControl {
         key: String,
     },
+    WorktreeSetup {
+        key: String,
+    },
     Boundary {
         message_index: usize,
         key: String,
@@ -8966,6 +8970,7 @@ impl TimelineRow {
     fn key(&self) -> &str {
         match self {
             Self::HistoryControl { key }
+            | Self::WorktreeSetup { key }
             | Self::Boundary { key, .. }
             | Self::UserOrSystem { key, .. }
             | Self::AssistantTurn { key, .. }
@@ -8994,6 +8999,11 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
     if t.history_has_more || t.history_error.is_some() {
         rows.push(TimelineRow::HistoryControl {
             key: push_unique_row_key(&mut seen, format!("history-control-{}", t.id)),
+        });
+    }
+    if t.worktree_setup.is_some() {
+        rows.push(TimelineRow::WorktreeSetup {
+            key: push_unique_row_key(&mut seen, format!("worktree-setup-row-{}", t.id)),
         });
     }
     let mut index = 0usize;
@@ -9349,6 +9359,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         && !visible_tools
         && !t.status.busy()
         && t.native.compactions.is_empty()
+        && t.worktree_setup.is_none()
         && !t.history_has_more
         && t.history_error.is_none()
     {
@@ -9410,6 +9421,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             move |s: &State, index| {
                 let row = match &build_rows[index] {
                     TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                    TimelineRow::WorktreeSetup { .. } => {
+                        worktree_setup_card(s, p).unwrap_or_else(el)
+                    }
                     TimelineRow::Boundary { message_index, .. } => {
                         work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
                     }
@@ -9572,6 +9586,161 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
 
     wrapper
+}
+
+/// Ported from KSG Code's `WorktreeSetupCard.tsx`, skinned in Pixel Voyage.
+fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
+    let t = s.current();
+    let setup = t.worktree_setup.as_ref()?;
+    let (status, status_word, title) = match setup.phase {
+        crate::model::WorktreeSetupPhase::Running => {
+            (Status::Running, "RUNNING", "Setting up worktree…")
+        }
+        crate::model::WorktreeSetupPhase::Succeeded => (
+            Status::Completed,
+            if setup.skipped { "SKIPPED" } else { "READY" },
+            if setup.skipped {
+                "Worktree setup skipped"
+            } else {
+                "Worktree ready"
+            },
+        ),
+        crate::model::WorktreeSetupPhase::Failed => {
+            (Status::Failed, "FAILED", "Worktree setup failed")
+        }
+    };
+    let tone = status_ink(status, p);
+    let mut header = row()
+        .w_full()
+        .min_h(24.0)
+        .center_y()
+        .gap(8.0)
+        .child(status_mark(status, p, 6.0))
+        .child(
+            label(title, TextStyle::new(14.0, 500.0).lh(20.0), p.ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(pixel_text(status_word, tone));
+    if setup.duration_ms > 0 {
+        let dur = if setup.duration_ms < 1000 {
+            format!("{}ms", setup.duration_ms)
+        } else {
+            format!("{:.1}s", setup.duration_ms as f64 / 1000.0)
+        };
+        header = header.child(pixel_text(dur, p.muted));
+    }
+
+    let mut card = col()
+        .w_full()
+        .padding(12.0)
+        .gap(8.0)
+        .radius(6.0)
+        .fill(p.card)
+        .child(header);
+
+    if let Some(script_name) = &setup.script_name {
+        let desc = match &setup.script_command {
+            Some(cmd) if !cmd.trim().is_empty() => format!("{script_name}: {cmd}"),
+            _ => script_name.clone(),
+        };
+        card = card.child(label(desc, SMALL, p.muted).wrap());
+    }
+    if let Some(err) = &setup.error {
+        card = card.child(label(err, SMALL, p.danger).wrap().selectable(true));
+    }
+
+    let tail_lines: Vec<&str> = setup.output.lines().collect();
+    if !tail_lines.is_empty() {
+        let start = tail_lines.len().saturating_sub(4);
+        let tail = tail_lines[start..].join("\n");
+        let open = t.worktree_setup_output_open;
+        let toggle = row()
+            .key("worktree-setup-output")
+            .role("button")
+            .label(if open { "Hide output" } else { "Show output" })
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .center_y()
+            .gap(6.0)
+            .h(24.0)
+            .px(6.0)
+            .radius(4.0)
+            .hover(p.selected)
+            .on_press(|s: &mut State| {
+                s.current_mut().worktree_setup_output_open =
+                    !s.current().worktree_setup_output_open;
+            })
+            .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted).size(12.0, 12.0))
+            .child(pixel_text("Output", p.muted));
+        card = card.child(toggle);
+        if open {
+            let mono = TextStyle::new(12.0, 400.0)
+                .lh(17.0)
+                .family(rune::Family::SystemMono);
+            card = card.child(
+                col()
+                    .key("worktree-setup-output-tail")
+                    .w_full()
+                    .px(10.0)
+                    .py(6.0)
+                    .radius(4.0)
+                    .fill(if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+                        p.coral_bg
+                    } else {
+                        p.code_bg
+                    })
+                    .border(1.0, p.line)
+                    .child(
+                        label(
+                            tail,
+                            mono,
+                            if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+                                p.danger
+                            } else {
+                                p.muted
+                            },
+                        )
+                        .wrap_anywhere()
+                        .selectable(true),
+                    ),
+            );
+        }
+    }
+
+    let mut actions = row().w_full().gap(8.0).center_y();
+    let mut has_actions = false;
+    if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+        has_actions = true;
+        actions = actions.child(framed(
+            button("worktree-setup-retry", "Retry", p, |s| {
+                s.retry_worktree_setup();
+            }),
+            p,
+        ));
+    }
+    if matches!(
+        setup.phase,
+        crate::model::WorktreeSetupPhase::Running | crate::model::WorktreeSetupPhase::Failed
+    ) {
+        has_actions = true;
+        actions = actions.child(button("worktree-setup-skip", "Skip", p, |s| {
+            s.skip_worktree_setup();
+        }));
+    }
+    if has_actions {
+        card = card.child(actions);
+    }
+
+    Some(
+        col().w_full().child(
+            card.key("worktree-setup-card")
+                .w_full()
+                .radius(6.0)
+                .border(2.0, p.frame),
+        ),
+    )
 }
 
 /// Ported from KSG Code's `AssistantSelectionToolbar` (`chat/AssistantSelectionToolbar.tsx`).
@@ -24846,5 +25015,100 @@ pub(crate) mod tests {
         rt.frame(0.75);
         assert!(rt.presented("env-mode-trigger").is_none());
         assert!(rt.presented("base-branch-trigger").is_none());
+    }
+
+    #[test]
+    fn worktree_toolbar_and_setup_card_layout_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.current_mut().draft.focused = true;
+            let project_path = rt
+                .state
+                .project(rt.state.current().project)
+                .unwrap()
+                .path
+                .to_string_lossy()
+                .into_owned();
+            rt.state.vcs_branches.insert(
+                ("local".into(), project_path),
+                crate::model::VcsBranchCacheEntry {
+                    is_repo: true,
+                    loaded: true,
+                    loading: false,
+                    error: None,
+                    refs: vec![crate::vcs::VcsRef {
+                        name: "main".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: true,
+                        is_default: true,
+                        worktree_path: None,
+                    }],
+                },
+            );
+            rt.state.current_mut().env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+            rt.state.current_mut().base_branch = Some("main".into());
+            rt.state.current_mut().worktree_setup = Some(crate::model::WorktreeSetupState {
+                phase: crate::model::WorktreeSetupPhase::Failed,
+                script_name: Some("Setup".into()),
+                script_command: Some("npm ci".into()),
+                error: Some("Setup script exited with code 1.".into()),
+                output: "line 1\nline 2\nline 3\nline 4".into(),
+                exit_code: Some(1),
+                timed_out: false,
+                duration_ms: 420,
+                skipped: false,
+            });
+            rt.state.current_mut().worktree_setup_output_open = true;
+            rt.frame(0.0);
+            rt.frame(0.25);
+
+            let (footer_rect, _) = rt
+                .presented("composer-footer")
+                .unwrap_or_else(|| panic!("{width}: composer-footer"));
+            for key in ["env-mode-trigger", "base-branch-trigger"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= footer_rect[0] - 0.5
+                        && rect[0] + rect[2] <= footer_rect[0] + footer_rect[2] + 0.5
+                        && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {key} overflowed footer: rect={rect:?} footer={footer_rect:?}"
+                );
+            }
+
+            let (lane_rect, _) = rt
+                .presented("chat-lane")
+                .unwrap_or_else(|| panic!("{width}: chat-lane"));
+            let (card_rect, _) = rt
+                .presented("worktree-setup-card")
+                .unwrap_or_else(|| panic!("{width}: worktree-setup-card"));
+            assert!(
+                card_rect[0] >= lane_rect[0] - 0.5
+                    && card_rect[0] + card_rect[2] <= lane_rect[0] + lane_rect[2] + 0.5,
+                "{width}: setup card outside conversation lane: card={card_rect:?} lane={lane_rect:?}"
+            );
+            for key in [
+                "worktree-setup-retry",
+                "worktree-setup-skip",
+                "worktree-setup-output",
+                "worktree-setup-output-tail",
+            ] {
+                assert!(rt.presented(key).is_some(), "{width}: missing {key}");
+            }
+            press(&mut rt, "worktree-setup-output");
+            assert!(
+                !rt.state.current().worktree_setup_output_open,
+                "{width}: toggle should flip state"
+            );
+            rt.frame(0.5);
+            assert!(
+                rt.presented("worktree-setup-output-tail").is_none(),
+                "{width}: output should collapse"
+            );
+        }
     }
 }

@@ -2574,6 +2574,13 @@ pub fn run_setup(input: &VcsRunSetupInput) -> Result<VcsRunSetupResult, String> 
     })
 }
 
+pub fn find_setup_script_info(
+    worktree_path: &Path,
+    project_cwd: &Path,
+) -> Result<Option<(String, String)>, String> {
+    Ok(find_setup_script(worktree_path, project_cwd)?.map(|s| (s.name, s.command)))
+}
+
 fn find_setup_script(
     worktree_path: &Path,
     project_cwd: &Path,

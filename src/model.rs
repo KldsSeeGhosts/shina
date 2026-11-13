@@ -518,6 +518,42 @@ struct VcsBranchResultMsg {
     result: Result<crate::vcs::VcsListBranchesResult, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeSetupPhase {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSetupState {
+    pub phase: WorktreeSetupPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+struct WorktreeSetupResultMsg {
+    thread_id: usize,
+    run_seq: u64,
+    result: Result<crate::vcs::VcsRunSetupResult, String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WorktreeBootstrapState {
     pub(crate) snapshot: crate::composer_rich::Snapshot,
@@ -593,6 +629,10 @@ pub struct Thread {
     pub base_branch: Option<String>,
     pub env_mode: Option<ThreadEnvMode>,
     pub start_from_origin: Option<bool>,
+    pub worktree_setup: Option<WorktreeSetupState>,
+    pub worktree_setup_output_open: bool,
+    pub(crate) worktree_setup_seq: u64,
+    pub(crate) worktree_bootstrap_fresh_context: bool,
     pub machine: String,
     pub updated: u64,
     pub title: String,
@@ -1024,6 +1064,10 @@ impl Thread {
             base_branch: None,
             env_mode: None,
             start_from_origin: None,
+            worktree_setup: None,
+            worktree_setup_output_open: false,
+            worktree_setup_seq: 0,
+            worktree_bootstrap_fresh_context: false,
             machine: "local".into(),
             peer_origin: None,
             stop_serial: 0,
@@ -3628,6 +3672,7 @@ pub struct State {
     pub(crate) vcs_branches: std::collections::BTreeMap<(String, String), VcsBranchCacheEntry>,
     vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
     worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
+    worktree_setup_rxs: Vec<std::sync::mpsc::Receiver<WorktreeSetupResultMsg>>,
     #[cfg(test)]
     pub(crate) test_git_context: Option<crate::vcs::GitContext>,
     #[cfg(test)]
@@ -3871,6 +3916,7 @@ impl State {
             vcs_branches: Default::default(),
             vcs_branch_rxs: Vec::new(),
             worktree_bootstrap_rxs: Vec::new(),
+            worktree_setup_rxs: Vec::new(),
             #[cfg(test)]
             test_git_context: None,
             #[cfg(test)]
@@ -9281,23 +9327,60 @@ impl State {
                     };
                     match msg.result {
                         Ok(created) => {
+                            let project_cwd = self
+                                .project(self.threads[index].project)
+                                .map(|p| p.path.clone());
+                            let wt_path = PathBuf::from(&created.worktree.path);
+                            let script_check = project_cwd
+                                .as_deref()
+                                .map(|cwd| crate::vcs::find_setup_script_info(&wt_path, cwd));
                             let thread = &mut self.threads[index];
                             thread.worktree_path = Some(created.worktree.path.clone());
                             thread.branch = Some(created.worktree.ref_name.clone());
                             thread.base_branch = Some(msg.base_branch);
                             thread.env_mode = Some(ThreadEnvMode::Worktree);
                             thread.submission_error = None;
+                            thread.worktree_bootstrap_fresh_context = boot.fresh_context;
                             thread.life.user_sent(lifecycle::now());
-                            thread.native.queue_held = false;
                             if boot.fresh_context {
                                 self.persist_transcripts = true;
                             }
-                            if self.runtime_enabled || self.threads[index].pi.is_some() {
-                                if self.threads[index].pi.is_none() {
-                                    self.connect_thread(index);
+                            match script_check {
+                                Some(Ok(Some((script_name, script_command)))) => {
+                                    thread.worktree_setup = Some(WorktreeSetupState {
+                                        phase: WorktreeSetupPhase::Running,
+                                        script_name: Some(script_name),
+                                        script_command: Some(script_command),
+                                        error: None,
+                                        output: String::new(),
+                                        exit_code: None,
+                                        timed_out: false,
+                                        duration_ms: 0,
+                                        skipped: false,
+                                    });
+                                    thread.worktree_setup_output_open = false;
+                                    thread.native.queue_held = true;
+                                    let tid = thread.id;
+                                    self.spawn_worktree_setup_runner(tid);
                                 }
-                                if self.threads[index].pi.is_some() {
-                                    self.threads[index].drive_session();
+                                Some(Err(error)) => {
+                                    thread.worktree_setup = Some(WorktreeSetupState {
+                                        phase: WorktreeSetupPhase::Failed,
+                                        script_name: None,
+                                        script_command: None,
+                                        error: Some(error),
+                                        output: String::new(),
+                                        exit_code: None,
+                                        timed_out: false,
+                                        duration_ms: 0,
+                                        skipped: false,
+                                    });
+                                    thread.worktree_setup_output_open = true;
+                                    thread.native.queue_held = true;
+                                }
+                                _ => {
+                                    thread.native.queue_held = false;
+                                    self.release_after_worktree_setup(index);
                                 }
                             }
                             self.checkpoint();
@@ -9325,6 +9408,197 @@ impl State {
         }
         self.worktree_bootstrap_rxs = remaining;
         changed
+    }
+
+    fn release_after_worktree_setup(&mut self, index: usize) {
+        if index >= self.threads.len() {
+            return;
+        }
+        if self.threads[index].worktree_bootstrap_fresh_context {
+            self.persist_transcripts = true;
+        }
+        self.threads[index].native.queue_held = false;
+        if self.runtime_enabled || self.threads[index].pi.is_some() {
+            if self.threads[index].pi.is_none() {
+                self.connect_thread(index);
+            }
+            if self.threads[index].pi.is_some() {
+                self.threads[index].drive_session();
+            }
+        }
+    }
+
+    fn spawn_worktree_setup_runner(&mut self, thread_id: usize) {
+        let Some(index) = self.threads.iter().position(|t| t.id == thread_id) else {
+            return;
+        };
+        let Some(project_cwd) = self
+            .project(self.threads[index].project)
+            .map(|p| p.path.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let Some(wt_path) = self.threads[index].worktree_path.clone() else {
+            return;
+        };
+        self.threads[index].worktree_setup_seq =
+            self.threads[index].worktree_setup_seq.saturating_add(1);
+        let run_seq = self.threads[index].worktree_setup_seq;
+        let wake = self.wake.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worktree_setup_rxs.push(rx);
+        std::thread::spawn(move || {
+            let result = crate::vcs::run_setup(&crate::vcs::VcsRunSetupInput {
+                cwd: project_cwd,
+                worktree_path: Some(wt_path),
+                timeout_ms: None,
+            });
+            let _ = tx.send(WorktreeSetupResultMsg {
+                thread_id,
+                run_seq,
+                result,
+            });
+            wake();
+        });
+    }
+
+    pub fn poll_worktree_setup(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.worktree_setup_rxs.len());
+        let rxs = std::mem::take(&mut self.worktree_setup_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    let Some(index) = self.threads.iter().position(|t| t.id == msg.thread_id)
+                    else {
+                        continue;
+                    };
+                    if self.threads[index].worktree_setup_seq != msg.run_seq {
+                        continue;
+                    }
+                    match msg.result {
+                        Ok(res) if res.status == "no_script" => {
+                            self.threads[index].worktree_setup = None;
+                            self.release_after_worktree_setup(index);
+                        }
+                        Ok(res) if res.exit_code == Some(0) && !res.timed_out => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Succeeded,
+                                script_name: res.script_name.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_name.clone())
+                                }),
+                                script_command: res.script_command.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_command.clone())
+                                }),
+                                error: None,
+                                output: res.output,
+                                exit_code: res.exit_code,
+                                timed_out: false,
+                                duration_ms: res.duration_ms,
+                                skipped: false,
+                            });
+                            self.release_after_worktree_setup(index);
+                        }
+                        Ok(res) => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            let error = if res.timed_out {
+                                "Setup script timed out.".to_owned()
+                            } else if let Some(code) = res.exit_code {
+                                format!("Setup script exited with code {code}.")
+                            } else {
+                                "Setup script failed.".to_owned()
+                            };
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Failed,
+                                script_name: res.script_name.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_name.clone())
+                                }),
+                                script_command: res.script_command.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_command.clone())
+                                }),
+                                error: Some(error),
+                                output: res.output,
+                                exit_code: res.exit_code,
+                                timed_out: res.timed_out,
+                                duration_ms: res.duration_ms,
+                                skipped: false,
+                            });
+                            self.threads[index].worktree_setup_output_open = true;
+                            self.threads[index].native.queue_held = true;
+                        }
+                        Err(error) => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Failed,
+                                script_name: existing.as_ref().and_then(|s| s.script_name.clone()),
+                                script_command: existing
+                                    .as_ref()
+                                    .and_then(|s| s.script_command.clone()),
+                                error: Some(error),
+                                output: existing.map(|s| s.output).unwrap_or_default(),
+                                exit_code: None,
+                                timed_out: false,
+                                duration_ms: 0,
+                                skipped: false,
+                            });
+                            self.threads[index].worktree_setup_output_open = true;
+                            self.threads[index].native.queue_held = true;
+                        }
+                    }
+                    self.checkpoint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.worktree_setup_rxs = remaining;
+        changed
+    }
+
+    pub fn retry_worktree_setup(&mut self) {
+        if self.forward("thread.worktreeSetup", json!({"action": "retry"})) {
+            return;
+        }
+        let thread = self.current_mut();
+        let Some(setup) = thread.worktree_setup.as_mut() else {
+            return;
+        };
+        if setup.phase != WorktreeSetupPhase::Failed || thread.worktree_path.is_none() {
+            return;
+        }
+        setup.phase = WorktreeSetupPhase::Running;
+        setup.error = None;
+        setup.output.clear();
+        setup.exit_code = None;
+        setup.timed_out = false;
+        setup.duration_ms = 0;
+        setup.skipped = false;
+        thread.native.queue_held = true;
+        let tid = thread.id;
+        self.spawn_worktree_setup_runner(tid);
+        self.checkpoint();
+    }
+
+    pub fn skip_worktree_setup(&mut self) {
+        if self.forward("thread.worktreeSetup", json!({"action": "skip"})) {
+            return;
+        }
+        let index = self.active;
+        let thread = &mut self.threads[index];
+        let Some(setup) = thread.worktree_setup.as_mut() else {
+            return;
+        };
+        if setup.phase == WorktreeSetupPhase::Succeeded {
+            return;
+        }
+        thread.worktree_setup_seq = thread.worktree_setup_seq.saturating_add(1);
+        setup.phase = WorktreeSetupPhase::Succeeded;
+        setup.skipped = true;
+        setup.error = None;
+        self.release_after_worktree_setup(index);
+        self.checkpoint();
     }
 
     pub fn open_external_url(&mut self, url: &str) {
@@ -11296,6 +11570,22 @@ impl State {
                         .and_then(|v| serde_json::from_value::<ThreadEnvMode>(v.clone()).ok());
                     thread.start_from_origin =
                         record.get("startFromOrigin").and_then(Value::as_bool);
+                    if let Some(setup_val) = record.get("worktreeSetup")
+                        && let Ok(mut setup) =
+                            serde_json::from_value::<Option<WorktreeSetupState>>(setup_val.clone())
+                    {
+                        if let Some(ref mut s) = setup
+                            && s.phase == WorktreeSetupPhase::Running
+                        {
+                            s.phase = WorktreeSetupPhase::Failed;
+                            s.error = Some(
+                                "Worktree setup was interrupted before restart. Retry or skip to continue."
+                                    .into(),
+                            );
+                            thread.worktree_setup_output_open = true;
+                        }
+                        thread.worktree_setup = setup;
+                    }
                     if let Some(suggestion) = record.get("promptSuggestion")
                         && let Ok(parsed) =
                             serde_json::from_value::<Option<PromptSuggestion>>(suggestion.clone())
@@ -12225,6 +12515,9 @@ impl Thread {
         if let Some(start_from_origin) = self.start_from_origin {
             record["startFromOrigin"] = json!(start_from_origin);
         }
+        if let Some(worktree_setup) = &self.worktree_setup {
+            record["worktreeSetup"] = json!(worktree_setup);
+        }
         record
     }
 }
@@ -12335,6 +12628,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= state.prewarm_current();
     changed |= state.poll_vcs_branches();
     changed |= state.poll_worktree_bootstraps();
+    changed |= state.poll_worktree_setup();
     changed |= state.poll_question_answers();
     if state.runtime_enabled && state.client.is_none() {
         for index in 0..state.threads.len() {
@@ -19546,6 +19840,258 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_setup_script_succeeds_fails_and_retries() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+
+        // 1. Setup script that succeeds holds the first message until setup completes, then runs it.
+        let root_ok = std::env::temp_dir().join(format!("shina-setup-ok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_ok).unwrap();
+        let empty_cfg_ok = root_ok.join("empty.gitconfig");
+        std::fs::write(&empty_cfg_ok, "").unwrap();
+        let repo_ok = init_temp_git_repo(&root_ok, &empty_cfg_ok);
+        std::fs::write(
+            repo_ok.join("t3.json"),
+            r#"{"scripts":[{"name":"Setup","command":"echo line1 && echo setup-done > setup.marker","runOnWorktreeCreate":true}]}"#,
+        )
+        .unwrap();
+        {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["add", "t3.json"])
+                .current_dir(&repo_ok)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_ok)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_ok);
+            assert!(cmd.status().unwrap().success());
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["commit", "-m", "add t3.json", "--quiet"])
+                .current_dir(&repo_ok)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_ok)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_ok);
+            assert!(cmd.status().unwrap().success());
+        }
+
+        let mut state_ok = State::new(repo_ok, false);
+        state_ok.data_dir = root_ok.join("data");
+        std::fs::create_dir_all(&state_ok.data_dir).unwrap();
+        state_ok.runtime_enabled = true;
+        state_ok.test_git_context = Some(crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg_ok.clone()),
+            git_config_system: Some(empty_cfg_ok.clone()),
+        });
+        let cmds_ok: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        let cmds_ok_hook = cmds_ok.clone();
+        state_ok.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *cmds_ok_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+        {
+            let t = state_ok.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("After setup succeeds");
+        }
+        state_ok.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_ok.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state_ok.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            state_ok.current().worktree_setup.as_ref().map(|s| s.phase),
+            Some(WorktreeSetupPhase::Running)
+        );
+        assert!(state_ok.current().native.queue_held);
+        assert!(state_ok.test_connect_workspaces.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_ok
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_ok.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let setup = state_ok.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(setup.phase, WorktreeSetupPhase::Succeeded);
+        assert!(setup.output.contains("line1"));
+        assert!(!state_ok.current().native.queue_held);
+        let wt_path = state_ok.current().worktree_path.clone().unwrap();
+        assert!(std::path::Path::new(&wt_path).join("setup.marker").exists());
+        let sent = cmds_ok
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first message released after setup succeeded");
+        assert_eq!(sent["message"], "After setup succeeds");
+
+        // Snapshot + restore preserves setup card state.
+        let snap = state_ok.snapshot();
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&snap).unwrap();
+        assert_eq!(
+            restored.current().worktree_setup.as_ref().map(|s| s.phase),
+            Some(WorktreeSetupPhase::Succeeded)
+        );
+        let _ = std::fs::remove_dir_all(&root_ok);
+
+        // 2. Setup script that fails holds the first message; retry succeeds and releases it.
+        let root_fail =
+            std::env::temp_dir().join(format!("shina-setup-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_fail).unwrap();
+        let empty_cfg_fail = root_fail.join("empty.gitconfig");
+        std::fs::write(&empty_cfg_fail, "").unwrap();
+        let repo_fail = init_temp_git_repo(&root_fail, &empty_cfg_fail);
+        let gate_file = root_fail.join("allow_pass");
+        let cmd_str = format!(
+            "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
+            gate_file.display()
+        );
+        std::fs::write(
+            repo_fail.join("t3.json"),
+            json!({
+                "scripts": [{
+                    "name": "Setup",
+                    "command": cmd_str,
+                    "runOnWorktreeCreate": true
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["add", "t3.json"])
+                .current_dir(&repo_fail)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_fail)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_fail);
+            assert!(cmd.status().unwrap().success());
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["commit", "-m", "add t3.json", "--quiet"])
+                .current_dir(&repo_fail)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_fail)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_fail);
+            assert!(cmd.status().unwrap().success());
+        }
+
+        let mut state_fail = State::new(repo_fail, false);
+        state_fail.data_dir = root_fail.join("data");
+        std::fs::create_dir_all(&state_fail.data_dir).unwrap();
+        state_fail.runtime_enabled = true;
+        state_fail.test_git_context = Some(crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg_fail.clone()),
+            git_config_system: Some(empty_cfg_fail.clone()),
+        });
+        let cmds_fail: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        let cmds_fail_hook = cmds_fail.clone();
+        state_fail.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *cmds_fail_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+        {
+            let t = state_fail.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("After retry succeeds");
+        }
+        state_fail.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state_fail.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_fail.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = state_fail.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(failed.phase, WorktreeSetupPhase::Failed);
+        assert_eq!(failed.exit_code, Some(2));
+        assert!(failed.output.contains("failing-tail"));
+        assert!(state_fail.current().native.queue_held);
+        assert!(state_fail.test_connect_workspaces.is_empty());
+
+        // Fix condition and retry: setup succeeds and releases the queued message.
+        std::fs::write(&gate_file, "ok").unwrap();
+        state_fail.retry_worktree_setup();
+        assert_eq!(
+            state_fail
+                .current()
+                .worktree_setup
+                .as_ref()
+                .map(|s| s.phase),
+            Some(WorktreeSetupPhase::Running)
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_fail.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let retried = state_fail.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(retried.phase, WorktreeSetupPhase::Succeeded);
+        assert!(retried.output.contains("retry-ok"));
+        assert!(!state_fail.current().native.queue_held);
+        let sent_retry = cmds_fail
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first message released after retry");
+        assert_eq!(sent_retry["message"], "After retry succeeds");
+
+        let _ = std::fs::remove_dir_all(&root_fail);
     }
 
     #[test]
