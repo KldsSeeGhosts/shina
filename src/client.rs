@@ -1229,6 +1229,9 @@ pub(crate) async fn cache_files(
                 &bytes,
             )?
             .to_value();
+            // Downloading bytes must not turn a lazy pasted-text file into a
+            // normal embeddable resource when it is copied into another draft.
+            local["source"] = reference["source"].clone();
         }
         *projected.pointer_mut(&path).unwrap() = local;
         Ok(())
@@ -1539,6 +1542,7 @@ pub(crate) async fn uploaded_command_capabilities(
         } else if let Some(asset_id) = value["asset_id"].as_str() {
             if !(crate::attachments::safe_id(asset_id)
                 || crate::attachments::safe_file_id(asset_id))
+                && !crate::attachments::Attachment::from_value(value).is_some_and(|a| !a.is_image())
             {
                 return Err("Invalid local attachment identity.".into());
             }

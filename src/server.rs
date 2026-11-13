@@ -159,7 +159,9 @@ async fn upload_start(
                 hash: hash.to_ascii_lowercase(),
                 name: name.trim().chars().take(255).collect(),
                 expires: Instant::now()
-                    + Duration::from_secs(if staged || file_mime.is_some() {
+                    + Duration::from_secs(if staged {
+                        60 * 60
+                    } else if file_mime.is_some() {
                         600
                     } else {
                         300
@@ -806,6 +808,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
                             "canUpdate":shared.database.authorize(&device,"server.requestUpdate",&json!({})).is_ok(),
                             "capabilities":capabilities,"limits":{"controlBytes":protocol::MAX_CONTROL,"outstandingCommands":32,"pageBytes":protocol::MAX_PAGE_BYTES,
+                                "fileAttachmentBytes":if staged_attachments {Some(crate::attachments::MAX_FILE_BYTES)} else {None},
                                 "historyLeaseCount":crate::history::LEASE_COUNT,"historyLeaseBytes":crate::history::LEASE_BYTES,"historyLeaseIdleSeconds":crate::history::LEASE_IDLE.as_secs(),
                                 "threadReplayEvents":crate::history::REPLAY_EVENTS,"threadReplayBytes":crate::history::REPLAY_BYTES}}))
                     }

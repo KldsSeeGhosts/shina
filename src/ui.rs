@@ -11,6 +11,14 @@ use rune::{
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 use std::time::Duration;
+#[path = "attachment_archive_preview.rs"]
+mod attachment_archive_preview;
+#[path = "attachment_preview.rs"]
+pub(crate) mod attachment_preview;
+#[path = "attachment_sqlite_preview.rs"]
+mod attachment_sqlite_preview;
+#[path = "attachment_text_preview.rs"]
+mod attachment_text_preview;
 #[path = "captain_ui.rs"]
 mod captain_ui;
 #[path = "composer_menu.rs"]
@@ -997,7 +1005,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
     }
-    if s.transcript_preview.is_some() {
+    if s.attachment_preview.is_some() {
+        root = root.child(attachment_preview::view(s, p));
+    } else if s.transcript_preview.is_some() {
         root = root.child(transcript_context::preview(s, p));
     } else if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
@@ -9757,6 +9767,46 @@ fn image_preview(
     height: f32,
     key: String,
 ) -> El {
+    if !image.is_image()
+        && (image.mime.starts_with("video/")
+            || crate::attachment_intake::native_mime(&image.name).starts_with("video/"))
+        && let Some(path) = crate::attachments::path_for(image).filter(|p| p.is_file())
+    {
+        // KSG ComposerVideoThumbnail and prepareVideoFirstFrame. Keep a paused,
+        // muted native poster alive between frames; evict only least-recently used posters.
+        let clock = s.attachment_poster_clock.get().wrapping_add(1);
+        s.attachment_poster_clock.set(clock);
+        let mut posters = s.attachment_video_posters.borrow_mut();
+        let (player, accessed) = posters
+            .entry(image.id.clone())
+            .or_insert_with(|| (rune::Player::file(path), clock));
+        *accessed = clock;
+        let player = player.clone();
+        if player.time() == 0.0
+            && let Some(duration) = player.duration().filter(|d| *d > 0.0)
+        {
+            player.seek(0.1_f64.min(duration / 2.0));
+        }
+        if posters.len() > 256
+            && let Some(oldest) = posters
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            posters.remove(&oldest);
+        }
+        return el()
+            .key(key)
+            .size(width, height)
+            .radius(4.0)
+            .clip_rounded(4.0)
+            .video(&player, rune::SurfaceFit::Fill)
+            .child(
+                el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .center()
+                    .child(icon("play", Color::WHITE)),
+            );
+    }
     let mut preview = el()
         .key(key)
         .size(width, height)
@@ -9799,8 +9849,41 @@ fn image_size(image: &Attachment, maximum: f32) -> (f32, f32) {
 /// A draft image as a bare 64 px thumbnail with a close button in its corner, ported from
 /// KSG Code's `ComposerAttachmentStrip`. The file name lives in the tooltip and the label.
 const ATTACHMENT_THUMB: f32 = 64.0;
+fn composer_attachment_thumbnail(
+    s: &State,
+    p: Palette,
+    image: &Attachment,
+    width: f32,
+    height: f32,
+    key: String,
+) -> El {
+    let inherited = s
+        .attachment_uploads
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.machine == s.machines.selected
+                && entry.thread == s.current().id
+                && entry.id == image.id
+        })
+        .and_then(|entry| entry.thumbnail(&s.attachment_cache));
+    if let Some(thumbnail) = inherited {
+        if rune::is_headless() {
+            let _ = thumbnail.wait();
+        }
+        if thumbnail.is_ready() && thumbnail.error().is_none() {
+            return el()
+                .key(key)
+                .size(width, height)
+                .pixels_fit(thumbnail.pixels(), rune::SurfaceFit::Fill);
+        }
+    }
+    image_preview(s, p, image, width, height, key)
+}
+
 fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
     let id = image.id.clone();
+    let preview_id = id.clone();
     let mut tile = el()
         .key(format!("attachment-{}", image.id))
         .role("group")
@@ -9812,7 +9895,7 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
         .help(image.name.clone())
         .size(ATTACHMENT_THUMB, ATTACHMENT_THUMB)
         .child(
-            image_preview(
+            composer_attachment_thumbnail(
                 s,
                 p,
                 image,
@@ -9822,7 +9905,13 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
             )
             .radius(4.0)
             .clip_rounded(4.0)
-            .a11y_hidden(),
+            .role("button")
+            .label(format!("Preview {}", image.name))
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut State| {
+                s.preview_attachments(s.current().draft_images.clone(), &preview_id, true);
+            }),
         )
         .child(
             el().key(format!("remove-attachment-{id}"))
@@ -9856,7 +9945,13 @@ fn attachment_upload_status(s: &State, p: Palette, id: &str) -> Option<El> {
         .entries
         .iter()
         .find(|entry| entry.id == id)?;
-    if !entry.image {
+    if !entry.image
+        && !s
+            .current()
+            .draft_images
+            .iter()
+            .any(|a| a.id == id && attachment_is_video(a))
+    {
         return None;
     }
     let elapsed = match phase {
@@ -9901,6 +9996,18 @@ fn preparing_attachment_chip(
     entry: &crate::attachment_uploads::Entry,
 ) -> El {
     let id = entry.id.clone();
+    let thumbnail = entry.thumbnail(&s.attachment_cache).and_then(|thumbnail| {
+        if rune::is_headless() {
+            let _ = thumbnail.wait();
+        }
+        (thumbnail.is_ready() && thumbnail.error().is_none()).then_some(thumbnail)
+    });
+    let body = if let Some(thumbnail) = thumbnail {
+        el().size(64.0, 64.0)
+            .pixels_fit(thumbnail.pixels(), rune::SurfaceFit::Fill)
+    } else {
+        icon("image", p.muted)
+    };
     let mut tile = el()
         .key(format!("attachment-{id}"))
         .size(64.0, 64.0)
@@ -9909,7 +10016,7 @@ fn preparing_attachment_chip(
         .fill(p.selected)
         .center()
         .label(format!("Preparing {}", entry.name))
-        .child(icon("image", p.muted))
+        .child(body)
         .child(
             icon_button(
                 &format!("remove-attachment-{id}"),
@@ -9934,6 +10041,62 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
     use crate::attachment_uploads::Phase;
     let mut rows = col().w_full().gap(4.0).px(12.0).pt(8.0);
     let mut any = false;
+    let inline = inline_file_attachment_ids(s.current());
+    for file in s.current().draft_images.iter().filter(|a| {
+        !a.is_image() && !attachment_is_video(a) && !a.needs_reattach() && !inline.contains(&a.id)
+    }) {
+        if s.attachment_uploads
+            .phase(&s.machines.selected, s.current().id, &file.id)
+            .is_some_and(|phase| !matches!(phase, Phase::Ready | Phase::Legacy))
+        {
+            continue;
+        }
+        any = true;
+        let id = file.id.clone();
+        let preview_id = id.clone();
+        let size = if file.bytes.div_ceil(1024).max(1) >= 1024 {
+            format!("{:.1} MB", file.bytes as f64 / 1048576.0)
+        } else {
+            format!("{} KB", file.bytes.div_ceil(1024).max(1))
+        };
+        rows = rows.child(
+            row()
+                .key(format!("attachment-{id}"))
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .py(4.0)
+                .center_y()
+                .child(icon("file", p.muted))
+                .child(
+                    label(&file.name, BODY, p.ink)
+                        .key(format!("attachment-thumb-{id}"))
+                        .role("button")
+                        .label(format!("Preview {}", file.name))
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .truncate()
+                        .w(0.0)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .on_press(move |s: &mut State| {
+                            s.preview_attachments(
+                                s.current().draft_images.clone(),
+                                &preview_id,
+                                true,
+                            )
+                        }),
+                )
+                .child(pixel_text(size, p.muted))
+                .child(icon_button(
+                    &format!("remove-attachment-{id}"),
+                    &format!("Remove {}", file.name),
+                    "close",
+                    p,
+                    move |s| s.remove_attachment(&id),
+                )),
+        );
+    }
     // KSG ComposerAttachmentFileList retains restored files with no bytes as markers.
     for file in s
         .current()
@@ -9946,43 +10109,53 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
         let can_attach = s.file_attachment_staging_supported_on(&s.machines.selected)
             && file.bytes <= crate::attachments::MAX_FILE_BYTES;
         rows = rows.child(
-            row()
-                .key(format!("attachment-needs-reattach-{id}"))
-                .w_full()
-                .min_w(0.0)
-                .gap(8.0)
-                .py(4.0)
-                .center_y()
-                .label(format!("{} needs reattach", file.name))
-                .child(icon("file", p.muted))
-                .child(
-                    label(&file.name, BODY, p.ink)
-                        .truncate()
-                        .w(0.0)
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(pixel_text(
-                    if can_attach {
-                        "Attach again"
-                    } else {
-                        "Remove to send"
-                    },
-                    p.muted,
-                ))
-                .child(icon_button(
-                    &format!("remove-missing-attachment-{id}"),
-                    &format!("Remove {}", file.name),
-                    "close",
-                    p,
-                    move |s| s.remove_attachment(&id),
-                )),
+            el().key(format!("attachment-{id}")).w_full().child(
+                row()
+                    .key(format!("attachment-needs-reattach-{id}"))
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(8.0)
+                    .py(4.0)
+                    .center_y()
+                    .label(format!("{} needs reattach", file.name))
+                    .child(icon("file", p.muted))
+                    .child(
+                        label(&file.name, BODY, p.ink)
+                            .truncate()
+                            .w(0.0)
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(pixel_text(
+                        if can_attach {
+                            "Attach again"
+                        } else {
+                            "Remove to send"
+                        },
+                        p.muted,
+                    ))
+                    .child(
+                        el().key(format!("remove-attachment-{id}"))
+                            .child(icon_button(
+                                &format!("remove-missing-attachment-{id}"),
+                                &format!("Remove {}", file.name),
+                                "close",
+                                p,
+                                move |s| s.remove_attachment(&id),
+                            )),
+                    ),
+            ),
         );
     }
     for entry in s.attachment_uploads.entries.iter().filter(|entry| {
         entry.machine == s.machines.selected
             && entry.thread == s.current().id
             && !entry.image
+            && !s
+                .current()
+                .draft_images
+                .iter()
+                .any(|a| a.id == entry.id && attachment_is_video(a))
             && !s
                 .current()
                 .draft_images
@@ -10038,28 +10211,40 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
     any.then_some(rows)
 }
 
-pub(crate) fn tray_attachments(t: &Thread) -> Vec<&Attachment> {
+fn inline_file_attachment_ids(t: &Thread) -> std::collections::HashSet<String> {
     let inline_ids = crate::composer_tokens::collect_inline_context_ids_from_edit(&t.draft);
-    let inline_file_attachment_ids: std::collections::HashSet<&str> = t
+    let mut ids: std::collections::HashSet<String> = t
         .draft_context
         .iter()
         .filter(|r| inline_ids.contains(&r.context_id))
         .filter_map(|r| match &r.data {
             crate::composer_context::ComposerContextData::File { attachment_id, .. } => {
-                Some(attachment_id.as_str())
+                Some(attachment_id.clone())
             }
             _ => None,
         })
         .collect();
+    for attachment in &t.draft_images {
+        if inline_ids.contains(
+            &crate::composer_context::to_kind_scoped_composer_context_id("file", &attachment.id),
+        ) {
+            ids.insert(attachment.id.clone());
+        }
+    }
+    ids
+}
+
+fn attachment_is_video(a: &Attachment) -> bool {
+    !a.is_image()
+        && (a.mime.starts_with("video/")
+            || crate::attachment_intake::file_mime(&a.name, &a.mime).starts_with("video/"))
+}
+
+pub(crate) fn tray_attachments(t: &Thread) -> Vec<&Attachment> {
+    // KSG keeps previewable videos in the media strip even when they have an inline chip.
     t.draft_images
         .iter()
-        .filter(|a| {
-            a.is_image()
-                || (!inline_file_attachment_ids.contains(a.id.as_str())
-                    && !inline_ids.contains(
-                        &crate::composer_context::to_kind_scoped_composer_context_id("file", &a.id),
-                    ))
-        })
+        .filter(|a| a.is_image() || attachment_is_video(a))
         .collect()
 }
 
@@ -10135,10 +10320,15 @@ fn message_images(s: &State, p: Palette, images: &[Attachment], key: &str) -> El
         .gap(6.0)
         .max_w(620.0);
     for (index, image) in images.iter().enumerate() {
+        let items = images.to_vec();
+        let id = image.id.clone();
         let (width, height) = image_size(image, if images.len() == 1 { 220.0 } else { 132.0 });
         strip = strip.child(
             image_preview(s, p, image, width, height, format!("{key}-image-{index}"))
-                .role("group")
+                .role("button")
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| s.preview_attachments(items.clone(), &id, false))
                 .label(format!(
                     "Attached {}: {}",
                     if image.is_image() { "image" } else { "file" },
@@ -10692,10 +10882,15 @@ fn composer(
 ) -> El {
     let t = s.current();
     let lane = lane_width(pane_width, wide);
+    let inline_files = inline_file_attachment_ids(t);
     let collapsed = s
         .attachment_uploads
         .block_reason(&s.machines.selected, t.id)
         .is_none()
+        && !t
+            .draft_images
+            .iter()
+            .any(|a| !a.is_image() && !attachment_is_video(a) && !inline_files.contains(&a.id))
         && composer_ui::collapsed(s, s.composer_ui.viewport.get(), lane - 32.0);
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
@@ -11087,8 +11282,9 @@ fn composer(
             );
         let resting_tray = tray_attachments(t);
         for image in resting_tray.iter().take(3) {
+            let id = image.id.clone();
             preview = preview.child(
-                image_preview(
+                composer_attachment_thumbnail(
                     s,
                     p,
                     image,
@@ -11098,10 +11294,10 @@ fn composer(
                 )
                 .opacity(composer_ui::image_arrival(s, true))
                 .role("button")
-                .label(format!("Expand composer. {}", image.name))
+                .label(format!("Preview {}", image.name))
                 .preserve_focus_on_press(true)
-                .on_press(|s: &mut State| {
-                    s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                .on_press(move |s: &mut State| {
+                    s.preview_attachments(s.current().draft_images.clone(), &id, true);
                 }),
             );
         }
@@ -14068,6 +14264,225 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn table_database_and_native_document_previews_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            let directory = rt.state.data_dir.clone();
+            let csv = directory.join("preview.csv");
+            std::fs::write(&csv, "name,value\n\"multi\nline\",two\n").unwrap();
+            let html = directory.join("preview.html");
+            std::fs::write(&html, "<!doctype html><p>HTML preview</p>").unwrap();
+            let pdf = directory.join("preview.pdf");
+            std::fs::write(&pdf, "%PDF-1.4\nfixture").unwrap();
+            let archive = directory.join("preview.txt.gz");
+            {
+                use std::io::Write;
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(b"Inside archive").unwrap();
+                std::fs::write(&archive, encoder.finish().unwrap()).unwrap();
+            }
+            let database = directory.join(format!("preview-{width}.sqlite"));
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE rows (value TEXT); INSERT INTO rows VALUES ('Database preview');",
+                )
+                .unwrap();
+            drop(connection);
+            for (path, key) in [
+                (csv, "attachment-text-rows"),
+                (html, "render-attachment-preview"),
+                (pdf, "open-native-attachment-preview"),
+                (database, "attachment-preview-database"),
+                (archive, "attachment-preview-archive"),
+            ] {
+                let file = crate::attachments::attach_file(&path).unwrap();
+                rt.update(|s, _| s.preview_attachments(vec![file.clone()], &file.id, true));
+                rt.frame(0.0);
+                let (dialog, _) = rt.presented("attachment-preview").unwrap();
+                assert!(
+                    dialog[0] >= 0.0 && dialog[0] + dialog[2] <= width + 0.5,
+                    "{width}: {key}: {dialog:?}"
+                );
+                assert!(rt.presented(key).is_some(), "{width}: {key}");
+                if key == "attachment-text-rows" {
+                    press(&mut rt, "render-attachment-preview");
+                    assert!(rt.presented("attachment-preview-text").is_some());
+                    press(&mut rt, "render-attachment-preview");
+                    assert!(rt.presented("attachment-text-rows").is_some());
+                }
+                if key == "attachment-preview-archive" {
+                    press(&mut rt, "archive-preview-entry-0");
+                    assert!(rt.presented("archive-preview-source").is_some());
+                    press(&mut rt, "archive-preview-back");
+                    assert!(rt.presented("archive-preview-entry-0").is_some());
+                }
+                press(&mut rt, "close-attachment-preview");
+            }
+        }
+    }
+
+    #[test]
+    fn image_preview_pinch_and_keyboard_pan_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let path = rt.state.data_dir.join("zoom.png");
+            image::RgbaImage::from_pixel(1600, 1600, image::Rgba([60, 80, 100, 255]))
+                .save(&path)
+                .unwrap();
+            let image = crate::attachments::attach_file(&path).unwrap();
+            rt.update(|s, _| s.preview_attachments(vec![image.clone()], &image.id, true));
+            rt.frame(0.5);
+            let (bounds, _) = rt.presented("attachment-preview-image-viewport").unwrap();
+            rt.magnify_event(
+                rune::MagnifyEvent::new(1.0)
+                    .at(bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0),
+            );
+            rt.frame(0.5);
+            assert_eq!(rt.state.attachment_preview.as_ref().unwrap().zoom(), 2.0);
+            let before = rt
+                .state
+                .attachment_preview
+                .as_ref()
+                .unwrap()
+                .scroll_offset();
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Down,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            let after = rt
+                .state
+                .attachment_preview
+                .as_ref()
+                .unwrap()
+                .scroll_offset();
+            assert!(
+                (after[1] - before[1] - 40.0).abs() < 1.0,
+                "{width}: {before:?} {after:?}"
+            );
+            let (x, y) = (bounds[0] + bounds[2] / 2.0, bounds[1] + bounds[3] / 2.0);
+            rt.pointer_down(x, y);
+            rt.pointer_move(x, y - 20.0);
+            rt.pointer_up(x, y - 20.0);
+            rt.frame(0.5);
+            assert_eq!(
+                rt.state.attachment_preview.as_ref().unwrap().zoom(),
+                2.0,
+                "dragging must not toggle zoom"
+            );
+            rt.wheel_event(rune::WheelEvent::new(0.0, 40.0).at(x, y).mods(rune::Mods {
+                ctrl: true,
+                ..Default::default()
+            }));
+            rt.frame(0.5);
+            assert!(rt.state.attachment_preview.as_ref().unwrap().zoom() > 2.0);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("0".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert_eq!(rt.state.attachment_preview.as_ref().unwrap().zoom(), 1.0);
+            rt.magnify_event(rune::MagnifyEvent::new(1.0).at(x, y));
+            rt.frame(0.5);
+            assert_eq!(rt.state.attachment_preview.as_ref().unwrap().zoom(), 2.0);
+            rt.set_viewport((width - 40.0, rt.state.viewport_height), 2.0);
+            rt.frame(0.5);
+            rt.frame(0.5);
+            assert_eq!(
+                rt.state.attachment_preview.as_ref().unwrap().zoom(),
+                1.0,
+                "resizing must refit"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_previews_open_from_tray_and_messages_and_fit_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let directory = rt.state.data_dir.clone();
+            let file_path = directory.join("preview.txt");
+            std::fs::write(&file_path, "Preview body").unwrap();
+            let file = crate::attachments::attach_file(&file_path).unwrap();
+            let movie_path = directory.join("preview.mp4");
+            std::fs::write(
+                &movie_path,
+                include_bytes!("../assets/tests/attachment-preview.mp4"),
+            )
+            .unwrap();
+            let video = crate::attachments::attach_file(&movie_path).unwrap();
+            let image_path = directory.join("preview.png");
+            image::RgbaImage::from_pixel(4, 2, image::Rgba([60, 80, 100, 255]))
+                .save(&image_path)
+                .unwrap();
+            let image = crate::attachments::attach_file(&image_path).unwrap();
+            rt.state.current_mut().draft_images = vec![image.clone(), file.clone(), video.clone()];
+            rt.state.current_mut().draft.replace_text("Inspect");
+            rt.state.current_mut().draft.focused = true;
+            rt.frame(0.0);
+            press(&mut rt, &format!("attachment-thumb-{}", image.id));
+            rt.frame(0.0);
+            assert!(rt.presented("attachment-preview-image").is_some());
+            press(&mut rt, "close-attachment-preview");
+            for attachment in [file.clone(), image.clone(), video.clone()] {
+                for draft in [true, false] {
+                    rt.update(|s, _| {
+                        s.preview_attachments(vec![attachment.clone()], &attachment.id, draft)
+                    });
+                    rt.frame(0.0);
+                    let (bounds, _) = rt.presented("attachment-preview").unwrap();
+                    assert!(
+                        bounds[0] >= 0.0 && bounds[0] + bounds[2] <= width + 0.5,
+                        "{width}: {bounds:?}"
+                    );
+                    assert!(
+                        bounds[1] >= 0.0 && bounds[1] + bounds[3] <= rt.state.viewport_height + 0.5
+                    );
+                    if attachment.id == video.id {
+                        assert!(rt.presented("attachment-preview-video").is_some());
+                        assert!(rt.presented("attachment-preview-seek").is_some());
+                        assert!(rt.presented("attachment-preview-media-controls").is_some());
+                        let player = rt
+                            .state
+                            .attachment_preview
+                            .as_ref()
+                            .unwrap()
+                            .player()
+                            .unwrap()
+                            .clone();
+                        rt.frame(0.25);
+                        assert!(
+                            !matches!(player.state(), rune::PlayerState::Failed(_)),
+                            "{:?}",
+                            player.state()
+                        );
+                        assert!(player.duration().is_some_and(|duration| duration > 0.0));
+                        rt.frame(0.25);
+                        assert!(player.time() > 0.0);
+                    } else if attachment.id == file.id {
+                        assert!(
+                            rt.elements()
+                                .iter()
+                                .any(|e| e.text.as_deref() == Some("Preview body")),
+                            "{width} draft {draft}: {:?}",
+                            rt.elements()
+                                .iter()
+                                .filter(|e| e.path.contains("attachment-preview"))
+                                .map(|e| (&e.key, &e.text, e.rect))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    press(&mut rt, "close-attachment-preview");
+                    assert!(rt.state.attachment_preview.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn missing_attachment_markers_fit_at_all_widths_and_matching_pick_uses_no_slot() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -14094,11 +14509,20 @@ pub(crate) mod tests {
                 rt.state.current_mut().draft_images.push(other);
             }
             let draft = rt.state.current().draft.text.clone();
-            std::fs::write(&path, "new").unwrap();
-            rt.state.attach_paths(&[path]);
+            let pick_directory = rt.state.data_dir.join("reattach-pick");
+            std::fs::create_dir_all(&pick_directory).unwrap();
+            let picked = pick_directory.join("missing.txt");
+            std::fs::write(&picked, "new").unwrap();
+            assert!(rt.state.current().draft_images[0].needs_reattach());
+            rt.state.attach_paths(&[picked]);
             assert_eq!(rt.state.current().draft_images.len(), 100);
             assert_eq!(rt.state.current().draft_images[0].id, marker.id);
             assert!(!rt.state.current().draft_images[0].needs_reattach());
+            assert!(rt.state.current().draft_images[0].asset_id.is_some());
+            assert_eq!(
+                Attachment::from_value(&rt.state.current().draft_images[0].to_value()),
+                Some(rt.state.current().draft_images[0].clone())
+            );
             assert_eq!(rt.state.current().draft.text, draft);
         }
     }

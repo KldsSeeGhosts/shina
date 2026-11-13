@@ -449,6 +449,22 @@ fn inline(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> String {
+    inline_mapped(edit, range, target_machine, machine_name).0
+}
+
+struct MarkdownSpan {
+    source: std::ops::Range<usize>,
+    start: usize,
+    len: usize,
+    code: bool,
+}
+
+fn inline_mapped(
+    edit: &TextEdit,
+    range: std::ops::Range<usize>,
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> (String, Vec<MarkdownSpan>) {
     // KSG disables links in new composer documents. Preserve URLs in legacy
     // Shina snapshots rather than silently losing them on their next send.
     let links: Vec<_> = edit
@@ -473,31 +489,23 @@ fn inline(
                 .collect(),
         );
         let mut out = String::new();
+        let mut spans = Vec::new();
         let mut cursor = range.start;
         for (link, url) in links {
-            out.push_str(&inline(
-                &without,
-                cursor..link.start,
-                target_machine,
-                machine_name,
-            ));
+            let (text, mapped) =
+                inline_mapped(&without, cursor..link.start, target_machine, machine_name);
+            append_mapped(&mut out, &mut spans, &text, mapped);
             out.push('[');
-            out.push_str(&inline(
-                &without,
-                link.clone(),
-                target_machine,
-                machine_name,
-            ));
+            let (text, mapped) =
+                inline_mapped(&without, link.clone(), target_machine, machine_name);
+            append_mapped(&mut out, &mut spans, &text, mapped);
             out.push_str(&format!("]({})", url.replace(')', "\\)")));
             cursor = link.end;
         }
-        out.push_str(&inline(
-            &without,
-            cursor..range.end,
-            target_machine,
-            machine_name,
-        ));
-        return out;
+        let (text, mapped) =
+            inline_mapped(&without, cursor..range.end, target_machine, machine_name);
+        append_mapped(&mut out, &mut spans, &text, mapped);
+        return (out, spans);
     }
     let mut bounds = vec![range.start, range.end];
     let marks: Vec<_> = edit
@@ -511,6 +519,7 @@ fn inline(
     bounds.sort_unstable();
     bounds.dedup();
     struct Run {
+        source: std::ops::Range<usize>,
         text: String,
         marks: Vec<Mark>,
         whitespace: bool,
@@ -534,6 +543,7 @@ fn inline(
         });
         if let Some((kind, context_id)) = context_ref {
             runs.push(Run {
+                source: start..end,
                 text: crate::composer_context::format_composer_context_reference(
                     &kind,
                     &context_id,
@@ -552,6 +562,7 @@ fn inline(
         });
         if let Some(token) = token {
             runs.push(Run {
+                source: start..end,
                 text: token.source_for(target_machine, machine_name),
                 marks: active,
                 whitespace: false,
@@ -561,6 +572,7 @@ fn inline(
         let text = &edit.text[start..end];
         if active.contains(&Mark::Code) {
             runs.push(Run {
+                source: start..end,
                 text: text.into(),
                 marks: active,
                 whitespace: false,
@@ -574,6 +586,7 @@ fn inline(
             if bound > at {
                 let text = &text[at..bound];
                 runs.push(Run {
+                    source: start + at..start + bound,
                     text: text.into(),
                     marks: active.clone(),
                     whitespace: text.chars().all(source::space),
@@ -637,6 +650,7 @@ fn inline(
         runs[index].marks = retained.into_iter().chain(remaining).collect();
     }
     let mut out = String::new();
+    let mut spans = Vec::new();
     let mut active: Vec<Mark> = Vec::new();
     for run in runs {
         let common = active
@@ -650,13 +664,33 @@ fn inline(
         for mark in &run.marks[common..] {
             out.push_str(source::delimiter(mark));
         }
+        spans.push(MarkdownSpan {
+            source: run.source,
+            start: out.len(),
+            len: run.text.len(),
+            code: false,
+        });
         out.push_str(&run.text);
         active = run.marks;
     }
     for mark in active.iter().rev() {
         out.push_str(source::delimiter(mark));
     }
-    out
+    (out, spans)
+}
+
+fn append_mapped(
+    out: &mut String,
+    spans: &mut Vec<MarkdownSpan>,
+    text: &str,
+    mapped: Vec<MarkdownSpan>,
+) {
+    let offset = out.len();
+    spans.extend(mapped.into_iter().map(|mut span| {
+        span.start += offset;
+        span
+    }));
+    out.push_str(text);
 }
 
 pub fn markdown(edit: &TextEdit) -> String {
@@ -668,19 +702,56 @@ pub fn markdown_for(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> String {
+    markdown_mapped(edit, target_machine, machine_name).0
+}
+
+/// KSG serializeEditorDoc/flatToMarkdown. Run ends belong to the next run,
+/// except a code block's end stays inside its closing fence. Offsets are bytes
+/// here, converted to UTF-16 by the caller at the protocol boundary.
+pub fn markdown_selection(edit: &TextEdit) -> (String, std::ops::Range<usize>) {
+    let (text, spans) = markdown_mapped(edit, None, &|machine| machine.to_owned());
+    let offset = |at: usize| {
+        for span in &spans {
+            if at < span.source.end || span.code && at == span.source.end {
+                let within = at.saturating_sub(span.source.start);
+                return span.start + within.min(span.len);
+            }
+        }
+        text.len()
+    };
+    let (start, end) = edit.range();
+    let range = offset(start)..offset(end);
+    (text, range)
+}
+
+fn markdown_mapped(
+    edit: &TextEdit,
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> (String, Vec<MarkdownSpan>) {
     let paragraphs = edit.paragraphs();
-    let mut out = Vec::new();
+    let mut out = String::new();
+    let mut spans = Vec::new();
     let mut numbers = [0usize; 4];
     let mut at = 0;
     while at < paragraphs.len() {
         let p = &paragraphs[at];
+        if at > 0 {
+            spans.push(MarkdownSpan {
+                source: p.range.start.saturating_sub(1)..p.range.start,
+                start: out.len(),
+                len: 1,
+                code: false,
+            });
+            out.push('\n');
+        }
         if at > 0
             && p.block == Block::Paragraph
             && !p.range.is_empty()
             && paragraphs[at - 1].block == Block::Quote
         {
             // Without a blank line Markdown treats a following paragraph as part of the quote.
-            out.push(String::new());
+            out.push('\n');
         }
         if p.block == Block::Code {
             let start = p.range.start;
@@ -693,7 +764,17 @@ pub fn markdown_for(
             let content = &edit.text[start..end];
             let ticks = fence(content, 3);
             let newline = if content.is_empty() { "" } else { "\n" };
-            out.push(format!("{ticks}{newline}{content}\n{ticks}"));
+            out.push_str(&ticks);
+            out.push_str(newline);
+            spans.push(MarkdownSpan {
+                source: start..end,
+                start: out.len(),
+                len: content.len(),
+                code: true,
+            });
+            out.push_str(content);
+            out.push('\n');
+            out.push_str(&ticks);
             numbers.fill(0);
             continue;
         }
@@ -731,13 +812,20 @@ pub fn markdown_for(
         } else {
             prefix
         };
-        out.push(format!(
-            "{prefix}{}",
-            inline(edit, p.range.clone(), target_machine, machine_name)
-        ));
+        out.push_str(&prefix);
+        let (text, mapped) = inline_mapped(edit, p.range.clone(), target_machine, machine_name);
+        if p.range.is_empty() {
+            spans.push(MarkdownSpan {
+                source: p.range.clone(),
+                start: out.len(),
+                len: 0,
+                code: true,
+            });
+        }
+        append_mapped(&mut out, &mut spans, &text, mapped);
         at += 1;
     }
-    out.join("\n")
+    (out, spans)
 }
 
 pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String {

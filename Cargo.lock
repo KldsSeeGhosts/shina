@@ -3593,6 +3593,8 @@ dependencies = [
  "block2 0.6.2",
  "chrono",
  "chrono-tz",
+ "crc32fast",
+ "flate2",
  "futures-util",
  "getrandom 0.4.3",
  "ignore",

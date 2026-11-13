@@ -9,8 +9,8 @@ pub fn should_fold(text: &str) -> bool {
 }
 
 pub fn would_exceed_limit(edit: &TextEdit, text: &str) -> bool {
-    let (start, end) = edit.range();
-    edit.text.encode_utf16().count() - edit.text[start..end].encode_utf16().count()
+    let (markdown, selected) = crate::composer_rich::markdown_selection(edit);
+    markdown.encode_utf16().count() - markdown[selected].encode_utf16().count()
         + text.encode_utf16().count()
         > crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS
 }
@@ -185,6 +185,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paste_limit_counts_serialized_markdown_and_selection_boundaries() {
+        let mut edit = TextEdit::new(&"x".repeat(119_996));
+        edit.set_marks(vec![rune::MarkRange::new(
+            0..edit.text.len(),
+            rune::Mark::Bold,
+        )]);
+        assert!(
+            would_exceed_limit(&edit, "a"),
+            "the bold delimiters fill the prompt"
+        );
+        edit.set_selection(1, 3);
+        assert!(!would_exceed_limit(&edit, "xx"));
+        assert!(would_exceed_limit(&edit, "xxx"));
+        edit.set_selection(0, edit.text.len());
+        assert!(!would_exceed_limit(&edit, &"a".repeat(119_998)));
+        assert!(
+            would_exceed_limit(&edit, &"a".repeat(119_999)),
+            "flatToMarkdown starts inside the opening bold delimiter"
+        );
+    }
+
+    #[test]
     fn prompt_limit_counts_utf16_and_replaces_the_selection() {
         let mut edit = TextEdit::new(&"x".repeat(119_999));
         assert!(!would_exceed_limit(&edit, "a"));
@@ -201,6 +223,15 @@ mod tests {
     #[test]
     fn pasted_source_is_negotiated_and_older_peers_keep_the_path_only_file() {
         let attachment = stage("exact text", &[]).unwrap();
+        let parts = attachments::acp_parts(
+            &[attachment.clone()],
+            &serde_json::json!({"embeddedContext":true}),
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("saved at:"));
+        assert!(!parts[0]["text"].as_str().unwrap().contains("exact text"));
         let mut command = crate::protocol::Command::new(
             "thread.send",
             serde_json::json!({

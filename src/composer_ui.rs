@@ -624,6 +624,7 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && s.current().request.is_none()
         && !s.current().context.popover_open()
         && s.confirm_remove_attachment.is_none()
+        && s.attachment_preview.is_none()
         && !captain_ui::is_earlier(s)
 }
 

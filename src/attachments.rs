@@ -19,7 +19,7 @@ use std::{
 
 pub const MAX_ATTACHMENTS: usize = 100;
 /// KSG contracts/chatAttachment.PROVIDER_SEND_TURN_MAX_FILE_BYTES.
-pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = crate::protocol::FILE_ATTACHMENT_MAX_BYTES;
 pub const MAX_TEXT_BYTES: u64 = 256 * 1024;
 /// The largest single image Shina accepts, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -129,7 +129,9 @@ impl Attachment {
         // Local draft-only fields never change an older peer's attachment schema.
         if let Some(asset_id) = value["asset_id"].as_str() {
             let id = value["id"].as_str()?;
-            if !(safe_id(id) && safe_id(asset_id) || safe_file_id(id) && safe_file_id(asset_id)) {
+            if !(safe_id(id) && safe_id(asset_id)
+                || logical_file_id(id) && logical_file_id(asset_id))
+            {
                 return None;
             }
             let mut source = value.clone();
@@ -184,7 +186,7 @@ impl Attachment {
             let mime = value["mime"].as_str()?;
             if !path.is_absolute()
                 || name.is_empty()
-                || name.chars().count() > NAME_LIMIT
+                || name.encode_utf16().count() > NAME_LIMIT
                 || mime.trim().is_empty()
                 || mime.encode_utf16().count() > 100
                 || id != file_id(&path)
@@ -214,7 +216,7 @@ impl Attachment {
             mime,
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
         ) || name.is_empty()
-            || name.chars().count() > NAME_LIMIT
+            || name.encode_utf16().count() > NAME_LIMIT
         {
             return None;
         }
@@ -303,6 +305,16 @@ pub(crate) fn safe_file_id(id: &str) -> bool {
     id.strip_prefix("file-")
         .and_then(|id| id.strip_suffix(".bin"))
         .is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+fn logical_file_id(id: &str) -> bool {
+    safe_file_id(id)
+        || id.strip_prefix("file-").is_some_and(|hash| {
             hash.len() == 64
                 && hash
                     .bytes()
@@ -643,6 +655,13 @@ fn file_reference(
 }
 
 fn attach_image_file(path: &Path) -> Result<Attachment, String> {
+    attach_image_file_with_thumbnail(path, |_| {})
+}
+
+pub(crate) fn attach_image_file_with_thumbnail(
+    path: &Path,
+    thumbnail: impl Fn(Vec<u8>),
+) -> Result<Attachment, String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     if metadata.len() > crate::attachment_intake::MAX_SOURCE_BYTES as u64 {
@@ -654,11 +673,12 @@ fn attach_image_file(path: &Path) -> Result<Attachment, String> {
     file.take(crate::attachment_intake::MAX_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Could not read {}: {error}", clean_name(&name)))?;
-    let (name, bytes) = crate::attachment_intake::prepare(
+    let (name, bytes) = crate::attachment_intake::prepare_with_thumbnail(
         &name,
         crate::attachment_intake::native_mime(&name),
         bytes,
         MAX_IMAGE_BYTES as usize,
+        thumbnail,
     )
     .map_err(|failure| failure.message(&name))?;
     attach_bytes(&name, bytes)
@@ -967,6 +987,11 @@ pub fn acp_parts(attachments: &[Attachment], capabilities: &Value) -> Result<Vec
     let mut parts = Vec::new();
     for attachment in attachments.iter().filter(|a| !a.is_image()) {
         let path = attachment.path.as_ref().unwrap();
+        if attachment.source == Some(AttachmentSource::PastedText) {
+            parts.push(json!({"type":"text","text":format!(
+                "[Attached file \"{}\" is saved at: {}]", attachment.name, path.display())}));
+            continue;
+        }
         let uri = file_uri(path);
         let text = if attachment.mime != "inode/directory" {
             text_content(path)?
@@ -1131,13 +1156,17 @@ fn extension(format: ImageFormat) -> &'static str {
 }
 
 fn clean_name(name: &str) -> String {
+    let mut units = 0;
     let name = name
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("Image")
         .chars()
         .filter(|character| !character.is_control())
-        .take(NAME_LIMIT)
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= NAME_LIMIT
+        })
         .collect::<String>();
     if name.trim().is_empty() {
         "Image".into()

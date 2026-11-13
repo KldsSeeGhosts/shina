@@ -301,6 +301,48 @@ pub fn prepare(
     bytes: Vec<u8>,
     maximum: usize,
 ) -> Result<(String, Vec<u8>), Failure> {
+    prepare_inner(name, mime, bytes, maximum, None)
+}
+
+pub fn prepare_with_thumbnail(
+    name: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    maximum: usize,
+    thumbnail: impl Fn(Vec<u8>),
+) -> Result<(String, Vec<u8>), Failure> {
+    prepare_inner(name, mime, bytes, maximum, Some(&thumbnail))
+}
+
+/// KSG renderComposerImageThumbnailFromBitmap: a centered square, at most 256 px,
+/// encoded as PNG. A failed thumbnail never rejects an otherwise attachable image.
+fn publish_thumbnail(source: &image::DynamicImage, publish: &dyn Fn(Vec<u8>)) {
+    let side = source.width().min(source.height());
+    if side == 0 {
+        return;
+    }
+    let dimension = side.min(256);
+    let cropped = source
+        .crop_imm(
+            (source.width() - side) / 2,
+            (source.height() - side) / 2,
+            side,
+            side,
+        )
+        .resize_exact(dimension, dimension, image::imageops::FilterType::Lanczos3);
+    let mut png = Cursor::new(Vec::new());
+    if cropped.write_to(&mut png, image::ImageFormat::Png).is_ok() {
+        publish(png.into_inner());
+    }
+}
+
+fn prepare_inner(
+    name: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    maximum: usize,
+    thumbnail: Option<&dyn Fn(Vec<u8>)>,
+) -> Result<(String, Vec<u8>), Failure> {
     let heic = is_heic(name, mime);
     if heic && bytes.len() > MAX_SOURCE_BYTES {
         return Err(Failure::TooLarge);
@@ -319,13 +361,51 @@ pub fn prepare(
         let resize = matches!(mime, "image/png" | "image/jpeg" | "image/jpg")
             && fit_size(dimensions.0, dimensions.1).is_some();
         if !resize && bytes.len() <= maximum {
+            if let Some(publish) = thumbnail
+                && bytes.len() <= MAX_SOURCE_BYTES
+            {
+                use image::ImageDecoder;
+                let decoded = (|| {
+                    let mut reader = image::ImageReader::new(Cursor::new(&bytes))
+                        .with_guessed_format()
+                        .ok()?;
+                    let mut limits = image::Limits::default();
+                    limits.max_alloc = Some(256 * 1024 * 1024);
+                    reader.limits(limits);
+                    let mut decoder = reader.into_decoder().ok()?;
+                    let orientation = decoder
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+                    image.apply_orientation(orientation);
+                    Some(image)
+                })();
+                if let Some(decoded) = decoded {
+                    publish_thumbnail(&decoded, publish);
+                }
+            }
             return Ok((name.into(), bytes));
         }
         if bytes.len() > MAX_SOURCE_BYTES {
             return Err(Failure::TooLarge);
         }
-        image::load_from_memory(&bytes).map_err(|_| Failure::Unreadable)?
+        use image::ImageDecoder;
+        let mut decoder = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|_| Failure::Unreadable)?
+            .into_decoder()
+            .map_err(|_| Failure::Unreadable)?;
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut decoded =
+            image::DynamicImage::from_decoder(decoder).map_err(|_| Failure::Unreadable)?;
+        decoded.apply_orientation(orientation);
+        decoded
     };
+    if let Some(publish) = thumbnail {
+        publish_thumbnail(&decoded, publish);
+    }
     let original_size = bytes.len();
     let mut fitted = None;
     if (heic || matches!(mime, "image/png" | "image/jpeg" | "image/jpg"))
@@ -383,6 +463,31 @@ pub fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_thumbnail_is_a_centered_square_and_does_not_reencode_a_small_source() {
+        let source = image::RgbaImage::from_pixel(800, 400, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = bytes.into_inner();
+        let thumbnails = std::cell::RefCell::new(Vec::new());
+        let (_, prepared) = prepare_with_thumbnail(
+            "source.png",
+            "image/png",
+            bytes.clone(),
+            10 * 1024 * 1024,
+            |thumbnail| thumbnails.borrow_mut().push(thumbnail),
+        )
+        .unwrap();
+        assert_eq!(prepared, bytes);
+        let thumbnails = thumbnails.borrow();
+        assert_eq!(thumbnails.len(), 1);
+        let image = image::load_from_memory(&thumbnails[0]).unwrap();
+        assert_eq!((image.width(), image.height()), (256, 256));
+        assert_eq!(image.to_rgba8().get_pixel(128, 128).0, [10, 20, 30, 255]);
+    }
 
     #[test]
     fn ksg_attachment_type_cases() {

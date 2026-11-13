@@ -130,6 +130,7 @@ enum Input {
     Image(String, Vec<u8>),
 }
 enum Event {
+    Thumbnail(Vec<u8>),
     Prepared(Result<Attachment, String>),
     Progress(f32),
     Uploaded(Result<Uploaded, String>),
@@ -150,8 +151,20 @@ pub struct Entry {
     verifying: bool,
     uploaded: Option<Uploaded>,
     previous: Option<(Link, Uploaded)>,
+    thumbnail_bytes: Option<Arc<[u8]>>,
+    thumbnail_handle: std::cell::RefCell<Option<rune::Image>>,
 }
 
+impl Entry {
+    pub fn thumbnail(&self, cache: &rune::ImageCache) -> Option<rune::Image> {
+        if let Some(image) = self.thumbnail_handle.borrow().as_ref() {
+            return Some(image.clone());
+        }
+        let image = cache.load(self.thumbnail_bytes.clone()?);
+        *self.thumbnail_handle.borrow_mut() = Some(image.clone());
+        Some(image)
+    }
+}
 #[cfg(test)]
 impl Entry {
     pub fn fixture(machine: &str, thread: usize, attachment: &Attachment, phase: Phase) -> Self {
@@ -170,6 +183,8 @@ impl Entry {
             verifying: false,
             uploaded: None,
             previous: None,
+            thumbnail_bytes: None,
+            thumbnail_handle: Default::default(),
         }
     }
 }
@@ -304,6 +319,9 @@ impl Queue {
         let kind = crate::attachment_intake::classify(&name, &mime);
         let image = kind == crate::attachment_intake::Kind::Image;
         let files_supported = state.file_attachment_staging_supported_on(&machine);
+        let file_maximum = state
+            .file_attachment_staging_limit_on(&machine)
+            .unwrap_or(attachments::MAX_FILE_BYTES);
         let Some(target) = target_mut(state, &machine, thread_id) else {
             return;
         };
@@ -334,8 +352,8 @@ impl Queue {
             Some("This server does not support file attachments.".into())
         } else if !image && bytes == 0 {
             Some(format!("'{name}' is empty or could not be read."))
-        } else if !image && bytes > attachments::MAX_FILE_BYTES {
-            Some(format!("'{name}' exceeds the 50 MB attachment limit."))
+        } else if !image && bytes > file_maximum {
+            Some(protocol::file_attachment_too_large(&name, file_maximum))
         } else {
             None
         };
@@ -366,7 +384,7 @@ impl Queue {
                 Input::Path(path) => Some(path.clone()),
                 _ => None,
             };
-            let placeholder = Attachment {
+            let mut placeholder = Attachment {
                 id: id.clone(),
                 name: name.clone(),
                 mime: crate::attachment_intake::file_mime(&name, &mime),
@@ -379,6 +397,13 @@ impl Queue {
                 source: None,
             };
             if let Some(index) = replacement {
+                // A restored path-reference marker has an older logical id. Preserve
+                // its new file's path identity until the worker publishes an owned blob.
+                if let Input::Path(path) = &input
+                    && let Ok(source) = attachments::reference_file(path)
+                {
+                    placeholder.asset_id = Some(source.id);
+                }
                 target.draft_images[index] = placeholder;
                 self.remove(&machine, thread_id, &id);
             } else {
@@ -401,6 +426,8 @@ impl Queue {
             verifying: false,
             uploaded: None,
             previous: None,
+            thumbnail_bytes: None,
+            thumbnail_handle: Default::default(),
         });
     }
 
@@ -515,6 +542,8 @@ impl Queue {
                     verifying: uploaded.is_some(),
                     uploaded,
                     previous: None,
+                    thumbnail_bytes: None,
+                    thumbnail_handle: Default::default(),
                 });
             }
         }
@@ -531,6 +560,7 @@ impl Queue {
         let mut keep = Vec::new();
         let mut connections = HashMap::new();
         for mut entry in std::mem::take(&mut self.entries) {
+            let file_maximum = state.file_attachment_staging_limit_on(&entry.machine);
             let (capability, connected, link) = connections
                 .entry(entry.machine.clone())
                 .or_insert_with(|| connection(state, &entry.machine))
@@ -587,10 +617,15 @@ impl Queue {
                         }
                     };
                     changed = true;
-                    if !matches!(event, Event::Progress(_)) {
+                    if matches!(event, Event::Prepared(_) | Event::Uploaded(_)) {
                         finished = true;
                     }
                     match event {
+                        Event::Thumbnail(bytes) => {
+                            entry.thumbnail_bytes = Some(bytes.into());
+                            *entry.thumbnail_handle.borrow_mut() = None;
+                            changed = true;
+                        }
                         Event::Progress(progress) => {
                             if let Phase::Uploading {
                                 progress: current, ..
@@ -677,6 +712,25 @@ impl Queue {
                     entry.worker = Some(receiver);
                 }
             }
+            if !entry.image
+                && let Some(file) = target.draft_images.iter().find(|a| a.id == entry.id)
+                && let Some(reason) = match file_maximum {
+                    Some(maximum) if file.bytes > maximum =>
+                        Some(protocol::file_attachment_too_large(&file.name, maximum)),
+                    None => Some("This server does not accept file attachments right now. Remove the files to send.".into()),
+                    _ => None,
+                }
+            {
+                entry.cancel.store(true, Ordering::Release);
+                entry.worker = None;
+                if entry.uploaded.is_none() && let Some(link) = &entry.link {
+                    release_failed(link, &entry.id);
+                }
+                changed |= !matches!(&entry.phase, Phase::Failed(current) if current == &reason);
+                entry.phase = Phase::Failed(reason);
+                keep.push(entry);
+                continue;
+            }
             // A capability change cancels the transfer. Persisted file stamps remain owned
             // by their draft; images and uncommitted transfers fall back to legacy sending.
             if capability == Capability::Legacy
@@ -734,25 +788,39 @@ impl Queue {
                     let wake = state.wake.clone();
                     let profile = state.data_dir.clone();
                     let cancel = entry.cancel.clone();
+                    let image = entry.image;
                     std::thread::spawn(move || {
+                        let thumbnail = |bytes| {
+                            if !cancel.load(Ordering::Acquire) {
+                                let _ = send.send(Event::Thumbnail(bytes));
+                                wake();
+                            }
+                        };
                         let prepare = || match input {
                             Input::Path(path) => {
-                                attachments::attach_file(&path).and_then(|attachment| {
-                                    if attachment.is_image() {
-                                        Ok(attachment)
-                                    } else {
-                                        attachments::stage_transfer_file(&attachment)
-                                    }
-                                })
+                                if image {
+                                    attachments::attach_image_file_with_thumbnail(&path, thumbnail)
+                                } else {
+                                    attachments::attach_file(&path).and_then(|attachment| {
+                                        if attachment.is_image() {
+                                            Ok(attachment)
+                                        } else {
+                                            attachments::stage_transfer_file(&attachment)
+                                        }
+                                    })
+                                }
                             }
-                            Input::Image(name, bytes) => crate::attachment_intake::prepare(
-                                &name,
-                                crate::attachment_intake::native_mime(&name),
-                                bytes,
-                                attachments::MAX_IMAGE_BYTES as usize,
-                            )
-                            .map_err(|failure| failure.message(&name))
-                            .and_then(|(name, bytes)| attachments::attach_bytes(&name, bytes)),
+                            Input::Image(name, bytes) => {
+                                crate::attachment_intake::prepare_with_thumbnail(
+                                    &name,
+                                    crate::attachment_intake::native_mime(&name),
+                                    bytes,
+                                    attachments::MAX_IMAGE_BYTES as usize,
+                                    thumbnail,
+                                )
+                                .map_err(|failure| failure.message(&name))
+                                .and_then(|(name, bytes)| attachments::attach_bytes(&name, bytes))
+                            }
                         };
                         #[cfg(test)]
                         let result = crate::store::with_directory(profile, prepare);
@@ -860,7 +928,33 @@ impl Drop for Queue {
 }
 
 impl State {
+    pub(crate) fn pasted_text_staging_supported(&self) -> bool {
+        if matches!(self.current().harness.as_str(), "pi" | "codex" | "claude") {
+            return true;
+        }
+        let client = self.client.as_ref().and_then(|client| {
+            if self.machines.selected == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&self.machines.selected)
+            }
+        });
+        client.is_none_or(|client| {
+            client.info.lock().expect("connection info")["capabilities"]
+                .as_array()
+                .is_none_or(|caps| {
+                    caps.iter()
+                        .any(|cap| cap == protocol::PASTED_TEXT_ATTACHMENTS)
+                })
+        })
+    }
+    pub(crate) fn attachment_preview_link(&self) -> Option<Link> {
+        connection(self, &self.machines.selected).2
+    }
     pub(crate) fn file_attachment_staging_supported_on(&self, machine: &str) -> bool {
+        self.file_attachment_staging_limit_on(machine).is_some()
+    }
+    pub(crate) fn file_attachment_staging_limit_on(&self, machine: &str) -> Option<u64> {
         let client = self.client.as_ref().and_then(|client| {
             if machine == "local" {
                 Some(client)
@@ -869,12 +963,10 @@ impl State {
             }
         });
         let Some(client) = client else {
-            return true;
+            return Some(attachments::MAX_FILE_BYTES);
         };
         let info = client.info.lock().expect("connection info");
-        info["capabilities"]
-            .as_array()
-            .is_none_or(|caps| caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS))
+        protocol::file_attachment_limit(&info)
     }
     pub(crate) fn set_attachment_target_error(
         &mut self,
@@ -987,6 +1079,15 @@ impl State {
         self.checkpoint();
     }
     pub fn attachment_send_block_reason(&self) -> Option<String> {
+        if !self.pasted_text_staging_supported()
+            && self
+                .current()
+                .draft_images
+                .iter()
+                .any(|a| a.source == Some(attachments::AttachmentSource::PastedText))
+        {
+            return Some(protocol::PASTED_TEXT_UPDATE_REQUIRED.into());
+        }
         if self
             .current()
             .draft_images
@@ -1025,6 +1126,17 @@ impl State {
         let info = client.info.lock().expect("connection info");
         if info["capabilities"]
             .as_array()
+            .is_some_and(|caps| !caps.iter().any(|cap| cap == protocol::STAGED_ATTACHMENTS))
+            && self.current().draft_images.iter().any(|a| {
+                !a.is_image()
+                    && a.uploaded.is_some()
+                    && !attachments::path_for(a).is_some_and(|p| p.is_file())
+            })
+        {
+            return Some("This server does not support staged attachments. Update it, or remove and attach these files again to send.".into());
+        }
+        if info["capabilities"]
+            .as_array()
             .is_some_and(|caps| !caps.iter().any(|cap| cap == protocol::ATTACHMENT_LIMITS))
         {
             let images: Vec<_> = self
@@ -1050,7 +1162,12 @@ impl State {
                 "This server does not accept file attachments right now. Remove the files to send."
                     .into(),
             ),
-            _ => None,
+            _ => match protocol::file_attachment_limit(&info) {
+                None => Some("This server does not accept file attachments right now. Remove the files to send.".into()),
+                Some(maximum) => self.current().draft_images.iter()
+                    .find(|file| !file.is_image() && file.mime != "inode/directory" && file.bytes > maximum)
+                    .map(|file| protocol::file_attachment_too_large(&file.name, maximum)),
+            },
         }
     }
     pub(crate) fn enqueue_attachment_path(&mut self, index: usize, path: PathBuf) {
@@ -1203,6 +1320,86 @@ pub async fn verify_upload(link: &Link, uploaded: &Uploaded) -> Result<bool, Str
         );
     }
     Ok(true)
+}
+
+/// Fetch a hydrated draft from its pending lease, never from a foreign filesystem path.
+pub(crate) async fn download_staged(
+    link: &Link,
+    profile: &std::path::Path,
+    attachment: &Attachment,
+) -> Result<Attachment, String> {
+    let uploaded = attachment
+        .uploaded
+        .as_ref()
+        .ok_or("The attachment is unavailable.")?;
+    if uploaded.environment_id != link.server_id || !verify_upload(link, uploaded).await? {
+        return Err("Uploaded file expired. Remove it and attach it again.".into());
+    }
+    let maximum = if attachment.is_image() {
+        attachments::MAX_IMAGE_BYTES
+    } else {
+        attachments::MAX_FILE_BYTES
+    };
+    if attachment.bytes == 0 || attachment.bytes > maximum {
+        return Err("Invalid file length.".into());
+    }
+    let http = http()?;
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < attachment.bytes {
+        let result = response(
+            http.get(format!(
+                "http://{}/v1/staged/{}/blob?offset={}&limit={}",
+                link.address()?,
+                uploaded.lease_id,
+                bytes.len(),
+                protocol::PAGE_BYTES
+            ))
+            .bearer_auth(&link.token)
+            .send()
+            .await
+            .map_err(|_| "The attachment is unavailable.")?,
+        )
+        .await;
+        let response = match result {
+            Ok(r) => r,
+            Err(error) => {
+                remember_denial(link, &error);
+                return Err(error);
+            }
+        };
+        if response
+            .content_length()
+            .is_none_or(|size| size > protocol::MAX_PAGE_BYTES as u64)
+        {
+            return Err("Invalid blob page length.".into());
+        }
+        let chunk = response
+            .bytes()
+            .await
+            .map_err(|_| "Could not load this file.")?;
+        if chunk.is_empty() || bytes.len() + chunk.len() > attachment.bytes as usize {
+            return Err("Invalid remote file length.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut fetched = if attachment.is_image() {
+        attachments::store_uploaded(&profile.join("attachments"), &attachment.name, &bytes)?
+    } else {
+        attachments::store_uploaded_file(
+            &profile.join("attachments"),
+            &attachment.name,
+            &attachment.mime,
+            &bytes,
+        )?
+    };
+    if fetched.id != uploaded.attachment_id {
+        return Err("Attachment hash mismatch.".into());
+    }
+    fetched.asset_id = Some(fetched.id.clone());
+    fetched.id = attachment.id.clone();
+    fetched.uploaded = Some(uploaded.clone());
+    fetched.source = attachment.source.clone();
+    Ok(fetched)
 }
 
 pub async fn release_upload(link: &Link, id: &str) {
@@ -1441,6 +1638,106 @@ async fn upload_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn advertised_file_limits_bound_intake_paste_and_existing_drafts() {
+        let mut state = State::new(".".into(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[protocol::FILE_ATTACHMENTS,
+            protocol::ATTACHMENT_LIMITS,protocol::PASTED_TEXT_ATTACHMENTS,protocol::STAGED_ATTACHMENTS],
+            "limits":{"fileAttachmentBytes":1024}});
+        state.client = Some(client);
+        let path = state.data_dir.join("one.bin");
+        std::fs::write(&path, vec![1; 1025]).unwrap();
+        state.attach_paths_to(state.current().id, &[path.clone()]);
+        assert!(state.current().draft_images.is_empty());
+        assert_eq!(
+            state.current().attachment_error.as_deref(),
+            Some("'one.bin' exceeds the 1 KB attachment limit.")
+        );
+        assert!(!state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        state
+            .current_mut()
+            .draft_images
+            .push(attachments::attach_file(&path).unwrap());
+        assert_eq!(
+            state.attachment_send_block_reason().as_deref(),
+            Some("'one.bin' exceeds the 1 KB attachment limit.")
+        );
+        let mut queue = Queue::default();
+        queue.entries.push(Entry::fixture(
+            "local",
+            state.current().id,
+            &state.current().draft_images[0],
+            Phase::Uploading {
+                progress: 0.5,
+                since: Instant::now(),
+            },
+        ));
+        let cancelled = queue.entries[0].cancel.clone();
+        assert!(queue.poll(&mut state));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(&queue.entries[0].phase, Phase::Failed(reason)
+            if reason == "'one.bin' exceeds the 1 KB attachment limit."));
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities":[protocol::FILE_ATTACHMENTS]});
+        assert_eq!(
+            state.file_attachment_staging_limit_on("local"),
+            Some(attachments::MAX_FILE_BYTES)
+        );
+        assert!(state.attachment_send_block_reason().is_none());
+    }
+
+    #[test]
+    fn an_older_peer_requires_reattach_for_a_pending_only_restored_file() {
+        let mut state = State::new(".".into(), false);
+        let path = state.data_dir.join("pending-only.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut file = attachments::attach_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.uploaded = Some(Uploaded {
+            environment_id: "fixture".into(),
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            attachment_id: format!("file-{}.bin", "0".repeat(64)),
+        });
+        state.current_mut().draft_images.push(file);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[protocol::FILE_ATTACHMENTS]});
+        state.client = Some(client);
+        assert!(
+            state
+                .attachment_send_block_reason()
+                .unwrap()
+                .contains("does not support staged attachments")
+        );
+        assert!(
+            state.current().draft_images[0].uploaded.is_some(),
+            "capability loss does not release the persisted lease"
+        );
+    }
+    #[test]
+    fn preparing_and_prepared_tiles_share_the_source_thumbnail_handle() {
+        let mut state = State::new(".".into(), false);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let attachment = attachments::attach_bytes("source.png", png.clone()).unwrap();
+        let mut entry = Entry::fixture("local", 1, &attachment, Phase::Preparing);
+        let (send, receive) = mpsc::channel();
+        entry.worker = Some(receive);
+        let mut queue = Queue::default();
+        queue.entries.push(entry);
+        send.send(Event::Thumbnail(png)).unwrap();
+        queue.poll(&mut state);
+        let first = queue.entries[0].thumbnail(&state.attachment_cache).unwrap();
+        send.send(Event::Prepared(Ok(attachment))).unwrap();
+        drop(send);
+        queue.poll(&mut state);
+        let second = queue.entries[0].thumbnail(&state.attachment_cache).unwrap();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(second.wait().unwrap(), [2, 2]);
+    }
     #[test]
     fn progress_is_floored_bounded_and_hidden_for_150_ms() {
         assert_eq!(progress_label(f32::NAN), "0%");

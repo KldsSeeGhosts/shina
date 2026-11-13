@@ -1652,6 +1652,7 @@ fn input_blocks_with_budget(
     }
     for attachment in &attachments {
         if usage.pages >= remaining.pages
+            || attachment.source == Some(crate::attachments::AttachmentSource::PastedText)
             || attachment
                 .mime
                 .split(';')

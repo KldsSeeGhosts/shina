@@ -198,6 +198,7 @@ fn composer_controls_blocked(state: &State) -> bool {
         || state.rename_thread.is_some()
         || state.delete_thread.is_some()
         || state.confirm_remove_attachment.is_some()
+        || state.attachment_preview.is_some()
         || t.native.conversation.is_some()
         || t.native.questionnaire.is_some()
 }
@@ -1392,6 +1393,9 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
     // Portraits rest while the window is in the background or minimized.
     .on_window(attachment_picker::set_window)
     .on_focus(|state, focused, _| state.portraits.set_focused(focused))
+    .on_visibility(|state, visible, _| {
+        if !visible { state.pause_attachment_preview(); }
+    })
     .keep_running()
     .on_close(|state, tx| {
         if !state.close_in_background() {

@@ -187,6 +187,73 @@ impl Default for Windows {
 }
 
 impl Windows {
+    /// Attachment previews reuse the isolated native document host, not a public file URL.
+    pub fn open_attachment_async(
+        self: &Arc<Self>,
+        attachment: crate::attachments::Attachment,
+        dark: bool,
+        wake: rune::Waker,
+    ) {
+        let windows = self.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                use std::io::Read;
+                let path = crate::attachments::path_for(&attachment)
+                    .ok_or("The attachment is unavailable.")?;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .map_err(|e| e.to_string())?
+                    .take(crate::attachments::MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                if bytes.len() as u64 > crate::attachments::MAX_FILE_BYTES {
+                    return Err("File exceeds 50 MiB.".into());
+                }
+                let mut input =
+                    json!({"title":attachment.name,"width":960,"dark":dark,"capture":false});
+                if attachment.mime == "application/pdf"
+                    || attachment.name.to_ascii_lowercase().ends_with(".pdf")
+                {
+                    if !bytes.starts_with(b"%PDF-") {
+                        return Err("Unable to load PDF.".into());
+                    }
+                    input["html"] = json!("");
+                    input["pdfBase64"] = json!(crate::attachments::encode_base64(&bytes));
+                } else if attachment.mime.starts_with("font/")
+                    || attachment.name.rsplit('.').next().is_some_and(|e| {
+                        matches!(
+                            e.to_ascii_lowercase().as_str(),
+                            "ttf" | "otf" | "woff" | "woff2"
+                        )
+                    })
+                {
+                    if bytes.len() > 10 * 1024 * 1024 {
+                        return Err("Font previews are limited to 10 MB.".into());
+                    }
+                    input["attachmentPreview"] = json!(true);
+                    input["html"] = json!(font_document(&bytes));
+                } else if attachment.mime.starts_with("image/") {
+                    let mime = crate::attachment_intake::native_mime(&attachment.name);
+                    if !mime.starts_with("image/") {
+                        return Err("Unable to load image.".into());
+                    }
+                    input["attachmentPreview"] = json!(true);
+                    input["html"] = json!(format!(
+                        "<!doctype html><style>html,body{{margin:0;width:100%;height:100%;display:grid;place-items:center}}img{{max-width:100%;max-height:100vh;object-fit:contain}}</style><img src=\"data:{mime};base64,{}\">",
+                        crate::attachments::encode_base64(&bytes)
+                    ));
+                } else {
+                    input["attachmentPreview"] = json!(true);
+                    input["html"] = json!(String::from_utf8_lossy(&bytes));
+                }
+                windows.open_document(&format!("attachment-{}", attachment.id), &input)?;
+                Ok(None)
+            })();
+            let _ = windows.send.send(result);
+            wake();
+        });
+    }
+
     pub fn open_async(
         self: &Arc<Self>,
         directory: PathBuf,
@@ -227,14 +294,23 @@ impl Windows {
         dark: bool,
     ) -> Result<Option<String>, String> {
         let html = crate::html_render::page(directory, reference)?;
+        let input =
+            json!({"html":html,"title":reference.title,"width":960,"dark":dark,"capture":false});
+        match self.open_document(&reference.attachment_id, &input) {
+            Ok(()) => Ok(None),
+            Err(_) => self.fallback.url(directory, reference, dark).map(Some),
+        }
+    }
+
+    fn open_document(&self, key: &str, request: &Value) -> Result<(), String> {
         let mut live = self.live.lock().expect("HTML windows");
-        if let Some(window) = live.get_mut(&reference.attachment_id) {
+        if let Some(window) = live.get_mut(key) {
             if window.process.try_wait().ok().flatten().is_none()
                 && writeln!(window.input, "{}", json!({"focus":true})).is_ok()
             {
-                return Ok(None);
+                return Ok(());
             }
-            live.remove(&reference.attachment_id);
+            live.remove(key);
         }
         drop(live);
         let launch = (|| -> Result<Live, String> {
@@ -244,12 +320,7 @@ impl Windows {
             let mut process =
                 crate::process::Process::spawn(&mut command()?).map_err(|e| e.to_string())?;
             let mut input = process.stdin.take().ok_or("Missing renderer input.")?;
-            writeln!(
-                input,
-                "{}",
-                json!({"html":html,"title":reference.title,"width":960,"dark":dark,"capture":false})
-            )
-            .map_err(|e| e.to_string())?;
+            writeln!(input, "{}", request).map_err(|e| e.to_string())?;
             // The native helper acknowledges only after all security settings are installed.
             let stdout = process.stdout.take().ok_or("Missing renderer output.")?;
             let (send, recv) = mpsc::channel();
@@ -278,10 +349,10 @@ impl Windows {
                 self.live
                     .lock()
                     .expect("HTML windows")
-                    .insert(reference.attachment_id.clone(), window);
-                Ok(None)
+                    .insert(key.to_owned(), window);
+                Ok(())
             }
-            Err(_) => self.fallback.url(directory, reference, dark).map(Some),
+            Err(error) => Err(error),
         }
     }
 
@@ -296,6 +367,44 @@ impl Windows {
             .expect("HTML windows")
             .retain(|_, window| writeln!(window.input, "{}", json!({"dark":dark})).is_ok());
     }
+}
+
+/// Only the trusted PDF host may embed a plugin. Published HTML retains object-src 'none'.
+pub(crate) fn pdf_bytes(input: &Value) -> Result<Option<Vec<u8>>, String> {
+    let Some(encoded) = input["pdfBase64"].as_str() else {
+        return Ok(None);
+    };
+    if encoded.len() as u64 > crate::attachments::MAX_FILE_BYTES.div_ceil(3) * 4 {
+        return Err("PDF exceeds 50 MiB.".into());
+    }
+    let bytes = crate::attachments::decode_base64(encoded).ok_or("Invalid PDF encoding.")?;
+    if bytes.len() as u64 > crate::attachments::MAX_FILE_BYTES || !bytes.starts_with(b"%PDF-") {
+        return Err("Unable to load PDF.".into());
+    }
+    Ok(Some(bytes))
+}
+
+/// KSG FontViewer's specimen, rendered by the existing platform FontFace engine.
+fn font_document(bytes: &[u8]) -> String {
+    let sizes = [12, 16, 24, 40, 64].into_iter().map(|size| format!(
+        "<p style=\"font-size:{size}px\"><small>{size} px</small>The quick brown fox jumps over the lazy dog.</p>")).collect::<String>();
+    let specimen = format!(
+        "<!doctype html><meta charset=\"utf-8\"><style>@font-face{{font-family:preview;src:url('data:application/octet-stream;base64,{}')}}body{{margin:0;padding:32px;font-family:preview;overflow-wrap:anywhere}}h1{{font-size:40px;font-weight:normal}}p{{line-height:1.4}}small{{font:12px monospace;display:block;opacity:.6;margin-bottom:8px}}</style><h1>Font preview</h1><p style=\"font-size:24px\">ABCDEFGHIJKLMNOPQRSTUVWXYZ<br>abcdefghijklmnopqrstuvwxyz<br>0123456789 !?&amp;@#%(){{}}[]</p>{sizes}",
+        crate::attachments::encode_base64(bytes)
+    );
+    format!(
+        "{specimen}<script>{}</script>",
+        include_str!("../assets/attachment-font-preview.js")
+            .replace("__FONT_DATA__", &crate::attachments::encode_base64(bytes))
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn pdf_document(bytes: &[u8]) -> String {
+    format!(
+        "<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; object-src data:; base-uri 'none'; form-action 'none'\"><style>html,body,embed{{margin:0;width:100%;height:100%;overflow:hidden}}</style><embed type=\"application/pdf\" src=\"data:application/pdf;base64,{}\">",
+        crate::attachments::encode_base64(bytes)
+    )
 }
 
 /// Early CLI entry. This mode never opens a Shina profile or starts MCP/client servers.
@@ -349,6 +458,28 @@ pub fn document(html: &str, dark: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_pdf_inputs_are_bounded_and_cannot_turn_published_html_into_a_plugin_host() {
+        assert!(pdf_bytes(&json!({"html":"ordinary"})).unwrap().is_none());
+        assert!(pdf_bytes(&json!({"pdfBase64":"not base64!"})).is_err());
+        assert!(
+            pdf_bytes(&json!({"pdfBase64":crate::attachments::encode_base64(b"not PDF")})).is_err()
+        );
+        assert_eq!(
+            pdf_bytes(&json!({"pdfBase64":crate::attachments::encode_base64(b"%PDF-1.4\n")}))
+                .unwrap()
+                .unwrap(),
+            b"%PDF-1.4\n"
+        );
+        assert!(
+            document("<embed src='data:application/pdf;base64,AA'>", false)
+                .contains("object-src 'none'")
+        );
+        let specimen = font_document(b"fixture");
+        for size in [12, 16, 24, 40, 64] {
+            assert!(specimen.contains(&format!("{size} px")));
+        }
+    }
     #[test]
     fn hostile_markup_cannot_escape_the_opaque_frame() {
         let page = document(

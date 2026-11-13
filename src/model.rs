@@ -3062,11 +3062,15 @@ pub struct State {
     pub portraits: crate::runtime::UiResource<crate::portraits::Portraits>,
     /// Decodes composer and conversation thumbnails off the UI thread.
     pub attachment_cache: crate::runtime::UiResource<rune::ImageCache>,
+    pub(crate) attachment_video_posters:
+        std::cell::RefCell<std::collections::HashMap<String, (rune::Player, u64)>>,
+    pub(crate) attachment_poster_clock: std::cell::Cell<u64>,
     pub html_windows: Arc<crate::html_window::Windows>,
     pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
+    pub(crate) attachment_preview: Option<crate::ui::attachment_preview::Preview>,
     pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
@@ -3277,8 +3281,11 @@ impl State {
             }),
             artwork,
             attachment_cache,
+            attachment_video_posters: Default::default(),
+            attachment_poster_clock: Default::default(),
             attachment_drop_hover: false,
             transcript_preview: None,
+            attachment_preview: None,
             pasted_text_names: None,
             transcript_layout: Default::default(),
             composer_ui: Default::default(),
@@ -7152,6 +7159,7 @@ impl State {
             return false;
         }
         let can_stage = !(self.current().machine != "local" && self.client.is_none())
+            && self.pasted_text_staging_supported()
             && self.file_attachment_staging_supported_on(&self.machines.selected)
             && self.attachment_guard(self.active).is_none()
             && self.current().draft_images.len()
@@ -7159,7 +7167,10 @@ impl State {
                     .attachment_uploads
                     .preparing_count(&self.machines.selected, self.current().id)
                 < attachments::MAX_ATTACHMENTS;
-        if !can_stage || text.len() as u64 > attachments::MAX_FILE_BYTES {
+        let maximum = self
+            .file_attachment_staging_limit_on(&self.machines.selected)
+            .unwrap_or(attachments::MAX_FILE_BYTES);
+        if !can_stage || text.len() as u64 > maximum {
             if !exceeds {
                 return false;
             }
@@ -7320,6 +7331,18 @@ impl State {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let file_kind = crate::attachment_intake::classify(
+                &name,
+                crate::attachment_intake::native_mime(&name),
+            );
+            if file_kind == crate::attachment_intake::Kind::File
+                && let Some(maximum) =
+                    self.file_attachment_staging_limit_on(&self.machines.selected)
+                && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > maximum)
+            {
+                errors.push(crate::protocol::file_attachment_too_large(&name, maximum));
+                continue;
+            }
             if crate::attachment_intake::classify(
                 &name,
                 crate::attachment_intake::native_mime(&name),
@@ -7355,6 +7378,13 @@ impl State {
             match attachments::attach_file(path) {
                 Ok(mut image) => {
                     if let Some(slot) = replacement {
+                        image = match attachments::stage_transfer_file(&image) {
+                            Ok(image) => image,
+                            Err(error) => {
+                                errors.push(error);
+                                continue;
+                            }
+                        };
                         image.asset_id = Some(image.id.clone());
                         image.id = self.threads[index].draft_images[slot].id.clone();
                         self.threads[index].draft_images[slot] = image;
@@ -7369,7 +7399,7 @@ impl State {
             }
         }
         if !errors.is_empty() {
-            self.threads[index].attachment_error = Some(errors.join(" "));
+            self.threads[index].attachment_error = errors.pop();
         }
         if !attached.is_empty() {
             self.threads[index].insert_attachment_chips(&attached, false);
@@ -9537,6 +9567,7 @@ impl Thread {
 }
 
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
+    state.expire_attachment_preview();
     let attachment_changed = state.poll_attachment_uploads();
     if state.attachment_uploads.entries.iter().any(|entry| {
         matches!(
@@ -13398,6 +13429,24 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .starts_with("Pasted text is too large for this message")
+        );
+    }
+
+    #[test]
+    fn an_older_acp_peer_cannot_silently_expand_a_folded_paste() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "fixture-acp".into();
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS]});
+        state.client = Some(client);
+        assert!(!state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        *state.client.as_ref().unwrap().info.lock().unwrap() = json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS,crate::protocol::PASTED_TEXT_ATTACHMENTS]});
+        assert!(state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS]});
+        assert_eq!(
+            state.attachment_send_block_reason().as_deref(),
+            Some(crate::protocol::PASTED_TEXT_UPDATE_REQUIRED)
         );
     }
 

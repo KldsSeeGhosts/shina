@@ -505,6 +505,10 @@ fn staged_files_linked_servers_failure_retry_claim_and_older_peer_negotiation() 
         json!({"protocolMajor":1,"protocolMinor":11,"projectionSchema":1}),
         json!("staged-hello"),
     );
+    assert_eq!(
+        hello["result"]["limits"]["fileAttachmentBytes"],
+        protocol::FILE_ATTACHMENT_MAX_BYTES
+    );
     assert!(
         hello["result"]["capabilities"]
             .as_array()
@@ -675,10 +679,77 @@ fn staged_files_linked_servers_failure_retry_claim_and_older_peer_negotiation() 
         .unwrap()
             == bytes
     );
+    // Images use the same pending lease lifecycle, including failure and retry,
+    // without invoking the fixture model, which deliberately does not declare vision.
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(4, 2, image::Rgba([10, 20, 30, 255]))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let png = encoded.into_inner();
+    let start_image = |base: &str, token: &str, hash: &str, staged: bool| {
+        let response = http.post(format!("{base}/v1/uploads")).bearer_auth(token)
+            .json(&json!({"staged":staged,"type":"image","name":"pixel.png","length":png.len(),"sha256":hash}))
+            .send().unwrap();
+        assert!(response.status().is_success());
+        response.json::<Value>().unwrap()["uploadId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let bad_image = start_image(&base_a, token_a, &"0".repeat(64), true);
+    assert!(
+        http.put(format!("{base_a}/v1/uploads/{bad_image}?offset=0"))
+            .bearer_auth(token_a)
+            .body(png.clone())
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        http.post(format!("{base_a}/v1/uploads/{bad_image}/commit"))
+            .bearer_auth(token_a)
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    let image_hash = format!("{:x}", sha2::Sha256::digest(&png));
+    let mut image_identity = None;
+    for (base, token) in [(&base_a, token_a), (&base_b, client_b.token.as_str())] {
+        let upload = start_image(base, token, &image_hash, true);
+        let image = complete(&http, base, token, &upload, &png);
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(image["width"], 4);
+        assert_eq!(image["height"], 2);
+        if let Some(id) = &image_identity {
+            assert_eq!(&image["id"], id);
+        }
+        image_identity = Some(image["id"].clone());
+        let page = http
+            .get(format!("{base}/v1/staged/{upload}/blob?offset=0"))
+            .bearer_auth(token)
+            .send()
+            .unwrap();
+        assert!(page.status().is_success());
+        assert_eq!(page.bytes().unwrap().as_ref(), png.as_slice());
+        assert_eq!(
+            http.delete(format!("{base}/v1/staged/{upload}"))
+                .bearer_auth(token)
+                .send()
+                .unwrap()
+                .status(),
+            204
+        );
+    }
     let old = client_b.rpc(
         "hello",
         json!({"protocolMajor":1,"protocolMinor":10,"projectionSchema":1}),
         json!("legacy-staged-hello"),
+    );
+    assert_eq!(
+        protocol::file_attachment_limit(&old["result"]),
+        Some(protocol::FILE_ATTACHMENT_MAX_BYTES)
     );
     assert!(
         !old["result"]["capabilities"]
@@ -697,6 +768,10 @@ fn staged_files_linked_servers_failure_retry_claim_and_older_peer_negotiation() 
         unsupported["error"]["message"],
         protocol::STAGED_ATTACHMENTS_UPDATE_REQUIRED
     );
+    let legacy_image = start_image(&base_b, &client_b.token, &image_hash, false);
+    let legacy_image = complete(&http, &base_b, &client_b.token, &legacy_image, &png);
+    assert!(legacy_image.get("stagedUploadId").is_none());
+    assert_eq!(legacy_image["id"], image_identity.unwrap());
     let legacy_id = start(&http, &base_b, &client_b.token, "legacy.txt", &bytes, false);
     let legacy = complete(&http, &base_b, &client_b.token, &legacy_id, &bytes);
     assert!(legacy.get("stagedUploadId").is_none());
