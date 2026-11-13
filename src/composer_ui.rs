@@ -602,6 +602,8 @@ impl State {
             self.current().draft.focused || self.composer_ui.scope_focused.get();
         self.composer_ui.overflow.set(false);
         self.composer_ui.scope_focused.set(false);
+        self.env_mode_picker = false;
+        self.base_branch_picker = false;
     }
 }
 
@@ -616,6 +618,8 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && !s.settings_menu
         && s.settings_picker.is_none()
         && !s.captain_picker
+        && !s.env_mode_picker
+        && !s.base_branch_picker
         && s.project_picker.is_none()
         && s.captain_editor.is_none()
         && s.rename_thread.is_none()
@@ -721,6 +725,8 @@ pub(super) fn collapsed(s: &State, width: f32, expanded_width: f32) -> bool {
         && !(s.composer_ui.menu_expanded
             && (s.settings_picker.is_some()
                 || s.captain_picker
+                || s.env_mode_picker
+                || s.base_branch_picker
                 || s.machines.picker
                 || s.current().native.access_picker
                 || s.composer_ui.overflow.get()))
@@ -773,21 +779,62 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     let measurement = s.composer_ui.measurement.get();
     let show_access = !resting || display_access.id() != s.thread_defaults.access;
     s.composer_ui.show_access.set(show_access);
+    let vcs_controls = s.composer_vcs_controls();
+    let branch_max_w = (width * 0.30).clamp(100.0, 200.0);
+    let (extra_block0, extra_icon0, vcs_fixed) = match &vcs_controls {
+        crate::model::ComposerVcsControls::Hidden => (0.0, 0.0, 0.0),
+        crate::model::ComposerVcsControls::Editable {
+            mode,
+            base_branch,
+            start_from_origin,
+        } => {
+            let mode_w =
+                text_width(crate::branch_toolbar::resolve_env_mode_label(*mode), SMALL) + 50.0;
+            let branch_w = if *mode == crate::model::ThreadEnvMode::Worktree {
+                let is_remote = base_branch.as_deref().and_then(|name| {
+                    s.thread_vcs_repo_key(t).and_then(|key| {
+                        s.vcs_branches
+                            .get(&key)
+                            .and_then(|entry| entry.refs.iter().find(|r| r.name == name))
+                            .map(|r| r.is_remote == Some(true))
+                    })
+                });
+                let label = crate::branch_toolbar::resolve_branch_trigger_label(
+                    None,
+                    *mode,
+                    base_branch.as_deref(),
+                    is_remote,
+                    *start_from_origin,
+                );
+                (text_width(&label, PIXEL) + 46.0).min(branch_max_w) + 4.0
+            } else {
+                0.0
+            };
+            (mode_w + 4.0, 38.0 + 4.0, branch_w)
+        }
+        crate::model::ComposerVcsControls::LockedWorktree { branch, .. } => {
+            let label = branch.as_deref().unwrap_or("Worktree");
+            let branch_w = (text_width(label, PIXEL) + 32.0).min(branch_max_w) + 4.0;
+            (0.0, 0.0, branch_w)
+        }
+    };
     let mut blocks = measurement.map_or([machine, captain_width, access], |m| [m[1], m[2], m[3]]);
-    let icon_widths = measurement.map_or(
+    let mut icon_widths = measurement.map_or(
         [38.0, if captain.is_some() { 40.0 } else { 38.0 }, 28.0],
         |m| [m[4], m[5], m[6]],
     );
+    blocks[0] += extra_block0;
+    icon_widths[0] += extra_icon0;
     // KSG uses an icon, never a label, for a non-default access chip in the resting row.
     if resting {
         blocks[2] = icon_widths[2];
     }
     let count = if show_access { 3 } else { 2 };
-    let fixed = if resting {
+    let fixed = (if resting {
         measurement.map_or(fixed, |m| m[0])
     } else {
         0.0
-    };
+    }) + vcs_fixed;
     let layout = resolve(
         width,
         fixed,
@@ -835,6 +882,36 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     }
     if visible > 0 {
         controls = controls.child(machine_selector(s, p, icon_only(0)));
+        match &vcs_controls {
+            crate::model::ComposerVcsControls::Hidden => {}
+            crate::model::ComposerVcsControls::Editable {
+                mode,
+                base_branch,
+                start_from_origin,
+            } => {
+                controls = controls.child(env_mode_trigger(s, p, icon_only(0), *mode));
+                if *mode == crate::model::ThreadEnvMode::Worktree {
+                    controls = controls.child(base_branch_trigger(
+                        s,
+                        p,
+                        base_branch.as_deref(),
+                        *start_from_origin,
+                        branch_max_w,
+                    ));
+                }
+            }
+            crate::model::ComposerVcsControls::LockedWorktree {
+                branch,
+                worktree_path,
+            } => {
+                controls = controls.child(worktree_branch_indicator(
+                    p,
+                    branch.as_deref(),
+                    worktree_path,
+                    branch_max_w,
+                ));
+            }
+        }
     }
     if visible > 1 {
         controls = controls.child(captain_selector_trigger(s, p, icon_only(1)));

@@ -1062,6 +1062,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.machines.picker {
         root = root.child(machine_picker(s, p));
     }
+    if s.env_mode_picker {
+        root = root.child(env_mode_picker(s, p));
+    }
+    if s.base_branch_picker {
+        root = root.child(base_branch_picker(s, p));
+    }
     if s.composer_ui.overflow.get() {
         root = root.child(composer_ui::overflow_menu(s, p));
     }
@@ -9590,6 +9596,8 @@ fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>) -> Option<
         || s.captain_editor.is_some()
         || s.settings_picker.is_some()
         || s.captain_picker
+        || s.env_mode_picker
+        || s.base_branch_picker
         || s.machines.picker
         || s.settings.archive.is_some()
         || s.attention_menu
@@ -12280,6 +12288,157 @@ fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
         .child(icon("chevron", p.muted).size(12.0, 12.0))
 }
 
+/// Ported from KSG Code's `BranchToolbarEnvModeSelector` and `ComposerControl` size `xs`.
+fn env_mode_trigger(
+    s: &State,
+    p: Palette,
+    icon_only: bool,
+    mode: crate::model::ThreadEnvMode,
+) -> El {
+    let title = crate::branch_toolbar::resolve_env_mode_label(mode);
+    let glyph = if mode == crate::model::ThreadEnvMode::Worktree {
+        "branch"
+    } else {
+        "folder"
+    };
+    row()
+        .key("env-mode-trigger")
+        .role("button")
+        .label(format!("Workspace: {title}"))
+        .help(title)
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .radius(4.0)
+        .hover(p.selected)
+        .preserve_focus_on_press(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let opening = !s.env_mode_picker;
+            s.begin_composer_menu();
+            s.env_mode_picker = opening;
+        })
+        .child(icon(glyph, p.muted).size(12.0, 12.0))
+        .child(if icon_only {
+            el()
+        } else {
+            label(title, SMALL, p.muted)
+                .key("env-mode-trigger-label")
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+        })
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Ported from KSG Code's `BranchToolbarBranchSelector` and `ComposerControl` size `xs`.
+fn base_branch_trigger(
+    s: &State,
+    p: Palette,
+    base_branch: Option<&str>,
+    start_from_origin: bool,
+    max_w: f32,
+) -> El {
+    let t = s.current();
+    let is_remote = base_branch.and_then(|name| {
+        s.thread_vcs_repo_key(t).and_then(|key| {
+            s.vcs_branches
+                .get(&key)
+                .and_then(|entry| entry.refs.iter().find(|r| r.name == name))
+                .map(|r| r.is_remote == Some(true))
+        })
+    });
+    let title = crate::branch_toolbar::resolve_branch_trigger_label(
+        None,
+        crate::model::ThreadEnvMode::Worktree,
+        base_branch,
+        is_remote,
+        start_from_origin,
+    );
+    row()
+        .key("base-branch-trigger")
+        .role("button")
+        .label(format!("Base branch: {title}"))
+        .help(title.clone())
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .max_w(max_w)
+        .shrink()
+        .radius(4.0)
+        .hover(p.selected)
+        .preserve_focus_on_press(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let opening = !s.base_branch_picker;
+            s.begin_composer_menu();
+            s.base_branch_picker = opening;
+            if opening {
+                s.base_branch_query = rune::TextEdit::default();
+                s.base_branch_query.focused = true;
+                s.ensure_vcs_branches(true);
+            }
+        })
+        .child(icon("branch", p.muted).size(12.0, 12.0))
+        .child(
+            label(
+                title,
+                PIXEL,
+                if base_branch.is_some() {
+                    p.ink
+                } else {
+                    p.muted
+                },
+            )
+            .key("base-branch-trigger-label")
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Read-only branch indicator for an active worktree thread, ported from KSG Code's
+/// `BranchToolbarBranchSelector` / `BranchToolbarEnvModeSelector`.
+fn worktree_branch_indicator(
+    p: Palette,
+    branch: Option<&str>,
+    worktree_path: &str,
+    max_w: f32,
+) -> El {
+    let fallback = crate::branch_toolbar::resolve_locked_workspace_label(
+        Some(worktree_path),
+        crate::model::ThreadEnvMode::Worktree,
+    );
+    let title = branch.unwrap_or(&fallback);
+    row()
+        .key("worktree-branch-indicator")
+        .label(format!("Worktree branch: {title}"))
+        .help(worktree_path)
+        .h(24.0)
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .max_w(max_w)
+        .shrink()
+        .child(icon("branch", p.muted).size(12.0, 12.0))
+        .child(label(title, PIXEL, p.muted).truncate().shrink().min_w(0.0))
+}
+
 pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool {
     let t = state.current();
     if t.status.busy()
@@ -12440,6 +12599,266 @@ fn machine_picker(s: &State, p: Palette) -> El {
         s.machines.picker = false;
         s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
     })
+}
+
+/// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
+fn env_mode_picker(s: &State, p: Palette) -> El {
+    let active = s.effective_env_mode(s.current());
+    let mut menu = col()
+        .key("env-mode-picker")
+        .role("menu")
+        .focus_group()
+        .label("Workspace")
+        .w(240.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(pixel_label("Workspace", p.muted).px(8.0).py(6.0));
+    for (mode, slug, glyph) in [
+        (crate::model::ThreadEnvMode::Local, "local", "folder"),
+        (crate::model::ThreadEnvMode::Worktree, "worktree", "branch"),
+    ] {
+        let title = crate::branch_toolbar::resolve_env_mode_label(mode);
+        let selected = active == mode;
+        let mut item = row()
+            .key(format!("env-mode-option-{slug}"))
+            .role("menuitemradio")
+            .checked(selected)
+            .label(title)
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .center_y()
+            .gap(8.0)
+            .h(30.0)
+            .px(8.0)
+            .radius(4.0)
+            .fill(if selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .on_press(move |s: &mut State| {
+                s.set_draft_env_mode(mode);
+                s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+            })
+            .child(icon(glyph, p.muted).size(14.0, 14.0))
+            .child(
+                label(title, TextStyle::new(13.0, 450.0), p.ink)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        if selected {
+            item = item.child(icon("check", p.sea));
+        }
+        menu = menu.child(item);
+    }
+    menu.anchored_fit("env-mode-trigger", rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.env_mode_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
+}
+
+/// Ported from KSG Code's `BranchPicker` and `BranchToolbarBranchSelector`.
+fn base_branch_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let selected_branch = t.base_branch.as_deref();
+    let start_from_origin = t.effective_start_from_origin();
+    let query = s.base_branch_query.text.trim().to_ascii_lowercase();
+    let repo_key = s.thread_vcs_repo_key(t);
+    let project_cwd = t
+        .project
+        .and_then(|id| s.project(Some(id)))
+        .map(|proj| proj.path.to_string_lossy().into_owned());
+    let entry = repo_key.as_ref().and_then(|k| s.vcs_branches.get(k));
+
+    let header = row().center_y().gap(8.0).px(10.0).py(8.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.base_branch_query, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(
+                text_input(&s.base_branch_query, TextStyle::new(13.0, 420.0))
+                    .key("base-branch-search")
+                    .label("Search refs")
+                    .placeholder("Search refs...", p.muted)
+                    .color(p.ink)
+                    .caret(p.coral, p.coral_bg)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .autofocus()
+                    .on_edit(|s: &mut State| &mut s.base_branch_query)
+                    .on_input_key(|s: &mut State, event, tx| {
+                        if matches!(event.key, rune::Key::Down)
+                            && !event.mods.cmd
+                            && !event.mods.ctrl
+                            && !event.mods.alt
+                            && !event.mods.shift
+                        {
+                            s.base_branch_query.focused = false;
+                            tx.focus("base-branch-list", true);
+                            return true;
+                        }
+                        false
+                    }),
+            ),
+    );
+
+    let mut list = col()
+        .key("base-branch-list")
+        .role("listbox")
+        .label("Branches")
+        .focus_group()
+        .w_full()
+        .max_h(224.0)
+        .pb(4.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+
+    if let Some(err) = entry.and_then(|e| e.error.as_deref()) {
+        list = list.child(label(err, SMALL, p.danger).wrap().px(12.0).py(8.0));
+    } else if entry.is_none_or(|e| e.loading && e.refs.is_empty()) {
+        list = list.child(label("Loading refs...", SMALL, p.muted).px(12.0).py(8.0));
+    } else if let Some(entry) = entry {
+        let ordered = crate::branch_toolbar::order_branches_for_picker(&entry.refs);
+        let filtered: Vec<&crate::vcs::VcsRef> = ordered
+            .into_iter()
+            .filter(|r| {
+                crate::branch_toolbar::should_include_branch_picker_item(
+                    &r.name, &query, None, None,
+                )
+            })
+            .collect();
+        if filtered.is_empty() {
+            list = list.child(label("No refs found.", SMALL, p.muted).px(12.0).py(8.0));
+        } else {
+            for r in filtered {
+                let name = r.name.clone();
+                let selected = selected_branch == Some(name.as_str());
+                let has_secondary_worktree = r
+                    .worktree_path
+                    .as_deref()
+                    .is_some_and(|wp| project_cwd.as_deref().is_some_and(|cwd| wp != cwd));
+                let badge = if r.current {
+                    Some("current")
+                } else if has_secondary_worktree {
+                    Some("worktree")
+                } else if r.is_remote == Some(true) {
+                    Some("remote")
+                } else if r.is_default {
+                    Some("default")
+                } else {
+                    None
+                };
+                let mut item = row()
+                    .key(format!("base-branch-option-{name}"))
+                    .role("option")
+                    .checked(selected)
+                    .label(&name)
+                    .focusable(true)
+                    .cursor(rune::Cursor::Pointer)
+                    .center_y()
+                    .gap(8.0)
+                    .h(30.0)
+                    .mx(4.0)
+                    .px(8.0)
+                    .radius(4.0)
+                    .fill(if selected {
+                        p.coral_bg
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(if selected { p.coral_bg } else { p.selected })
+                    .focus_fill(p.selected)
+                    .focus_selected(selected)
+                    .on_press(move |s: &mut State| {
+                        s.set_draft_base_branch(name.clone());
+                        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+                    })
+                    .child(
+                        label(&r.name, TextStyle::new(13.0, 450.0), p.ink)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    );
+                if selected {
+                    item = item.child(icon("check", p.sea));
+                }
+                if let Some(badge) = badge {
+                    item = item.child(pixel_text(badge, p.faint));
+                }
+                list = list.child(item);
+            }
+        }
+    }
+
+    let origin_row = row()
+        .key("start-from-remote-row")
+        .center_y()
+        .justify_between()
+        .gap(12.0)
+        .px(12.0)
+        .py(8.0)
+        .help("Uses the latest commit of the base branch's tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.")
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .min_w(0.0)
+                .child(icon("cloud", p.muted).size(12.0, 12.0))
+                .child(label("Start from remote", SMALL, p.muted).truncate()),
+        )
+        .child(captain_ui::switch(
+            s,
+            "start-from-remote-toggle",
+            "Start worktree from remote",
+            start_from_origin,
+            p,
+            |s: &mut State| {
+                let next = !s.current().effective_start_from_origin();
+                s.set_draft_start_from_origin(next);
+            },
+        ));
+
+    col()
+        .key("base-branch-picker")
+        .role("dialog")
+        .label("Base branch")
+        .w(320.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(header)
+        .child(rule(p))
+        .child(list)
+        .child(rule(p))
+        .child(origin_row)
+        .anchored_fit(
+            "base-branch-trigger",
+            rune::Side::Top,
+            rune::Align::Start,
+            6.0,
+        )
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.base_branch_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
@@ -24321,5 +24740,111 @@ pub(crate) mod tests {
                 "{width}: toolbar fits width: {toolbar_rect:?}"
             );
         }
+    }
+
+    #[test]
+    fn worktree_controls_hidden_for_non_git_messages_and_missing_capability() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.focused = true;
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+
+        // 1. Non-git project: controls hidden.
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: false,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: Vec::new(),
+            },
+        );
+        rt.frame(0.0);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        // 2. Git repo with 0 messages: env-mode-trigger shown; selecting Worktree shows base-branch-trigger.
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![
+                    crate::vcs::VcsRef {
+                        name: "feature/a".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: true,
+                        is_default: false,
+                        worktree_path: None,
+                    },
+                    crate::vcs::VcsRef {
+                        name: "main".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: false,
+                        is_default: true,
+                        worktree_path: None,
+                    },
+                ],
+            },
+        );
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("env-mode-trigger").is_some());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        press(&mut rt, "env-mode-trigger");
+        assert!(rt.presented("env-mode-picker").is_some());
+        press(&mut rt, "env-mode-option-worktree");
+        assert_eq!(
+            rt.state.current().env_mode,
+            Some(crate::model::ThreadEnvMode::Worktree)
+        );
+        assert_eq!(rt.state.current().base_branch.as_deref(), Some("main"));
+        assert!(rt.presented("base-branch-trigger").is_some());
+
+        press(&mut rt, "base-branch-trigger");
+        assert!(rt.presented("base-branch-picker").is_some());
+        assert!(rt.presented("base-branch-search").is_some());
+        assert!(rt.presented("base-branch-option-main").is_some());
+        assert!(rt.presented("base-branch-option-feature/a").is_some());
+        press(&mut rt, "base-branch-option-feature/a");
+        assert_eq!(rt.state.current().base_branch.as_deref(), Some("feature/a"));
+
+        // 3. Thread with messages (in local mode): controls hidden.
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Local);
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Hello".into(),
+            images: vec![],
+            context: None,
+        });
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        // 4. Machine without vcs-worktrees-v1 capability: controls hidden.
+        rt.state.current_mut().messages.clear();
+        let (client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": ["fresh-context"]});
+        rt.state.client = Some(client);
+        rt.invalidate();
+        rt.frame(0.75);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
     }
 }

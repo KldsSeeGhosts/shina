@@ -501,11 +501,41 @@ pub struct PromptSuggestion {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreadEnvMode {
+    #[default]
     Local,
     Worktree,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VcsBranchCacheEntry {
+    pub is_repo: bool,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub refs: Vec<crate::vcs::VcsRef>,
+}
+
+struct VcsBranchResultMsg {
+    machine: String,
+    project_path: String,
+    result: Result<crate::vcs::VcsListBranchesResult, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerVcsControls {
+    Hidden,
+    Editable {
+        mode: ThreadEnvMode,
+        base_branch: Option<String>,
+        start_from_origin: bool,
+    },
+    LockedWorktree {
+        branch: Option<String>,
+        worktree_path: String,
+    },
 }
 
 pub struct Thread {
@@ -549,6 +579,7 @@ pub struct Thread {
     pub branch: Option<String>,
     pub base_branch: Option<String>,
     pub env_mode: Option<ThreadEnvMode>,
+    pub start_from_origin: Option<bool>,
     pub machine: String,
     pub updated: u64,
     pub title: String,
@@ -977,6 +1008,7 @@ impl Thread {
             branch: None,
             base_branch: None,
             env_mode: None,
+            start_from_origin: None,
             machine: "local".into(),
             peer_origin: None,
             stop_serial: 0,
@@ -1448,6 +1480,10 @@ impl Thread {
         )
         .1;
         self.begin_prompt_with_fresh(prompt, fresh_context);
+    }
+
+    pub fn effective_start_from_origin(&self) -> bool {
+        self.start_from_origin.unwrap_or(true)
     }
 
     pub fn reconcile_draft_context(&mut self) {
@@ -3567,6 +3603,13 @@ pub struct State {
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
     pub captain_picker_highlight: usize,
+    pub env_mode_picker: bool,
+    pub base_branch_picker: bool,
+    pub base_branch_query: TextEdit,
+    pub(crate) vcs_branches: std::collections::BTreeMap<(String, String), VcsBranchCacheEntry>,
+    vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
+    next_vcs_request_id: u64,
+    pending_vcs_requests: std::collections::HashMap<u64, (String, String)>,
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
@@ -3795,6 +3838,13 @@ impl State {
             captain_picker: false,
             captain_picker_query: TextEdit::default(),
             captain_picker_highlight: 0,
+            env_mode_picker: false,
+            base_branch_picker: false,
+            base_branch_query: TextEdit::default(),
+            vcs_branches: Default::default(),
+            vcs_branch_rxs: Vec::new(),
+            next_vcs_request_id: 0,
+            pending_vcs_requests: Default::default(),
             captain_project: None,
             captains: Vec::new(),
             captain_scopes: Default::default(),
@@ -3918,11 +3968,14 @@ impl State {
         }
         self.active = index;
         self.plan_menu = None;
+        self.env_mode_picker = false;
+        self.base_branch_picker = false;
         self.assistant_selection = None;
         self.citation_highlight = None;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
+        self.ensure_vcs_branches(false);
         self.selected_threads.clear();
         let id = self.current().id;
         if self.thread_find.open
@@ -6306,6 +6359,7 @@ impl State {
             let mut thread = Thread::new(self.next_id);
             thread.harness = self.default_harness.clone();
             thread.project = project;
+            thread.env_mode = Some(self.effective_default_thread_env_mode());
             if let Some(project) = self.project(project) {
                 thread.set_machine(project.machine.clone());
             }
@@ -8612,6 +8666,309 @@ impl State {
         )
     }
 
+    pub fn effective_default_thread_env_mode(&self) -> ThreadEnvMode {
+        if self.client.is_some() {
+            self.machines
+                .views
+                .get(&self.machines.selected)
+                .and_then(|v| {
+                    serde_json::from_value::<ThreadEnvMode>(
+                        v["index"]["threadDefaults"]["default_thread_env_mode"].clone(),
+                    )
+                    .ok()
+                })
+                .unwrap_or(self.thread_defaults.default_thread_env_mode)
+        } else {
+            self.thread_defaults.default_thread_env_mode
+        }
+    }
+
+    pub fn effective_env_mode(&self, thread: &Thread) -> ThreadEnvMode {
+        if thread.worktree_path.is_some() {
+            return ThreadEnvMode::Worktree;
+        }
+        if !thread.messages.is_empty() {
+            return ThreadEnvMode::Local;
+        }
+        thread
+            .env_mode
+            .unwrap_or_else(|| self.effective_default_thread_env_mode())
+    }
+
+    pub fn supports_vcs_worktrees_on(&self, machine: &str) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(machine, crate::protocol::VCS_WORKTREES)
+        })
+    }
+
+    pub fn thread_vcs_repo_key(&self, thread: &Thread) -> Option<(String, String)> {
+        if thread.captain_home && !thread.delegated {
+            return None;
+        }
+        let project = self.project(thread.project)?;
+        let machine = if self.client.is_some() {
+            self.machines.selected.clone()
+        } else {
+            thread.machine.clone()
+        };
+        Some((machine, project.path.to_string_lossy().into_owned()))
+    }
+
+    pub fn composer_vcs_controls(&self) -> ComposerVcsControls {
+        if self.demo {
+            return ComposerVcsControls::Hidden;
+        }
+        let thread = self.current();
+        let Some((machine, project_path)) = self.thread_vcs_repo_key(thread) else {
+            return ComposerVcsControls::Hidden;
+        };
+        if !self.supports_vcs_worktrees_on(&machine) {
+            return ComposerVcsControls::Hidden;
+        }
+        if let Some(worktree_path) = &thread.worktree_path {
+            return ComposerVcsControls::LockedWorktree {
+                branch: thread.branch.clone(),
+                worktree_path: worktree_path.clone(),
+            };
+        }
+        if !thread.messages.is_empty() {
+            return ComposerVcsControls::Hidden;
+        }
+        let is_repo = self
+            .vcs_branches
+            .get(&(machine, project_path))
+            .is_some_and(|entry| entry.is_repo);
+        if !is_repo {
+            return ComposerVcsControls::Hidden;
+        }
+        ComposerVcsControls::Editable {
+            mode: self.effective_env_mode(thread),
+            base_branch: thread.base_branch.clone(),
+            start_from_origin: thread.effective_start_from_origin(),
+        }
+    }
+
+    pub fn ensure_vcs_branches(&mut self, force_refresh: bool) {
+        if self.demo {
+            return;
+        }
+        if !force_refresh && !self.runtime_enabled && self.client.is_none() {
+            return;
+        }
+        let Some((machine, project_path)) = self.thread_vcs_repo_key(self.current()) else {
+            return;
+        };
+        if !self.supports_vcs_worktrees_on(&machine) {
+            return;
+        }
+        let key = (machine.clone(), project_path.clone());
+        if let Some(entry) = self.vcs_branches.get(&key)
+            && (entry.loading || (entry.loaded && !force_refresh))
+        {
+            return;
+        }
+        if let Some(client) = &self.client {
+            if !self.machine_connected(&machine) {
+                return;
+            }
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                return;
+            };
+            self.vcs_branches.entry(key.clone()).or_default().loading = true;
+            self.next_vcs_request_id += 1;
+            let req_id = self.next_vcs_request_id;
+            self.pending_vcs_requests.insert(req_id, key);
+            let input = crate::vcs::VcsListBranchesInput {
+                cwd: project_path,
+                query: None,
+                cursor: None,
+                include_matching_remote_refs: None,
+                ref_kind: None,
+                refresh: force_refresh.then_some(true),
+                limit: Some(crate::vcs::GIT_LIST_BRANCHES_MAX_LIMIT),
+            };
+            if let Ok(params) = serde_json::to_value(&input) {
+                target.call_rpc(format!("vcs-branches:{req_id}"), "vcs.listBranches", params);
+            }
+            return;
+        }
+        self.vcs_branches.entry(key).or_default().loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.vcs_branch_rxs.push(rx);
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            let input = crate::vcs::VcsListBranchesInput {
+                cwd: project_path.clone(),
+                query: None,
+                cursor: None,
+                include_matching_remote_refs: None,
+                ref_kind: None,
+                refresh: force_refresh.then_some(true),
+                limit: Some(crate::vcs::GIT_LIST_BRANCHES_MAX_LIMIT),
+            };
+            let result = crate::vcs::list_branches(&input);
+            let _ = tx.send(VcsBranchResultMsg {
+                machine,
+                project_path,
+                result,
+            });
+            wake();
+        });
+    }
+
+    pub fn poll_vcs_branches(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.vcs_branch_rxs.len());
+        let rxs = std::mem::take(&mut self.vcs_branch_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    self.apply_vcs_branches_result(msg.machine, msg.project_path, msg.result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.vcs_branch_rxs = remaining;
+        changed
+    }
+
+    pub(crate) fn apply_vcs_branches_result(
+        &mut self,
+        machine: String,
+        project_path: String,
+        result: Result<crate::vcs::VcsListBranchesResult, String>,
+    ) {
+        let key = (machine.clone(), project_path.clone());
+        let entry = self.vcs_branches.entry(key.clone()).or_default();
+        entry.loading = false;
+        entry.loaded = true;
+        match result {
+            Ok(res) => {
+                entry.is_repo = res.is_repo;
+                entry.error = None;
+                entry.refs = res.refs;
+            }
+            Err(err) => {
+                entry.error = Some(err);
+            }
+        }
+        let default_branch = if entry.is_repo {
+            crate::branch_toolbar::default_worktree_base_branch(&entry.refs, None)
+        } else {
+            None
+        };
+        if let Some(default_branch) = default_branch {
+            let mut updated_active = false;
+            let default_mode = self.effective_default_thread_env_mode();
+            for index in 0..self.threads.len() {
+                let matches = self.thread_vcs_repo_key(&self.threads[index]).as_ref() == Some(&key);
+                if matches {
+                    let t = &self.threads[index];
+                    let mode = if t.worktree_path.is_some() {
+                        ThreadEnvMode::Worktree
+                    } else if !t.messages.is_empty() {
+                        ThreadEnvMode::Local
+                    } else {
+                        t.env_mode.unwrap_or(default_mode)
+                    };
+                    if t.messages.is_empty()
+                        && t.worktree_path.is_none()
+                        && mode == ThreadEnvMode::Worktree
+                        && t.base_branch.is_none()
+                    {
+                        self.threads[index].base_branch = Some(default_branch.clone());
+                        if index == self.active {
+                            updated_active = true;
+                        }
+                    }
+                }
+            }
+            if updated_active {
+                self.checkpoint();
+            }
+        }
+    }
+
+    pub(crate) fn handle_vcs_branches_rpc(&mut self, req_id: u64, result: Result<Value, String>) {
+        let Some((machine, project_path)) = self.pending_vcs_requests.remove(&req_id) else {
+            return;
+        };
+        let parsed = result.and_then(|val| {
+            serde_json::from_value::<crate::vcs::VcsListBranchesResult>(val)
+                .map_err(|e| format!("Invalid vcs.listBranches response: {e}"))
+        });
+        self.apply_vcs_branches_result(machine, project_path, parsed);
+    }
+
+    pub fn set_draft_env_mode(&mut self, mode: ThreadEnvMode) {
+        let t = self.current();
+        if !t.messages.is_empty() || t.worktree_path.is_some() {
+            return;
+        }
+        let default_branch = self.thread_vcs_repo_key(t).and_then(|key| {
+            self.vcs_branches
+                .get(&key)
+                .filter(|entry| entry.is_repo)
+                .and_then(|entry| {
+                    crate::branch_toolbar::default_worktree_base_branch(&entry.refs, None)
+                })
+        });
+        let thread = self.current_mut();
+        thread.env_mode = Some(mode);
+        if mode == ThreadEnvMode::Local {
+            if thread.submission_error.as_deref()
+                == Some("Select a base branch before sending in New worktree mode.")
+            {
+                thread.submission_error = None;
+            }
+        } else {
+            if thread.base_branch.is_none() {
+                thread.base_branch = default_branch;
+            }
+            // Do not keep an idle prewarmed session in the main checkout once switched to worktree.
+            if thread.pi.is_some() && thread.session.is_none() && thread.messages.is_empty() {
+                thread.disconnect();
+                thread.prewarm_attempted = false;
+            }
+        }
+        self.env_mode_picker = false;
+        if mode == ThreadEnvMode::Worktree {
+            self.ensure_vcs_branches(false);
+        }
+        self.checkpoint();
+    }
+
+    pub fn set_draft_base_branch(&mut self, branch: String) {
+        let thread = self.current_mut();
+        if !thread.messages.is_empty() || thread.worktree_path.is_some() {
+            return;
+        }
+        thread.base_branch = Some(branch);
+        if thread.submission_error.as_deref()
+            == Some("Select a base branch before sending in New worktree mode.")
+        {
+            thread.submission_error = None;
+        }
+        self.base_branch_picker = false;
+        self.checkpoint();
+    }
+
+    pub fn set_draft_start_from_origin(&mut self, start_from_origin: bool) {
+        let thread = self.current_mut();
+        if !thread.messages.is_empty() || thread.worktree_path.is_some() {
+            return;
+        }
+        thread.start_from_origin = Some(start_from_origin);
+        self.checkpoint();
+    }
+
     pub fn open_external_url(&mut self, url: &str) {
         self.pending_open_urls.push(url.to_owned());
     }
@@ -10080,6 +10437,8 @@ impl State {
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
+            && !(self.effective_env_mode(thread) == ThreadEnvMode::Worktree
+                && thread.worktree_path.is_none())
             && (thread.has_draft_content() || (thread.session.is_some() && !thread.history_loaded))
         {
             self.connect_thread(self.active);
@@ -10548,6 +10907,8 @@ impl State {
                     thread.env_mode = record
                         .get("envMode")
                         .and_then(|v| serde_json::from_value::<ThreadEnvMode>(v.clone()).ok());
+                    thread.start_from_origin =
+                        record.get("startFromOrigin").and_then(Value::as_bool);
                     if let Some(suggestion) = record.get("promptSuggestion")
                         && let Ok(parsed) =
                             serde_json::from_value::<Option<PromptSuggestion>>(suggestion.clone())
@@ -11474,6 +11835,9 @@ impl Thread {
         if let Some(env_mode) = self.env_mode {
             record["envMode"] = json!(env_mode);
         }
+        if let Some(start_from_origin) = self.start_from_origin {
+            record["startFromOrigin"] = json!(start_from_origin);
+        }
         record
     }
 }
@@ -11582,6 +11946,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
+    changed |= state.poll_vcs_branches();
     changed |= state.poll_question_answers();
     if state.runtime_enabled && state.client.is_none() {
         for index in 0..state.threads.len() {
@@ -18567,5 +18932,67 @@ mod tests {
         state.sync_fallback_model(1_700_010_060_000);
         assert_eq!(state.current().harness, "codex");
         assert!(state.composer_notices.ordered().is_empty());
+    }
+
+    #[test]
+    fn draft_workspace_mode_and_base_branch_persist_across_thread_switch_and_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-draft-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let index_path = dir.join("index.json");
+        let mut store = crate::store::Store::new(index_path.clone(), Arc::new(|| {}));
+
+        let mut state = State::new(".".into(), false);
+        state.data_dir = dir.clone();
+        state.current_mut().messages.push(Message {
+            id: "u1".into(),
+            role: "You",
+            text: "First thread".into(),
+            images: vec![],
+            context: None,
+        });
+        state.thread_defaults.default_thread_env_mode = ThreadEnvMode::Worktree;
+        state.new_thread();
+        assert_eq!(state.threads.len(), 2);
+        let t2_idx = state.active;
+        assert_eq!(
+            state.threads[t2_idx].env_mode,
+            Some(ThreadEnvMode::Worktree)
+        );
+        state.set_draft_base_branch("main".into());
+        state.set_draft_start_from_origin(false);
+
+        // Switch away to thread 0 and switch back: draft choices persist.
+        state.select_thread(0);
+        state.select_thread(t2_idx);
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(state.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(state.current().start_from_origin, Some(false));
+        assert!(!state.current().effective_start_from_origin());
+
+        // Save to disk and reload from temporary data directory.
+        let snapshot = state.snapshot();
+        store.save(snapshot);
+        store.flush().unwrap();
+        let loaded = crate::store::load(&index_path)
+            .unwrap()
+            .expect("saved index");
+        let mut reloaded = State::new(".".into(), false);
+        reloaded.data_dir = dir.clone();
+        reloaded.restore_global(&loaded).unwrap();
+        assert_eq!(
+            reloaded.thread_defaults.default_thread_env_mode,
+            ThreadEnvMode::Worktree
+        );
+        let restored_t2 = reloaded
+            .threads
+            .iter()
+            .find(|t| t.id == state.threads[t2_idx].id)
+            .expect("restored draft thread");
+        assert_eq!(restored_t2.env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(restored_t2.base_branch.as_deref(), Some("main"));
+        assert_eq!(restored_t2.start_from_origin, Some(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

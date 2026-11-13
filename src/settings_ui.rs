@@ -104,6 +104,8 @@ pub struct ThreadDefaults {
     pub add_project_base_directory: String,
     /// KSG Code's `promptSuggestionsEnabled`: off by default.
     pub prompt_suggestions_enabled: bool,
+    /// KSG Code's `defaultThreadEnvMode`: `"local"` by default.
+    pub default_thread_env_mode: crate::model::ThreadEnvMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model_selection: Option<crate::model_selection::ModelSelection>,
 }
@@ -126,6 +128,7 @@ impl Default for ThreadDefaults {
             models: BTreeMap::new(),
             add_project_base_directory: String::new(),
             prompt_suggestions_enabled: false,
+            default_thread_env_mode: crate::model::ThreadEnvMode::Local,
             fallback_model_selection: None,
         }
     }
@@ -1921,6 +1924,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             "Default access mode",
             "Default harness",
             "Default model and effort",
+            "Workspace",
         ],
         2 => &["Pi", "Codex", "Claude", "ACP harnesses"],
         3 => &["Linked machines", "Update all machines"],
@@ -2276,6 +2280,32 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         },
                     )),
+                p,
+            );
+            let default_env_mode = defaults.default_thread_env_mode;
+            pane = add(
+                pane,
+                s,
+                "settings-default-env-mode",
+                "Workspace",
+                "Where new threads start. Projects and their t3.json can override it.",
+                settings_button(
+                    "default-env-mode-toggle",
+                    crate::branch_toolbar::resolve_env_mode_label(default_env_mode),
+                    p,
+                    move |s| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.default_thread_env_mode = match defaults.default_thread_env_mode {
+                            crate::model::ThreadEnvMode::Local => {
+                                crate::model::ThreadEnvMode::Worktree
+                            }
+                            crate::model::ThreadEnvMode::Worktree => {
+                                crate::model::ThreadEnvMode::Local
+                            }
+                        };
+                        s.save_defaults(defaults);
+                    },
+                ),
                 p,
             );
             let prompt_suggestions_enabled = defaults.prompt_suggestions_enabled;

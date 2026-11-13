@@ -5,6 +5,7 @@ mod approval;
 mod assistant_citation;
 mod attachments;
 mod backend;
+mod branch_toolbar;
 mod brand;
 mod cache_persistence;
 mod captains;

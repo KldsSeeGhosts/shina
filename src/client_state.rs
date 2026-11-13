@@ -224,6 +224,12 @@ struct ThreadView {
         deserialize_with = "deserialize_lenient_env_mode"
     )]
     env_mode: Option<crate::model::ThreadEnvMode>,
+    #[serde(
+        rename = "startFromOrigin",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    start_from_origin: Option<bool>,
 }
 
 impl ThreadView {
@@ -365,6 +371,7 @@ impl ThreadView {
             branch: thread.branch.clone(),
             base_branch: thread.base_branch.clone(),
             env_mode: thread.env_mode,
+            start_from_origin: thread.start_from_origin,
         }
     }
 
@@ -373,6 +380,7 @@ impl ThreadView {
         thread.branch = self.branch;
         thread.base_branch = self.base_branch;
         thread.env_mode = self.env_mode;
+        thread.start_from_origin = self.start_from_origin;
         thread.memory_suggestions = self.memory_suggestions;
         thread.fresh_session_messages = self.fresh_session_messages;
         if thread.remote.is_some() {
@@ -1089,11 +1097,23 @@ impl State {
             self.threads
                 .iter()
                 .filter(|t| t.client_draft)
-                .map(|t| json!({
-                    "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
-                    "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life,
-                    "serviceTier":t.harness_state["serviceTier"]
-                }))
+                .map(|t| {
+                    let mut entry = json!({
+                        "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
+                        "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life,
+                        "serviceTier":t.harness_state["serviceTier"]
+                    });
+                    if let Some(env_mode) = t.env_mode {
+                        entry["envMode"] = json!(env_mode);
+                    }
+                    if let Some(base_branch) = &t.base_branch {
+                        entry["baseBranch"] = json!(base_branch);
+                    }
+                    if let Some(start_from_origin) = t.start_from_origin {
+                        entry["startFromOrigin"] = json!(start_from_origin);
+                    }
+                    entry
+                })
                 .collect::<Vec<_>>()
         );
         ui["pendingMessages"] = json!({});
@@ -1414,6 +1434,11 @@ impl State {
                                 .map_err(|e| e.to_string())
                         });
                         self.apply_usage_limits_result(req_id, parsed);
+                    } else if let Some(req_id) = tag
+                        .strip_prefix("vcs-branches:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.handle_vcs_branches_rpc(req_id, result);
                     } else if let Some(rest) = tag.strip_prefix("search:")
                         && let Some((seq_str, target_srv)) = rest.split_once(':')
                         && let Ok(seq) = seq_str.parse::<u64>()
@@ -1696,6 +1721,7 @@ impl State {
                 local.branch = thread.branch;
                 local.base_branch = thread.base_branch;
                 local.env_mode = thread.env_mode;
+                local.start_from_origin = thread.start_from_origin;
                 local.machine = thread.machine;
                 local.updated = thread.updated;
                 local.captain = thread.captain;
@@ -1754,6 +1780,15 @@ impl State {
                     thread.life = serde_json::from_value(life.clone())
                         .map_err(|_| "Invalid saved client draft lifecycle.")?;
                 }
+                thread.env_mode = draft.get("envMode").and_then(|v| {
+                    serde_json::from_value::<crate::model::ThreadEnvMode>(v.clone()).ok()
+                });
+                thread.base_branch = draft
+                    .get("baseBranch")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                thread.start_from_origin = draft.get("startFromOrigin").and_then(Value::as_bool);
                 self.threads.push(thread);
             }
         }
@@ -1886,6 +1921,7 @@ impl State {
         {
             self.forward("project.put", json!({"path":path}));
         }
+        self.ensure_vcs_branches(false);
         Ok(())
     }
 
@@ -2285,6 +2321,7 @@ impl State {
             self.machines.scope_remote,
         ) = filter;
         self.tick_composer_notices_at(Instant::now(), None);
+        self.ensure_vcs_branches(false);
     }
 
     /// KSG useDraftEnvironmentRouting locks promoted, started and running conversations.
@@ -2381,6 +2418,7 @@ impl State {
             thread.client_draft = true;
             thread.harness = self.default_harness.clone();
             thread.project = project;
+            thread.env_mode = Some(self.effective_default_thread_env_mode());
             self.threads.push(thread);
             self.threads.len() - 1
         });
@@ -2398,9 +2436,13 @@ impl State {
         if self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
             && self.current().client_draft
         {
+            if self.current().project != project {
+                self.current_mut().base_branch = None;
+            }
             self.current_mut().project = project;
             self.project_picker = None;
             self.machines.draft_picker = None;
+            self.ensure_vcs_branches(false);
             self.checkpoint();
         } else {
             self.new_thread_in(project);
