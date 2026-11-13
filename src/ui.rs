@@ -13,6 +13,8 @@ use serde_json::json;
 use std::time::Duration;
 #[path = "attachment_archive_preview.rs"]
 mod attachment_archive_preview;
+#[path = "attachment_notebook_preview.rs"]
+mod attachment_notebook_preview;
 #[path = "attachment_preview.rs"]
 pub(crate) mod attachment_preview;
 #[path = "attachment_sqlite_preview.rs"]
@@ -16843,6 +16845,76 @@ pub(crate) mod tests {
                     assert!(rt.state.attachment_preview.is_none());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn notebook_attachment_preview_pages_cells_and_fits_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let path = rt.state.data_dir.join("sample.ipynb");
+            let cells: Vec<_> = (0..45)
+                .map(|index| match index % 3 {
+                    0 => json!({
+                        "cell_type": "markdown",
+                        "source": [format!("**cell {index}**")],
+                    }),
+                    1 => json!({
+                        "cell_type": "code",
+                        "execution_count": index,
+                        "source": [format!("print({index})")],
+                        "outputs": [{"output_type": "stream", "name": "stdout",
+                                     "text": [format!("out {index}\n")]}],
+                    }),
+                    _ => json!({
+                        "cell_type": "raw",
+                        "source": [format!("raw {index}")],
+                    }),
+                })
+                .collect();
+            std::fs::write(
+                &path,
+                json!({
+                    "nbformat": 4,
+                    "nbformat_minor": 5,
+                    "metadata": {"language_info": {"name": "python"}},
+                    "cells": cells,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let notebook = crate::attachments::attach_file(&path).unwrap();
+            // Direct state changes need an explicit invalidate before the frame.
+            rt.state.current_mut().draft_images = vec![notebook.clone()];
+            rt.invalidate();
+            // The first frame syncs viewport_width through workspace-root's layout.
+            rt.frame(0.0);
+            rt.update(|s, _| s.preview_attachments(vec![notebook.clone()], &notebook.id, true));
+            rt.frame(0.0);
+            let (card, _) = rt.presented("attachment-preview").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5,
+                "{width}: {card:?}"
+            );
+            let (scroll, _) = rt.presented("attachment-preview-notebook").unwrap();
+            assert!(
+                scroll[0] >= 0.0
+                    && scroll[0] + scroll[2] <= width + 0.5
+                    && scroll[1] >= 0.0
+                    && scroll[1] + scroll[3] <= rt.state.viewport_height + 0.5,
+                "{width}: {scroll:?}"
+            );
+            assert!(rt.presented("notebook-cell-0").is_some(), "{width}");
+            assert!(rt.presented("notebook-cell-19").is_some(), "{width}");
+            assert!(rt.presented("notebook-cell-20").is_none(), "{width}");
+            assert!(rt.presented("notebook-more").is_some(), "{width}");
+            // The button sits below the fold; wheel over the list's top cell
+            // (a markdown cell with no inner scroll) to reach the end.
+            rt.wheel(scroll[0] + scroll[2] / 2.0, scroll[1] + 12.0, -10000.0);
+            rt.frame(0.0);
+            press(&mut rt, "notebook-more");
+            assert!(rt.presented("notebook-cell-39").is_some(), "{width}");
+            assert!(rt.presented("notebook-cell-40").is_none(), "{width}");
         }
     }
 

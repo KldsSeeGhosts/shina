@@ -234,10 +234,10 @@ Item 1 also retains the permitted Windows HEIC/HEIF gap.
   WebP encoding, not the quality-controlled lossy WebP encoder needed for KSG's
   quality ladder. This does not reproduce the output bytes of a KSG browser
   with working lossy WebP canvas support. Small supported originals remain intact.
-- KSG's Office, EPUB and notebook viewers are not ported. Their
+- KSG's Office and EPUB viewers are not ported. Their
   browser decoder/parser packages are not in Shina's locked dependency tree.
   Rune's image/player APIs and the linked native webview do not themselves
-  lay out Office/notebook documents with KSG's parser, paging and safety rules. The native host cannot
+  lay out Office documents with KSG's parser, paging and safety rules. The native host cannot
   reproduce those viewers without their parsers or a separate implementation.
   Such files retain the explicit "No preview for this file" and Save fallback.
   This is an unimplemented part of item 6, not a claim that the formats are
@@ -256,15 +256,22 @@ Item 1 also retains the permitted Windows HEIC/HEIF gap.
     XML 8,388,608 UTF-16 units, depth 100, 100,000 nodes, rendered markup
     16,777,216 UTF-16 units; OpenDocument
     page/sheet navigation and EPUB package/spine/XHTML handling.
-  - `files/extendedDocumentPreview.ts:426`: strict UTF-8 notebook v4,
-    8 MiB input, 500 cells, 256,000 UTF-16 units per source/text output,
-    100 outputs/cell, image base64 text 4,194,304 UTF-16 units and 16,777,216 pixels.
-    `NotebookPreview.tsx:55` adds 20 cells at a time, inert Markdown,
-    saved outputs only, and at most 16 mounted HTML-output frames.
   - `files/extendedDocumentPreview.ts:466`: RTF 8 MiB input and
     8,388,608 UTF-16 units of rendered content,
     500 pages, nesting 100, byte/code-page decoding, binary destinations,
     Unicode fallback, formatting and ignored non-content destinations.
+- The notebook viewer is ported: `attachment_notebook_preview::parse`
+  reproduces `files/extendedDocumentPreview.ts:426` — strict UTF-8, notebook
+  v4 only, 8 MiB input, 500 cells, 256,000 UTF-16 units per source/text
+  output, 100 outputs/cell, image base64 text 4,194,304 UTF-16 units,
+  16,777,216 pixels, and KSG's error messages. `attachment_preview`'s
+  notebook branch reproduces `NotebookPreview.tsx` — twenty cells at a
+  time, inert Markdown, stream/result/display/error saved outputs with
+  ANSI escapes stripped from tracebacks, and nothing executed. One
+  difference: KSG mounts HTML outputs in bounded browser frames; Shina
+  has no embedded browser, so an HTML output shows its `text/plain`
+  alternative, or the muted line "HTML output is not shown" when it has
+  none.
 - Full standalone Mermaid parity is not ported. The pinned Rune checkout has
   an optional native Mermaid parser, but its documented behavior skips lines
   outside its supported subset. That is not KSG's renderer/error behavior.
