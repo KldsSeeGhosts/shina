@@ -10,6 +10,7 @@ pub struct QueuedEdit {
     pub(super) ordinary: TextEdit,
     pub(super) ordinary_images: Vec<Attachment>,
     pub(super) ordinary_context: Vec<crate::composer_context::ComposerContextRecord>,
+    pub(super) ordinary_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     ordinary_error: Option<String>,
 }
 
@@ -112,6 +113,13 @@ impl Thread {
         let ordinary_images =
             std::mem::replace(&mut self.draft_images, original.attachments.clone());
         let ordinary_context = std::mem::replace(&mut self.draft_context, original.context.clone());
+        let reply = crate::composer_tokens::split_leading_reply_reference(
+            &prompt.text,
+            Some(&self.draft),
+            prompt.context.as_ref(),
+        )
+        .map(|(record, _)| record);
+        let ordinary_reply_to = std::mem::replace(&mut self.draft_reply_to, reply);
         self.retained_context = Default::default();
         self.queued_edit = Some(QueuedEdit {
             input_id: id,
@@ -122,6 +130,7 @@ impl Thread {
             ordinary,
             ordinary_images,
             ordinary_context,
+            ordinary_reply_to,
             ordinary_error: self.attachment_error.take(),
         });
         self.draft.focused = true;
@@ -136,6 +145,7 @@ impl Thread {
             self.draft = edit.ordinary;
             self.draft_images = edit.ordinary_images;
             self.draft_context = edit.ordinary_context;
+            self.draft_reply_to = edit.ordinary_reply_to;
             self.retained_context = Default::default();
             self.attachment_error = edit.ordinary_error;
             self.draft.focused = true;
@@ -170,11 +180,13 @@ impl Thread {
         let editor = self.draft.clone();
         let images = self.draft_images.clone();
         let context = self.draft_context.clone();
+        let reply_to = self.draft_reply_to.clone();
         self.cancel_queued_edit();
         if recover {
             self.draft = editor;
             self.draft_images = images;
             self.draft_context = context;
+            self.draft_reply_to = reply_to;
         }
         if changed {
             self.error = Some(format!(
@@ -247,10 +259,11 @@ impl Thread {
             .find(|q| q.id == id)
             .map(|q| q.prompt.images.iter().map(|a| a.id.clone()).collect())
             .unwrap_or_default();
-        let prompt = match crate::composer_tokens::prompt_for_target(
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
+            self.draft_reply_to.as_ref(),
             Some(&self.machine),
             target_server_id,
             peers,

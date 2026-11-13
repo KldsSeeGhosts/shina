@@ -636,10 +636,7 @@ pub(super) fn activate(s: &mut State, message_id: &str, href: &str, tx: &mut Tx)
         }
         Data::Environment { .. } => {}
         Data::Response { citation, .. } => {
-            if let Ok(id) = citation.thread_id.parse::<usize>() {
-                s.open_machine_thread(&machine_key(s, &citation.environment_id), id);
-                tx.scroll_into_view(format!("row-{id}-{}", citation.message_id));
-            }
+            s.navigate_to_citation(citation, tx);
         }
         _ => {
             s.transcript_preview = Some(Preview {

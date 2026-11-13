@@ -1779,6 +1779,7 @@ impl State {
                             thread.draft.clone(),
                             thread.draft_images.clone(),
                             thread.draft_context.clone(),
+                            thread.draft_reply_to.clone(),
                             thread.retained_context.clone(),
                             thread.attachment_error.clone(),
                         )
@@ -1788,11 +1789,12 @@ impl State {
                 vec![]
             };
             self.restore_ui(&local)?;
-            for (id, draft, images, context, retained, error) in editors {
+            for (id, draft, images, context, reply_to, retained, error) in editors {
                 if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
                     thread.draft = draft;
                     thread.draft_images = images;
                     thread.draft_context = context;
+                    thread.draft_reply_to = reply_to;
                     thread.retained_context = retained;
                     thread.attachment_error = error;
                 }
@@ -2273,6 +2275,7 @@ impl State {
         let draft = self.current().draft.clone();
         let images = self.current().draft_images.clone();
         let context = self.current().draft_context.clone();
+        let reply_to = self.current().draft_reply_to.clone();
         let retained = self.current().retained_context.clone();
         self.select_machine(server);
         if self.machines.selected != server {
@@ -2282,6 +2285,7 @@ impl State {
         self.current_mut().draft = draft;
         self.current_mut().draft_images = images;
         self.current_mut().draft_context = context;
+        self.current_mut().draft_reply_to = reply_to;
         self.current_mut().retained_context = retained;
         if let Some(thread) = self
             .machines
@@ -2292,6 +2296,7 @@ impl State {
             thread.draft.replace_text("");
             thread.draft_images.clear();
             thread.draft_context.clear();
+            thread.draft_reply_to = None;
             thread.retained_context = Default::default();
         }
         // Update the old machine's saved editor too, so a later switch cannot restore a copy.
@@ -2382,6 +2387,7 @@ impl State {
                 let thread = self.current_mut();
                 thread.client_creating = Some(command);
                 thread.remote_send = Some((command, snapshot));
+                thread.remote_send_reply_to = thread.draft_reply_to.take();
                 thread.life.last_requested_at = Some(lifecycle::now());
                 thread.draft.replace_text("");
                 thread.draft_images.clear();
@@ -2463,9 +2469,13 @@ impl State {
             };
             draft.client_creating = None;
             let submitted = draft.remote_send.take();
+            let sent_reply_to = draft.remote_send_reply_to.take();
             if value["result"]["status"] != "accepted" {
                 if let Some((_, snapshot)) = submitted {
                     draft.restore_snapshot(&snapshot);
+                }
+                if draft.draft_reply_to.is_none() {
+                    draft.draft_reply_to = sent_reply_to;
                 }
                 let error = value["error"]["message"]
                     .as_str()
@@ -2477,10 +2487,11 @@ impl State {
             } else if let Some(id) = value["result"]["result"]["threadId"].as_u64() {
                 draft.client_promoted = Some(id as usize);
                 if let Some((_, snapshot)) = submitted {
-                    match crate::composer_tokens::prompt_for_target(
+                    match crate::composer_tokens::prompt_for_target_with_reply(
                         &snapshot.editor(),
                         &snapshot.attachments,
                         &snapshot.context,
+                        sent_reply_to.as_ref(),
                         Some(server),
                         Some(&target_server_id),
                         &target_peers,
@@ -2497,10 +2508,14 @@ impl State {
                             match result {
                                 Ok(cmd_id) => {
                                     draft.remote_send = Some((cmd_id, snapshot));
+                                    draft.remote_send_reply_to = sent_reply_to;
                                     Outcome::None
                                 }
                                 Err(error) => {
                                     draft.restore_snapshot(&snapshot);
+                                    if draft.draft_reply_to.is_none() {
+                                        draft.draft_reply_to = sent_reply_to;
+                                    }
                                     draft.error = Some(error.clone());
                                     Outcome::Failed(draft.background_send.take(), draft.id, error)
                                 }
@@ -2508,6 +2523,9 @@ impl State {
                         }
                         Err(error) => {
                             draft.restore_snapshot(&snapshot);
+                            if draft.draft_reply_to.is_none() {
+                                draft.draft_reply_to = sent_reply_to;
+                            }
                             draft.attachment_error = Some(error.clone());
                             Outcome::Failed(draft.background_send.take(), draft.id, error)
                         }
@@ -2544,14 +2562,18 @@ impl State {
             let text = std::mem::take(&mut self.threads[draft_index].draft);
             let images = std::mem::take(&mut self.threads[draft_index].draft_images);
             let context = std::mem::take(&mut self.threads[draft_index].draft_context);
+            let reply_to = std::mem::take(&mut self.threads[draft_index].draft_reply_to);
             let retained = std::mem::take(&mut self.threads[draft_index].retained_context);
             let sending = self.threads[draft_index].remote_send.take();
+            let sending_reply_to = self.threads[draft_index].remote_send_reply_to.take();
             let background_send = self.threads[draft_index].background_send.take();
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
             self.threads[index].draft_context = context;
+            self.threads[index].draft_reply_to = reply_to;
             self.threads[index].retained_context = retained;
             self.threads[index].remote_send = sending;
+            self.threads[index].remote_send_reply_to = sending_reply_to;
             if background_send.is_some() {
                 self.threads[index].background_send = background_send;
             }
@@ -3051,6 +3073,13 @@ impl State {
                     .map(|d| d.context.clone())
                     .or_else(|| prompt.context.as_ref().map(|c| c.records.clone()))
                     .unwrap_or_default();
+                let reply_to = crate::composer_tokens::split_leading_reply_reference(
+                    &prompt.text,
+                    Some(&self.current().draft),
+                    prompt.context.as_ref(),
+                )
+                .map(|(record, _)| record);
+                self.current_mut().draft_reply_to = reply_to;
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
                 let _ = self.dispatch_send_with_options(
@@ -3067,6 +3096,7 @@ impl State {
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
                     self.current_mut().draft_context.clear();
+                    self.current_mut().draft_reply_to = None;
                     self.current_mut().retained_context = Default::default();
                     return Err(error);
                 }

@@ -2,6 +2,7 @@
 
 mod acp;
 mod approval;
+mod assistant_citation;
 mod attachments;
 mod backend;
 mod brand;

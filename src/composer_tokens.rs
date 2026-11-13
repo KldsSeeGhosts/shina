@@ -176,9 +176,32 @@ pub fn prompt_for_target(
     peers: &[crate::peer::Peer],
     machine_name: &dyn Fn(&str) -> String,
 ) -> Result<Prompt, String> {
+    prompt_for_target_with_reply(
+        edit,
+        images,
+        draft_context,
+        None,
+        target_machine,
+        target_server_id,
+        peers,
+        machine_name,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_for_target_with_reply(
+    edit: &TextEdit,
+    images: &[Attachment],
+    draft_context: &[crate::composer_context::ComposerContextRecord],
+    reply_to: Option<&crate::composer_context::ComposerContextRecord>,
+    target_machine: Option<&str>,
+    target_server_id: Option<&str>,
+    peers: &[crate::peer::Peer],
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
     validate_pill_kinds(edit)?;
     let mut attachments = images.to_vec();
-    let referenced_ids = collect_inline_context_ids_from_edit(edit);
+    let mut referenced_ids = collect_inline_context_ids_from_edit(edit);
     if let Some(target) = target_machine {
         if let Some((record, reason)) =
             crate::composer_context::thread_contexts_outside_environment(
@@ -234,22 +257,67 @@ pub fn prompt_for_target(
         }
     }
     attachments::validate_prompt_images(&attachments)?;
-    let context = crate::composer_context::build_message_context(
-        &referenced_ids,
-        draft_context,
-        &attachments,
-    );
-    let mut prompt = Prompt::with_context(
-        crate::composer_rich::markdown_for(edit, target_machine, machine_name),
-        attachments,
-        context,
-    );
+    let mut all_context = draft_context.to_vec();
+    let mut body = crate::composer_rich::markdown_for(edit, target_machine, machine_name);
+    if let Some(reply) = reply_to
+        && !referenced_ids.contains(&reply.context_id)
+    {
+        referenced_ids.insert(reply.context_id.clone());
+        if !all_context.iter().any(|r| r.context_id == reply.context_id) {
+            all_context.insert(0, reply.clone());
+        }
+        let prefix = crate::composer_context::format_composer_context_reference(
+            "response",
+            &reply.context_id,
+            &reply.label,
+        );
+        body = if body.is_empty() {
+            prefix
+        } else {
+            format!("{prefix} {body}")
+        };
+    }
+    let context =
+        crate::composer_context::build_message_context(&referenced_ids, &all_context, &attachments);
+    let mut prompt = Prompt::with_context(body, attachments, context);
     prompt.draft = Some(crate::composer_rich::Snapshot::capture_with_context(
         edit,
         images,
         draft_context,
     ));
     Ok(prompt)
+}
+
+/// If `text` begins with an inline `response` reference that belongs to `replyTo` (not an
+/// inline pill in `editor`), return `(reply_record, remaining_body)`.
+pub fn split_leading_reply_reference<'a>(
+    text: &'a str,
+    editor: Option<&TextEdit>,
+    context: Option<&crate::composer_context::MessageContext>,
+) -> Option<(crate::composer_context::ComposerContextRecord, &'a str)> {
+    let context = context?;
+    let first = crate::composer_context::collect_composer_context_references(text)
+        .into_iter()
+        .find(|occ| occ.start == 0 && occ.kind == "response")?;
+    if let Some(edit) = editor
+        && collect_inline_context_ids_from_edit(edit).contains(&first.context_id)
+    {
+        return None;
+    }
+    let record = context
+        .records
+        .iter()
+        .find(|r| {
+            r.context_id == first.context_id
+                && matches!(
+                    r.data,
+                    crate::composer_context::ComposerContextData::Response { .. }
+                )
+        })?
+        .clone();
+    let rest = &text[first.end..];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    Some((record, rest))
 }
 
 fn validate_pill_kinds(edit: &TextEdit) -> Result<(), String> {
@@ -285,7 +353,11 @@ pub fn received_prompt_with_context(
             serde_json::from_value(value).map_err(|_| "Invalid composer document.")?;
         let editor = snapshot.editor();
         validate_pill_kinds(&editor)?;
-        if crate::composer_rich::markdown(&editor) != prompt.text {
+        let editor_md = crate::composer_rich::markdown(&editor);
+        let matches_reply =
+            split_leading_reply_reference(&prompt.text, Some(&editor), prompt.context.as_ref())
+                .is_some_and(|(_, body)| body == editor_md);
+        if editor_md != prompt.text && !matches_reply {
             return Err("The composer document does not match the submitted message.".into());
         }
         snapshot.attachments = snapshot
