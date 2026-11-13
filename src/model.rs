@@ -203,6 +203,16 @@ pub struct ToastNotice {
     pub expires_at: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlanSaveDialog {
+    pub machine: String,
+    pub cwd: String,
+    pub contents: String,
+    pub path_edit: TextEdit,
+    pub saving: bool,
+    pub request_id: Option<u64>,
+}
+
 /// The validated fields of a `delegate_task.target` request.
 pub(crate) struct DelegationTarget {
     harness: Option<String>,
@@ -2956,6 +2966,12 @@ pub struct State {
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
+    pub plan_menu: Option<String>,
+    pub plan_copied: Option<(String, u64)>,
+    pub plan_expanded: std::collections::HashSet<String>,
+    pub plan_save_dialog: Option<PlanSaveDialog>,
+    pub plan_save_last_path: Option<String>,
+    next_plan_save_request_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
@@ -3166,6 +3182,12 @@ impl State {
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
+            plan_menu: None,
+            plan_copied: None,
+            plan_expanded: Default::default(),
+            plan_save_dialog: None,
+            plan_save_last_path: None,
+            next_plan_save_request_id: 0,
             opened_draft: None,
             composer_sources: crate::composer_sources::Sources::default(),
             snooze_menu: None,
@@ -3324,6 +3346,7 @@ impl State {
             self.threads[previous].draft.focused = false;
         }
         self.active = index;
+        self.plan_menu = None;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
@@ -7315,6 +7338,179 @@ impl State {
         self.toasts.len() != before
     }
 
+    pub(crate) fn thread_workspace_path(&self, thread_id: usize) -> Option<String> {
+        let thread = self.threads.iter().find(|t| t.id == thread_id)?;
+        thread.project?;
+        if self.client.is_some() && thread.machine != "local" {
+            return self.client_views["directories"][thread.id.to_string()]
+                .as_str()
+                .map(str::to_owned);
+        }
+        self.project(thread.project)
+            .filter(|project| project.machine == thread.machine)
+            .map(|project| project.path.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn can_write_project_file(&self, thread: &Thread) -> bool {
+        !self.demo
+            && self.thread_workspace_path(thread.id).is_some()
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::PROJECT_WRITE_FILE)
+            })
+    }
+
+    pub(crate) fn is_plan_copied(&self, card_id: &str) -> bool {
+        self.plan_copied
+            .as_ref()
+            .is_some_and(|(id, expires)| id == card_id && *expires > lifecycle::now())
+    }
+
+    pub(crate) fn mark_plan_copied(&mut self, card_id: String, tx: &mut Tx) {
+        self.plan_copied = Some((card_id, lifecycle::now().saturating_add(2_000)));
+        tx.wake_after(Duration::from_secs(2));
+    }
+
+    pub(crate) fn toggle_plan_expanded(&mut self, card_id: &str) {
+        if !self.plan_expanded.remove(card_id) {
+            self.plan_expanded.insert(card_id.to_owned());
+        }
+    }
+
+    pub(crate) fn open_plan_save_dialog(&mut self, thread_id: usize, plan_markdown: &str) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == thread_id) else {
+            return;
+        };
+        if !self.can_write_project_file(thread) {
+            return;
+        }
+        let Some(cwd) = self.thread_workspace_path(thread_id) else {
+            return;
+        };
+        let machine = thread.machine.clone();
+        let initial_path = self.plan_save_last_path.clone().unwrap_or_else(|| {
+            crate::plan_export::build_proposed_plan_markdown_filename(plan_markdown)
+        });
+        let mut path_edit = TextEdit::default();
+        path_edit.replace_text(&initial_path);
+        path_edit.focused = true;
+        self.plan_save_dialog = Some(PlanSaveDialog {
+            machine,
+            cwd,
+            contents: crate::plan_export::normalize_plan_markdown_for_export(plan_markdown),
+            path_edit,
+            saving: false,
+            request_id: None,
+        });
+    }
+
+    pub(crate) fn close_plan_save_dialog(&mut self) {
+        if !self.plan_save_dialog.as_ref().is_some_and(|d| d.saving) {
+            self.plan_save_dialog = None;
+        }
+    }
+
+    pub(crate) fn submit_plan_save(&mut self) {
+        let Some(dialog) = self.plan_save_dialog.as_mut() else {
+            return;
+        };
+        if dialog.saving {
+            return;
+        }
+        let raw_path = dialog.path_edit.text.clone();
+        let relative_path = raw_path.trim().to_owned();
+        if relative_path.is_empty() {
+            self.push_toast(
+                ToastKind::Warning,
+                "Enter a workspace path",
+                None,
+                None,
+                Some(5_000),
+            );
+            return;
+        }
+        self.plan_save_last_path = Some(raw_path);
+        self.next_plan_save_request_id += 1;
+        let req_id = self.next_plan_save_request_id;
+        dialog.saving = true;
+        dialog.request_id = Some(req_id);
+        let machine = dialog.machine.clone();
+        let cwd = dialog.cwd.clone();
+        let contents = dialog.contents.clone();
+        if let Some(client) = &self.client {
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                self.apply_plan_save_result(req_id, Err("Machine unavailable.".into()));
+                return;
+            };
+            if !target.has_capability(crate::protocol::PROJECT_WRITE_FILE) {
+                self.apply_plan_save_result(
+                    req_id,
+                    Err("This server needs an update to save plans to the workspace.".into()),
+                );
+                return;
+            }
+            target.call_rpc(
+                format!("write-plan:{req_id}"),
+                "project.writeFile",
+                json!({
+                    "cwd": cwd,
+                    "relativePath": relative_path,
+                    "contents": contents,
+                }),
+            );
+        } else if machine != "local" {
+            self.apply_plan_save_result(req_id, Err("Machine unavailable.".into()));
+        } else {
+            let result =
+                crate::projects::write_project_file(&crate::protocol::ProjectWriteFileInput {
+                    cwd,
+                    relative_path,
+                    contents,
+                });
+            self.apply_plan_save_result(req_id, result);
+        }
+    }
+
+    pub(crate) fn apply_plan_save_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::protocol::ProjectWriteFileResult, String>,
+    ) {
+        let Some(dialog) = self.plan_save_dialog.as_mut() else {
+            return;
+        };
+        if dialog.request_id != Some(req_id) {
+            return;
+        }
+        match result {
+            Ok(written) => {
+                self.plan_save_dialog = None;
+                self.push_toast(
+                    ToastKind::Success,
+                    "Plan saved to workspace",
+                    Some(written.relative_path),
+                    None,
+                    Some(5_000),
+                );
+            }
+            Err(error) => {
+                dialog.saving = false;
+                dialog.request_id = None;
+                self.push_toast(
+                    ToastKind::Error,
+                    "Could not save plan",
+                    Some(error),
+                    None,
+                    Some(5_000),
+                );
+            }
+        }
+    }
+
     pub(crate) fn notify_background_started(&mut self, server: &str, thread_id: usize) {
         self.push_toast(
             ToastKind::Success,
@@ -9637,6 +9833,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             && expires > at
         {
             tx.wake_after(Duration::from_millis(expires - at));
+        }
+    }
+    if let Some((_, expires)) = &state.plan_copied {
+        if *expires <= at {
+            state.plan_copied = None;
+            changed = true;
+        } else {
+            tx.wake_after(Duration::from_millis(*expires - at));
         }
     }
     if let Some(error) = state
