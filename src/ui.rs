@@ -43,6 +43,8 @@ pub(crate) mod composer_ui;
 mod crew_ui;
 #[path = "diff_panel.rs"]
 pub(crate) mod diff_panel;
+#[path = "diff_tree.rs"]
+pub(crate) mod diff_tree;
 #[path = "markdown_ui.rs"]
 mod markdown_ui;
 #[path = "pi_ui.rs"]
@@ -17165,6 +17167,8 @@ pub(crate) mod tests {
             base_ref: None,
             rows: vec![],
             rows_version: 0,
+            tree_rows: vec![],
+            tree_version: 0,
         }))
     }
 
@@ -17281,6 +17285,8 @@ pub(crate) mod tests {
                         base_ref: None,
                         rows: vec![],
                         rows_version: 0,
+                        tree_rows: vec![],
+                        tree_version: 0,
                     }))),
                     last_refresh_at: Some(std::time::Instant::now()),
                     ..Default::default()

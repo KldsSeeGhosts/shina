@@ -130,6 +130,10 @@ pub struct Ready {
     /// (never per frame) and versioned so row keys re-commit after a rebuild.
     pub rows: Vec<DiffRow>,
     pub rows_version: u64,
+    /// The file tree's flat rows beside the list, rebuilt on the same changes
+    /// and on folder-collapse toggles (`diff_tree::flatten_tree`).
+    pub tree_rows: Vec<diff_tree::DiffTreeRow>,
+    pub tree_version: u64,
 }
 
 /// What the last preview left to show; mirrors KSG's empty-state chain.
@@ -171,6 +175,17 @@ pub struct ThreadDiff {
     /// The `diff-file-*` row a reveal resolved to; the body's one-shot marker
     /// scrolls it to the list's top, then clears the flag.
     pub reveal_row: Option<String>,
+    /// Collapsed folder chains of the diff file tree, per thread and session
+    /// only (KSG's Pierre tree keeps the same set for a panel mount).
+    pub dirs_collapsed: HashSet<String>,
+    /// The file the diff scroll position marks in the tree — KSG's
+    /// `lastViewedFileKey`, the file whose section tops the viewport.
+    pub current_file: Option<usize>,
+    /// The tree row the keyboard cursor sits on.
+    pub tree_cursor: usize,
+    /// A one-shot `diff-tree-*` key the tree scrolls into view after a
+    /// selection sync; the column's marker clears it like `reveal_row`.
+    pub tree_sync: Option<String>,
 }
 
 impl ThreadDiff {
@@ -372,6 +387,8 @@ fn preview_done(scope: Scope, cwd: &str, result: ReviewDiffPreviewResult) -> Don
         base_ref: source.base_ref.clone(),
         rows: Vec::new(),
         rows_version: 0,
+        tree_rows: Vec::new(),
+        tree_version: 0,
     };
     let stats = source.files.unwrap_or_default();
     // KSG `lazySource`: deferred patches (or a truncated inline patch with
@@ -1047,6 +1064,8 @@ impl State {
         if let Some(Done::Ready(ready)) = &mut diff.done {
             ready.rows = flatten(&ready.files, hide, collapsed);
             ready.rows_version += 1;
+            ready.tree_rows = diff_tree::flatten_tree(&ready.files, hide, &diff.dirs_collapsed);
+            ready.tree_version += 1;
         }
     }
 
@@ -1107,7 +1126,9 @@ pub(crate) fn reveal_file(state: &mut State, panel_key: &str, path: &str) {
 /// The ready half of `reveal_file`: match the path, unfold the file, fetch
 /// its patch when it is still a stat row, and name its header row the scroll
 /// target. `hide-tests` filtered files leave no row, so they skip the scroll.
-fn apply_reveal(state: &mut State, panel_key: &str, path: &str) {
+/// The file tree calls this for its presses (KSG `onSelectFile`); the same
+/// selection sync marks the file and opens its folder chain in the tree.
+pub(crate) fn apply_reveal(state: &mut State, panel_key: &str, path: &str) {
     let index = {
         let Some(ready) = state.diffs.get(panel_key).and_then(ThreadDiff::ready) else {
             return;
@@ -1145,6 +1166,32 @@ fn apply_reveal(state: &mut State, panel_key: &str, path: &str) {
             _ => None,
         })
     });
+    diff.current_file = Some(index);
+    // KSG's selection sync expands every ancestor of the selected path so its
+    // tree row exists, then scrolls that row into view.
+    let ancestors = diff
+        .ready()
+        .map(|ready| diff_tree::ancestor_dirs(&ready.files[index].file.path))
+        .unwrap_or_default();
+    let mut dirty = false;
+    for dir in ancestors {
+        dirty |= diff.dirs_collapsed.remove(&dir);
+    }
+    if dirty {
+        diff.tree_sync = None;
+        // `diff`'s borrow ends here so the rebuild can take `state` again.
+        state.diff_rebuild_tree(panel_key);
+        let Some(diff) = state.diffs.get_mut(panel_key) else {
+            return;
+        };
+        diff.tree_sync = diff
+            .ready()
+            .and_then(|ready| diff_tree::file_row_key(ready, index));
+    } else {
+        diff.tree_sync = diff
+            .ready()
+            .and_then(|ready| diff_tree::file_row_key(ready, index));
+    }
 }
 
 /// A timeline path names a diff file when it equals the file's path relative
@@ -1925,46 +1972,48 @@ fn ready_body(p: Palette, panel_key: &str, ready: &Ready) -> El {
     let key = panel_key.to_string();
     let key2 = panel_key.to_string();
     let key3 = panel_key.to_string();
-    body.child(
-        col()
-            .key("diff-rows")
-            .grow(1.0)
-            .min_h(0.0)
-            .min_w(0.0)
-            .scroll_xy()
-            .child(
-                col()
-                    .key("diff-rows-virtual")
-                    .growth(Default::default())
-                    .virtual_rows(
-                        row_count,
-                        LINE_H,
-                        move |s: &State, i| -> Cow<'_, str> {
-                            s.diffs
-                                .get(&key)
-                                .and_then(ThreadDiff::ready)
-                                .and_then(|ready| ready.rows.get(i))
-                                .map(|row| Cow::Borrowed(row.key()))
-                                .unwrap_or_else(|| Cow::Owned(format!("diff-row-missing-{i}")))
-                        },
-                        move |s: &State, i| diff_row(s, palette(s.dark), &key2, i),
-                    )
-                    .virtual_rows_version(version)
-                    // The list-end boundary becoming visible fetches the next
-                    // batch, KSG's renderLoadingBoundary.
-                    .on_visible_rows(move |s: &mut State, range| {
-                        let needs =
-                            s.diffs
-                                .get(&key3)
-                                .and_then(ThreadDiff::ready)
-                                .is_some_and(|ready| {
-                                    matches!(ready.rows.last(), Some(DiffRow::Boundary { .. }))
-                                        && range.end >= ready.rows.len()
-                                });
-                        needs && s.diff_load_next(&key3)
-                    }),
-            ),
-    )
+    let key4 = panel_key.to_string();
+    let list = col()
+        .key("diff-rows")
+        .grow(1.0)
+        .min_h(0.0)
+        .min_w(0.0)
+        .scroll_xy()
+        .child(
+            col()
+                .key("diff-rows-virtual")
+                .growth(Default::default())
+                .virtual_rows(
+                    row_count,
+                    LINE_H,
+                    move |s: &State, i| -> Cow<'_, str> {
+                        s.diffs
+                            .get(&key)
+                            .and_then(ThreadDiff::ready)
+                            .and_then(|ready| ready.rows.get(i))
+                            .map(|row| Cow::Borrowed(row.key()))
+                            .unwrap_or_else(|| Cow::Owned(format!("diff-row-missing-{i}")))
+                    },
+                    move |s: &State, i| diff_row(s, palette(s.dark), &key2, i),
+                )
+                .virtual_rows_version(version)
+                // The list-end boundary becoming visible fetches the next
+                // batch, KSG's renderLoadingBoundary; the first visible row
+                // also drives the file tree's current-file mark.
+                .on_visible_rows(move |s: &mut State, range| {
+                    s.diff_note_visible(&key4, range.start);
+                    let needs =
+                        s.diffs
+                            .get(&key3)
+                            .and_then(ThreadDiff::ready)
+                            .is_some_and(|ready| {
+                                matches!(ready.rows.last(), Some(DiffRow::Boundary { .. }))
+                                    && range.end >= ready.rows.len()
+                            });
+                    needs && s.diff_load_next(&key3)
+                }),
+        );
+    body.child(list)
 }
 
 /// A one-shot scroll trigger for `reveal_file`'s resolved row: mounting it
@@ -2542,6 +2591,8 @@ mod tests {
                 source_kind: ReviewSourceKind::WorkingTree,
                 base_ref: None,
                 rows: vec![],
+                tree_rows: vec![],
+                tree_version: 0,
                 rows_version: 0,
             }))),
             ..ThreadDiff::default()

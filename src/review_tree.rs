@@ -1,4 +1,6 @@
-#![allow(dead_code)] // The tree-sidebar entries and sorts wait on the diff file tree.
+#![allow(dead_code)] // `tree_entries`, `TreeEntry`, `collect_directory_paths`,
+// `compare_positioned_tree_entries` and `compare_tree_entries` are still
+// test-only; the diff file tree builds its rows in `diff_tree.rs`.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
