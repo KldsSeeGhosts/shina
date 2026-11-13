@@ -34,7 +34,9 @@ pub fn delimiter(name: &str, mime: &str) -> Option<u8> {
         | "text/plain"
         | "application/octet-stream"
         | "binary/octet-stream"
-        | "application/unknown" => {
+        | "application/unknown"
+        | "video/mp2t"
+        | "video/vnd.dlna.mpeg-tts" => {
             let name = name.to_ascii_lowercase();
             if name.ends_with(".csv") {
                 Some(b',')

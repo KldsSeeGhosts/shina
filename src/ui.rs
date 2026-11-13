@@ -17,6 +17,8 @@ mod attachment_archive_preview;
 pub(crate) mod attachment_preview;
 #[path = "attachment_sqlite_preview.rs"]
 mod attachment_sqlite_preview;
+#[path = "attachment_table_preview.rs"]
+mod attachment_table_preview;
 #[path = "attachment_text_preview.rs"]
 mod attachment_text_preview;
 #[path = "captain_ui.rs"]
