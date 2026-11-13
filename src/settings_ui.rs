@@ -482,6 +482,7 @@ impl State {
         ctx.composer_requires_modifier =
             crate::composer::requires_modifier(self.preferences.send_shortcut, &t.draft.text);
         ctx.model_picker_open = self.settings_picker == Some(SettingsPicker::Model);
+        ctx.right_panel_open = self.right_panel().open;
         ctx
     }
 

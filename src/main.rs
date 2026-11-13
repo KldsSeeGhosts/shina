@@ -306,6 +306,22 @@ fn dispatch_global_command(
             }
             state.checkpoint();
         }
+        "rightPanel.toggle" => state.right_panel_toggle(),
+        "diff.toggle" => state.right_panel_toggle_diff(),
+        "rightPanel.toggleMaximized" => {
+            // KSG ignores repeats here, and gates the toggle on the panel being open.
+            if !key_repeat {
+                state.right_panel_toggle_maximized();
+            }
+        }
+        "rightPanel.close" => {
+            // KSG returns false without an active surface so the key can fall through, and
+            // ignores repeats.
+            if key_repeat {
+                return true;
+            }
+            return state.right_panel_close_active();
+        }
         "composer.focus" => {
             state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
