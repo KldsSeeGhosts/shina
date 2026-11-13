@@ -1174,6 +1174,24 @@ impl Thread {
         true
     }
 
+    pub(crate) fn refresh_estimated_breakdown(&mut self) {
+        if self.harness == "claude" {
+            return;
+        }
+        let Some(used_tokens) = self.context.usage.tokens.filter(|tokens| *tokens > 0) else {
+            self.context.usage.breakdown = None;
+            return;
+        };
+        let totals = crate::context_breakdown::thread_char_totals(
+            &self.messages,
+            &self.tools,
+            &self.thoughts,
+            &self.native.compactions,
+        );
+        self.context.usage.breakdown =
+            crate::context_breakdown::estimate_context_breakdown(&totals, used_tokens);
+    }
+
     /// Asks Pi for the current context window. Event-driven only: startup, a completed turn,
     /// a model change and compaction completion call this. Nothing polls on a timer.
     fn refresh_context_usage(&mut self) -> bool {
@@ -2027,7 +2045,9 @@ impl Thread {
                 // Context stats are optional telemetry. A rejected or stale request must never
                 // surface as a conversation error, and it must not disturb configuring.
                 if command == "get_session_stats" {
-                    self.context.accept_response(&record);
+                    if self.context.accept_response(&record) {
+                        self.refresh_estimated_breakdown();
+                    }
                     self.drive_session();
                     return;
                 }
@@ -8650,6 +8670,13 @@ impl State {
                     {
                         thread.model_options = parsed;
                     }
+                    if let Some(breakdown) = record.get("contextBreakdown")
+                        && let Ok(parsed) = serde_json::from_value::<
+                            Option<Vec<crate::context_breakdown::ContextBreakdownRow>>,
+                        >(breakdown.clone())
+                    {
+                        thread.context.usage.breakdown = parsed;
+                    }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
                     }
@@ -9505,6 +9532,7 @@ impl Thread {
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,
+            "contextBreakdown":self.context.usage.breakdown,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
         record
@@ -15738,5 +15766,50 @@ mod tests {
         let dismiss_id = async_state.toasts[0].id;
         async_state.dismiss_toast(dismiss_id);
         assert!(async_state.toasts.is_empty());
+    }
+
+    #[test]
+    fn context_breakdown_metadata_round_trips_and_decodes_legacy_records() {
+        let mut state = State::new(".".into(), false);
+        let rows = vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 12_000,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Autocompact buffer".into(),
+                tokens: 30_000,
+                kind: crate::context_breakdown::BreakdownRowKind::Buffer,
+            },
+        ];
+        state.current_mut().context.usage.breakdown = Some(rows.clone());
+        let with_breakdown = state.snapshot();
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_breakdown).unwrap();
+        assert_eq!(restored.current().context.usage.breakdown, Some(rows));
+
+        // Removing contextBreakdown simulates an older peer / legacy index.
+        let mut legacy = with_breakdown;
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("contextBreakdown");
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().context.usage.breakdown, None);
+
+        // Without breakdown on the thread, round-trip stays None.
+        state.current_mut().context.usage.breakdown = None;
+        let without_breakdown = state.snapshot();
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_breakdown).unwrap();
+        assert_eq!(restored_none.current().context.usage.breakdown, None);
+
+        // Wire compatibility for ContextUsage projection without breakdown.
+        let old_wire = json!({"tokens": 1000, "context_window": 200000, "percent": 0.5});
+        let decoded: crate::context::ContextUsage = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(decoded.breakdown, None);
     }
 }

@@ -19,6 +19,7 @@ mod composer_skills;
 mod composer_sources;
 mod composer_tokens;
 mod context;
+mod context_breakdown;
 mod crisp;
 mod database;
 mod descriptors;

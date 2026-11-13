@@ -10151,6 +10151,11 @@ fn context_toggle(s: &mut State) {
 fn context_ring(t: &Thread, p: Palette) -> El {
     let limit = context_limit(t);
     let open = t.context.popover_open();
+    let first_legend_key = open
+        .then(|| context_legend_for_thread(t))
+        .flatten()
+        .and_then(|legend| breakdown_keys(&legend).into_iter().next())
+        .map(|(_, legend_key)| legend_key);
     el().key("context-usage-ring")
         .role("button")
         .cursor(rune::Cursor::Pointer)
@@ -10163,9 +10168,17 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         .fill(if open { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(context_toggle)
-        .on_key(|s: &mut State, event, _| {
+        .on_key(move |s: &mut State, event, tx| {
             if event.key == rune::Key::Enter {
                 context_toggle(s);
+                return true;
+            }
+            if event.key == rune::Key::Tab
+                && !event.mods.shift
+                && let Some(first) = &first_legend_key
+            {
+                tx.focus(first.as_str(), true);
+                s.current_mut().context.focus_segment(Some(0));
                 return true;
             }
             context_escape(s, event)
@@ -10423,15 +10436,268 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
     card
 }
 
-/// The usage popover, ported from KSG Code's `ContextWindowMeter` popup (the branch without a
-/// breakdown, which is what Pi reports): a `w-64` tooltip-style card above the ring, aligned to
-/// its end, with "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, a
-/// `h-1.5` usage bar, total processed and cost rows, the compaction state, and a full-width
+/// Derives the breakdown legend for a thread when breakdown rows are available.
+fn context_legend_for_thread(
+    t: &Thread,
+) -> Option<Vec<crate::context_breakdown::ContextLegendItem>> {
+    let limit = context_limit(t);
+    let usage = &t.context.usage;
+    let used_tokens = usage.tokens.unwrap_or_else(|| {
+        usage
+            .breakdown
+            .as_deref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.kind != crate::context_breakdown::BreakdownRowKind::Buffer)
+                    .map(|r| r.tokens)
+                    .sum()
+            })
+            .unwrap_or(0)
+    });
+    crate::context_breakdown::build_context_legend(usage.breakdown.as_deref(), limit, used_tokens)
+}
+
+fn breakdown_slug(label: &str, kind: crate::context_breakdown::ContextLegendKind) -> String {
+    use crate::context_breakdown::ContextLegendKind;
+    match kind {
+        ContextLegendKind::Other => "other".into(),
+        ContextLegendKind::Buffer => "buffer".into(),
+        ContextLegendKind::Free => "free".into(),
+        ContextLegendKind::Used | ContextLegendKind::Estimated | ContextLegendKind::Inferred => {
+            let mut slug = String::with_capacity(label.len());
+            let mut prev_dash = false;
+            for ch in label.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    slug.push(ch.to_ascii_lowercase());
+                    prev_dash = false;
+                } else if !prev_dash && !slug.is_empty() {
+                    slug.push('-');
+                    prev_dash = true;
+                }
+            }
+            while slug.ends_with('-') {
+                slug.pop();
+            }
+            if slug.is_empty() {
+                "segment".into()
+            } else {
+                slug
+            }
+        }
+    }
+}
+
+fn breakdown_keys(legend: &[crate::context_breakdown::ContextLegendItem]) -> Vec<(String, String)> {
+    use crate::context_breakdown::ContextLegendKind;
+    let mut seen = std::collections::HashSet::new();
+    legend
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let base = breakdown_slug(&item.label, item.kind);
+            let unique = if seen.insert(base.clone()) {
+                base
+            } else {
+                let disambiguated = format!("{base}-{index}");
+                seen.insert(disambiguated.clone());
+                disambiguated
+            };
+            let segment_key = if item.kind == ContextLegendKind::Buffer {
+                "context-breakdown-reserve".to_owned()
+            } else {
+                format!("context-breakdown-segment-{unique}")
+            };
+            let legend_key = format!("context-breakdown-legend-{unique}");
+            (segment_key, legend_key)
+        })
+        .collect()
+}
+
+/// Distinct existing Palette fills per segment kind, ordered by preference:
+/// primary accent for the largest conversational segment, then status/existing fields.
+fn breakdown_segment_color(
+    kind: crate::context_breakdown::ContextLegendKind,
+    conversational_index: usize,
+    p: Palette,
+) -> Color {
+    use crate::context_breakdown::ContextLegendKind;
+    match kind {
+        ContextLegendKind::Used | ContextLegendKind::Estimated => {
+            let colors = [p.coral, p.sea, p.brass, p.ink, p.frame, p.message_bg];
+            colors[conversational_index % colors.len()]
+        }
+        ContextLegendKind::Inferred => p.muted,
+        ContextLegendKind::Other => p.field_line,
+        ContextLegendKind::Free => p.line,
+        ContextLegendKind::Buffer => p.faint,
+    }
+}
+
+/// Segmented context breakdown bar and legend, ported from KSG Code's
+/// `ContextWindowMeter.tsx` (`ContextWindowBreakdown`).
+fn context_breakdown_view(
+    legend: &[crate::context_breakdown::ContextLegendItem],
+    approximate: bool,
+    active_segment: Option<usize>,
+    p: Palette,
+) -> El {
+    use crate::context_breakdown::ContextLegendKind;
+    let keys = breakdown_keys(legend);
+    let legend_keys: Vec<String> = keys.iter().map(|(_, lk)| lk.clone()).collect();
+    let total_tokens: u64 = legend.iter().map(|item| item.tokens).sum();
+
+    let mut conversational_count = 0usize;
+    let mut bar = row()
+        .key("context-breakdown-bar")
+        .role("img")
+        .label("Context window breakdown")
+        .w_full()
+        .h(6.0);
+    let mut rows = col().key("context-breakdown-legend").w_full().gap(2.0);
+
+    for (index, item) in legend.iter().enumerate() {
+        let color = breakdown_segment_color(item.kind, conversational_count, p);
+        if matches!(
+            item.kind,
+            ContextLegendKind::Used | ContextLegendKind::Estimated
+        ) {
+            conversational_count += 1;
+        }
+        let (segment_key, legend_key) = &keys[index];
+        let opacity = if active_segment.is_none() || active_segment == Some(index) {
+            1.0
+        } else {
+            0.35
+        };
+
+        let mut segment = el()
+            .key(segment_key.clone())
+            .w(0.0)
+            .grow(item.tokens.max(1) as f32)
+            .min_w(0.0)
+            .h_full()
+            .opacity(opacity);
+        if item.kind == ContextLegendKind::Buffer {
+            segment = segment.border(2.0, p.faint);
+        } else {
+            segment = segment.fill(color);
+        }
+        bar = bar.child(segment);
+
+        let prefix = if approximate
+            && !matches!(
+                item.kind,
+                ContextLegendKind::Free | ContextLegendKind::Buffer
+            ) {
+            "~"
+        } else {
+            ""
+        };
+        let count_label = format!("{prefix}{}", context_tokens_text(item.tokens));
+        let pct_label = if total_tokens > 0 {
+            context_percent_text(item.tokens as f64 * 100.0 / total_tokens as f64)
+        } else {
+            "0%".into()
+        };
+
+        let mut swatch = el().size(8.0, 8.0);
+        if item.kind == ContextLegendKind::Buffer {
+            swatch = swatch.border(2.0, p.faint);
+        } else {
+            swatch = swatch.fill(color);
+        }
+
+        let nav_keys = legend_keys.clone();
+        let legend_row = row()
+            .key(legend_key.clone())
+            .role("button")
+            .focusable(true)
+            .w_full()
+            .min_h(16.0)
+            .px(2.0)
+            .gap(6.0)
+            .center_y()
+            .hover(p.selected)
+            .focus_fill(p.selected)
+            .label(format!("{}, {}, {}", item.label, count_label, pct_label))
+            .on_hover_change(move |s: &mut State, inside, _| {
+                s.current_mut().context.hover_segment(index, inside);
+            })
+            .on_press(move |s: &mut State| {
+                s.current_mut().context.focus_segment(Some(index));
+            })
+            .on_key(move |s: &mut State, event, tx| {
+                let count = nav_keys.len();
+                match event.key {
+                    rune::Key::Tab if !event.mods.shift => {
+                        if index + 1 < count {
+                            tx.focus(nav_keys[index + 1].as_str(), true);
+                            s.current_mut().context.focus_segment(Some(index + 1));
+                            true
+                        } else {
+                            s.current_mut().context.focus_segment(None);
+                            false
+                        }
+                    }
+                    rune::Key::Tab if event.mods.shift => {
+                        if index > 0 {
+                            tx.focus(nav_keys[index - 1].as_str(), true);
+                            s.current_mut().context.focus_segment(Some(index - 1));
+                            true
+                        } else {
+                            s.current_mut().context.focus_segment(None);
+                            false
+                        }
+                    }
+                    rune::Key::Down | rune::Key::Right => {
+                        let next = (index + 1) % count;
+                        tx.focus(nav_keys[next].as_str(), true);
+                        s.current_mut().context.focus_segment(Some(next));
+                        true
+                    }
+                    rune::Key::Up | rune::Key::Left => {
+                        let prev = (index + count - 1) % count;
+                        tx.focus(nav_keys[prev].as_str(), true);
+                        s.current_mut().context.focus_segment(Some(prev));
+                        true
+                    }
+                    _ => context_escape(s, event),
+                }
+            })
+            .child(swatch)
+            .child(
+                label(&item.label, SMALL.lh(16.0), p.muted)
+                    .truncate()
+                    .min_w(0.0)
+                    .grow(1.0),
+            )
+            .child(label(count_label, TIMER, p.ink))
+            .child(label(pct_label, TIMER, p.muted));
+        rows = rows.child(legend_row);
+    }
+
+    let framed_bar = el()
+        .w_full()
+        .border(2.0, p.frame)
+        .border_layout()
+        .child(bar);
+    col().w_full().gap(8.0).child(framed_bar).child(rows)
+}
+
+/// The usage popover, ported from KSG Code's `ContextWindowMeter` popup: a `w-64` (or `w-80`
+/// with a segmented breakdown) tooltip-style card above the ring, aligned to its end, with
+/// "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, the breakdown or
+/// aggregate usage bar, total processed and cost rows, the compaction state, and a full-width
 /// "Compact context" button.
 fn context_popover(s: &State, p: Palette) -> El {
     let t = s.current();
     let limit = context_limit(t);
     let usage = &t.context.usage;
+    let legend = context_legend_for_thread(t);
+    let last_legend_key = legend
+        .as_deref()
+        .and_then(|items| breakdown_keys(items).into_iter().last())
+        .map(|(_, legend_key)| legend_key);
     // Figures are Departure Mono with tabular digits; their names stay Inter.
     let secondary = TIMER;
     let strong = TIMER;
@@ -10458,7 +10724,7 @@ fn context_popover(s: &State, p: Palette) -> El {
         .key("context-details")
         .role("dialog")
         .label("Context window")
-        .w(256.0)
+        .w(if legend.is_some() { 320.0 } else { 256.0 })
         .padding(12.0)
         .gap(8.0)
         .radius(6.0)
@@ -10478,7 +10744,16 @@ fn context_popover(s: &State, p: Palette) -> El {
                 .child(spacer())
                 .child(figures),
         );
-    if let Some(limit) = limit
+    if let Some(legend) = &legend {
+        let approximate =
+            crate::context_breakdown::is_approximate(usage.breakdown.as_deref(), Some(legend));
+        card = card.child(context_breakdown_view(
+            legend,
+            approximate,
+            t.context.active_segment(),
+            p,
+        ));
+    } else if let Some(limit) = limit
         && limit > 0
     {
         let fraction = usage.percent.unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0;
@@ -10621,10 +10896,26 @@ fn context_popover(s: &State, p: Palette) -> El {
         .child(icon("minimize", p.ink).size(14.0, 14.0))
         .child(label("Compact context", TextStyle::new(12.0, 500.0), p.ink));
     if can_compact {
-        compact = compact.focusable(true).on_press(|s: &mut State| {
-            s.current_mut().context.close_popover();
-            s.compact_context(None);
-        });
+        let legend_count = legend.as_ref().map(|items| items.len()).unwrap_or(0);
+        compact = compact
+            .focusable(true)
+            .on_press(|s: &mut State| {
+                s.current_mut().context.close_popover();
+                s.compact_context(None);
+            })
+            .on_key(move |s: &mut State, event, tx| {
+                if event.key == rune::Key::Tab
+                    && event.mods.shift
+                    && let Some(last) = &last_legend_key
+                {
+                    tx.focus(last.as_str(), true);
+                    s.current_mut()
+                        .context
+                        .focus_segment(Some(legend_count - 1));
+                    return true;
+                }
+                context_escape(s, event)
+            });
     }
     card = card.child(compact);
     if !can_compact {
@@ -14952,6 +15243,7 @@ pub(crate) mod tests {
                 tokens: Some(60_000),
                 context_window: Some(200_000),
                 percent: Some(30.0),
+                breakdown: None,
             };
             t.draft.replace_text("A short draft");
             t.draft.focused = true;
@@ -16750,6 +17042,7 @@ pub(crate) mod tests {
             tokens: Some(60_000),
             context_window: Some(200_000),
             percent: Some(30.0),
+            breakdown: None,
         };
         thread.draft.replace_text("Ready");
         rt.invalidate();
@@ -16875,6 +17168,7 @@ pub(crate) mod tests {
             tokens: None,
             context_window: Some(200_000),
             percent: None,
+            breakdown: None,
         };
         thread.context.phase = ContextPhase::AwaitingUsage;
         thread.draft.replace_text("Ready");
@@ -16950,6 +17244,7 @@ pub(crate) mod tests {
             tokens: Some(61_400),
             context_window: Some(200_000),
             percent: Some(30.7),
+            breakdown: None,
         };
         thread.native.stats = json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
         thread.draft.replace_text("Ready");
@@ -17346,6 +17641,147 @@ pub(crate) mod tests {
         assert!((quarter[0][0] - 13.0).abs() < 0.001 && quarter[0][1] < 4.0);
         let last = quarter.last().unwrap();
         assert!(last[0] > 22.0 && (last[1] - 13.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn context_breakdown_segments_sum_to_bar_width_and_focus_dims_others() {
+        use crate::context_breakdown::{BreakdownRowKind, ContextBreakdownRow};
+
+        for width in [620.0, 1280.0] {
+            let mut rt = context_fixture(width);
+            rt.state.current_mut().context.details_open = true;
+            rt.invalidate();
+            rt.frame(0.3);
+            assert!(rt.presented("context-details-bar").is_some(), "{width}");
+            assert!(rt.presented("context-breakdown-bar").is_none(), "{width}");
+            rt.state.current_mut().context.close_popover();
+            rt.invalidate();
+            rt.frame(0.3);
+
+            {
+                let thread = rt.state.current_mut();
+                thread.context_window = Some(200_000);
+                thread.context.usage = ContextUsage {
+                    tokens: Some(70_000),
+                    context_window: Some(200_000),
+                    percent: Some(35.0),
+                    breakdown: Some(vec![
+                        ContextBreakdownRow {
+                            label: "Messages".into(),
+                            tokens: 40_000,
+                            kind: BreakdownRowKind::Estimated,
+                        },
+                        ContextBreakdownRow {
+                            label: "Tool output".into(),
+                            tokens: 20_000,
+                            kind: BreakdownRowKind::Estimated,
+                        },
+                        ContextBreakdownRow {
+                            label: "System".into(),
+                            tokens: 10_000,
+                            kind: BreakdownRowKind::Inferred,
+                        },
+                        ContextBreakdownRow {
+                            label: "Autocompact buffer".into(),
+                            tokens: 30_000,
+                            kind: BreakdownRowKind::Buffer,
+                        },
+                    ]),
+                };
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Open via keyboard from the ring, then Tab onto the first legend row.
+            for _ in 0..120 {
+                if focused_key(&rt).as_deref() == Some("context-usage-ring") {
+                    break;
+                }
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Tab,
+                    mods: Default::default(),
+                });
+                rt.frame(0.0);
+            }
+            assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+
+            assert!(rt.presented("context-details-bar").is_none(), "{width}");
+            let (card, _) = rt.presented("context-details").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5,
+                "{width}: breakdown popover leaves window {card:?}"
+            );
+            let (bar, _) = rt.presented("context-breakdown-bar").unwrap();
+            let segment_keys = [
+                "context-breakdown-segment-messages",
+                "context-breakdown-segment-tool-output",
+                "context-breakdown-segment-system",
+                "context-breakdown-reserve",
+                "context-breakdown-segment-free",
+            ];
+            let width_sum: f32 = segment_keys
+                .iter()
+                .map(|key| rt.presented(key).unwrap().0[2])
+                .sum();
+            assert!(
+                (width_sum - bar[2]).abs() <= 1.0,
+                "{width}: segment sum {width_sum} vs bar {}",
+                bar[2]
+            );
+
+            let elements = rt.elements();
+            let legend_label = |key: &str| {
+                elements
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .and_then(|e| e.label.clone())
+                    .unwrap()
+            };
+            assert!(legend_label("context-breakdown-legend-messages").contains("~40k"));
+            assert!(legend_label("context-breakdown-legend-buffer").contains("30k"));
+            assert!(!legend_label("context-breakdown-legend-buffer").contains("~30k"));
+
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert_eq!(
+                focused_key(&rt).as_deref(),
+                Some("context-breakdown-legend-messages")
+            );
+            assert_eq!(rt.state.current().context.focused_segment, Some(0));
+            let opacity = |rt: &Runtime<State>, key: &str| {
+                rt.presented(key)
+                    .map(|(_, opacity)| opacity)
+                    .unwrap_or_else(|| panic!("missing {key}"))
+            };
+            assert_eq!(opacity(&rt, "context-breakdown-segment-messages"), 1.0);
+            for other in &segment_keys[1..] {
+                let op = opacity(&rt, other);
+                assert!(
+                    (op - 0.35).abs() < 0.01,
+                    "{width}: expected {other} dimmed to 0.35, got {op}"
+                );
+            }
+
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Down,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert_eq!(
+                focused_key(&rt).as_deref(),
+                Some("context-breakdown-legend-tool-output")
+            );
+            assert_eq!(opacity(&rt, "context-breakdown-segment-tool-output"), 1.0);
+            assert!((opacity(&rt, "context-breakdown-segment-messages") - 0.35).abs() < 0.01);
+        }
     }
 
     #[test]

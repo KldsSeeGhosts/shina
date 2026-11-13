@@ -1637,6 +1637,7 @@ impl Thread {
                     self.context.cancel_request();
                     self.context
                         .absorb(&json!({"contextUsage":{"tokens":tokens,"contextWindow":window}}));
+                    self.refresh_estimated_breakdown();
                 }
             }
             "queue_update" => {

@@ -1467,3 +1467,59 @@ fn codex_model_value_includes_descriptor_capabilities() {
     assert_eq!(descriptors[0]["currentValue"], "medium");
     assert_eq!(descriptors[1]["id"], "serviceTier");
 }
+
+#[test]
+fn codex_token_usage_notification_produces_estimated_and_inferred_breakdown() {
+    let mut thread = Thread::new(11);
+    thread.harness = "codex".into();
+    thread.apply(json!({
+        "type": "message_start",
+        "message": { "role": "user", "content": [{ "type": "text", "text": &"a".repeat(3500) }] }
+    }));
+    thread.apply(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "args": { "command": "ls" }
+    }));
+    thread.apply(json!({
+        "type": "tool_execution_end",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "isError": false,
+        "result": { "content": [{ "type": "text", "text": &"o".repeat(7000) }] }
+    }));
+
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client
+        .notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": {
+                    "modelContextWindow": 200000,
+                    "last": { "totalTokens": 10000 }
+                }
+            }),
+        )
+        .unwrap();
+    for event in client.events {
+        thread.apply(event);
+    }
+
+    let breakdown = thread
+        .context
+        .usage
+        .breakdown
+        .as_ref()
+        .expect("expected estimated breakdown");
+    assert!(breakdown.iter().any(|r| {
+        r.label == "System" && r.kind == crate::context_breakdown::BreakdownRowKind::Inferred
+    }));
+    assert!(breakdown.iter().any(|r| {
+        r.label == "Messages" && r.kind == crate::context_breakdown::BreakdownRowKind::Estimated
+    }));
+    assert!(breakdown.iter().any(|r| {
+        r.label == "Tool output" && r.kind == crate::context_breakdown::BreakdownRowKind::Estimated
+    }));
+    assert_eq!(breakdown.iter().map(|r| r.tokens).sum::<u64>(), 10000);
+}
