@@ -41,6 +41,7 @@ mod model_picker;
 mod model_selection;
 mod outbox;
 mod peer;
+mod plan_export;
 mod portraits;
 mod power;
 mod process;

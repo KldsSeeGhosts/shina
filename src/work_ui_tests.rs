@@ -569,3 +569,110 @@ fn positional_cards_and_events_before_prose_are_not_moved_below_the_preamble() {
         assert!(event[1] < prose[1], "{kind} moved after prose");
     }
 }
+
+#[test]
+fn proposed_plan_actions_and_collapse_toggle_at_narrow_and_wide_widths() {
+    let long_markdown = format!(
+        "# Long Plan\n\n{}",
+        (1..=24)
+            .map(|i| format!("Line {i} of the proposed plan"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for width in [620.0, 1280.0] {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        t.apply(json!({
+            "type": "harness_update",
+            "field": "plan",
+            "value": { "planId": "long", "markdown": long_markdown }
+        }));
+        t.work[0].expanded = true;
+        let card_id = format!("{}-0", t.id);
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        let actions_key = format!("plan-actions-{card_id}");
+        let collapse_key = format!("plan-collapse-{card_id}");
+        let (actions_rect, _) = rt.presented(&actions_key).expect("actions button");
+        assert!(
+            (actions_rect[2] - 28.0).abs() < 0.5,
+            "{width}: {actions_rect:?}"
+        );
+        assert!(
+            (actions_rect[3] - 28.0).abs() < 0.5,
+            "{width}: {actions_rect:?}"
+        );
+        assert!(
+            rt.presented(&collapse_key).is_some(),
+            "{width}: collapse button"
+        );
+
+        let collapse_btn = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(collapse_key.as_str()))
+            .expect("collapse element");
+        assert_eq!(collapse_btn.label.as_deref(), Some("Expand plan"));
+        let text_nodes = |rt: &rune::Runtime<State>| -> Vec<String> {
+            rt.elements().into_iter().filter_map(|e| e.text).collect()
+        };
+        let texts = text_nodes(&rt);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Line 1 of the proposed plan")),
+            "{width}: preview should include first line"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("Line 24 of the proposed plan")),
+            "{width}: collapsed preview should hide line 24"
+        );
+
+        press(&mut rt, &collapse_key);
+        let collapse_btn = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(collapse_key.as_str()))
+            .expect("collapse element after expand");
+        assert_eq!(collapse_btn.label.as_deref(), Some("Collapse plan"));
+        let texts = text_nodes(&rt);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Line 24 of the proposed plan")),
+            "{width}: expanded body should show line 24"
+        );
+
+        press(&mut rt, &collapse_key);
+        let collapse_btn = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(collapse_key.as_str()))
+            .expect("collapse element after re-collapse");
+        assert_eq!(collapse_btn.label.as_deref(), Some("Expand plan"));
+        let texts = text_nodes(&rt);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("Line 24 of the proposed plan")),
+            "{width}: re-collapsed preview should hide line 24"
+        );
+
+        press(&mut rt, &actions_key);
+        assert!(
+            rt.presented(&format!("plan-copy-{card_id}")).is_some(),
+            "{width}"
+        );
+        assert!(
+            rt.presented(&format!("plan-download-{card_id}")).is_some(),
+            "{width}"
+        );
+        assert!(
+            rt.presented(&format!("plan-save-{card_id}")).is_some(),
+            "{width}"
+        );
+    }
+}

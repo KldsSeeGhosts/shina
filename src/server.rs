@@ -667,6 +667,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         }
                         deferred_work = minor >= 11;
                         if deferred_work { capabilities.push(protocol::DEFERRED_WORK); }
+                        if minor >= 12 { capabilities.push(protocol::PROJECT_WRITE_FILE); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -754,6 +755,24 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         database.authorize(&device, "filesystem.browse", &json!({}))?;
                         serde_json::to_value(listing).map_err(|_| "Could not encode the folder listing.".into())
                     }).await.unwrap_or_else(|_| Err("Folder listing failed.".into()))
+                } else if method == "project.writeFile" {
+                    let args = params.get("args").unwrap_or(params);
+                    match serde_json::from_value::<protocol::ProjectWriteFileInput>(args.clone()) {
+                        Err(_) => Err("Invalid project.writeFile parameters.".into()),
+                        Ok(input) => {
+                            let database = shared.database.clone();
+                            let device = device.clone();
+                            tokio::task::spawn_blocking(move || {
+                                database.authorize(&device, "project.writeFile", &json!({}))?;
+                                let written = crate::projects::write_project_file(&input)?;
+                                database.authorize(&device, "project.writeFile", &json!({}))?;
+                                serde_json::to_value(written)
+                                    .map_err(|_| "Could not encode the file write result.".into())
+                            })
+                            .await
+                            .unwrap_or_else(|_| Err("Writing workspace file failed.".into()))
+                        }
+                    }
                 } else if method == "peer.thread.wait" {
                     crate::model::wait_for_peer_thread(snapshots.clone(), shared.database.clone(),
                         device.clone(), shared.discovery.server_id.clone(), params["args"].clone()).await
@@ -1577,6 +1596,82 @@ mod tests {
             assert!(fallback.contains("needs an update") && fallback.contains("Type a path"));
             let typed = crate::client::remote_rpc(&older_link, "project.put", json!({"path":folder})).await.unwrap();
             assert_eq!(typed["status"], "accepted");
+        });
+    }
+
+    #[test]
+    fn project_write_file_writes_inside_cwd_and_rejects_escapes() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("write-file").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+            let workspace = fixture.shared.directory.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(hello["protocolMinor"].as_u64().unwrap_or(0) >= 12);
+            assert!(crate::client::supports_project_write_file(&hello));
+
+            let written = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "docs/plans/my-plan.md",
+                    "contents": "# Plan\n\nBody\n"
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(written["relativePath"], "docs/plans/my-plan.md");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("docs/plans/my-plan.md")).unwrap(),
+                "# Plan\n\nBody\n"
+            );
+
+            let abs_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": workspace.join("abs.md"),
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!abs_err.is_empty());
+            assert!(!workspace.join("abs.md").exists());
+
+            let escape_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "../escaped.md",
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!escape_err.is_empty());
+            assert!(!fixture.shared.directory.join("escaped.md").exists());
+
+            let nested_escape_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "docs/../../escaped.md",
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!nested_escape_err.is_empty());
+            assert!(!fixture.shared.directory.join("escaped.md").exists());
         });
     }
 

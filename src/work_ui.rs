@@ -605,16 +605,16 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
     body
 }
 
-/// Ported from KSG's todo_list/proposed_plan inspector. The informational frame
-/// follows the brief's outlined card, while Markdown uses Shina's existing renderer.
+/// Ported from KSG Code's `ProposedPlanCard` (`components/chat/ProposedPlanCard.tsx`)
+/// and todo_list/proposed_plan inspector. The informational frame follows the brief's outlined
+/// card, while Markdown uses Shina's existing renderer.
 pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
     let id = format!("{}-{index}", t.id);
     let plan = crate::work::plan_data(&tool.input);
-    let displayed = plan["markdown"]
-        .as_str()
-        .map(crate::thread_find::plan_parts);
+    let plan_markdown = plan["markdown"].as_str();
+    let displayed = plan_markdown.map(crate::thread_find::plan_parts);
     let query = (s.thread_find_active() && !s.thread_find.query.text.trim().is_empty())
         .then(|| s.thread_find.query.text.trim());
     let active_occ = query.and_then(|_| {
@@ -650,13 +650,34 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
                 highlight
             }));
     }
-    let mut body = col().min_w(0.0).gap(8.0).child(
-        row()
-            .center_y()
-            .gap(8.0)
-            .child(icon(kind_icon(ToolKind::Plan), p.muted))
-            .child(title_label),
-    );
+    let mut header = row()
+        .min_w(0.0)
+        .center_y()
+        .gap(8.0)
+        .child(icon(kind_icon(ToolKind::Plan), p.muted))
+        .child(title_label.grow(1.0).min_w(0.0));
+    if plan_markdown.is_some() {
+        let menu_open = s.plan_menu.as_deref() == Some(id.as_str());
+        let menu_id = id.clone();
+        header = header.child(
+            toggle_button(
+                &format!("plan-actions-{id}"),
+                "Plan actions",
+                "more",
+                menu_open,
+                p,
+                move |s| {
+                    if s.plan_menu.as_deref() == Some(menu_id.as_str()) {
+                        s.plan_menu = None;
+                    } else {
+                        s.plan_menu = Some(menu_id.clone());
+                    }
+                },
+            )
+            .size(28.0, 28.0),
+        );
+    }
+    let mut body = col().min_w(0.0).gap(8.0).child(header);
     if let Some(explanation) = plan["explanation"].as_str().filter(|s| !s.is_empty()) {
         body = body.child(
             label(explanation, SMALL, p.muted)
@@ -709,26 +730,72 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
     {
         body = body.child(block(format!("plan-steps-{id}"), steps, false));
     }
-    if let Some((_, markdown)) = displayed.as_ref().filter(|(_, body)| !body.is_empty()) {
-        body = body.child(block(
-            format!("plan-markdown-{id}"),
-            markdown_ui::render_with_find(
-                markdown,
-                p,
-                s.dark,
-                s.viewport_width >= WIDE_PANE,
-                false,
-                !tool.done,
-                &format!("plan-{id}"),
-                query.map(|query| {
-                    (
-                        query,
-                        active_occ.and_then(|occ| occ.checked_sub(title_count)),
-                    )
-                }),
-            ),
+    let can_collapse = plan_markdown.is_some_and(crate::plan_export::can_collapse_plan);
+    let expanded = s.plan_expanded.contains(&id);
+    let is_collapsed = can_collapse && !expanded;
+    let find_active = s.thread_find_active();
+    let show_preview = is_collapsed && !find_active;
+    let preview_markdown = show_preview.then(|| {
+        crate::plan_export::build_collapsed_proposed_plan_preview_markdown(
+            plan_markdown.expect("collapsible plan has markdown"),
+            10,
+        )
+    });
+    let markdown_body = if let Some(preview) = preview_markdown.as_deref() {
+        Some((preview, false))
+    } else {
+        displayed
+            .as_ref()
+            .map(|(_, body)| body.as_str())
+            .filter(|body| !body.is_empty())
+            .map(|body| (body, true))
+    };
+    if let Some((markdown, with_find)) = markdown_body {
+        let rendered = markdown_ui::render_with_find(
+            markdown,
+            p,
+            s.dark,
+            s.viewport_width >= WIDE_PANE,
+            false,
             !tool.done,
-        ));
+            &format!("plan-{id}"),
+            with_find
+                .then(|| {
+                    query.map(|query| {
+                        (
+                            query,
+                            active_occ.and_then(|occ| occ.checked_sub(title_count)),
+                        )
+                    })
+                })
+                .flatten(),
+        );
+        let markdown_el = if can_collapse && (expanded || find_active) {
+            col()
+                .key(format!("plan-markdown-{id}"))
+                .min_w(0.0)
+                .child(rendered)
+        } else {
+            block(format!("plan-markdown-{id}"), rendered, !tool.done)
+        };
+        body = body.child(markdown_el);
+    }
+    if can_collapse {
+        let collapse_id = id.clone();
+        body = body.child(
+            secondary_button(
+                &format!("plan-collapse-{id}"),
+                if expanded {
+                    "Collapse plan"
+                } else {
+                    "Expand plan"
+                },
+                p,
+                move |s| s.toggle_plan_expanded(&collapse_id),
+            )
+            .w_full()
+            .justify_center(),
+        );
     }
     col()
         .key(format!("inline-tool-{id}"))
@@ -741,4 +808,206 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
                 .child(body.padding(12.0)),
             p,
         ))
+}
+
+/// Ported from KSG Code's `ProposedPlanCard` actions menu, reusing `thread_menu` and `menu_item`.
+pub(super) fn plan_menu(s: &State, p: Palette) -> El {
+    let Some(id) = s.plan_menu.clone() else {
+        return el();
+    };
+    let t = s.current();
+    let prefix = format!("{}-", t.id);
+    let Some(index) = id
+        .strip_prefix(&prefix)
+        .and_then(|raw| raw.parse::<usize>().ok())
+    else {
+        return el();
+    };
+    let Some(tool) = t.tools.get(index) else {
+        return el();
+    };
+    let plan = crate::work::plan_data(&tool.input);
+    let Some(plan_markdown) = plan["markdown"].as_str() else {
+        return el();
+    };
+    let thread_id = t.id;
+    let export_contents = crate::plan_export::normalize_plan_markdown_for_export(plan_markdown);
+    let download_filename =
+        crate::plan_export::build_proposed_plan_markdown_filename(plan_markdown);
+    let copied = s.is_plan_copied(&id);
+    let can_save =
+        s.can_write_project_file(t) && !s.plan_save_dialog.as_ref().is_some_and(|d| d.saving);
+
+    col()
+        .key(format!("plan-menu-{id}"))
+        .role("menu")
+        .focus_group()
+        .label("Plan actions")
+        .w(212.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .anchored_fit(
+            format!("plan-actions-{id}"),
+            rune::Side::Bottom,
+            rune::Align::End,
+            4.0,
+        )
+        .modal(true, |s: &mut State| s.plan_menu = None)
+        .child(
+            menu_item(
+                &format!("plan-copy-{id}"),
+                if copied {
+                    "Copied!"
+                } else {
+                    "Copy to clipboard"
+                },
+                if copied { "check" } else { "copy" },
+                p,
+            )
+            .on_press_tx({
+                let copy_id = id.clone();
+                let contents = export_contents.clone();
+                move |s: &mut State, tx| {
+                    tx.copy(contents.clone());
+                    s.mark_plan_copied(copy_id.clone(), tx);
+                    s.plan_menu = None;
+                }
+            }),
+        )
+        .child(
+            menu_item(
+                &format!("plan-download-{id}"),
+                "Download as markdown",
+                "file",
+                p,
+            )
+            .on_press_tx({
+                let contents = export_contents.clone();
+                let filename = download_filename.clone();
+                move |s: &mut State, tx| {
+                    s.plan_menu = None;
+                    let contents = contents.clone();
+                    tx.save_file(
+                        rune::FileDialogOptions {
+                            title: "Download as markdown".into(),
+                            directory: crate::projects::downloads_dir(),
+                            file_name: Some(filename.clone()),
+                            ..Default::default()
+                        }
+                        .filter("Markdown", &["md"]),
+                        move |s: &mut State, result, _| match result {
+                            Ok(Some(path)) => {
+                                if let Err(error) = std::fs::write(&path, contents.as_bytes()) {
+                                    s.push_toast(
+                                        crate::model::ToastKind::Error,
+                                        "Could not download plan",
+                                        Some(error.to_string()),
+                                        None,
+                                        Some(5_000),
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                s.push_toast(
+                                    crate::model::ToastKind::Error,
+                                    "Could not download plan",
+                                    Some(error.to_string()),
+                                    None,
+                                    Some(5_000),
+                                );
+                            }
+                        },
+                    );
+                }
+            }),
+        )
+        .child(
+            menu_item(&format!("plan-save-{id}"), "Save to workspace", "folder", p)
+                .disabled(!can_save)
+                .on_press({
+                    let markdown = plan_markdown.to_owned();
+                    move |s: &mut State| {
+                        s.plan_menu = None;
+                        s.open_plan_save_dialog(thread_id, &markdown);
+                    }
+                }),
+        )
+}
+
+/// Ported from KSG Code's `SavePlanToWorkspaceForm`, reusing `thread_dialog` structure and styling.
+pub(super) fn plan_save_dialog(s: &State, p: Palette) -> El {
+    let dialog = s.plan_save_dialog.as_ref().expect("plan save dialog");
+    let card = col()
+        .key("plan-save-dialog")
+        .role("dialog")
+        .label("Save plan to workspace")
+        .w(380.0)
+        .max_w(540.0)
+        .padding(16.0)
+        .gap(12.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .on_press(|_: &mut State| {})
+        .child(label("Save plan to workspace", DIALOG_TITLE, p.ink))
+        .child(
+            label(
+                format!("Enter a path relative to {}", dialog.cwd),
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        )
+        .child(
+            text_input(&dialog.path_edit, BODY)
+                .key("plan-save-path-input")
+                .label("Workspace path")
+                .placeholder("docs/plan.md", p.muted)
+                .single_line()
+                .color(p.ink)
+                .w_full()
+                .padding(8.0)
+                .radius(6.0)
+                .fill(if s.dark { p.bg } else { p.panel })
+                .field_focus(&dialog.path_edit, p)
+                .on_edit(|s: &mut State| {
+                    &mut s
+                        .plan_save_dialog
+                        .as_mut()
+                        .expect("plan save dialog")
+                        .path_edit
+                })
+                .on_submit(|s: &mut State, _| s.submit_plan_save()),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .child(spacer())
+                .child(
+                    secondary_button("cancel-plan-save", "Cancel", p, |s| {
+                        s.close_plan_save_dialog()
+                    })
+                    .disabled(dialog.saving),
+                )
+                .child(
+                    button("confirm-plan-save", "Save", p, |s| s.submit_plan_save())
+                        .disabled(dialog.saving),
+                ),
+        );
+    el().key("plan-save-dialog-backdrop")
+        .instant_changes()
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .center()
+        .padding(16.0)
+        .fill(Color::BLACK.alpha(0.3))
+        .modal(false, |s: &mut State| s.close_plan_save_dialog())
+        .child(card)
 }

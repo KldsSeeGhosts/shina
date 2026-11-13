@@ -1659,6 +1659,9 @@ async fn remote_request(
                 "This server needs an update to browse folders. Type a path instead.".into(),
             );
         }
+        if command.method == "project.writeFile" && !supports_project_write_file(&hello) {
+            return Err("This server needs an update to save plans to the workspace.".into());
+        }
         if matches!(
             command.method.as_str(),
             "server.updateStatus" | "server.requestUpdate"
@@ -1704,6 +1707,16 @@ pub fn supports_browse(hello: &Value) -> bool {
             capabilities
                 .iter()
                 .any(|capability| capability == protocol::FILESYSTEM_BROWSE)
+        })
+}
+
+pub fn supports_project_write_file(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::PROJECT_WRITE_FILE)
         })
 }
 

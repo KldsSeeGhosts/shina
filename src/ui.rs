@@ -1000,6 +1000,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(transcript_context::preview(s, p));
     } else if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
+    } else if s.plan_save_dialog.is_some() {
+        root = root.child(work_ui::plan_save_dialog(s, p));
     } else if s.confirm_remove_attachment.is_some() {
         root = root.child(remove_attachment_dialog(s, p));
     } else if s.project_picker == Some(ProjectPicker::AddProject) {
@@ -1021,6 +1023,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
+    } else if s.plan_menu.is_some() {
+        root = root.child(work_ui::plan_menu(s, p));
     }
     if s.row_menu.is_some() {
         // A right-click opens the menu where it landed; the keyboard opens it beside the row.
