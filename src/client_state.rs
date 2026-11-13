@@ -96,6 +96,16 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn deserialize_lenient_env_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::model::ThreadEnvMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value::<crate::model::ThreadEnvMode>(v).ok()))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ThreadView {
     id: usize,
@@ -193,6 +203,27 @@ struct ThreadView {
     context_updated_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt_cache_ttl_ms: Option<u64>,
+    #[serde(
+        rename = "worktreePath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(
+        rename = "baseBranch",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    base_branch: Option<String>,
+    #[serde(
+        rename = "envMode",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_env_mode"
+    )]
+    env_mode: Option<crate::model::ThreadEnvMode>,
 }
 
 impl ThreadView {
@@ -330,10 +361,18 @@ impl ThreadView {
                 .collect(),
             context_updated_at: thread.context.updated_at,
             prompt_cache_ttl_ms: thread.context.prompt_cache_ttl_ms,
+            worktree_path: thread.worktree_path.clone(),
+            branch: thread.branch.clone(),
+            base_branch: thread.base_branch.clone(),
+            env_mode: thread.env_mode,
         }
     }
 
     fn apply(self, thread: &mut Thread) -> Result<(), String> {
+        thread.worktree_path = self.worktree_path;
+        thread.branch = self.branch;
+        thread.base_branch = self.base_branch;
+        thread.env_mode = self.env_mode;
         thread.memory_suggestions = self.memory_suggestions;
         thread.fresh_session_messages = self.fresh_session_messages;
         if thread.remote.is_some() {
@@ -1653,6 +1692,10 @@ impl State {
                 local.harness = thread.harness;
                 local.harness_context_sent = thread.harness_context_sent;
                 local.project = thread.project;
+                local.worktree_path = thread.worktree_path;
+                local.branch = thread.branch;
+                local.base_branch = thread.base_branch;
+                local.env_mode = thread.env_mode;
                 local.machine = thread.machine;
                 local.updated = thread.updated;
                 local.captain = thread.captain;
@@ -5053,6 +5096,51 @@ mod tests {
         let view: ThreadView = serde_json::from_value(legacy).unwrap();
         view.apply(&mut restored).unwrap();
         assert!(!restored.work[0].stopped);
+    }
+
+    #[test]
+    fn thread_view_and_projection_preserve_and_ignore_absent_worktree_fields() {
+        let mut server = State::new(".".into(), false);
+        let thread = server.current_mut();
+        thread.worktree_path = Some("/tmp/worktrees/repo/wt-1".into());
+        thread.branch = Some("t3/deadbeef".into());
+        thread.base_branch = Some("main".into());
+        thread.env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+
+        let projection = server.projection();
+        let mut client = State::new(".".into(), false);
+        client.apply_projection(projection).unwrap();
+        assert_eq!(
+            client.current().worktree_path.as_deref(),
+            Some("/tmp/worktrees/repo/wt-1")
+        );
+        assert_eq!(client.current().branch.as_deref(), Some("t3/deadbeef"));
+        assert_eq!(client.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(
+            client.current().env_mode,
+            Some(crate::model::ThreadEnvMode::Worktree)
+        );
+
+        // Old ThreadView without worktree fields decodes cleanly as None.
+        let mut old_view = serde_json::to_value(ThreadView::capture(server.current())).unwrap();
+        for key in ["worktreePath", "branch", "baseBranch", "envMode"] {
+            old_view.as_object_mut().unwrap().remove(key);
+        }
+        let decoded: ThreadView = serde_json::from_value(old_view).unwrap();
+        let mut restored = Thread::new(1);
+        decoded.apply(&mut restored).unwrap();
+        assert_eq!(restored.worktree_path, None);
+        assert_eq!(restored.branch, None);
+        assert_eq!(restored.base_branch, None);
+        assert_eq!(restored.env_mode, None);
+
+        // Unknown envMode value in ThreadView decodes as None instead of failing.
+        let mut future_view = serde_json::to_value(ThreadView::capture(server.current())).unwrap();
+        future_view["envMode"] = json!("future");
+        let decoded_future: ThreadView = serde_json::from_value(future_view).unwrap();
+        let mut restored_future = Thread::new(1);
+        decoded_future.apply(&mut restored_future).unwrap();
+        assert_eq!(restored_future.env_mode, None);
     }
 
     #[test]
