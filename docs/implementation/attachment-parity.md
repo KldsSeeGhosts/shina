@@ -304,9 +304,9 @@ Item 1 also retains the permitted Windows HEIC/HEIF gap.
   the Rune dialog. Video uses Rune directly on both platforms.
 - KSG `MediaVideoPlayer.tsx:166` uses browser-native video controls. The Rune
   viewer has custom controls. Play/pause, seeking, mute, volume, rate and
-  full-screen operations exist, but the volume/rate button cycles are not a
-  port of browser-native sliders/menus. That control behavior remains a parity
-  gap, not a Rune impossibility.
+  full-screen operations exist, and the mute button now sits beside a volume
+  slider with a playback-speed menu of the browser's rates, including its
+  narrow-width habit of dropping the slider first.
 - Question-attachment guards and questionnaire UI remain owned by the
   parallel approvals/questions worktree. This work did not edit those panels
   or `State::send`.

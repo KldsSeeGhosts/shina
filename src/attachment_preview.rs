@@ -210,6 +210,10 @@ pub(crate) struct Preview {
     notebook: Option<Arc<attachment_notebook_preview::Notebook>>,
     notebook_loading: bool,
     notebook_visible: usize,
+    /// The browser speed menu above the rate button.
+    rate_menu: bool,
+    /// The level the mute button returns to, as the browser keeps it.
+    restore_volume: f32,
 }
 
 enum ArchiveContent {
@@ -253,6 +257,26 @@ impl Preview {
     #[cfg(test)]
     pub(super) fn player(&self) -> Option<&rune::Player> {
         self.player.as_ref()
+    }
+    /// The browser's mute button: going quiet keeps the level it returns to.
+    fn toggle_mute(&mut self, player: &rune::Player) {
+        if player.muted() || player.volume() <= 0.0 {
+            player.set_muted(false);
+            player.set_volume(self.restore_volume);
+        } else {
+            self.restore_volume = player.volume();
+            player.set_volume(0.0);
+            player.set_muted(true);
+        }
+    }
+    /// The volume slider's write: it unmutes and becomes the level unmute returns to.
+    fn set_volume(&mut self, player: &rune::Player, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        player.set_muted(false);
+        player.set_volume(volume);
+        if volume > 0.0 {
+            self.restore_volume = volume;
+        }
     }
     fn blank(
         machine: String,
@@ -301,6 +325,8 @@ impl Preview {
             notebook: None,
             notebook_loading: false,
             notebook_visible: 20,
+            rate_menu: false,
+            restore_volume: 1.0,
         }
     }
     fn selected(&self) -> &Attachment {
@@ -333,6 +359,8 @@ impl Preview {
         self.image_drag = None;
         self.image_viewport_size = [0.0; 2];
         self.suppress_image_click = false;
+        self.rate_menu = false;
+        self.restore_volume = 1.0;
         let attachment = self.selected().clone();
         let Some(path) = crate::attachments::path_for(&attachment).filter(|p| p.is_file()) else {
             self.error = Some("The attachment is unavailable.".into());
@@ -1633,6 +1661,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         .box_shadow(hard_shadow(p))
         .on_press(|_: &mut State| {})
         .child(header);
+    let mut menu = None;
     if let Some(error) = &preview.error {
         card = card
             .child(
@@ -1881,74 +1910,215 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                     .child(el().w(0.0).grow(1.0 - fraction).h_full()),
                             ),
                     );
-                    let player_volume = player.clone();
-                    let player_rate = player.clone();
-                    card = card.child(
-                        row()
-                            .key("attachment-preview-media-controls")
-                            .center_y()
-                            .gap(8.0)
-                            .child(button(
-                                "attachment-preview-play",
-                                if player.is_playing() { "Pause" } else { "Play" },
-                                p,
-                                move |_| {
-                                    if player_copy.is_playing() {
-                                        player_copy.pause();
-                                    } else {
-                                        player_copy.play();
-                                    }
-                                },
-                            ))
-                            .child(button(
-                                "attachment-preview-mute",
-                                if player.muted() { "Unmute" } else { "Mute" },
-                                p,
-                                move |_| player_mute.set_muted(!player_mute.muted()),
-                            ))
-                            .child(pixel_text(
-                                format!(
-                                    "{:.0} / {:.0} s",
-                                    player.time(),
-                                    player.duration().unwrap_or(0.0)
+                    // KSG plays in the browser's `<video controls>`: beside play and the
+                    // clock sit the mute button, its volume slider, the speed menu and
+                    // full screen. The mute button's icon is the sound wedge (`open`) or
+                    // a cross while quiet, the only glyphs that read as volume here.
+                    let player_volume_drag = player.clone();
+                    let player_volume_step = player.clone();
+                    let player_volume_limit = player.clone();
+                    let volume = player.volume().clamp(0.0, 1.0);
+                    let muted = player.muted() || volume <= 0.0;
+                    let volume_slider = el()
+                        .key("attachment-preview-volume")
+                        .role("slider")
+                        .label("Volume")
+                        .a11y_value(format!("{:.0}", volume * 100.0))
+                        .focusable(true)
+                        .w(72.0)
+                        .h(20.0)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_step(move |s: &mut State, delta, _| {
+                            if let Some(preview) = &mut s.attachment_preview {
+                                preview.set_volume(
+                                    &player_volume_step,
+                                    player_volume_step.volume() + delta as f32 * 0.05,
+                                );
+                            }
+                        })
+                        .on_step_limit(move |s: &mut State, max, _| {
+                            if let Some(preview) = &mut s.attachment_preview {
+                                preview
+                                    .set_volume(&player_volume_limit, if max { 1.0 } else { 0.0 });
+                            }
+                        })
+                        .on_drag(move |s: &mut State, drag, _| {
+                            if drag.cancelled() {
+                                return;
+                            }
+                            if let Some(preview) = &mut s.attachment_preview {
+                                preview.set_volume(
+                                    &player_volume_drag,
+                                    (drag.x - 6.0) / (drag.w - 12.0).max(1.0),
+                                );
+                            }
+                        })
+                        .child(
+                            el().pin(Some(0.0), Some(8.0), Some(0.0), Some(8.0))
+                                .fill(p.frame)
+                                .child(
+                                    row()
+                                        .w_full()
+                                        .h_full()
+                                        .child(el().w(0.0).grow(volume).h_full().fill(p.ink))
+                                        .child(el().w(0.0).grow(1.0 - volume).h_full()),
                                 ),
-                                p.muted,
-                            ))
-                            .child(button(
-                                "attachment-preview-volume",
-                                "Volume",
-                                p,
-                                move |_| {
-                                    player_volume.set_volume(if player_volume.volume() >= 1.0 {
-                                        0.5
-                                    } else {
-                                        1.0
-                                    })
-                                },
-                            ))
-                            .child(button(
-                                "attachment-preview-speed",
-                                &format!("{}×", player.rate()),
-                                p,
-                                move |_| {
-                                    player_rate.set_rate(if player_rate.rate() >= 2.0 {
-                                        0.5
-                                    } else {
-                                        player_rate.rate() + 0.5
-                                    })
-                                },
-                            ))
-                            .child(
-                                icon_button(
-                                    "attachment-preview-fullscreen",
-                                    "Full screen",
-                                    "expand",
-                                    p,
-                                    |_| {},
-                                )
-                                .on_press_tx(|_: &mut State, tx| tx.toggle_full_screen()),
+                        )
+                        .child(
+                            row()
+                                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                                .center_y()
+                                .child(el().w(0.0).grow(volume))
+                                .child(el().size(12.0, 12.0).radius(4.0).fill(p.ink))
+                                .child(el().w(0.0).grow(1.0 - volume)),
+                        );
+                    let mut controls = row()
+                        .key("attachment-preview-media-controls")
+                        .center_y()
+                        .gap(8.0)
+                        .child(button(
+                            "attachment-preview-play",
+                            if player.is_playing() { "Pause" } else { "Play" },
+                            p,
+                            move |_| {
+                                if player_copy.is_playing() {
+                                    player_copy.pause();
+                                } else {
+                                    player_copy.play();
+                                }
+                            },
+                        ))
+                        .child(pixel_text(
+                            format!(
+                                "{:.0} / {:.0} s",
+                                player.time(),
+                                player.duration().unwrap_or(0.0)
                             ),
-                    );
+                            p.muted,
+                        ))
+                        .child(icon_button(
+                            "attachment-preview-mute",
+                            if muted { "Unmute" } else { "Mute" },
+                            if muted { "close" } else { "open" },
+                            p,
+                            move |s: &mut State| {
+                                if let Some(preview) = &mut s.attachment_preview {
+                                    preview.toggle_mute(&player_mute);
+                                }
+                            },
+                        ));
+                    // The browser drops its volume slider when the control bar runs out of
+                    // room; the rest of the row stays. The card's inner width tells.
+                    if width.min(s.viewport_width - 24.0) - 32.0 >= 400.0 {
+                        controls = controls.child(volume_slider);
+                    }
+                    controls = controls
+                        .child(outlined(
+                            row()
+                                .key("attachment-preview-rate")
+                                .role("button")
+                                .cursor(rune::Cursor::Pointer)
+                                .label("Playback speed")
+                                .focusable(true)
+                                .center_y()
+                                .h(24.0)
+                                .px(10.0)
+                                .radius(4.0)
+                                .hover(p.selected)
+                                .press(p.selected)
+                                .on_press(|s: &mut State| {
+                                    if let Some(preview) = &mut s.attachment_preview {
+                                        preview.rate_menu = !preview.rate_menu;
+                                    }
+                                })
+                                .child(pixel_text(format!("{}x", player.rate()), p.ink)),
+                            p,
+                        ))
+                        .child(
+                            icon_button(
+                                "attachment-preview-fullscreen",
+                                "Full screen",
+                                "expand",
+                                p,
+                                |_| {},
+                            )
+                            .on_press_tx(|_: &mut State, tx| tx.toggle_full_screen()),
+                        );
+                    card = card.child(controls);
+                    if preview.rate_menu {
+                        let mut card_menu = col()
+                            .key("attachment-preview-rate-menu")
+                            .role("menu")
+                            .focus_group()
+                            .label("Playback speed")
+                            .w(160.0)
+                            .padding(4.0)
+                            .gap(1.0)
+                            .radius(6.0)
+                            .fill(p.card)
+                            .border(2.0, p.frame)
+                            .box_shadow(hard_shadow(p))
+                            .on_press(|_: &mut State| {})
+                            // Left and Right still reach the overlay's attachment
+                            // navigation, so the menu swallows them.
+                            .on_key(|_: &mut State, event, _| {
+                                matches!(event.key, rune::Key::Left | rune::Key::Right)
+                            });
+                        for option in [0.25_f32, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                            let selected = (player.rate() - option).abs() < 0.001;
+                            let title = if option == 1.0 {
+                                "Normal".to_owned()
+                            } else {
+                                format!("{option}x")
+                            };
+                            let player_pick = player.clone();
+                            let mut item = row()
+                                .key(format!("attachment-preview-rate-{option}"))
+                                .role("menuitemradio")
+                                .checked(selected)
+                                .label(title.clone())
+                                .focusable(true)
+                                .cursor(rune::Cursor::Pointer)
+                                .h(28.0)
+                                .px(8.0)
+                                .gap(8.0)
+                                .center_y()
+                                .radius(4.0)
+                                .hover(p.selected)
+                                .focus_highlight(p.selected)
+                                .on_press(move |s: &mut State| {
+                                    player_pick.set_rate(option);
+                                    if let Some(preview) = &mut s.attachment_preview {
+                                        preview.rate_menu = false;
+                                    }
+                                })
+                                .child(
+                                    label(title, TextStyle::new(13.0, 450.0), p.ink)
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate(),
+                                );
+                            if selected {
+                                item = item.autofocus().child(icon("check", p.sea));
+                            }
+                            card_menu = card_menu.child(item);
+                        }
+                        menu = Some(
+                            card_menu
+                                .anchored_fit(
+                                    "attachment-preview-rate",
+                                    rune::Side::Top,
+                                    rune::Align::End,
+                                    6.0,
+                                )
+                                .focus_return("attachment-preview-rate")
+                                .modal(true, |s: &mut State| {
+                                    if let Some(preview) = &mut s.attachment_preview {
+                                        preview.rate_menu = false;
+                                    }
+                                }),
+                        );
+                    }
                 }
             }
             Kind::Text | Kind::Markdown | Kind::Html => {
@@ -2368,7 +2538,8 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                 })),
         );
     }
-    el().key("attachment-preview-overlay")
+    let mut overlay = el()
+        .key("attachment-preview-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(Color::BLACK.alpha(0.35))
         .center()
@@ -2451,7 +2622,11 @@ pub(super) fn view(s: &State, p: Palette) -> El {
             }
             true
         })
-        .child(el().key("transcript-context-preview").child(card))
+        .child(el().key("transcript-context-preview").child(card));
+    if let Some(menu) = menu {
+        overlay = overlay.child(menu);
+    }
+    overlay
 }
 
 #[cfg(test)]
