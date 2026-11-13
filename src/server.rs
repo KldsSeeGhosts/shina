@@ -64,6 +64,20 @@ impl Drop for Upload {
     }
 }
 
+/// Project root paths from the current snapshot, for workspace-bound commands.
+fn project_roots(snapshot: &Value) -> Vec<std::path::PathBuf> {
+    snapshot["state"]["index"]["projects"]
+        .as_array()
+        .map(|projects| {
+            projects
+                .iter()
+                .filter_map(|project| project["path"].as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn authorized(shared: &Shared, headers: &HeaderMap, method: &str) -> Option<String> {
     if headers.contains_key("origin") {
         return None;
@@ -733,6 +747,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut provider_handoff = false;
     let mut workspace_search = false;
     let mut workspace_read_file = false;
+    let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -845,6 +860,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         workspace_read_file = minor >= u64::from(protocol::WORKSPACE_READ_FILE_MINOR);
                         if workspace_read_file {
                             capabilities.push(protocol::WORKSPACE_READ_FILE);
+                        }
+                        review_diff = minor >= u64::from(protocol::REVIEW_DIFF_MINOR);
+                        if review_diff {
+                            capabilities.push(protocol::REVIEW_DIFF);
                         }
                         if minor >= u64::from(protocol::THREAD_TITLE_SEARCH_MINOR) {
                             capabilities.push(protocol::THREAD_TITLE_SEARCH);
@@ -1018,6 +1037,90 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             database.authorize(&device, "workspace.readFile", &json!({}))?;
                             Ok(json!({"id":stored.id,"name":stored.name,"mime":stored.mime,"bytes":stored.bytes}))
                         }).await.unwrap_or_else(|_| Err("Workspace file read failed.".into()))
+                    }
+                } else if method == "review.getBranchCommits" {
+                    if !review_diff {
+                        Err(protocol::REVIEW_DIFF_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::review::ReviewBranchCommitsInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid review.getBranchCommits parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let snapshots = shared.snapshots.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "review.getBranchCommits", &json!({}))?;
+                                    let roots = project_roots(&snapshots.borrow());
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
+                                    let result = crate::review::get_branch_commits(
+                                        &input,
+                                        &crate::vcs::GitContext::default(),
+                                    )?;
+                                    // Revocation also fences an in-flight read.
+                                    database.authorize(&device, "review.getBranchCommits", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the branch commits result.".into()
+                                    })
+                                }).await.unwrap_or_else(|_| Err("Reading review branch commits failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "review.getDiffPreview" {
+                    if !review_diff {
+                        Err(protocol::REVIEW_DIFF_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::review::ReviewDiffPreviewInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid review.getDiffPreview parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let snapshots = shared.snapshots.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "review.getDiffPreview", &json!({}))?;
+                                    let roots = project_roots(&snapshots.borrow());
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
+                                    let result = crate::review::get_diff_preview(
+                                        &input,
+                                        &crate::vcs::GitContext::default(),
+                                    )?;
+                                    database.authorize(&device, "review.getDiffPreview", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the diff preview result.".into()
+                                    })
+                                }).await.unwrap_or_else(|_| Err("Reading the review diff preview failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "review.getDiffFileContents" {
+                    if !review_diff {
+                        Err(protocol::REVIEW_DIFF_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::review::ReviewDiffFileContentsInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid review.getDiffFileContents parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let snapshots = shared.snapshots.clone();
+                                let state_dir = shared.directory.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "review.getDiffFileContents", &json!({}))?;
+                                    let roots = project_roots(&snapshots.borrow());
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
+                                    let result = crate::review::get_diff_file_contents(
+                                        &input,
+                                        &crate::vcs::GitContext::default(),
+                                        &state_dir,
+                                    )?;
+                                    database.authorize(&device, "review.getDiffFileContents", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the diff file contents result.".into()
+                                    })
+                                }).await.unwrap_or_else(|_| Err("Reading the review file contents failed.".into()))
+                            }
+                        }
                     }
                 } else if method == "project.writeFile" {
                     let args = params.get("args").unwrap_or(params);
@@ -3748,6 +3851,169 @@ mod tests {
             .await
             .unwrap();
             assert!(!std::path::Path::new(&created.worktree.path).exists());
+        });
+    }
+
+    #[test]
+    fn review_commands_round_trip_through_a_project_root() {
+        if !crate::vcs::git_available() {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("review-rpc").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            // The capability is present at protocol::MINOR.
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR))
+            );
+            assert!(crate::client::supports_review_diff(&hello));
+
+            // A scratch repository on a branch three commits ahead of main.
+            let empty_cfg = fixture.shared.directory.join("empty.gitconfig");
+            std::fs::write(&empty_cfg, "").unwrap();
+            let repo = fixture.shared.directory.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let run_git = |args: &[&str]| {
+                let mut cmd = std::process::Command::new("git");
+                cmd.arg("-c")
+                    .arg("user.name=Test User")
+                    .arg("-c")
+                    .arg("user.email=test@example.com")
+                    .args(args)
+                    .current_dir(&repo)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+                    .env("GIT_CONFIG_SYSTEM", &empty_cfg);
+                let out =
+                    crate::process::output(&mut cmd, Duration::from_secs(10), 1024 * 1024).unwrap();
+                assert!(out.status.success(), "{:?} failed", args);
+            };
+            run_git(&["init", "-b", "main", "--quiet"]);
+            std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+            run_git(&["add", "file.txt"]);
+            run_git(&["commit", "-m", "base", "--quiet"]);
+            run_git(&["checkout", "-b", "feature", "--quiet"]);
+            for index in 1..=3 {
+                std::fs::write(
+                    repo.join(format!("feature-{index}.txt")),
+                    format!("{index}\n"),
+                )
+                .unwrap();
+                run_git(&["add", "."]);
+                run_git(&["commit", "-m", &format!("feature {index}"), "--quiet"]);
+            }
+            let repo_str = repo.to_string_lossy().into_owned();
+
+            let put = crate::client::remote_rpc(
+                &link,
+                "project.put",
+                json!({"path": repo, "createFolder": false}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(put["status"], "accepted", "{put}");
+            let expected = crate::projects::normalize_path(&repo);
+            wait_until(|| {
+                fixture.shared.snapshots.borrow()["state"]["index"]["projects"]
+                    .as_array()
+                    .is_some_and(|projects| projects.iter().any(|p| p["path"] == json!(expected)))
+            })
+            .await;
+
+            // review.getBranchCommits lists the feature commits, newest first.
+            let commits = crate::client::remote_rpc(
+                &link,
+                "review.getBranchCommits",
+                json!({"cwd": repo_str}),
+            )
+            .await
+            .unwrap();
+            let listed = commits["commits"].as_array().unwrap();
+            assert_eq!(listed.len(), 3, "{commits}");
+            assert_eq!(listed[0]["subject"], "feature 3");
+            assert_eq!(commits["truncated"], false);
+
+            // review.getDiffPreview reports the working-tree edit.
+            std::fs::write(repo.join("file.txt"), "base\nchanged\n").unwrap();
+            let preview =
+                crate::client::remote_rpc(&link, "review.getDiffPreview", json!({"cwd": repo_str}))
+                    .await
+                    .unwrap();
+            let sources = preview["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 2, "{preview}");
+            assert_eq!(sources[0]["id"], "working-tree");
+            assert!(sources[0]["diff"].as_str().unwrap().contains("changed"));
+            assert_eq!(sources[0]["files"][0]["path"], "file.txt");
+
+            // review.getDiffFileContents reads the revision and the working tree.
+            let contents = crate::client::remote_rpc(
+                &link,
+                "review.getDiffFileContents",
+                json!({
+                    "cwd": repo_str,
+                    "sourceKind": "working-tree",
+                    "changeType": "change",
+                    "baseRef": null,
+                    "headRef": null,
+                    "oldPath": "file.txt",
+                    "newPath": "file.txt",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(contents["oldContents"], "base\n");
+            assert_eq!(contents["newContents"], "base\nchanged\n");
+
+            // A cwd outside every project root is rejected.
+            let outside = crate::client::remote_rpc(
+                &link,
+                "review.getDiffPreview",
+                json!({"cwd": fixture.shared.directory}),
+            )
+            .await;
+            let err = outside.unwrap_err();
+            assert!(err.contains("not inside a project"), "{err}");
+
+            // A device without the read grant is rejected.
+            fixture
+                .shared
+                .database
+                .issue_scoped_device("review-denied", "review-denied-secret", &["paired"])
+                .unwrap();
+            let mut denied = link.clone();
+            denied.device_id = "review-denied".into();
+            denied.token = "review-denied-secret".into();
+            let err = crate::client::remote_rpc(
+                &denied,
+                "review.getBranchCommits",
+                json!({"cwd": repo_str}),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("read"), "{err}");
+
+            // One minor below the gate the capability is absent and the
+            // client refuses before sending, like any unknown command.
+            let older = Fixture::with_minor("review-older", protocol::REVIEW_DIFF_MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(!crate::client::supports_review_diff(&older_hello));
+            let refused = crate::client::remote_rpc(
+                &older_link,
+                "review.getDiffPreview",
+                json!({"cwd": "/"}),
+            )
+            .await;
+            assert!(refused.unwrap_err().contains("Update required"));
         });
     }
 }

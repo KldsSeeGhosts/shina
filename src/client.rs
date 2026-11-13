@@ -2389,6 +2389,13 @@ async fn remote_request_outcome(
         }
         if matches!(
             command.method.as_str(),
+            "review.getBranchCommits" | "review.getDiffPreview" | "review.getDiffFileContents"
+        ) && !supports_review_diff(&hello)
+        {
+            return Err(protocol::REVIEW_DIFF_UPDATE_REQUIRED.into());
+        }
+        if matches!(
+            command.method.as_str(),
             "server.updateStatus" | "server.requestUpdate"
         ) && hello["protocolMinor"].as_u64().unwrap_or(0) < 6
         {
@@ -2463,6 +2470,16 @@ pub fn supports_vcs_worktrees(hello: &Value) -> bool {
             capabilities
                 .iter()
                 .any(|capability| capability == protocol::VCS_WORKTREES)
+        })
+}
+
+pub fn supports_review_diff(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::REVIEW_DIFF)
         })
 }
 
