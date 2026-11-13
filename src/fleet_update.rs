@@ -216,6 +216,13 @@ pub fn skip_reason(online: bool, hello: &Value, status: &Value, target: &str) ->
     None
 }
 
+/// A link that reached the machine but was refused (for example an older build) is not
+/// connected, yet a one-off request still answers. Only a link that never started counts as
+/// offline without asking.
+fn should_probe(connected: bool, phase: crate::client::ConnectionPhase) -> bool {
+    connected || phase != crate::client::ConnectionPhase::Offline
+}
+
 #[derive(Clone)]
 pub struct Row {
     pub server: String,
@@ -315,7 +322,8 @@ impl crate::model::State {
                         .unwrap_or("unknown")
                         .to_owned()
                 });
-                let online = remote.commands.connected();
+                let online =
+                    should_probe(remote.commands.connected(), remote.connection_state().phase);
                 self.fleet.rows.push(Row {
                     server: id.clone(),
                     name: link.host.clone(),
@@ -645,6 +653,14 @@ mod tests {
         state.poll_fleet();
         assert!(state.restart_for_update);
         assert!(!state.fleet.open);
+    }
+    #[test]
+    fn a_refused_link_is_still_asked_for_its_update_status() {
+        use crate::client::ConnectionPhase::*;
+        assert!(should_probe(true, Available));
+        assert!(should_probe(false, Error));
+        assert!(should_probe(false, Reconnecting));
+        assert!(!should_probe(false, Offline));
     }
     #[test]
     fn old_protocol_version_metadata_still_enables_the_review_and_offline_is_never_eligible() {

@@ -104,7 +104,10 @@ pub enum FailureKind {
 
 impl FailureKind {
     fn from_error(error: &str) -> Self {
-        if error.contains("mismatch") || error.contains("older") {
+        if error.contains("mismatch")
+            || error.contains("older")
+            || error.starts_with("Update required")
+        {
             Self::Outdated
         } else if error.contains("Authentication denied") || error.contains("handshake refused") {
             Self::AuthDenied
@@ -822,6 +825,7 @@ async fn supervise(
     let mut pending = VecDeque::<Command>::new();
     let mut attempt = 0;
     let mut was_connected = false;
+    let mut update_required_reported = false;
     let mut next_spawn = Instant::now();
     let mut owned_instance = None;
     let mut socket: Option<Socket> = None;
@@ -931,9 +935,25 @@ async fn supervise(
                             state.last_failure = Some(FailureKind::from_error(&error));
                             state.last_error = Some(error.clone());
                             drop(state);
-                            report(error);
-                            break;
+                            if !update_required_reported {
+                                report(error);
+                            }
+                            if remote.is_none() {
+                                break;
+                            }
+                            // A linked machine on an older build can be updated while this
+                            // client runs, so keep checking instead of ending the link.
+                            update_required_reported = true;
+                            cache.notices.clear();
+                            drop(connected);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                                _ = retry_notify.notified() => {},
+                                _ = stopped(&stop) => break,
+                            }
+                            continue;
                         }
+                        update_required_reported = false;
                         if child
                             .as_ref()
                             .is_some_and(|child| child.id() == discovery.pid)
