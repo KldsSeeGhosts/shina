@@ -25,6 +25,8 @@ mod attachment_table_preview;
 mod attachment_text_preview;
 #[path = "captain_ui.rs"]
 mod captain_ui;
+#[path = "composer_code_picker.rs"]
+pub(crate) mod composer_code_picker;
 #[path = "composer_menu.rs"]
 pub(crate) mod composer_menu;
 #[path = "composer_stash.rs"]
@@ -47,6 +49,7 @@ mod sidebar_ui;
 pub(crate) mod transcript_context;
 #[path = "work_ui.rs"]
 mod work_ui;
+use composer_code_picker::CodeLanguageHeaders;
 pub(crate) use pi_ui::questionnaire_key;
 
 /// Keyboard navigation uses the same server-scoped order as the unified sidebar.
@@ -1092,6 +1095,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if composer_stash::menu_open(s) {
         // KSG's drawer portal, mounted beside the other composer popovers.
         root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+    }
+    if composer_code_picker::menu_open(s) {
+        root = root.child(composer_code_picker::menu(s, p));
     }
     if s.machines.dialog {
         root = root.child(machine_dialog(s, p));
@@ -12777,6 +12783,7 @@ fn composer(
         rule_margin_top: Some(10.4),
         rule_margin_bottom: Some(10.4),
     })
+    .code_language_headers(s, p, locked)
     .caret(p.coral, p.coral_bg)
     .w_full()
     .min_h(COMPOSER_FIELD_MIN)
@@ -18211,6 +18218,86 @@ pub(crate) mod tests {
                 ]
             );
             assert_eq!(crate::composer_rich::markdown(draft), source);
+        }
+    }
+
+    /// KSG's ComposerCodeBlockLanguagePicker: a header trigger per code block, a
+    /// searchable menu that fits the window, and a language change that rewrites only
+    /// that block's fence.
+    #[test]
+    fn code_block_language_picker_edits_only_its_own_fence_at_all_widths() {
+        let source = "```python\nfirst()\n```\n\nprose\n\n```rust\nsecond()\n```";
+        let changed = "```python\nfirst()\n```\n\nprose\n\n```dart\nsecond()\n```";
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.draft = crate::composer_rich::draft("");
+                crate::composer_rich::paste_with_path_query(&mut t.draft, source, false, &|_| None);
+                t.draft.focused = true;
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            let (card, _) = rt.presented("composer-natural").unwrap();
+            for n in 0..2 {
+                let key = format!("composer-code-language-{n}");
+                let (trigger, _) = rt
+                    .presented(&key)
+                    .unwrap_or_else(|| panic!("{width}: {key} not presented"));
+                assert!(
+                    trigger[0] >= card[0]
+                        && trigger[0] + trigger[2] <= card[0] + card[2] + 1.0
+                        && trigger[1] >= card[1]
+                        && trigger[1] + trigger[3] <= card[1] + card[3] + 1.0,
+                    "{width}: {key} {trigger:?} outside card {card:?}"
+                );
+            }
+            press(&mut rt, "composer-code-language-1");
+            let (menu, _) = rt
+                .presented("composer-code-language-menu")
+                .unwrap_or_else(|| panic!("{width}: menu not presented"));
+            assert!(
+                menu[0] >= 0.0
+                    && menu[0] + menu[2] <= width + 1.0
+                    && menu[1] >= 0.0
+                    && menu[1] + menu[3] <= 721.0,
+                "{width}: menu {menu:?} outside window"
+            );
+            assert!(
+                rt.presented("composer-code-language-search").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "composer-code-language-option-dart");
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                changed,
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-code-language-menu").is_none(),
+                "{width}"
+            );
+            assert!(rt.state.current().draft.focused, "{width}");
+            // Reopen and Escape: the menu closes and the draft does not change.
+            press(&mut rt, "composer-code-language-1");
+            assert!(
+                rt.presented("composer-code-language-menu").is_some(),
+                "{width}"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.presented("composer-code-language-menu").is_none(),
+                "{width}"
+            );
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                changed,
+                "{width}"
+            );
         }
     }
 

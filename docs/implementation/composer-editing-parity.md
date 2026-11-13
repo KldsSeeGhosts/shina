@@ -37,7 +37,7 @@ The input regexes and formatting chords also come from KSG's installed Tiptap 3.
 | Headings, checked tasks, horizontal rules | Heading/task/rule input rules and attributed node types | `Rules::changed`, `Rules::key`, `fragment`, `markdown_for`, `BlockStyle` | Ported on top of the Rune fork (`BlockKind::{Heading, Task, Rule}`, `BlockAttributes`, `BlockStyle`, atomic rule selection, checkbox click). |
 | Full list grammar, authored source and nesting | `parseListPrefix`, list normalization, `composer-list-continuation.ts` | `composer_list.rs`, `Rules::changed`, `fragment`, `markdown_for` | Ported with `-`/`*`/`+` markers, ordered start/delimiter, zero-padding, renumbering, KSG Tab/Shift+Tab/Enter-lift and `MAX_LIST_LEVEL` nesting. |
 | Fence info, code editing and exits | `composer-code-block.ts`, `codeBlockSource` | `composer_code.rs`, `Rules::key`, `editor_key_before_commands`, `fragment`, `markdown_for` | Ported with Rune `LogicalBlock` + `CodeAttributes` (fence char/length, info string, exact close/unclosed state, distinct adjacent fences). |
-| Language picker, retained language, highlighting | Language picker/node view and highlight extension | No new picker | Blocked on retained logical code-block identity/attributes, R2, and a per-block view/header, R3. Syntax-color spans already exist in Rune. A picker outside the selected block would differ from KSG's placement and behavior. |
+| Language picker, retained language, highlighting | `ComposerCodeBlockLanguagePicker`, `ComposerCodeBlockNodeView`, `composer-code-languages.ts`, highlight extension | `composer_code_picker.rs`, `composer_code_languages.rs`, Rune `InputBlockView` | Picker ported: a noneditable header on each code block carries the language trigger, the searchable popover anchors under it, and choosing a language rewrites only the info-string token before focusing the editor at the block's end. Per-block syntax highlighting remains open. |
 | Editable source at caret and reparse on leave | `composer-markdown-source.ts`, styled-edge helpers | `composer_source.rs`, `ui.rs` (`on_input_selection_change`) | Ported on top of the Rune fork (`on_input_selection_change`, `AppMark`, `TransactionOptions::Transient`, `EditMap` selection mapping, and `preview_decorations`). |
 
 ## Pinned Rune findings
@@ -128,14 +128,14 @@ The shipped fallback preserves unsupported pasted source rather than stripping a
 
 ## Fork dependency
 
-Shina builds against the local Rune fork via `[patch]` entries in `Cargo.toml` (adding `BlockKind`, `BlockAttributes`, `BlockStyle`, `LogicalBlock`/`CodeAttributes`, `EditorSelection::Block`, `MAX_LIST_LEVEL = u8::MAX`, `AppMark`, `TransactionOptions`/`EditMap`, and `on_input_selection_change`). Code-block language picker headers (`InputBlockView`) remain unported pending the remaining fork layout work (`FORK.md`).
+Shina builds against the local Rune fork via `[patch]` entries in `Cargo.toml` (adding `BlockKind`, `BlockAttributes`, `BlockStyle`, `LogicalBlock`/`CodeAttributes`, `EditorSelection::Block`, `MAX_LIST_LEVEL = u8::MAX`, `AppMark`, `TransactionOptions`/`EditMap`, `on_input_selection_change`, and `InputBlockView`). The composer uses `InputBlockView::header` for the code-block language picker headers described in `FORK.md`.
 
 ## Deviations and remaining work
 
 - Shina splits top-level prose around representable pasted blocks through newline insertion and block attributes. The split rules were checked against KSG's installed `insertContentAt`/ProseMirror `replaceWith`. Pasting structural content across nested/mixed block selections is not fully verified.
 - Ordinary source parser cases match the copied tests, but KSG's complete math shielding and context/model/citation token import/reconciliation are not ported. File and skill tokens are the supported Shina types. Formula/mention-boundary guards therefore do not establish full selection-wrap parity.
 - Native Rune undo grouping remains in use outside explicit input-rule reversal, grouped paste, and `TransactionOptions::Transient` source reveal/collapse.
-- Code-block language picker UI and per-block syntax highlighting remain unported until the fork provides composite block-header layout.
+- The code-block language picker is ported; per-block syntax highlighting remains open (`composerCodeBlockHighlight.ts` is not ported).
 - Legacy Shina link marks still serialize as links. KSG disables new link marks. Existing file pills without an authored source keep their previous expanded-path transport; newly pasted file references retain their authored source.
 - `BlockStyle` does not express a separate checked checkbox fill color/check glyph (`checkbox_color` sets both frame and fill in `ink`), per-heading line-height (`1.3`) or `h6` muted color, or vertical margins around rules (`0.65rem`).
 
@@ -143,7 +143,7 @@ Shina builds against the local Rune fork via `[patch]` entries in `Cargo.toml` (
 
 The first six parity tests failed against the original implementation. Paste tests also failed against plain insertion before implementation. Regression tests include KSG's own inline parser, selection surround, path-query paste and code indentation cases, plus document and Markdown assertions, paste undo/redo, structural paste around prose, source-preserving block fallbacks and token boundaries.
 
-The headless UI regression covers 620, 960, 1280 and 1920 px. It verifies resolved skill pills, unknown skill text, composer bounds and code Enter before send. No picker layout test exists because no picker was implemented.
+The headless UI regression covers 620, 960, 1280 and 1920 px. It verifies resolved skill pills, unknown skill text, composer bounds and code Enter before send. A second regression puts a draft with two code blocks through the language picker at the same widths: each header trigger stays inside the composer card, the open menu stays inside the window, choosing a language rewrites only that block's fence, the menu closes on selection, and a reopened menu's Escape changes nothing.
 
 Final checks passed:
 
