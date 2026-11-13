@@ -1,7 +1,6 @@
-//! KSG Code's buildTiptapContent and handlePaste, restricted to blocks whose
-//! authored attributes Rune can retain. Unsupported blocks retain literal source.
+//! KSG Code's buildTiptapContent and handlePaste, ported to Rune authored blocks.
 use super::{draft, source};
-use rune::{Block, MarkRange, TextEdit};
+use rune::{Block, BlockAttributes, BlockKind, MAX_LIST_LEVEL, MarkRange, TextEdit};
 use std::{ops::Range, sync::LazyLock};
 
 pub type Resolver<'a> = &'a dyn Fn(&str) -> Option<(String, String)>;
@@ -176,9 +175,6 @@ mod tests {
     #[test]
     fn unrepresentable_blocks_keep_source_and_fences_stay_literal() {
         for text in [
-            "# heading",
-            "- [x] done",
-            "---",
             "+ item\n* other",
             "07)  item",
             "~~~py title=example\n**bold** @README.md $known\n~~~~ ",
@@ -258,7 +254,91 @@ pub fn closes(line: &str, fence: &str) -> bool {
     line.len() >= fence.len() && line.bytes().all(|b| b == fence.as_bytes()[0])
 }
 
-fn fragment(
+fn parse_rule(line: &str) -> bool {
+    let mut chars = line.chars();
+    let Some(marker) = chars.next() else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+    let mut count = 1usize;
+    for ch in chars {
+        if ch == marker {
+            count += 1;
+        } else if !matches!(ch, ' ' | '\t') {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+fn parse_heading(line: &str) -> Option<(u8, &str, &str)> {
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &line[hashes..];
+    let space_len = rest
+        .bytes()
+        .take_while(|b| matches!(*b, b' ' | b'\t'))
+        .count();
+    if space_len == 0 {
+        return None;
+    }
+    Some((hashes as u8, &rest[..space_len], &rest[space_len..]))
+}
+
+struct TaskPrefix<'a> {
+    indent: &'a str,
+    marker_space: &'a str,
+    check_char: char,
+    content_space: &'a str,
+    content: &'a str,
+}
+
+fn parse_task(line: &str) -> Option<TaskPrefix<'_>> {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| matches!(*b, b' ' | b'\t'))
+        .count();
+    let indent = &line[..indent_len];
+    let after_indent = &line[indent_len..];
+    let after_dash = after_indent.strip_prefix('-')?;
+    let marker_space_len = after_dash
+        .bytes()
+        .take_while(|b| matches!(*b, b' ' | b'\t'))
+        .count();
+    if marker_space_len == 0 {
+        return None;
+    }
+    let marker_space = &after_dash[..marker_space_len];
+    let after_space = &after_dash[marker_space_len..];
+    let rest = after_space.strip_prefix('[')?;
+    let check_char = rest.chars().next()?;
+    if !matches!(check_char, ' ' | 'x' | 'X') {
+        return None;
+    }
+    let after_box = rest[1..].strip_prefix(']')?;
+    let content_space_len = after_box
+        .bytes()
+        .take_while(|b| matches!(*b, b' ' | b'\t'))
+        .count();
+    let content_space = &after_box[..content_space_len];
+    let content = &after_box[content_space_len..];
+    if !content.is_empty() && content_space.is_empty() {
+        return None;
+    }
+    Some(TaskPrefix {
+        indent,
+        marker_space,
+        check_char,
+        content_space,
+        content,
+    })
+}
+
+pub(super) fn fragment(
     text: &str,
     blocks: bool,
     fences: bool,
@@ -266,12 +346,14 @@ fn fragment(
     resolve: Resolver<'_>,
 ) -> TextEdit {
     let lines: Vec<_> = text.split('\n').collect();
-    let mut parts = Vec::new();
+    let mut parts: Vec<(TextEdit, Vec<(BlockKind, BlockAttributes)>)> = Vec::new();
     let mut index = 0;
     let mut numbers = [0usize; 4];
+    let mut list_stack: Vec<(String, String)> = Vec::new();
     while index < lines.len() {
         let line = lines[index];
         if index == 0 && literal_length > 0 {
+            list_stack.clear();
             let literal = &line[..literal_length.min(line.len())];
             let rest = inline(&line[literal.len()..], resolve);
             let mut part = draft(format!("{literal}{}", rest.text));
@@ -286,11 +368,15 @@ fn fragment(
                     })
                     .collect(),
             );
-            parts.push(part);
+            parts.push((
+                part,
+                vec![(BlockKind::Paragraph, BlockAttributes::default())],
+            ));
             index += 1;
             continue;
         }
         if fences && let Some((fence, info)) = opening_fence(line) {
+            list_stack.clear();
             let start = index;
             index += 1;
             while index < lines.len() && !closes(lines[index], fence) {
@@ -302,35 +388,93 @@ fn fragment(
                 && lines.get(index) == Some(&"```")
                 && parts
                     .last()
-                    .is_none_or(|p: &TextEdit| p.active_block() != Block::Code);
+                    .is_none_or(|(_, ks)| ks.last().is_none_or(|(k, _)| *k != BlockKind::Code));
             if canonical {
                 let mut part = draft(lines[start + 1..index].join("\n"));
-                part.set_blocks(vec![
-                    Block::Code;
-                    part.text.bytes().filter(|b| *b == b'\n').count() + 1
-                ]);
-                parts.push(part);
+                let count = part.text.bytes().filter(|b| *b == b'\n').count() + 1;
+                part.set_blocks(vec![Block::Code; count]);
+                parts.push((
+                    part,
+                    vec![(BlockKind::Code, BlockAttributes::default()); count],
+                ));
             } else {
                 // Do not style code or turn its tokens into pills, even when
                 // the fence's attributes cannot be represented.
                 for line in &lines[start..(index + usize::from(index < lines.len()))] {
-                    parts.push(draft(*line));
+                    parts.push((
+                        draft(*line),
+                        vec![(BlockKind::Paragraph, BlockAttributes::default())],
+                    ));
                 }
             }
             index += usize::from(index < lines.len());
             numbers.fill(0);
             continue;
         }
-        let mut block = Block::Paragraph;
+        let mut kind = BlockKind::Paragraph;
+        let mut attrs = BlockAttributes::default();
         let mut content = line;
         if blocks {
-            if let Some(text) = line.strip_prefix("> ")
+            if parse_rule(line) {
+                list_stack.clear();
+                numbers.fill(0);
+                kind = BlockKind::Rule;
+                attrs = BlockAttributes::default().with_rule_source(line);
+                content = "";
+            } else if let Some((level, space, heading_content)) = parse_heading(line) {
+                list_stack.clear();
+                numbers.fill(0);
+                kind = BlockKind::Heading { level };
+                attrs = BlockAttributes::default().with_heading_space(space);
+                content = heading_content;
+            } else if let Some(text) = line.strip_prefix("> ")
                 && !text.starts_with([' ', '\t'])
             {
-                block = Block::Quote;
+                list_stack.clear();
+                kind = BlockKind::Quote;
                 content = text;
                 numbers.fill(0);
+            } else if let Some(task) = parse_task(line) {
+                let indent = task.indent.to_owned();
+                let key = "task".to_owned();
+                loop {
+                    let stack_len = list_stack.len();
+                    let Some((top_indent, top_key)) = list_stack.last_mut() else {
+                        list_stack.push((indent.clone(), key));
+                        break;
+                    };
+                    if *top_indent == indent {
+                        *top_key = key;
+                        break;
+                    }
+                    if !top_indent.is_empty() && !indent.starts_with(top_indent.as_str()) {
+                        if stack_len > 1 {
+                            list_stack.pop();
+                            continue;
+                        }
+                        *top_indent = indent.clone();
+                        *top_key = key;
+                        break;
+                    }
+                    list_stack.push((indent.clone(), key));
+                    break;
+                }
+                let level = (list_stack.len() - 1).min(MAX_LIST_LEVEL as usize) as u8;
+                kind = BlockKind::Task {
+                    level,
+                    checked: task.check_char != ' ',
+                };
+                attrs = BlockAttributes::default()
+                    .with_indent(task.indent)
+                    .with_marker_space(task.marker_space)
+                    .with_content_space(task.content_space);
+                if task.check_char == 'X' {
+                    attrs = attrs.with_marker("X");
+                }
+                content = task.content;
+                numbers.fill(0);
             } else {
+                list_stack.clear();
                 let indent = line.bytes().take_while(|b| *b == b' ').count();
                 let level = indent / 4;
                 if indent % 4 == 0 && level <= 3 {
@@ -341,7 +485,7 @@ fn fragment(
                             || text.starts_with("[x]")
                             || text.starts_with("[X]"))
                     {
-                        block = Block::Bullet(level as u8);
+                        kind = BlockKind::Bullet(level as u8);
                         content = text;
                         numbers[level..].fill(0);
                     } else {
@@ -351,25 +495,25 @@ fn fragment(
                         {
                             numbers[level] += 1;
                             numbers[level + 1..].fill(0);
-                            block = Block::Numbered(level as u8);
+                            kind = BlockKind::Numbered(level as u8);
                             content = text;
                         }
                     }
                 }
-                if block == Block::Paragraph {
+                if kind == BlockKind::Paragraph {
                     numbers.fill(0);
                 }
             }
         }
-        let mut part = inline(content, resolve);
-        part.set_block(block);
-        parts.push(part);
+        let part = inline(content, resolve);
+        parts.push((part, vec![(kind, attrs)]));
         index += 1;
     }
     let mut text = String::new();
     let mut marks = Vec::new();
-    let mut block_attrs = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
+    let mut logical_meta: Vec<(usize, usize, BlockKind, BlockAttributes)> = Vec::new();
+    let mut line_cursor = 0usize;
+    for (index, (part, meta)) in parts.iter().enumerate() {
         if index > 0 {
             text.push('\n');
         }
@@ -380,11 +524,35 @@ fn fragment(
                 .iter()
                 .map(|m| MarkRange::new(m.start + offset..m.end + offset, m.mark.clone())),
         );
-        block_attrs.extend_from_slice(part.blocks());
+        let count = meta.len();
+        if count > 0 {
+            if meta
+                .iter()
+                .all(|(k, a)| *k == BlockKind::Code && *a == meta[0].1)
+            {
+                logical_meta.push((
+                    line_cursor,
+                    line_cursor + count - 1,
+                    BlockKind::Code,
+                    meta[0].1.clone(),
+                ));
+            } else {
+                for (j, (kind, attrs)) in meta.iter().enumerate() {
+                    if *kind != BlockKind::Paragraph || *attrs != BlockAttributes::default() {
+                        logical_meta.push((line_cursor + j, line_cursor + j, *kind, attrs.clone()));
+                    }
+                }
+            }
+        }
+        line_cursor += count;
     }
     let mut edit = draft(text);
-    edit.set_blocks(block_attrs);
+    for (first_line, last_line, kind, attrs) in logical_meta {
+        let range = edit.line_range(first_line).start..edit.line_range(last_line).end;
+        let _ = edit.set_logical_block(range, kind, attrs);
+    }
     edit.set_marks(marks);
+    edit.clear_history();
     edit
 }
 
@@ -435,36 +603,42 @@ pub fn paste_with_path_query(
     let (from, to) = edit.range();
     let line = edit.line_range(edit.line_of_byte(from));
     let last_line = edit.line_range(edit.line_of_byte(to));
-    let blocks = edit.active_block() == Block::Paragraph;
+    let first_index = edit.line_of_byte(from);
+    let last_index = edit.line_of_byte(to);
+    let blocks = edit.block_kind(first_index) == BlockKind::Paragraph;
     let mut fragment = fragment(&text, blocks, blocks, literal_length, resolve);
     let prefix = from > line.start;
     let suffix = to < last_line.end;
-    let first_index = edit.line_of_byte(from);
-    let last_index = edit.line_of_byte(to);
     if !prefix
         && first_index > 0
-        && edit.blocks()[first_index - 1] == Block::Code
-        && fragment.blocks().first() == Some(&Block::Code)
+        && edit.block_kind(first_index - 1) == BlockKind::Code
+        && fragment.block_kind(0) == BlockKind::Code
         || !suffix
             && edit.blocks().get(last_index + 1) == Some(&Block::Code)
-            && fragment.blocks().last() == Some(&Block::Code)
+            && fragment.block_kind(fragment.blocks().len() - 1) == BlockKind::Code
     {
         // Adjacent fences require identity that Rune cannot retain. Preserve
         // the authored fence rather than accidentally merging two code blocks.
         fragment = self::fragment(&text, false, blocks, literal_length, resolve);
     }
-    let structural =
-        blocks && (fragment.blocks().len() > 1 || fragment.blocks()[0] != Block::Paragraph);
+    let fragment_lines = fragment.blocks().len();
+    let structural = blocks
+        && (fragment_lines > 1
+            || fragment.block_kind(0) != BlockKind::Paragraph
+            || fragment.block_attributes(0) != &BlockAttributes::default());
     let before = if structural && prefix { "\n" } else { "" };
     let after = if structural && suffix { "\n" } else { "" };
     let replacement = format!("{before}{}{after}", fragment.text);
     let content_start = from + before.len();
     let content_end = content_start + fragment.text.len();
-    let suffix_block = edit.blocks()[last_index];
+    let suffix_kind = edit.block_kind(last_index);
+    let suffix_attrs = edit.block_attributes(last_index).clone();
     // Rune's HTML importer drops a leading space before a pill. Insert the
     // app-built fragment directly with public editing APIs, in one undo group.
     let inherit = literal_length == 0
-        && fragment.blocks() == [Block::Paragraph]
+        && fragment_lines == 1
+        && fragment.block_kind(0) == BlockKind::Paragraph
+        && fragment.block_attributes(0) == &BlockAttributes::default()
         && fragment.marks().is_empty();
     edit.undo_group(|edit| {
         edit.insert(&replacement);
@@ -493,12 +667,17 @@ pub fn paste_with_path_query(
         }
         if blocks {
             let first = edit.line_of_byte(content_start);
-            let mut attrs = edit.blocks().to_vec();
-            attrs[first..first + fragment.blocks().len()].copy_from_slice(fragment.blocks());
-            if structural && suffix {
-                attrs[first + fragment.blocks().len()] = suffix_block;
+            for lb in fragment.logical_blocks() {
+                let b_first = fragment.line_of_byte(lb.range.start);
+                let b_last = fragment.line_of_byte(lb.range.end);
+                let range =
+                    edit.line_range(first + b_first).start..edit.line_range(first + b_last).end;
+                let _ = edit.set_logical_block(range, lb.kind, lb.attributes);
             }
-            edit.set_blocks(attrs);
+            if structural && suffix {
+                let suffix_line = edit.line_range(first + fragment_lines);
+                let _ = edit.set_logical_block(suffix_line, suffix_kind, suffix_attrs);
+            }
         }
         edit.set_caret(content_end);
     });

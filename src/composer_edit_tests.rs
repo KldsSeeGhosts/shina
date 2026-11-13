@@ -1,6 +1,7 @@
 //! Cases copied from KSG's composer-rich-text.test.ts, composer-rich-text-doc.test.ts
 //! and composer-code-block.test.ts. Offsets here are UTF-8 bytes, not PM positions.
 use super::*;
+use rune::{BlockKind, EditorSelection};
 
 fn type_text(edit: &mut TextEdit, rules: &mut Rules, text: &str) {
     for ch in text.chars() {
@@ -340,5 +341,251 @@ fn ksg_block_paste_splits_prose_at_start_middle_and_end() {
         assert_eq!(markdown(&edit), expected, "{at}: {source}");
         edit.undo();
         assert_eq!(markdown(&edit), "abcd");
+    }
+}
+
+fn resolve_readme(source: &str) -> Option<(String, String)> {
+    (source == "@README.md").then(|| {
+        (
+            crate::composer_tokens::Token::File {
+                path: "README.md".into(),
+                directory: false,
+                source: Some("@README.md".into()),
+            }
+            .id(),
+            "README.md".into(),
+        )
+    })
+}
+
+#[test]
+fn ksg_headings_round_trip() {
+    for source in [
+        "# Heading",
+        "## Two",
+        "###### Six",
+        "####### seven hashes stays a paragraph",
+        "#  two spaces",
+        "#\tTab",
+        "# Trailing hashes stay literal #",
+        "#1234",
+        "#1234 is a pull request, not a heading",
+        "# Heading with **bold** and @README.md",
+        "#",
+        "# ",
+        "text\n# Heading\ntext",
+        "# Heading\n- item\n> quote\n---",
+    ] {
+        let edit = pasted::fragment(source, true, true, 0, &resolve_readme);
+        assert_eq!(markdown(&edit), source, "{source}");
+        let mut pasted_edit = draft("");
+        paste(&mut pasted_edit, source, &resolve_readme);
+        let expected = if source.ends_with("@README.md") {
+            format!("{source} ")
+        } else {
+            source.to_string()
+        };
+        assert_eq!(markdown(&pasted_edit), expected, "{source}");
+    }
+    let seven = pasted::fragment("####### seven", true, true, 0, &resolve_readme);
+    assert_eq!(seven.block_kind(0), BlockKind::Paragraph);
+
+    let h6 = pasted::fragment("###### Six", true, true, 0, &resolve_readme);
+    assert_eq!(h6.block_kind(0), BlockKind::Heading { level: 6 });
+
+    let rich = pasted::fragment(
+        "# Heading with **bold** and @README.md",
+        true,
+        true,
+        0,
+        &resolve_readme,
+    );
+    assert_eq!(rich.block_kind(0), BlockKind::Heading { level: 1 });
+    assert!(rich.marks().iter().any(|m| m.mark == Mark::Bold));
+    assert_eq!(rich.pills().count(), 1);
+}
+
+#[test]
+fn ksg_tasks_round_trip() {
+    for source in [
+        "- [ ] buy milk",
+        "-   [ ]  buy milk",
+        "\t-\t[x]\t\titem",
+        "- [ ]  ",
+        "- [ ]\n  - [ ] child",
+        "  - [ ] first\n - [ ] second\n  - [ ] child",
+        "- [x] done\n- [ ] next",
+        "- [X] uppercase",
+        "- [ ] parent\n  - [ ] child\n  - [ ] sibling\n- [ ] uncle",
+        "- [ ] empty task follows\n- [ ]",
+        "- [ ] **bold** task with @README.md",
+        "para\n- [ ] task\npara",
+        "- [ ]No space stays literal",
+        "-[ ] also literal",
+    ] {
+        let edit = pasted::fragment(source, true, true, 0, &resolve_readme);
+        assert_eq!(markdown(&edit), source, "{source}");
+        let mut pasted_edit = draft("");
+        paste(&mut pasted_edit, source, &resolve_readme);
+        let expected = if source.ends_with("@README.md") {
+            format!("{source} ")
+        } else {
+            source.to_string()
+        };
+        assert_eq!(markdown(&pasted_edit), expected, "{source}");
+    }
+    let mut upper = draft("");
+    paste(&mut upper, "- [X] uppercase", &resolve_readme);
+    assert_eq!(
+        upper.block_kind(0),
+        BlockKind::Task {
+            level: 0,
+            checked: true
+        }
+    );
+    upper.set_task_checked(0, false);
+    assert_eq!(markdown(&upper), "- [ ] uppercase");
+    upper.undo();
+    assert_eq!(markdown(&upper), "- [X] uppercase");
+    upper.redo();
+    assert_eq!(markdown(&upper), "- [ ] uppercase");
+
+    let mut literal = draft("");
+    paste(&mut literal, "- [ ]No space stays literal", &resolve_readme);
+    assert_eq!(literal.block_kind(0), BlockKind::Paragraph);
+}
+
+#[test]
+fn ksg_rules_round_trip_and_selection_deletion() {
+    for source in [
+        "---",
+        "***",
+        "___",
+        "- - -",
+        "* * *",
+        "-----",
+        "---   ",
+        "text\n---\nmore",
+        "- item\n---\n- item two",
+        "```\n---\n```",
+        "--",
+        "-- -",
+        "---text",
+    ] {
+        let mut edit = draft("");
+        paste(&mut edit, source, &resolve_readme);
+        assert_eq!(markdown(&edit), source, "{source}");
+    }
+    let mut ordered_kinds = draft("");
+    paste(
+        &mut ordered_kinds,
+        "- - -\n***\n___\ntext\n---\n- item",
+        &resolve_readme,
+    );
+    assert_eq!(
+        (0..6)
+            .map(|i| ordered_kinds.block_kind(i))
+            .collect::<Vec<_>>(),
+        vec![
+            BlockKind::Rule,
+            BlockKind::Rule,
+            BlockKind::Rule,
+            BlockKind::Paragraph,
+            BlockKind::Rule,
+            BlockKind::Bullet(0),
+        ]
+    );
+
+    // Selection, navigation, deletion, undo, redo.
+    let mut edit = draft("");
+    paste(&mut edit, "above\n* * *\nbelow", &resolve_readme);
+    let rule_id = edit.logical_blocks().nth(1).unwrap().id;
+    assert!(edit.select_block(rule_id));
+    assert_eq!(edit.selection(), EditorSelection::Block(rule_id));
+    assert_eq!(edit.selected(), "* * *");
+    press(&mut edit, &mut Rules::default(), Key::Backspace, false);
+    assert_eq!(markdown(&edit), "above\nbelow");
+    edit.undo();
+    assert_eq!(markdown(&edit), "above\n* * *\nbelow");
+    assert_eq!(edit.selection(), EditorSelection::Block(rule_id));
+    edit.redo();
+    assert_eq!(markdown(&edit), "above\nbelow");
+}
+
+#[test]
+fn heading_task_and_rule_input_rules_backspace_and_enter() {
+    // Headings 1..6: immediate Backspace reversal, start-of-heading revert, Enter to paragraph.
+    for level in 1..=6u8 {
+        let prefix = format!("{} ", "#".repeat(level as usize));
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, &prefix);
+        assert_eq!(edit.block_kind(0), BlockKind::Heading { level });
+        assert_eq!(markdown(&edit), prefix);
+        press(&mut edit, &mut rules, Key::Backspace, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Paragraph);
+        assert_eq!(edit.text, prefix);
+
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, &format!("{prefix}Title"));
+        assert_eq!(edit.block_kind(0), BlockKind::Heading { level });
+        assert_eq!(markdown(&edit), format!("{prefix}Title"));
+        edit.set_caret(0);
+        press(&mut edit, &mut rules, Key::Backspace, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Paragraph);
+        assert_eq!(edit.text, "Title");
+
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, &prefix);
+        press(&mut edit, &mut rules, Key::Enter, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Heading { level });
+        assert_eq!(edit.block_kind(1), BlockKind::Paragraph);
+    }
+
+    // Tasks: - [ ] , - [x] , - [X] , bullet-to-task [ ] , Backspace reversal, Enter continue/exit.
+    for (trigger, checked) in [("- [ ] ", false), ("- [x] ", true), ("- [X] ", true)] {
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, trigger);
+        assert_eq!(edit.block_kind(0), BlockKind::Task { level: 0, checked });
+        assert_eq!(markdown(&edit), trigger);
+        press(&mut edit, &mut rules, Key::Backspace, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Paragraph);
+        assert_eq!(edit.text, trigger);
+    }
+    let mut edit = draft("");
+    let mut rules = Rules::default();
+    type_text(&mut edit, &mut rules, "* [ ] item");
+    assert_eq!(
+        edit.block_kind(0),
+        BlockKind::Task {
+            level: 0,
+            checked: false
+        }
+    );
+    assert_eq!(edit.text, "item");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    assert_eq!(
+        edit.block_kind(1),
+        BlockKind::Task {
+            level: 0,
+            checked: false
+        }
+    );
+    press(&mut edit, &mut rules, Key::Enter, false);
+    assert_eq!(edit.block_kind(1), BlockKind::Paragraph);
+
+    // Rules: --- , *** , ___ and Backspace reversal.
+    for trigger in ["---", "*** ", "___ "] {
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, trigger);
+        assert_eq!(edit.block_kind(0), BlockKind::Rule);
+        assert_eq!(markdown(&edit), trigger);
+        press(&mut edit, &mut rules, Key::Backspace, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Paragraph);
+        assert_eq!(edit.text, trigger);
     }
 }

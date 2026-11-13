@@ -11340,6 +11340,22 @@ fn composer(
         quote_bar: p.muted,
         marker: Some(p.muted),
     })
+    .block_style(rune::BlockStyle {
+        heading_scale: [
+            20.0 / 15.0,
+            18.0 / 15.0,
+            16.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+        ],
+        heading_weight: [600.0; 6],
+        checkbox_size: 14.0,
+        checkbox_stroke: 2.0,
+        checkbox_color: Some(p.ink),
+        rule_thickness: 2.0,
+        rule_color: Some(p.line),
+    })
     .caret(p.coral, p.coral_bg)
     .w_full()
     .min_h(COMPOSER_FIELD_MIN)
@@ -11354,14 +11370,30 @@ fn composer(
             composer_menu::scroll_selected(s, tx);
             return true;
         }
-        if (event.is_command('c') || event.is_command('x'))
-            && !event.mods.shift
-            && !event.mods.alt
-            && s.current().draft.anchor != s.current().draft.focus
-            && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+        if (event.is_command('c') || event.is_command('x')) && !event.mods.shift && !event.mods.alt
         {
-            tx.copy_rich(content);
-            return true;
+            if s.current().draft.anchor != s.current().draft.focus
+                && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+            {
+                tx.copy_rich(content);
+                return true;
+            }
+            if matches!(
+                s.current().draft.selection(),
+                rune::EditorSelection::Block(_)
+            ) && !s.current().draft.is_secure()
+            {
+                let cut = event.is_command('x');
+                let d = &mut s.current_mut().draft;
+                let content =
+                    rune::ClipboardContent::new(d.selected()).with_html(d.selected_html());
+                tx.copy_rich(content);
+                if cut {
+                    d.insert("");
+                    s.current_mut().update_submission_error();
+                }
+                return true;
+            }
         }
         if event.is_command('v') && event.mods.shift && !event.mods.alt {
             let id = s.current().id;
