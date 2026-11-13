@@ -171,11 +171,11 @@ pub struct ManagedPolicy {
 /// System policy file location, matching KSG Code's `managedPolicyPath`.
 pub fn managed_policy_path() -> &'static std::path::Path {
     if cfg!(target_os = "macos") {
-        std::path::Path::new("/Library/Application Support/T3Code/policy.json")
+        std::path::Path::new("/Library/Application Support/Shina/policy.json")
     } else if cfg!(target_os = "windows") {
-        std::path::Path::new(r"C:\Program Files\T3Code\policy.json")
+        std::path::Path::new(r"C:\Program Files\Shina\policy.json")
     } else {
-        std::path::Path::new("/etc/t3code/policy.json")
+        std::path::Path::new("/etc/shina/policy.json")
     }
 }
 
