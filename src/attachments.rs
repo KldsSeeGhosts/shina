@@ -322,7 +322,7 @@ fn logical_file_id(id: &str) -> bool {
         })
 }
 
-fn validate_file_metadata(name: &str, mime: &str, length: u64) -> Result<(), String> {
+pub(crate) fn validate_file_metadata(name: &str, mime: &str, length: u64) -> Result<(), String> {
     if name.trim().is_empty()
         || name.encode_utf16().count() > 255
         || mime.trim().is_empty()

@@ -153,13 +153,16 @@ fn kind(name: &str, mime: &str) -> Kind {
 
 pub(crate) struct Preview {
     machine: String,
-    thread: usize,
-    items: Vec<Attachment>,
-    index: usize,
+    pub(crate) thread: usize,
+    pub(crate) items: Vec<Attachment>,
+    pub(crate) index: usize,
     draft: bool,
+    /// A composer-pill preview never joins the draft's attachments, so the
+    /// remove control stays hidden and retry re-resolves its source.
+    pub(crate) transient: bool,
     player: Option<rune::Player>,
     text: String,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
     truncated: bool,
     rendered: bool,
     wrap: bool,
@@ -169,7 +172,7 @@ pub(crate) struct Preview {
     image_viewport_size: [f32; 2],
     suppress_image_click: bool,
     document: Option<Arc<attachment_text_preview::Document>>,
-    cancel: Arc<AtomicBool>,
+    pub(crate) cancel: Arc<AtomicBool>,
     database: Option<Arc<attachment_sqlite_preview::Database>>,
     database_page: Option<attachment_sqlite_preview::Page>,
     database_table: usize,
@@ -220,10 +223,52 @@ impl Preview {
     pub(super) fn player(&self) -> Option<&rune::Player> {
         self.player.as_ref()
     }
+    fn blank(
+        machine: String,
+        thread: usize,
+        items: Vec<Attachment>,
+        index: usize,
+        draft: bool,
+    ) -> Self {
+        Self {
+            machine,
+            thread,
+            items,
+            index,
+            draft,
+            transient: false,
+            player: None,
+            text: String::new(),
+            error: None,
+            truncated: false,
+            rendered: true,
+            wrap: true,
+            zoom: 1.0,
+            image_scroll: Arc::new(std::sync::Mutex::new(Default::default())),
+            image_drag: None,
+            image_viewport_size: [0.0; 2],
+            suppress_image_click: false,
+            document: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            database: None,
+            database_page: None,
+            database_table: 0,
+            database_page_index: 0,
+            database_picker: false,
+            database_loading: false,
+            archive: None,
+            archive_loading: false,
+            archive_folder: String::new(),
+            archive_entry: None,
+            notebook: None,
+            notebook_loading: false,
+            notebook_visible: 20,
+        }
+    }
     fn selected(&self) -> &Attachment {
         &self.items[self.index]
     }
-    fn load(&mut self, wake: rune::Waker) {
+    pub(crate) fn load(&mut self, wake: rune::Waker) {
         self.cancel.store(true, Ordering::Release);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.document = None;
@@ -349,68 +394,20 @@ impl State {
             vec![selected]
         };
         let index = items.iter().position(|a| a.id == id).unwrap_or(0);
-        let mut preview = Preview {
-            machine: self.machines.selected.clone(),
-            thread: self.current().id,
+        let mut preview = Preview::blank(
+            self.machines.selected.clone(),
+            self.current().id,
             items,
             index,
             draft,
-            player: None,
-            text: String::new(),
-            error: None,
-            truncated: false,
-            rendered: true,
-            wrap: true,
-            zoom: 1.0,
-            image_scroll: Arc::new(std::sync::Mutex::new(Default::default())),
-            image_drag: None,
-            image_viewport_size: [0.0; 2],
-            suppress_image_click: false,
-            document: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            database: None,
-            database_page: None,
-            database_table: 0,
-            database_page_index: 0,
-            database_picker: false,
-            database_loading: false,
-            archive: None,
-            archive_loading: false,
-            archive_folder: String::new(),
-            archive_entry: None,
-            notebook: None,
-            notebook_loading: false,
-            notebook_visible: 20,
-        };
+        );
         preview.load(self.wake.clone());
         let fetch = preview.error.is_some() && preview.selected().uploaded.is_some();
         let file = preview.selected().clone();
         let loading = preview.cancel.clone();
         let origin_thread = preview.thread;
-        if (matches!(
-            kind(&preview.selected().name, &preview.selected().mime),
-            Kind::Pdf | Kind::Html | Kind::Font
-        ) || preview.selected().mime == "image/avif")
-            && !rune::is_headless()
-            && preview.error.is_none()
-        {
-            self.html_windows.open_attachment_async(
-                preview.selected().clone(),
-                self.dark,
-                self.wake.clone(),
-            );
-        }
         self.attachment_preview = Some(preview);
-        self.load_attachment_text_document();
-        if kind(&file.name, &file.mime) == Kind::Sqlite {
-            self.load_attachment_database(0, 0);
-        }
-        if kind(&file.name, &file.mime) == Kind::Archive {
-            self.load_attachment_archive();
-        }
-        if kind(&file.name, &file.mime) == Kind::Notebook {
-            self.load_attachment_notebook();
-        }
+        self.finish_preview_load();
         if fetch
             && let (Some(link), Some(handle)) = (
                 self.attachment_preview_link(),
@@ -463,6 +460,54 @@ impl State {
         }
     }
 
+    /// A composer-pill preview is transient: the file never joins the draft's
+    /// attachments, the remove control stays hidden, and closing leaves the
+    /// draft unchanged. This is the settled substitute for KSG Code's right
+    /// panel (`ComposerMentionNodeView` calls `actions.openMention(path)`);
+    /// Shina has no right panel yet.
+    pub(crate) fn preview_mention(&mut self, attachment: Attachment) {
+        let mut preview = Preview::blank(
+            self.machines.selected.clone(),
+            self.current().id,
+            vec![attachment],
+            0,
+            false,
+        );
+        preview.transient = true;
+        preview.load(self.wake.clone());
+        self.attachment_preview = Some(preview);
+        self.finish_preview_load();
+    }
+
+    /// Once the selected item has local bytes, run the deferred loaders and
+    /// the isolated-document check `preview_attachments` runs for each open.
+    pub(crate) fn finish_preview_load(&mut self) {
+        let Some(preview) = &self.attachment_preview else {
+            return;
+        };
+        let file = preview.selected().clone();
+        self.load_attachment_text_document();
+        match kind(&file.name, &file.mime) {
+            Kind::Sqlite => self.load_attachment_database(0, 0),
+            Kind::Archive => self.load_attachment_archive(),
+            Kind::Notebook => self.load_attachment_notebook(),
+            _ => {}
+        }
+        if (matches!(
+            kind(&file.name, &file.mime),
+            Kind::Pdf | Kind::Html | Kind::Font
+        ) || file.mime == "image/avif")
+            && !rune::is_headless()
+            && self
+                .attachment_preview
+                .as_ref()
+                .is_some_and(|preview| preview.error.is_none())
+        {
+            self.html_windows
+                .open_attachment_async(file, self.dark, self.wake.clone());
+        }
+    }
+
     fn navigate_attachment_preview(&mut self, direction: isize) {
         if let Some(preview) = &mut self.attachment_preview {
             preview.index = (preview.index as isize + direction)
@@ -473,6 +518,12 @@ impl State {
 
     fn retry_attachment_preview(&mut self) {
         if let Some(preview) = &self.attachment_preview {
+            if preview.transient {
+                if let Some(path) = preview.selected().path.clone() {
+                    self.preview_mention_path(&path);
+                }
+                return;
+            }
             let (items, id, draft) = (
                 preview.items.clone(),
                 preview.selected().id.clone(),
@@ -1230,7 +1281,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
             );
         }),
     );
-    if preview.draft {
+    if preview.draft && !preview.transient {
         let id = attachment.id.clone();
         header = header.child(icon_button(
             "remove-preview-attachment",
