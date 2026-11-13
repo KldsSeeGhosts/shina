@@ -4,6 +4,8 @@ use rune::{Block, BlockAttributes, BlockKind, EditorSelection, Key, KeyEvent, Ma
 
 #[path = "composer_code.rs"]
 mod code;
+#[path = "composer_list.rs"]
+mod list;
 #[path = "composer_markdown_paste.rs"]
 mod pasted;
 #[path = "composer_inline.rs"]
@@ -154,12 +156,23 @@ impl Rules {
                         });
                         return true;
                     }
-                    BlockKind::Task { level: 0, .. } => {
+                    BlockKind::Bullet(0)
+                    | BlockKind::Numbered(0)
+                    | BlockKind::Task { level: 0, .. } => {
                         edit.undo_group(|e| {
                             e.set_block_kind(line_idx, BlockKind::Paragraph);
                             e.set_block_attributes(line_idx, BlockAttributes::default());
                         });
                         return true;
+                    }
+                    BlockKind::Bullet(_) | BlockKind::Numbered(_) | BlockKind::Task { .. } => {
+                        let mut outdented = false;
+                        edit.undo_group(|e| {
+                            outdented = list::outdent_single_line(e, line_idx);
+                        });
+                        if outdented {
+                            return true;
+                        }
                     }
                     _ => {}
                 }
@@ -193,6 +206,15 @@ impl Rules {
         if code::key(edit, ev) {
             return true;
         }
+        if ev.key == Key::Tab && !ev.mods.cmd && !ev.mods.ctrl && !ev.mods.alt {
+            if ev.mods.shift {
+                if list::outdent_at_cursor(edit) {
+                    return true;
+                }
+            } else if list::indent_at_cursor(edit) {
+                return true;
+            }
+        }
         if ev.key == Key::Enter && !ev.mods.cmd && !ev.mods.ctrl {
             let line_idx = edit.line_of_byte(edit.focus);
             let line = edit.line_range(line_idx);
@@ -216,29 +238,8 @@ impl Rules {
                 edit.key(&KeyEvent::from(Key::Enter), None);
             } else if matches!(kind, BlockKind::Heading { .. }) {
                 edit.key(&KeyEvent::from(Key::Enter), None);
-            } else if let BlockKind::Task { level, .. } = kind {
-                if edit.anchor == edit.focus && line.is_empty() {
-                    if level == 0 {
-                        edit.undo_group(|e| {
-                            e.set_block_kind(line_idx, BlockKind::Paragraph);
-                            e.set_block_attributes(line_idx, BlockAttributes::default());
-                        });
-                    } else {
-                        edit.outdent_list();
-                    }
-                } else {
-                    edit.key(&KeyEvent::from(Key::Enter), None);
-                    let new_line = edit.line_of_byte(edit.focus);
-                    if new_line != line_idx
-                        && matches!(edit.block_kind(new_line), BlockKind::Task { .. })
-                    {
-                        let mut attrs = edit.block_attributes(new_line).clone();
-                        if attrs.content_space().is_none_or(str::is_empty) {
-                            attrs = attrs.with_content_space(" ");
-                            edit.set_block_attributes(new_line, attrs);
-                        }
-                    }
-                }
+            } else if list::is_list(kind) {
+                list::enter_in_list(edit);
             } else if kind == BlockKind::Paragraph {
                 edit.insert("\n");
             } else {
@@ -360,8 +361,9 @@ impl Rules {
                 edit.undo_group(|e| {
                     e.set_selection(line.start, focus);
                     e.insert("");
+                    let range = e.line_range(line_idx);
                     let _ = e.set_logical_block(
-                        line.start..line.start,
+                        range,
                         BlockKind::Heading {
                             level: hashes as u8,
                         },
@@ -389,39 +391,105 @@ impl Rules {
             edit.undo_group(|e| {
                 e.set_selection(line.start, focus);
                 e.insert("");
-                let _ = e.set_logical_block(
-                    line.start..line.start,
-                    BlockKind::Task { level: 0, checked },
-                    attrs,
-                );
+                let range = e.line_range(line_idx);
+                let _ = e.set_logical_block(range, BlockKind::Task { level: 0, checked }, attrs);
                 e.set_caret(line.start);
             });
             self.converted = Some(edit.clone());
             return;
         }
-        let (block, marker_end) = match prefix {
-            "* " => (Block::Bullet(0), edit.focus),
-            "1. " => (Block::Numbered(0), edit.focus),
-            "> " => (Block::Quote, edit.focus),
-            _ if prefix.starts_with("- ")
-                && prefix.len() == 2 + prefix[2..].chars().next().map_or(0, char::len_utf8)
-                && prefix[2..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| !source::space(c) && c != '[') =>
-            {
-                (Block::Bullet(0), line.start + 2)
+        if prefix == "> " {
+            let end = focus;
+            edit.undo_group(|e| {
+                e.set_selection(line.start, end);
+                e.insert("");
+                e.set_block(Block::Quote);
+                e.set_caret(line.start);
+            });
+            self.converted = Some(edit.clone());
+            return;
+        }
+        if let Some(ch) = prefix.chars().next().filter(|c| matches!(c, '*' | '+')) {
+            let rest = &prefix[1..];
+            if rest.chars().count() == 1 && rest.chars().next().is_some_and(source::space) {
+                let marker = ch.to_string();
+                let space = rest.to_owned();
+                let attrs = BlockAttributes::default()
+                    .with_indent("")
+                    .with_marker(marker)
+                    .with_space(space);
+                edit.undo_group(|e| {
+                    e.set_selection(line.start, focus);
+                    e.insert("");
+                    let range = e.line_range(line_idx);
+                    let _ = e.set_logical_block(range, BlockKind::Bullet(0), attrs);
+                    e.set_caret(line.start);
+                });
+                self.converted = Some(edit.clone());
+                return;
             }
-            _ => return,
-        };
-        let end = edit.focus;
-        edit.undo_group(|e| {
-            e.set_selection(line.start, marker_end);
-            e.insert("");
-            e.set_block(block);
-            e.set_caret(end - (marker_end - line.start));
-        });
-        self.converted = Some(edit.clone());
+        }
+        let digits = prefix.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0
+            && prefix[digits..]
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '.' | ')'))
+        {
+            let rest = &prefix[digits + 1..];
+            if rest.chars().count() == 1 && rest.chars().next().is_some_and(source::space) {
+                let marker = prefix[..digits + 1].to_owned();
+                let space = rest.to_owned();
+                let attrs = BlockAttributes::default()
+                    .with_indent("")
+                    .with_marker(marker)
+                    .with_space(space);
+                edit.undo_group(|e| {
+                    e.set_selection(line.start, focus);
+                    e.insert("");
+                    let range = e.line_range(line_idx);
+                    let _ = e.set_logical_block(range, BlockKind::Numbered(0), attrs);
+                    e.set_caret(line.start);
+                });
+                self.converted = Some(edit.clone());
+                return;
+            }
+        }
+        if let Some(after_dash) = prefix.strip_prefix('-') {
+            let space_len = after_dash
+                .bytes()
+                .take_while(|b| matches!(*b, b' ' | b'\t'))
+                .count();
+            if space_len > 0 {
+                let marker_end = line.start + 1 + space_len;
+                let tail = &edit.text[marker_end..line.end];
+                let unfinished_task = tail.is_empty()
+                    || tail == "["
+                    || tail == "[ "
+                    || tail == "[x"
+                    || tail == "[X"
+                    || tail == "[]"
+                    || tail.starts_with("[ ]")
+                    || tail.starts_with("[x]")
+                    || tail.starts_with("[X]");
+                if !unfinished_task {
+                    let space = after_dash[..space_len].to_owned();
+                    let attrs = BlockAttributes::default()
+                        .with_indent("")
+                        .with_marker("-")
+                        .with_space(space);
+                    let end = focus;
+                    edit.undo_group(|e| {
+                        e.set_selection(line.start, marker_end);
+                        e.insert("");
+                        let range = e.line_range(line_idx);
+                        let _ = e.set_logical_block(range, BlockKind::Bullet(0), attrs);
+                        e.set_caret(end - (marker_end - line.start));
+                    });
+                    self.converted = Some(edit.clone());
+                }
+            }
+        }
     }
 }
 
@@ -472,15 +540,28 @@ pub fn editor_key_before_commands(thread: &mut crate::model::Thread, event: &Key
         || event.key == Key::Enter
             && edit.anchor == edit.focus
             && edit.focus == line.end
-            && edit.active_block() == Block::Paragraph
+            && edit.block_kind(edit.line_of_byte(edit.focus)) == BlockKind::Paragraph
             && &edit.text[line] == "```";
     if code_key && thread.composer_rules.key(&mut thread.draft, event) {
         thread.typing_guard.on_type(std::time::Instant::now());
         thread.update_submission_error();
-        true
-    } else {
-        false
+        return true;
     }
+    if event.key == Key::Tab
+        && event.mods.shift
+        && !event.mods.alt
+        && list::is_list(
+            thread
+                .draft
+                .block_kind(thread.draft.line_of_byte(thread.draft.focus)),
+        )
+        && thread.composer_rules.key(&mut thread.draft, event)
+    {
+        thread.typing_guard.on_type(std::time::Instant::now());
+        thread.update_submission_error();
+        return true;
+    }
+    false
 }
 
 /// KSG's handleTextInput leaves styled text and chips to normal replacement. Plain
@@ -865,7 +946,7 @@ pub fn markdown_for(
 ) -> String {
     let paragraphs = edit.paragraphs();
     let mut out = Vec::new();
-    let mut numbers = [0usize; 4];
+    let mut numbers: Vec<usize> = Vec::new();
     let mut at = 0;
     while at < paragraphs.len() {
         let p = &paragraphs[at];
@@ -900,11 +981,11 @@ pub fn markdown_for(
             let ticks = fence(content, 3);
             let newline = if content.is_empty() { "" } else { "\n" };
             out.push(format!("{ticks}{newline}{content}\n{ticks}"));
-            numbers.fill(0);
+            numbers.clear();
             continue;
         }
         if kind == BlockKind::Rule {
-            numbers.fill(0);
+            numbers.clear();
             out.push(
                 attrs
                     .rule_source()
@@ -917,7 +998,7 @@ pub fn markdown_for(
         }
         let prefix = match kind {
             BlockKind::Heading { level } => {
-                numbers.fill(0);
+                numbers.clear();
                 if p.soft_break {
                     String::new()
                 } else {
@@ -929,13 +1010,11 @@ pub fn markdown_for(
                 }
             }
             BlockKind::Task { level, checked } => {
-                numbers[level as usize..].fill(0);
+                numbers.truncate(level as usize);
                 if p.soft_break {
                     "    ".repeat(level as usize + 1)
                 } else {
-                    let indent = attrs
-                        .indent()
-                        .map_or_else(|| "  ".repeat(level as usize), str::to_owned);
+                    let indent = list::effective_indent(edit, at);
                     let marker_space = attrs.marker_space().unwrap_or(" ");
                     let empty = p.range.is_empty();
                     let content_space = match attrs.content_space() {
@@ -968,34 +1047,76 @@ pub fn markdown_for(
                 }
             }
             BlockKind::Bullet(level) => {
-                numbers[level as usize..].fill(0);
+                numbers.truncate(level as usize);
                 if p.soft_break {
                     "    ".repeat(level as usize + 1)
                 } else {
-                    format!("{}- ", "    ".repeat(level as usize))
+                    let indent = list::effective_indent(edit, at);
+                    let marker = attrs.marker().filter(|s| !s.is_empty()).unwrap_or("-");
+                    let empty = p.range.is_empty();
+                    let space = match attrs.space() {
+                        Some("") => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                        Some(s) => s,
+                        None => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                    };
+                    format!("{indent}{marker}{space}")
                 }
             }
             BlockKind::Numbered(level) => {
                 if !p.soft_break {
+                    if numbers.len() <= level as usize {
+                        numbers.resize(level as usize + 1, 0);
+                    }
                     numbers[level as usize] += 1;
-                    numbers[level as usize + 1..].fill(0);
+                    numbers.truncate(level as usize + 1);
                 }
                 if p.soft_break {
                     "    ".repeat(level as usize + 1)
                 } else {
-                    format!(
-                        "{}{}. ",
-                        "    ".repeat(level as usize),
-                        numbers[level as usize]
-                    )
+                    let indent = list::effective_indent(edit, at);
+                    let empty = p.range.is_empty();
+                    let space = match attrs.space() {
+                        Some("") => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                        Some(s) => s,
+                        None => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                    };
+                    if let Some(marker) = attrs.marker().filter(|s| !s.is_empty()) {
+                        format!("{indent}{marker}{space}")
+                    } else {
+                        format!("{indent}{}.{space}", numbers[level as usize])
+                    }
                 }
             }
             BlockKind::Quote => {
-                numbers.fill(0);
+                numbers.clear();
                 "> ".into()
             }
             _ => {
-                numbers.fill(0);
+                numbers.clear();
                 String::new()
             }
         };
@@ -1017,7 +1138,7 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
     let paragraphs = edit.paragraphs();
     let mut out = Vec::new();
     let mut at = 0;
-    let mut numbers = [0usize; 4];
+    let mut numbers: Vec<usize> = Vec::new();
     while at < paragraphs.len() {
         let p = &paragraphs[at];
         let kind = edit.block_kind(at);
@@ -1054,11 +1175,11 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
             let ticks = fence(content, 3);
             let newline = if content.is_empty() { "" } else { "\n" };
             out.push(format!("{ticks}{newline}{content}\n{ticks}"));
-            numbers.fill(0);
+            numbers.clear();
             continue;
         }
         if kind == BlockKind::Rule {
-            numbers.fill(0);
+            numbers.clear();
             out.push(
                 attrs
                     .rule_source()
@@ -1072,7 +1193,7 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
         let prefix = if sub_start == p.range.start {
             match kind {
                 BlockKind::Heading { level } => {
-                    numbers.fill(0);
+                    numbers.clear();
                     if p.soft_break {
                         String::new()
                     } else {
@@ -1084,13 +1205,11 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
                     }
                 }
                 BlockKind::Task { level, checked } => {
-                    numbers[level as usize..].fill(0);
+                    numbers.truncate(level as usize);
                     if p.soft_break {
                         "    ".repeat(level as usize + 1)
                     } else {
-                        let indent = attrs
-                            .indent()
-                            .map_or_else(|| "  ".repeat(level as usize), str::to_owned);
+                        let indent = list::effective_indent(edit, at);
                         let marker_space = attrs.marker_space().unwrap_or(" ");
                         let empty = p.range.is_empty();
                         let content_space = match attrs.content_space() {
@@ -1123,30 +1242,72 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
                     }
                 }
                 BlockKind::Bullet(level) => {
-                    numbers[level as usize..].fill(0);
-                    format!("{}- ", "    ".repeat(level as usize))
+                    numbers.truncate(level as usize);
+                    let indent = list::effective_indent(edit, at);
+                    let marker = attrs.marker().filter(|s| !s.is_empty()).unwrap_or("-");
+                    let empty = p.range.is_empty();
+                    let space = match attrs.space() {
+                        Some("") => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                        Some(s) => s,
+                        None => {
+                            if empty {
+                                ""
+                            } else {
+                                " "
+                            }
+                        }
+                    };
+                    format!("{indent}{marker}{space}")
                 }
                 BlockKind::Numbered(level) => {
                     if !p.soft_break {
+                        if numbers.len() <= level as usize {
+                            numbers.resize(level as usize + 1, 0);
+                        }
                         numbers[level as usize] += 1;
-                        numbers[level as usize + 1..].fill(0);
+                        numbers.truncate(level as usize + 1);
                     }
                     if p.soft_break {
                         "    ".repeat(level as usize + 1)
                     } else {
-                        format!(
-                            "{}{}. ",
-                            "    ".repeat(level as usize),
-                            numbers[level as usize]
-                        )
+                        let indent = list::effective_indent(edit, at);
+                        let empty = p.range.is_empty();
+                        let space = match attrs.space() {
+                            Some("") => {
+                                if empty {
+                                    ""
+                                } else {
+                                    " "
+                                }
+                            }
+                            Some(s) => s,
+                            None => {
+                                if empty {
+                                    ""
+                                } else {
+                                    " "
+                                }
+                            }
+                        };
+                        if let Some(marker) = attrs.marker().filter(|s| !s.is_empty()) {
+                            format!("{indent}{marker}{space}")
+                        } else {
+                            format!("{indent}{}.{space}", numbers[level as usize])
+                        }
                     }
                 }
                 BlockKind::Quote => {
-                    numbers.fill(0);
+                    numbers.clear();
                     "> ".into()
                 }
                 _ => {
-                    numbers.fill(0);
+                    numbers.clear();
                     String::new()
                 }
             }

@@ -589,3 +589,157 @@ fn heading_task_and_rule_input_rules_backspace_and_enter() {
         assert_eq!(edit.text, trigger);
     }
 }
+
+#[test]
+fn ksg_lists_round_trip_and_depth_six() {
+    for source in [
+        "- one\n- two",
+        "* star\n* star two",
+        "+ plus",
+        "* star\n+ plus",
+        "1. first\n2. second",
+        "1) paren\n2) paren",
+        "3. starts at three\n4. four",
+        "01. zero padded\n02. two",
+        "07)  item",
+        "- parent\n  - child\n  - sibling\n- uncle",
+        "1. ordered\n   - bullet child\n2. next",
+        "- outer\n  1. inner ordered\n  2. more\n- outer again",
+        "-   wide space item",
+        "-",
+        "1.",
+        "- \n- second",
+        "- **bold** item with @README.md",
+        "- [ ] task\n- bullet after",
+        "- bullet\n- [x] task after",
+        "para\n- item\npara",
+        "\t- tab indented\n\t- again",
+        "  - leading indent only",
+        "- item\n\n- after a blank",
+        "- item one\n```\ncode\n```\n- item two",
+        "-no space stays literal",
+        "1.no space stays literal",
+        "10. ten\n11. eleven",
+        "- d0\n  - d1\n    - d2\n      - d3\n        - d4\n          - d5\n            - d6",
+    ] {
+        let edit = pasted::fragment(source, true, true, 0, &resolve_readme);
+        assert_eq!(markdown(&edit), source, "{source}");
+    }
+
+    let deep = pasted::fragment(
+        "- d0\n  - d1\n    - d2\n      - d3\n        - d4\n          - d5\n            - d6",
+        true,
+        true,
+        0,
+        &resolve_readme,
+    );
+    assert_eq!(
+        (0..7).map(|i| deep.block_kind(i)).collect::<Vec<_>>(),
+        (0..=6).map(BlockKind::Bullet).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ksg_list_markers_indent_outdent_lift_and_renumbering() {
+    // Typed markers keep authored marker and start number and reverse on Backspace.
+    for (trigger, expected_kind, content) in [
+        ("* ", BlockKind::Bullet(0), "star"),
+        ("+ ", BlockKind::Bullet(0), "plus"),
+        ("3. ", BlockKind::Numbered(0), "three"),
+        ("1) ", BlockKind::Numbered(0), "paren"),
+        ("01. ", BlockKind::Numbered(0), "padded"),
+    ] {
+        let mut edit = draft("");
+        let mut rules = Rules::default();
+        type_text(&mut edit, &mut rules, trigger);
+        assert_eq!(edit.block_kind(0), expected_kind, "{trigger}");
+        press(&mut edit, &mut rules, Key::Backspace, false);
+        assert_eq!(edit.block_kind(0), BlockKind::Paragraph, "{trigger}");
+        assert_eq!(edit.text, trigger, "{trigger}");
+        edit.replace_text("");
+        type_text(&mut edit, &mut rules, &format!("{trigger}{content}"));
+        assert_eq!(markdown(&edit), format!("{trigger}{content}"));
+    }
+
+    // Tab nesting to parent content column and Shift+Tab reversal.
+    for (initial, indented) in [
+        ("1. parent\n2. child", "1. parent\n   1. child"),
+        ("10. parent\n11. child", "10. parent\n    1. child"),
+        ("1.\tparent\n2. child", "1.\tparent\n    1. child"),
+    ] {
+        let mut edit = pasted::fragment(initial, true, true, 0, &resolve_readme);
+        let pos = edit.text.rfind("child").unwrap() + 2;
+        edit.set_caret(pos);
+        let mut rules = Rules::default();
+        press(&mut edit, &mut rules, Key::Tab, false);
+        assert_eq!(markdown(&edit), indented);
+        press(&mut edit, &mut rules, Key::Tab, true);
+        assert_eq!(markdown(&edit), initial);
+    }
+
+    // Continue sibling numbering on Tab.
+    let mut edit = pasted::fragment(
+        "1. parent\n   1. first\n2. second",
+        true,
+        true,
+        0,
+        &resolve_readme,
+    );
+    edit.set_caret(edit.text.len());
+    press(&mut edit, &mut Rules::default(), Key::Tab, false);
+    assert_eq!(markdown(&edit), "1. parent\n   1. first\n   2. second");
+
+    // Outdent renumbers only within parent's matching ordered list.
+    let mut edit = pasted::fragment("1. a\n   1. b\n2. c", true, true, 0, &resolve_readme);
+    let pos = edit.text.find('b').unwrap();
+    edit.set_caret(pos);
+    press(&mut edit, &mut Rules::default(), Key::Tab, true);
+    assert_eq!(markdown(&edit), "1. a\n2. b\n3. c");
+
+    let mut edit = pasted::fragment("- a\n  5. b", true, true, 0, &resolve_readme);
+    let pos = edit.text.find('b').unwrap();
+    edit.set_caret(pos);
+    press(&mut edit, &mut Rules::default(), Key::Tab, true);
+    assert_eq!(markdown(&edit), "- a\n5. b");
+
+    // Enter on an empty nested item lifts one level per press before exiting.
+    let mut edit = pasted::fragment(
+        "1. parent\n   1. child\n      1. ",
+        true,
+        true,
+        0,
+        &resolve_readme,
+    );
+    edit.set_caret(edit.text.len());
+    let mut rules = Rules::default();
+    for expected in [
+        "1. parent\n   1. child\n   2. ",
+        "1. parent\n   1. child\n2. ",
+        "1. parent\n   1. child\n",
+    ] {
+        press(&mut edit, &mut rules, Key::Enter, false);
+        assert_eq!(markdown(&edit), expected);
+    }
+
+    // Lifting an empty nested item renumbers following siblings.
+    let mut edit = pasted::fragment("1. a\n   1. \n2. b", true, true, 0, &resolve_readme);
+    let mid = edit.line_range(1).start;
+    edit.set_caret(mid);
+    press(&mut edit, &mut Rules::default(), Key::Enter, false);
+    assert_eq!(markdown(&edit), "1. a\n2. \n3. b");
+
+    // Interactive nesting to depth 6 with Tab.
+    let mut edit = draft("");
+    let mut rules = Rules::default();
+    type_text(&mut edit, &mut rules, "- d0");
+    for depth in 1..=6u8 {
+        press(&mut edit, &mut rules, Key::Enter, false);
+        press(&mut edit, &mut rules, Key::Tab, false);
+        type_text(&mut edit, &mut rules, &format!("d{depth}"));
+    }
+    assert_eq!(edit.block_kind(6), BlockKind::Bullet(6));
+    assert_eq!(
+        markdown(&edit),
+        "- d0\n  - d1\n    - d2\n      - d3\n        - d4\n          - d5\n            - d6"
+    );
+}

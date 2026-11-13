@@ -175,8 +175,6 @@ mod tests {
     #[test]
     fn unrepresentable_blocks_keep_source_and_fences_stay_literal() {
         for text in [
-            "+ item\n* other",
-            "07)  item",
             "~~~py title=example\n**bold** @README.md $known\n~~~~ ",
             "```ts\nconst x = 1",
         ] {
@@ -338,6 +336,80 @@ fn parse_task(line: &str) -> Option<TaskPrefix<'_>> {
     })
 }
 
+enum ParsedList<'a> {
+    Task(TaskPrefix<'a>),
+    Ordered {
+        indent: &'a str,
+        marker: &'a str,
+        space: &'a str,
+        content: &'a str,
+    },
+    Bullet {
+        indent: &'a str,
+        marker: &'a str,
+        space: &'a str,
+        content: &'a str,
+    },
+}
+
+fn parse_list(line: &str) -> Option<ParsedList<'_>> {
+    if let Some(task) = parse_task(line) {
+        return Some(ParsedList::Task(task));
+    }
+    let indent_len = line
+        .bytes()
+        .take_while(|b| matches!(*b, b' ' | b'\t'))
+        .count();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0
+        && let Some(delim) = rest[digits..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '.' | ')'))
+    {
+        let after_marker = &rest[digits + delim.len_utf8()..];
+        let space_len = after_marker
+            .bytes()
+            .take_while(|b| matches!(*b, b' ' | b'\t'))
+            .count();
+        let space = &after_marker[..space_len];
+        let content = &after_marker[space_len..];
+        if !space.is_empty() || content.is_empty() {
+            return Some(ParsedList::Ordered {
+                indent,
+                marker: &rest[..digits + delim.len_utf8()],
+                space,
+                content,
+            });
+        }
+    }
+    if let Some(marker) = rest.get(..1).filter(|m| matches!(*m, "-" | "*" | "+")) {
+        let after_marker = &rest[1..];
+        let space_len = after_marker
+            .bytes()
+            .take_while(|b| matches!(*b, b' ' | b'\t'))
+            .count();
+        let space = &after_marker[..space_len];
+        let content = &after_marker[space_len..];
+        if (!space.is_empty() || content.is_empty())
+            && !(marker == "-"
+                && (content.starts_with("[ ]")
+                    || content.starts_with("[x]")
+                    || content.starts_with("[X]")))
+        {
+            return Some(ParsedList::Bullet {
+                indent,
+                marker,
+                space,
+                content,
+            });
+        }
+    }
+    None
+}
+
 pub(super) fn fragment(
     text: &str,
     blocks: bool,
@@ -348,7 +420,6 @@ pub(super) fn fragment(
     let lines: Vec<_> = text.split('\n').collect();
     let mut parts: Vec<(TextEdit, Vec<(BlockKind, BlockAttributes)>)> = Vec::new();
     let mut index = 0;
-    let mut numbers = [0usize; 4];
     let mut list_stack: Vec<(String, String)> = Vec::new();
     while index < lines.len() {
         let line = lines[index];
@@ -408,7 +479,6 @@ pub(super) fn fragment(
                 }
             }
             index += usize::from(index < lines.len());
-            numbers.fill(0);
             continue;
         }
         let mut kind = BlockKind::Paragraph;
@@ -417,13 +487,11 @@ pub(super) fn fragment(
         if blocks {
             if parse_rule(line) {
                 list_stack.clear();
-                numbers.fill(0);
                 kind = BlockKind::Rule;
                 attrs = BlockAttributes::default().with_rule_source(line);
                 content = "";
             } else if let Some((level, space, heading_content)) = parse_heading(line) {
                 list_stack.clear();
-                numbers.fill(0);
                 kind = BlockKind::Heading { level };
                 attrs = BlockAttributes::default().with_heading_space(space);
                 content = heading_content;
@@ -433,10 +501,17 @@ pub(super) fn fragment(
                 list_stack.clear();
                 kind = BlockKind::Quote;
                 content = text;
-                numbers.fill(0);
-            } else if let Some(task) = parse_task(line) {
-                let indent = task.indent.to_owned();
-                let key = "task".to_owned();
+            } else if let Some(parsed) = parse_list(line) {
+                let (indent, key) = match &parsed {
+                    ParsedList::Task(t) => (t.indent.to_owned(), "task".to_owned()),
+                    ParsedList::Ordered { indent, marker, .. } => (
+                        (*indent).to_owned(),
+                        format!("ordered:{}", marker.chars().last().unwrap_or('.')),
+                    ),
+                    ParsedList::Bullet { indent, marker, .. } => {
+                        ((*indent).to_owned(), format!("bullet:{marker}"))
+                    }
+                };
                 loop {
                     let stack_len = list_stack.len();
                     let Some((top_indent, top_key)) = list_stack.last_mut() else {
@@ -460,49 +535,50 @@ pub(super) fn fragment(
                     break;
                 }
                 let level = (list_stack.len() - 1).min(MAX_LIST_LEVEL as usize) as u8;
-                kind = BlockKind::Task {
-                    level,
-                    checked: task.check_char != ' ',
-                };
-                attrs = BlockAttributes::default()
-                    .with_indent(task.indent)
-                    .with_marker_space(task.marker_space)
-                    .with_content_space(task.content_space);
-                if task.check_char == 'X' {
-                    attrs = attrs.with_marker("X");
-                }
-                content = task.content;
-                numbers.fill(0);
-            } else {
-                list_stack.clear();
-                let indent = line.bytes().take_while(|b| *b == b' ').count();
-                let level = indent / 4;
-                if indent % 4 == 0 && level <= 3 {
-                    let tail = &line[indent..];
-                    if let Some(text) = tail.strip_prefix("- ")
-                        && !text.starts_with([' ', '\t'])
-                        && !(text.starts_with("[ ]")
-                            || text.starts_with("[x]")
-                            || text.starts_with("[X]"))
-                    {
-                        kind = BlockKind::Bullet(level as u8);
-                        content = text;
-                        numbers[level..].fill(0);
-                    } else {
-                        let prefix = format!("{}. ", numbers[level] + 1);
-                        if let Some(text) = tail.strip_prefix(&prefix)
-                            && !text.starts_with([' ', '\t'])
-                        {
-                            numbers[level] += 1;
-                            numbers[level + 1..].fill(0);
-                            kind = BlockKind::Numbered(level as u8);
-                            content = text;
+                match parsed {
+                    ParsedList::Task(task) => {
+                        kind = BlockKind::Task {
+                            level,
+                            checked: task.check_char != ' ',
+                        };
+                        attrs = BlockAttributes::default()
+                            .with_indent(task.indent)
+                            .with_marker_space(task.marker_space)
+                            .with_content_space(task.content_space);
+                        if task.check_char == 'X' {
+                            attrs = attrs.with_marker("X");
                         }
+                        content = task.content;
+                    }
+                    ParsedList::Ordered {
+                        indent,
+                        marker,
+                        space,
+                        content: item_content,
+                    } => {
+                        kind = BlockKind::Numbered(level);
+                        attrs = BlockAttributes::default()
+                            .with_indent(indent)
+                            .with_marker(marker)
+                            .with_space(space);
+                        content = item_content;
+                    }
+                    ParsedList::Bullet {
+                        indent,
+                        marker,
+                        space,
+                        content: item_content,
+                    } => {
+                        kind = BlockKind::Bullet(level);
+                        attrs = BlockAttributes::default()
+                            .with_indent(indent)
+                            .with_marker(marker)
+                            .with_space(space);
+                        content = item_content;
                     }
                 }
-                if kind == BlockKind::Paragraph {
-                    numbers.fill(0);
-                }
+            } else {
+                list_stack.clear();
             }
         }
         let part = inline(content, resolve);
