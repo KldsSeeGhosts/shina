@@ -54,8 +54,12 @@ winresource = "0.1"
 
 # Rune's Windows integrations require its vendored dependency patches at the app root.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "22fcaf167b5e8d74e2ab173a698b7cf2053c5889" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "22fcaf167b5e8d74e2ab173a698b7cf2053c5889" }
+wgpu-hal = { path = "/Volumes/DevDrive/AiStack/rune-pin/vendor/wgpu-hal" }
+winit = { path = "/Volumes/DevDrive/AiStack/rune-pin/vendor/winit" }
+
+[patch."https://github.com/anomalyco/rune"]
+rune = { path = "/Volumes/DevDrive/AiStack/rune-pin/crates/rune" }
+rune-kit = { path = "/Volumes/DevDrive/AiStack/rune-pin/crates/rune-kit" }
 
 [profile.release]
 lto = "thin"
