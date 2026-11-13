@@ -3034,6 +3034,20 @@ fn model_list(
             ));
         }
 
+        // A started thread hands its context to the new provider; the row says so
+        // under the name, KSG Code's pending-handoff wording for the pick.
+        let handoff_hint = enabled && t.has_started_session() && model.instance_id != t.harness;
+        let mut name_col = col().gap(1.0).grow(1.0).min_w(0.0).child(name_row);
+        if handoff_hint {
+            name_col = name_col.child(
+                label("Starts a context handoff", SMALL, p.muted)
+                    .key(format!("handoff-hint-{index}"))
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        }
+
         let fav_provider = model.instance_id.clone();
         let fav_slug = model.slug.clone();
         let mut star_btn = row()
@@ -3082,7 +3096,7 @@ fn model_list(
             .opacity(if enabled { 1.0 } else { 0.55 })
             .center_y()
             .gap(8.0)
-            .h(34.0)
+            .min_h(34.0)
             .mx(4.0)
             .pl(12.0)
             .pr(8.0)
@@ -3137,7 +3151,7 @@ fn model_list(
                 model_vendor(&model.slug, &model.name),
                 16.0,
             ))
-            .child(name_row)
+            .child(name_col)
             .child(trailing);
         if let Some(reason) = &disabled_reason {
             item = item.help(reason);
@@ -9124,6 +9138,10 @@ enum TimelineRow {
         message_id: String,
         key: String,
     },
+    Handoff {
+        index: usize,
+        key: String,
+    },
     AssistantTurn {
         start: usize,
         end: usize,
@@ -9142,6 +9160,7 @@ impl TimelineRow {
             | Self::WorktreeSetup { key }
             | Self::Boundary { key, .. }
             | Self::UserOrSystem { key, .. }
+            | Self::Handoff { key, .. }
             | Self::AssistantTurn { key, .. }
             | Self::LiveTurn { key, .. } => key,
         }
@@ -9175,9 +9194,31 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
             key: push_unique_row_key(&mut seen, format!("worktree-setup-row-{}", t.id)),
         });
     }
+    // A handoff row sits before the message that carried it; a pending one rides at
+    // the end, where KSG Code's `resolvePendingHandoff` shows it.
+    let mut pending_handoffs = t
+        .handoffs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| index)
+        .peekable();
+    let mut emit_handoffs =
+        |upto: usize, rows: &mut Vec<TimelineRow>, seen: &mut std::collections::HashSet<String>| {
+            while let Some(&index) = pending_handoffs.peek() {
+                if t.handoffs[index].message_index > upto {
+                    break;
+                }
+                pending_handoffs.next();
+                rows.push(TimelineRow::Handoff {
+                    index,
+                    key: push_unique_row_key(seen, format!("handoff-row-{index}")),
+                });
+            }
+        };
     let mut index = 0usize;
     while index < t.messages.len() {
         let message = &t.messages[index];
+        emit_handoffs(index, &mut rows, &mut seen);
         if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
             rows.push(TimelineRow::Boundary {
                 message_index: index,
@@ -9204,6 +9245,7 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
         });
         index += 1;
     }
+    emit_handoffs(usize::MAX, &mut rows, &mut seen);
     if work_ui::has_boundary_events(t, t.messages.len()) {
         rows.push(TimelineRow::Boundary {
             message_index: t.messages.len(),
@@ -9365,6 +9407,94 @@ fn fresh_session_row(message_id: &str, p: Palette) -> El {
                 .gap(6.0)
                 .child(icon("alert", p.muted))
                 .child(pixel_text("New session", p.muted)),
+        )
+        .child(el().h(1.0).grow(1.0).fill(p.line))
+}
+
+/// Ported from KSG Code's `HandoffRow` (`components/chat/V2LifecycleRow.tsx`): the
+/// divider's label is KSG's title and its detail the two provider endpoints.
+fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Palette) -> El {
+    use crate::handoff::HandoffStatus;
+    let pending = handoff.status == HandoffStatus::Pending;
+    let failed = handoff.status == HandoffStatus::Failed;
+    let tone = if failed { p.danger } else { p.muted };
+    let title = if pending {
+        "Context handoff pending"
+    } else if failed {
+        "Context handoff failed"
+    } else {
+        "Context handoff"
+    };
+    // `HandoffEndpoint`: the provider mark, then the model name (the instance id
+    // when the record names no model).
+    let endpoint = |instance: &str, model: Option<&str>| {
+        let name = model
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(instance);
+        row()
+            .center_y()
+            .gap(4.0)
+            .min_w(0.0)
+            .shrink()
+            .child(provider_icon(s, p, model_vendor(name, ""), 12.0))
+            .child(pixel_text(name, p.muted).truncate().shrink().min_w(0.0))
+    };
+    let mut detail = row().center_y().gap(6.0).min_w(0.0).shrink();
+    let sources: Vec<(&str, Option<&str>)> = if handoff.from_models.is_empty() {
+        handoff
+            .from_instances
+            .iter()
+            .map(|instance| (instance.as_str(), None))
+            .collect()
+    } else {
+        handoff
+            .from_models
+            .iter()
+            .map(|selection| {
+                (
+                    selection.instance_id.as_str(),
+                    Some(selection.model.as_str()),
+                )
+            })
+            .collect()
+    };
+    for (position, (instance, model)) in sources.iter().enumerate() {
+        if position > 0 {
+            detail = detail.child(pixel_text(",", p.muted));
+        }
+        detail = detail.child(endpoint(instance, *model));
+    }
+    if !sources.is_empty() {
+        detail = detail.child(pixel_text("→", p.muted));
+    }
+    detail = detail.child(endpoint(&handoff.to_instance, handoff.to_model.as_deref()));
+    if handoff.delivery.status == crate::handoff::DeliveryStatus::Inline {
+        let covered = handoff.delivery.delivered_item_ids.len();
+        let omitted = handoff.delivery.omitted_item_ids.len();
+        detail = detail.child(pixel_text(
+            format!("· {covered} items, {omitted} omitted"),
+            p.muted,
+        ));
+    }
+    row()
+        .key(format!("handoff-row-{index}"))
+        .role("status")
+        .label(format!("{title}: {}", handoff.to_instance))
+        .w_full()
+        .min_w(0.0)
+        .py(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .min_w(0.0)
+                .shrink()
+                .child(icon("swap", tone))
+                .child(pixel_text(title, tone).shrink())
+                .child(detail),
         )
         .child(el().h(1.0).grow(1.0).fill(p.line))
 }
@@ -9601,6 +9731,12 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         message_id,
                         ..
                     } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                    TimelineRow::Handoff { index, .. } => s
+                        .current()
+                        .handoffs
+                        .get(*index)
+                        .map(|handoff| handoff_row(s, *index, handoff, p))
+                        .unwrap_or_else(el),
                     TimelineRow::AssistantTurn { start, end, .. } => {
                         assistant_turn(s, p, wide, *start, *end)
                     }
@@ -17297,13 +17433,12 @@ pub(crate) mod tests {
             assert_eq!(
                 rt.state.current().harness,
                 "fixture",
-                "harness is fixed after first send"
+                "switching the tab does not move the thread"
             );
-            assert!(
-                find(&rt.accessibility_json(), "choose-harness-pi")
-                    .and_then(|node| node["states"].as_array().cloned())
-                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
-                "{width}: pi is disabled after first send"
+            assert_eq!(
+                rt.state.model_picker_tab,
+                Some(crate::model_picker::ModelPickerTab::Instance("pi".into())),
+                "{width}: pi stays reachable on a started thread via context handoff"
             );
         }
     }
@@ -17315,6 +17450,81 @@ pub(crate) mod tests {
             .as_array()?
             .iter()
             .find_map(|c| find(c, key))
+    }
+
+    #[test]
+    fn handoff_row_and_picker_hint_fit_at_supported_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.harness = "claude".into();
+                t.model = "claude-opus-4-5".into();
+                t.model_id = "claude-opus-4-5".into();
+                t.messages.push(crate::model::Message {
+                    id: "u1".into(),
+                    role: "You",
+                    text: "First request on Codex.".into(),
+                    images: vec![],
+                    context: None,
+                });
+                t.messages.push(crate::model::Message {
+                    id: "u2".into(),
+                    role: "You",
+                    text: "The message that switched to Claude.".into(),
+                    images: vec![],
+                    context: None,
+                });
+                let mut handoff = crate::handoff::Handoff::new(
+                    "codex".into(),
+                    Some("gpt-5.2".into()),
+                    "claude".into(),
+                    Some("claude-opus-4-5".into()),
+                    1,
+                    0,
+                );
+                handoff.status = crate::handoff::HandoffStatus::Ready;
+                handoff.delivery.status = crate::handoff::DeliveryStatus::Inline;
+                handoff.delivery.delivered_item_ids = vec!["u1".into()];
+                t.handoffs.push(handoff);
+            }
+            rt.frame(0.0);
+            let (lane, _) = rt
+                .presented("chat-lane")
+                .unwrap_or_else(|| panic!("{width}: lane"));
+            let (row, _) = rt
+                .presented("handoff-row-0")
+                .unwrap_or_else(|| panic!("{width}: handoff row"));
+            assert!(
+                row[0] >= lane[0] && row[0] + row[2] <= lane[0] + lane[2] + 1.0,
+                "{width}: handoff row inside the lane {row:?} {lane:?}"
+            );
+            let tree = rt.accessibility_json().to_string();
+            assert!(tree.contains("Context handoff"), "{width}: {tree}");
+            assert!(tree.contains("gpt-5.2"), "{width}: source endpoint");
+            assert!(
+                tree.contains("claude-opus-4-5"),
+                "{width}: destination endpoint"
+            );
+            assert!(tree.contains("1 items, 0 omitted"), "{width}: {tree}");
+
+            // The picker hints the provider change on another harness's rows.
+            rt.state.codex_catalog.models = vec![crate::session::AgentModel {
+                provider: "codex".into(),
+                id: "gpt-5.2".into(),
+                name: "GPT-5.2".into(),
+                ..Default::default()
+            }];
+            rt.state.open_model_picker(SettingsPicker::Model);
+            press(&mut rt, "choose-harness-codex");
+            rt.invalidate();
+            rt.frame(0.1);
+            let picker_tree = rt.accessibility_json().to_string();
+            assert!(
+                picker_tree.contains("Starts a context handoff"),
+                "{width}: {picker_tree}"
+            );
+        }
     }
 
     #[test]
@@ -22526,7 +22736,8 @@ pub(crate) mod tests {
                 "{width}: {codex_tree}"
             );
 
-            // Pick GPT-6 Astra on Codex, then mark thread as started and verify continuation restriction
+            // Pick GPT-6 Astra on Codex, then mark thread as started: other providers
+            // stay reachable through a context handoff instead of being locked out.
             press(&mut rt, "choose-model-0");
             assert_eq!(rt.state.current().harness, "codex");
             assert_eq!(rt.state.current().model_id, "gpt-6-astra");
@@ -22537,23 +22748,42 @@ pub(crate) mod tests {
             assert!(
                 find(&rt.accessibility_json(), "choose-harness-pi")
                     .and_then(|node| node["states"].as_array().cloned())
-                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
-                "{width}: pi should be disabled on started codex thread"
+                    .is_some_and(|states| !states.iter().any(|x| x == "disabled")),
+                "{width}: pi stays enabled on a started codex thread"
             );
-            // Searching across providers respects continuation lock on a started thread
+            // Searching across providers now lists the other provider's models with
+            // the context-handoff hint under the name.
             rt.state.model_search.replace_text("opus");
             rt.invalidate();
             rt.frame(0.6);
-            let locked_search_tree = rt.accessibility_json().to_string();
-            assert!(!locked_search_tree.contains("Claude Opus 5.5"), "{width}");
-            assert!(locked_search_tree.contains("No models found"), "{width}");
+            let search_tree = rt.accessibility_json().to_string();
+            assert!(search_tree.contains("Claude Opus 5.5"), "{width}");
+            assert!(
+                search_tree.contains("Starts a context handoff"),
+                "{width}: {search_tree}"
+            );
+            // Picking it stages a pending handoff; the harness only moves on send.
+            press(&mut rt, "choose-model-0");
+            assert_eq!(rt.state.current().harness, "codex");
+            assert!(
+                rt.state.current().staged_handoff().is_some(),
+                "{width}: a pending handoff is staged"
+            );
 
             // On an unstarted thread, searching across providers ranks matches globally
-            rt.state.current_mut().life.latest_user_message_at = None;
+            let t = rt.state.current_mut();
+            t.life.latest_user_message_at = None;
+            t.handoffs.clear();
+            t.staged_handoff = None;
+            rt.state.open_model_picker(SettingsPicker::Model);
             rt.invalidate();
             rt.frame(0.7);
             let search_tree = rt.accessibility_json().to_string();
             assert!(search_tree.contains("Claude Opus 5.5"), "{width}");
+            assert!(
+                !search_tree.contains("Starts a context handoff"),
+                "{width}: no handoff hint before the first send"
+            );
         }
     }
 

@@ -251,6 +251,11 @@ glyph!(
     STAR_OFF,
     r#"<path d="M10 2h4v2h-4zM8 4h2v4H8zM14 4h2v4h-2zM2 8h6v2H2zM16 8h6v2h-6zM4 10h2v2H4zM18 10h2v2h-2zM6 12h2v4H6zM16 12h2v4h-2zM10 14h4v2h-4zM4 16h4v4H4zM16 16h4v4h-4zM2 20h4v2H2zM18 20h4v2h-4z"/>"#
 );
+// Two opposing arrows for a provider switch, KSG Code's ArrowRightLeft.
+glyph!(
+    SWAP,
+    r#"<path d="M4 8h12v2H4zM16 6h2v2h-2zM18 8h2v2h-2zM16 10h2v2h-2zM8 14h12v2H8zM6 12h2v2H6zM4 14h2v2H4zM6 16h2v2H6z"/>"#
+);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
 pub(super) fn glyph(kind: &str) -> &'static Icon {
@@ -312,6 +317,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "star" => &STAR,
         "star-off" => &STAR_OFF,
         "workflow" => &WORKFLOW,
+        "swap" => &SWAP,
         _ => &CHECK,
     }
 }

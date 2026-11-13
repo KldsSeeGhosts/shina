@@ -440,9 +440,18 @@ impl State {
         self.checkpoint();
     }
 
+    /// KSG's `threadSupportsProviderHandoff`: local threads hand off natively; remote
+    /// ones need the owning server to advertise `provider-handoff-v1`.
+    pub fn provider_handoff_supported(&self, thread: &Thread) -> bool {
+        thread.remote.is_none()
+            || self.client.as_ref().is_some_and(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::PROVIDER_HANDOFF)
+            })
+    }
+
     pub fn locked_provider_for_current(&self) -> Option<String> {
         let t = self.current();
-        if t.has_started_session() {
+        if t.has_started_session() && !self.provider_handoff_supported(t) {
             Some(t.harness.clone())
         } else {
             None
@@ -453,10 +462,16 @@ impl State {
         let t = self.current();
         crate::model_picker::get_model_disabled_reason(
             t.has_started_session(),
-            false,
+            self.provider_handoff_supported(t),
             &t.harness,
             instance_id,
         )
+        .or_else(|| {
+            // Cross-provider picks are allowed in principle but blocked right now.
+            (t.has_started_session() && instance_id != t.harness)
+                .then(|| t.handoff_block_reason())
+                .flatten()
+        })
     }
 
     pub fn provider_instance_entries(&self) -> Vec<crate::model_picker::ProviderInstanceEntry> {

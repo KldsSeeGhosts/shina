@@ -142,6 +142,9 @@ use queued_edit::queue_revision;
 #[cfg(test)]
 pub use run_control::StopPhase;
 pub use run_control::{StopControl, TurnCapabilities};
+#[cfg(test)]
+#[path = "handoff_tests.rs"]
+mod handoff_tests;
 #[path = "honcho.rs"]
 mod honcho;
 #[path = "memory.rs"]
@@ -377,6 +380,17 @@ impl Tool {
             duration_ms: None,
         }
     }
+}
+
+/// The thread selection an in-flight handoff replaced; restored if the destination
+/// fails before the provider accepts the turn.
+pub(crate) struct HandoffRevert {
+    harness: String,
+    session: Option<String>,
+    selected_model: Option<(String, String)>,
+    model_provider: String,
+    model_id: String,
+    model: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -638,6 +652,18 @@ pub struct Thread {
     pub(crate) remote_send_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     pub fresh_session_arm: Option<u64>,
     pub fresh_session_messages: Vec<String>,
+    /// Provider handoff records in order. KSG: `thread.contextHandoffs`.
+    pub handoffs: Vec<crate::handoff::Handoff>,
+    /// Retained provider session ids per harness, so switching back resumes natively.
+    pub handoff_sessions: std::collections::BTreeMap<String, String>,
+    /// The staged switch (a pending record) awaiting the next send.
+    pub(crate) staged_handoff: Option<usize>,
+    /// The record currently delivering its package; cleared on acceptance or failure.
+    pub(crate) inflight_handoff: Option<usize>,
+    /// Selection snapshot to restore when the destination fails.
+    pub(crate) handoff_revert: Option<HandoffRevert>,
+    /// The package text delivered with the in-flight turn.
+    pub(crate) handoff_package: Option<String>,
     pub fallback_active: Option<crate::usage_limits::FallbackInfo>,
     pub fallback_explicit_override: bool,
     pub composer_context_supported: bool,
@@ -1132,6 +1158,12 @@ impl Thread {
             remote_send_reply_to: None,
             fresh_session_arm: None,
             fresh_session_messages: Vec::new(),
+            handoffs: Vec::new(),
+            handoff_sessions: std::collections::BTreeMap::new(),
+            staged_handoff: None,
+            inflight_handoff: None,
+            handoff_revert: None,
+            handoff_package: None,
             composer_context_supported: true,
             fallback_active: None,
             fallback_explicit_override: false,
@@ -1356,11 +1388,37 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
+        let handoff_switch = self.has_started_session()
+            && provider
+                != if self.harness == "pi" {
+                    "cpa"
+                } else {
+                    self.harness.as_str()
+                };
         if self.forward(
             "thread.configure",
-            json!({"provider":provider,"model":model_id}),
+            if handoff_switch {
+                json!({"provider":provider,"model":model_id,"handoff":true})
+            } else {
+                json!({"provider":provider,"model":model_id})
+            },
         ) {
             return;
+        }
+        // KSG: a different harness on a started thread stages a context handoff instead
+        // of being refused, when the current state allows the switch.
+        if handoff_switch {
+            match self.handoff_block_reason() {
+                None => {
+                    self.attachment_error = None;
+                    self.stage_handoff(provider, model_id);
+                    return;
+                }
+                Some(reason) => {
+                    self.error = Some(reason);
+                    return;
+                }
+            }
         }
         if self.harness == "pi" && provider != "cpa"
             || self.harness != "pi" && provider != self.harness
@@ -1691,7 +1749,10 @@ impl Thread {
     }
 
     pub(super) fn begin_prompt_with_fresh(&mut self, prompt: Prompt, fresh_context: bool) {
-        if fresh_context {
+        self.apply_staged_handoff(&prompt);
+        // A staged handoff already cleared the session state it replaced; the fresh
+        // reset would wipe the destination's retained session.
+        if fresh_context && self.inflight_handoff.is_none() {
             let held_queue = !self.native.queue.is_empty();
             let previous_held = self.native.queue_held;
             if held_queue {
@@ -1711,6 +1772,7 @@ impl Thread {
             self.native.session_name = None;
             self.context.begin_model_change();
         }
+        self.apply_staged_handoff(&prompt);
         self.run_id = Some(uuid::Uuid::new_v4().to_string());
         self.resumable_run_id = None;
         self.continuation_of_run_id = None;
@@ -1940,7 +2002,324 @@ impl Thread {
         }
     }
 
+    /// KSG's pick rule: stage a pending handoff, retarget the staged one, or disarm it
+    /// when the user picks the thread's current harness again.
+    pub fn stage_handoff(&mut self, instance: String, model: String) {
+        if let Some(index) = self.staged_handoff {
+            if instance == self.harness {
+                self.handoffs.remove(index);
+                self.staged_handoff = None;
+            } else {
+                let handoff = &mut self.handoffs[index];
+                handoff.to_instance = instance;
+                handoff.to_model = Some(model);
+                handoff.updated_at = lifecycle::now();
+            }
+            return;
+        }
+        if instance == self.harness {
+            return;
+        }
+        // Re-arm a stale pending record for the same destination instead of a duplicate.
+        if let Some(index) = self.handoffs.iter().position(|handoff| {
+            handoff.status == crate::handoff::HandoffStatus::Pending
+                && handoff.to_instance == instance
+        }) {
+            let handoff = &mut self.handoffs[index];
+            handoff.to_model = Some(model);
+            handoff.updated_at = lifecycle::now();
+            handoff.message_index = self.messages.len();
+            self.staged_handoff = Some(index);
+            return;
+        }
+        let from_model = self
+            .selected_model
+            .as_ref()
+            .map(|(_, model)| model.clone())
+            .or_else(|| (!self.model_id.is_empty()).then(|| self.model_id.clone()));
+        self.handoffs.push(crate::handoff::Handoff::new(
+            self.harness.clone(),
+            from_model,
+            instance,
+            Some(model),
+            self.messages.len(),
+            lifecycle::now(),
+        ));
+        self.staged_handoff = Some(self.handoffs.len() - 1);
+    }
+
+    /// The staged switch's destination, if any.
+    #[allow(dead_code)] // Read by UI tests and the picker's pending-row checks.
+    pub fn staged_handoff(&self) -> Option<&crate::handoff::Handoff> {
+        self.staged_handoff
+            .and_then(|index| self.handoffs.get(index))
+    }
+
+    /// Why a provider switch cannot stage right now. KSG blocks the change while a run
+    /// is active or an approval is pending.
+    pub fn handoff_block_reason(&self) -> Option<String> {
+        if self.status.busy() {
+            return Some("Wait for the current run to finish before switching providers.".into());
+        }
+        if self.request.is_some()
+            || self.approval_send.is_some()
+            || !self.pending_approvals().is_empty()
+        {
+            return Some("Answer the pending request before switching providers.".into());
+        }
+        None
+    }
+
+    /// The transcript as KSG `HistoricalMessage`s, in display order: each message, then
+    /// the tools anchored to it. Reasoning stays out, like KSG's `historicalMessage`.
+    pub fn handoff_items(&self) -> Vec<crate::handoff::HistoricalItem> {
+        use crate::handoff::HistoricalItem;
+        // Items between handoff k-1's and handoff k's coverage end ran under record k's
+        // `from` harness; everything after the last record ran under the current one.
+        let spans: Vec<(usize, &str)> = self
+            .handoffs
+            .iter()
+            .filter_map(|handoff| {
+                handoff
+                    .from_instances
+                    .first()
+                    .map(|from| (handoff.covered.to as usize, from.as_str()))
+            })
+            .collect();
+        let provider_for = |index: usize| -> Option<String> {
+            Some(
+                spans
+                    .iter()
+                    .find(|(end, _)| index < *end)
+                    .map(|(_, from)| (*from).to_owned())
+                    .unwrap_or_else(|| self.harness.clone()),
+            )
+        };
+        let tool_item = |tool: &Tool, run: usize, index: usize| -> Option<HistoricalItem> {
+            let command = format!(
+                "Command: {}\nExit code: {}\n{}",
+                if tool.detail.is_empty() {
+                    &tool.name
+                } else {
+                    &tool.detail
+                },
+                tool.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                tool.output
+            );
+            let (kind, text) = if !tool.changes.is_empty() && tool.output.is_empty() {
+                (
+                    "file_change",
+                    format!(
+                        "File change: {}",
+                        tool.changes
+                            .iter()
+                            .map(|change| change.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            } else if tool.failed && tool.exit_code.is_none() && !tool.output.is_empty() {
+                ("error", tool.output.clone())
+            } else if !tool.detail.is_empty() || !tool.output.is_empty() || tool.exit_code.is_some()
+            {
+                ("command_execution", command)
+            } else {
+                return None;
+            };
+            Some(HistoricalItem {
+                role: "assistant",
+                kind,
+                text,
+                item_id: tool.id.clone(),
+                run: format!("{run}"),
+                provider_thread: provider_for(index),
+                status: if tool.failed {
+                    "failed"
+                } else if tool.done {
+                    "completed"
+                } else {
+                    "running"
+                },
+            })
+        };
+        let mut items = Vec::new();
+        let mut turn = 0usize;
+        for (index, message) in self.messages.iter().enumerate() {
+            let (role, kind) = match message.role {
+                "You" => {
+                    turn += 1;
+                    ("user", "user_message")
+                }
+                "Shina" => ("user", "user_message"),
+                _ => ("assistant", "assistant_message"),
+            };
+            items.push(HistoricalItem {
+                role,
+                kind,
+                text: if message.role == "Shina" {
+                    message.display_text().to_owned()
+                } else {
+                    message.text.clone()
+                },
+                item_id: message.id.clone(),
+                run: format!("{}", turn.max(1)),
+                provider_thread: provider_for(items.len()),
+                status: "completed",
+            });
+            let mut anchored: Vec<&Tool> = self
+                .tools
+                .iter()
+                .filter(|tool| tool.anchor.message == index)
+                .collect();
+            anchored.sort_by_key(|tool| (tool.anchor.offset, tool.order));
+            let position = items.len();
+            items.extend(
+                anchored
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, tool)| tool_item(tool, turn.max(1), position + offset)),
+            );
+        }
+        let position = items.len();
+        let mut trailing: Vec<&Tool> = self
+            .tools
+            .iter()
+            .filter(|tool| tool.anchor.message >= self.messages.len())
+            .collect();
+        trailing.sort_by_key(|tool| (tool.anchor.message, tool.anchor.offset, tool.order));
+        items.extend(
+            trailing
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, tool)| tool_item(tool, turn.max(1), position + offset)),
+        );
+        items
+    }
+
+    /// How much of the item sequence `instance` has seen: natively before it was
+    /// switched away from, or through a delivered handoff.
+    pub fn handoff_seen_through(&self, instance: &str) -> usize {
+        self.handoffs
+            .iter()
+            .filter(|handoff| {
+                handoff
+                    .from_instances
+                    .first()
+                    .is_some_and(|from| from == instance)
+                    || (handoff.to_instance == instance
+                        && handoff.status == crate::handoff::HandoffStatus::Ready)
+            })
+            .map(|handoff| handoff.covered.to as usize)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The switch at send time: retain the source session id, point the thread at the
+    /// destination (its retained session if it has one), and stage the package on the
+    /// thread for `drive_session` to prepend to this turn.
+    fn apply_staged_handoff(&mut self, prompt: &Prompt) {
+        let Some(index) = self.staged_handoff.take() else {
+            return;
+        };
+        let Some(handoff) = self.handoffs.get(index) else {
+            return;
+        };
+        if handoff.status != crate::handoff::HandoffStatus::Pending
+            || handoff.to_instance == self.harness
+        {
+            return;
+        }
+        let to_instance = handoff.to_instance.clone();
+        let to_model = handoff.to_model.clone();
+        // disconnect() calls revert_handoff(), so the source state is stashed after it.
+        if self.pi.is_some() {
+            self.disconnect();
+        }
+        self.handoff_revert = Some(HandoffRevert {
+            harness: self.harness.clone(),
+            session: self.session.clone(),
+            selected_model: self.selected_model.clone(),
+            model_provider: self.model_provider.clone(),
+            model_id: self.model_id.clone(),
+            model: self.model.clone(),
+        });
+        if let Some(session) = self.session.take() {
+            self.handoff_sessions.insert(self.harness.clone(), session);
+        }
+        // History items carry the provider that produced them; compute before the switch.
+        let items = self.handoff_items();
+        let seen = self.handoff_seen_through(&to_instance);
+        self.session = self.handoff_sessions.get(&to_instance).cloned();
+        self.harness = to_instance.clone();
+        if let Some(model) = to_model {
+            self.selected_model = Some((to_instance.clone(), model.clone()));
+            self.model_provider = to_instance.clone();
+            self.model_id = model.clone();
+            self.model = model;
+        }
+        self.harness_context_sent = false;
+        self.native.fork_source = None;
+        self.native.fork_entry = None;
+        self.native.previous_session = None;
+        self.native.session_name = None;
+        self.context.begin_model_change();
+        let budget = crate::handoff::handoff_budget(&crate::handoff::BudgetInput {
+            token_cap: crate::handoff::configured_token_cap(),
+            user_text: &prompt.text,
+            images: prompt.images.iter().filter(|a| a.is_image()).count(),
+            files: prompt.images.iter().filter(|a| !a.is_image()).count(),
+            native_used: 0,
+            max_tokens: self.context_window,
+            model_context_window: self.context_window,
+        });
+        let package = crate::handoff::build_package(&format!("{}", self.id), &items, seen, budget);
+        let handoff = &mut self.handoffs[index];
+        handoff.covered = package.covered;
+        handoff.strategy = package.strategy;
+        handoff.summary = package.context.clone();
+        handoff.delivery.delivered_item_ids = package.delivered_item_ids;
+        handoff.delivery.omitted_item_ids = package.omitted_item_ids;
+        handoff.updated_at = lifecycle::now();
+        self.handoff_package = Some(package.text);
+        self.inflight_handoff = Some(index);
+    }
+
+    /// KSG marks the record delivered once the provider accepts the turn.
+    fn mark_handoff_delivered(&mut self) {
+        let Some(index) = self.inflight_handoff.take() else {
+            return;
+        };
+        if let Some(handoff) = self.handoffs.get_mut(index) {
+            handoff.status = crate::handoff::HandoffStatus::Ready;
+            handoff.delivery.status = crate::handoff::DeliveryStatus::Inline;
+            handoff.updated_at = lifecycle::now();
+        }
+        self.handoff_package = None;
+        self.handoff_revert = None;
+    }
+
+    /// Back to the source harness and model, with its retained session restored; the
+    /// record stays pending for a later explicit retry. Returns true when it reverted.
+    fn revert_handoff(&mut self) -> bool {
+        if self.inflight_handoff.take().is_none() && self.handoff_revert.is_none() {
+            return false;
+        }
+        if let Some(revert) = self.handoff_revert.take() {
+            self.harness = revert.harness;
+            self.session = revert.session;
+            self.selected_model = revert.selected_model;
+            self.model_provider = revert.model_provider;
+            self.model_id = revert.model_id;
+            self.model = revert.model;
+        }
+        self.handoff_package = None;
+        true
+    }
+
     pub fn disconnect(&mut self) {
+        self.revert_handoff();
         self.memory_pending.clear();
         self.learned_turn = None;
         self.memory_staged.clear();
@@ -2138,8 +2517,12 @@ impl Thread {
         self.memory_context.clear();
         self.scope_context_pending = true;
         self.native.queue_held = true;
+        let handoff_delivery = self.inflight_handoff.is_some() || self.handoff_revert.is_some();
         self.disconnect();
-        self.error = Some(error);
+        self.error = Some(error.clone());
+        if handoff_delivery {
+            self.submission_error = Some(error);
+        }
         self.status = Status::Failed;
         self.life.failed_at = Some(lifecycle::now());
         self.complete_task("failed");
@@ -2260,13 +2643,19 @@ impl Thread {
                 json!({"message": format!("/shina-service-tier {tier}")}),
             );
         }
-        let record = match attachments::prompt_record(&prompt, self.harness == "pi") {
+        let mut record = match attachments::prompt_record(&prompt, self.harness == "pi") {
             Ok(record) => record,
             Err(error) => {
                 self.reject_images(&prompt, index, error);
                 return;
             }
         };
+        if self.inflight_handoff.is_some()
+            && let Some(package) = &self.handoff_package
+        {
+            let user_text = record["message"].as_str().unwrap_or_default().to_owned();
+            record["message"] = json!(crate::handoff::with_inline_context(package, &user_text));
+        }
         if self.command("prompt", record) {
             self.pending_prompt = Some((format!("{}-{}", self.id, self.serial), prompt, index));
         } else {
@@ -2572,6 +2961,9 @@ impl Thread {
                             .is_some_and(|(id, _, _)| record["id"] == *id)
                         && let Some((_, prompt, index)) = self.pending_prompt.take()
                     {
+                        if self.revert_handoff() {
+                            self.submission_error = self.error.clone();
+                        }
                         self.restore_prompt(&prompt);
                         self.remove_optimistic_prompt(&prompt, index);
                     }
@@ -3030,6 +3422,7 @@ impl Thread {
                                 .is_some_and(|(id, _, _)| record["id"] == *id)
                         {
                             self.pending_prompt = None;
+                            self.mark_handoff_delivered();
                         }
                         if record["data"]["disposition"] == "handled"
                             && self.status == Status::Running
@@ -3044,6 +3437,7 @@ impl Thread {
                 }
             }
             "agent_start" => {
+                self.mark_handoff_delivered();
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
                 }
@@ -3788,9 +4182,15 @@ pub struct State {
     pub(crate) test_git_context: Option<crate::vcs::GitContext>,
     #[cfg(test)]
     pub(crate) test_connect_workspaces: Vec<(usize, PathBuf)>,
+    /// (thread id, harness, session id at connect): `None` means a new session started.
+    #[cfg(test)]
+    pub(crate) test_connect_sessions: Vec<(usize, String, Option<String>)>,
     #[cfg(test)]
     pub(crate) test_connect_pi:
         Option<Box<dyn FnMut(usize, &std::path::Path) -> Option<Pi> + Send>>,
+    /// When set, connect_thread fails with this error instead of starting a session.
+    #[cfg(test)]
+    pub(crate) test_connect_error: Option<String>,
     next_vcs_request_id: u64,
     pending_vcs_requests: std::collections::HashMap<u64, (String, String)>,
     pub captain_project: Option<Option<ProjectId>>,
@@ -4039,7 +4439,11 @@ impl State {
             #[cfg(test)]
             test_connect_workspaces: Vec::new(),
             #[cfg(test)]
+            test_connect_sessions: Vec::new(),
+            #[cfg(test)]
             test_connect_pi: None,
+            #[cfg(test)]
+            test_connect_error: None,
             next_vcs_request_id: 0,
             pending_vcs_requests: Default::default(),
             captain_project: None,
@@ -7065,6 +7469,15 @@ impl State {
         {
             let tid = self.threads[index].id;
             self.test_connect_workspaces.push((tid, path.clone()));
+            self.test_connect_sessions.push((
+                tid,
+                self.threads[index].harness.clone(),
+                self.threads[index].session.clone(),
+            ));
+            if let Some(error) = self.test_connect_error.clone() {
+                self.threads[index].fail_session(error);
+                return;
+            }
             if let Some(hook) = self.test_connect_pi.as_mut()
                 && let Some(pi) = hook(tid, &path)
             {
@@ -12693,6 +13106,13 @@ impl State {
                         thread.scope_context_pending = pending.as_bool()?;
                     }
                     thread.never_sent = record["neverSent"] == true;
+                    // Handoff records are optional thread data: absent means none, and
+                    // older files decode with an empty list.
+                    thread.handoffs = serde_json::from_value(record["handoffs"].clone())
+                        .unwrap_or_default();
+                    thread.handoff_sessions =
+                        serde_json::from_value(record["handoffSessions"].clone())
+                            .unwrap_or_default();
                     thread.native.fork_source = record["forkSource"].as_str().map(str::to_owned);
                     thread.native.fork_entry = record["forkEntry"].as_str().map(str::to_owned);
                     thread.native.previous_session =
@@ -13726,7 +14146,8 @@ impl Thread {
             "options":self.model_options,
             "contextBreakdown":self.context.usage.breakdown,
             "promptSuggestion":self.prompt_suggestion,
-            "serviceTier":self.harness_state["serviceTier"]
+            "serviceTier":self.harness_state["serviceTier"],
+            "handoffs":self.handoffs,"handoffSessions":self.handoff_sessions
         }).as_object().unwrap().clone());
         if let Some(worktree_path) = &self.worktree_path {
             record["worktreePath"] = json!(worktree_path);
