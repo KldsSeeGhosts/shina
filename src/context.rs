@@ -105,6 +105,9 @@ pub struct ContextMeter {
     /// The pointer rests on the ring, or on the popover the ring opened.
     pub ring_hovered: bool,
     pub popover_hovered: bool,
+    /// Legend row currently hovered or keyboard-focused inside the breakdown popover.
+    pub hovered_segment: Option<usize>,
+    pub focused_segment: Option<usize>,
     /// The id of the in-flight `get_session_stats` request. Responses to an older request
     /// are ignored, which is how a stats request that crossed a compaction cannot restore
     /// the percentage compaction invalidated.
@@ -160,6 +163,8 @@ impl ContextMeter {
         self.usage.tokens = None;
         self.usage.percent = None;
         self.usage.breakdown = None;
+        self.hovered_segment = None;
+        self.focused_segment = None;
     }
 
     pub fn finish_compaction(&mut self) {
@@ -168,6 +173,8 @@ impl ContextMeter {
         self.usage.tokens = None;
         self.usage.percent = None;
         self.usage.breakdown = None;
+        self.hovered_segment = None;
+        self.focused_segment = None;
     }
 
     /// A different model has different capacity and a different cache. Do not show the
@@ -176,6 +183,8 @@ impl ContextMeter {
         self.pending = None;
         self.usage = ContextUsage::default();
         self.phase = ContextPhase::Idle;
+        self.hovered_segment = None;
+        self.focused_segment = None;
     }
 
     pub fn state_text(&self) -> Option<&'static str> {
@@ -219,9 +228,14 @@ impl ContextMeter {
             self.ring_hovered = inside;
         } else {
             self.popover_hovered = inside;
+            if !inside {
+                self.hovered_segment = None;
+            }
         }
         if !self.ring_hovered && !self.popover_hovered && !inside {
             self.details_open = false;
+            self.hovered_segment = None;
+            self.focused_segment = None;
         }
     }
 
@@ -229,6 +243,24 @@ impl ContextMeter {
         self.details_open = false;
         self.ring_hovered = false;
         self.popover_hovered = false;
+        self.hovered_segment = None;
+        self.focused_segment = None;
+    }
+
+    pub fn hover_segment(&mut self, index: usize, inside: bool) {
+        if inside {
+            self.hovered_segment = Some(index);
+        } else if self.hovered_segment == Some(index) {
+            self.hovered_segment = None;
+        }
+    }
+
+    pub fn focus_segment(&mut self, index: Option<usize>) {
+        self.focused_segment = index;
+    }
+
+    pub fn active_segment(&self) -> Option<usize> {
+        self.hovered_segment.or(self.focused_segment)
     }
 }
 

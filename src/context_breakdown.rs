@@ -12,7 +12,6 @@ use serde_json::Value;
 /// estimate simple; the reported total absorbs the remaining error.
 const CHARS_PER_TOKEN: f64 = 3.5;
 const CONTEXT_SYSTEM_LABEL: &str = "System";
-#[cfg_attr(not(test), allow(dead_code))]
 const VISIBLE_BREAKDOWN_ROWS: usize = 5;
 const MAX_BREAKDOWN_ROWS: usize = 32;
 const MAX_LABEL_CHARS: usize = 64;
@@ -34,7 +33,6 @@ pub struct ContextBreakdownRow {
     pub kind: BreakdownRowKind,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextLegendKind {
     Used,
@@ -45,7 +43,6 @@ pub enum ContextLegendKind {
     Free,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextLegendItem {
     pub label: String,
@@ -291,7 +288,6 @@ pub fn estimate_context_breakdown(
 /// The card's segments, in bar order: the largest rows, the rest folded into
 /// "Other", the compaction buffer, then free space. `None` when the provider
 /// gave no breakdown, so the card keeps its plain bar.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_context_legend(
     breakdown: Option<&[ContextBreakdownRow]>,
     max_tokens: Option<u64>,
@@ -380,7 +376,6 @@ pub fn build_context_legend(
     Some(items)
 }
 
-#[allow(dead_code)]
 pub fn is_approximate(
     breakdown: Option<&[ContextBreakdownRow]>,
     legend: Option<&[ContextLegendItem]>,
