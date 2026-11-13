@@ -18,6 +18,8 @@ mod client;
 mod client_history;
 mod codex;
 mod composer;
+#[allow(dead_code)] // wired into the composer input in the next commit
+mod composer_code_highlight;
 mod composer_code_languages;
 mod composer_context;
 mod composer_notices;

@@ -110,7 +110,7 @@ impl MarkdownSourceState {
     }
 }
 
-fn diff_single_edit(old: &str, new: &str) -> (Range<usize>, usize) {
+pub(crate) fn diff_single_edit(old: &str, new: &str) -> (Range<usize>, usize) {
     let old_b = old.as_bytes();
     let new_b = new.as_bytes();
     let min_len = old_b.len().min(new_b.len());
