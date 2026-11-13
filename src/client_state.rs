@@ -1289,6 +1289,15 @@ impl State {
                                 .map_err(|e| e.to_string())
                         });
                         self.apply_plan_save_result(req_id, parsed);
+                    } else if let Some(req_id) = tag
+                        .strip_prefix("usage-limits:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let parsed = result.and_then(|val| {
+                            serde_json::from_value::<crate::usage_limits::UsageLimitsReport>(val)
+                                .map_err(|e| e.to_string())
+                        });
+                        self.apply_usage_limits_result(req_id, parsed);
                     } else if let Some(rest) = tag.strip_prefix("search:")
                         && let Some((seq_str, target_srv)) = rest.split_once(':')
                         && let Ok(seq) = seq_str.parse::<u64>()

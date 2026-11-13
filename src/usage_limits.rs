@@ -6,16 +6,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[allow(dead_code)]
 pub const USAGE_LIMITS_COMMAND_NAME: &str = "usage-limits";
-#[allow(dead_code)]
 pub const USAGE_LIMITS_COMMAND_DESCRIPTION: &str = "Show this provider's usage limits";
 
-#[allow(dead_code)]
 const MINUTE_MS: i64 = 60_000;
-#[allow(dead_code)]
 const HOUR_MS: i64 = 60 * MINUTE_MS;
-#[allow(dead_code)]
 const DAY_MS: i64 = 24 * HOUR_MS;
 const SESSION_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
@@ -104,7 +99,6 @@ pub fn claude(info: &Value, previous: &Value) -> Value {
     json!({"windows":windows})
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `isUsageLimitsCommand` (`packages/shared/src/usageLimits.ts`).
 pub fn is_usage_limits_command(prompt: &str) -> bool {
     prompt.trim().eq_ignore_ascii_case("/usage-limits")
@@ -319,7 +313,6 @@ pub fn iso_from_epoch_seconds(value: f64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
-#[allow(dead_code)]
 pub fn parse_iso_ms(value: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -339,7 +332,6 @@ pub fn remaining_percent(window: &ServerProviderUsageWindow) -> i64 {
     (100.0 - clamp_percent(window.used_percent)).round() as i64
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `formatDuration` (`packages/shared/src/usageLimits.ts`).
 pub fn format_duration(ms: i64) -> String {
     let remaining = ms.max(0);
@@ -355,7 +347,6 @@ pub fn format_duration(ms: i64) -> String {
     }
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `formatResetsIn` (`packages/shared/src/usageLimits.ts`).
 pub fn format_resets_in(window: &ServerProviderUsageWindow, now_ms: i64) -> Option<String> {
     let resets_at = window.resets_at.as_deref().and_then(parse_iso_ms)?;
@@ -368,7 +359,6 @@ pub fn format_resets_in(window: &ServerProviderUsageWindow, now_ms: i64) -> Opti
     Some(format!("resets in {}", format_duration(resets_at - now_ms)))
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `limitsNotice` (`packages/shared/src/usageLimits.ts`).
 pub fn limits_notice(limits: &ServerProviderUsageLimits) -> Option<String> {
     if let Some(unavailable) = &limits.unavailable {
@@ -390,7 +380,6 @@ pub fn limits_notice(limits: &ServerProviderUsageLimits) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `ResetCreditChoice` and `resetCreditChoices` (`packages/shared/src/usageLimits.ts`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResetCreditChoice {
@@ -402,7 +391,6 @@ pub struct ResetCreditChoice {
     pub input: ProviderConsumeResetCreditInput,
 }
 
-#[allow(dead_code)]
 pub fn reset_credit_choices(
     credits: &ServerProviderResetCredits,
     input: &ProviderConsumeResetCreditInput,
@@ -478,7 +466,6 @@ pub fn reset_credit_choices(
     }]
 }
 
-#[allow(dead_code)]
 fn driver_display_name(driver: &str) -> &str {
     match driver {
         "codex" => "Codex",
@@ -488,7 +475,6 @@ fn driver_display_name(driver: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
 /// Ported from KSG Code's `accountLabel` and `AccountSummary` (`ComposerUsageLimits.tsx`).
 pub fn account_label(account: &UsageLimitsAccount) -> String {
     let Some(instance_id) = account.instance_id.as_deref() else {
@@ -509,7 +495,6 @@ pub fn account_label(account: &UsageLimitsAccount) -> String {
     }
 }
 
-#[allow(dead_code)]
 pub fn account_summary(account: &UsageLimitsAccount) -> String {
     let label = account_label(account);
     match account

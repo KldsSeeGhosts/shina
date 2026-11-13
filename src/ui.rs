@@ -10380,7 +10380,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
             .child(content)
             .child(actions);
 
-        let card = col()
+        let mut card = col()
             .key(format!("composer-notice-{}", notice.id))
             .role(role)
             .label(a11y_label)
@@ -10398,10 +10398,178 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .a11y_hidden(),
             )
             .child(card_row);
+        if let Some(body) = &notice.body {
+            match body {
+                crate::composer_notices::NoticeBody::UsageLimits(report) => {
+                    card = card.child(usage_limits_notice_body(s, report, p));
+                }
+            }
+        }
 
         stack = stack.child(card);
     }
     Some(stack)
+}
+
+fn usage_progress_bar(key: String, fill_key: Option<String>, percent: f64, p: Palette) -> El {
+    let fraction = percent.clamp(0.0, 100.0) as f32 / 100.0;
+    let mut fill = el()
+        .w_frac(fraction)
+        .h_full()
+        .radius(2.0)
+        .fill(if percent >= 90.0 { p.coral } else { p.faint });
+    if let Some(fill_key) = fill_key {
+        fill = fill.key(fill_key);
+    }
+    row()
+        .key(key)
+        .role("progressbar")
+        .label(format!("{} used", context_percent_text(percent)))
+        .w_full()
+        .h(6.0)
+        .radius(2.0)
+        .clip_rounded(2.0)
+        .fill(p.line)
+        .child(fill)
+}
+
+/// Ported from KSG Code's `UsageLimitsBannerBody` (`ComposerUsageLimits.tsx`) and
+/// `ComposerBanner.Scroll` (`ComposerBanner.tsx`: `max-h-[min(24rem,40dvh)]`), skinned per
+/// Pixel Voyage using `usage_progress_bar` and 11 px Departure Mono figures.
+fn usage_limits_notice_body(
+    s: &State,
+    report: &crate::usage_limits::UsageLimitsReport,
+    p: Palette,
+) -> El {
+    let max_h = if s.viewport_height > 0.0 {
+        384.0_f32.min((s.viewport_height * 0.4).max(120.0))
+    } else {
+        384.0
+    };
+    let now_ms = crate::usage_limits::parse_iso_ms(&report.created_at)
+        .unwrap_or_else(|| crate::lifecycle::now() as i64);
+    let mut body = col()
+        .w_full()
+        .min_w(0.0)
+        .pl(28.0)
+        .pr(8.0)
+        .pt(4.0)
+        .pb(6.0)
+        .gap(8.0);
+    for (acc_idx, account) in report.accounts.iter().enumerate() {
+        let mut acc_col = col()
+            .key(format!("usage-limits-account-{acc_idx}"))
+            .w_full()
+            .min_w(0.0)
+            .gap(4.0);
+        if report.accounts.len() > 1 {
+            acc_col = acc_col.child(
+                label(
+                    crate::usage_limits::account_summary(account),
+                    SMALL,
+                    p.muted,
+                )
+                .truncate()
+                .w_full(),
+            );
+        }
+        if let Some(notice_text) = crate::usage_limits::limits_notice(&account.limits) {
+            acc_col = acc_col.child(label(notice_text, SMALL, p.muted).wrap().w_full());
+        } else {
+            for (win_idx, window) in account.limits.windows.iter().enumerate() {
+                let reset_text =
+                    crate::usage_limits::format_resets_in(window, now_ms).unwrap_or_default();
+                let bar = usage_progress_bar(
+                    format!("usage-limits-bar-{acc_idx}-{win_idx}"),
+                    None,
+                    window.used_percent,
+                    p,
+                );
+                let win_row = row()
+                    .key(format!("usage-limits-window-{acc_idx}-{win_idx}"))
+                    .w_full()
+                    .min_w(0.0)
+                    .center_y()
+                    .gap(12.0)
+                    .child(
+                        row()
+                            .w(136.0)
+                            .min_w(0.0)
+                            .center_y()
+                            .gap(6.0)
+                            .child(
+                                label(&window.label, SMALL, p.muted)
+                                    .truncate()
+                                    .min_w(0.0)
+                                    .grow(1.0),
+                            )
+                            .child(pixel_text(context_percent_text(window.used_percent), p.ink)),
+                    )
+                    .child(row().grow(1.0).min_w(48.0).center_y().child(bar))
+                    .child(
+                        row()
+                            .min_w(84.0)
+                            .justify_end()
+                            .center_y()
+                            .child(pixel_text(reset_text, p.muted)),
+                    );
+                acc_col = acc_col.child(win_row);
+            }
+        }
+        if let Some(external) = &account.limits.external_usage {
+            let url = external.url.clone();
+            acc_col = acc_col.child(row().w_full().child(button(
+                &format!("usage-limits-manage-{acc_idx}"),
+                "Manage usage",
+                p,
+                move |s| s.open_external_url(&url),
+            )));
+        }
+        if let Some(input) = &account.reset_credit_input
+            && let Some(credits) = &account.limits.reset_credits
+            && credits.available_count > 0
+        {
+            for (c_idx, choice) in
+                crate::usage_limits::reset_credit_choices(credits, input, now_ms, false)
+                    .into_iter()
+                    .enumerate()
+            {
+                if choice.available_count == 0 {
+                    continue;
+                }
+                let btn_key = if c_idx == 0 {
+                    format!("usage-limits-reset-{acc_idx}")
+                } else {
+                    format!("usage-limits-reset-{acc_idx}-{c_idx}")
+                };
+                let choice_input = choice.input.clone();
+                acc_col = acc_col.child(
+                    row()
+                        .w_full()
+                        .min_w(0.0)
+                        .center_y()
+                        .gap(12.0)
+                        .child(pixel_text(choice.summary, p.muted))
+                        .child(button(&btn_key, &choice.action_label, p, move |s| {
+                            s.redeem_usage_reset_credit(choice_input.clone())
+                        })),
+                );
+            }
+        }
+        body = body.child(acc_col);
+    }
+    for notice_line in &report.notices {
+        body = body.child(label(notice_line, SMALL, p.muted).wrap().w_full());
+    }
+    col()
+        .key("usage-limits-scroll")
+        .w_full()
+        .min_w(0.0)
+        .max_h(max_h)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(body)
 }
 
 /// Overflow details popover for a composer notice, reusing `context_popover` styling.
@@ -10833,7 +11001,6 @@ fn context_popover(s: &State, p: Palette) -> El {
             let Some(percent) = window["usedPercent"].as_f64().filter(|n| n.is_finite()) else {
                 continue;
             };
-            let fraction = percent.clamp(0.0, 100.0) as f32 / 100.0;
             let reset = window["resetsAt"]
                 .as_i64()
                 .and_then(chrono::DateTime::from_timestamp_secs)
@@ -10863,24 +11030,12 @@ fn context_popover(s: &State, p: Palette) -> El {
                                     .key(format!("usage-percent-{index}")),
                             ),
                     )
-                    .child(
-                        row()
-                            .key(format!("usage-bar-{index}"))
-                            .role("progressbar")
-                            .label(format!("{} used", context_percent_text(percent)))
-                            .w_full()
-                            .h(6.0)
-                            .radius(2.0)
-                            .clip_rounded(2.0)
-                            .fill(p.line)
-                            .child(
-                                el().key(format!("usage-fill-{index}"))
-                                    .w_frac(fraction)
-                                    .h_full()
-                                    .radius(2.0)
-                                    .fill(if percent >= 90.0 { p.coral } else { p.faint }),
-                            ),
-                    )
+                    .child(usage_progress_bar(
+                        format!("usage-bar-{index}"),
+                        Some(format!("usage-fill-{index}")),
+                        percent,
+                        p,
+                    ))
                     .child(
                         pixel_text(reset, p.muted)
                             .key(format!("usage-reset-{index}"))
@@ -22650,6 +22805,106 @@ pub(crate) mod tests {
             assert!(
                 rt.state.keep_full_history(rt.state.current()),
                 "{width}: clicking toggle switches to Keep"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_limits_notice_shows_windows_above_composer_and_scrolls_when_many_accounts() {
+        use crate::usage_limits::{
+            ServerProviderUsageLimits, ServerProviderUsageWindow, UsageLimitsAccount,
+            UsageLimitsReport, UsageWindowKind,
+        };
+
+        let make_account = |idx: usize| UsageLimitsAccount {
+            id: format!("acc-{idx}"),
+            driver: "codex".into(),
+            label: format!("Codex [acc-{idx}]"),
+            plan: Some("ChatGPT Plus Subscription".into()),
+            email: None,
+            source_label: None,
+            instance_id: Some("codex".into()),
+            reset_credit_input: None,
+            display_name: Some(format!("Account {idx}")),
+            accent_color: None,
+            limits: ServerProviderUsageLimits {
+                checked_at: "2026-01-01T00:00:00.000Z".into(),
+                windows: vec![
+                    ServerProviderUsageWindow {
+                        id: "primary".into(),
+                        kind: UsageWindowKind::Session,
+                        label: "Session".into(),
+                        used_percent: 40.0,
+                        resets_at: Some("2026-01-01T03:00:00.000Z".into()),
+                        window_duration_mins: Some(300),
+                        estimated: None,
+                    },
+                    ServerProviderUsageWindow {
+                        id: "secondary".into(),
+                        kind: UsageWindowKind::Weekly,
+                        label: "Weekly".into(),
+                        used_percent: 75.0,
+                        resets_at: Some("2026-01-05T00:00:00.000Z".into()),
+                        window_duration_mins: Some(10080),
+                        estimated: None,
+                    },
+                ],
+                credential_fingerprint: None,
+                reset_credits: None,
+                external_usage: None,
+                unavailable: None,
+            },
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.show_usage_limits_report(UsageLimitsReport {
+                created_at: "2026-01-01T00:00:00.000Z".into(),
+                accounts: vec![make_account(0)],
+                notices: vec![],
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (notice_rect, _) = rt
+                .presented("composer-notice-usage-limits")
+                .expect("usage-limits notice");
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+            assert!(
+                (composer_rect[1] - (notice_rect[1] + notice_rect[3])).abs() < 0.5,
+                "{width}: notice should sit directly above composer: notice={notice_rect:?} composer={composer_rect:?}"
+            );
+            assert!(rt.presented("usage-limits-account-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-window-0-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-bar-0-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-window-0-1").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-bar-0-1").is_some(), "{width}");
+
+            // With many accounts, the body scrolls inside the max-h-[min(24rem,40dvh)] cap.
+            let accounts = (0..12).map(make_account).collect();
+            rt.state.show_usage_limits_report(UsageLimitsReport {
+                created_at: "2026-01-01T00:00:00.000Z".into(),
+                accounts,
+                notices: vec![],
+            });
+            rt.frame(1.0);
+            let (scroll_rect, _) = rt
+                .presented("usage-limits-scroll")
+                .expect("usage-limits scroll container");
+            assert!(
+                scroll_rect[3] <= 384.0_f32.min(720.0 * 0.4) + 1.0,
+                "{width}: scroll height {scroll_rect:?} exceeded KSG max-h cap"
+            );
+            assert!(rt.presented("usage-limits-account-0").is_some(), "{width}");
+            assert!(
+                rt.presented("usage-limits-account-11").is_none(),
+                "{width}: last account should be clipped outside scroll viewport before scrolling"
+            );
+            rt.update(|_, tx| tx.scroll_to_bottom_instant("usage-limits-scroll"));
+            rt.frame(1.0);
+            assert!(
+                rt.presented("usage-limits-account-11").is_some(),
+                "{width}: scrolling to bottom reveals last account"
             );
         }
     }

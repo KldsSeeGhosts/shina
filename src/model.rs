@@ -3241,6 +3241,10 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub pending_open_urls: Vec<String>,
+    pub next_usage_limits_request_id: u64,
+    pub pending_usage_limits_request: Option<(u64, String, usize, String)>,
+    pub usage_limits_notice_key: Option<(String, usize, String)>,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
@@ -3459,6 +3463,10 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            pending_open_urls: Vec::new(),
+            next_usage_limits_request_id: 0,
+            pending_usage_limits_request: None,
+            usage_limits_notice_key: None,
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
             timeline_positions: std::cell::RefCell::default(),
@@ -3572,6 +3580,15 @@ impl State {
         }
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
+        }
+        let current_key = (
+            self.machines.selected.clone(),
+            id,
+            self.current().harness.clone(),
+        );
+        if self.usage_limits_notice_key.as_ref() != Some(&current_key) {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove("usage-limits");
         }
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
         if !self.headless {
@@ -7881,9 +7898,204 @@ impl State {
             && thread.native.questionnaire.is_none()
     }
 
+    pub fn usage_limits_command_available(&self, thread: &Thread) -> bool {
+        !self.demo
+            && crate::usage_limits::has_usage_limits(&thread.harness)
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::USAGE_LIMITS)
+            })
+    }
+
     pub fn slash_matches(&self) -> Vec<pi_session::SlashCommand> {
-        self.current()
-            .slash_matches_with_fresh(self.fresh_session_command_available(self.current()))
+        self.current().slash_matches_with_capabilities(
+            self.fresh_session_command_available(self.current()),
+            self.usage_limits_command_available(self.current()),
+        )
+    }
+
+    pub fn open_external_url(&mut self, url: &str) {
+        self.pending_open_urls.push(url.to_owned());
+    }
+
+    pub fn open_usage_limits(&mut self) -> bool {
+        let machine = self.machines.selected.clone();
+        let thread = self.current();
+        let thread_id = thread.id;
+        let harness = thread.harness.clone();
+        let client_draft = thread.client_draft;
+        if !self.usage_limits_command_available(thread) {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        }
+        if let Some(client) = &self.client {
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            };
+            if !target.has_capability(crate::protocol::USAGE_LIMITS) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            }
+            self.next_usage_limits_request_id += 1;
+            let req_id = self.next_usage_limits_request_id;
+            self.pending_usage_limits_request = Some((req_id, machine, thread_id, harness.clone()));
+            let params = if client_draft {
+                json!({"threadId": thread_id, "draft": true, "harness": harness})
+            } else {
+                json!({"threadId": thread_id})
+            };
+            target.call_rpc(format!("usage-limits:{req_id}"), "usage.limits", params);
+            return true;
+        }
+
+        let catalog = match harness.as_str() {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            _ => None,
+        };
+        let hs = &thread.harness_state;
+        let usage_limits = (!hs["usageLimits"].is_null())
+            .then_some(&hs["usageLimits"])
+            .or_else(|| catalog.map(|c| &c.usage_limits).filter(|v| !v.is_null()));
+        let usage_limits_raw = (!hs["usageLimitsRaw"].is_null())
+            .then_some(&hs["usageLimitsRaw"])
+            .or_else(|| {
+                catalog
+                    .map(|c| &c.usage_limits_raw)
+                    .filter(|v| !v.is_null())
+            });
+        let usage_account = (!hs["usageAccount"].is_null())
+            .then_some(&hs["usageAccount"])
+            .or_else(|| catalog.map(|c| &c.usage_account).filter(|v| !v.is_null()));
+        let Some(report) = crate::usage_limits::build_usage_limits_report(
+            crate::usage_limits::UsageLimitsReportInput {
+                harness: &harness,
+                now_ms: lifecycle::now() as i64,
+                usage_limits,
+                usage_limits_raw,
+                usage_account,
+            },
+        ) else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        };
+        self.show_usage_limits_report(report);
+        true
+    }
+
+    pub(crate) fn apply_usage_limits_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::usage_limits::UsageLimitsReport, String>,
+    ) {
+        let Some((pending_id, machine, thread_id, harness)) =
+            self.pending_usage_limits_request.as_ref()
+        else {
+            return;
+        };
+        if *pending_id != req_id {
+            return;
+        }
+        let matches_current = self.machines.selected == *machine
+            && self.current().id == *thread_id
+            && self.current().harness == *harness;
+        self.pending_usage_limits_request = None;
+        if !matches_current {
+            return;
+        }
+        match result {
+            Ok(report) => self.show_usage_limits_report(report),
+            Err(_) => {
+                self.usage_limits_notice_key = None;
+                self.composer_notices.remove("usage-limits");
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+            }
+        }
+    }
+
+    pub fn show_usage_limits_report(&mut self, report: crate::usage_limits::UsageLimitsReport) {
+        let description = if report.accounts.len() == 1 {
+            report
+                .accounts
+                .first()
+                .map(crate::usage_limits::account_summary)
+        } else {
+            Some(format!("{} accounts", report.accounts.len()))
+        };
+        self.usage_limits_notice_key = Some((
+            self.machines.selected.clone(),
+            self.current().id,
+            self.current().harness.clone(),
+        ));
+        self.composer_notices.remove("usage-limits");
+        self.composer_notices.push(
+            crate::composer_notices::Notice::new(
+                "usage-limits",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                "Usage limits",
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(description)
+            .body(crate::composer_notices::NoticeBody::UsageLimits(report))
+            .dismiss_label("Dismiss usage limits"),
+        );
+    }
+
+    pub fn redeem_usage_reset_credit(
+        &mut self,
+        input: crate::usage_limits::ProviderConsumeResetCreditInput,
+    ) {
+        let _ = input;
+        if self.client.is_none() && self.current().harness == "codex" && self.current().pi.is_some()
+        {
+            let key = uuid::Uuid::new_v4().to_string();
+            self.current_mut()
+                .command("consume_reset_credit", json!({"idempotencyKey": key}));
+            return;
+        }
+        self.push_toast(
+            ToastKind::Error,
+            "Could not use the reset credit.",
+            None,
+            None,
+            Some(5_000),
+        );
     }
 
     pub fn arm_fresh_session(&mut self, thread_id: usize) {
@@ -7910,6 +8122,9 @@ impl State {
             self.disarm_fresh_session(thread_id, None);
             self.composer_notices.remove(id);
             self.checkpoint();
+        } else if id == "usage-limits" {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove(id);
         } else {
             self.composer_notices.dismiss(id);
         }
@@ -8067,6 +8282,22 @@ impl State {
             self.checkpoint();
             return false;
         }
+        if composer_holds_only_text
+            && self.usage_limits_command_available(self.current())
+            && crate::usage_limits::is_usage_limits_command(&draft_markdown)
+        {
+            if self.open_usage_limits() {
+                let t = self.current_mut();
+                t.prompt_history.reset();
+                t.typing_guard.on_blur_or_send();
+                t.paste_history = Default::default();
+                t.draft.replace_text("");
+                t.submission_error = None;
+                t.attachment_error = None;
+                self.checkpoint();
+            }
+            return false;
+        }
         // Read once: an arm made while this send is in flight belongs to the next message.
         let fresh_arm = if forced_fresh_context.is_some() {
             None
@@ -8176,6 +8407,8 @@ impl State {
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    self.usage_limits_notice_key = None;
+                    self.composer_notices.remove("usage-limits");
                     true
                 }
                 Some(Err(error)) => {
@@ -8219,6 +8452,9 @@ impl State {
                 return false;
             }
             Some(command) if command.eq_ignore_ascii_case("/clear") => {}
+            Some(command)
+                if command.eq_ignore_ascii_case("/usage-limits")
+                    && self.usage_limits_command_available(self.current()) => {}
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
@@ -8437,6 +8673,8 @@ impl State {
             }
             self.current_mut().submission_error = None;
         }
+        self.usage_limits_notice_key = None;
+        self.composer_notices.remove("usage-limits");
         let local_server_id = self.machine_identity(&self.machines.selected);
         let peers = self.peers.clone();
         let labels: Vec<(String, String)> = peers
@@ -10072,6 +10310,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
+    for url in std::mem::take(&mut state.pending_open_urls) {
+        html_changed = true;
+        if let Err(error) = tx.open_url(&url) {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not open the link",
+                Some(error.to_string()),
+                None,
+                Some(5_000),
+            );
+        }
+    }
     let keybindings_changed = !state.headless && state.poll_keybindings();
     let browsing = state.poll_folder_browser()
         | state.poll_settings()
@@ -10336,6 +10586,40 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
     changed |= state.sync_fresh_session_notice();
+    if let Some(outcome) = state
+        .current_mut()
+        .harness_state
+        .as_object_mut()
+        .and_then(|obj| obj.remove("resetCreditOutcome"))
+    {
+        changed = true;
+        if let Some(err) = outcome["error"].as_str() {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not use the reset credit.",
+                Some(err.to_owned()),
+                None,
+                Some(5_000),
+            );
+        } else {
+            let msg = match outcome["outcome"].as_str() {
+                Some("reset") => "Reset applied. Your windows have cleared.",
+                Some("nothingToReset") => "Nothing to reset right now.",
+                Some("noCredit") => "No reset credit left.",
+                Some("alreadyRedeemed") => "That credit was already redeemed.",
+                _ => "Could not use the reset credit.",
+            };
+            let kind = if outcome["outcome"].as_str() == Some("reset") {
+                ToastKind::Success
+            } else {
+                ToastKind::Warning
+            };
+            state.push_toast(kind, msg, None, None, Some(5_000));
+            if state.usage_limits_notice_key.is_some() {
+                state.open_usage_limits();
+            }
+        }
+    }
     if global_changed {
         state.persistence_scope = None;
         changed = true;
@@ -16694,5 +16978,88 @@ mod tests {
         assert_eq!(compact["type"], "compact");
         assert_eq!(compact["customInstructions"], "focus on tests");
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn usage_limits_command_raises_notice_without_sending_and_requires_capability() {
+        let mut state = State::new(".".into(), false);
+        // Pi has no report, so `/usage-limits` is not offered and sends as ordinary text.
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        let (pi, commands, _events) = Pi::test_connection();
+        {
+            let t = state.current_mut();
+            t.harness = "codex".into();
+            t.model_provider = "codex".into();
+            t.pi = Some(pi);
+            t.harness_state["usageLimitsRaw"] = json!({
+                "checkedAtMs": 1_700_000_000_000i64,
+                "snapshot": {
+                    "limitId": "codex",
+                    "planType": "plus",
+                    "primary": {"usedPercent": 35.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+                }
+            });
+            t.draft.replace_text("/");
+        }
+        assert!(
+            state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        // Sending `/usage-limits` alone raises the notice, clears the draft, and sends nothing.
+        state.current_mut().draft.replace_text("/usage-limits");
+        state.send();
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "usage-limits");
+        assert_eq!(notices[0].title, "Usage limits");
+        assert!(matches!(
+            notices[0].body,
+            Some(crate::composer_notices::NoticeBody::UsageLimits(_))
+        ));
+
+        // Dismissing removes it; choosing from the slash menu raises it again without sending.
+        state.dismiss_composer_notice("usage-limits");
+        assert!(state.composer_notices.ordered().is_empty());
+        state.current_mut().draft.replace_text("/usage");
+        state.choose_slash(crate::usage_limits::USAGE_LIMITS_COMMAND_NAME.into());
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(state.composer_notices.ordered().len(), 1);
+
+        // Sending `/usage-limits` with extra text sends as ordinary text (KSG `isUsageLimitsCommand`).
+        state
+            .current_mut()
+            .draft
+            .replace_text("/usage-limits explain");
+        state.send();
+        let sent = commands.try_recv().expect("ordinary prompt sent");
+        assert_eq!(sent["type"], "prompt");
+        assert_eq!(sent["message"], "/usage-limits explain");
+
+        // Machine lacking `usage-limits` capability hides the command.
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": []});
+        state.client = Some(client);
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
     }
 }

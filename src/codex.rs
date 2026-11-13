@@ -489,6 +489,14 @@ impl Client {
                 self.usage_limits_raw = raw;
                 self.events.push(json!({"type":"harness_update","field":"usageLimitsRaw","value":self.usage_limits_raw}));
             }
+            "consume_reset_credit" => {
+                self.reply(&request, result.clone());
+                self.request(
+                    "account/rateLimits/read",
+                    Value::Null,
+                    json!({"type":"rateLimits"}),
+                );
+            }
             "skills" => {
                 self.skill_commands =
                     crate::composer_skills::codex_commands(result, &self.start.workspace);
@@ -1239,6 +1247,18 @@ impl Client {
                 }
                 _ => self.reply(&record, json!({})),
             },
+            "consume_reset_credit" => {
+                let idempotency_key = record["idempotencyKey"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.request(
+                    "account/rateLimitResetCredit/consume",
+                    json!({"idempotencyKey": idempotency_key}),
+                    record,
+                );
+            }
             _ => self.reject(&record, format!("Codex does not support {kind} in Shina.")),
         }
         Ok(())
