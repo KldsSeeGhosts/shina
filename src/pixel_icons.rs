@@ -266,6 +266,12 @@ glyph!(
     SWAP,
     r#"<path d="M4 8h12v2H4zM16 6h2v2h-2zM18 8h2v2h-2zM16 10h2v2h-2zM8 14h12v2H8zM6 12h2v2H6zM4 14h2v2H4zM6 16h2v2H6z"/>"#
 );
+// A diff mark drawn here on the same grid, a plus over a minus, as KSG Code's
+// FileDiffIcon reads at small size. Pixelarticons has no diff glyph.
+glyph!(
+    DIFF,
+    r#"<path d="M11 4h2v8h-2zM7 7h10v2H7zM7 16h10v2H7z"/>"#
+);
 
 /// The pixel glyph for an icon name. Unknown names draw a check.
 pub(super) fn glyph(kind: &str) -> &'static Icon {
@@ -330,6 +336,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "star-off" => &STAR_OFF,
         "workflow" => &WORKFLOW,
         "swap" => &SWAP,
+        "diff" => &DIFF,
         _ => &CHECK,
     }
 }

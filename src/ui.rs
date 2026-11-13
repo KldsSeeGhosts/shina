@@ -6902,9 +6902,10 @@ fn right_panel_tab_menu(s: &State, p: Palette) -> El {
         .child(item("menu-tab-all", "Close all", "close", all))
 }
 
-fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
-    // The tab strip already names the thread, so the header only holds thread actions:
-    // status, a labeled "More actions" menu and the session panel toggle.
+fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
+    // The tab strip already names the thread, so the header only holds controls: status, a
+    // "More actions" menu, the session panel toggle, and the diff and panel toggles KSG's
+    // PanelLayoutControls keeps at the right end.
     let mut header = row()
         .key("chat-header")
         .w_full()
@@ -7009,6 +7010,60 @@ fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
                 s.activity_full = false;
             },
         ));
+    }
+    // KSG's panel controls sit at the header's right end: the diff stat and the Diff tab
+    // toggle, then the whole-panel toggle (KSG's PanelRight). The stat reads the totals the
+    // diff panel already computed, so it never starts a request just to fill the header.
+    let panel_key = s.panel_key();
+    let resolved = s.resolved_keybindings();
+    let ctx = s.shortcut_context(false);
+    let platform = crate::keybindings::Platform::current();
+    let shortcut = |command: &str| {
+        crate::keybindings::shortcut_label_for_command(&resolved, command, &ctx, platform)
+    };
+    // First control to drop as the row narrows is the stat, then the panel toggle; the diff
+    // toggle stays as long as the header draws.
+    if !narrow
+        && let Some(ready) = s
+            .diffs
+            .get(&panel_key)
+            .and_then(diff_panel::ThreadDiff::ready)
+        && (ready.additions > 0 || ready.deletions > 0)
+    {
+        header = header.child(diff_panel::diff_stat_label(
+            "header-diff-stat",
+            ready.additions,
+            ready.deletions,
+            p,
+        ));
+    }
+    let diff_open =
+        s.right_panels.active_surface(&panel_key) == Some(crate::right_panel::Surface::Diff);
+    let mut diff = toggle_button(
+        "header-diff",
+        "Toggle diff",
+        "diff",
+        diff_open,
+        p,
+        |s: &mut State| s.right_panel_toggle_diff(),
+    );
+    if let Some(shortcut) = shortcut("diff.toggle") {
+        diff = diff.description(format!("Toggle diff ({shortcut})"));
+    }
+    header = header.child(diff);
+    if !compact {
+        let mut panel = toggle_button(
+            "header-right-panel",
+            "Toggle right panel",
+            "panel",
+            s.right_panel().open,
+            p,
+            |s: &mut State| s.right_panel_toggle(),
+        );
+        if let Some(shortcut) = shortcut("rightPanel.toggle") {
+            panel = panel.description(format!("Toggle right panel ({shortcut})"));
+        }
+        header = header.child(panel);
     }
     header
 }
@@ -17248,6 +17303,118 @@ pub(crate) mod tests {
                 mounted < 400,
                 "{width}: {mounted} line rows mounted of 20,000"
             );
+        }
+    }
+
+    /// KSG `PanelLayoutControls` in the chat header: the diff toggle opens and
+    /// closes the Diff tab, the panel toggle the whole panel, and the loaded
+    /// diff's totals sit beside the diff toggle once the row is wide enough.
+    #[test]
+    fn header_diff_and_panel_buttons_toggle_the_right_panel_at_all_widths() {
+        // Two files: +2 -1 on src/a.rs, +3 on src/b.rs — "+5 -1" total.
+        const PATCH: &str = "diff --git a/src/a.rs b/src/a.rs\n\
+            --- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n keep\n-old\n+new\n+more\n tail\n\
+            diff --git a/src/b.rs b/src/b.rs\n\
+            --- a/src/b.rs\n+++ b/src/b.rs\n@@ -5,0 +5,3 @@\n+one\n+two\n+three\n";
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // A loaded diff, fresh enough that mounting the tab does not re-read git.
+            let key = rt.state.panel_key();
+            rt.state.diffs.insert(
+                key.clone(),
+                diff_panel::ThreadDiff {
+                    done: Some(parsed_ready(PATCH)),
+                    last_refresh_at: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            );
+            rt.state.diff_rebuild_rows(&key);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.5);
+
+            let (header, _) = rt.presented("chat-header").unwrap();
+            // Every presented right-side control stays inside the header and
+            // clear of its neighbours and the status text's slot.
+            let mut controls = Vec::new();
+            for key in [
+                "chat-status",
+                "thread-actions",
+                "open-session-panel",
+                "header-diff-stat",
+                "header-diff",
+                "header-right-panel",
+            ] {
+                if let Some((rect, _)) = rt.presented(key) {
+                    controls.push((key, rect));
+                }
+            }
+            for (name, rect) in &controls {
+                assert!(
+                    rect[0] >= header[0] - 0.5 && rect[0] + rect[2] <= header[0] + header[2] + 0.5,
+                    "{width}: {name} {rect:?} escapes header {header:?}"
+                );
+            }
+            for (i, (a, ar)) in controls.iter().enumerate() {
+                for (b, br) in &controls[i + 1..] {
+                    let overlap = (ar[0] + ar[2]).min(br[0] + br[2]) - ar[0].max(br[0]);
+                    assert!(overlap <= 0.5, "{width}: {a} {ar:?} overlaps {b} {br:?}");
+                }
+            }
+
+            // The diff toggle opens the panel on the Diff tab and presses off again.
+            assert!(rt.presented("header-diff").is_some(), "{width}");
+            press(&mut rt, "header-diff");
+            rt.frame(0.5);
+            let key = rt.state.panel_key();
+            assert_eq!(
+                rt.state.right_panels.active_surface(&key),
+                Some(crate::right_panel::Surface::Diff),
+                "{width}"
+            );
+            assert!(rt.presented("right-panel").is_some(), "{width}");
+            press(&mut rt, "header-diff");
+            rt.frame(0.5);
+            assert!(
+                rt.presented("right-panel").is_none(),
+                "{width}: a second press closes the panel"
+            );
+
+            // The panel toggle shows and hides the whole panel; it drops out of
+            // the header only once the window is compact.
+            match rt.presented("header-right-panel") {
+                Some(_) => {
+                    press(&mut rt, "header-right-panel");
+                    rt.frame(0.5);
+                    assert!(rt.presented("right-panel").is_some(), "{width}");
+                    press(&mut rt, "header-right-panel");
+                    rt.frame(0.5);
+                    assert!(rt.presented("right-panel").is_none(), "{width}");
+                }
+                None => assert!(
+                    width < 760.0,
+                    "{width}: the panel toggle only drops when compact"
+                ),
+            }
+
+            // The stat reads the loaded diff's totals at and above the narrow fold.
+            assert_eq!(
+                rt.presented("header-diff-stat").is_some(),
+                width >= 1050.0,
+                "{width}: the stat only shows once the row is wide enough"
+            );
+            if width >= 1050.0 {
+                let stat = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some("header-diff-stat"))
+                    .unwrap();
+                assert_eq!(
+                    stat.label.as_deref(),
+                    Some("5 additions, 1 deletions"),
+                    "{width}"
+                );
+            }
         }
     }
 

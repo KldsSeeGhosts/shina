@@ -1248,7 +1248,7 @@ fn scope_option(scope: Scope, current: Scope, key: &str, p: Palette) -> El {
 
 /// KSG `DiffStatLabel`: `+N -N` in the addition and deletion colours, Departure
 /// Mono, with its group aria label.
-fn diff_stat_label(key: &str, additions: u32, deletions: u32, p: Palette) -> El {
+pub(super) fn diff_stat_label(key: &str, additions: u32, deletions: u32, p: Palette) -> El {
     row()
         .key(key)
         .role("group")
