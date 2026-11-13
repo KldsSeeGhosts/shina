@@ -1092,6 +1092,182 @@ pub fn browse_folder(input: &str, partial: bool) -> Result<crate::protocol::Fold
     })
 }
 
+/// The user's Downloads folder, falling back to their home folder.
+pub fn downloads_dir() -> Option<PathBuf> {
+    home_dir()
+        .map(|home| home.join("Downloads"))
+        .filter(|path| path.is_dir())
+        .or_else(home_dir)
+}
+
+fn is_in_git_folder(path: &std::path::Path) -> Result<bool, String> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".git")
+        )
+    }) {
+        return Ok(true);
+    }
+    let mut folder = path.parent();
+    while let Some(dir) = folder {
+        let has = |name: &str| -> Result<Option<std::fs::Metadata>, String> {
+            match std::fs::symlink_metadata(dir.join(name)) {
+                Ok(meta) => Ok(Some(meta)),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(err) => Err(format!("Could not inspect workspace folder: {err}")),
+            }
+        };
+        let head = has("HEAD")?.is_some();
+        let commondir = has("commondir")?.is_some();
+        let objects = has("objects")?.is_some();
+        let refs = has("refs")?.is_some();
+        let dot_git = has(".git")?;
+        if head && (commondir || (objects && refs)) {
+            return Ok(true);
+        }
+        if dot_git.is_some_and(|meta| meta.is_file()) {
+            return Ok(false);
+        }
+        folder = dir.parent();
+    }
+    Ok(false)
+}
+
+/// Ported from KSG Code's `WorkspacePaths.resolveRelativePathWithinRoot` and
+/// `WorkspaceFileSystem.writeFile`: validates a relative path inside `cwd`, creates parent
+/// directories, and writes `contents` without following escaping or dangling symlinks.
+pub fn write_project_file(
+    input: &crate::protocol::ProjectWriteFileInput,
+) -> Result<crate::protocol::ProjectWriteFileResult, String> {
+    let cwd_trimmed = input.cwd.trim();
+    if cwd_trimmed.is_empty() || !std::path::Path::new(cwd_trimmed).is_absolute() {
+        return Err("Workspace root must be an absolute path.".into());
+    }
+    let cwd_meta = std::fs::metadata(cwd_trimmed)
+        .map_err(|err| format!("Workspace root could not be accessed: {err}"))?;
+    if !cwd_meta.is_dir() {
+        return Err("Workspace root is not a directory.".into());
+    }
+    let real_workspace_root = std::fs::canonicalize(cwd_trimmed)
+        .map_err(|err| format!("Workspace root could not be resolved: {err}"))?;
+
+    let trimmed = input.relative_path.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Err("Enter a workspace path.".into());
+    }
+    if std::path::Path::new(trimmed).is_absolute()
+        || trimmed.starts_with('/')
+        || (cfg!(windows) && trimmed.starts_with('\\'))
+    {
+        return Err("Path must be relative to the workspace root.".into());
+    }
+    if trimmed.ends_with('/') || (cfg!(windows) && trimmed.ends_with('\\')) {
+        return Err("Path must name a file inside the workspace root.".into());
+    }
+
+    let mut segments: Vec<std::ffi::OsString> = Vec::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if segments.pop().is_none() {
+                    return Err("Path escapes the workspace root.".into());
+                }
+            }
+            std::path::Component::Normal(part) => segments.push(part.to_os_string()),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err("Path must be relative to the workspace root.".into());
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err("Path must name a file inside the workspace root.".into());
+    }
+
+    let display_relative_path = segments
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let mut named_target_path = real_workspace_root.clone();
+    for seg in &segments {
+        named_target_path.push(seg);
+    }
+
+    let mut real_target_path = None;
+    for depth in (1..=segments.len()).rev() {
+        let mut candidate = real_workspace_root.clone();
+        for seg in &segments[..depth] {
+            candidate.push(seg);
+        }
+        match std::fs::canonicalize(&candidate) {
+            Ok(resolved) => {
+                let mut target = resolved;
+                for seg in &segments[depth..] {
+                    target.push(seg);
+                }
+                real_target_path = Some(target);
+                break;
+            }
+            Err(err) => {
+                let exists = std::fs::symlink_metadata(&candidate).is_ok();
+                if err.kind() == std::io::ErrorKind::NotFound && !exists {
+                    continue;
+                }
+                return Err(format!("Could not resolve target path: {err}"));
+            }
+        }
+    }
+    let real_target_path = real_target_path.unwrap_or_else(|| named_target_path.clone());
+
+    if !real_target_path.starts_with(&real_workspace_root)
+        || real_target_path == real_workspace_root
+    {
+        return Err("Path escapes the workspace root.".into());
+    }
+    if is_in_git_folder(&real_target_path)? || is_in_git_folder(&named_target_path)? {
+        return Err("Cannot write inside a Git folder.".into());
+    }
+
+    if let Some(parent) = real_target_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create parent directory: {err}"))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&real_target_path)
+            .map_err(|err| format!("Could not write file: {err}"))?;
+        file.write_all(input.contents.as_bytes())
+            .map_err(|err| format!("Could not write file: {err}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&real_target_path, input.contents.as_bytes())
+            .map_err(|err| format!("Could not write file: {err}"))?;
+    }
+
+    Ok(crate::protocol::ProjectWriteFileResult {
+        relative_path: display_relative_path,
+    })
+}
+
 /// The native folder picker, shared by the Add workspace palette and Ctrl+O.
 pub fn pick_folder(s: &mut State, tx: &mut Tx) {
     if s.machines.selected != "local" {

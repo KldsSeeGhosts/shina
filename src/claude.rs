@@ -131,6 +131,7 @@ fn permission_mode(access: &str) -> &'static str {
     match access {
         "full-access" => "bypassPermissions",
         "auto-accept-edits" => "acceptEdits",
+        "auto" => "auto",
         "read-only" => "dontAsk",
         _ => "default",
     }
@@ -141,10 +142,6 @@ fn read_tool(name: &str) -> bool {
         name,
         "Read" | "Glob" | "Grep" | "LS" | "WebSearch" | "WebFetch" | "TaskOutput"
     )
-}
-
-fn edit_tool(name: &str) -> bool {
-    matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
 }
 
 fn tool_name(name: &str) -> String {
@@ -174,6 +171,31 @@ struct Approval {
     name: String,
     tool_id: Value,
     hook: bool,
+    suggestions: Vec<Value>,
+}
+
+/// KSG ClaudeAdapterV2.claudeUserInputQuestions.
+fn claude_questions(input: &Value) -> Vec<Value> {
+    let input = if input["type"] == "record" {
+        &input["value"]
+    } else {
+        input
+    };
+    input["questions"].as_array().into_iter().flatten().enumerate().filter_map(|(index,q)| {
+        let question = q["question"].as_str()?.trim();
+        if question.is_empty() { return None; }
+        let header = q["header"].as_str().map(str::trim).filter(|s| !s.is_empty())
+            .map(str::to_owned).unwrap_or_else(|| format!("Question {}",index+1));
+        let options: Vec<_> = q["options"].as_array().into_iter().flatten().filter_map(|o| {
+            let label = o["label"].as_str()?.trim();
+            if label.is_empty() { return None; }
+            let description = o["description"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(label);
+            let mut option = json!({"label":label,"description":description});
+            if let Some(preview) = o["preview"].as_str() { option["preview"] = json!(preview); }
+            Some(option)
+        }).collect();
+        Some(json!({"id":question,"header":header,"question":question,"options":options,"multiSelect":q["multiSelect"]==true}))
+    }).collect()
 }
 
 struct Client {
@@ -187,6 +209,7 @@ struct Client {
     serial: usize,
     pending: HashMap<String, Pending>,
     approvals: HashMap<String, Approval>,
+    elicitation_grants: HashSet<String>,
     models: Vec<Value>,
     commands: Vec<Value>,
     model: Value,
@@ -212,6 +235,11 @@ struct Client {
     wire: Vec<Value>,
     events: Vec<Value>,
     usage_limits: Value,
+    active_run_id: Option<String>,
+    settled_run_id: Option<String>,
+    turn_serial: u64,
+    usage_limits_raw: Value,
+    usage_account: Value,
 }
 
 impl Client {
@@ -232,6 +260,7 @@ impl Client {
             serial: 0,
             pending: HashMap::new(),
             approvals: HashMap::new(),
+            elicitation_grants: HashSet::new(),
             models: vec![],
             commands: vec![],
             model: Value::Null,
@@ -255,6 +284,11 @@ impl Client {
             wire: vec![],
             events: vec![],
             usage_limits: Value::Null,
+            active_run_id: None,
+            settled_run_id: None,
+            turn_serial: 0,
+            usage_limits_raw: Value::Null,
+            usage_account: Value::Null,
         }
     }
 
@@ -329,12 +363,23 @@ impl Client {
     fn request(&mut self, request: Value, original: Value) {
         self.serial += 1;
         let id = format!("shina-claude-{}", self.serial);
+        let timeout = if request["subtype"] == "get_context_usage" {
+            Duration::from_secs(2)
+        } else if request["subtype"] == "get_usage" {
+            if self.start.link.is_none() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(5)
+            }
+        } else {
+            Duration::from_secs(30)
+        };
         self.pending.insert(
             id.clone(),
             Pending {
                 original,
                 request: request.clone(),
-                deadline: Instant::now() + Duration::from_secs(30),
+                deadline: Instant::now() + timeout,
             },
         );
         self.wire
@@ -344,6 +389,7 @@ impl Client {
     fn initialize(&mut self) {
         self.request(json!({"subtype":"initialize",
             "forwardSubagentText":true,"forwardNestedSubagentToolCalls":true,
+            "promptSuggestions":self.start.prompt_suggestions,
             "hooks":{"PreToolUse":[{"hookCallbackIds":["shina-policy"],"onFailure":"block","timeout":660}]}
         }), json!({"type":"initialize"}));
     }
@@ -528,6 +574,16 @@ impl Client {
             json!({"commands":self.commands}),
         );
         self.update("awareness", json!(true));
+        if data["account"].is_object() {
+            let mut acct = data["account"].clone();
+            crate::usage_limits::conceal_account_json(&mut acct);
+            self.usage_account = acct;
+            self.update("usageAccount", self.usage_account.clone());
+        }
+        self.request(
+            json!({"subtype":"get_usage","skipBehaviors":true}),
+            json!({"type":"get_usage"}),
+        );
         Ok(())
     }
 
@@ -607,12 +663,27 @@ impl Client {
                             "Claude could not apply the plan's permission mode: {error}"
                         ));
                     }
+                    if matches!(
+                        pending.request["subtype"].as_str(),
+                        Some("get_context_usage" | "get_usage")
+                    ) {
+                        return Ok(());
+                    }
                     self.reject(&pending.original, error);
                     return Ok(());
                 }
                 let data = &response["response"];
                 match pending.request["subtype"].as_str().unwrap_or("") {
                     "initialize" => self.initialized(data)?,
+                    "get_usage" => {
+                        if data.get("rate_limits_available").is_some() {
+                            self.usage_limits_raw = json!({
+                                "checkedAtMs": crate::lifecycle::now(),
+                                "response": data,
+                            });
+                            self.update("usageLimitsRaw", self.usage_limits_raw.clone());
+                        }
+                    }
                     "set_model" => {
                         self.model = self
                             .models
@@ -678,6 +749,18 @@ impl Client {
                         }
                         self.reply(&pending.original, json!({}));
                     }
+                    "get_context_usage" => {
+                        if !self.compacting
+                            && self.usage.is_object()
+                            && let Some(rows) =
+                                crate::context_breakdown::claude_context_breakdown(data)
+                        {
+                            self.usage["breakdown"] = json!(rows);
+                            self.events.push(
+                                json!({"type":"context_usage","data":{"contextUsage":self.usage}}),
+                            );
+                        }
+                    }
                     _ => self.reply(&pending.original, data.clone()),
                 }
             }
@@ -733,6 +816,7 @@ impl Client {
                         "Claude failed: {error}. Sign in with the Claude CLI outside Shina, then retry. No prompt was retried."
                     ));
                 }
+                let was_compacting = self.compacting;
                 if self.compacting {
                     if error.is_none() && !self.cancelling {
                         error = Some(
@@ -758,8 +842,31 @@ impl Client {
                     self.model["contextWindow"] = json!(window);
                 }
                 self.publish_usage();
+                if !self.cancelling
+                    && error.is_none()
+                    && self.usage["tokens"].as_u64().is_some()
+                    && !self
+                        .pending
+                        .values()
+                        .any(|p| p.request["subtype"] == "get_context_usage")
+                {
+                    self.request(
+                        json!({"subtype":"get_context_usage","detail":"summary"}),
+                        json!({"type":"get_context_usage"}),
+                    );
+                }
                 self.running = record["queued_turn_count"].as_u64().unwrap_or(0) > 0;
                 if !self.running {
+                    if !self.cancelling
+                        && error.is_none()
+                        && self.queued.is_empty()
+                        && !was_compacting
+                    {
+                        self.settled_run_id = self.active_run_id.take();
+                    } else {
+                        self.active_run_id = None;
+                        self.settled_run_id = None;
+                    }
                     if let Some(error) = &error {
                         self.events.push(json!({"type":"message_end","message":{
                             "role":"assistant","stopReason":"error","errorMessage":error}}));
@@ -870,6 +977,26 @@ impl Client {
                     crate::usage_limits::claude(&record["rate_limit_info"], &self.usage_limits);
                 self.update("usageLimits", self.usage_limits.clone());
             }
+            "prompt_suggestion" => {
+                if self.start.prompt_suggestions
+                    && !self.running
+                    && let Some(run_id) = self.settled_run_id.as_deref()
+                    && record
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id == run_id)
+                {
+                    let text = record["suggestion"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    self.events.push(json!({
+                        "type": "prompt_suggestion",
+                        "runId": run_id,
+                        "text": text,
+                    }));
+                }
+            }
             "auth_status" if record["error"].is_string() => {
                 return Err(AUTH_ERROR.into());
             }
@@ -884,6 +1011,38 @@ impl Client {
             .as_str()
             .ok_or("Claude request lacks request_id.")?;
         if self.approvals.contains_key(id) {
+            return Ok(());
+        }
+        if request["subtype"] == "elicitation" {
+            let Some(acceptance) = crate::approval::claude_mcp_acceptance(request) else {
+                self.control_reply(id, json!({"action":"decline"}));
+                return Ok(());
+            };
+            let grant_key = format!(
+                "{}\0{}",
+                request["mcp_server_name"].as_str().unwrap_or(""),
+                request["message"].as_str().unwrap_or("")
+            );
+            if self.elicitation_grants.contains(&grant_key) {
+                self.control_reply(id, acceptance);
+            } else if self.cancelling || !self.running {
+                self.control_reply(id, json!({"action":"cancel"}));
+            } else {
+                self.events.push(json!({"type":"extension_ui_request","id":id,"method":"confirm",
+                    "title":request["display_name"].as_str().or(request["title"].as_str()).unwrap_or(request["mcp_server_name"].as_str().unwrap_or("")),
+                    "message":request["message"],"approvalOptions":crate::approval::defaults()}));
+                self.approvals.insert(
+                    id.into(),
+                    Approval {
+                        request_id: id.into(),
+                        input: request.clone(),
+                        name: "__mcp_elicitation".into(),
+                        tool_id: Value::Null,
+                        hook: false,
+                        suggestions: vec![],
+                    },
+                );
+            }
             return Ok(());
         }
         let hook = request["subtype"] == "hook_callback";
@@ -911,6 +1070,10 @@ impl Client {
             name: name.clone(),
             tool_id: data["tool_use_id"].clone(),
             hook,
+            suggestions: data["permission_suggestions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
         };
         if self.cancelling || self.approvals.len() >= 32 {
             self.answer(approval, false, None);
@@ -943,20 +1106,13 @@ impl Client {
                 self.approvals.insert(id.into(), approval);
             }
         } else if name == "AskUserQuestion" {
-            let mut questions = input["questions"].as_array().cloned().unwrap_or_default();
-            if questions.is_empty() || questions.len() > 32 {
+            let questions = claude_questions(&input);
+            if questions.is_empty() {
                 self.answer(approval, false, None);
             } else {
-                for q in &mut questions {
-                    // Claude keys its answers by question text, not header or array index.
-                    q["id"] = q["question"].clone();
-                    if !q["options"].is_array() {
-                        q["options"] = json!([]);
-                    }
-                }
                 self.events.push(
                     json!({"type":"extension_ui_request","id":id,"method":"input",
-                    "title":"Claude needs your input","questions":questions}),
+                    "title":"Claude needs your input","questions":questions,"responseCapability":{"type":"live"}}),
                 );
                 self.approvals.insert(id.into(), approval);
             }
@@ -969,14 +1125,44 @@ impl Client {
         } else if hook {
             // Continue normal CLI permission evaluation; only read-only must override allow rules.
             self.control_reply(id, json!({}));
-        } else if read_tool(&name)
-            || self.access() == "full-access"
-            || self.access() == "auto-accept-edits" && edit_tool(&name)
-        {
-            self.answer(approval, true, None);
         } else {
-            self.events.push(json!({"type":"extension_ui_request","id":id,"method":"confirm",
-                "title":format!("Allow Claude {name}?"),"message":self.redact(&format!("{}\n{input}",data["decision_reason"].as_str().unwrap_or("")))}));
+            // Node util.stripVTControlCharacters, used by KSG's claudeApprovalPresentation.
+            let reason =
+                regex::Regex::new(r"(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\u{009c}))|[\x1b\u{009b}][\[\]()#;?]*(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]")
+                    .expect("constant terminal escape regex")
+                    .replace_all(data["decision_reason"].as_str().unwrap_or(""), "")
+                    .trim()
+                    .to_owned();
+            if name == "Bash"
+                && self.access() == "full-access"
+                && data["matched_ask_rule"].is_null()
+                && (regex::Regex::new(r"(?i)^Dangerous rm(?:dir)?\b")
+                    .expect("constant regex")
+                    .is_match(&reason)
+                    || reason == "This shell -c script runs rm and could not be checked"
+                    || reason == "A permission rule denies a command in this shell -c script")
+            {
+                self.control_reply(id, json!({"behavior":"deny","toolUseID":approval.tool_id,
+                    "message":format!("Claude Code's removal safety check denied this command; the user did not reject it. The command did not run. Do not bypass the check by splitting the removal, putting it in a script, or using another tool or shell. If the warning below supplies a safe rewrite, use it and let the same check evaluate it. Otherwise continue the rest of the task without the removal and tell the user what you needed to delete and why. Warning: {reason}")}));
+                return Ok(());
+            }
+            let mut event = json!({"type":"extension_ui_request","id":id,"method":"confirm",
+                "responseCapability":{"type":"live","supportsFeedback":true},
+                "title":format!("Allow Claude {name}?"),"message":self.redact(&format!("{reason}\n{input}"))});
+            if data["suppress_always_allow_rule"] == true {
+                event["approvalOptions"] = json!([
+                    {"decision":"decline","label":"Decline"},
+                    {"decision":"accept","label":"Approve"}
+                ]);
+            }
+            if self.access() == "full-access" {
+                event["fullAccessOverride"] = json!(if data["matched_ask_rule"].is_null() {
+                    "provider_check"
+                } else {
+                    "ask_rule"
+                });
+            }
+            self.events.push(event);
             self.approvals.insert(id.into(), approval);
         }
         Ok(())
@@ -1011,6 +1197,53 @@ impl Client {
         self.control_reply(&approval.request_id, response);
     }
 
+    fn answer_decision(&mut self, approval: Approval, decision: &str, feedback: Option<&str>) {
+        if approval.name == "__mcp_elicitation" {
+            let response = if matches!(decision, "accept" | "acceptForSession") {
+                if decision == "acceptForSession" {
+                    self.elicitation_grants.insert(format!(
+                        "{}\0{}",
+                        approval.input["mcp_server_name"].as_str().unwrap_or(""),
+                        approval.input["message"].as_str().unwrap_or("")
+                    ));
+                }
+                crate::approval::claude_mcp_acceptance(&approval.input)
+                    .unwrap_or(json!({"action":"decline"}))
+            } else {
+                json!({"action":if decision == "cancel" {"cancel"} else {"decline"}})
+            };
+            self.control_reply(&approval.request_id, response);
+            return;
+        }
+        let allow = matches!(decision, "accept" | "acceptForSession");
+        if approval.hook {
+            self.answer(approval, allow, None);
+            return;
+        }
+        let mut response = if allow {
+            json!({"behavior":"allow","updatedInput":approval.input,"toolUseID":approval.tool_id,
+                "decisionClassification":if decision == "acceptForSession" {"user_permanent"} else {"user_temporary"}})
+        } else {
+            json!({"behavior":"deny","toolUseID":approval.tool_id,"decisionClassification":"user_reject",
+                "message":feedback.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(
+                    if decision == "cancel" {"User cancelled tool execution."} else {"User declined tool execution."})})
+        };
+        if decision == "cancel" {
+            response["interrupt"] = json!(true);
+        }
+        if decision == "acceptForSession" {
+            let mut updates = approval.suggestions;
+            if updates.is_empty() {
+                updates.push(json!({"type":"addRules","rules":[{"toolName":approval.name}],"behavior":"allow"}));
+            }
+            for update in &mut updates {
+                update["destination"] = json!("session");
+            }
+            response["updatedPermissions"] = json!(updates);
+        }
+        self.control_reply(&approval.request_id, response);
+    }
+
     fn command(&mut self, record: Value) -> Result<(), String> {
         let kind = record["type"].as_str().unwrap_or("");
         if kind == "extension_ui_response" {
@@ -1026,8 +1259,8 @@ impl Client {
                         .unwrap_or(Value::Null);
                     let mut input = approval.input.clone();
                     let mut answers = serde_json::Map::new();
-                    for q in input["questions"].as_array().into_iter().flatten() {
-                        if let Some(key) = q["question"].as_str()
+                    for q in claude_questions(&input) {
+                        if let Some(key) = q["id"].as_str()
                             && let Some(value) = supplied.get(key)
                         {
                             let value = value.as_str().map(str::to_owned).unwrap_or_else(|| {
@@ -1061,10 +1294,13 @@ impl Client {
                         self.queue_update();
                     }
                 } else {
-                    let allow = allowed
-                        && record["confirmed"] == true
-                        && (self.access() != "read-only" || read_tool(&approval.name));
-                    self.answer(approval, allow, None);
+                    let decision = crate::approval::decision(&record)?;
+                    let decision = if self.access() == "read-only" && !read_tool(&approval.name) {
+                        "decline"
+                    } else {
+                        decision
+                    };
+                    self.answer_decision(approval, decision, record["feedback"].as_str());
                 }
             }
             return Ok(());
@@ -1190,7 +1426,7 @@ impl Client {
                 record["sentUuids"] = json!(self.sent.keys().collect::<Vec<_>>());
                 self.cancelling = self.running;
                 for (_, approval) in std::mem::take(&mut self.approvals) {
-                    self.answer(approval, false, None);
+                    self.answer_decision(approval, "cancel", None);
                 }
                 self.request(json!({"subtype":"interrupt","cancel_queued":true}), record);
                 if !self.running {
@@ -1209,6 +1445,7 @@ impl Client {
                     let input = json!({"message":format!("/compact {instructions}")});
                     self.compact = Some(record);
                     self.cancelling = false;
+                    self.settled_run_id = None;
                     self.begin_compaction();
                     self.send_input(&input)?;
                 }
@@ -1257,6 +1494,14 @@ impl Client {
         }
         self.cancelling = false;
         if !was_running {
+            self.turn_serial += 1;
+            self.active_run_id = Some(
+                record["runId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("claude-turn-{}", self.turn_serial)),
+            );
+            self.settled_run_id = None;
             self.compact_failure = None;
             self.compact_reported = false;
             self.events.push(json!({"type":"agent_start"}));
@@ -1481,7 +1726,41 @@ impl Client {
             .get("contextWindow")
             .cloned()
             .unwrap_or(Value::Null);
-        self.usage = json!({"tokens":tokens,"contextWindow":window});
+        let preserved_breakdown = self
+            .usage
+            .get("breakdown")
+            .filter(|_| {
+                self.usage["contextWindow"] == window
+                    && tokens.is_some_and(|t| self.usage["tokens"].as_u64().is_some_and(|p| t >= p))
+            })
+            .cloned();
+        let ttl_ms = if self.last_usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(60 * 60_000u64)
+        } else if self.last_usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(5 * 60_000u64)
+        } else {
+            None
+        };
+        let mut usage = json!({
+            "tokens": tokens,
+            "contextWindow": window,
+            "updatedAt": crate::lifecycle::now(),
+        });
+        if let Some(ttl) = ttl_ms {
+            usage["promptCacheTtlMs"] = json!(ttl);
+        }
+        if let Some(breakdown) = preserved_breakdown {
+            usage["breakdown"] = breakdown;
+        }
+        self.usage = usage;
         self.events
             .push(json!({"type":"context_usage","data":{"contextUsage":self.usage}}));
     }
@@ -2180,11 +2459,14 @@ fn run_mode(
             {
                 return Err("Claude stopped reading commands.".into());
             }
-            if client
-                .pending
-                .values()
-                .any(|p| Instant::now() >= p.deadline)
-            {
+            let now = Instant::now();
+            client.pending.retain(|_, p| {
+                !(matches!(
+                    p.request["subtype"].as_str(),
+                    Some("get_context_usage" | "get_usage")
+                ) && now >= p.deadline)
+            });
+            if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
             }
             for record in std::mem::take(&mut client.wire) {
@@ -2198,7 +2480,13 @@ fn run_mode(
                     return Ok(());
                 }
             }
-            if probe && client.ready {
+            if probe
+                && client.ready
+                && !client
+                    .pending
+                    .values()
+                    .any(|p| p.request["subtype"] == "get_usage")
+            {
                 return Ok(());
             }
             for _ in 0..64 {

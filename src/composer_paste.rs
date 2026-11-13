@@ -185,6 +185,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paste_limits_keep_main_heading_task_rule_and_fence_serialization() {
+        for source in [
+            "# Heading",
+            "- [X] Task",
+            "1. Ordered",
+            "~~~rust\nlet x = 1;\n~~~",
+            "---",
+        ] {
+            let mut edit = crate::composer_rich::draft_from_canonical(source);
+            assert_eq!(crate::composer_rich::markdown(&edit), source);
+            assert_eq!(crate::composer_rich::markdown_selection(&edit).0, source);
+            edit.set_selection(edit.text.len(), edit.text.len());
+            let remaining =
+                crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS - source.encode_utf16().count();
+            assert!(
+                !would_exceed_limit(&edit, &"x".repeat(remaining)),
+                "{source}"
+            );
+            assert!(
+                would_exceed_limit(&edit, &"x".repeat(remaining + 1)),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn paste_limit_counts_serialized_markdown_and_selection_boundaries() {
         let mut edit = TextEdit::new(&"x".repeat(119_996));
         edit.set_marks(vec![rune::MarkRange::new(

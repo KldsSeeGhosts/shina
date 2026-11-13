@@ -120,22 +120,32 @@ fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, Stri
 }
 
 /// KSG's runtime modes, with a non-escalating read-only mode for captain homes.
-fn policy(access: &str) -> (&'static str, &'static str, Value) {
+fn policy(access: &str) -> (&'static str, &'static str, &'static str, Value) {
     match access {
         "full-access" => (
             "never",
+            "user",
             "danger-full-access",
             json!({"type":"dangerFullAccess"}),
         ),
-        "auto-accept-edits" => (
+        "auto" => (
             "on-request",
+            "auto_review",
             "workspace-write",
             json!({"type":"workspaceWrite"}),
         ),
-        "read-only" => ("never", "read-only", json!({"type":"readOnly"})),
-        _ => ("untrusted", "read-only", json!({"type":"readOnly"})),
+        "auto-accept-edits" => (
+            "on-request",
+            "user",
+            "workspace-write",
+            json!({"type":"workspaceWrite"}),
+        ),
+        "read-only" => ("never", "user", "read-only", json!({"type":"readOnly"})),
+        _ => ("untrusted", "user", "read-only", json!({"type":"readOnly"})),
     }
 }
+
+const PROMPT_SUGGESTION_PROMPT: &str = "Predict the next message the user will send in this conversation. Reply with only that message, written as the user would type it, in under 20 words. Do not use tools. If there is no clear next step, reply with nothing.";
 
 struct Pending {
     request: Value,
@@ -146,6 +156,27 @@ struct Approval {
     id: Value,
     method: String,
     params: Value,
+}
+
+/// KSG CodexAdapterV2.buildUserInputRequestArtifacts.
+fn codex_questions(questions: &[Value]) -> Vec<Value> {
+    fn nonempty(value: &Value, fallback: &str) -> String {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+            .to_owned()
+    }
+    questions.iter().enumerate().map(|(index,q)| json!({
+        "id":nonempty(&q["id"],&format!("question-{}",index+1)),
+        "header":nonempty(&q["header"],"Question"),
+        "question":nonempty(&q["question"],"Choose an answer."),
+        "options":q["options"].as_array().into_iter().flatten().enumerate().map(|(index,o)| json!({
+            "label":nonempty(&o["label"],&format!("Option {}",index+1)),
+            "description":nonempty(&o["description"],o["label"].as_str().unwrap_or(""))
+        })).collect::<Vec<_>>()
+    })).collect()
 }
 
 struct Client {
@@ -166,6 +197,7 @@ struct Client {
     serial: usize,
     pending: HashMap<String, Pending>,
     approvals: HashMap<String, Approval>,
+    session_allowances: HashSet<String>,
     queued: VecDeque<Value>,
     models: Vec<Value>,
     raw_models: Vec<Value>,
@@ -189,15 +221,22 @@ struct Client {
     turns: Vec<Value>,
     turn_items: Vec<Value>,
     usage_limits: Value,
+    usage_limits_raw: Value,
+    usage_account: Value,
     history_mode: String,
     hydration: Option<(Value, Value)>,
     history_cursors: HashSet<String>,
     child_parents: HashMap<String, String>,
     goal: Value,
+    prompt_suggestions: bool,
+    active_run_id: Option<String>,
+    settled_run_id: Option<String>,
+    turn_serial: u64,
 }
 
 impl Client {
     fn new(start: Start) -> Self {
+        let prompt_suggestions = start.prompt_suggestions;
         Self {
             start,
             session: None,
@@ -216,6 +255,7 @@ impl Client {
             serial: 0,
             pending: HashMap::new(),
             approvals: HashMap::new(),
+            session_allowances: HashSet::new(),
             queued: VecDeque::new(),
             models: vec![],
             raw_models: vec![],
@@ -239,11 +279,17 @@ impl Client {
             turns: vec![],
             turn_items: vec![],
             usage_limits: Value::Null,
+            usage_limits_raw: Value::Null,
+            usage_account: Value::Null,
             history_mode: "legacy".into(),
             hydration: None,
             history_cursors: HashSet::new(),
             child_parents: HashMap::new(),
             goal: Value::Null,
+            prompt_suggestions,
+            active_run_id: None,
+            settled_run_id: None,
+            turn_serial: 0,
         }
     }
 
@@ -257,11 +303,16 @@ impl Client {
     fn request(&mut self, method: &str, params: Value, request: Value) {
         self.serial += 1;
         let id = format!("shina-codex-{}", self.serial);
+        let timeout = if matches!(request["type"].as_str(), Some("rateLimits" | "account")) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
         self.pending.insert(
             id.clone(),
             Pending {
                 request,
-                deadline: Instant::now() + Duration::from_secs(30),
+                deadline: Instant::now() + timeout,
             },
         );
         // app-server omits the JSON-RPC version, exactly as KSG's patched protocol does.
@@ -282,10 +333,10 @@ impl Client {
     /// Supply this on BOTH start and resume. Never overwrite baseInstructions or login.
     fn session_params(&self) -> Value {
         let link = self.start.link.as_ref().expect("MCP required at boundary");
-        let (approval, sandbox, _) = policy(self.access());
+        let (approval, reviewer, sandbox, _) = policy(self.access());
         json!({
             "cwd":self.start.workspace,
-            "approvalPolicy":approval,"approvalsReviewer":"user","sandbox":sandbox,
+            "approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,
             "developerInstructions":developer_instructions(&self.start),
             "config":{
                 "tools.update_plan.enabled":true,
@@ -360,8 +411,8 @@ impl Client {
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
             let error = auth_guidance(&error);
-            if kind == "rateLimits" {
-                // Usage is optional. An older CLI or an API-key account has none to read.
+            if matches!(kind, "rateLimits" | "account") {
+                // Usage and account metadata are optional. An older CLI or API-key account has none.
                 return Ok(());
             }
             if kind == "skills" {
@@ -413,6 +464,9 @@ impl Client {
                 self.reject(&request["original"], error);
                 return Ok(());
             }
+            if kind == "prompt_suggestion" {
+                return Ok(());
+            }
             self.reject(&request, error);
             return Ok(());
         }
@@ -430,9 +484,8 @@ impl Client {
                     json!({"cwds":[self.start.workspace]}),
                     json!({"type":"skills","id":"commands"}),
                 );
-                if self.probe.is_none() {
-                    // Codex pushes rate limits only when they change, so a quiet turn would
-                    // leave the usage block empty. KSG reads them the same way.
+                if self.probe != Some(false) {
+                    self.request("account/read", json!({}), json!({"type":"account"}));
                     self.request(
                         "account/rateLimits/read",
                         Value::Null,
@@ -445,6 +498,12 @@ impl Client {
                     self.ready = true;
                 }
             }
+            "account" => {
+                let mut acct = result.clone();
+                crate::usage_limits::conceal_account_json(&mut acct);
+                self.usage_account = acct;
+                self.events.push(json!({"type":"harness_update","field":"usageAccount","value":self.usage_account}));
+            }
             "rateLimits" => {
                 let read = &result["rateLimitsByLimitId"]["codex"];
                 let read = if read.is_null() {
@@ -454,6 +513,26 @@ impl Client {
                 };
                 self.usage_limits = crate::usage_limits::codex(read, &self.usage_limits);
                 self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
+                let mut raw = json!({
+                    "checkedAtMs": crate::lifecycle::now(),
+                    "snapshot": result["rateLimits"],
+                });
+                if !result["rateLimitsByLimitId"].is_null() {
+                    raw["rateLimitsByLimitId"] = result["rateLimitsByLimitId"].clone();
+                }
+                if !result["rateLimitResetCredits"].is_null() {
+                    raw["rateLimitResetCredits"] = result["rateLimitResetCredits"].clone();
+                }
+                self.usage_limits_raw = raw;
+                self.events.push(json!({"type":"harness_update","field":"usageLimitsRaw","value":self.usage_limits_raw}));
+            }
+            "consume_reset_credit" => {
+                self.reply(&request, result.clone());
+                self.request(
+                    "account/rateLimits/read",
+                    Value::Null,
+                    json!({"type":"rateLimits"}),
+                );
             }
             "skills" => {
                 self.skill_commands =
@@ -663,6 +742,23 @@ impl Client {
                 self.begin_hydration(result.clone(), request)?;
             }
             "steer" => self.reply(&request["original"], json!({})),
+            "prompt_suggestion" => {
+                let req_run_id = request["runId"].as_str();
+                if !self.running
+                    && self.settled_run_id.is_some()
+                    && req_run_id == self.settled_run_id.as_deref()
+                {
+                    let text = result["text"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    self.events.push(json!({
+                        "type": "prompt_suggestion",
+                        "runId": req_run_id,
+                        "text": text,
+                    }));
+                }
+            }
             _ => self.reply(&request, result.clone()),
         }
         Ok(())
@@ -890,10 +986,13 @@ impl Client {
                         .push(json!({"id":approval.id,"result":{"answers":answers}}));
                     return Ok(());
                 }
-                let allow = record["confirmed"] == true
-                    && record["cancelled"] != true
-                    && self.access() != "read-only";
-                self.answer_approval(approval, allow);
+                let decision = crate::approval::decision(&record)?;
+                let decision = if self.access() == "read-only" {
+                    "decline"
+                } else {
+                    decision
+                };
+                self.answer_decision(approval, decision);
             }
             return Ok(());
         }
@@ -1011,9 +1110,9 @@ impl Client {
                         if params["status"] == "active" {
                             // Codex starts a goal turn itself. Apply the current policy/model
                             // first, natively, so it cannot reuse a stale, broader turn policy.
-                            let (approval, _, sandbox) = policy(self.access());
+                            let (approval, reviewer, _, sandbox) = policy(self.access());
                             let mut settings = json!({"threadId":self.session,"cwd":self.start.workspace,
-                                "approvalPolicy":approval,"approvalsReviewer":"user","sandboxPolicy":sandbox});
+                                "approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":sandbox});
                             if let Some(model) = self.model["id"].as_str() {
                                 settings["model"] = json!(model);
                             }
@@ -1123,6 +1222,10 @@ impl Client {
                         .push(json!({"type":"agent_settled","aborted":true}));
                 }
             }
+            "set_prompt_suggestions" => {
+                self.prompt_suggestions = record["enabled"] == true;
+                self.reply(&record, json!({}));
+            }
             "prompt" if self.running => {
                 // KSG uses turn/steer with expectedTurnId. Follow-ups retain FIFO ordering.
                 if record["streamingBehavior"] == "steer"
@@ -1205,6 +1308,18 @@ impl Client {
                 }
                 _ => self.reply(&record, json!({})),
             },
+            "consume_reset_credit" => {
+                let idempotency_key = record["idempotencyKey"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.request(
+                    "account/rateLimitResetCredit/consume",
+                    json!({"idempotencyKey": idempotency_key}),
+                    record,
+                );
+            }
             _ => self.reject(&record, format!("Codex does not support {kind} in Shina.")),
         }
         Ok(())
@@ -1221,9 +1336,9 @@ impl Client {
             self.service_tier = Some(tier.into());
         }
         let input = codex_input(&record)?;
-        let (approval, _, sandbox) = policy(self.access());
+        let (approval, reviewer, _, sandbox) = policy(self.access());
         let mut params = json!({"threadId":self.session,"cwd":self.start.workspace,
-            "input":input,"approvalPolicy":approval,"approvalsReviewer":"user",
+            "input":input,"approvalPolicy":approval,"approvalsReviewer":reviewer,
             "sandboxPolicy":sandbox,"summary":"detailed"});
         if let Some(model) = self.model["id"].as_str() {
             params["model"] = json!(model);
@@ -1238,6 +1353,14 @@ impl Client {
         self.cancelling = false;
         self.interrupt_sent = false;
         self.turn = None;
+        self.turn_serial += 1;
+        self.active_run_id = Some(
+            record["runId"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("codex-turn-{}", self.turn_serial)),
+        );
+        self.settled_run_id = None;
         self.events.push(json!({"type":"agent_start"}));
         self.request("turn/start", params, record);
         Ok(())
@@ -1250,29 +1373,45 @@ impl Client {
     }
 
     fn server_request(&mut self, method: &str, record: &Value) {
+        if method == "mcpServer/elicitation/request" {
+            let params = &record["params"];
+            if crate::approval::mcp_response(params, "accept")["action"] != "accept"
+                || !self.running
+                || params["turnId"].as_str() != self.turn.as_deref()
+            {
+                self.wire
+                    .push(json!({"id":record["id"],"result":{"action":"decline"}}));
+                return;
+            }
+            self.serial += 1;
+            let key = format!("codex-elicitation-{}", self.serial);
+            self.events.push(
+                json!({"type":"extension_ui_request","id":key,"method":"confirm",
+                "title":crate::approval::mcp_app_name(params),"message":params["message"],
+                "approvalOptions":crate::approval::mcp_options(params)}),
+            );
+            self.approvals.insert(
+                key,
+                Approval {
+                    id: record["id"].clone(),
+                    method: method.into(),
+                    params: params.clone(),
+                },
+            );
+            return;
+        }
         if method == "item/tool/requestUserInput" {
             let questions = record["params"]["questions"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            if questions.is_empty()
-                || questions.len() > 32
-                || questions.iter().any(|q| q["isSecret"] == true)
-            {
+            if questions.is_empty() {
                 self.wire
                     .push(json!({"id":record["id"],"error":{"code":-32602,
                     "message":"Shina supports up to 32 non-secret questions."}}));
                 return;
             }
-            let questions: Vec<_> = questions
-                .into_iter()
-                .map(|mut q| {
-                    if !q["options"].is_array() {
-                        q["options"] = json!([]);
-                    }
-                    q
-                })
-                .collect();
+            let questions = codex_questions(&questions);
             if self.cancelling || self.approvals.len() >= 32 {
                 self.wire
                     .push(json!({"id":record["id"],"result":{"answers":{}}}));
@@ -1289,7 +1428,7 @@ impl Client {
                 );
                 self.events.push(
                     json!({"type":"extension_ui_request","id":key,"method":"input",
-                    "title":"Codex needs your input","questions":questions}),
+                    "title":"Codex needs your input","questions":questions,"responseCapability":{"type":"live"}}),
                 );
             }
             return;
@@ -1299,6 +1438,8 @@ impl Client {
             "item/commandExecution/requestApproval"
                 | "item/fileChange/requestApproval"
                 | "item/permissions/requestApproval"
+                | "execCommandApproval"
+                | "applyPatchApproval"
         ) {
             let approval = Approval {
                 id: record["id"].clone(),
@@ -1307,6 +1448,11 @@ impl Client {
             };
             if self.access() == "read-only" || self.cancelling || self.approvals.len() >= 32 {
                 self.answer_approval(approval, false);
+            } else if self
+                .session_allowances
+                .contains(Self::approval_kind(method))
+            {
+                self.answer_decision(approval, "acceptForSession");
             } else if self.access() == "full-access"
                 || self.access() == "auto-accept-edits"
                     && method == "item/fileChange/requestApproval"
@@ -1333,12 +1479,43 @@ impl Client {
     }
 
     fn answer_approval(&mut self, approval: Approval, allow: bool) {
-        let result = if approval.method == "item/tool/requestUserInput" {
+        self.answer_decision(approval, if allow { "accept" } else { "decline" });
+    }
+
+    fn approval_kind(method: &str) -> &'static str {
+        match method {
+            "item/fileChange/requestApproval" | "applyPatchApproval" => "file-change",
+            "item/permissions/requestApproval" => "permission",
+            _ => "command",
+        }
+    }
+
+    fn answer_decision(&mut self, approval: Approval, decision: &str) {
+        if matches!(decision, "acceptForSession" | "acceptAlways")
+            && Self::approval_kind(&approval.method) != "permission"
+        {
+            self.session_allowances
+                .insert(Self::approval_kind(&approval.method).into());
+        }
+        let result = if approval.method == "mcpServer/elicitation/request" {
+            crate::approval::mcp_response(&approval.params, decision)
+        } else if approval.method == "item/tool/requestUserInput" {
             json!({"answers":{}})
         } else if approval.method == "item/permissions/requestApproval" {
-            json!({"permissions":if allow {approval.params["permissions"].clone()} else {json!({})},"scope":"turn"})
+            json!({"permissions":if matches!(decision,"accept" | "acceptForSession") {approval.params["permissions"].clone()} else {json!({})},
+                "scope":if decision == "acceptForSession" {"session"} else {"turn"}})
+        } else if matches!(
+            approval.method.as_str(),
+            "execCommandApproval" | "applyPatchApproval"
+        ) {
+            json!({"decision":match decision {
+                "accept" => json!("approved"),
+                "acceptForSession" | "acceptAlways" => json!("approved_for_session"),
+                "cancel" => json!("abort"),
+                _ => json!({"denied":{"rejection":"User declined the request."}}),
+            }})
         } else {
-            json!({"decision":if allow {"accept"} else {"decline"}})
+            json!({"decision":if decision == "acceptAlways" {"acceptForSession"} else {decision}})
         };
         self.wire.push(json!({"id":approval.id,"result":result}));
     }
@@ -1421,6 +1598,23 @@ impl Client {
                 self.usage_limits =
                     crate::usage_limits::codex(&params["rateLimits"], &self.usage_limits);
                 self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
+                let update = &params["rateLimits"];
+                if update["limitId"].as_str().is_none_or(|id| id == "codex") {
+                    if !self.usage_limits_raw.is_object() {
+                        self.usage_limits_raw = json!({"snapshot": {}});
+                    }
+                    self.usage_limits_raw["checkedAtMs"] = json!(crate::lifecycle::now());
+                    if let Some(target) = self.usage_limits_raw["snapshot"].as_object_mut()
+                        && let Some(src) = update.as_object()
+                    {
+                        for (k, v) in src {
+                            target.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        self.usage_limits_raw["snapshot"] = update.clone();
+                    }
+                    self.events.push(json!({"type":"harness_update","field":"usageLimitsRaw","value":self.usage_limits_raw}));
+                }
             }
             "thread/goal/updated" => {
                 self.goal = params["goal"].clone();
@@ -1490,6 +1684,11 @@ impl Client {
                         self.item(item, true, true);
                     }
                 }
+                let was_compacting = self.compacting;
+                let turn_id = turn["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| self.turn.clone());
                 if self.compacting {
                     self.end_compaction(self.compaction_outcome(turn), true);
                 }
@@ -1517,6 +1716,28 @@ impl Client {
                 self.running = false;
                 self.turn = None;
                 self.cancelling = false;
+                if !aborted && !failed && !was_compacting && self.queued.is_empty() {
+                    let run_id = self.active_run_id.take().or_else(|| turn_id.clone());
+                    self.settled_run_id = run_id.clone();
+                    if self.prompt_suggestions
+                        && let (Some(run_id), Some(turn_id), Some(session_id)) =
+                            (run_id, turn_id, self.session.clone())
+                    {
+                        self.request(
+                            "thread/sample",
+                            json!({
+                                "threadId": session_id,
+                                "expectedTurnId": turn_id,
+                                "prompt": PROMPT_SUGGESTION_PROMPT,
+                                "effort": "low",
+                            }),
+                            json!({"type": "prompt_suggestion", "runId": run_id}),
+                        );
+                    }
+                } else {
+                    self.active_run_id = None;
+                    self.settled_run_id = None;
+                }
                 self.events
                     .push(json!({"type":"agent_settled","aborted":aborted}));
                 if !aborted
@@ -1661,6 +1882,22 @@ impl Client {
                 }
             }
             "agentMessage" if done => {
+                if emit
+                    && item["delivery"] == "async"
+                    && item["questions"].as_array().is_some_and(|q| !q.is_empty())
+                {
+                    let questions: Vec<_> = item["questions"].as_array().unwrap().iter().enumerate()
+                        .map(|(index,q)| json!({"id":index.to_string(),"header":"Question",
+                            "question":q["title"],"options":q["options"].as_array().into_iter().flatten()
+                                .map(|label| json!({"label":label,"description":""})).collect::<Vec<_>>()})).collect();
+                    self.events.push(
+                        json!({"type":"extension_ui_request","id":format!("async:{id}"),
+                        "method":"input","questions":codex_questions(&questions),
+                        "responseMode":"message","responseCapability":{"type":"message"}}),
+                    );
+                    // Async questions are request items, not duplicated final-answer messages.
+                    return;
+                }
                 if emit {
                     self.begin_message(id);
                 }
@@ -2221,11 +2458,14 @@ fn run_mode(
                     pending.deadline = Instant::now() + Duration::from_secs(30);
                 }
             }
-            if client
-                .pending
-                .values()
-                .any(|p| Instant::now() >= p.deadline)
-            {
+            let now = Instant::now();
+            client.pending.retain(|_, p| {
+                !(matches!(
+                    p.request["type"].as_str(),
+                    Some("prompt_suggestion" | "rateLimits" | "account")
+                ) && now >= p.deadline)
+            });
+            if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Codex did not acknowledge an operation within 30 seconds.".into());
             }
             for record in std::mem::take(&mut client.wire) {

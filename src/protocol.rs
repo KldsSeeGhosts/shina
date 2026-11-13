@@ -3,7 +3,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 11;
+pub const MINOR: u32 = 21;
+pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
+pub const VCS_WORKTREES_MINOR: u32 = 20;
+pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
+pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to use branches and worktrees.";
+pub const FRESH_CONTEXT: &str = "fresh-context";
+pub const USAGE_LIMITS: &str = "usage-limits";
+pub const PROJECT_WRITE_FILE: &str = "project-write-file";
+pub const QUESTION_DISMISS: &str = "question-dismiss-v1";
+pub const QUESTION_DISMISS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to dismiss questions.";
+pub const QUESTION_ATTACHMENTS: &str = "question-attachments-v1";
+pub const QUESTION_ATTACHMENTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to attach files to answers.";
+pub const QUESTION_CONTRACT: &str = "question-contract-v1";
+pub const QUESTIONS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer these questions.";
+pub const APPROVAL_FEEDBACK: &str = "approval-feedback-v1";
+pub const APPROVAL_FEEDBACK_UPDATE_REQUIRED: &str = "Update required. Update Shina on the client and server to send approval feedback or redirect pending approvals.";
+pub const COMPOSER_REQUESTS: &str = "composer-requests-v1";
+pub const REQUESTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer composer requests.";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
@@ -134,6 +156,20 @@ pub struct FolderListing {
     pub target_exists: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWriteFileInput {
+    pub cwd: String,
+    pub relative_path: String,
+    pub contents: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWriteFileResult {
+    pub relative_path: String,
+}
+
 /// Every routed method has an explicit grant. Unknown methods fail closed.
 pub fn method_grant(method: &str) -> Option<&'static str> {
     Some(match method {
@@ -147,8 +183,12 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "command.get"
         | "server.status"
         | "blobs.read"
-        | "filesystem.browse" => "read",
-        "request.respond" => "approve",
+        | "filesystem.browse"
+        | "usage.limits"
+        | "vcs.listBranches"
+        | "vcs.status"
+        | "vcs.listWorktrees" => "read",
+        "request.respond" | "thread.user-input.dismiss" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "peer.link"
@@ -184,6 +224,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.fork"
         | "thread.rewind"
         | "thread.forkPoints"
+        | "thread.worktreeSetup"
         | "settings.autoSettle"
         | "settings.defaultHarness"
         | "settings.threadDefaults"
@@ -216,7 +257,11 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "task.delegate"
         | "task.send"
         | "task.cancel"
-        | "uploads.write" => "operate",
+        | "project.writeFile"
+        | "uploads.write"
+        | "vcs.createWorktree"
+        | "vcs.removeWorktree"
+        | "vcs.runSetup" => "operate",
         _ => return None,
     })
 }
@@ -403,6 +448,14 @@ pub fn text_page_revision(text: &str, revision: &str, params: &Value) -> Result<
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadEnvMode {
+    #[default]
+    Local,
+    Worktree,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendInput {
@@ -416,6 +469,16 @@ pub struct SendInput {
     pub draft: Option<Value>,
     #[serde(default)]
     pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_context: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_before_send: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_mode: Option<ThreadEnvMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_from_origin: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -581,7 +644,11 @@ mod tests {
                 | "command.get"
                 | "server.status"
                 | "blobs.read"
-                | "filesystem.browse" => "read",
+                | "filesystem.browse"
+                | "usage.limits"
+                | "vcs.listBranches"
+                | "vcs.status"
+                | "vcs.listWorktrees" => "read",
                 "request.respond" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

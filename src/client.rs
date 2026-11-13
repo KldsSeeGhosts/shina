@@ -82,6 +82,70 @@ impl Commands {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionPhase {
+    Available,
+    Connecting,
+    Reconnecting,
+    Error,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    Outdated,
+    AuthDenied,
+    Timeout,
+    Refused,
+    Dns,
+    InvalidResponse,
+    ServerNotAnswering,
+}
+
+impl FailureKind {
+    fn from_error(error: &str) -> Self {
+        if error.contains("mismatch") || error.contains("older") {
+            Self::Outdated
+        } else if error.contains("Authentication denied") || error.contains("handshake refused") {
+            Self::AuthDenied
+        } else if error.contains("timed out") {
+            Self::Timeout
+        } else if error.contains("did not resolve") {
+            Self::Dns
+        } else if error.contains("refused") {
+            Self::Refused
+        } else if error.contains("Invalid")
+            || error.contains("unexpected")
+            || error.contains("closed before hello")
+        {
+            Self::InvalidResponse
+        } else {
+            Self::ServerNotAnswering
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionState {
+    pub phase: ConnectionPhase,
+    pub attempt: u32,
+    pub attempt_seq: u64,
+    pub last_failure: Option<FailureKind>,
+    pub last_error: Option<String>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            phase: ConnectionPhase::Offline,
+            attempt: 0,
+            attempt_seq: 0,
+            last_failure: None,
+            last_error: None,
+        }
+    }
+}
+
 pub enum Event {
     Receipt(Command, Value),
     Rpc {
@@ -94,6 +158,7 @@ pub enum Event {
 
 pub struct Client {
     pub remote: Option<crate::peer::Link>,
+    enabled: bool,
     pub linked: std::collections::BTreeMap<String, Client>,
     directory: PathBuf,
     device_directory: PathBuf,
@@ -105,6 +170,9 @@ pub struct Client {
     snapshot: Arc<Mutex<Option<Value>>>,
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
+    worker_finished: Arc<AtomicBool>,
+    retry_notify: Arc<tokio::sync::Notify>,
+    connection: Arc<Mutex<ConnectionState>>,
     history_thread: Arc<AtomicUsize>,
     history_requests: Arc<Mutex<VecDeque<HistoryRequest>>>,
     rpc_requests: Arc<Mutex<VecDeque<(String, String, Value)>>>,
@@ -114,7 +182,98 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn test_commands(&mut self) -> tokio::sync::mpsc::Receiver<Command> {
         self.commands.ready.store(true, Ordering::Release);
+        *self.connection.lock().expect("connection state") = ConnectionState {
+            phase: ConnectionPhase::Available,
+            attempt: 0,
+            attempt_seq: 0,
+            last_failure: None,
+            last_error: None,
+        };
         self.input.take().expect("unused test client")
+    }
+    #[cfg(test)]
+    pub(crate) fn set_test_connection_state(&self, state: ConnectionState) {
+        *self.connection.lock().expect("connection state") = state;
+    }
+    pub fn connection_state(&self) -> ConnectionState {
+        self.connection.lock().expect("connection state").clone()
+    }
+    pub fn connection_state_for(&self, server: &str) -> Option<ConnectionState> {
+        if server == "local" {
+            Some(self.connection_state())
+        } else {
+            self.linked.get(server).map(Client::connection_state)
+        }
+    }
+    pub fn enabled(&self) -> bool {
+        self.remote
+            .as_ref()
+            .map_or(self.enabled, |link| link.enabled)
+    }
+    pub fn set_enabled(&mut self, enabled: bool, wake: rune::Waker) -> Result<(), String> {
+        if let Some(link) = &self.remote {
+            let mut updated = link.clone();
+            updated.enabled = enabled;
+            updated.save(&self.directory)?;
+            self.remote = Some(updated);
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.shutdown();
+            self.commands.ready.store(false, Ordering::Release);
+            *self.connection.lock().expect("connection state") = ConnectionState::default();
+            return Ok(());
+        }
+        let running = self.worker.lock().expect("client worker").is_some()
+            && !self.worker_finished.load(Ordering::Acquire);
+        if running {
+            let _ = self.retry_now();
+        } else {
+            self.shutdown();
+            if self.input.is_none() {
+                let (sender, input) = tokio::sync::mpsc::channel(32);
+                let (output, events) = mpsc::sync_channel(64);
+                self.commands = Commands {
+                    sender,
+                    ready: Arc::default(),
+                };
+                self.input = Some(input);
+                self.output = output;
+                self.events = events;
+            }
+            self.stop.store(false, Ordering::Release);
+            self.worker_finished.store(false, Ordering::Release);
+            {
+                let mut state = self.connection.lock().expect("connection state");
+                state.phase = ConnectionPhase::Connecting;
+                state.attempt = 0;
+                state.attempt_seq = state.attempt_seq.saturating_add(1);
+                state.last_failure = None;
+                state.last_error = None;
+            }
+            self.start(wake);
+        }
+        Ok(())
+    }
+    pub fn retry_now(&self) -> Result<(), String> {
+        let mut state = self.connection.lock().expect("connection state");
+        if self.worker_finished.load(Ordering::Acquire)
+            || self.worker.lock().expect("client worker").is_none()
+        {
+            return Err(state
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Server connection is offline.".into()));
+        }
+        state.phase = if state.attempt == 0 && state.last_failure.is_none() {
+            ConnectionPhase::Connecting
+        } else {
+            ConnectionPhase::Reconnecting
+        };
+        state.attempt_seq = state.attempt_seq.saturating_add(1);
+        drop(state);
+        self.retry_notify.notify_one();
+        Ok(())
     }
     #[cfg(test)]
     pub(crate) fn test_snapshot(&self, projection: Value) {
@@ -138,6 +297,7 @@ impl Client {
         Self {
             info: Arc::default(),
             remote: None,
+            enabled: true,
             linked: Default::default(),
             device_directory: directory.clone(),
             directory,
@@ -151,6 +311,9 @@ impl Client {
             snapshot: Arc::default(),
             stop: Arc::default(),
             worker: Arc::default(),
+            worker_finished: Arc::default(),
+            retry_notify: Arc::default(),
+            connection: Arc::default(),
             history_thread: Arc::default(),
             history_requests: Arc::default(),
             rpc_requests: Arc::default(),
@@ -160,6 +323,9 @@ impl Client {
         self.device_directory = directory;
     }
     pub fn start(&mut self, wake: rune::Waker) {
+        if !self.enabled() {
+            return;
+        }
         if self.remote.is_none() {
             match crate::peer::Link::load_all(&self.directory) {
                 Ok(links) => {
@@ -181,11 +347,15 @@ impl Client {
         let snapshot = self.snapshot.clone();
         let stop = self.stop.clone();
         let ready = self.commands.ready.clone();
+        let worker_finished = self.worker_finished.clone();
+        let retry_notify = self.retry_notify.clone();
+        let connection = self.connection.clone();
         let history_thread = self.history_thread.clone();
         let history_requests = self.history_requests.clone();
         let rpc_requests = self.rpc_requests.clone();
         let remote = self.remote.clone();
         let info = self.info.clone();
+        worker_finished.store(false, Ordering::Release);
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
             #[cfg(test)]
             let test_directory = directory.clone();
@@ -209,6 +379,9 @@ impl Client {
                     snapshot,
                     stop,
                     ready,
+                    worker_finished,
+                    retry_notify,
+                    connection,
                     wake,
                 ))
             };
@@ -228,8 +401,12 @@ impl Client {
             .device_directory
             .join("linked-views")
             .join(&link.server_id);
+        client.enabled = link.enabled;
+        let enabled = link.enabled;
         client.remote = Some(link.clone());
-        client.start(wake);
+        if enabled {
+            client.start(wake);
+        }
         self.linked.insert(link.server_id, client);
     }
     pub fn commands_for(&self, server: &str) -> Option<&Commands> {
@@ -245,7 +422,9 @@ impl Client {
             views.push(("local".into(), value));
         }
         for (id, client) in &self.linked {
-            if let Some(value) = client.snapshot() {
+            if client.enabled()
+                && let Some(value) = client.snapshot()
+            {
                 views.push((id.clone(), value));
             }
         }
@@ -279,6 +458,83 @@ impl Client {
         info.lock().expect("connection info")["capabilities"]
             .as_array()
             .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
+    }
+    pub fn can_approve(&self, server: &str) -> bool {
+        let info = if server == "local" {
+            &self.info
+        } else if let Some(remote) = self.linked.get(server) {
+            &remote.info
+        } else {
+            return false;
+        };
+        info.lock().expect("connection info")["canApprove"] == true
+    }
+    pub fn can_operate(&self, server: &str) -> bool {
+        let info = if server == "local" {
+            &self.info
+        } else if let Some(remote) = self.linked.get(server) {
+            &remote.info
+        } else {
+            return false;
+        };
+        info.lock().expect("connection info")["canOperate"] == true
+    }
+
+    /// Sends attachments already prepared by the composer transaction, without a second upload.
+    pub(crate) fn send_prepared(
+        &self,
+        command: Command,
+        wake: rune::Waker,
+    ) -> Result<uuid::Uuid, String> {
+        if !self.commands.connected() {
+            return Err("This machine is disconnected. Your draft was kept.".into());
+        }
+        let Some(link) = self.remote.clone() else {
+            return self.commands.send(&command.method, command.params);
+        };
+        let id = command.command_id;
+        let output = self.output.clone();
+        let stop = self.stop.clone();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        let mut attempt = 0;
+                        loop {
+                            if stop.load(Ordering::Acquire) {
+                                break Err("The client stopped before the send completed.".into());
+                            }
+                            match remote_request_outcome(&link, command.clone(), false).await {
+                                Ok(RemoteResponse::Receipt(result)) => break Ok(result),
+                                Ok(RemoteResponse::Refused(error)) => break Err(error),
+                                Err(error)
+                                    if stop.load(Ordering::Acquire)
+                                        || error.starts_with("Authentication denied.")
+                                        || error.starts_with("Server handshake refused")
+                                        || error.contains("Update required") =>
+                                {
+                                    break Err(error);
+                                }
+                                Err(_) => {
+                                    // The same UUID reaches the durable receipt store on every retry.
+                                    tokio::time::sleep(restart_delay(attempt)).await;
+                                    attempt = attempt.saturating_add(1);
+                                }
+                            }
+                        }
+                    })
+                });
+            let value = match result {
+                Ok(result) => json!({"result":result}),
+                Err(error) => json!({"error":{"message":error}}),
+            };
+            let _ = output.send(Event::Receipt(command, value));
+            wake();
+        });
+        Ok(id)
     }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
@@ -530,6 +786,9 @@ async fn supervise(
     snapshot: Arc<Mutex<Option<Value>>>,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    worker_finished: Arc<AtomicBool>,
+    retry_notify: Arc<tokio::sync::Notify>,
+    connection: Arc<Mutex<ConnectionState>>,
     wake: rune::Waker,
 ) {
     let (directory, device_directory, history_thread, history_requests, rpc_requests, remote) =
@@ -562,6 +821,7 @@ async fn supervise(
     let mut child: Option<Child> = None;
     let mut pending = VecDeque::<Command>::new();
     let mut attempt = 0;
+    let mut was_connected = false;
     let mut next_spawn = Instant::now();
     let mut owned_instance = None;
     let mut socket: Option<Socket> = None;
@@ -644,17 +904,33 @@ async fn supervise(
                 .map(Ok)
                 .unwrap_or_else(|| Discovery::read(&directory));
             if let Ok(discovery) = discovery {
+                {
+                    let mut state = connection.lock().expect("connection state");
+                    state.phase = if attempt == 0 && !was_connected {
+                        ConnectionPhase::Connecting
+                    } else {
+                        ConnectionPhase::Reconnecting
+                    };
+                    state.attempt = attempt;
+                    state.attempt_seq = state.attempt_seq.saturating_add(1);
+                }
+                wake();
                 match tokio::select! {
                     result = connect(&discovery, &device, &device_directory, &cache, true, remote.as_ref()) => result,
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"canOperate":hello["canOperate"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
                         wake();
                         if let Err(error) = cache.reconnect(&hello) {
+                            let mut state = connection.lock().expect("connection state");
+                            state.phase = ConnectionPhase::Error;
+                            state.last_failure = Some(FailureKind::from_error(&error));
+                            state.last_error = Some(error.clone());
+                            drop(state);
                             report(error);
                             break;
                         }
@@ -670,6 +946,19 @@ async fn supervise(
                         } else {
                             None
                         };
+                        pending.retain(|command| {
+                            if command.method == "thread.user-input.dismiss"
+                                && !hello["capabilities"].as_array().is_some_and(|caps| {
+                                    caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS)
+                                })
+                            {
+                                let _ = output.try_send(Event::Receipt(command.clone(), json!({"error":{"message":protocol::QUESTION_DISMISS_UPDATE_REQUIRED}})));
+                                wake();
+                                false
+                            } else {
+                                true
+                            }
+                        });
                         for command in &pending {
                             match uploaded_command_capabilities(
                                 command,
@@ -701,6 +990,12 @@ async fn supervise(
                                 }
                                 Err(error) => {
                                     if error.starts_with("Authentication denied.") {
+                                        let mut state =
+                                            connection.lock().expect("connection state");
+                                        state.phase = ConnectionPhase::Error;
+                                        state.last_failure = Some(FailureKind::AuthDenied);
+                                        state.last_error = Some(error.clone());
+                                        drop(state);
                                         report(error);
                                         break 'supervisor;
                                     }
@@ -712,6 +1007,7 @@ async fn supervise(
                         if sent {
                             socket = Some(connected);
                             attempt = 0;
+                            was_connected = true;
                             continue;
                         }
                     }
@@ -720,18 +1016,33 @@ async fn supervise(
                             || error.contains("mismatch")
                             || error.contains("handshake refused") =>
                     {
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Error;
+                        state.last_failure = Some(FailureKind::from_error(&error));
+                        state.last_error = Some(error.clone());
+                        drop(state);
                         report(error);
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         next_spawn = Instant::now() + restart_delay(attempt);
                         attempt = attempt.saturating_add(1);
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Reconnecting;
+                        state.attempt = attempt;
+                        state.last_failure = Some(FailureKind::from_error(&error));
+                        state.last_error = Some(error);
+                        drop(state);
+                        wake();
                     }
                 }
             }
             if remote.is_some() {
                 tokio::select! {
                     _ = tokio::time::sleep(next_spawn.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))) => {},
+                    _ = retry_notify.notified() => {
+                        next_spawn = Instant::now();
+                    },
                     _ = stopped(&stop) => break,
                 }
                 continue;
@@ -755,13 +1066,59 @@ async fn supervise(
                     ),
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                _ = retry_notify.notified() => {
+                    next_spawn = Instant::now();
+                },
+                _ = stopped(&stop) => break,
+            }
             continue;
         }
         let connected = socket.as_mut().expect("connected");
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.method == "thread.user-input.dismiss"
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTION_DISMISS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.params["questionAttachments"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_ATTACHMENTS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.params["questionContract"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_CONTRACT))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTIONS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.method == "request.respond" && command.params["response"].get("feedback").is_some()
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::APPROVAL_FEEDBACK))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
+                if command.params["requestContract"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_REQUESTS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::REQUESTS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if matches!(command.method.as_str(), "queue.update" | "queue.returnDraft")
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_TRANSACTIONS))
@@ -854,7 +1211,15 @@ async fn supervise(
                                 let phase = cache.maintenance["phase"].as_str().unwrap_or("ready");
                                 server_stopped |= phase == "stopping";
                                 updating |= phase == "restarting";
-                                ready.store(cache.seq.is_some() && phase == "ready",Ordering::Release);
+                                let is_ready = cache.seq.is_some() && phase == "ready";
+                                ready.store(is_ready, Ordering::Release);
+                                if is_ready {
+                                    let mut state = connection.lock().expect("connection state");
+                                    state.phase = ConnectionPhase::Available;
+                                    state.attempt = 0;
+                                    state.last_failure = None;
+                                    state.last_error = None;
+                                }
                             }
                             if let Some(id) = value["id"].as_str()
                                 && let Some(tag) = pending_rpcs.remove(id)
@@ -884,7 +1249,15 @@ async fn supervise(
                     }
                     Some(Ok(Message::Ping(payload))) => { if !send(connected, Message::Pong(payload)).await { socket = None; } }
                     Some(Ok(Message::Pong(_))) => {}
-                    _ => { socket = None; report("Server disconnected. Reconnecting with the same command IDs.".into()); }
+                    _ => {
+                        socket = None;
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Reconnecting;
+                        state.last_failure = Some(FailureKind::ServerNotAnswering);
+                        state.last_error = Some("Server disconnected.".into());
+                        drop(state);
+                        report("Server disconnected. Reconnecting with the same command IDs.".into());
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
@@ -925,6 +1298,14 @@ async fn supervise(
         }
     }
     ready.store(false, Ordering::Release);
+    worker_finished.store(true, Ordering::Release);
+    {
+        let mut state = connection.lock().expect("connection state");
+        if state.phase != ConnectionPhase::Error {
+            state.phase = ConnectionPhase::Offline;
+        }
+    }
+    wake();
     if let Some(job) = image_job {
         job.abort();
     }
@@ -1406,7 +1787,6 @@ pub(crate) fn downgrade_composer_context_command(
     command
 }
 
-#[cfg(test)]
 pub(crate) async fn uploaded_command(
     command: &Command,
     remote: Option<&crate::peer::Link>,
@@ -1727,6 +2107,7 @@ fn local_upload_link(
         return None;
     }
     Some(crate::peer::Link {
+        enabled: true,
         server_id: discovery.server_id,
         host: format!("127.0.0.1:{}", discovery.port),
         device_id: saved["deviceId"].as_str()?.into(),
@@ -1867,8 +2248,38 @@ async fn remote_request(
     command: Command,
     peer: bool,
 ) -> Result<Value, String> {
+    match remote_request_outcome(link, command, peer).await? {
+        RemoteResponse::Receipt(value) => Ok(value),
+        RemoteResponse::Refused(error) => Err(error),
+    }
+}
+
+enum RemoteResponse {
+    Receipt(Value),
+    Refused(String),
+}
+
+async fn remote_request_outcome(
+    link: &crate::peer::Link,
+    command: Command,
+    peer: bool,
+) -> Result<RemoteResponse, String> {
     let timeout = if command.method == "peer.thread.wait" {
         58
+    } else if command.method == "request.respond" && command.params["questionAttachments"] == true {
+        let files = command.params["attachmentsByQuestionId"]
+            .as_object()
+            .into_iter()
+            .flat_map(|map| map.values())
+            .filter_map(Value::as_array)
+            .map(Vec::len)
+            .sum::<usize>();
+        8 + 16 * files as u64
+    } else if matches!(
+        command.method.as_str(),
+        "vcs.createWorktree" | "vcs.removeWorktree" | "vcs.runSetup"
+    ) {
+        120
     } else {
         8
     };
@@ -1891,7 +2302,36 @@ async fn remote_request(
         )
         .await?;
         if command.method == "hello" {
-            return Ok(hello);
+            return Ok(RemoteResponse::Receipt(hello));
+        }
+        if command.method == "thread.user-input.dismiss"
+            && !hello["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS))
+        {
+            return Ok(RemoteResponse::Refused(
+                protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into(),
+            ));
+        }
+        for (marker, capability, error) in [
+            (
+                "questionContract",
+                protocol::QUESTION_CONTRACT,
+                protocol::QUESTIONS_UPDATE_REQUIRED,
+            ),
+            (
+                "questionAttachments",
+                protocol::QUESTION_ATTACHMENTS,
+                protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED,
+            ),
+        ] {
+            if command.params[marker] == true
+                && !hello["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == capability))
+            {
+                return Ok(RemoteResponse::Refused(error.into()));
+            }
         }
         if peer
             && command.method != "peer.capabilities"
@@ -1912,6 +2352,21 @@ async fn remote_request(
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),
             );
+        }
+        if command.method == "project.writeFile" && !supports_project_write_file(&hello) {
+            return Err("This server needs an update to save plans to the workspace.".into());
+        }
+        if matches!(
+            command.method.as_str(),
+            "vcs.listBranches"
+                | "vcs.status"
+                | "vcs.createWorktree"
+                | "vcs.removeWorktree"
+                | "vcs.listWorktrees"
+                | "vcs.runSetup"
+        ) && !supports_vcs_worktrees(&hello)
+        {
+            return Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into());
         }
         if matches!(
             command.method.as_str(),
@@ -1937,9 +2392,9 @@ async fn remote_request(
                         serde_json::from_str(&text).map_err(|_| "Invalid remote response.")?;
                     if value["id"] == command.command_id.to_string() {
                         if let Some(error) = value["error"]["message"].as_str() {
-                            return Err(error.into());
+                            return Ok(RemoteResponse::Refused(error.into()));
                         }
-                        return Ok(value["result"].clone());
+                        return Ok(RemoteResponse::Receipt(value["result"].clone()));
                     }
                 }
                 _ => {}
@@ -1959,6 +2414,86 @@ pub fn supports_browse(hello: &Value) -> bool {
                 .iter()
                 .any(|capability| capability == protocol::FILESYSTEM_BROWSE)
         })
+}
+
+pub fn supports_project_write_file(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::PROJECT_WRITE_FILE)
+        })
+}
+
+pub fn supports_vcs_worktrees(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::VCS_WORKTREES)
+        })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_list_branches(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsListBranchesInput,
+) -> Result<crate::vcs::VcsListBranchesResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.listBranches", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.listBranches response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_status(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsStatusInput,
+) -> Result<crate::vcs::VcsStatusResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.status", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.status response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_create_worktree(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsCreateWorktreeInput,
+) -> Result<crate::vcs::VcsCreateWorktreeResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.createWorktree", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.createWorktree response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_remove_worktree(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsRemoveWorktreeInput,
+) -> Result<(), String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let _ = remote_rpc(link, "vcs.removeWorktree", args).await?;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_list_worktrees(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsListWorktreesInput,
+) -> Result<crate::vcs::VcsListWorktreesResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.listWorktrees", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.listWorktrees response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_run_setup(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsRunSetupInput,
+) -> Result<crate::vcs::VcsRunSetupResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.runSetup", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.runSetup response: {e}"))
 }
 
 fn wire_command(command: &Command) -> Message {
@@ -2036,7 +2571,7 @@ mod tests {
             let host=listener.local_addr().unwrap();
             let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
             let profile=crate::store::directory().unwrap().join("stable-blob-test");
-            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into()};
+            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into(),enabled:true};
             let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
             let snapshot=Arc::new(Mutex::new(Some(view(1))));
             let generation=Arc::new(AtomicUsize::new(1));

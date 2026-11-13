@@ -4,12 +4,37 @@ use crate::model::ConversationMode;
 
 /// Ported from KSG Code's ComposerPendingUserInputPanel: header, 14 px option labels,
 /// descriptions, digit shortcuts, radio/checkbox rows and a scrollable composer replacement.
-pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
+pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
     let t = s.current();
     let form = t.native.questionnaire.as_ref().expect("questionnaire");
     let question = &form.questions[form.index];
     let answer = &form.answers[form.index];
-    let custom = !t.reply.text.trim().is_empty();
+    let thread_id = t.id;
+    let request_id = t.request.as_ref().expect("question request")["id"].clone();
+    let question_scope = t.question_scope();
+    let toggle_scope = question_scope.clone();
+    let machine = s.machines.selected.clone();
+    let toggle_machine = machine.clone();
+    let collapsed = t.questionnaire_collapsed();
+    let toggle_title = if collapsed {
+        "Show the question and its options"
+    } else {
+        "Hide the question and its options"
+    };
+    let dismissible =
+        form.capability == "message" || form.response_mode.as_deref() == Some("message");
+    let dismissal_disabled = t.responding_request.is_some()
+        || t.question_submission_pending()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_DISMISS)
+        });
+    let disabled = !t.questionnaire_can_respond()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_CONTRACT)
+        });
+    let custom = question.allow_custom && !t.reply.text.trim().is_empty();
     let mut options = col().gap(2.0).w_full();
     for (i, option) in question.options.iter().enumerate() {
         let selected = !custom && answer.selected.contains(&option.value);
@@ -65,8 +90,13 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 .wrap_anywhere(),
                         )
                         .child(
-                            label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
-                                .wrap_anywhere(),
+                            if !option.description.is_empty() && option.description != option.label
+                            {
+                                label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
+                                    .wrap_anywhere()
+                            } else {
+                                el()
+                            },
                         ),
                 )
                 .child(el().w(28.0).center().child(if i < 9 {
@@ -74,10 +104,13 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 } else {
                     el()
                 }))
+                .disabled(disabled)
                 .on_press(move |s: &mut State| s.current_mut().questionnaire_toggle(i)),
         );
     }
-    let can_advance = custom || !answer.selected.is_empty();
+    let mut live_form = form.clone();
+    live_form.edit(t.reply.text.clone());
+    let can_advance = live_form.answer(form.index).is_some();
     let last = form.index + 1 == form.questions.len();
     col()
         .key("pi-dialog")
@@ -96,20 +129,88 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 .box_shadow(hard_shadow(p))
                 .child(
                     row()
+                        .key("questionnaire-toggle")
+                        .role("button")
+                        .label(toggle_title)
+                        .help(toggle_title)
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .py(6.0)
                         .gap(8.0)
+                        .on_press(move |s: &mut State| {
+                            if s.current().id == thread_id
+                                && s.machines.selected == toggle_machine
+                                && s.current().question_scope() == toggle_scope
+                            {
+                                s.current_mut().toggle_questionnaire();
+                            }
+                        })
                         .child(
                             pixel_label(&question.header, p.muted)
-                                .grow(1.0)
+                                .grow(if collapsed { 0.0 } else { 1.0 })
+                                .max_w(if collapsed {
+                                    (lane - 32.0).max(0.0) * 0.5
+                                } else {
+                                    f32::INFINITY
+                                })
                                 .min_w(0.0)
                                 .truncate(),
                         )
-                        .child(label(
-                            format!("{}/{}", form.index + 1, form.questions.len()),
-                            TIMER,
-                            p.muted,
-                        )),
+                        .child(if collapsed {
+                            row()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(4.0)
+                                .child(label("·", SMALL, p.faint))
+                                .child(
+                                    label(&question.text, SMALL, p.muted)
+                                        .key("questionnaire-summary")
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate(),
+                                )
+                        } else {
+                            el()
+                        })
+                        .child(if form.questions.len() > 1 {
+                            label(
+                                format!("{}/{}", form.index + 1, form.questions.len()),
+                                TIMER,
+                                p.muted,
+                            )
+                            .key("questionnaire-count")
+                        } else {
+                            el()
+                        })
+                        .child(
+                            icon(if collapsed { "chevron-up" } else { "chevron" }, p.muted)
+                                .a11y_hidden(),
+                        )
+                        .child(if dismissible {
+                            icon_button(
+                                "dialog-cancel",
+                                "Dismiss question without answering",
+                                "close",
+                                p,
+                                move |s| {
+                                    if s.current().id != thread_id
+                                        || s.machines.selected != machine
+                                        || s.current().question_scope() != question_scope
+                                    {
+                                        return;
+                                    }
+                                    if let Err(error) = s.dismiss_question(thread_id, &request_id) {
+                                        s.current_mut().error = Some(error);
+                                    }
+                                },
+                            )
+                            .help("Dismiss question without answering")
+                            .disabled(dismissal_disabled)
+                        } else {
+                            el()
+                        }),
                 )
-                .child(
+                .child(if !collapsed {
                     col()
                         .key("questionnaire-scroll")
                         .w_full()
@@ -117,14 +218,31 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .scroll(ScrollSpec {
                             stick_bottom: false,
                         })
-                        .child(label(&question.text, BODY, p.ink).wrap_anywhere())
-                        .child(options),
-                )
-                .child(
+                        .child(
+                            markdown_ui::render_with_find(
+                                &question.text,
+                                p,
+                                s.dark,
+                                false,
+                                false,
+                                false,
+                                &format!("question-{}-{}", t.id, question.id),
+                                None,
+                            )
+                            .key("questionnaire-markdown"),
+                        )
+                        .child(options)
+                } else {
+                    el()
+                })
+                .child(if question.allow_custom {
                     text_input(&t.reply, BODY)
                         .key("dialog-reply")
                         .label("Other answer")
-                        .placeholder("Other answer...", p.muted)
+                        .placeholder(
+                            "Type your own answer, or leave this blank to use the selected option",
+                            p.muted,
+                        )
                         .color(p.ink)
                         .w_full()
                         .min_h(32.0)
@@ -134,19 +252,76 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .radius(6.0)
                         .fill(p.card)
                         .field_focus(&t.reply, p)
+                        .disabled(disabled)
                         .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
-                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false)),
+                        .on_input_change(|s: &mut State, _| {
+                            s.current_mut().questionnaire_changed();
+                            if let Some(scope) = s.current().question_scope() {
+                                s.with_question_draft(s.active, scope, |s| {
+                                    s.current_mut().reconcile_draft_context()
+                                });
+                            }
+                        })
+                        .on_input_key(|s: &mut State, event, tx| {
+                            if event.is_command('c') || event.is_command('x') {
+                                let cut = event.is_command('x');
+                                if let Some(scope) = s.current().question_scope()
+                                    && let Some(content) = s
+                                        .with_question_draft(s.active, scope, |s| {
+                                            s.copy_composer_selection(cut)
+                                        })
+                                        .flatten()
+                                {
+                                    tx.copy_rich(content);
+                                    return true;
+                                }
+                            }
+                            false
+                        })
+                        .on_input_paste(|s: &mut State, content, _| {
+                            s.paste_composer_content(content, false)
+                        })
+                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false))
+                } else {
+                    el()
+                })
+                .child(
+                    row()
+                        .key("question-attachments")
+                        .gap(8.0)
+                        .flex_wrap()
+                        .children(
+                            t.question_files()
+                                .iter()
+                                .map(|file| attachment_chip(s, p, file)),
+                        ),
                 )
                 .child(
                     row()
                         .gap(6.0)
                         .flex_wrap()
                         .child(
+                            if question.allow_custom
+                                && s.client.as_ref().is_none_or(|c| {
+                                    c.supports_capability(
+                                        &s.machines.selected,
+                                        crate::protocol::QUESTION_ATTACHMENTS,
+                                    )
+                                })
+                            {
+                                attach_control(disabled, p)
+                            } else {
+                                el()
+                            },
+                        )
+                        .child(if form.index > 0 {
                             button("questionnaire-previous", "Previous", p, |s| {
                                 s.current_mut().questionnaire_step(true)
                             })
-                            .disabled(form.index == 0),
-                        )
+                            .disabled(disabled)
+                        } else {
+                            el()
+                        })
                         .child(
                             button(
                                 if last {
@@ -154,15 +329,23 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 } else {
                                     "questionnaire-next"
                                 },
-                                if last { "Submit reply" } else { "Next" },
+                                if t.responding_request.is_some() || t.question_submission_pending()
+                                {
+                                    "Submitting..."
+                                } else if s.viewport_width < 640.0 {
+                                    if last { "Submit" } else { "Next" }
+                                } else if !last {
+                                    "Next question"
+                                } else if form.index > 0 {
+                                    "Submit answers"
+                                } else {
+                                    "Submit answer"
+                                },
                                 p,
                                 |s| s.current_mut().questionnaire_step(false),
                             )
-                            .disabled(!can_advance),
+                            .disabled(disabled || !can_advance || last && !live_form.complete()),
                         )
-                        .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
-                            s.current_mut().respond(json!({"cancelled":true}))
-                        }))
                         .child(if t.status.busy() || t.stop_control.phase().is_some() {
                             icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
                                 s.current_mut().stop();
@@ -180,7 +363,14 @@ pub(crate) fn questionnaire_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         || event.mods.cmd
         || event.mods.alt
         || s.current().reply.focused
+        || s.current().draft.focused
         || s.search.focused
+        || s.current().questionnaire_collapsed()
+        || !s.current().questionnaire_can_respond()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_CONTRACT)
+        })
     {
         return false;
     }
@@ -263,6 +453,9 @@ pub(super) fn composer_pi_key(
         None | Some(crate::composer::SubmissionIntent::Foreground)
     ) && composer_menu::key(s, event)
     {
+        return true;
+    }
+    if composer_suggestion_key(s, event, tx.key_repeat()) {
         return true;
     }
     if let Some(intent) = submission_intent {
@@ -400,6 +593,52 @@ fn composer_queue_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> b
     }
     s.checkpoint();
     true
+}
+
+pub(super) fn suggestion_menu_open(s: &State) -> bool {
+    composer_menu::trigger(s).is_some()
+        || s.settings_picker.is_some()
+        || s.captain_picker
+        || s.machines.picker
+        || s.current().native.access_picker
+        || s.project_picker.is_some()
+        || s.open_option_menu.is_some()
+        || s.row_menu.is_some()
+        || s.thread_menu
+        || s.settings_menu
+        || s.attention_menu
+        || s.plan_menu.is_some()
+        || s.snooze_menu.is_some()
+        || s.current().context.popover_open()
+}
+
+fn composer_suggestion_key(s: &mut State, event: &rune::KeyEvent, key_repeat: bool) -> bool {
+    if suggestion_menu_open(s) || s.offered_prompt_suggestion().is_none() {
+        return false;
+    }
+    if event.key == rune::Key::Tab
+        && !event.mods.shift
+        && !event.mods.alt
+        && !event.mods.cmd
+        && !event.mods.ctrl
+    {
+        if key_repeat {
+            return true;
+        }
+        return s.accept_prompt_suggestion();
+    }
+    if event.key == rune::Key::Escape
+        && !event.mods.shift
+        && !event.mods.alt
+        && !event.mods.cmd
+        && !event.mods.ctrl
+    {
+        if key_repeat {
+            return true;
+        }
+        return s.dismiss_prompt_suggestion();
+    }
+    false
 }
 
 /// Ported from KSG Code's QueuedRunsControl: right-aligned unsent messages, per-message edit,
@@ -788,7 +1027,11 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
 
 /// Ported from KSG Code's ComposerFooterModeControls and runtimeModeConfig permission menu.
 pub(super) fn access_picker(s: &State, p: Palette) -> El {
-    use crate::model::AccessMode;
+    let t = s.current();
+    let (modes, _) = crate::model::resolve_compatible_access_mode(
+        t.native.access,
+        crate::model::supported_access_modes(&t.harness),
+    );
     let mut card = col()
         .key("access-picker")
         .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
@@ -798,42 +1041,41 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));
-    for (mode, description) in [
-        (
-            AccessMode::ReadOnly,
-            "Read files and coordinate. Delegate code changes to a thread.",
-        ),
-        (
-            AccessMode::Supervised,
-            "Ask before commands and file changes.",
-        ),
-        (
-            AccessMode::Edits,
-            "Auto-approve edits, ask before other actions.",
-        ),
-        (
-            AccessMode::Full,
-            "Allow commands and edits without prompts.",
-        ),
-    ] {
-        card = card.child(
-            col()
-                .key(format!("access-{}", mode.id()))
-                .role("button")
-                .label(mode.label())
+    for mode in modes {
+        let description = mode.description();
+        let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
+        let disabled = denial.is_some();
+        let mut row = col()
+            .key(format!("access-{}", mode.id()))
+            .role("button")
+            .label(mode.label())
+            .disabled(disabled)
+            .padding(8.0)
+            .gap(4.0)
+            .radius(4.0)
+            .child(label(
+                mode.label(),
+                LABEL,
+                if disabled { p.muted } else { p.ink },
+            ))
+            .child(label(description, SMALL, p.muted).wrap());
+        if let Some(reason) = denial {
+            row = row.child(
+                label(&reason, SMALL, p.muted)
+                    .key(format!("access-{}-denial", mode.id()))
+                    .wrap(),
+            );
+        } else {
+            row = row
                 .focusable(true)
                 .cursor(rune::Cursor::Pointer)
-                .padding(8.0)
-                .gap(4.0)
-                .radius(4.0)
                 .hover(p.selected)
-                .child(label(mode.label(), LABEL, p.ink))
-                .child(label(description, SMALL, p.muted).wrap())
                 .on_press(move |s: &mut State| {
                     s.set_access_mode(mode);
                     s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-                }),
-        );
+                });
+        }
+        card = card.child(row);
     }
     card = card.child(label("Tool approvals do not sandbox the process. Trusted extensions retain your account's permissions.",SMALL,p.muted).wrap().padding(8.0));
     modal_frame(
@@ -867,6 +1109,91 @@ mod tests {
             let (option, _) = rt.presented("access-read-only").expect("Read only option");
             assert!(option[2] > 0.0 && option[3] > 0.0);
             assert!(option[0] >= 0.0 && option[0] + option[2] <= width);
+        }
+    }
+
+    #[test]
+    fn access_picker_filters_by_harness_and_disables_modes_above_managed_ceiling() {
+        fn find_node<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+            if tree["key"] == key {
+                return Some(tree);
+            }
+            tree["children"]
+                .as_array()?
+                .iter()
+                .find_map(|child| find_node(child, key))
+        }
+
+        let dir = crate::store::directory().unwrap();
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            r#"{"schemaVersion":1,"organization":"Example Corp","limits":{"maxRuntimeMode":"auto-accept-edits"}}"#,
+        )
+        .unwrap();
+        let policy = crate::model::pi_session::read_managed_policy_from_path(&policy_path);
+
+        for width in [620.0, 1280.0] {
+            // Codex thread shows Auto.
+            let mut codex_state = State::new(".".into(), false);
+            codex_state.managed_policy = policy.clone();
+            codex_state.current_mut().harness = "codex".into();
+            codex_state.open_access_picker();
+            let mut rt = rune::Runtime::with_text(
+                codex_state,
+                view,
+                (width, 720.0),
+                rune::Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            assert!(
+                rt.presented("access-auto").is_some(),
+                "{width}: codex shows Auto"
+            );
+            let tree = rt.accessibility_json();
+            let full_node = find_node(&tree, "access-full-access").expect("Full access row");
+            assert!(
+                full_node["states"]
+                    .as_array()
+                    .is_some_and(|states| states.iter().any(|s| s == "disabled")),
+                "{width}: Full access should be disabled under auto-accept-edits ceiling"
+            );
+            assert!(
+                rt.presented("access-full-access-denial").is_some(),
+                "{width}: Full access denial reason should be presented"
+            );
+            assert!(
+                tree.to_string()
+                    .contains("Example Corp limits threads to Auto-accept edits."),
+                "{width}: denial reason text should appear in accessibility tree"
+            );
+
+            // Pi thread does not show Auto.
+            let mut pi_state = State::new(".".into(), false);
+            pi_state.managed_policy = policy.clone();
+            pi_state.current_mut().harness = "pi".into();
+            pi_state.open_access_picker();
+            let mut rt = rune::Runtime::with_text(
+                pi_state,
+                view,
+                (width, 720.0),
+                rune::Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            assert!(
+                rt.presented("access-auto").is_none(),
+                "{width}: pi hides Auto"
+            );
+            let tree = rt.accessibility_json();
+            let full_node = find_node(&tree, "access-full-access").expect("Full access row");
+            assert!(
+                full_node["states"]
+                    .as_array()
+                    .is_some_and(|states| states.iter().any(|s| s == "disabled")),
+                "{width}: Full access should be disabled on pi too"
+            );
         }
     }
 }

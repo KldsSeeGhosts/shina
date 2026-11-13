@@ -19,6 +19,19 @@ pub fn supports_compaction(id: &str) -> bool {
     matches!(id, "pi" | "codex" | "claude")
 }
 
+/// Providers for which KSG Code declares `freshContext` support (server-wide in KSG's
+/// `ServerEnvironment`): Pi (`SessionSource::New`), Codex (`thread/start`), Claude
+/// (`--session-id`), and ACP (`session/new`).
+pub fn supports_fresh_context(id: &str) -> bool {
+    matches!(id, "pi" | "codex" | "claude") || valid_id(id)
+}
+
+/// Prompt suggestions are obtained only for providers that expose a native prediction signal
+/// or sampling call in KSG Code (`claude` and `codex`).
+pub fn supports_prompt_suggestions(id: &str) -> bool {
+    matches!(id, "claude" | "codex")
+}
+
 impl Start {
     /// Metadata discovery never registers MCP, starts a conversation or sends a prompt.
     pub(crate) fn discovery(id: &str, workspace: PathBuf) -> Self {
@@ -30,6 +43,7 @@ impl Start {
             link: None,
             owner: Arc::default(),
             context_sent: false,
+            prompt_suggestions: false,
         }
     }
 }
@@ -252,6 +266,7 @@ pub struct Start {
     pub link: Option<HostLink>,
     pub owner: Arc<SessionOwner>,
     pub context_sent: bool,
+    pub prompt_suggestions: bool,
 }
 
 pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, String> {
@@ -358,6 +373,7 @@ mod tests {
                 link: None,
                 owner: Arc::default(),
                 context_sent: false,
+                prompt_suggestions: false,
             });
             let instructions = start.instructions.as_deref().unwrap();
             assert!(instructions.contains(crate::mcp::INSTRUCTIONS), "{path}");

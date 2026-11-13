@@ -29,6 +29,7 @@ impl HasDisplayHandle for Parent<'_> {
 
 pub fn open(state: &mut State, thread: usize, options: rune::FileDialogOptions) {
     let machine = state.machines.selected.clone();
+    let question = state.current().question_scope();
     let handle = state.background.handle.clone();
     let window = WINDOW.lock().expect("attachment picker window").clone();
     let result = window
@@ -60,6 +61,9 @@ pub fn open(state: &mut State, thread: usize, options: rune::FileDialogOptions) 
                         .collect::<Vec<_>>()
                 });
                 handle.update(move |state, _| {
+                    if !target_accepts(state, &machine, thread, question.as_deref()) {
+                        return;
+                    }
                     if let Some(paths) = paths {
                         state.attach_paths_on_to(&machine, thread, &paths);
                     }
@@ -76,4 +80,27 @@ pub fn open(state: &mut State, thread: usize, options: rune::FileDialogOptions) 
         }
         _ => {}
     }
+}
+
+/// Keep the originating ordinary draft across navigation, but never deliver a
+/// picker result to a replacement question or an expired answer scope.
+pub(crate) fn target_accepts(
+    state: &State,
+    machine: &str,
+    thread: usize,
+    question: Option<&str>,
+) -> bool {
+    if question.is_some() && machine != state.machines.selected {
+        return false;
+    }
+    let threads = if machine == state.machines.selected {
+        Some(state.threads.as_slice())
+    } else {
+        state.machines.threads.get(machine).map(Vec::as_slice)
+    };
+    threads.is_some_and(|threads| {
+        threads
+            .iter()
+            .any(|target| target.id == thread && target.question_scope().as_deref() == question)
+    })
 }

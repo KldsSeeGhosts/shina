@@ -54,7 +54,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
     }
     let query = s.search.text.to_lowercase();
     for (server, projection) in &s.machines.views {
-        if server == &s.machines.selected {
+        if server == &s.machines.selected || !s.machine_enabled(server) {
             continue;
         }
         let views: std::collections::HashMap<_, _> = projection["threads"]

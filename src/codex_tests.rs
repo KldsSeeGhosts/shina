@@ -2,6 +2,128 @@ use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
 #[test]
+fn user_input_questions_use_ksg_native_defaults_not_unoffered_extensions() {
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.server_request(
+        "item/tool/requestUserInput",
+        &json!({"id":71,"params":{"questions":[
+            {"id":" ","header":"","question":" ","isSecret":true,"multiSelect":true,
+             "allowCustomAnswer":false,"initialAnswer":"not offered","options":[
+                 {"label":"  A  ","description":"  Explanation  ","value":"unoffered"}]}
+        ]}}),
+    );
+    let request = client.events.last().expect("native question");
+    assert_eq!(
+        request["questions"],
+        json!([{"id":"question-1","header":"Question",
+        "question":"Choose an answer.","options":[{"label":"A","description":"Explanation"}]}])
+    );
+    assert_eq!(request["responseCapability"]["type"], "live");
+}
+
+#[test]
+fn async_agent_message_questions_survive_turn_completion_as_message_requests() {
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.ready = true;
+    client.item(
+        &json!({"type":"agentMessage","id":"async-item","delivery":"async",
+        "text":"Question text","questions":[{"title":"Choose one.","options":["A","B"]}]}),
+        true,
+        true,
+    );
+    let request = client
+        .events
+        .iter()
+        .find(|r| r["method"] == "input")
+        .expect("async question");
+    assert_eq!(request["responseMode"], "message");
+    assert_eq!(request["responseCapability"]["type"], "message");
+    assert_eq!(request["questions"][0]["id"], "0");
+    assert_eq!(request["questions"][0]["question"], "Choose one.");
+}
+
+#[test]
+fn approval_decisions_keep_cancel_session_and_legacy_wire_meanings() {
+    for (decision, expected) in [
+        ("accept", json!("accept")),
+        ("acceptForSession", json!("acceptForSession")),
+        ("acceptAlways", json!("acceptForSession")),
+        ("decline", json!("decline")),
+        ("cancel", json!("cancel")),
+    ] {
+        let mut client = Client::new(Start::discovery(
+            "codex",
+            crate::store::directory().unwrap(),
+        ));
+        client.answer_decision(
+            Approval {
+                id: json!(19),
+                method: "item/commandExecution/requestApproval".into(),
+                params: json!({}),
+            },
+            decision,
+        );
+        assert_eq!(client.wire.last().unwrap()["result"]["decision"], expected);
+    }
+}
+
+#[test]
+fn provider_approval_messages_keep_session_scope_and_mcp_offered_options() {
+    for method in [
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+        client.server_request(
+            method,
+            &json!({"id":42,"params":{"permissions":{"network":{"enabled":true}}}}),
+        );
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":"acceptForSession"}))
+            .unwrap();
+        let response = &client.wire.last().unwrap()["result"];
+        if method == "item/permissions/requestApproval" {
+            assert_eq!(response["scope"], "session");
+            assert_eq!(response["permissions"]["network"]["enabled"], true);
+        } else {
+            assert!(matches!(
+                response["decision"].as_str(),
+                Some("acceptForSession" | "approved_for_session")
+            ));
+        }
+    }
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.running = true;
+    client.turn = Some("turn".into());
+    client.server_request(
+        "mcpServer/elicitation/request",
+        &json!({"id":43,"params":{
+            "turnId":"turn","mode":"form","serverName":"browser","message":"Allow browser?",
+            "requestedSchema":{"properties":{}},"_meta":{"persist":["session","always"]}
+        }}),
+    );
+    let request = client.events.last().unwrap().clone();
+    assert_eq!(
+        request["approvalOptions"][2]["decision"],
+        "acceptForSession"
+    );
+    assert_eq!(request["approvalOptions"][3]["decision"], "acceptAlways");
+    client
+        .command(
+            json!({"type":"extension_ui_response","id":request["id"],"decision":"acceptAlways"}),
+        )
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["_meta"]["persist"],
+        "always"
+    );
+}
+
+#[test]
 fn prompt_free_probe_paginates_models_and_discovers_workspace_skills() {
     for flags in [
         vec![],
@@ -620,6 +742,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         }),
         owner: Arc::default(),
         context_sent: false,
+        prompt_suggestions: false,
     }
 }
 
@@ -944,11 +1067,12 @@ fn authentication_denial_stops_without_retry_or_configuration_changes() {
 
 #[test]
 fn runtime_modes_match_ksg_and_read_only_cannot_escalate() {
-    for (mode, approval, sandbox) in [
-        ("approval-required", "untrusted", "readOnly"),
-        ("auto-accept-edits", "on-request", "workspaceWrite"),
-        ("full-access", "never", "dangerFullAccess"),
-        ("read-only", "never", "readOnly"),
+    for (mode, approval, reviewer, sandbox) in [
+        ("approval-required", "untrusted", "user", "readOnly"),
+        ("auto-accept-edits", "on-request", "user", "workspaceWrite"),
+        ("auto", "on-request", "auto_review", "workspaceWrite"),
+        ("full-access", "never", "user", "dangerFullAccess"),
+        ("read-only", "never", "user", "readOnly"),
     ] {
         let mut client = Client::new(spec(SessionSource::New, mode));
         client.session = Some("fixture".into());
@@ -957,6 +1081,7 @@ fn runtime_modes_match_ksg_and_read_only_cannot_escalate() {
             .command(json!({"type":"prompt","message":"test"}))
             .unwrap();
         assert_eq!(client.wire[0]["params"]["approvalPolicy"], approval);
+        assert_eq!(client.wire[0]["params"]["approvalsReviewer"], reviewer);
         assert_eq!(client.wire[0]["params"]["sandboxPolicy"]["type"], sandbox);
     }
 }
@@ -1464,4 +1589,173 @@ fn codex_model_value_includes_descriptor_capabilities() {
     assert_eq!(descriptors[0]["id"], "reasoningEffort");
     assert_eq!(descriptors[0]["currentValue"], "medium");
     assert_eq!(descriptors[1]["id"], "serviceTier");
+}
+
+#[test]
+fn codex_token_usage_notification_produces_estimated_and_inferred_breakdown() {
+    let mut thread = Thread::new(11);
+    thread.harness = "codex".into();
+    thread.apply(json!({
+        "type": "message_start",
+        "message": { "role": "user", "content": [{ "type": "text", "text": &"a".repeat(3500) }] }
+    }));
+    thread.apply(json!({
+        "type": "tool_execution_start",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "args": { "command": "ls" }
+    }));
+    thread.apply(json!({
+        "type": "tool_execution_end",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "isError": false,
+        "result": { "content": [{ "type": "text", "text": &"o".repeat(7000) }] }
+    }));
+
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client
+        .notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": {
+                    "modelContextWindow": 200000,
+                    "last": { "totalTokens": 10000 }
+                }
+            }),
+        )
+        .unwrap();
+    for event in client.events {
+        thread.apply(event);
+    }
+
+    let breakdown = thread
+        .context
+        .usage
+        .breakdown
+        .as_ref()
+        .expect("expected estimated breakdown");
+    assert!(breakdown.iter().any(|r| {
+        r.label == "System" && r.kind == crate::context_breakdown::BreakdownRowKind::Inferred
+    }));
+    assert!(breakdown.iter().any(|r| {
+        r.label == "Messages" && r.kind == crate::context_breakdown::BreakdownRowKind::Estimated
+    }));
+    assert!(breakdown.iter().any(|r| {
+        r.label == "Tool output" && r.kind == crate::context_breakdown::BreakdownRowKind::Estimated
+    }));
+    assert_eq!(breakdown.iter().map(|r| r.tokens).sum::<u64>(), 10000);
+}
+
+#[test]
+fn codex_fresh_session_issues_thread_start_and_not_resume() {
+    let mut client = Client::new(Start {
+        prompt_suggestions: false,
+        id: "codex".into(),
+        workspace: PathBuf::from("."),
+        source: SessionSource::New,
+        instructions: None,
+        link: Some(crate::backend::HostLink {
+            url: "http://127.0.0.1:1/mcp".into(),
+            token: "test-token".into(),
+            extension: PathBuf::new(),
+            access_mode: "workspace".into(),
+        }),
+        owner: Arc::default(),
+        context_sent: false,
+    });
+    client.initialize();
+    let init_id = client.wire[0]["id"].clone();
+    client
+        .incoming(json!({"id": init_id, "result": {"userAgent": "codex/0.120.0"}}))
+        .unwrap();
+    let models_id = client
+        .wire
+        .iter()
+        .find(|msg| msg["method"] == "model/list")
+        .unwrap()["id"]
+        .clone();
+    client
+        .incoming(json!({"id": models_id, "result": {"data": []}}))
+        .unwrap();
+    let methods: Vec<&str> = client
+        .wire
+        .iter()
+        .filter_map(|msg| msg["method"].as_str())
+        .collect();
+    assert!(methods.contains(&"thread/start"), "{methods:?}");
+    assert!(!methods.contains(&"thread/resume"), "{methods:?}");
+}
+
+#[test]
+fn codex_prompt_suggestion_samples_after_turn_and_discards_late_answer() {
+    let mut start = spec(SessionSource::New, "read-only");
+    start.prompt_suggestions = true;
+    let mut client = Client::new(start);
+    client.ready = true;
+    client.session = Some("codex-session-1".into());
+
+    let mut thread = Thread::new(41);
+    thread.harness = "codex".into();
+    thread.run_id = Some("run-1".into());
+
+    client
+        .command(json!({"type": "prompt", "id": "p1", "message": "hello", "runId": "run-1"}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn": {"id": "turn-1", "status": "completed", "items": []}}),
+        )
+        .unwrap();
+    let sample_req = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "thread/sample")
+        .expect("expected thread/sample request")
+        .clone();
+    assert_eq!(sample_req["params"]["threadId"], "codex-session-1");
+    assert_eq!(sample_req["params"]["expectedTurnId"], "turn-1");
+    assert_eq!(sample_req["params"]["effort"], "low");
+    assert_eq!(sample_req["params"]["prompt"], PROMPT_SUGGESTION_PROMPT);
+
+    client
+        .incoming(json!({"id": sample_req["id"], "result": {"text": "  Run cargo test  "}}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.prompt_suggestion,
+        Some(crate::model::PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        })
+    );
+
+    // Start run-2 and complete it, then deliver a late thread/sample response from run-1.
+    thread.run_id = Some("run-2".into());
+    client.wire.clear();
+    client
+        .command(json!({"type": "prompt", "id": "p2", "message": "next", "runId": "run-2"}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn": {"id": "turn-2", "status": "completed", "items": []}}),
+        )
+        .unwrap();
+    client.request(
+        "thread/sample",
+        json!({"threadId": "codex-session-1", "expectedTurnId": "turn-1"}),
+        json!({"type": "prompt_suggestion", "runId": "run-1"}),
+    );
+    let stale_id = client.wire.last().unwrap()["id"].clone();
+    client
+        .incoming(json!({"id": stale_id, "result": {"text": "Stale suggestion"}}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(thread.prompt_suggestion, None);
 }

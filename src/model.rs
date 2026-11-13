@@ -30,6 +30,7 @@ struct ContextAssetDownload {
     mime_type: String,
     kind: &'static str,
     result: Result<Vec<u8>, String>,
+    question_scope: Option<String>,
 }
 
 fn fetch_linked_blob(
@@ -98,7 +99,24 @@ fn fetch_linked_blob(
 
 #[path = "pi_session.rs"]
 pub(crate) mod pi_session;
-pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+pub use pi_session::{
+    AccessMode, ConversationMode, ManagedPolicy, PiSession, clamp_managed_access_mode,
+    managed_access_mode_denial, read_managed_policy, resolve_compatible_access_mode,
+    session_history, supported_access_modes,
+};
+#[path = "approval_send.rs"]
+mod approval_send;
+#[cfg(test)]
+#[path = "approval_send_tests.rs"]
+mod approval_send_tests;
+#[path = "question_answers.rs"]
+mod question_answers;
+#[cfg(test)]
+#[path = "question_attachment_tests.rs"]
+mod question_attachment_tests;
+#[cfg(test)]
+#[path = "question_flow_tests.rs"]
+mod question_flow_tests;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -202,6 +220,16 @@ pub struct ToastNotice {
     pub action_label: Option<String>,
     pub action: Option<ToastAction>,
     pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanSaveDialog {
+    pub machine: String,
+    pub cwd: String,
+    pub contents: String,
+    pub path_edit: TextEdit,
+    pub saving: bool,
+    pub request_id: Option<u64>,
 }
 
 /// The validated fields of a `delegate_task.target` request.
@@ -466,12 +494,102 @@ pub struct BriefUi {
     pub demo_status: Option<background::BackgroundStatus>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSuggestion {
+    pub run_id: String,
+    pub text: String,
+}
+
+pub use crate::protocol::ThreadEnvMode;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VcsBranchCacheEntry {
+    pub is_repo: bool,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub refs: Vec<crate::vcs::VcsRef>,
+}
+
+struct VcsBranchResultMsg {
+    machine: String,
+    project_path: String,
+    result: Result<crate::vcs::VcsListBranchesResult, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeSetupPhase {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSetupState {
+    pub phase: WorktreeSetupPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+struct WorktreeSetupResultMsg {
+    thread_id: usize,
+    run_seq: u64,
+    result: Result<crate::vcs::VcsRunSetupResult, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreeBootstrapState {
+    pub(crate) snapshot: crate::composer_rich::Snapshot,
+    pub(crate) reply_to: Option<crate::composer_context::ComposerContextRecord>,
+    pub(crate) queued_id: usize,
+    pub(crate) fresh_context: bool,
+}
+
+struct WorktreeBootstrapResult {
+    thread_id: usize,
+    base_branch: String,
+    result: Result<crate::vcs::VcsCreateWorktreeResult, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerVcsControls {
+    Hidden,
+    Editable {
+        mode: ThreadEnvMode,
+        base_branch: Option<String>,
+        start_from_origin: bool,
+    },
+    LockedWorktree {
+        branch: Option<String>,
+        worktree_path: String,
+    },
+}
+
 pub struct Thread {
     pub peer_origin: Option<PeerOrigin>,
     pub stop_serial: u64,
     pub run_id: Option<String>,
     pub resumable_run_id: Option<String>,
     pub continuation_of_run_id: Option<String>,
+    pub prompt_suggestion: Option<PromptSuggestion>,
+    pub(crate) prompt_suggestions_enabled: bool,
     pub stop_control: StopControl,
     run_control_supported: bool,
     resume_command: Option<uuid::Uuid>,
@@ -481,10 +599,21 @@ pub struct Thread {
     pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
     pub(crate) remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
+    pub(crate) remote_send_fresh_arm: Option<u64>,
+    pub(crate) remote_send_reply_to: Option<crate::composer_context::ComposerContextRecord>,
+    pub fresh_session_arm: Option<u64>,
+    pub fresh_session_messages: Vec<String>,
+    pub fallback_active: Option<crate::usage_limits::FallbackInfo>,
+    pub fallback_explicit_override: bool,
     pub composer_context_supported: bool,
     pub(crate) background_start_pending: bool,
     pub(crate) background_send: Option<String>,
     pub(crate) pending_send_and_new_thread: Option<(uuid::Uuid, String)>,
+    pub(crate) worktree_bootstrap: Option<WorktreeBootstrapState>,
+    pub(crate) remote_bootstrap_snapshot: Option<(
+        crate::composer_rich::Snapshot,
+        Option<crate::composer_context::ComposerContextRecord>,
+    )>,
     request_generation: String,
     server_owned: bool,
     recovery_command: Option<uuid::Uuid>,
@@ -495,6 +624,15 @@ pub struct Thread {
     pub harness_context_sent: bool,
     pub harness_state: Value,
     pub project: Option<ProjectId>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub env_mode: Option<ThreadEnvMode>,
+    pub start_from_origin: Option<bool>,
+    pub worktree_setup: Option<WorktreeSetupState>,
+    pub worktree_setup_output_open: bool,
+    pub(crate) worktree_setup_seq: u64,
+    pub(crate) worktree_bootstrap_fresh_context: bool,
     pub machine: String,
     pub updated: u64,
     pub title: String,
@@ -517,6 +655,7 @@ pub struct Thread {
     pub composer_rules: crate::composer_rich::Rules,
     pub draft_images: Vec<Attachment>,
     pub draft_context: Vec<crate::composer_context::ComposerContextRecord>,
+    pub draft_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     pub retained_context: crate::composer_context::RetainedContextPayloads,
     pub attachment_error: Option<String>,
     pub submission_error: Option<String>,
@@ -539,7 +678,17 @@ pub struct Thread {
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
+    pub(crate) requests_supported: bool,
+    pub(crate) question_contract_supported: bool,
+    pub(crate) responding_request: Option<uuid::Uuid>,
+    approval_send: Option<approval_send::ApprovalSend>,
     pub reply: TextEdit,
+    question_drafts: std::collections::HashMap<String, question_answers::Draft>,
+    pub(super) answer_intake: bool,
+    pub(super) answer_scope: Option<String>,
+    pub(super) question_submit_requested: bool,
+    question_submission: Option<question_answers::Submission>,
+    question_resolutions: Vec<question_answers::Resolution>,
     pub session: Option<String>,
     /// A thread made here as a new thread. Until a prompt is sent, a session on it is only a
     /// warmed harness and the thread is still a draft. Restored records without the flag keep
@@ -602,6 +751,20 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn is_fresh_session_message(&self, message_id: &str) -> bool {
+        self.fresh_session_messages
+            .iter()
+            .any(|id| id == message_id)
+    }
+
+    #[cfg(test)]
+    pub fn fresh_session_command_available_local(&self) -> bool {
+        !self.messages.is_empty()
+            && crate::harness::supports_fresh_context(&self.harness)
+            && self.request.is_none()
+            && self.native.questionnaire.is_none()
+    }
+
     pub fn can_choose_harness(&self) -> bool {
         if self.remote.is_some() {
             return self.projected_harness_choice;
@@ -691,6 +854,7 @@ impl Thread {
         !self.draft.text.trim().is_empty()
             || self.draft.pills().next().is_some()
             || !self.draft_images.is_empty()
+            || self.draft_reply_to.is_some()
     }
     /// Add a validated attachment while preserving the text draft and its undo history.
     pub(crate) fn insert_attachment_chips(
@@ -713,7 +877,14 @@ impl Thread {
         skip_image_inline_chip: bool,
         force_image_chip: bool,
     ) {
-        if attachments.is_empty() || self.request.is_some() {
+        if attachments.is_empty()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+                && !self.answer_intake
+                && !self.request_held_by_typing_guard()
+        {
             return;
         }
         let prose = crate::composer_context::strip_inline_context_references(
@@ -721,7 +892,9 @@ impl Thread {
         );
         let image_attachments_get_chips = force_image_chip
             || !skip_image_inline_chip
-                && (self.draft.anchor != self.draft.focus || !prose.trim().is_empty());
+                && (self.answer_intake
+                    || self.draft.anchor != self.draft.focus
+                    || !prose.trim().is_empty());
         let mut records = Vec::new();
         for attachment in attachments {
             if attachment.is_image() && !image_attachments_get_chips {
@@ -770,6 +943,51 @@ impl Thread {
         });
     }
 
+    pub(crate) fn insert_context_chip(
+        &mut self,
+        record: crate::composer_context::ComposerContextRecord,
+    ) {
+        if self.request.is_some() {
+            return;
+        }
+        let (start, end) = if self.draft.focused {
+            self.draft.range()
+        } else {
+            let end = self.draft.text.len();
+            (end, end)
+        };
+        let prev = self.draft.text[..start].chars().next_back();
+        let needs_leading_space = !matches!(prev, None | Some(' ' | '\n' | '\t' | '\r'));
+        let replace_end = if self.draft.text[end..].starts_with(' ') {
+            end + 1
+        } else {
+            end
+        };
+        let pill_id = crate::composer_context::format_composer_context_href(
+            record.kind(),
+            &record.context_id,
+        );
+        let chip_label = record.label.clone();
+        if let Some(existing) = self
+            .draft_context
+            .iter_mut()
+            .find(|r| r.context_id == record.context_id)
+        {
+            *existing = record;
+        } else {
+            self.draft_context.push(record);
+        }
+        self.draft.undo_group(|e| {
+            e.set_selection(start, replace_end);
+            e.insert(if needs_leading_space { " " } else { "" });
+            let pill_start = e.focus;
+            e.insert(&chip_label);
+            let pill_end = e.focus;
+            e.replace_with_pill(pill_start..pill_end, pill_id, &chip_label);
+            e.insert(" ");
+        });
+    }
+
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
         if self
             .draft_images
@@ -780,7 +998,16 @@ impl Thread {
         }
         let mut proposed = self.draft_images.clone();
         proposed.push(image);
-        attachments::validate_prompt_images(&proposed)?;
+        if self.answer_intake {
+            if self.question_reserved_count() >= attachments::MAX_ATTACHMENTS {
+                return Err(format!(
+                    "You can attach up to {} files per message.",
+                    attachments::MAX_ATTACHMENTS
+                ));
+            }
+        } else {
+            attachments::validate_prompt_images(&proposed)?;
+        }
         self.draft_images = proposed;
         self.attachment_error = None;
         Ok(())
@@ -838,7 +1065,11 @@ impl Thread {
             self.retained_context.records.remove(&id);
         }
         self.draft_images.retain(|image| image.id != id);
-        self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
+        self.attachment_error = if self.answer_intake {
+            None
+        } else {
+            attachments::validate_prompt_images(&self.draft_images).err()
+        };
     }
     fn image_model_error(&self) -> String {
         let model = if self.model.is_empty() {
@@ -860,16 +1091,26 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            remote_send_fresh_arm: None,
+            remote_send_reply_to: None,
+            fresh_session_arm: None,
+            fresh_session_messages: Vec::new(),
             composer_context_supported: true,
+            fallback_active: None,
+            fallback_explicit_override: false,
             background_start_pending: false,
             background_send: None,
             pending_send_and_new_thread: None,
+            worktree_bootstrap: None,
+            remote_bootstrap_snapshot: None,
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
             run_id: None,
             resumable_run_id: None,
             continuation_of_run_id: None,
+            prompt_suggestion: None,
+            prompt_suggestions_enabled: false,
             stop_control: StopControl::default(),
             run_control_supported: true,
             resume_command: None,
@@ -885,6 +1126,15 @@ impl Thread {
             harness_context_sent: false,
             harness_state: json!({}),
             project: None,
+            worktree_path: None,
+            branch: None,
+            base_branch: None,
+            env_mode: None,
+            start_from_origin: None,
+            worktree_setup: None,
+            worktree_setup_output_open: false,
+            worktree_setup_seq: 0,
+            worktree_bootstrap_fresh_context: false,
             machine: "local".into(),
             peer_origin: None,
             stop_serial: 0,
@@ -904,6 +1154,7 @@ impl Thread {
             composer_rules: crate::composer_rich::Rules::default(),
             draft_images: Vec::new(),
             draft_context: Vec::new(),
+            draft_reply_to: None,
             retained_context: Default::default(),
             attachment_error: None,
             submission_error: None,
@@ -923,7 +1174,17 @@ impl Thread {
             error: None,
             diagnostics: vec![],
             request: None,
+            requests_supported: true,
+            question_contract_supported: true,
+            responding_request: None,
+            approval_send: None,
             reply: TextEdit::default(),
+            question_drafts: Default::default(),
+            answer_intake: false,
+            answer_scope: None,
+            question_submit_requested: false,
+            question_submission: None,
+            question_resolutions: Vec::new(),
             session: None,
             never_sent: true,
             life: Lifecycle::new(lifecycle::now()),
@@ -1024,17 +1285,7 @@ impl Thread {
         self.startup_selection_verified = false;
         self.context_startup_requested = false;
         self.context.begin_model_change();
-        let source = self
-            .native
-            .fork_source
-            .clone()
-            .map(crate::backend::SessionSource::Fork)
-            .or_else(|| {
-                self.session
-                    .clone()
-                    .map(crate::backend::SessionSource::Resume)
-            })
-            .unwrap_or(crate::backend::SessionSource::New);
+        let source = self.planned_session_source();
         match crate::harness::start(
             backend,
             crate::harness::Start {
@@ -1045,12 +1296,26 @@ impl Thread {
                 link: self.host.clone(),
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
+                prompt_suggestions: self.prompt_suggestions_enabled && !self.delegated,
             },
             wake,
         ) {
             Ok(session) => self.pi = Some(session),
             Err(error) => self.fail_session(error),
         }
+    }
+
+    pub(crate) fn planned_session_source(&self) -> crate::backend::SessionSource {
+        self.native
+            .fork_source
+            .clone()
+            .map(crate::backend::SessionSource::Fork)
+            .or_else(|| {
+                self.session
+                    .clone()
+                    .map(crate::backend::SessionSource::Resume)
+            })
+            .unwrap_or(crate::backend::SessionSource::New)
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
@@ -1108,6 +1373,11 @@ impl Thread {
         } else if self.command("set_model", json!({"provider":provider,"modelId":model_id})) {
             self.configuring = true;
         }
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
     }
 
     pub fn set_thinking(&mut self, level: String) {
@@ -1181,9 +1451,25 @@ impl Thread {
         })
     }
 
+    pub fn set_machine(&mut self, machine: impl Into<String>) {
+        let machine = machine.into();
+        if self.machine != machine {
+            self.machine = machine;
+            self.prompt_suggestion = None;
+        }
+    }
+
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
-        if kind == "prompt" && self.harness == "codex" {
-            data["serviceTier"] = self.harness_state["serviceTier"].clone();
+        if kind == "prompt" {
+            self.prompt_suggestion = None;
+            if data.get("runId").is_none()
+                && let Some(run_id) = &self.run_id
+            {
+                data["runId"] = json!(run_id);
+            }
+            if self.harness == "codex" {
+                data["serviceTier"] = self.harness_state["serviceTier"].clone();
+            }
         }
         self.track_learned_turn(kind, &data);
         let context = if kind == "prompt" {
@@ -1223,6 +1509,24 @@ impl Thread {
         true
     }
 
+    pub(crate) fn refresh_estimated_breakdown(&mut self) {
+        if self.harness == "claude" {
+            return;
+        }
+        let Some(used_tokens) = self.context.usage.tokens.filter(|tokens| *tokens > 0) else {
+            self.context.usage.breakdown = None;
+            return;
+        };
+        let totals = crate::context_breakdown::thread_char_totals(
+            &self.messages,
+            &self.tools,
+            &self.thoughts,
+            &self.native.compactions,
+        );
+        self.context.usage.breakdown =
+            crate::context_breakdown::estimate_context_breakdown(&totals, used_tokens);
+    }
+
     /// Asks Pi for the current context window. Event-driven only: startup, a completed turn,
     /// a model change and compaction completion call this. Nothing polls on a timer.
     fn refresh_context_usage(&mut self) -> bool {
@@ -1246,14 +1550,15 @@ impl Thread {
 
     #[cfg(test)]
     pub fn send(&mut self) {
-        self.send_with_peers(None, &[], &str::to_owned);
+        self.send_with_fresh(None, &[], &str::to_owned, false);
     }
 
-    pub(crate) fn send_with_peers(
+    pub(crate) fn send_with_fresh(
         &mut self,
         target_server_id: Option<&str>,
         peers: &[crate::peer::Peer],
         machine_name: &dyn Fn(&str) -> String,
+        fresh_context: bool,
     ) {
         if self.offline_blocked || self.status == Status::Paused {
             return;
@@ -1270,10 +1575,11 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_target(
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
+            self.draft_reply_to.as_ref(),
             Some(&self.machine),
             target_server_id,
             peers,
@@ -1291,9 +1597,23 @@ impl Thread {
         self.draft.replace_text("");
         self.draft_images.clear();
         self.draft_context.clear();
+        self.draft_reply_to = None;
         self.retained_context = Default::default();
         self.native.queue_held = false;
-        self.begin_prompt(prompt);
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
+        self.begin_prompt_with_fresh(prompt, fresh_context);
+    }
+
+    pub fn effective_start_from_origin(&self) -> bool {
+        self.start_from_origin.unwrap_or(true)
+    }
+
+    pub fn worktree_bootstrapping(&self) -> bool {
+        self.worktree_bootstrap.is_some()
     }
 
     pub fn reconcile_draft_context(&mut self) {
@@ -1329,10 +1649,35 @@ impl Thread {
         self.submission_error = crate::composer::prompt_length_validation_message(&expanded);
     }
 
-    fn begin_prompt(&mut self, prompt: Prompt) {
+    pub(super) fn begin_prompt(&mut self, prompt: Prompt) {
+        self.begin_prompt_with_fresh(prompt, false);
+    }
+
+    pub(super) fn begin_prompt_with_fresh(&mut self, prompt: Prompt, fresh_context: bool) {
+        if fresh_context {
+            let held_queue = !self.native.queue.is_empty();
+            let previous_held = self.native.queue_held;
+            if held_queue {
+                self.native.queue_held = true;
+            }
+            if self.pi.is_some() {
+                self.disconnect();
+            }
+            if held_queue {
+                self.native.queue_held = previous_held;
+            }
+            self.session = None;
+            self.harness_context_sent = false;
+            self.native.fork_source = None;
+            self.native.fork_entry = None;
+            self.native.previous_session = None;
+            self.native.session_name = None;
+            self.context.begin_model_change();
+        }
         self.run_id = Some(uuid::Uuid::new_v4().to_string());
         self.resumable_run_id = None;
         self.continuation_of_run_id = None;
+        self.prompt_suggestion = None;
         self.stop_control = StopControl::default();
         self.native.initial_user = true;
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
@@ -1358,8 +1703,12 @@ impl Thread {
                 prompt.text.chars().take(45).collect()
             };
         }
+        let message_id = uuid::Uuid::new_v4().to_string();
+        if fresh_context {
+            self.fresh_session_messages.push(message_id.clone());
+        }
         self.messages.push(Message {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: message_id,
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
@@ -1444,10 +1793,66 @@ impl Thread {
     }
 
     pub fn respond(&mut self, mut response: Value) {
+        if self.responding_request.is_some() {
+            return;
+        }
+        if self.native.questionnaire.is_some() && !self.question_contract_supported {
+            self.error = Some(crate::protocol::QUESTIONS_UPDATE_REQUIRED.into());
+            return;
+        }
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| !form.can_respond())
+        {
+            self.error = Some("This request is not resumable.".into());
+            return;
+        }
+        if let Some(request) = &self.request {
+            if !crate::approval::can_respond(request) {
+                self.error = Some("This request is not resumable.".into());
+                return;
+            }
+            if request["method"] == "confirm" {
+                if let Err(error) = crate::approval::validate(request, &response) {
+                    self.error = Some(error);
+                    return;
+                }
+                let decision = crate::approval::decision(&response)
+                    .expect("validated")
+                    .to_owned();
+                let feedback = response.get("feedback").cloned();
+                response = crate::approval::response(&decision);
+                if let Some(feedback) = feedback {
+                    response["feedback"] = feedback;
+                }
+                if self.remote.is_none() && self.harness == "pi" && decision == "acceptAlways" {
+                    response = json!({"cancelled":true});
+                }
+            }
+        }
         if self.remote.is_some() {
+            if !self.requests_supported {
+                self.error = Some(crate::protocol::REQUESTS_UPDATE_REQUIRED.into());
+                return;
+            }
             let request = self.request.clone().unwrap_or(Value::Null);
-            self.forward("request.respond", json!({"requestId":request["id"],"generation":request["runtimeGeneration"],
-                "session":response["allowForSession"] == true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response}));
+            let params = json!({"threadId":self.id,"requestId":request["id"],"generation":request["runtimeGeneration"],
+                "requestContract":true,"questionContract":self.native.questionnaire.is_some(),
+                "answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response});
+            match self
+                .remote
+                .as_ref()
+                .expect("remote")
+                .send("request.respond", params)
+            {
+                Ok(id) => self.responding_request = Some(id),
+                Err(error) => self.error = Some(error),
+            }
+            return;
+        }
+        if self.respond_message_question(&response) {
             return;
         }
         if response["cancelled"] == true {
@@ -1456,8 +1861,33 @@ impl Thread {
         let Some(request) = &self.request else {
             return;
         };
+        if request["method"] == "confirm" {
+            let request = request.clone();
+            match self.write_approval_response(&request, response) {
+                Ok(()) => {
+                    self.request = None;
+                    self.forwarded_question = None;
+                    self.native_dialog_done();
+                }
+                Err(error) => self.error = Some(error),
+            }
+            return;
+        }
+        if response.get("feedback").is_some() {
+            self.error = Some(
+                "Feedback requires a live approval that supports it and a decline decision.".into(),
+            );
+            return;
+        }
         response["type"] = "extension_ui_response".into();
         response["id"] = request["id"].clone();
+        if self.harness == "pi"
+            && let Some(fields) = response.as_object_mut()
+        {
+            // Pi's extension transport consumes only its boolean reply, not our contract.
+            fields.remove("decision");
+            fields.remove("allowForSession");
+        }
         let result = self
             .pi
             .as_ref()
@@ -1490,7 +1920,9 @@ impl Thread {
         self.pi = None;
         self.status = Status::Ready;
         self.assistant = None;
-        self.request = None;
+        if self.native.questionnaire.is_none() {
+            self.request = None;
+        }
         self.forwarded_question = None;
         self.initializing = false;
         self.session_started = None;
@@ -1566,6 +1998,10 @@ impl Thread {
             return false;
         }
         let text = self.pending_injections[0].text.clone();
+        if !self.status.busy() || self.run_id.is_none() {
+            self.run_id = Some(uuid::Uuid::new_v4().to_string());
+            self.prompt_suggestion = None;
+        }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
         if !self.command(
             "prompt",
@@ -2071,7 +2507,9 @@ impl Thread {
                 // Context stats are optional telemetry. A rejected or stale request must never
                 // surface as a conversation error, and it must not disturb configuring.
                 if command == "get_session_stats" {
-                    self.context.accept_response(&record);
+                    if self.context.accept_response(&record) {
+                        self.refresh_estimated_breakdown();
+                    }
                     self.drive_session();
                     return;
                 }
@@ -2235,6 +2673,27 @@ impl Thread {
                             return;
                         }
                         if let Some(messages) = record["data"]["messages"].as_array() {
+                            let fresh_boundary = self
+                                .messages
+                                .iter()
+                                .rposition(|m| self.is_fresh_session_message(&m.id));
+                            if let Some(b) = fresh_boundary
+                                && messages.is_empty()
+                                && record["data"]["replaceHistory"] != true
+                                && self.queued_prompt.is_none()
+                                && self.pending_prompt.is_none()
+                                && self.messages.len() > b
+                            {
+                                self.recover_native_inputs();
+                                self.history_loaded = true;
+                                self.drive_session();
+                                return;
+                            }
+                            let saved_queued_id = self
+                                .queued_prompt
+                                .as_ref()
+                                .and_then(|(_, idx)| self.messages.get(*idx).map(|m| m.id.clone()));
+                            let _ = &saved_queued_id;
                             let saved_work = self.work.clone();
                             let saved_orders: std::collections::HashMap<_, _> = self
                                 .tools
@@ -2248,9 +2707,44 @@ impl Thread {
                                 .filter(|t| t.order > 0)
                                 .map(|t| (t.anchor, t.block, t.order))
                                 .collect();
-                            let saved_messages = std::mem::take(&mut self.messages);
-                            self.tools.clear();
-                            self.thoughts.clear();
+                            let mut saved_messages = std::mem::take(&mut self.messages);
+                            let mut prefix_messages = Vec::new();
+                            let mut prefix_tools = Vec::new();
+                            let mut prefix_thoughts = Vec::new();
+                            let mut prefix_work = Vec::new();
+                            let mut prefix_compactions = Vec::new();
+                            let message_offset = fresh_boundary.unwrap_or(0);
+                            if let Some(b) = fresh_boundary {
+                                let keep = b.min(saved_messages.len());
+                                prefix_messages = saved_messages.drain(..keep).collect();
+                                for tool in std::mem::take(&mut self.tools) {
+                                    if tool.anchor.message < keep {
+                                        prefix_tools.push(tool);
+                                    }
+                                }
+                                for thought in std::mem::take(&mut self.thoughts) {
+                                    if thought.anchor.message < keep {
+                                        prefix_thoughts.push(thought);
+                                    }
+                                }
+                                for work in &saved_work {
+                                    if work.start < keep {
+                                        prefix_work.push(work.clone());
+                                    }
+                                }
+                                for compaction in std::mem::take(&mut self.native.compactions) {
+                                    if compaction["anchor"]["message"]
+                                        .as_u64()
+                                        .is_some_and(|m| (m as usize) < keep)
+                                    {
+                                        prefix_compactions.push(compaction);
+                                    }
+                                }
+                            } else {
+                                self.tools.clear();
+                                self.thoughts.clear();
+                                self.native.compactions.clear();
+                            }
                             self.work.clear();
                             self.assistant = None;
                             if let Some(points) = record["data"]["forkMessages"].as_array() {
@@ -2267,8 +2761,16 @@ impl Thread {
                                     .rev()
                                     .collect();
                             }
-                            for (history_index, message) in messages.iter().enumerate() {
-                                self.anchor_compactions(history_index);
+                            let messages = approval_send::history_with_approval_feedback(
+                                messages,
+                                &saved_messages,
+                            );
+                            let mut native_history_index = 0;
+                            for message in &messages {
+                                if message["shinaFeedbackId"].is_null() {
+                                    self.anchor_compactions(native_history_index);
+                                    native_history_index += 1;
+                                }
                                 let role = string(message, "role");
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
@@ -2284,7 +2786,12 @@ impl Thread {
                                             self.ensure_work();
                                         }
                                         self.messages.push(Message {
-                                            id: uuid::Uuid::new_v4().to_string(),
+                                            id: message["shinaFeedbackId"]
+                                                .as_str()
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    uuid::Uuid::new_v4().to_string()
+                                                }),
                                             role: if role != "user" {
                                                 "Pi"
                                             } else if text.starts_with(INJECTION_PREFIX) {
@@ -2344,6 +2851,11 @@ impl Thread {
                                     let found =
                                         saved_messages.iter().enumerate().find(|(i, old)| {
                                             !used.contains(i)
+                                                && if message.id.starts_with("approval-feedback:") {
+                                                    old.id == message.id
+                                                } else {
+                                                    !old.id.starts_with("approval-feedback:")
+                                                }
                                                 && old.role == message.role
                                                 && old.text == message.text
                                         });
@@ -2356,15 +2868,16 @@ impl Thread {
                             for (i, message) in self.messages.iter_mut().enumerate() {
                                 if let Some(id) = identities[i].take() {
                                     message.id = id;
-                                } else if let Some(old) = saved_messages
-                                    .get(i)
-                                    .filter(|old| old.role == message.role && !used.contains(&i))
-                                {
+                                } else if let Some(old) = saved_messages.get(i).filter(|old| {
+                                    old.role == message.role
+                                        && !used.contains(&i)
+                                        && !old.id.starts_with("approval-feedback:")
+                                }) {
                                     used.insert(i);
                                     message.id = old.id.clone();
                                 }
                             }
-                            self.anchor_compactions(messages.len());
+                            self.anchor_compactions(native_history_index);
                             for tool in &mut self.tools {
                                 if let Some(order) = saved_orders.get(&tool.id) {
                                     tool.order = *order;
@@ -2383,24 +2896,59 @@ impl Thread {
                                 if work.outcome.is_none() {
                                     work.outcome = saved_work
                                         .iter()
-                                        .find(|saved| saved.start == work.start)
+                                        .find(|saved| saved.start == work.start + message_offset)
                                         .and_then(|saved| saved.outcome);
                                 }
-                                if let Some(saved) = saved_work
-                                    .iter()
-                                    .find(|saved| saved.start == work.start && saved.stopped)
-                                {
+                                if let Some(saved) = saved_work.iter().find(|saved| {
+                                    saved.start == work.start + message_offset && saved.stopped
+                                }) {
                                     work.stopped = true;
                                     work.stopped_order = saved.stopped_order;
                                     work.elapsed = saved.elapsed;
                                 }
                             }
-                            for saved in saved_work.into_iter().filter(|w| w.stopped) {
-                                if !self.work.iter().any(|w| w.start == saved.start) {
-                                    self.work.push(saved);
+                            for saved in saved_work
+                                .into_iter()
+                                .filter(|w| w.stopped && w.start >= message_offset)
+                            {
+                                let local_start = saved.start - message_offset;
+                                if !self.work.iter().any(|w| w.start == local_start) {
+                                    let mut shifted = saved;
+                                    shifted.start = local_start;
+                                    self.work.push(shifted);
                                 }
                             }
                             self.work.sort_by_key(|w| w.start);
+                            if message_offset > 0 {
+                                for tool in &mut self.tools {
+                                    tool.anchor.message += message_offset;
+                                }
+                                for thought in &mut self.thoughts {
+                                    thought.anchor.message += message_offset;
+                                }
+                                for work in &mut self.work {
+                                    work.start += message_offset;
+                                }
+                                for compaction in &mut self.native.compactions {
+                                    if let Some(m) = compaction["anchor"]["message"].as_u64() {
+                                        compaction["anchor"]["message"] =
+                                            json!(m + message_offset as u64);
+                                    }
+                                }
+                                if let Some(assistant) = &mut self.assistant {
+                                    *assistant += message_offset;
+                                }
+                                prefix_messages.append(&mut self.messages);
+                                self.messages = prefix_messages;
+                                prefix_tools.append(&mut self.tools);
+                                self.tools = prefix_tools;
+                                prefix_thoughts.append(&mut self.thoughts);
+                                self.thoughts = prefix_thoughts;
+                                prefix_work.append(&mut self.work);
+                                self.work = prefix_work;
+                                prefix_compactions.append(&mut self.native.compactions);
+                                self.native.compactions = prefix_compactions;
+                            }
                             // A process can accept a prompt before its response reaches us.
                             // Do not replay it if its unique delivery marker is already saved.
                             self.pending_injections.retain_mut(|injection| {
@@ -2414,8 +2962,20 @@ impl Thread {
                         }
                         if let Some((prompt, index)) = &mut self.queued_prompt {
                             *index = self.messages.len();
+                            let mut id = uuid::Uuid::new_v4().to_string();
+                            if record["data"]["messages"]
+                                .as_array()
+                                .is_some_and(|messages| messages.is_empty())
+                                && let Some(prev_id) =
+                                    self.fresh_session_messages.last().filter(|prev_id| {
+                                        self.messages.iter().all(|m| m.id != **prev_id)
+                                    })
+                            {
+                                id = prev_id.clone();
+                            }
+                            let _ = &id;
                             self.messages.push(Message {
-                                id: uuid::Uuid::new_v4().to_string(),
+                                id,
                                 role: "You",
                                 text: prompt.text.clone(),
                                 images: prompt.images.to_vec(),
@@ -2450,6 +3010,7 @@ impl Thread {
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
                 }
+                self.prompt_suggestion = None;
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
                 self.assistant = None;
@@ -2466,7 +3027,10 @@ impl Thread {
                     self.operation_deadline = None;
                 }
                 self.life.last_completed_at = Some(lifecycle::now());
-                self.request = None;
+                self.expire_live_question("The provider turn ended.");
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 let aborted = record["aborted"] == true;
                 if aborted {
                     self.mark_stopped();
@@ -2474,9 +3038,20 @@ impl Thread {
                     self.resumable_run_id = None;
                 }
                 self.finish_run();
+                if self
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .is_some_and(|form| form.capability == "message")
+                {
+                    self.native.dialog_status = Some(self.status);
+                }
                 // A stopped run is idle, not a finished task.
                 if aborted && self.status == Status::Completed {
                     self.status = Status::Ready;
+                }
+                if aborted || self.status != Status::Completed {
+                    self.prompt_suggestion = None;
                 }
                 self.complete_task(if aborted {
                     "cancelled"
@@ -2490,7 +3065,9 @@ impl Thread {
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
-                self.request = None;
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 self.status = Status::Running;
                 self.assistant();
             }
@@ -2588,6 +3165,9 @@ impl Thread {
             "compaction_end" => {
                 if let Some(error) = record["errorMessage"].as_str() {
                     self.error = Some(error.into());
+                    if !self.native.queue.is_empty() {
+                        self.native.queue_held = true;
+                    }
                 }
                 self.context.finish_compaction();
                 // Pi reports null usage until its next assistant response, so this request
@@ -2623,12 +3203,40 @@ impl Thread {
                     string(&record, "method"),
                     "confirm" | "select" | "input" | "editor"
                 ) {
-                    self.reply.replace_text(string(&record, "prefill"));
+                    self.reply.replace_text(
+                        self.native
+                            .questionnaire
+                            .as_ref()
+                            .map(|form| form.answers[form.index].other.as_str())
+                            .unwrap_or_else(|| string(&record, "prefill")),
+                    );
                     self.request = Some(record);
                     self.refresh_typing_guard();
+                    if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+                        self.draft.focused = false;
+                        self.reply.focused = false;
+                    }
                     self.status = Status::Waiting;
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
+                }
+            }
+            "prompt_suggestion" => {
+                let event_run_id = record["runId"].as_str();
+                if !self.status.busy()
+                    && self.status == Status::Completed
+                    && self.run_id.is_some()
+                    && event_run_id == self.run_id.as_deref()
+                    && crate::harness::supports_prompt_suggestions(&self.harness)
+                {
+                    self.prompt_suggestion = record["text"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| PromptSuggestion {
+                            run_id: event_run_id.unwrap().to_owned(),
+                            text: text.to_owned(),
+                        });
                 }
             }
             _ => {}
@@ -2792,6 +3400,13 @@ impl Thread {
     }
 
     fn restore_prompt(&mut self, prompt: &Prompt) {
+        let split_reply = prompt.draft.as_ref().and_then(|draft| {
+            crate::composer_tokens::split_leading_reply_reference(
+                &prompt.text,
+                Some(&draft.editor()),
+                prompt.context.as_ref(),
+            )
+        });
         let submitted = prompt.draft.as_ref().map_or_else(
             || crate::composer_rich::draft(&prompt.text),
             crate::composer_rich::Snapshot::editor,
@@ -2824,6 +3439,11 @@ impl Thread {
             }
         }
         self.draft_context = context;
+        if self.draft_reply_to.is_none()
+            && let Some((reply_record, _)) = split_reply
+        {
+            self.draft_reply_to = Some(reply_record);
+        }
         self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
     }
 
@@ -2860,8 +3480,19 @@ impl Thread {
             return false;
         }
         let (_, snapshot) = self.remote_send.take().unwrap();
-        if !accepted {
+        let sent_arm = self.remote_send_fresh_arm.take();
+        let sent_reply_to = self.remote_send_reply_to.take();
+        if accepted {
+            if let Some(arm) = sent_arm
+                && self.fresh_session_arm == Some(arm)
+            {
+                self.fresh_session_arm = None;
+            }
+        } else {
             self.restore_snapshot(&snapshot);
+            if self.draft_reply_to.is_none() {
+                self.draft_reply_to = sent_reply_to;
+            }
         }
         true
     }
@@ -2910,6 +3541,24 @@ impl Thread {
                 .map(|start| start.elapsed().as_millis() as u64);
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AssistantSelection {
+    pub thread_id: usize,
+    pub machine: String,
+    pub message_index: usize,
+    pub message_id: String,
+    pub chunk_from: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CitationHighlight {
+    pub machine: String,
+    pub thread_id: usize,
+    pub message_id: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2971,6 +3620,7 @@ pub struct State {
     tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
     requested_tab: Option<(String, usize, u64, Option<usize>)>,
     requested_tab_restore: Option<RequestedTabRestore>,
+    pub dismissed_prompt_suggestions: std::collections::HashSet<(String, usize, String)>,
     undo_tabs: std::collections::HashMap<(String, usize), (usize, bool)>,
     deleted_threads: Vec<Thread>,
     deleted_records: Option<DeletedRecords>,
@@ -3013,6 +3663,7 @@ pub struct State {
     pub delete_thread: Option<usize>,
     pub delete_roots: Vec<usize>,
     pub confirm_remove_attachment: Option<(usize, String)>,
+    answer_remove_scope: Option<String>,
     pub(crate) pending_context_imports: Vec<(String, usize, String)>,
     context_import_rxs: Vec<std::sync::mpsc::Receiver<ContextAssetDownload>>,
     pub project_scope: ProjectScope,
@@ -3025,6 +3676,15 @@ pub struct State {
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
+    pub composer_notices: crate::composer_notices::Store,
+    fresh_arm_seq: u64,
+    keep_full_history_threads: std::collections::HashSet<(String, usize)>,
+    pub plan_menu: Option<String>,
+    pub plan_copied: Option<(String, u64)>,
+    pub plan_expanded: std::collections::HashSet<String>,
+    pub plan_save_dialog: Option<PlanSaveDialog>,
+    pub plan_save_last_path: Option<String>,
+    next_plan_save_request_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
@@ -3073,10 +3733,28 @@ pub struct State {
     pub(crate) attachment_preview: Option<crate::ui::attachment_preview::Preview>,
     pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
+    pub(crate) assistant_selection: Option<AssistantSelection>,
+    pub(crate) citation_highlight: Option<CitationHighlight>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
     pub captain_picker_highlight: usize,
+    pub env_mode_picker: bool,
+    pub base_branch_picker: bool,
+    pub base_branch_query: TextEdit,
+    pub(crate) vcs_branches: std::collections::BTreeMap<(String, String), VcsBranchCacheEntry>,
+    vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
+    worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
+    worktree_setup_rxs: Vec<std::sync::mpsc::Receiver<WorktreeSetupResultMsg>>,
+    #[cfg(test)]
+    pub(crate) test_git_context: Option<crate::vcs::GitContext>,
+    #[cfg(test)]
+    pub(crate) test_connect_workspaces: Vec<(usize, PathBuf)>,
+    #[cfg(test)]
+    pub(crate) test_connect_pi:
+        Option<Box<dyn FnMut(usize, &std::path::Path) -> Option<Pi> + Send>>,
+    next_vcs_request_id: u64,
+    pending_vcs_requests: std::collections::HashMap<u64, (String, String)>,
     pub captain_project: Option<Option<ProjectId>>,
     pub captains: Vec<Captain>,
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
@@ -3097,6 +3775,10 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub pending_open_urls: Vec<String>,
+    pub next_usage_limits_request_id: u64,
+    pub pending_usage_limits_request: Option<(u64, String, usize, String)>,
+    pub usage_limits_notice_key: Option<(String, usize, String)>,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
@@ -3117,6 +3799,7 @@ pub struct State {
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
+    pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
@@ -3189,6 +3872,7 @@ impl State {
             server_epoch: uuid::Uuid::new_v4().to_string(),
             server_seq: 0,
             persist_transcripts: false,
+            dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
@@ -3230,6 +3914,7 @@ impl State {
             delete_thread: None,
             delete_roots: vec![],
             confirm_remove_attachment: None,
+            answer_remove_scope: None,
             pending_context_imports: Vec::new(),
             context_import_rxs: Vec::new(),
             project_scope: ProjectScope::All,
@@ -3241,8 +3926,19 @@ impl State {
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
+            composer_notices: crate::composer_notices::Store::default(),
+            fresh_arm_seq: 0,
+            keep_full_history_threads: Default::default(),
+            plan_menu: None,
+            plan_copied: None,
+            plan_expanded: Default::default(),
+            plan_save_dialog: None,
+            plan_save_last_path: None,
+            next_plan_save_request_id: 0,
             opened_draft: None,
             composer_sources: crate::composer_sources::Sources::default(),
+            assistant_selection: None,
+            citation_highlight: None,
             snooze_menu: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
@@ -3292,6 +3988,21 @@ impl State {
             captain_picker: false,
             captain_picker_query: TextEdit::default(),
             captain_picker_highlight: 0,
+            env_mode_picker: false,
+            base_branch_picker: false,
+            base_branch_query: TextEdit::default(),
+            vcs_branches: Default::default(),
+            vcs_branch_rxs: Vec::new(),
+            worktree_bootstrap_rxs: Vec::new(),
+            worktree_setup_rxs: Vec::new(),
+            #[cfg(test)]
+            test_git_context: None,
+            #[cfg(test)]
+            test_connect_workspaces: Vec::new(),
+            #[cfg(test)]
+            test_connect_pi: None,
+            next_vcs_request_id: 0,
+            pending_vcs_requests: Default::default(),
             captain_project: None,
             captains: Vec::new(),
             captain_scopes: Default::default(),
@@ -3310,6 +4021,10 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            pending_open_urls: Vec::new(),
+            next_usage_limits_request_id: 0,
+            pending_usage_limits_request: None,
+            usage_limits_notice_key: None,
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
             timeline_positions: std::cell::RefCell::default(),
@@ -3323,6 +4038,11 @@ impl State {
             codex_catalog: Default::default(),
             claude_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
+            managed_policy: if cfg!(test) {
+                None
+            } else {
+                read_managed_policy()
+            },
             runtime_enabled: false,
             ownership_denied: false,
             runtime_stop_requested: false,
@@ -3337,6 +4057,7 @@ impl State {
         } else {
             state.projects.next_id = 1;
         }
+        state.threads[0].native.access = state.effective_access_mode(&state.threads[0]);
         if demo {
             state.populate_demo();
         }
@@ -3401,11 +4122,18 @@ impl State {
         let previous = self.active;
         if previous != index && previous < self.threads.len() {
             self.threads[previous].draft.focused = false;
+            self.threads[previous].cancel_questionnaire_advance();
         }
         self.active = index;
+        self.plan_menu = None;
+        self.env_mode_picker = false;
+        self.base_branch_picker = false;
+        self.assistant_selection = None;
+        self.citation_highlight = None;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
+        self.ensure_vcs_branches(false);
         self.selected_threads.clear();
         let id = self.current().id;
         if self.thread_find.open
@@ -3417,6 +4145,15 @@ impl State {
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
         }
+        let current_key = (
+            self.machines.selected.clone(),
+            id,
+            self.current().harness.clone(),
+        );
+        if self.usage_limits_notice_key.as_ref() != Some(&current_key) {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove("usage-limits");
+        }
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
         if !self.headless {
             self.composer_thread_opened();
@@ -3425,6 +4162,8 @@ impl State {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
         }
+        self.sync_fresh_session_notice();
+        self.sync_fallback_model(lifecycle::now() as i64);
         self.checkpoint();
     }
     /// Closing a blank draft also deletes it. Written drafts survive without a tab.
@@ -3777,6 +4516,173 @@ impl State {
         );
         true
     }
+
+    pub(crate) fn cite_assistant_selection(&mut self, tx: &mut Tx) -> bool {
+        let Some(sel) = self.assistant_selection.clone() else {
+            return false;
+        };
+        if self.demo {
+            return false;
+        }
+        let current = self.current();
+        if current.id != sel.thread_id
+            || current.machine != sel.machine
+            || current.archived()
+            || current.request.is_some()
+            || current.native.questionnaire.is_some()
+        {
+            return false;
+        }
+        let Some(message) = current.messages.get(sel.message_index) else {
+            return false;
+        };
+        if message.id != sel.message_id || message.role != "Pi" {
+            return false;
+        }
+        let env_id = self.machine_identity(&current.machine);
+        let thread_id_str = current.id.to_string();
+        let Ok(citation) = crate::assistant_citation::build_assistant_citation_from_selection(
+            &env_id,
+            &thread_id_str,
+            &message.id,
+            &message.text,
+            sel.chunk_from,
+            &sel.text,
+        ) else {
+            return false;
+        };
+        let record =
+            crate::assistant_citation::citation_context_record(citation, &message.id, None);
+        self.current_mut().insert_context_chip(record);
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Inserted);
+        self.assistant_selection = None;
+        tx.clear_text_selection();
+        self.checkpoint();
+        true
+    }
+
+    pub(crate) fn navigate_to_citation(
+        &mut self,
+        citation: &crate::composer_context::AssistantCitation,
+        tx: &mut Tx,
+    ) -> bool {
+        let Ok(id) = citation.thread_id.parse::<usize>() else {
+            return false;
+        };
+        let machine = if citation.environment_id == self.machine_identity("local") {
+            "local".to_owned()
+        } else {
+            citation.environment_id.clone()
+        };
+        self.open_machine_thread(&machine, id);
+        if self.current().id != id || self.machines.selected != machine {
+            return false;
+        }
+        let t = self.current();
+        let msg_idx = t.messages.iter().position(|m| m.id == citation.message_id);
+        let row_key = match msg_idx {
+            Some(idx) if t.messages[idx].role == "Pi" => {
+                let start = t.messages[..=idx]
+                    .iter()
+                    .rposition(|m| m.role != "Pi")
+                    .map_or(0, |i| i + 1);
+                format!("turn-{id}-{}", t.messages[start].id)
+            }
+            _ => format!("row-{id}-{}", citation.message_id),
+        };
+        self.citation_highlight = Some(CitationHighlight {
+            machine,
+            thread_id: id,
+            message_id: citation.message_id.clone(),
+            text: citation.text.clone(),
+        });
+        tx.scroll_center_in(format!("conversation-{id}"), row_key);
+        true
+    }
+
+    pub(crate) fn reply_to_message(&mut self, message_id: &str) -> bool {
+        if self.demo {
+            return false;
+        }
+        let current = self.current();
+        if current.archived() || current.request.is_some() || current.native.questionnaire.is_some()
+        {
+            return false;
+        }
+        let Some(msg_idx) = current
+            .messages
+            .iter()
+            .position(|m| m.id == message_id && m.role == "Pi" && !m.text.trim().is_empty())
+        else {
+            return false;
+        };
+        let message = &current.messages[msg_idx];
+        let Some(opening) =
+            crate::assistant_citation::capture_assistant_message_opening(&message.text)
+        else {
+            return false;
+        };
+        let env_id = self.machine_identity(&current.machine);
+        let thread_id_str = current.id.to_string();
+        let citation = crate::composer_context::AssistantCitation {
+            version: 1,
+            environment_id: env_id,
+            thread_id: thread_id_str,
+            message_id: message.id.clone(),
+            text: opening.text,
+            comment: None,
+            start: opening.start,
+            end: opening.end,
+            prefix: opening.prefix,
+            suffix: opening.suffix,
+        };
+        let subagents = if self.is_captain_home(current) {
+            let turn_start = current.messages[..=msg_idx]
+                .iter()
+                .rposition(|m| m.role != "Pi")
+                .map_or(0, |i| i + 1);
+            let tasks = self.tasks_for(current.id);
+            let mut refs = Vec::new();
+            let mut seen_threads = std::collections::HashSet::new();
+            for tool in &current.tools {
+                if !(turn_start..=msg_idx).contains(&tool.anchor.message)
+                    || (tool.name != "delegate_task" && !tool.name.ends_with("__delegate_task"))
+                {
+                    continue;
+                }
+                let child_id = serde_json::from_str::<Value>(&tool.output)
+                    .ok()
+                    .and_then(|v| v["thread_id"].as_u64())
+                    .or_else(|| tool.structured["thread_id"].as_u64());
+                if let Some(child_id) = child_id
+                    && let Some(task) = tasks.iter().find(|task| task.child_id == child_id as usize)
+                    && seen_threads.insert(task.child_id)
+                {
+                    refs.push(crate::composer_context::ResponseSubagentRef {
+                        thread_id: task.child_id.to_string(),
+                        title: task.title.clone(),
+                        environment_id: task.remote.as_ref().map(|r| r.server_id.clone()),
+                    });
+                }
+            }
+            (!refs.is_empty()).then_some(refs)
+        } else {
+            None
+        };
+        let record =
+            crate::assistant_citation::response_context_record(citation, &message.id, subagents);
+        self.current_mut().draft_reply_to = Some(record);
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Explicit);
+        self.checkpoint();
+        true
+    }
+
+    pub(crate) fn clear_reply_to(&mut self) {
+        if self.current().draft_reply_to.is_some() {
+            self.current_mut().draft_reply_to = None;
+            self.checkpoint();
+        }
+    }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
         thread.captain_home && !thread.delegated
     }
@@ -3789,6 +4695,9 @@ impl State {
                 .ok_or("The remote server has not reported this thread's host directory.".into());
         }
         crate::backend::BackendHost::resolve(&thread.machine)?;
+        if let Some(worktree_path) = &thread.worktree_path {
+            return Ok(PathBuf::from(worktree_path));
+        }
         match thread.project {
             Some(id) => {
                 let project = self
@@ -5510,7 +6419,8 @@ impl State {
             let harness = self.default_harness.clone();
             self.threads[index].harness = harness.clone();
             self.threads[index].native.access =
-                AccessMode::parse(&self.thread_defaults.access).unwrap_or_default();
+                AccessMode::parse(&self.thread_defaults.access).unwrap_or(AccessMode::Supervised);
+            self.threads[index].native.access = self.effective_access_mode(&self.threads[index]);
             if let Some(selection) = self.thread_defaults.models.get(&harness)
                 && !selection.provider.is_empty()
                 && !selection.model.is_empty()
@@ -5532,8 +6442,9 @@ impl State {
         else {
             return;
         };
-        if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-            self.threads[index].native.access = access;
+        if let Some(access) = seed["access"].as_str() {
+            self.threads[index].native.access =
+                AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
         }
         let models = self.harness_models(harness);
         let selection: Option<(String, String)> =
@@ -5546,12 +6457,16 @@ impl State {
             self.inherit_composer(index, &Value::Null);
             // Access inheritance does not depend on model discovery. A missing model
             // must never replace the source thread's read-only mode with a broader default.
-            if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-                self.threads[index].native.access = access;
+            if let Some(access) = seed["access"].as_str() {
+                self.threads[index].native.access =
+                    AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
             }
             return;
         };
         let thread = &mut self.threads[index];
+        if thread.harness != harness {
+            thread.prompt_suggestion = None;
+        }
         thread.harness = harness.into();
         thread.models = models.clone();
         thread.model_provider = model.provider.clone();
@@ -5581,6 +6496,13 @@ impl State {
         {
             thread.harness_state["serviceTier"] = json!(tier);
         }
+        thread.native.access = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        )
+        .1;
+        let clamped = self.effective_access_mode(&self.threads[index]);
+        self.threads[index].native.access = clamped;
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
@@ -5598,8 +6520,9 @@ impl State {
             let mut thread = Thread::new(self.next_id);
             thread.harness = self.default_harness.clone();
             thread.project = project;
+            thread.env_mode = Some(self.effective_default_thread_env_mode());
             if let Some(project) = self.project(project) {
-                thread.machine = project.machine.clone();
+                thread.set_machine(project.machine.clone());
             }
             self.threads.push(thread);
             self.next_id += 1;
@@ -5625,6 +6548,7 @@ impl State {
             }
         }
         self.select_thread(index);
+        self.sync_fallback_model(lifecycle::now() as i64);
     }
     pub fn open_captain(&mut self, captain: usize) {
         if self.forward("captain.open", json!({"captain":captain,"project":self.captain_project.unwrap_or(self.current().project),"assignProject":self.projects.captain_target})) {
@@ -5676,7 +6600,7 @@ impl State {
             thread.captain_home = true;
             thread.native.access = AccessMode::ReadOnly;
             thread.project = project_id;
-            thread.machine = machine;
+            thread.set_machine(machine);
             self.threads.push(thread);
         }
         let index = self
@@ -6098,6 +7022,30 @@ impl State {
                 return;
             }
         };
+        #[cfg(test)]
+        {
+            let tid = self.threads[index].id;
+            self.test_connect_workspaces.push((tid, path.clone()));
+            if let Some(hook) = self.test_connect_pi.as_mut()
+                && let Some(pi) = hook(tid, &path)
+            {
+                let thread = &mut self.threads[index];
+                thread.error = None;
+                if !thread.pending_injections.is_empty() && !thread.status.busy() {
+                    thread.arm_task();
+                    thread.status = Status::Running;
+                    thread.started = None;
+                    thread.phase = "Working".into();
+                } else if thread.status == Status::Failed {
+                    thread.status = Status::Ready;
+                }
+                thread.initializing = false;
+                thread.prewarm_attempted = true;
+                thread.pi = Some(pi);
+                thread.drive_session();
+                return;
+            }
+        }
         if self.threads[index].project.is_none()
             && let Err(error) = std::fs::create_dir_all(&path)
         {
@@ -6143,7 +7091,9 @@ impl State {
                 access_mode: self.threads[index].native.access.id().into(),
             })
         });
+        let prompt_suggestions_enabled = self.thread_defaults.prompt_suggestions_enabled;
         let thread = &mut self.threads[index];
+        thread.prompt_suggestions_enabled = prompt_suggestions_enabled && !thread.delegated;
         match host {
             Ok(host) => thread.host = Some(host),
             Err(error) => {
@@ -6717,7 +7667,20 @@ impl State {
                 records.push(crate::composer_context::attachment_context_record(att));
             }
         }
-        if let Err(error) = attachments::stage_clipboard_files(&mut records, &mut copied_files) {
+        let staged = if self.current().answer_intake {
+            (|| -> Result<(), String> {
+                let files = std::mem::take(&mut copied_files);
+                for (id, file) in files {
+                    let mut single = std::collections::HashMap::from([(id, file)]);
+                    attachments::stage_clipboard_files(&mut records, &mut single)?;
+                    copied_files.extend(single);
+                }
+                Ok(())
+            })()
+        } else {
+            attachments::stage_clipboard_files(&mut records, &mut copied_files)
+        };
+        if let Err(error) = staged {
             self.current_mut().attachment_error = Some(error);
             return None;
         }
@@ -6776,6 +7739,20 @@ impl State {
         content: &rune::ClipboardContent,
         bypass_fold: bool,
     ) -> bool {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            if !self.question_attachments_allowed(self.active) {
+                self.current_mut().attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return true;
+            }
+            return self
+                .with_question_draft(self.active, scope, |s| {
+                    s.paste_composer_content(content, bypass_fold)
+                })
+                .unwrap_or(true);
+        }
         let has_image = content.image().is_some();
         if let Some(image) = content.image() {
             self.attach_image_with_options("Pasted image.png", image.png(), bypass_fold);
@@ -6792,6 +7769,17 @@ impl State {
             self.attach_paths(content.files());
         }
         if !content.text().is_empty() && !has_image && !claim_files {
+            if self.current().answer_intake
+                && self
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .is_some_and(|f| f.questions[f.index].initial_answer.is_some())
+            {
+                self.current_mut().draft.insert(content.text());
+                return true;
+            }
             if !bypass_fold && self.fold_paste(content.text()) {
                 return true;
             }
@@ -6812,6 +7800,16 @@ impl State {
                 &self.current().draft_context,
                 &self.current().draft_images,
             );
+            if self.current().answer_intake
+                && outcome
+                    .imported_records
+                    .iter()
+                    .any(|r| !matches!(r.kind(), "thread" | "file" | "image"))
+            {
+                self.current_mut().attachment_error =
+                    Some("Answer or dismiss the question first, then add it to chat.".into());
+                return true;
+            }
             for rec in outcome.imported_records {
                 let t = self.current_mut();
                 if let Some(existing) = t
@@ -6841,6 +7839,15 @@ impl State {
         target_thread_id: usize,
         pending: crate::composer_context::PendingAttachmentImport,
     ) {
+        if self.current().answer_intake
+            && self.current().question_reserved_count() >= attachments::MAX_ATTACHMENTS
+        {
+            self.current_mut().attachment_error = Some(format!(
+                "You can attach up to {} files per message.",
+                attachments::MAX_ATTACHMENTS
+            ));
+            return;
+        }
         let (attachment_id, name, mime_type, kind) = match &pending.record.data {
             crate::composer_context::ComposerContextData::Image {
                 attachment_id,
@@ -6989,6 +7996,16 @@ impl State {
         let wake = self.wake.clone();
         let target_machine = target_machine.to_owned();
         let new_context_id = pending.new_context_id.clone();
+        let question_scope = self
+            .threads
+            .iter()
+            .find(|t| t.id == target_thread_id)
+            .and_then(|t| t.answer_scope.clone());
+        if let Some(scope) = &question_scope
+            && let Some(t) = self.threads.iter_mut().find(|t| t.id == target_thread_id)
+        {
+            t.question_drafts.entry(scope.clone()).or_default().pending += 1;
+        }
         self.pending_context_imports.push((
             target_machine.clone(),
             target_thread_id,
@@ -7010,6 +8027,7 @@ impl State {
                 mime_type,
                 kind,
                 result,
+                question_scope,
             });
             wake();
         });
@@ -7028,15 +8046,46 @@ impl State {
                             && *tid == download.thread_id
                             && cid == &download.new_context_id)
                     });
-                    self.apply_imported_attachment_bytes(
-                        &download.machine,
-                        download.thread_id,
-                        &download.new_context_id,
-                        &download.name,
-                        &download.mime_type,
-                        download.kind,
-                        download.result,
-                    );
+                    if let Some(scope) = download.question_scope {
+                        if download.machine == self.machines.selected
+                            && let Some(index) =
+                                self.threads.iter().position(|t| t.id == download.thread_id)
+                        {
+                            if let Some(draft) = self.threads[index].question_drafts.get_mut(&scope)
+                            {
+                                draft.pending = draft.pending.saturating_sub(1);
+                            }
+                            self.with_question_draft(index, scope, |s| {
+                                s.apply_imported_attachment_bytes(
+                                    &download.machine,
+                                    download.thread_id,
+                                    &download.new_context_id,
+                                    &download.name,
+                                    &download.mime_type,
+                                    download.kind,
+                                    download.result,
+                                )
+                            });
+                        } else if let Some(t) = self
+                            .machines
+                            .threads
+                            .get_mut(&download.machine)
+                            .and_then(|ts| ts.iter_mut().find(|t| t.id == download.thread_id))
+                            && let Some(draft) = t.question_drafts.get_mut(&scope)
+                        {
+                            draft.pending = draft.pending.saturating_sub(1);
+                        }
+                    } else {
+                        self.apply_imported_attachment_bytes(
+                            &download.machine,
+                            download.thread_id,
+                            &download.new_context_id,
+                            &download.name,
+                            &download.mime_type,
+                            download.kind,
+                            download.result,
+                        );
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
@@ -7080,7 +8129,12 @@ impl State {
                 return;
             }
         };
-        if t.draft_images.len() >= attachments::MAX_ATTACHMENTS {
+        if (if t.answer_intake {
+            t.question_reserved_count()
+        } else {
+            t.draft_images.len()
+        }) >= attachments::MAX_ATTACHMENTS
+        {
             t.attachment_error = Some(format!(
                 "Couldn't bring {name} into this message. The attachment limit has been reached. Remove the chip or attach the file again."
             ));
@@ -7135,8 +8189,14 @@ impl State {
             Some("Open a real workspace before attaching files.".into())
         } else if self.threads[index].archived() {
             Some("Restore this thread before attaching files.".into())
-        } else if self.threads[index].request.is_some() {
-            Some("Answer the current question before attaching files.".into())
+        } else if !self.threads[index].answer_intake
+            && !self.threads[index].request_held_by_typing_guard()
+            && self.threads[index]
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+        {
+            Some("This question cannot accept attachments.".into())
         } else if self.threads[index].status.busy() {
             if self.threads[index].native.operating() {
                 Some("Wait for the current operation before attaching files.".into())
@@ -7162,11 +8222,16 @@ impl State {
             && self.pasted_text_staging_supported()
             && self.file_attachment_staging_supported_on(&self.machines.selected)
             && self.attachment_guard(self.active).is_none()
-            && self.current().draft_images.len()
-                + self
-                    .attachment_uploads
+            && (if self.current().answer_intake {
+                self.current().question_reserved_count()
+            } else {
+                self.current().draft_images.len()
+            }) + if self.current().answer_intake {
+                0
+            } else {
+                self.attachment_uploads
                     .preparing_count(&self.machines.selected, self.current().id)
-                < attachments::MAX_ATTACHMENTS;
+            } < attachments::MAX_ATTACHMENTS;
         let maximum = self
             .file_attachment_staging_limit_on(&self.machines.selected)
             .unwrap_or(attachments::MAX_FILE_BYTES);
@@ -7257,6 +8322,17 @@ impl State {
         let Some(index) = self.threads.iter().position(|t| t.id == thread) else {
             return;
         };
+        if !self.threads[index].answer_intake
+            && let Some(scope) = self.threads[index].question_scope()
+        {
+            if !self.question_attachments_allowed(index) {
+                self.threads[index].attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return;
+            }
+            self.with_question_draft(index, scope, |s| s.attach_paths_to(thread, paths));
+            return;
+        }
         if let Some(error) = self.attachment_guard(index) {
             self.threads[index].attachment_error = Some(error);
             return;
@@ -7363,7 +8439,11 @@ impl State {
                 )
             });
             if replacement.is_none()
-                && self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS
+                && (if self.threads[index].answer_intake {
+                    self.threads[index].question_reserved_count()
+                } else {
+                    self.threads[index].draft_images.len()
+                }) >= attachments::MAX_ATTACHMENTS
             {
                 errors.push(format!(
                     "You can attach up to {} files per message.",
@@ -7371,7 +8451,9 @@ impl State {
                 ));
                 break;
             }
-            if self.background.handle.is_some() {
+            // Question drafts retain main's request-scoped, send-time upload path.
+            // The ordinary tray queue owns thread drafts, not question answer scopes.
+            if self.background.handle.is_some() && !self.threads[index].answer_intake {
                 self.enqueue_attachment_path(index, path.clone());
                 continue;
             }
@@ -7419,11 +8501,24 @@ impl State {
         self.attach_image_with_options(name, bytes, false);
     }
     pub fn attach_image_with_options(&mut self, name: &str, bytes: &[u8], skip_inline_chip: bool) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            if !self.question_attachments_allowed(self.active) {
+                self.current_mut().attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return;
+            }
+            self.with_question_draft(self.active, scope, |s| {
+                s.attach_image_with_options(name, bytes, skip_inline_chip)
+            });
+            return;
+        }
         if let Some(error) = self.attachment_guard(self.active) {
             self.current_mut().attachment_error = Some(error);
             return;
         }
-        if self.background.handle.is_some() {
+        if self.background.handle.is_some() && !self.current().answer_intake {
             self.current_mut().attachment_error = None;
             self.enqueue_attachment_image(
                 self.active,
@@ -7459,9 +8554,18 @@ impl State {
         self.checkpoint();
     }
     pub fn request_remove_attachment(&mut self, id: &str) {
-        if self.attachment_uploads.entries.iter().any(|entry| {
-            entry.id == id && matches!(entry.phase, crate::attachment_uploads::Phase::Preparing)
-        }) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            self.answer_remove_scope = Some(scope.clone());
+            self.with_question_draft(self.active, scope, |s| s.request_remove_attachment(id));
+            return;
+        }
+        if !self.current().answer_intake
+            && self.attachment_uploads.entries.iter().any(|entry| {
+                entry.id == id && matches!(entry.phase, crate::attachment_uploads::Phase::Preparing)
+            })
+        {
             self.remove_attachment(id);
             return;
         }
@@ -7481,6 +8585,18 @@ impl State {
         self.remove_attachment(id);
     }
     pub fn confirm_remove_attachment_dialog(&mut self) {
+        if let Some(scope) = self.answer_remove_scope.clone()
+            && !self.current().answer_intake
+        {
+            if self.current().question_scope().as_ref() != Some(&scope) {
+                self.confirm_remove_attachment = None;
+                self.answer_remove_scope = None;
+                return;
+            }
+            self.with_question_draft(self.active, scope, |s| s.confirm_remove_attachment_dialog());
+            self.answer_remove_scope = None;
+            return;
+        }
         let Some((thread_id, id)) = self.confirm_remove_attachment.take() else {
             return;
         };
@@ -7520,14 +8636,24 @@ impl State {
         t.draft_context.retain(|r| r.context_id != ctx_id);
         t.retained_context.records.remove(&ctx_id);
         t.remove_attachment(&id);
-        self.attachment_uploads
-            .remove(&self.machines.selected, thread_id, &id);
+        if !t.answer_intake {
+            self.attachment_uploads
+                .remove(&self.machines.selected, thread_id, &id);
+        }
         self.checkpoint();
     }
     pub fn remove_attachment(&mut self, id: &str) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            self.with_question_draft(self.active, scope, |s| s.remove_attachment(id));
+            return;
+        }
         let thread = self.current().id;
-        self.attachment_uploads
-            .remove(&self.machines.selected, thread, id);
+        if !self.current().answer_intake {
+            self.attachment_uploads
+                .remove(&self.machines.selected, thread, id);
+        }
         self.current_mut().remove_attachment(id);
         self.checkpoint();
     }
@@ -7602,6 +8728,179 @@ impl State {
         self.toasts.len() != before
     }
 
+    pub(crate) fn thread_workspace_path(&self, thread_id: usize) -> Option<String> {
+        let thread = self.threads.iter().find(|t| t.id == thread_id)?;
+        thread.project?;
+        if self.client.is_some() && thread.machine != "local" {
+            return self.client_views["directories"][thread.id.to_string()]
+                .as_str()
+                .map(str::to_owned);
+        }
+        self.project(thread.project)
+            .filter(|project| project.machine == thread.machine)
+            .map(|project| project.path.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn can_write_project_file(&self, thread: &Thread) -> bool {
+        !self.demo
+            && self.thread_workspace_path(thread.id).is_some()
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::PROJECT_WRITE_FILE)
+            })
+    }
+
+    pub(crate) fn is_plan_copied(&self, card_id: &str) -> bool {
+        self.plan_copied
+            .as_ref()
+            .is_some_and(|(id, expires)| id == card_id && *expires > lifecycle::now())
+    }
+
+    pub(crate) fn mark_plan_copied(&mut self, card_id: String, tx: &mut Tx) {
+        self.plan_copied = Some((card_id, lifecycle::now().saturating_add(2_000)));
+        tx.wake_after(Duration::from_secs(2));
+    }
+
+    pub(crate) fn toggle_plan_expanded(&mut self, card_id: &str) {
+        if !self.plan_expanded.remove(card_id) {
+            self.plan_expanded.insert(card_id.to_owned());
+        }
+    }
+
+    pub(crate) fn open_plan_save_dialog(&mut self, thread_id: usize, plan_markdown: &str) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == thread_id) else {
+            return;
+        };
+        if !self.can_write_project_file(thread) {
+            return;
+        }
+        let Some(cwd) = self.thread_workspace_path(thread_id) else {
+            return;
+        };
+        let machine = thread.machine.clone();
+        let initial_path = self.plan_save_last_path.clone().unwrap_or_else(|| {
+            crate::plan_export::build_proposed_plan_markdown_filename(plan_markdown)
+        });
+        let mut path_edit = TextEdit::default();
+        path_edit.replace_text(&initial_path);
+        path_edit.focused = true;
+        self.plan_save_dialog = Some(PlanSaveDialog {
+            machine,
+            cwd,
+            contents: crate::plan_export::normalize_plan_markdown_for_export(plan_markdown),
+            path_edit,
+            saving: false,
+            request_id: None,
+        });
+    }
+
+    pub(crate) fn close_plan_save_dialog(&mut self) {
+        if !self.plan_save_dialog.as_ref().is_some_and(|d| d.saving) {
+            self.plan_save_dialog = None;
+        }
+    }
+
+    pub(crate) fn submit_plan_save(&mut self) {
+        let Some(dialog) = self.plan_save_dialog.as_mut() else {
+            return;
+        };
+        if dialog.saving {
+            return;
+        }
+        let raw_path = dialog.path_edit.text.clone();
+        let relative_path = raw_path.trim().to_owned();
+        if relative_path.is_empty() {
+            self.push_toast(
+                ToastKind::Warning,
+                "Enter a workspace path",
+                None,
+                None,
+                Some(5_000),
+            );
+            return;
+        }
+        self.plan_save_last_path = Some(raw_path);
+        self.next_plan_save_request_id += 1;
+        let req_id = self.next_plan_save_request_id;
+        dialog.saving = true;
+        dialog.request_id = Some(req_id);
+        let machine = dialog.machine.clone();
+        let cwd = dialog.cwd.clone();
+        let contents = dialog.contents.clone();
+        if let Some(client) = &self.client {
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                self.apply_plan_save_result(req_id, Err("Machine unavailable.".into()));
+                return;
+            };
+            if !target.has_capability(crate::protocol::PROJECT_WRITE_FILE) {
+                self.apply_plan_save_result(
+                    req_id,
+                    Err("This server needs an update to save plans to the workspace.".into()),
+                );
+                return;
+            }
+            target.call_rpc(
+                format!("write-plan:{req_id}"),
+                "project.writeFile",
+                json!({
+                    "cwd": cwd,
+                    "relativePath": relative_path,
+                    "contents": contents,
+                }),
+            );
+        } else if machine != "local" {
+            self.apply_plan_save_result(req_id, Err("Machine unavailable.".into()));
+        } else {
+            let result =
+                crate::projects::write_project_file(&crate::protocol::ProjectWriteFileInput {
+                    cwd,
+                    relative_path,
+                    contents,
+                });
+            self.apply_plan_save_result(req_id, result);
+        }
+    }
+
+    pub(crate) fn apply_plan_save_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::protocol::ProjectWriteFileResult, String>,
+    ) {
+        let Some(dialog) = self.plan_save_dialog.as_mut() else {
+            return;
+        };
+        if dialog.request_id != Some(req_id) {
+            return;
+        }
+        match result {
+            Ok(written) => {
+                self.plan_save_dialog = None;
+                self.push_toast(
+                    ToastKind::Success,
+                    "Plan saved to workspace",
+                    Some(written.relative_path),
+                    None,
+                    Some(5_000),
+                );
+            }
+            Err(error) => {
+                dialog.saving = false;
+                dialog.request_id = None;
+                self.push_toast(
+                    ToastKind::Error,
+                    "Could not save plan",
+                    Some(error),
+                    None,
+                    Some(5_000),
+                );
+            }
+        }
+    }
+
     pub(crate) fn notify_background_started(&mut self, server: &str, thread_id: usize) {
         self.push_toast(
             ToastKind::Success,
@@ -7659,6 +8958,10 @@ impl State {
     /// on a draft thread, starts in the background and opens a fresh composer; on an existing
     /// thread, dispatches the turn and opens a new draft once accepted.
     pub fn send_background(&mut self) {
+        self.send_background_intent(false);
+    }
+
+    fn send_background_intent(&mut self, approval_redirect: bool) {
         let source_index = self.active;
         let source_id = self.current().id;
         let was_draft = self.current().is_draft();
@@ -7666,7 +8969,7 @@ impl State {
         let seed = self.composer_seed();
         let server = self.machines.selected.clone();
 
-        if !self.dispatch_send() {
+        if !self.dispatch_send_intent(true, approval_redirect) {
             return;
         }
         if self.client.is_some() {
@@ -7734,7 +9037,1564 @@ impl State {
         }
     }
 
+    pub(crate) fn fresh_session_available(&self, thread: &Thread) -> bool {
+        !self.demo
+            && !thread.messages.is_empty()
+            && crate::harness::supports_fresh_context(&thread.harness)
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::FRESH_CONTEXT)
+            })
+    }
+
+    pub(crate) fn fresh_session_command_available(&self, thread: &Thread) -> bool {
+        self.fresh_session_available(thread)
+            && thread.request.is_none()
+            && thread.native.questionnaire.is_none()
+    }
+
+    pub fn usage_limits_command_available(&self, thread: &Thread) -> bool {
+        !self.demo
+            && crate::usage_limits::has_usage_limits(&thread.harness)
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::USAGE_LIMITS)
+            })
+    }
+
+    pub fn slash_matches(&self) -> Vec<pi_session::SlashCommand> {
+        self.current().slash_matches_with_capabilities(
+            self.fresh_session_command_available(self.current()),
+            self.usage_limits_command_available(self.current()),
+        )
+    }
+
+    pub fn effective_default_thread_env_mode(&self) -> ThreadEnvMode {
+        if self.client.is_some() {
+            self.machines
+                .views
+                .get(&self.machines.selected)
+                .and_then(|v| {
+                    serde_json::from_value::<ThreadEnvMode>(
+                        v["index"]["threadDefaults"]["default_thread_env_mode"].clone(),
+                    )
+                    .ok()
+                })
+                .unwrap_or(self.thread_defaults.default_thread_env_mode)
+        } else {
+            self.thread_defaults.default_thread_env_mode
+        }
+    }
+
+    pub fn effective_env_mode(&self, thread: &Thread) -> ThreadEnvMode {
+        if thread.worktree_path.is_some() {
+            return ThreadEnvMode::Worktree;
+        }
+        if !thread.messages.is_empty() {
+            return ThreadEnvMode::Local;
+        }
+        thread
+            .env_mode
+            .unwrap_or_else(|| self.effective_default_thread_env_mode())
+    }
+
+    pub fn supports_vcs_worktrees_on(&self, machine: &str) -> bool {
+        self.client.as_ref().is_none_or(|client| {
+            client.supports_capability(machine, crate::protocol::VCS_WORKTREES)
+        })
+    }
+
+    pub fn thread_vcs_repo_key(&self, thread: &Thread) -> Option<(String, String)> {
+        if thread.captain_home && !thread.delegated {
+            return None;
+        }
+        let project = self.project(thread.project)?;
+        let machine = if self.client.is_some() {
+            self.machines.selected.clone()
+        } else {
+            thread.machine.clone()
+        };
+        Some((machine, project.path.to_string_lossy().into_owned()))
+    }
+
+    pub fn composer_vcs_controls(&self) -> ComposerVcsControls {
+        if self.demo {
+            return ComposerVcsControls::Hidden;
+        }
+        let thread = self.current();
+        let Some((machine, project_path)) = self.thread_vcs_repo_key(thread) else {
+            return ComposerVcsControls::Hidden;
+        };
+        if !self.supports_vcs_worktrees_on(&machine) {
+            return ComposerVcsControls::Hidden;
+        }
+        if let Some(worktree_path) = &thread.worktree_path {
+            return ComposerVcsControls::LockedWorktree {
+                branch: thread.branch.clone(),
+                worktree_path: worktree_path.clone(),
+            };
+        }
+        if !thread.messages.is_empty() {
+            return ComposerVcsControls::Hidden;
+        }
+        let is_repo = self
+            .vcs_branches
+            .get(&(machine, project_path))
+            .is_some_and(|entry| entry.is_repo);
+        if !is_repo {
+            return ComposerVcsControls::Hidden;
+        }
+        ComposerVcsControls::Editable {
+            mode: self.effective_env_mode(thread),
+            base_branch: thread.base_branch.clone(),
+            start_from_origin: thread.effective_start_from_origin(),
+        }
+    }
+
+    pub fn ensure_vcs_branches(&mut self, force_refresh: bool) {
+        if self.demo {
+            return;
+        }
+        if !force_refresh && !self.runtime_enabled && self.client.is_none() {
+            return;
+        }
+        let Some((machine, project_path)) = self.thread_vcs_repo_key(self.current()) else {
+            return;
+        };
+        if !self.supports_vcs_worktrees_on(&machine) {
+            return;
+        }
+        let key = (machine.clone(), project_path.clone());
+        if let Some(entry) = self.vcs_branches.get(&key)
+            && (entry.loading || (entry.loaded && !force_refresh))
+        {
+            return;
+        }
+        if let Some(client) = &self.client {
+            if !self.machine_connected(&machine) {
+                return;
+            }
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                return;
+            };
+            self.vcs_branches.entry(key.clone()).or_default().loading = true;
+            self.next_vcs_request_id += 1;
+            let req_id = self.next_vcs_request_id;
+            self.pending_vcs_requests.insert(req_id, key);
+            let input = crate::vcs::VcsListBranchesInput {
+                cwd: project_path,
+                query: None,
+                cursor: None,
+                include_matching_remote_refs: None,
+                ref_kind: None,
+                refresh: force_refresh.then_some(true),
+                limit: Some(crate::vcs::GIT_LIST_BRANCHES_MAX_LIMIT),
+            };
+            if let Ok(params) = serde_json::to_value(&input) {
+                target.call_rpc(format!("vcs-branches:{req_id}"), "vcs.listBranches", params);
+            }
+            return;
+        }
+        self.vcs_branches.entry(key).or_default().loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.vcs_branch_rxs.push(rx);
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            let input = crate::vcs::VcsListBranchesInput {
+                cwd: project_path.clone(),
+                query: None,
+                cursor: None,
+                include_matching_remote_refs: None,
+                ref_kind: None,
+                refresh: force_refresh.then_some(true),
+                limit: Some(crate::vcs::GIT_LIST_BRANCHES_MAX_LIMIT),
+            };
+            let result = crate::vcs::list_branches(&input);
+            let _ = tx.send(VcsBranchResultMsg {
+                machine,
+                project_path,
+                result,
+            });
+            wake();
+        });
+    }
+
+    pub fn poll_vcs_branches(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.vcs_branch_rxs.len());
+        let rxs = std::mem::take(&mut self.vcs_branch_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    self.apply_vcs_branches_result(msg.machine, msg.project_path, msg.result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.vcs_branch_rxs = remaining;
+        changed
+    }
+
+    pub(crate) fn apply_vcs_branches_result(
+        &mut self,
+        machine: String,
+        project_path: String,
+        result: Result<crate::vcs::VcsListBranchesResult, String>,
+    ) {
+        let key = (machine.clone(), project_path.clone());
+        let entry = self.vcs_branches.entry(key.clone()).or_default();
+        entry.loading = false;
+        entry.loaded = true;
+        match result {
+            Ok(res) => {
+                entry.is_repo = res.is_repo;
+                entry.error = None;
+                entry.refs = res.refs;
+            }
+            Err(err) => {
+                entry.error = Some(err);
+            }
+        }
+        let default_branch = if entry.is_repo {
+            crate::branch_toolbar::default_worktree_base_branch(&entry.refs, None)
+        } else {
+            None
+        };
+        if let Some(default_branch) = default_branch {
+            let mut updated_active = false;
+            let default_mode = self.effective_default_thread_env_mode();
+            for index in 0..self.threads.len() {
+                let matches = self.thread_vcs_repo_key(&self.threads[index]).as_ref() == Some(&key);
+                if matches {
+                    let t = &self.threads[index];
+                    let mode = if t.worktree_path.is_some() {
+                        ThreadEnvMode::Worktree
+                    } else if !t.messages.is_empty() {
+                        ThreadEnvMode::Local
+                    } else {
+                        t.env_mode.unwrap_or(default_mode)
+                    };
+                    if t.messages.is_empty()
+                        && t.worktree_path.is_none()
+                        && mode == ThreadEnvMode::Worktree
+                        && t.base_branch.is_none()
+                    {
+                        self.threads[index].base_branch = Some(default_branch.clone());
+                        if index == self.active {
+                            updated_active = true;
+                        }
+                    }
+                }
+            }
+            if updated_active {
+                self.checkpoint();
+            }
+        }
+    }
+
+    pub(crate) fn handle_vcs_branches_rpc(&mut self, req_id: u64, result: Result<Value, String>) {
+        let Some((machine, project_path)) = self.pending_vcs_requests.remove(&req_id) else {
+            return;
+        };
+        let parsed = result.and_then(|val| {
+            serde_json::from_value::<crate::vcs::VcsListBranchesResult>(val)
+                .map_err(|e| format!("Invalid vcs.listBranches response: {e}"))
+        });
+        self.apply_vcs_branches_result(machine, project_path, parsed);
+    }
+
+    pub fn set_draft_env_mode(&mut self, mode: ThreadEnvMode) {
+        let t = self.current();
+        if !t.messages.is_empty() || t.worktree_path.is_some() {
+            return;
+        }
+        let default_branch = self.thread_vcs_repo_key(t).and_then(|key| {
+            self.vcs_branches
+                .get(&key)
+                .filter(|entry| entry.is_repo)
+                .and_then(|entry| {
+                    crate::branch_toolbar::default_worktree_base_branch(&entry.refs, None)
+                })
+        });
+        let thread = self.current_mut();
+        thread.env_mode = Some(mode);
+        if mode == ThreadEnvMode::Local {
+            if thread.submission_error.as_deref()
+                == Some("Select a base branch before sending in New worktree mode.")
+            {
+                thread.submission_error = None;
+            }
+        } else {
+            if thread.base_branch.is_none() {
+                thread.base_branch = default_branch;
+            }
+            // Do not keep an idle prewarmed session in the main checkout once switched to worktree.
+            if thread.pi.is_some() && thread.session.is_none() && thread.messages.is_empty() {
+                thread.disconnect();
+                thread.prewarm_attempted = false;
+            }
+        }
+        self.env_mode_picker = false;
+        if mode == ThreadEnvMode::Worktree {
+            self.ensure_vcs_branches(false);
+        }
+        self.checkpoint();
+    }
+
+    pub fn set_draft_base_branch(&mut self, branch: String) {
+        let thread = self.current_mut();
+        if !thread.messages.is_empty() || thread.worktree_path.is_some() {
+            return;
+        }
+        thread.base_branch = Some(branch);
+        if thread.submission_error.as_deref()
+            == Some("Select a base branch before sending in New worktree mode.")
+        {
+            thread.submission_error = None;
+        }
+        self.base_branch_picker = false;
+        self.checkpoint();
+    }
+
+    pub fn set_draft_start_from_origin(&mut self, start_from_origin: bool) {
+        let thread = self.current_mut();
+        if !thread.messages.is_empty() || thread.worktree_path.is_some() {
+            return;
+        }
+        thread.start_from_origin = Some(start_from_origin);
+        self.checkpoint();
+    }
+
+    pub(crate) fn missing_worktree_base_branch_error(&self, thread: &Thread) -> Option<String> {
+        let should_create = !thread.worktree_bootstrapping()
+            && !thread.native.queue_held
+            && thread.messages.is_empty()
+            && thread.worktree_path.is_none()
+            && thread.project.is_some()
+            && !self.is_captain_home(thread)
+            && self.effective_env_mode(thread) == ThreadEnvMode::Worktree;
+        if should_create
+            && thread
+                .base_branch
+                .as_deref()
+                .is_none_or(|b| b.trim().is_empty())
+        {
+            Some("Select a base branch before sending in New worktree mode.".into())
+        } else {
+            None
+        }
+    }
+
+    fn build_current_prompt(&mut self) -> Option<Prompt> {
+        if self.current().harness == "pi"
+            && !self.current().model_provider.is_empty()
+            && self.current().model_provider != "cpa"
+        {
+            self.current_mut().error = Some(
+                "Choose a CPA model before sending. Shina will not send prompts to a direct provider."
+                    .into(),
+            );
+            return None;
+        }
+        if self.current().draft_images.iter().any(Attachment::is_image)
+            && self.current().supports_images == Some(false)
+        {
+            let err = self.current().image_model_error();
+            self.current_mut().attachment_error = Some(err);
+            return None;
+        }
+        let local_server_id = self.machine_identity(&self.machines.selected);
+        let peers = self.peers.clone();
+        let labels: Vec<(String, String)> = peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+            self.current().draft_reply_to.as_ref(),
+            Some(&self.current().machine),
+            Some(&local_server_id),
+            &peers,
+            &|m| {
+                if m == "local" {
+                    "Local".into()
+                } else {
+                    labels
+                        .iter()
+                        .find(|(id, _)| id == m)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| m.to_owned())
+                }
+            },
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.current_mut().attachment_error = Some(error);
+                return None;
+            }
+        };
+        if !self.headless
+            && let Some(error) = self.current().validate_prompt_length(&prompt)
+        {
+            self.current_mut().submission_error = Some(error);
+            return None;
+        }
+        self.current_mut().submission_error = None;
+        Some(prompt)
+    }
+
+    fn try_worktree_bootstrap_send(
+        &mut self,
+        fresh_context: bool,
+        fresh_arm: Option<u64>,
+    ) -> Option<bool> {
+        let queue_behind_bootstrap = self.current().worktree_bootstrapping()
+            || (self.current().native.queue_held
+                && self.current().worktree_path.is_some()
+                && !self.current().status.busy());
+        if queue_behind_bootstrap {
+            let prompt = match self.build_current_prompt() {
+                Some(p) => p,
+                None => return Some(false),
+            };
+            let thread = self.current_mut();
+            thread.prompt_history.reset();
+            thread.typing_guard.on_blur_or_send();
+            thread.paste_history = Default::default();
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.draft_reply_to = None;
+            thread.retained_context = Default::default();
+            thread.native.queue_held = true;
+            thread.serial += 1;
+            let queued_id = thread.serial;
+            if fresh_context {
+                thread.native.fresh_queue_ids.insert(queued_id);
+            }
+            thread.native.queue.push_back(pi_session::QueuedMessage {
+                id: queued_id,
+                prompt,
+            });
+            thread.life.user_sent(lifecycle::now());
+            let id = thread.id;
+            let server = self.machines.selected.clone();
+            self.set_keep_full_history(&server, id, false);
+            if let Some(arm) = fresh_arm {
+                self.disarm_fresh_session(id, Some(arm));
+            }
+            self.checkpoint();
+            return Some(true);
+        }
+
+        let is_first_worktree = self.current().messages.is_empty()
+            && self.current().worktree_path.is_none()
+            && self.current().project.is_some()
+            && !self.is_captain_home(self.current())
+            && self.effective_env_mode(self.current()) == ThreadEnvMode::Worktree;
+        if !is_first_worktree {
+            return None;
+        }
+
+        if let Some(error) = self.missing_worktree_base_branch_error(self.current()) {
+            self.current_mut().submission_error = Some(error);
+            return Some(false);
+        }
+        let base_branch = self
+            .current()
+            .base_branch
+            .clone()
+            .map(|b| b.trim().to_owned())
+            .filter(|b| !b.is_empty())?;
+        let prompt = match self.build_current_prompt() {
+            Some(p) => p,
+            None => return Some(false),
+        };
+        let project_cwd = self
+            .project(self.current().project)
+            .map(|p| p.path.clone())?;
+        let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+        );
+        let thread = self.current_mut();
+        let reply_to = thread.draft_reply_to.take();
+        let start_from_origin = thread.effective_start_from_origin();
+        thread.prompt_history.reset();
+        thread.typing_guard.on_blur_or_send();
+        thread.paste_history = Default::default();
+        thread.draft.replace_text("");
+        thread.draft_images.clear();
+        thread.draft_context.clear();
+        thread.retained_context = Default::default();
+        thread.error = None;
+        thread.attachment_error = None;
+        if thread.pi.is_some() && thread.session.is_none() {
+            thread.disconnect();
+            thread.prewarm_attempted = false;
+        }
+        thread.native.queue_held = true;
+        thread.serial += 1;
+        let queued_id = thread.serial;
+        if fresh_context {
+            thread.native.fresh_queue_ids.insert(queued_id);
+        }
+        thread.native.queue.push_back(pi_session::QueuedMessage {
+            id: queued_id,
+            prompt,
+        });
+        thread.worktree_bootstrap = Some(WorktreeBootstrapState {
+            snapshot,
+            reply_to,
+            queued_id,
+            fresh_context,
+        });
+        let thread_id = thread.id;
+        let server = self.machines.selected.clone();
+        self.set_keep_full_history(&server, thread_id, false);
+        self.invalidate_undo(thread_id);
+        if let Some(arm) = fresh_arm {
+            self.disarm_fresh_session(thread_id, Some(arm));
+        }
+
+        let worktrees_dir = self.data_dir.join("worktrees");
+        let wake = self.wake.clone();
+        #[cfg(test)]
+        let git_ctx = self.test_git_context.clone().unwrap_or_default();
+        #[cfg(not(test))]
+        let git_ctx = crate::vcs::GitContext::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worktree_bootstrap_rxs.push(rx);
+        std::thread::spawn(move || {
+            let cwd_str = project_cwd.to_string_lossy().into_owned();
+            let raw_branch = crate::vcs::build_temporary_worktree_branch_name(
+                &uuid::Uuid::new_v4().simple().to_string(),
+            );
+            let new_branch =
+                crate::vcs::resolve_available_branch_name_with(&project_cwd, &raw_branch, &git_ctx)
+                    .unwrap_or(raw_branch);
+            let result = crate::vcs::create_worktree_with(
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: cwd_str,
+                    ref_name: base_branch.clone(),
+                    new_ref_name: Some(new_branch),
+                    base_ref_name: Some(base_branch.clone()),
+                    path: None,
+                    start_from_origin: Some(start_from_origin),
+                },
+                &worktrees_dir,
+                &git_ctx,
+            );
+            let _ = tx.send(WorktreeBootstrapResult {
+                thread_id,
+                base_branch,
+                result,
+            });
+            wake();
+        });
+        self.checkpoint();
+        Some(true)
+    }
+
+    pub fn poll_worktree_bootstraps(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.worktree_bootstrap_rxs.len());
+        let rxs = std::mem::take(&mut self.worktree_bootstrap_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    let Some(index) = self.threads.iter().position(|t| t.id == msg.thread_id)
+                    else {
+                        continue;
+                    };
+                    let Some(boot) = self.threads[index].worktree_bootstrap.take() else {
+                        continue;
+                    };
+                    match msg.result {
+                        Ok(created) => {
+                            let project_cwd = self
+                                .project(self.threads[index].project)
+                                .map(|p| p.path.clone());
+                            let wt_path = PathBuf::from(&created.worktree.path);
+                            let script_check = project_cwd
+                                .as_deref()
+                                .map(|cwd| crate::vcs::find_setup_script_info(&wt_path, cwd));
+                            let thread = &mut self.threads[index];
+                            thread.worktree_path = Some(created.worktree.path.clone());
+                            thread.branch = Some(created.worktree.ref_name.clone());
+                            thread.base_branch = Some(msg.base_branch);
+                            thread.env_mode = Some(ThreadEnvMode::Worktree);
+                            thread.submission_error = None;
+                            thread.worktree_bootstrap_fresh_context = boot.fresh_context;
+                            thread.life.user_sent(lifecycle::now());
+                            if boot.fresh_context {
+                                self.persist_transcripts = true;
+                            }
+                            match script_check {
+                                Some(Ok(Some((script_name, script_command)))) => {
+                                    thread.worktree_setup = Some(WorktreeSetupState {
+                                        phase: WorktreeSetupPhase::Running,
+                                        script_name: Some(script_name),
+                                        script_command: Some(script_command),
+                                        error: None,
+                                        output: String::new(),
+                                        exit_code: None,
+                                        timed_out: false,
+                                        duration_ms: 0,
+                                        skipped: false,
+                                    });
+                                    thread.worktree_setup_output_open = false;
+                                    thread.native.queue_held = true;
+                                    let tid = thread.id;
+                                    self.spawn_worktree_setup_runner(tid);
+                                }
+                                Some(Err(error)) => {
+                                    thread.worktree_setup = Some(WorktreeSetupState {
+                                        phase: WorktreeSetupPhase::Failed,
+                                        script_name: None,
+                                        script_command: None,
+                                        error: Some(error),
+                                        output: String::new(),
+                                        exit_code: None,
+                                        timed_out: false,
+                                        duration_ms: 0,
+                                        skipped: false,
+                                    });
+                                    thread.worktree_setup_output_open = true;
+                                    thread.native.queue_held = true;
+                                }
+                                _ => {
+                                    thread.native.queue_held = false;
+                                    self.release_after_worktree_setup(index);
+                                }
+                            }
+                            self.checkpoint();
+                        }
+                        Err(error) => {
+                            let thread = &mut self.threads[index];
+                            thread.native.queue.retain(|q| q.id != boot.queued_id);
+                            thread.native.fresh_queue_ids.remove(&boot.queued_id);
+                            thread.native.queue_held = false;
+                            thread.worktree_path = None;
+                            thread.branch = None;
+                            thread.env_mode = Some(ThreadEnvMode::Worktree);
+                            thread.restore_snapshot(&boot.snapshot);
+                            if thread.draft_reply_to.is_none() {
+                                thread.draft_reply_to = boot.reply_to;
+                            }
+                            thread.submission_error = Some(error);
+                            self.checkpoint();
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.worktree_bootstrap_rxs = remaining;
+        changed
+    }
+
+    fn release_after_worktree_setup(&mut self, index: usize) {
+        if index >= self.threads.len() {
+            return;
+        }
+        if self.threads[index].worktree_bootstrap_fresh_context {
+            self.persist_transcripts = true;
+        }
+        self.threads[index].native.queue_held = false;
+        if self.runtime_enabled || self.threads[index].pi.is_some() {
+            if self.threads[index].pi.is_none() {
+                self.connect_thread(index);
+            }
+            if self.threads[index].pi.is_some() {
+                self.threads[index].drive_session();
+            }
+        }
+    }
+
+    fn spawn_worktree_setup_runner(&mut self, thread_id: usize) {
+        let Some(index) = self.threads.iter().position(|t| t.id == thread_id) else {
+            return;
+        };
+        let Some(project_cwd) = self
+            .project(self.threads[index].project)
+            .map(|p| p.path.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let Some(wt_path) = self.threads[index].worktree_path.clone() else {
+            return;
+        };
+        self.threads[index].worktree_setup_seq =
+            self.threads[index].worktree_setup_seq.saturating_add(1);
+        let run_seq = self.threads[index].worktree_setup_seq;
+        let wake = self.wake.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worktree_setup_rxs.push(rx);
+        std::thread::spawn(move || {
+            let result = crate::vcs::run_setup(&crate::vcs::VcsRunSetupInput {
+                cwd: project_cwd,
+                worktree_path: Some(wt_path),
+                timeout_ms: None,
+            });
+            let _ = tx.send(WorktreeSetupResultMsg {
+                thread_id,
+                run_seq,
+                result,
+            });
+            wake();
+        });
+    }
+
+    pub fn poll_worktree_setup(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.worktree_setup_rxs.len());
+        let rxs = std::mem::take(&mut self.worktree_setup_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    let Some(index) = self.threads.iter().position(|t| t.id == msg.thread_id)
+                    else {
+                        continue;
+                    };
+                    if self.threads[index].worktree_setup_seq != msg.run_seq {
+                        continue;
+                    }
+                    match msg.result {
+                        Ok(res) if res.status == "no_script" => {
+                            self.threads[index].worktree_setup = None;
+                            self.release_after_worktree_setup(index);
+                        }
+                        Ok(res) if res.exit_code == Some(0) && !res.timed_out => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Succeeded,
+                                script_name: res.script_name.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_name.clone())
+                                }),
+                                script_command: res.script_command.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_command.clone())
+                                }),
+                                error: None,
+                                output: res.output,
+                                exit_code: res.exit_code,
+                                timed_out: false,
+                                duration_ms: res.duration_ms,
+                                skipped: false,
+                            });
+                            self.release_after_worktree_setup(index);
+                        }
+                        Ok(res) => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            let error = if res.timed_out {
+                                "Setup script timed out.".to_owned()
+                            } else if let Some(code) = res.exit_code {
+                                format!("Setup script exited with code {code}.")
+                            } else {
+                                "Setup script failed.".to_owned()
+                            };
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Failed,
+                                script_name: res.script_name.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_name.clone())
+                                }),
+                                script_command: res.script_command.or_else(|| {
+                                    existing.as_ref().and_then(|s| s.script_command.clone())
+                                }),
+                                error: Some(error),
+                                output: res.output,
+                                exit_code: res.exit_code,
+                                timed_out: res.timed_out,
+                                duration_ms: res.duration_ms,
+                                skipped: false,
+                            });
+                            self.threads[index].worktree_setup_output_open = true;
+                            self.threads[index].native.queue_held = true;
+                        }
+                        Err(error) => {
+                            let existing = self.threads[index].worktree_setup.take();
+                            self.threads[index].worktree_setup = Some(WorktreeSetupState {
+                                phase: WorktreeSetupPhase::Failed,
+                                script_name: existing.as_ref().and_then(|s| s.script_name.clone()),
+                                script_command: existing
+                                    .as_ref()
+                                    .and_then(|s| s.script_command.clone()),
+                                error: Some(error),
+                                output: existing.map(|s| s.output).unwrap_or_default(),
+                                exit_code: None,
+                                timed_out: false,
+                                duration_ms: 0,
+                                skipped: false,
+                            });
+                            self.threads[index].worktree_setup_output_open = true;
+                            self.threads[index].native.queue_held = true;
+                        }
+                    }
+                    self.checkpoint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.worktree_setup_rxs = remaining;
+        changed
+    }
+
+    pub fn retry_worktree_setup(&mut self) {
+        if self.forward("thread.worktreeSetup", json!({"action": "retry"})) {
+            return;
+        }
+        let thread = self.current_mut();
+        let Some(setup) = thread.worktree_setup.as_mut() else {
+            return;
+        };
+        if setup.phase != WorktreeSetupPhase::Failed || thread.worktree_path.is_none() {
+            return;
+        }
+        setup.phase = WorktreeSetupPhase::Running;
+        setup.error = None;
+        setup.output.clear();
+        setup.exit_code = None;
+        setup.timed_out = false;
+        setup.duration_ms = 0;
+        setup.skipped = false;
+        thread.native.queue_held = true;
+        let tid = thread.id;
+        self.spawn_worktree_setup_runner(tid);
+        self.checkpoint();
+    }
+
+    pub fn skip_worktree_setup(&mut self) {
+        if self.forward("thread.worktreeSetup", json!({"action": "skip"})) {
+            return;
+        }
+        let index = self.active;
+        let thread = &mut self.threads[index];
+        let Some(setup) = thread.worktree_setup.as_mut() else {
+            return;
+        };
+        if setup.phase == WorktreeSetupPhase::Succeeded {
+            return;
+        }
+        thread.worktree_setup_seq = thread.worktree_setup_seq.saturating_add(1);
+        setup.phase = WorktreeSetupPhase::Succeeded;
+        setup.skipped = true;
+        setup.error = None;
+        self.release_after_worktree_setup(index);
+        self.checkpoint();
+    }
+
+    pub fn open_external_url(&mut self, url: &str) {
+        self.pending_open_urls.push(url.to_owned());
+    }
+
+    pub fn open_usage_limits(&mut self) -> bool {
+        let machine = self.machines.selected.clone();
+        let thread = self.current();
+        let thread_id = thread.id;
+        let harness = thread.harness.clone();
+        let client_draft = thread.client_draft;
+        if !self.usage_limits_command_available(thread) {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        }
+        if let Some(client) = &self.client {
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            };
+            if !target.has_capability(crate::protocol::USAGE_LIMITS) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            }
+            self.next_usage_limits_request_id += 1;
+            let req_id = self.next_usage_limits_request_id;
+            self.pending_usage_limits_request = Some((req_id, machine, thread_id, harness.clone()));
+            let params = if client_draft {
+                json!({"threadId": thread_id, "draft": true, "harness": harness})
+            } else {
+                json!({"threadId": thread_id})
+            };
+            target.call_rpc(format!("usage-limits:{req_id}"), "usage.limits", params);
+            return true;
+        }
+
+        let catalog = match harness.as_str() {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            _ => None,
+        };
+        let hs = &thread.harness_state;
+        let usage_limits = (!hs["usageLimits"].is_null())
+            .then_some(&hs["usageLimits"])
+            .or_else(|| catalog.map(|c| &c.usage_limits).filter(|v| !v.is_null()));
+        let usage_limits_raw = (!hs["usageLimitsRaw"].is_null())
+            .then_some(&hs["usageLimitsRaw"])
+            .or_else(|| {
+                catalog
+                    .map(|c| &c.usage_limits_raw)
+                    .filter(|v| !v.is_null())
+            });
+        let usage_account = (!hs["usageAccount"].is_null())
+            .then_some(&hs["usageAccount"])
+            .or_else(|| catalog.map(|c| &c.usage_account).filter(|v| !v.is_null()));
+        let Some(report) = crate::usage_limits::build_usage_limits_report(
+            crate::usage_limits::UsageLimitsReportInput {
+                harness: &harness,
+                now_ms: lifecycle::now() as i64,
+                usage_limits,
+                usage_limits_raw,
+                usage_account,
+            },
+        ) else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        };
+        self.show_usage_limits_report(report);
+        true
+    }
+
+    pub(crate) fn apply_usage_limits_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::usage_limits::UsageLimitsReport, String>,
+    ) {
+        let Some((pending_id, machine, thread_id, harness)) =
+            self.pending_usage_limits_request.as_ref()
+        else {
+            return;
+        };
+        if *pending_id != req_id {
+            return;
+        }
+        let matches_current = self.machines.selected == *machine
+            && self.current().id == *thread_id
+            && self.current().harness == *harness;
+        self.pending_usage_limits_request = None;
+        if !matches_current {
+            return;
+        }
+        match result {
+            Ok(report) => self.show_usage_limits_report(report),
+            Err(_) => {
+                self.usage_limits_notice_key = None;
+                self.composer_notices.remove("usage-limits");
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+            }
+        }
+    }
+
+    pub fn show_usage_limits_report(&mut self, report: crate::usage_limits::UsageLimitsReport) {
+        let description = if report.accounts.len() == 1 {
+            report
+                .accounts
+                .first()
+                .map(crate::usage_limits::account_summary)
+        } else {
+            Some(format!("{} accounts", report.accounts.len()))
+        };
+        self.usage_limits_notice_key = Some((
+            self.machines.selected.clone(),
+            self.current().id,
+            self.current().harness.clone(),
+        ));
+        self.composer_notices.remove("usage-limits");
+        self.composer_notices.push(
+            crate::composer_notices::Notice::new(
+                "usage-limits",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                "Usage limits",
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(description)
+            .body(crate::composer_notices::NoticeBody::UsageLimits(report))
+            .dismiss_label("Dismiss usage limits"),
+        );
+    }
+
+    pub fn redeem_usage_reset_credit(
+        &mut self,
+        input: crate::usage_limits::ProviderConsumeResetCreditInput,
+    ) {
+        let _ = input;
+        if self.client.is_none() && self.current().harness == "codex" && self.current().pi.is_some()
+        {
+            let key = uuid::Uuid::new_v4().to_string();
+            self.current_mut()
+                .command("consume_reset_credit", json!({"idempotencyKey": key}));
+            return;
+        }
+        self.push_toast(
+            ToastKind::Error,
+            "Could not use the reset credit.",
+            None,
+            None,
+            Some(5_000),
+        );
+    }
+
+    pub fn arm_fresh_session(&mut self, thread_id: usize) {
+        self.fresh_arm_seq = self.fresh_arm_seq.saturating_add(1).max(1);
+        let arm = self.fresh_arm_seq;
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.fresh_session_arm = Some(arm);
+        }
+        self.sync_fresh_session_notice();
+    }
+
+    pub fn disarm_fresh_session(&mut self, thread_id: usize, expected_arm: Option<u64>) {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id)
+            && expected_arm.is_none_or(|arm| thread.fresh_session_arm == Some(arm))
+        {
+            thread.fresh_session_arm = None;
+        }
+        self.sync_fresh_session_notice();
+    }
+
+    pub fn dismiss_composer_notice(&mut self, id: &str) {
+        if id == "fresh-session" {
+            let thread_id = self.current().id;
+            self.disarm_fresh_session(thread_id, None);
+            self.composer_notices.remove(id);
+            self.checkpoint();
+        } else if id == "usage-limits" {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove(id);
+        } else {
+            self.composer_notices.dismiss(id);
+        }
+    }
+
+    pub fn fallback_model_candidates(&self) -> Vec<crate::model_selection::ModelSelection> {
+        let entries = self.provider_instance_entries();
+        let models_by_instance = self.picker_models_by_instance();
+        let mut out = Vec::new();
+        // Order non-default providers first so toggling on prefers an alternate provider.
+        let mut ordered_entries = entries.clone();
+        ordered_entries.sort_by_key(|e| e.instance_id == self.default_harness);
+        for entry in ordered_entries {
+            if !entry.enabled || !entry.is_available {
+                continue;
+            }
+            if let Some(opts) = models_by_instance.get(&entry.instance_id)
+                && !opts.is_empty()
+            {
+                for opt in opts {
+                    out.push(crate::model_selection::ModelSelection {
+                        instance_id: entry.instance_id.clone(),
+                        model: opt.slug.clone(),
+                        options: Vec::new(),
+                    });
+                }
+            } else {
+                out.push(crate::model_selection::ModelSelection {
+                    instance_id: entry.instance_id.clone(),
+                    model: crate::model_selection::default_model_by_provider(&entry.driver_kind)
+                        .to_owned(),
+                    options: Vec::new(),
+                });
+            }
+        }
+        out
+    }
+
+    fn default_model_selection_for_fallback(
+        &self,
+    ) -> Option<crate::model_selection::ModelSelection> {
+        let harness = &self.default_harness;
+        if let Some(def) = self.thread_defaults.models.get(harness)
+            && !def.model.trim().is_empty()
+        {
+            let mut options = Vec::new();
+            if !def.effort.trim().is_empty() {
+                let key = if harness == "codex" {
+                    "reasoningEffort"
+                } else {
+                    "effort"
+                };
+                options.push(crate::model_selection::ProviderOptionSelection {
+                    id: key.into(),
+                    value: crate::model_selection::OptionValue::Str(def.effort.clone()),
+                });
+            }
+            return Some(crate::model_selection::ModelSelection {
+                instance_id: harness.clone(),
+                model: def.model.clone(),
+                options,
+            });
+        }
+        let models = self.harness_models(harness);
+        let model = models
+            .iter()
+            .find(|m| m.is_default)
+            .or_else(|| models.first())
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                crate::model_selection::default_model_by_provider(harness).to_owned()
+            });
+        Some(crate::model_selection::ModelSelection {
+            instance_id: harness.clone(),
+            model,
+            options: Vec::new(),
+        })
+    }
+
+    fn provider_usage_windows(
+        &self,
+        harness: &str,
+        now_ms: i64,
+    ) -> Vec<crate::usage_limits::ServerProviderUsageWindow> {
+        if !crate::usage_limits::has_usage_limits(harness) {
+            return Vec::new();
+        }
+        let catalog = match harness {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            _ => None,
+        };
+        let thread = if self.current().harness == harness {
+            Some(self.current())
+        } else {
+            self.threads.iter().find(|t| {
+                t.harness == harness
+                    && (!t.harness_state["usageLimitsRaw"].is_null()
+                        || !t.harness_state["usageLimits"].is_null())
+            })
+        };
+        let hs = thread.map(|t| &t.harness_state);
+        let usage_limits = hs
+            .map(|h| &h["usageLimits"])
+            .filter(|v| !v.is_null())
+            .or_else(|| catalog.map(|c| &c.usage_limits).filter(|v| !v.is_null()));
+        let usage_limits_raw = hs
+            .map(|h| &h["usageLimitsRaw"])
+            .filter(|v| !v.is_null())
+            .or_else(|| {
+                catalog
+                    .map(|c| &c.usage_limits_raw)
+                    .filter(|v| !v.is_null())
+            });
+        let usage_account = hs
+            .map(|h| &h["usageAccount"])
+            .filter(|v| !v.is_null())
+            .or_else(|| catalog.map(|c| &c.usage_account).filter(|v| !v.is_null()));
+        crate::usage_limits::build_usage_limits_report(
+            crate::usage_limits::UsageLimitsReportInput {
+                harness,
+                now_ms,
+                usage_limits,
+                usage_limits_raw,
+                usage_account,
+            },
+        )
+        .and_then(|r| r.accounts.into_iter().next())
+        .map(|a| a.limits.windows)
+        .unwrap_or_default()
+    }
+
+    fn friendly_model_name(&self, harness: &str, model_id: &str) -> String {
+        if self.current().harness == harness
+            && let Some(m) = self.current().models.iter().find(|m| m.id == model_id)
+        {
+            return m.name.clone();
+        }
+        self.harness_models(harness)
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.name)
+            .unwrap_or_else(|| model_id.to_owned())
+    }
+
+    fn apply_selection_to_thread(
+        &mut self,
+        index: usize,
+        selection: &crate::model_selection::ModelSelection,
+    ) {
+        let prev_active = self.active;
+        self.active = index;
+        if self.threads[index].harness != selection.instance_id {
+            self.choose_harness(&selection.instance_id);
+        }
+        let provider = if selection.instance_id == "pi" {
+            "cpa".to_owned()
+        } else {
+            selection.instance_id.clone()
+        };
+        let models = self.harness_models(&selection.instance_id);
+        if self.threads[index].models.is_empty() && !models.is_empty() {
+            self.threads[index].models = models;
+        }
+        self.threads[index].set_model(provider, selection.model.clone());
+        for opt in &selection.options {
+            self.threads[index].set_option(opt.id.clone(), opt.value.clone());
+        }
+        self.reconcile_current_access_mode();
+        self.active = prev_active;
+    }
+
+    pub fn use_default_from_fallback(&mut self) {
+        let Some(info) = self.current().fallback_active.clone() else {
+            return;
+        };
+        self.current_mut().fallback_active = None;
+        self.current_mut().fallback_explicit_override = true;
+        self.apply_selection_to_thread(self.active, &info.default_selection);
+        self.composer_notices.sync("fallback-model", None);
+        self.checkpoint();
+    }
+
+    /// Evaluates KSG's new-thread fallback rule for the active thread and syncs the
+    /// `fallback-model` composer notice.
+    pub(crate) fn sync_fallback_model(&mut self, now_ms: i64) -> bool {
+        let t = self.current();
+        let eligible = !self.demo
+            && t.messages.is_empty()
+            && t.life.latest_user_message_at.is_none()
+            && t.session.is_none()
+            && !t.fallback_explicit_override;
+        if !eligible {
+            self.current_mut().fallback_active = None;
+            return self.composer_notices.sync("fallback-model", None);
+        }
+        let Some(fallback_sel) = self.thread_defaults.fallback_model_selection.clone() else {
+            if let Some(prev) = self.current_mut().fallback_active.take() {
+                self.apply_selection_to_thread(self.active, &prev.default_selection);
+            }
+            return self.composer_notices.sync("fallback-model", None);
+        };
+        let default_sel = self
+            .current()
+            .fallback_active
+            .as_ref()
+            .map(|f| f.default_selection.clone())
+            .or_else(|| self.default_model_selection_for_fallback());
+        let entries = self.provider_instance_entries();
+        let windows_by_id: Vec<(String, Vec<crate::usage_limits::ServerProviderUsageWindow>)> =
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.instance_id.clone(),
+                        self.provider_usage_windows(&e.instance_id, now_ms),
+                    )
+                })
+                .collect();
+        let candidates: Vec<crate::usage_limits::ProviderFallbackCandidate<'_>> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::usage_limits::ProviderFallbackCandidate {
+                instance_id: &e.instance_id,
+                driver_kind: &e.driver_kind,
+                display_name: &e.display_name,
+                enabled: e.enabled,
+                installed: e.installed,
+                authenticated: !matches!(
+                    e.auth_status,
+                    crate::model_picker::ProviderAuthStatus::Unauthenticated
+                ),
+                is_available: e.is_available,
+                windows: &windows_by_id[i].1,
+            })
+            .collect();
+        let res = crate::usage_limits::resolve_new_thread_model_selection(
+            default_sel.as_ref(),
+            None,
+            Some(&fallback_sel),
+            &candidates,
+            now_ms,
+        );
+        if let (Some(target_sel), Some(info)) = (res.selection, res.fallback) {
+            let needs_apply = self.current().fallback_active.as_ref() != Some(&info)
+                || self.current().harness != target_sel.instance_id
+                || self.current().model_id != target_sel.model;
+            if needs_apply {
+                self.apply_selection_to_thread(self.active, &target_sel);
+                self.current_mut().fallback_active = Some(info.clone());
+            }
+            let fallback_model_name =
+                self.friendly_model_name(&target_sel.instance_id, &target_sel.model);
+            let default_model_name = self.friendly_model_name(
+                &info.default_selection.instance_id,
+                &info.default_selection.model,
+            );
+            let resets_suffix = info
+                .resets_at
+                .as_deref()
+                .and_then(crate::usage_limits::format_reset_clock_iso)
+                .map(|clock| format!(" · resets {clock}"))
+                .unwrap_or_default();
+            let notice = crate::composer_notices::Notice::new(
+                "fallback-model",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                format!("Using {fallback_model_name}"),
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(Some(format!(
+                "{} is out of usage{resets_suffix}",
+                info.default_provider_name
+            )))
+            .actions(vec![crate::composer_notices::NoticeAction::new(
+                format!("Use {default_model_name}"),
+                |s| s.use_default_from_fallback(),
+            )])
+            .dismiss_label("Dismiss fallback model notice");
+            self.composer_notices.sync("fallback-model", Some(notice))
+        } else {
+            if let Some(prev) = self.current_mut().fallback_active.take() {
+                self.apply_selection_to_thread(self.active, &prev.default_selection);
+            }
+            self.composer_notices.sync("fallback-model", None)
+        }
+    }
+
+    pub(crate) fn sync_fresh_session_notice(&mut self) -> bool {
+        let t = self.current();
+        let show =
+            self.fresh_session_available(t) && t.fresh_session_arm.is_some() && t.request.is_none();
+        let notice = show.then(|| {
+            crate::composer_notices::Notice::new(
+                "fresh-session",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                "Your next message starts a fresh session",
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(Some(
+                "The agent won't see earlier messages in this thread.".into(),
+            ))
+            .dismiss_label("Keep the current session")
+        });
+        self.composer_notices.sync("fresh-session", notice)
+    }
+
+    pub(crate) fn keep_full_history(&self, thread: &Thread) -> bool {
+        self.keep_full_history_threads
+            .contains(&(self.machines.selected.clone(), thread.id))
+    }
+
+    pub(crate) fn set_keep_full_history(&mut self, server: &str, thread_id: usize, keep: bool) {
+        let key = (server.to_owned(), thread_id);
+        if keep {
+            self.keep_full_history_threads.insert(key);
+        } else {
+            self.keep_full_history_threads.remove(&key);
+        }
+    }
+
+    pub fn toggle_keep_full_history(&mut self) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        let next = !self.keep_full_history(self.current());
+        self.set_keep_full_history(&server, thread_id, next);
+    }
+
+    /// Ported from KSG Code's `compactBeforeSendTokens` / `resumeCompactionTokens`
+    /// (`packages/client-runtime/src/state/contextWindow.ts` and `ChatView.tsx`).
+    pub(crate) fn resume_compaction_tokens(&self, thread: &Thread, now_ms: u64) -> Option<u64> {
+        if self.demo {
+            return None;
+        }
+        if self.fresh_session_available(thread) && thread.fresh_session_arm.is_some() {
+            return None;
+        }
+        if thread.archived()
+            || thread.status.busy()
+            || thread.initializing
+            || thread.configuring
+            || thread.native.operating()
+            || thread.context.phase == crate::context::ContextPhase::Compacting
+            || thread.native.queue_held
+            || thread.request.is_some()
+            || thread.native.questionnaire.is_some()
+            || !crate::harness::supports_compaction(&thread.harness)
+        {
+            return None;
+        }
+        let has_prior_turn = thread.session.is_some()
+            || thread.messages.iter().any(|m| {
+                m.role == "You"
+                    && (!m.text.trim().eq_ignore_ascii_case("/compact") || !m.images.is_empty())
+            });
+        if !has_prior_turn {
+            return None;
+        }
+        let used_tokens = thread.context.usage.tokens?;
+        crate::context::should_offer_resume_compaction(crate::context::ResumeCompactionInput {
+            harness: &thread.harness,
+            used_tokens: Some(used_tokens),
+            updated_at_ms: thread.context.updated_at,
+            prompt_cache_ttl_ms: thread.context.prompt_cache_ttl_ms,
+            now_ms,
+        })
+        .then_some(used_tokens)
+    }
+
+    pub fn prompt_suggestions_enabled(&self) -> bool {
+        if self.client.is_some() {
+            self.machines
+                .views
+                .get(&self.machines.selected)
+                .and_then(|v| v["index"]["threadDefaults"]["prompt_suggestions_enabled"].as_bool())
+                .unwrap_or(self.thread_defaults.prompt_suggestions_enabled)
+        } else {
+            self.thread_defaults.prompt_suggestions_enabled
+        }
+    }
+
+    /// Ported condition by condition from KSG Code's `usePromptSuggestion.ts` and `ChatComposer.tsx`.
+    pub fn offered_prompt_suggestion(&self) -> Option<&str> {
+        if !self.prompt_suggestions_enabled()
+            || self.demo
+            || self.ownership_denied
+            || self.unreachable_selected().is_some()
+        {
+            return None;
+        }
+        let t = self.current();
+        if t.delegated
+            || t.archived()
+            || t.offline_blocked
+            || t.status != Status::Completed
+            || t.configuring
+            || t.initializing
+            || t.phase == "Stopping"
+            || t.remote_send.is_some()
+            || t.client_creating.is_some()
+            || t.queued_edit.is_some()
+            || t.request.is_some()
+            || t.native.questionnaire.is_some()
+            || !t.draft.text.is_empty()
+            || t.draft.is_composing()
+            || t.draft.pills().next().is_some()
+            || !t.draft_images.is_empty()
+            || !t.draft_context.is_empty()
+            || t.draft_reply_to.is_some()
+            || !crate::harness::supports_prompt_suggestions(&t.harness)
+        {
+            return None;
+        }
+        let run_id = t.run_id.as_deref()?;
+        let suggestion = t.prompt_suggestion.as_ref()?;
+        if suggestion.run_id != run_id || suggestion.text.trim().is_empty() {
+            return None;
+        }
+        if self
+            .dismissed_prompt_suggestions
+            .contains(&(t.machine.clone(), t.id, run_id.to_owned()))
+        {
+            return None;
+        }
+        Some(suggestion.text.as_str())
+    }
+
+    pub fn dismiss_prompt_suggestion(&mut self) -> bool {
+        if self.offered_prompt_suggestion().is_none() {
+            return false;
+        }
+        let machine = self.current().machine.clone();
+        let thread_id = self.current().id;
+        if let Some(run_id) = self.current().run_id.clone() {
+            self.dismissed_prompt_suggestions
+                .insert((machine, thread_id, run_id));
+            return true;
+        }
+        false
+    }
+
+    pub fn accept_prompt_suggestion(&mut self) -> bool {
+        let Some(text) = self.offered_prompt_suggestion().map(str::to_owned) else {
+            return false;
+        };
+        let t = self.current_mut();
+        t.draft.anchor = 0;
+        t.draft.focus = 0;
+        t.draft.insert(&text);
+        t.native.slash_index = 0;
+        t.composer_rules.changed(&mut t.draft);
+        t.reconcile_draft_context();
+        t.typing_guard.on_type(std::time::Instant::now());
+        t.update_submission_error();
+        self.ensure_composer_commands();
+        self.checkpoint();
+        true
+    }
+
     fn dispatch_send(&mut self) -> bool {
+        self.dispatch_send_full(false, false, None, None)
+    }
+
+    pub(crate) fn dispatch_send_with_options(
+        &mut self,
+        forced_fresh_context: Option<bool>,
+        forced_compact_before_send: Option<bool>,
+    ) -> bool {
+        self.dispatch_send_full(
+            false,
+            false,
+            forced_fresh_context,
+            forced_compact_before_send,
+        )
+    }
+
+    fn dispatch_send_intent(&mut self, background: bool, approval_redirect: bool) -> bool {
+        self.dispatch_send_full(background, approval_redirect, None, None)
+    }
+
+    fn dispatch_send_full(
+        &mut self,
+        background: bool,
+        approval_redirect: bool,
+        forced_fresh_context: Option<bool>,
+        forced_compact_before_send: Option<bool>,
+    ) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
@@ -7749,7 +10609,7 @@ impl State {
             );
             return false;
         }
-        if self.current().resume_pending() {
+        if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
         }
         if self.current().queued_edit.is_some() {
@@ -7774,9 +10634,97 @@ impl State {
             self.checkpoint();
             return false;
         }
-        if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
+        if self.current().approval_send.is_some() {
             return false;
         }
+        if !self.headless
+            && !self.current().request_held_by_typing_guard()
+            && (self.current().native.questionnaire.is_some()
+                || self
+                    .current()
+                    .request
+                    .as_ref()
+                    .is_some_and(|r| r["method"] != "confirm"))
+        {
+            return false;
+        }
+        if self.current().request.is_some() {
+            if self.current().draft.text.trim() == "/model" {
+                self.choose_slash("model".into());
+                return false;
+            }
+            if self.client.is_none() && self.handle_composer_local_command() {
+                return false;
+            }
+            if !self.approval_send_is_local_command()
+                && !approval_redirect
+                && !self.headless
+                && !self.current().request_held_by_typing_guard()
+            {
+                if let Some(error) = self.approval_send_command_error() {
+                    self.current_mut().error = Some(error);
+                    return false;
+                }
+                return self.begin_approval_send(background);
+            }
+        }
+        self.reconcile_current_access_mode();
+        let fresh_session_available = self.fresh_session_available(self.current());
+        let draft_markdown = crate::composer_rich::markdown(&self.current().draft);
+        let composer_holds_only_text = self.current().draft_images.is_empty()
+            && self.current().draft_context.is_empty()
+            && self.current().draft_reply_to.is_none()
+            && self.current().draft.pills().next().is_none();
+        if forced_fresh_context.is_none()
+            && fresh_session_available
+            && composer_holds_only_text
+            && is_clear_command(&draft_markdown)
+        {
+            let thread_id = self.current().id;
+            self.arm_fresh_session(thread_id);
+            let t = self.current_mut();
+            t.prompt_history.reset();
+            t.typing_guard.on_blur_or_send();
+            t.paste_history = Default::default();
+            t.draft.replace_text("");
+            t.submission_error = None;
+            t.attachment_error = None;
+            self.checkpoint();
+            return false;
+        }
+        if composer_holds_only_text
+            && self.usage_limits_command_available(self.current())
+            && crate::usage_limits::is_usage_limits_command(&draft_markdown)
+        {
+            if self.open_usage_limits() {
+                let t = self.current_mut();
+                t.prompt_history.reset();
+                t.typing_guard.on_blur_or_send();
+                t.paste_history = Default::default();
+                t.draft.replace_text("");
+                t.submission_error = None;
+                t.attachment_error = None;
+                self.checkpoint();
+            }
+            return false;
+        }
+        // Read once: an arm made while this send is in flight belongs to the next message.
+        let fresh_arm = if forced_fresh_context.is_some() {
+            None
+        } else if fresh_session_available {
+            self.current().fresh_session_arm
+        } else {
+            None
+        };
+        let fresh_context = forced_fresh_context.unwrap_or(fresh_arm.is_some());
+        let compact_before_send = forced_compact_before_send.unwrap_or_else(|| {
+            !fresh_context
+                && self
+                    .resume_compaction_tokens(self.current(), lifecycle::now())
+                    .is_some()
+                && !self.keep_full_history(self.current())
+                && !is_compact_command(&draft_markdown)
+        });
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -7802,10 +10750,11 @@ impl State {
             let revision = uuid::Uuid::new_v4();
             let target_machine = self.machines.selected.clone();
             let target_server_id = self.machine_identity(&target_machine);
-            let prompt = match crate::composer_tokens::prompt_for_target(
+            let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
                 Some(&target_machine),
                 Some(&target_server_id),
                 &self.peers,
@@ -7823,13 +10772,59 @@ impl State {
                 self.current_mut().submission_error = Some(error);
                 return false;
             }
+            if let Some(error) = self.missing_worktree_base_branch_error(self.current()) {
+                self.current_mut().submission_error = Some(error);
+                return false;
+            }
             self.current_mut().submission_error = None;
             if self.current().client_draft {
                 self.promote_client_draft();
                 return self.current().client_creating.is_some();
             }
-            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+            let supports_fresh_cap = self.client.as_ref().is_some_and(|c| {
+                c.supports_capability(&self.current().machine, crate::protocol::FRESH_CONTEXT)
+            });
+            let supports_vcs_cap = self.client.as_ref().is_some_and(|c| {
+                c.supports_capability(&self.current().machine, crate::protocol::VCS_WORKTREES)
+            });
+            let mut mode = if (self.current().status.busy()
+                && (self.current().follow_up_queues() || fresh_context))
+                || self.current().native.queue_held
+            {
+                "queue"
+            } else if self.current().status.busy() {
+                "steer"
+            } else {
+                "prompt"
+            };
+            let mut params = json!({"threadId":self.current().id,"text":prompt.text,
+                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":mode});
+            let sending_worktree_bootstrap = supports_vcs_cap
+                && self.current().worktree_path.is_none()
+                && self.current().messages.is_empty()
+                && self.current().project.is_some()
+                && !self.is_captain_home(self.current())
+                && self.effective_env_mode(self.current()) == ThreadEnvMode::Worktree;
+            if sending_worktree_bootstrap {
+                params["envMode"] = json!(ThreadEnvMode::Worktree);
+                if let Some(base) = &self.current().base_branch {
+                    params["baseBranch"] = json!(base);
+                }
+                params["startFromOrigin"] = json!(self.current().effective_start_from_origin());
+            }
+            if fresh_context {
+                params["freshContext"] = json!(true);
+            }
+            if compact_before_send {
+                if supports_fresh_cap {
+                    params["compactBeforeSend"] = json!(true);
+                } else {
+                    let _ = self.remote("thread.compact", json!({"instructions": Value::Null}));
+                    mode = "queue";
+                    params["mode"] = json!(mode);
+                }
+            }
+            let result = self.remote("thread.send", params);
             return match result {
                 Some(Ok(id)) => {
                     let snapshot = crate::composer_rich::Snapshot::capture_with_context(
@@ -7838,11 +10833,21 @@ impl State {
                         &self.current().draft_context,
                     );
                     let thread = self.current_mut();
+                    let reply_for_remote = thread.draft_reply_to.clone();
+                    if sending_worktree_bootstrap {
+                        thread.remote_bootstrap_snapshot =
+                            Some((snapshot.clone(), reply_for_remote));
+                    }
                     thread.remote_send = Some((id, snapshot));
+                    thread.remote_send_fresh_arm = fresh_arm;
+                    thread.remote_send_reply_to = thread.draft_reply_to.take();
                     thread.draft.replace_text("");
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    thread.typing_guard.on_blur_or_send();
+                    self.usage_limits_notice_key = None;
+                    self.composer_notices.remove("usage-limits");
                     true
                 }
                 Some(Err(error)) => {
@@ -7868,9 +10873,7 @@ impl State {
         {
             return false;
         }
-        let text = crate::composer_rich::markdown(&self.current().draft)
-            .trim()
-            .to_owned();
+        let text = draft_markdown.trim().to_owned();
         let mut words = text.splitn(2, char::is_whitespace);
         match words.next().filter(|_| {
             !self
@@ -7887,6 +10890,10 @@ impl State {
                 self.choose_slash("model".into());
                 return false;
             }
+            Some(command) if command.eq_ignore_ascii_case("/clear") => {}
+            Some(command)
+                if command.eq_ignore_ascii_case("/usage-limits")
+                    && self.usage_limits_command_available(self.current()) => {}
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
@@ -7955,13 +10962,106 @@ impl State {
             }
             _ => {}
         }
+        if self
+            .current()
+            .request
+            .as_ref()
+            .is_some_and(crate::approval::not_resumable)
+        {
+            self.current_mut().request = None;
+        }
         self.release_task_results(self.current().id);
+        if let Some(sent) = self.try_worktree_bootstrap_send(fresh_context, fresh_arm) {
+            return sent;
+        }
+        if compact_before_send && !self.current().status.busy() {
+            if self.current().harness == "pi"
+                && !self.current().model_provider.is_empty()
+                && self.current().model_provider != "cpa"
+            {
+                self.current_mut().error = Some(
+                    "Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into(),
+                );
+                return false;
+            }
+            if self.current().draft_images.iter().any(Attachment::is_image)
+                && self.current().supports_images == Some(false)
+            {
+                let err = self.current().image_model_error();
+                self.current_mut().attachment_error = Some(err);
+                return false;
+            }
+            let local_server_id = self.machine_identity(&self.machines.selected);
+            let peers = self.peers.clone();
+            let labels: Vec<(String, String)> = peers
+                .iter()
+                .map(|p| (p.server_id.clone(), p.label.clone()))
+                .collect();
+            let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
+                &self.current().draft,
+                &self.current().draft_images,
+                &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
+                Some(&self.current().machine),
+                Some(&local_server_id),
+                &peers,
+                &|m| {
+                    if m == "local" {
+                        "Local".into()
+                    } else {
+                        labels
+                            .iter()
+                            .find(|(id, _)| id == m)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| m.to_owned())
+                    }
+                },
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.current_mut().attachment_error = Some(error);
+                    return false;
+                }
+            };
+            if !self.headless
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return false;
+            }
+            self.current_mut().submission_error = None;
+            let thread = self.current_mut();
+            thread.prompt_history.reset();
+            thread.typing_guard.on_blur_or_send();
+            thread.paste_history = Default::default();
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.draft_reply_to = None;
+            thread.retained_context = Default::default();
+            thread.native.queue_held = false;
+            thread.serial += 1;
+            let queued_id = thread.serial;
+            thread.native.queue.push_back(pi_session::QueuedMessage {
+                id: queued_id,
+                prompt,
+            });
+            thread.life.user_sent(lifecycle::now());
+            let id = thread.id;
+            let server = self.machines.selected.clone();
+            self.set_keep_full_history(&server, id, false);
+            self.invalidate_undo(id);
+            self.compact_context(None);
+            self.checkpoint();
+            return true;
+        }
         if self.current().status.busy() {
             if !self.headless {
-                if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
+                if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                     &self.current().draft,
                     &self.current().draft_images,
                     &self.current().draft_context,
+                    self.current().draft_reply_to.as_ref(),
                     Some(&self.current().machine),
                     Some(&self.machine_identity(&self.machines.selected)),
                     &self.peers,
@@ -7979,8 +11079,10 @@ impl State {
                 .iter()
                 .map(|p| (p.server_id.clone(), p.label.clone()))
                 .collect();
-            self.current_mut()
-                .send_during_run_with_peers(Some(&local_server_id), &peers, &|m| {
+            self.current_mut().send_during_run_with_fresh(
+                Some(&local_server_id),
+                &peers,
+                &|m| {
                     if m == "local" {
                         "Local".into()
                     } else {
@@ -7990,18 +11092,30 @@ impl State {
                             .map(|(_, l)| l.clone())
                             .unwrap_or_else(|| m.to_owned())
                     }
-                });
+                },
+                fresh_context,
+            );
             let dispatched = !self.current().has_draft_content();
             if dispatched {
+                if fresh_context {
+                    self.persist_transcripts = true;
+                }
+                let thread_id = self.current().id;
+                let server = self.machines.selected.clone();
+                self.set_keep_full_history(&server, thread_id, false);
+                if let Some(arm) = fresh_arm {
+                    self.disarm_fresh_session(thread_id, Some(arm));
+                }
                 self.checkpoint();
             }
             return dispatched;
         }
         if !self.headless {
-            if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
+            if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                 &self.current().draft,
                 &self.current().draft_images,
                 &self.current().draft_context,
+                self.current().draft_reply_to.as_ref(),
                 Some(&self.current().machine),
                 Some(&self.machine_identity(&self.machines.selected)),
                 &self.peers,
@@ -8013,14 +11127,18 @@ impl State {
             }
             self.current_mut().submission_error = None;
         }
+        self.usage_limits_notice_key = None;
+        self.composer_notices.remove("usage-limits");
         let local_server_id = self.machine_identity(&self.machines.selected);
         let peers = self.peers.clone();
         let labels: Vec<(String, String)> = peers
             .iter()
             .map(|p| (p.server_id.clone(), p.label.clone()))
             .collect();
-        self.current_mut()
-            .send_with_peers(Some(&local_server_id), &peers, &|m| {
+        self.current_mut().send_with_fresh(
+            Some(&local_server_id),
+            &peers,
+            &|m| {
                 if m == "local" {
                     "Local".into()
                 } else {
@@ -8030,12 +11148,22 @@ impl State {
                         .map(|(_, l)| l.clone())
                         .unwrap_or_else(|| m.to_owned())
                 }
-            });
+            },
+            fresh_context,
+        );
         if self.current().has_draft_content() || self.current().status != Status::Running {
             return false;
         }
         let id = self.current().id;
+        let server = self.machines.selected.clone();
+        self.set_keep_full_history(&server, id, false);
         self.invalidate_undo(id);
+        if fresh_context {
+            self.persist_transcripts = true;
+        }
+        if let Some(arm) = fresh_arm {
+            self.disarm_fresh_session(id, Some(arm));
+        }
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
@@ -8209,6 +11337,8 @@ impl State {
         thread.native.commands_loaded = false;
         thread.error = None;
         thread.prewarm_attempted = false;
+        let access = self.effective_access_mode(self.current());
+        self.current_mut().native.access = access;
         if id == "pi" {
             self.apply_catalog();
         } else {
@@ -8266,6 +11396,8 @@ impl State {
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
+            && !(self.effective_env_mode(thread) == ThreadEnvMode::Worktree
+                && thread.worktree_path.is_none())
             && (thread.has_draft_content() || (thread.session.is_some() && !thread.history_loaded))
         {
             self.connect_thread(self.active);
@@ -8531,6 +11663,9 @@ impl State {
         self.thread_defaults =
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
+        if AccessMode::parse(&self.thread_defaults.access).is_none() {
+            self.thread_defaults.access = AccessMode::Supervised.id().into();
+        }
         self.thread_defaults.validate()?;
         self.model_favorites = match index.get("modelFavorites") {
             None | Some(Value::Null) => None,
@@ -8638,7 +11773,8 @@ impl State {
                     thread.native.previous_session =
                         record["previousSession"].as_str().map(str::to_owned);
                     if let Some(access) = record.get("accessMode") {
-                        thread.native.access = AccessMode::parse(access.as_str()?)?;
+                        thread.native.access =
+                            AccessMode::parse(access.as_str()?).unwrap_or(AccessMode::Supervised);
                     }
                     if index["version"] == 4 && record.get("lifecycle").is_none() {
                         return None;
@@ -8704,6 +11840,55 @@ impl State {
                         >(options.clone())
                     {
                         thread.model_options = parsed;
+                    }
+                    if let Some(breakdown) = record.get("contextBreakdown")
+                        && let Ok(parsed) = serde_json::from_value::<
+                            Option<Vec<crate::context_breakdown::ContextBreakdownRow>>,
+                        >(breakdown.clone())
+                    {
+                        thread.context.usage.breakdown = parsed;
+                    }
+                    thread.worktree_path = record
+                        .get("worktreePath")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.branch = record
+                        .get("branch")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.base_branch = record
+                        .get("baseBranch")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.env_mode = record
+                        .get("envMode")
+                        .and_then(|v| serde_json::from_value::<ThreadEnvMode>(v.clone()).ok());
+                    thread.start_from_origin =
+                        record.get("startFromOrigin").and_then(Value::as_bool);
+                    if let Some(setup_val) = record.get("worktreeSetup")
+                        && let Ok(mut setup) =
+                            serde_json::from_value::<Option<WorktreeSetupState>>(setup_val.clone())
+                    {
+                        if let Some(ref mut s) = setup
+                            && s.phase == WorktreeSetupPhase::Running
+                        {
+                            s.phase = WorktreeSetupPhase::Failed;
+                            s.error = Some(
+                                "Worktree setup was interrupted before restart. Retry or skip to continue."
+                                    .into(),
+                            );
+                            thread.worktree_setup_output_open = true;
+                        }
+                        thread.worktree_setup = setup;
+                    }
+                    if let Some(suggestion) = record.get("promptSuggestion")
+                        && let Ok(parsed) =
+                            serde_json::from_value::<Option<PromptSuggestion>>(suggestion.clone())
+                    {
+                        thread.prompt_suggestion = parsed;
                     }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
@@ -8971,19 +12156,33 @@ impl State {
             "scopeRemote":self.machines.scope_remote,
             "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
             "drafts":self.threads.iter().map(|t| {
-                let (draft, images, context) = t.queued_edit.as_ref().map_or(
-                    (&t.draft, &t.draft_images, &t.draft_context),
-                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context),
+                let (draft, images, context, reply_to) = t.queued_edit.as_ref().map_or(
+                    (&t.draft, &t.draft_images, &t.draft_context, &t.draft_reply_to),
+                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context, &edit.ordinary_reply_to),
                 );
-                let value = if images.is_empty() && context.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
+                let value = if images.is_empty()
+                    && context.is_empty()
+                    && reply_to.is_none()
+                    && !crate::composer_rich::has_format(draft)
+                    && draft.pills().next().is_none()
+                    && t.fresh_session_arm.is_none()
+                {
                     json!(draft.text)
                 } else {
-                    json!({
+                    let mut obj = json!({
                         "text": draft.text,
                         "richHtml": draft.to_html(),
                         "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                         "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
-                    })
+                    });
+                    if let Some(reply) = reply_to {
+                        obj["replyTo"] = json!(reply);
+                    }
+                    if let Some(arm) = t.fresh_session_arm {
+                        obj["freshSession"] = json!(true);
+                        obj["freshSessionArm"] = json!(arm);
+                    }
+                    obj
                 };
                 (t.id.to_string(), value)
             }).collect::<serde_json::Map<_,_>>(),
@@ -9091,7 +12290,32 @@ impl State {
                     .and_then(|v| crate::composer_context::decode_message_context(v).ok())
                     .map(|c| c.records)
                     .unwrap_or_default();
+                t.draft_reply_to = draft
+                    .get("replyTo")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| {
+                        serde_json::from_value::<crate::composer_context::ComposerContextRecord>(
+                            v.clone(),
+                        )
+                        .ok()
+                    })
+                    .filter(|r| {
+                        matches!(
+                            r.data,
+                            crate::composer_context::ComposerContextData::Response { .. }
+                        )
+                    });
                 t.retained_context = Default::default();
+                if draft["freshSession"] == true {
+                    let arm = draft["freshSessionArm"].as_u64().unwrap_or_else(|| {
+                        self.fresh_arm_seq = self.fresh_arm_seq.saturating_add(1).max(1);
+                        self.fresh_arm_seq
+                    });
+                    self.fresh_arm_seq = self.fresh_arm_seq.max(arm);
+                    t.fresh_session_arm = Some(arm);
+                } else {
+                    t.fresh_session_arm = None;
+                }
                 t.attachment_error = if missing_images {
                     Some("Some saved draft images are missing or invalid. Attach those images again.".into())
                 } else {
@@ -9123,9 +12347,13 @@ impl State {
             }
         }
         self.capture_opened_draft();
+        self.sync_fresh_session_notice();
         Ok(())
     }
     pub fn checkpoint(&mut self) {
+        if self.threads.iter().any(|t| t.answer_intake) {
+            return;
+        }
         if self.demo {
             return;
         }
@@ -9345,7 +12573,13 @@ impl State {
         index["serverEpoch"] = json!(self.server_epoch);
         index["serverSeq"] = json!(self.server_seq);
         index["recoveredInputs"] = json!(self.recovered_inputs);
-        if self.headless || self.persist_transcripts {
+        if self.headless
+            || self.persist_transcripts
+            || self
+                .threads
+                .iter()
+                .any(|t| !t.fresh_session_messages.is_empty())
+        {
             index["threadViews"] = self.thread_views();
             index["runtimeInputs"] = json!(
                 self.threads
@@ -9560,10 +12794,44 @@ impl Thread {
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,
+            "contextBreakdown":self.context.usage.breakdown,
+            "promptSuggestion":self.prompt_suggestion,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
+        if let Some(worktree_path) = &self.worktree_path {
+            record["worktreePath"] = json!(worktree_path);
+        }
+        if let Some(branch) = &self.branch {
+            record["branch"] = json!(branch);
+        }
+        if let Some(base_branch) = &self.base_branch {
+            record["baseBranch"] = json!(base_branch);
+        }
+        if let Some(env_mode) = self.env_mode {
+            record["envMode"] = json!(env_mode);
+        }
+        if let Some(start_from_origin) = self.start_from_origin {
+            record["startFromOrigin"] = json!(start_from_origin);
+        }
+        if let Some(worktree_setup) = &self.worktree_setup {
+            record["worktreeSetup"] = json!(worktree_setup);
+        }
         record
     }
+}
+
+/// Ported from KSG Code's `isClearComposerCommand` (`packages/shared/src/composerTrigger.ts`).
+pub fn is_clear_command(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("/clear")
+}
+
+/// Ported from KSG Code's `COMPACT_COMMAND_PATTERN` (`packages/client-runtime/src/state/contextWindow.ts`).
+pub fn is_compact_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/compact"))
+        && trimmed[8..].chars().next().is_none_or(char::is_whitespace)
 }
 
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
@@ -9592,6 +12860,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
+    for url in std::mem::take(&mut state.pending_open_urls) {
+        html_changed = true;
+        if let Err(error) = tx.open_url(&url) {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not open the link",
+                Some(error.to_string()),
+                None,
+                Some(5_000),
+            );
+        }
+    }
     let keybindings_changed = !state.headless && state.poll_keybindings();
     let browsing = state.poll_folder_browser()
         | state.poll_settings()
@@ -9656,6 +12936,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
+    changed |= state.poll_vcs_branches();
+    changed |= state.poll_worktree_bootstraps();
+    changed |= state.poll_worktree_setup();
+    changed |= state.poll_question_answers();
+    if state.runtime_enabled && state.client.is_none() {
+        for index in 0..state.threads.len() {
+            if std::mem::take(&mut state.threads[index].native.question_message_connect) {
+                state.connect_thread(index);
+                changed = true;
+            }
+        }
+    }
     if state.runtime_enabled
         && !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
@@ -9682,6 +12974,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         .filter(|t| t.remote.is_some())
         .map(|t| t.child_thread_id)
         .collect();
+    let mut connect_indices = Vec::new();
     for (index, thread) in state.threads.iter_mut().enumerate() {
         if remote_children.contains(&thread.id) {
             continue;
@@ -9824,6 +13117,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             };
             tx.wake_after(remaining);
         }
+        if thread.pi.is_none()
+            && thread.queued_prompt.is_some()
+            && thread.status == Status::Running
+            && !thread.offline_blocked
+            && thread.session_started.is_none()
+        {
+            connect_indices.push(index);
+        }
+    }
+    for index in connect_indices {
+        state.connect_thread(index);
+        changed = true;
     }
     for (parent, question) in crew_questions {
         state.persistence_scope = None;
@@ -9843,6 +13148,42 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     global_changed |= state.pause_offline_errors()
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
+    changed |= state.sync_fresh_session_notice();
+    changed |= state.sync_fallback_model(lifecycle::now() as i64);
+    if let Some(outcome) = state
+        .current_mut()
+        .harness_state
+        .as_object_mut()
+        .and_then(|obj| obj.remove("resetCreditOutcome"))
+    {
+        changed = true;
+        if let Some(err) = outcome["error"].as_str() {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not use the reset credit.",
+                Some(err.to_owned()),
+                None,
+                Some(5_000),
+            );
+        } else {
+            let msg = match outcome["outcome"].as_str() {
+                Some("reset") => "Reset applied. Your windows have cleared.",
+                Some("nothingToReset") => "Nothing to reset right now.",
+                Some("noCredit") => "No reset credit left.",
+                Some("alreadyRedeemed") => "That credit was already redeemed.",
+                _ => "Could not use the reset credit.",
+            };
+            let kind = if outcome["outcome"].as_str() == Some("reset") {
+                ToastKind::Success
+            } else {
+                ToastKind::Warning
+            };
+            state.push_toast(kind, msg, None, None, Some(5_000));
+            if state.usage_limits_notice_key.is_some() {
+                state.open_usage_limits();
+            }
+        }
+    }
     if global_changed {
         state.persistence_scope = None;
         changed = true;
@@ -9942,6 +13283,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::from_millis(expires - at));
         }
     }
+    if let Some((_, expires)) = &state.plan_copied {
+        if *expires <= at {
+            state.plan_copied = None;
+            changed = true;
+        } else {
+            tx.wake_after(Duration::from_millis(*expires - at));
+        }
+    }
     if let Some(error) = state
         .store
         .as_ref()
@@ -9976,6 +13325,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     {
         state.storage_error = None;
         changed = true;
+    }
+    changed |= state.poll_approval_sends();
+    if state.approval_sends_pending() {
+        tx.wake_after(Duration::from_millis(16));
     }
     if changed {
         state.checkpoint();
@@ -15884,5 +19237,1322 @@ mod tests {
         let dismiss_id = async_state.toasts[0].id;
         async_state.dismiss_toast(dismiss_id);
         assert!(async_state.toasts.is_empty());
+    }
+
+    #[test]
+    fn context_breakdown_metadata_round_trips_and_decodes_legacy_records() {
+        let mut state = State::new(".".into(), false);
+        let rows = vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 12_000,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Autocompact buffer".into(),
+                tokens: 30_000,
+                kind: crate::context_breakdown::BreakdownRowKind::Buffer,
+            },
+        ];
+        state.current_mut().context.usage.breakdown = Some(rows.clone());
+        let with_breakdown = state.snapshot();
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_breakdown).unwrap();
+        assert_eq!(restored.current().context.usage.breakdown, Some(rows));
+
+        // Removing contextBreakdown simulates an older peer / legacy index.
+        let mut legacy = with_breakdown;
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("contextBreakdown");
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().context.usage.breakdown, None);
+
+        // Without breakdown on the thread, round-trip stays None.
+        state.current_mut().context.usage.breakdown = None;
+        let without_breakdown = state.snapshot();
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_breakdown).unwrap();
+        assert_eq!(restored_none.current().context.usage.breakdown, None);
+
+        // Wire compatibility for ContextUsage projection without breakdown.
+        let old_wire = json!({"tokens": 1000, "context_window": 200000, "percent": 0.5});
+        let decoded: crate::context::ContextUsage = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(decoded.breakdown, None);
+    }
+
+    #[test]
+    fn worktree_thread_metadata_round_trips_and_decodes_legacy_records() {
+        let mut state = State::new(".".into(), false);
+        let thread = state.current_mut();
+        thread.worktree_path = Some("/tmp/worktrees/repo/feat-abc".into());
+        thread.branch = Some("feature/worktree".into());
+        thread.base_branch = Some("main".into());
+        thread.env_mode = Some(ThreadEnvMode::Worktree);
+
+        let with_worktree = state.snapshot();
+        assert_eq!(
+            with_worktree["threads"][0]["worktreePath"],
+            "/tmp/worktrees/repo/feat-abc"
+        );
+        assert_eq!(with_worktree["threads"][0]["branch"], "feature/worktree");
+        assert_eq!(with_worktree["threads"][0]["baseBranch"], "main");
+        assert_eq!(with_worktree["threads"][0]["envMode"], "worktree");
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_worktree).unwrap();
+        assert_eq!(
+            restored.current().worktree_path.as_deref(),
+            Some("/tmp/worktrees/repo/feat-abc")
+        );
+        assert_eq!(
+            restored.current().branch.as_deref(),
+            Some("feature/worktree")
+        );
+        assert_eq!(restored.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(restored.current().env_mode, Some(ThreadEnvMode::Worktree));
+
+        // Thread projection also carries the worktree fields on the wire.
+        let projection = state.projection();
+        assert_eq!(
+            projection["threads"][0]["worktreePath"],
+            "/tmp/worktrees/repo/feat-abc"
+        );
+        assert_eq!(projection["threads"][0]["branch"], "feature/worktree");
+        assert_eq!(projection["threads"][0]["baseBranch"], "main");
+        assert_eq!(projection["threads"][0]["envMode"], "worktree");
+
+        // Legacy metadata without worktree fields decodes to None.
+        let mut legacy = with_worktree;
+        let obj = legacy["threads"][0].as_object_mut().unwrap();
+        for key in ["worktreePath", "branch", "baseBranch", "envMode"] {
+            obj.remove(key);
+        }
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().worktree_path, None);
+        assert_eq!(restored_legacy.current().branch, None);
+        assert_eq!(restored_legacy.current().base_branch, None);
+        assert_eq!(restored_legacy.current().env_mode, None);
+
+        // Absent fields stay omitted and round-trip as None.
+        let empty = State::new(".".into(), false);
+        let without_worktree = empty.snapshot();
+        for key in ["worktreePath", "branch", "baseBranch", "envMode"] {
+            assert!(without_worktree["threads"][0].get(key).is_none(), "{key}");
+        }
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_worktree).unwrap();
+        assert_eq!(restored_none.current().worktree_path, None);
+        assert_eq!(restored_none.current().branch, None);
+        assert_eq!(restored_none.current().base_branch, None);
+        assert_eq!(restored_none.current().env_mode, None);
+
+        // Unknown envMode value decodes leniently as None rather than failing restore.
+        let mut unknown_env = empty.snapshot();
+        unknown_env["threads"][0]["envMode"] = json!("future-mode");
+        let mut restored_unknown = State::new(".".into(), false);
+        restored_unknown.restore_global(&unknown_env).unwrap();
+        assert_eq!(restored_unknown.current().env_mode, None);
+
+        // Local envMode round-trips too.
+        let mut local_state = State::new(".".into(), false);
+        local_state.current_mut().env_mode = Some(ThreadEnvMode::Local);
+        let local_snap = local_state.snapshot();
+        assert_eq!(local_snap["threads"][0]["envMode"], "local");
+        let mut restored_local = State::new(".".into(), false);
+        restored_local.restore_global(&local_snap).unwrap();
+        assert_eq!(
+            restored_local.current().env_mode,
+            Some(ThreadEnvMode::Local)
+        );
+    }
+
+    #[test]
+    fn clear_command_arms_when_alone_sends_text_with_attachment_and_unavailable_with_approval() {
+        let mut state = State::new(".".into(), false);
+        // Empty thread: /clear is unavailable.
+        state.current_mut().draft.replace_text("/");
+        state.current_mut().draft.focused = true;
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 1);
+        assert_eq!(state.current().messages[0].text, "/clear");
+
+        // Thread with history: /clear alone arms, clears draft, and sends nothing.
+        state.current_mut().status = Status::Completed;
+        state.current_mut().draft.replace_text("/");
+        assert!(state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_some());
+        assert!(state.current().draft.text.is_empty());
+        assert_eq!(state.current().messages.len(), 1);
+        assert!(
+            state
+                .composer_notices
+                .ordered()
+                .iter()
+                .any(|n| n.id == "fresh-session")
+        );
+
+        // With an attachment present, /clear is sent as ordinary text and does not arm.
+        state.disarm_fresh_session(state.current().id, None);
+        state.current_mut().draft.replace_text("/clear");
+        state
+            .current_mut()
+            .add_attachment(test_attachment("note.png", 1))
+            .unwrap();
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+        assert_eq!(state.current().messages[1].text, "/clear");
+
+        // Unavailable with a pending approval.
+        state.current_mut().status = Status::Waiting;
+        state.current_mut().request = Some(json!({"id":"perm-1","method":"confirm"}));
+        state.current_mut().draft.replace_text("/");
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+
+        // Unavailable on a linked machine lacking the `fresh-context` capability.
+        state.current_mut().status = Status::Completed;
+        state.current_mut().request = None;
+        let (old_client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *old_client.info.lock().unwrap() = json!({"capabilities": []});
+        state.client = Some(old_client);
+        state.current_mut().draft.replace_text("/");
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+    }
+
+    #[test]
+    fn fresh_session_arm_is_read_once_keeps_on_failed_send_and_persists_with_draft() {
+        let dir = crate::store::directory().unwrap().join("fresh-arm-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = State::new(dir.clone(), false);
+        state.load_global_for_test();
+        state.persist_transcripts = true;
+        state.current_mut().messages.push(Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Earlier".into(),
+            images: vec![],
+            context: None,
+        });
+        state.current_mut().status = Status::Completed;
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        let first_arm = state.current().fresh_session_arm.expect("armed");
+
+        // Persist draft and reload in a fresh State against the same temp directory.
+        state.current_mut().draft.replace_text("Carry over");
+        state.checkpoint_and_flush().unwrap();
+        drop(state);
+
+        let mut reloaded = State::new(dir, false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft.text, "Carry over");
+        assert_eq!(reloaded.current().fresh_session_arm, Some(first_arm));
+        assert!(
+            reloaded
+                .composer_notices
+                .ordered()
+                .iter()
+                .any(|n| n.id == "fresh-session")
+        );
+
+        // Failed local send (e.g., Pi with non-CPA model) keeps the arm.
+        reloaded.current_mut().harness = "pi".into();
+        reloaded.current_mut().model_provider = "anthropic".into();
+        reloaded.send();
+        assert_eq!(reloaded.current().fresh_session_arm, Some(first_arm));
+        assert_eq!(reloaded.current().draft.text, "Carry over");
+
+        // Accepted local send clears the arm, keeps visible transcript, and marks the message.
+        reloaded.current_mut().model_provider = "cpa".into();
+        reloaded.send();
+        assert!(reloaded.current().fresh_session_arm.is_none());
+        assert_eq!(reloaded.current().messages.len(), 2);
+        assert_eq!(reloaded.current().messages[0].text, "Earlier");
+        assert_eq!(reloaded.current().messages[1].text, "Carry over");
+        assert!(
+            reloaded
+                .current()
+                .is_fresh_session_message(&reloaded.current().messages[1].id)
+        );
+
+        // Read-once semantics for in-flight remote sends: re-arming during flight stays armed.
+        let (client, mut rx_cmd) = crate::client::Client::test_connected(reloaded.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": [crate::protocol::FRESH_CONTEXT]});
+        let commands = client.commands.clone();
+        let mut remote_state = State::new(reloaded.data_dir.clone(), false);
+        remote_state.client = Some(client);
+        remote_state.current_mut().remote = Some(commands);
+        remote_state.current_mut().messages.push(Message {
+            id: "rm1".into(),
+            role: "You",
+            text: "First".into(),
+            images: vec![],
+            context: None,
+        });
+        remote_state.current_mut().draft.replace_text("/clear");
+        remote_state.send();
+        let inflight_arm = remote_state.current().fresh_session_arm.unwrap();
+        remote_state.current_mut().draft.replace_text("Second");
+        assert!(remote_state.dispatch_send());
+        let sent = rx_cmd.try_recv().unwrap();
+        assert_eq!(sent.params["freshContext"], true);
+        let cmd_id = sent.command_id;
+
+        // User re-arms while first send is in flight.
+        remote_state.current_mut().draft.replace_text("/clear");
+        remote_state.send();
+        let newer_arm = remote_state.current().fresh_session_arm.unwrap();
+        assert_ne!(newer_arm, inflight_arm);
+
+        // First send acceptance must not clear the newer arm.
+        assert!(remote_state.current_mut().finish_remote_send(cmd_id, true));
+        assert_eq!(remote_state.current().fresh_session_arm, Some(newer_arm));
+
+        // A failed remote send keeps its arm.
+        remote_state.current_mut().draft.replace_text("Third");
+        assert!(remote_state.dispatch_send());
+        let failed_cmd = rx_cmd.try_recv().unwrap().command_id;
+        assert!(
+            remote_state
+                .current_mut()
+                .finish_remote_send(failed_cmd, false)
+        );
+        assert_eq!(remote_state.current().fresh_session_arm, Some(newer_arm));
+    }
+
+    #[test]
+    fn fresh_turn_with_steer_mode_queues_instead_and_cannot_steer() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, _events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().status = Status::Running;
+        state.current_mut().native.follow_up = false; // steer mode
+        state.current_mut().harness_state["turnCapabilities"] =
+            json!({"supportsInterrupt": true, "supportsActiveSteering": true});
+        state.current_mut().messages.push(Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Running turn".into(),
+            images: vec![],
+            context: None,
+        });
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_some());
+
+        state.current_mut().draft.replace_text("Fresh queued turn");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().native.queue.len(), 1);
+        let queued_id = state.current().native.queue[0].id;
+        assert!(state.current().native.fresh_queue_ids.contains(&queued_id));
+        assert!(
+            commands.try_recv().is_err(),
+            "fresh turn must queue, never steer"
+        );
+
+        // Attempting to steer the queued fresh-context item is rejected.
+        state.current_mut().steer_queued(queued_id);
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert!(state.current().error.is_some());
+
+        // When the active turn settles, the queued item pops and starts a fresh session.
+        state.current_mut().error = None;
+        state.current_mut().session = Some("old-session.jsonl".into());
+        state
+            .current_mut()
+            .apply(json!({"type":"agent_settled","aborted":false}));
+        assert!(state.current().native.queue.is_empty());
+        assert!(state.current().session.is_none());
+        assert!(state.current().pi.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+        assert!(
+            state
+                .current()
+                .is_fresh_session_message(&state.current().messages[1].id)
+        );
+    }
+
+    #[test]
+    fn compact_before_send_queues_behind_compaction_respects_keep_and_skips_slash_compact() {
+        let stale_at = lifecycle::now().saturating_sub(80 * 60_000);
+        let setup_stale_claude = |state: &mut State| {
+            let (pi, commands, _events) = Pi::test_connection();
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.session = Some("11111111-1111-4111-8111-111111111111".into());
+            t.status = Status::Completed;
+            t.messages.push(Message {
+                id: "u1".into(),
+                role: "You",
+                text: "Earlier work".into(),
+                images: vec![],
+                context: None,
+            });
+            t.context.absorb(&json!({
+                "contextUsage": {
+                    "tokens": 220_000,
+                    "contextWindow": 1_000_000,
+                    "updatedAt": stale_at
+                }
+            }));
+            commands
+        };
+
+        // 1. Default "Compact" queues the message behind compaction and sends after compaction ends.
+        let mut state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut state);
+        assert_eq!(
+            state.resume_compaction_tokens(state.current(), lifecycle::now()),
+            Some(220_000)
+        );
+        state.current_mut().draft.replace_text("Follow up");
+        state.send();
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert_eq!(state.current().native.queue[0].prompt.text, "Follow up");
+        let compact_cmd = commands.try_recv().unwrap();
+        assert_eq!(compact_cmd["type"], "compact");
+        let compact_id = compact_cmd["id"].as_str().unwrap().to_owned();
+        assert!(
+            commands.try_recv().is_err(),
+            "prompt must wait for compaction"
+        );
+
+        // Compaction completes -> queued message begins its prompt.
+        state.current_mut().apply(json!({"type":"compaction_end"}));
+        state.current_mut().apply(json!({
+            "type":"response","id":compact_id,"command":"compact","success":true,"data":{}
+        }));
+        let probe = commands
+            .try_iter()
+            .find(|c| c["type"] == "get_state")
+            .unwrap();
+        state.current_mut().apply(json!({
+            "type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}
+        }));
+        assert!(state.current().native.queue.is_empty());
+        let sent_prompt = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("queued prompt sent after compaction");
+        assert_eq!(sent_prompt["message"], "Follow up");
+
+        // 2. If compaction fails, the message stays queued and the failure is shown.
+        let mut fail_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut fail_state);
+        fail_state
+            .current_mut()
+            .draft
+            .replace_text("Wait for compact");
+        fail_state.send();
+        let compact_cmd = commands.try_recv().unwrap();
+        assert_eq!(compact_cmd["type"], "compact");
+        let compact_id = compact_cmd["id"].as_str().unwrap().to_owned();
+        fail_state.current_mut().apply(json!({
+            "type":"compaction_end","errorMessage":"Compaction failed"
+        }));
+        fail_state.current_mut().apply(json!({
+            "type":"response","id":compact_id,"command":"compact","success":false,"error":"Compaction failed"
+        }));
+        let probe = commands
+            .try_iter()
+            .find(|c| c["type"] == "get_state")
+            .unwrap();
+        fail_state.current_mut().apply(json!({
+            "type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}
+        }));
+        assert_eq!(fail_state.current().native.queue.len(), 1);
+        assert!(fail_state.current().native.queue_held);
+        assert_eq!(
+            fail_state.current().error.as_deref(),
+            Some("Compaction failed")
+        );
+        assert!(
+            !commands.try_iter().any(|c| c["type"] == "prompt"),
+            "failed compaction must not send queued prompt"
+        );
+
+        // 3. "Keep" sends directly without compacting and resets after sending.
+        let mut keep_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut keep_state);
+        keep_state.toggle_keep_full_history();
+        assert!(keep_state.keep_full_history(keep_state.current()));
+        keep_state.current_mut().draft.replace_text("Direct send");
+        keep_state.send();
+        assert!(keep_state.current().native.queue.is_empty());
+        assert!(!keep_state.keep_full_history(keep_state.current()));
+        let sent_cmds: Vec<_> = commands.try_iter().collect();
+        assert!(!sent_cmds.iter().any(|c| c["type"] == "compact"));
+        let sent = sent_cmds
+            .iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("direct prompt");
+        assert_eq!(sent["message"], "Direct send");
+
+        // 4. Typing `/compact` does not double-compact.
+        let mut cmd_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut cmd_state);
+        cmd_state
+            .current_mut()
+            .draft
+            .replace_text("/compact focus on tests");
+        cmd_state.send();
+        assert!(cmd_state.current().native.queue.is_empty());
+        let compact = commands.try_recv().unwrap();
+        assert_eq!(compact["type"], "compact");
+        assert_eq!(compact["customInstructions"], "focus on tests");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn prompt_suggestion_metadata_round_trip_and_legacy_decode() {
+        let mut state = State::new(".".into(), false);
+        let suggestion = PromptSuggestion {
+            run_id: "run-42".into(),
+            text: "Run the test suite".into(),
+        };
+        state.current_mut().run_id = Some("run-42".into());
+        state.current_mut().prompt_suggestion = Some(suggestion.clone());
+        let with_suggestion = state.snapshot();
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_suggestion).unwrap();
+        assert_eq!(
+            restored.current().prompt_suggestion,
+            Some(suggestion.clone())
+        );
+
+        // Removing promptSuggestion simulates an older peer / legacy index.
+        let mut legacy = with_suggestion;
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("promptSuggestion");
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().prompt_suggestion, None);
+
+        // Without suggestion on the thread, round-trip stays None.
+        state.current_mut().prompt_suggestion = None;
+        let without_suggestion = state.snapshot();
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_suggestion).unwrap();
+        assert_eq!(restored_none.current().prompt_suggestion, None);
+
+        // Changing machine clears the suggestion.
+        state.current_mut().prompt_suggestion = Some(suggestion);
+        state.current_mut().set_machine("remote-host");
+        assert_eq!(state.current().prompt_suggestion, None);
+    }
+
+    #[test]
+    fn prompt_suggestion_show_rule_conditions() {
+        let mut state = State::new(".".into(), false);
+        state.thread_defaults.prompt_suggestions_enabled = true;
+        let t = state.current_mut();
+        t.harness = "claude".into();
+        t.status = Status::Completed;
+        t.run_id = Some("run-1".into());
+        t.prompt_suggestion = Some(PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        });
+
+        // 1. Shows on empty draft after completion.
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 2. Hidden with text, shows again after deleting back to empty.
+        state.current_mut().draft.replace_text("hi");
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().draft.replace_text("");
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 3. Hidden with an attachment.
+        state.current_mut().draft_images.push(Attachment {
+            id: "att-1".into(),
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 3,
+            path: None,
+            asset_id: None,
+            uploaded: None,
+            source: None,
+        });
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().draft_images.clear();
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 4. Hidden with a pending approval.
+        state.current_mut().request = Some(json!({"id": "req-1", "method": "confirm"}));
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().request = None;
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 5. Hidden while running.
+        state.current_mut().status = Status::Running;
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().status = Status::Completed;
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 6. Hidden after dismissal for this run.
+        assert!(state.dismiss_prompt_suggestion());
+        assert_eq!(state.offered_prompt_suggestion(), None);
+
+        // 7. Shows again for the next run.
+        let t = state.current_mut();
+        t.run_id = Some("run-2".into());
+        t.prompt_suggestion = Some(PromptSuggestion {
+            run_id: "run-2".into(),
+            text: "Inspect the diff".into(),
+        });
+        assert_eq!(state.offered_prompt_suggestion(), Some("Inspect the diff"));
+    }
+
+    #[test]
+    fn usage_limits_command_raises_notice_without_sending_and_requires_capability() {
+        let mut state = State::new(".".into(), false);
+        // Pi has no report, so `/usage-limits` is not offered and sends as ordinary text.
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        let (pi, commands, _events) = Pi::test_connection();
+        {
+            let t = state.current_mut();
+            t.harness = "codex".into();
+            t.model_provider = "codex".into();
+            t.pi = Some(pi);
+            t.harness_state["usageLimitsRaw"] = json!({
+                "checkedAtMs": 1_700_000_000_000i64,
+                "snapshot": {
+                    "limitId": "codex",
+                    "planType": "plus",
+                    "primary": {"usedPercent": 35.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+                }
+            });
+            t.draft.replace_text("/");
+        }
+        assert!(
+            state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        // Sending `/usage-limits` alone raises the notice, clears the draft, and sends nothing.
+        state.current_mut().draft.replace_text("/usage-limits");
+        state.send();
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "usage-limits");
+        assert_eq!(notices[0].title, "Usage limits");
+        assert!(matches!(
+            notices[0].body,
+            Some(crate::composer_notices::NoticeBody::UsageLimits(_))
+        ));
+
+        // Dismissing removes it; choosing from the slash menu raises it again without sending.
+        state.dismiss_composer_notice("usage-limits");
+        assert!(state.composer_notices.ordered().is_empty());
+        state.current_mut().draft.replace_text("/usage");
+        state.choose_slash(crate::usage_limits::USAGE_LIMITS_COMMAND_NAME.into());
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(state.composer_notices.ordered().len(), 1);
+
+        // Sending `/usage-limits` with extra text sends as ordinary text (KSG `isUsageLimitsCommand`).
+        state
+            .current_mut()
+            .draft
+            .replace_text("/usage-limits explain");
+        state.send();
+        let sent = commands.try_recv().expect("ordinary prompt sent");
+        assert_eq!(sent["type"], "prompt");
+        assert_eq!(sent["message"], "/usage-limits explain");
+
+        // Machine lacking `usage-limits` capability hides the command.
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": []});
+        state.client = Some(client);
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+    }
+
+    #[test]
+    fn fallback_model_switches_when_out_of_usage_restores_on_reset_and_use_default_clears_notice() {
+        let mut state = State::new(".".into(), false);
+        state.default_harness = "codex".into();
+        state.codex_catalog.models.push(
+            AgentModel::from_harness_value(
+                &json!({
+                    "provider": "codex",
+                    "id": "gpt-6-astra",
+                    "name": "GPT-6 Astra",
+                    "isDefault": true,
+                    "thinkingLevels": ["medium"]
+                }),
+                "codex",
+            )
+            .unwrap(),
+        );
+        state.claude_catalog.models.push(
+            AgentModel::from_harness_value(
+                &json!({
+                    "provider": "claude",
+                    "id": "claude-opus-5-5",
+                    "name": "Claude Opus 5.5",
+                    "isDefault": true,
+                    "thinkingLevels": ["high"]
+                }),
+                "claude",
+            )
+            .unwrap(),
+        );
+        state.thread_defaults.fallback_model_selection =
+            Some(crate::model_selection::ModelSelection {
+                instance_id: "claude".into(),
+                model: "claude-opus-5-5".into(),
+                options: vec![],
+            });
+        let now_ms = 1_700_000_000_000i64;
+        // Codex primary window is exhausted (100% used, resets 1h from now_ms).
+        state.codex_catalog.usage_limits_raw = json!({
+            "checkedAtMs": now_ms,
+            "snapshot": {
+                "limitId": "codex",
+                "planType": "plus",
+                "primary": {"usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+            }
+        });
+
+        state.sync_fallback_model(now_ms);
+        assert_eq!(state.current().harness, "claude");
+        assert_eq!(state.current().model_id, "claude-opus-5-5");
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "fallback-model");
+        assert_eq!(notices[0].title, "Using Claude Opus 5.5");
+        assert!(
+            notices[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("Codex is out of usage · resets ")
+        );
+        assert_eq!(notices[0].actions.len(), 1);
+        assert_eq!(notices[0].actions[0].label, "Use GPT-6 Astra");
+        assert_eq!(
+            notices[0].dismiss_label.as_deref(),
+            Some("Dismiss fallback model notice")
+        );
+
+        // Dismissing keeps the notice hidden while the fallback state continues.
+        state.dismiss_composer_notice("fallback-model");
+        assert!(state.composer_notices.ordered().is_empty());
+        state.sync_fallback_model(now_ms + 60_000);
+        assert!(state.composer_notices.ordered().is_empty());
+
+        // When usage resets (now passes resetsAt), the thread restores its default model and
+        // clears dismissal so a later exhaustion can show the notice again.
+        state.sync_fallback_model(1_700_003_601_000);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().model_id, "gpt-6-astra");
+        assert!(state.composer_notices.ordered().is_empty());
+
+        // Out of usage again -> switches and re-raises notice; clicking "Use default" switches back and removes notice.
+        state.codex_catalog.usage_limits_raw = json!({
+            "checkedAtMs": 1_700_010_000_000i64,
+            "snapshot": {
+                "limitId": "codex",
+                "planType": "plus",
+                "primary": {"usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1_700_020_000}
+            }
+        });
+        state.sync_fallback_model(1_700_010_000_000);
+        assert_eq!(state.current().harness, "claude");
+        let action = state.composer_notices.ordered()[0].actions[0]
+            .handler
+            .clone();
+        action.call(&mut state);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().model_id, "gpt-6-astra");
+        assert!(state.composer_notices.ordered().is_empty());
+        // Explicit override persists while staying on that thread.
+        state.sync_fallback_model(1_700_010_060_000);
+        assert_eq!(state.current().harness, "codex");
+        assert!(state.composer_notices.ordered().is_empty());
+    }
+
+    #[test]
+    fn worktree_send_without_base_branch_is_refused_with_exact_message() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "claude".into();
+        state.current_mut().model_provider = "claude".into();
+        state.current_mut().env_mode = Some(ThreadEnvMode::Worktree);
+        state.current_mut().base_branch = None;
+        state.current_mut().draft.replace_text("Do work");
+        state.send();
+        assert_eq!(
+            state.current().submission_error.as_deref(),
+            Some("Select a base branch before sending in New worktree mode.")
+        );
+        assert_eq!(state.current().draft.text, "Do work");
+        assert!(state.current().messages.is_empty());
+        assert!(state.current().native.queue.is_empty());
+        assert!(state.current().worktree_path.is_none());
+    }
+
+    fn init_temp_git_repo(root: &std::path::Path, empty_config: &std::path::Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_GLOBAL", empty_config)
+                .env("GIT_CONFIG_SYSTEM", empty_config);
+            let out = crate::process::output(&mut cmd, Duration::from_secs(10), 1024 * 1024)
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&repo, &["init", "-b", "main", "--quiet"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-m", "initial", "--quiet"]);
+        repo
+    }
+
+    #[test]
+    fn worktree_bootstrap_creates_worktree_starts_harness_and_queues_second_send() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-wt-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_cfg = root.join("empty.gitconfig");
+        std::fs::write(&empty_cfg, "").unwrap();
+        let repo = init_temp_git_repo(&root, &empty_cfg);
+        let git_ctx = crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg.clone()),
+            git_config_system: Some(empty_cfg.clone()),
+        };
+
+        let mut state = State::new(repo.clone(), false);
+        state.data_dir = root.join("data");
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state.runtime_enabled = true;
+        state.test_git_context = Some(git_ctx);
+
+        let commands_slot: std::sync::Arc<
+            std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>,
+        > = std::sync::Arc::default();
+        let commands_slot_hook = commands_slot.clone();
+        state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *commands_slot_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+
+        {
+            let t = state.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(true);
+            t.draft.replace_text("First turn in worktree");
+        }
+        state.send();
+        assert!(state.current().worktree_bootstrapping());
+        assert!(state.current().native.queue_held);
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert!(state.current().draft.text.is_empty());
+
+        // Second send while bootstrap is in progress queues behind the first message.
+        state.current_mut().draft.replace_text("Second queued turn");
+        state.send();
+        assert_eq!(state.current().native.queue.len(), 2);
+        assert!(state.current().native.queue_held);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !state.current().worktree_bootstrapping(),
+            "bootstrap did not finish in time"
+        );
+
+        let wt_path = state
+            .current()
+            .worktree_path
+            .clone()
+            .expect("worktreePath recorded");
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert!(
+            state
+                .current()
+                .branch
+                .as_deref()
+                .is_some_and(|b| b.starts_with("t3/"))
+        );
+        assert_eq!(state.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(state.test_connect_workspaces.len(), 1);
+        assert_eq!(state.test_connect_workspaces[0].1, PathBuf::from(&wt_path));
+        assert_eq!(
+            state.thread_directory(state.active).unwrap(),
+            PathBuf::from(&wt_path)
+        );
+
+        // First prompt was released and sent to the harness; second stays queued behind it.
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert_eq!(
+            state.current().native.queue[0].prompt.text,
+            "Second queued turn"
+        );
+        let commands = commands_slot.lock().unwrap().take().expect("pi commands");
+        let first_cmd = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first prompt dispatched");
+        assert_eq!(first_cmd["message"], "First turn in worktree");
+
+        // Settling turn 1 releases the queued second turn in the same worktree.
+        state.current_mut().apply(json!({
+            "type": "response",
+            "id": first_cmd["id"],
+            "command": "prompt",
+            "success": true,
+            "data": {}
+        }));
+        state
+            .current_mut()
+            .apply(json!({"type": "agent_settled", "aborted": false}));
+        assert!(state.current().native.queue.is_empty());
+        let second_cmd = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("second prompt dispatched");
+        assert_eq!(second_cmd["message"], "Second queued turn");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_bootstrap_failure_restores_draft_and_records_nothing() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-wt-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_cfg = root.join("empty.gitconfig");
+        std::fs::write(&empty_cfg, "").unwrap();
+        let repo = init_temp_git_repo(&root, &empty_cfg);
+        let git_ctx = crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg.clone()),
+            git_config_system: Some(empty_cfg.clone()),
+        };
+
+        let mut state = State::new(repo, false);
+        state.data_dir = root.join("data");
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state.runtime_enabled = true;
+        state.test_git_context = Some(git_ctx);
+
+        {
+            let t = state.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("missing-branch-does-not-exist".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("Keep this draft on failure");
+        }
+        state.send();
+        assert!(state.current().worktree_bootstrapping());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!state.current().worktree_bootstrapping());
+        assert_eq!(state.current().draft.text, "Keep this draft on failure");
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert!(state.current().worktree_path.is_none());
+        assert!(state.current().branch.is_none());
+        assert!(state.current().native.queue.is_empty());
+        assert!(!state.current().native.queue_held);
+        assert!(state.test_connect_workspaces.is_empty());
+        assert!(
+            state
+                .current()
+                .submission_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Git command failed")),
+            "expected git error, got {:?}",
+            state.current().submission_error
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_setup_script_succeeds_fails_and_retries() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+
+        // 1. Setup script that succeeds holds the first message until setup completes, then runs it.
+        let root_ok = std::env::temp_dir().join(format!("shina-setup-ok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_ok).unwrap();
+        let empty_cfg_ok = root_ok.join("empty.gitconfig");
+        std::fs::write(&empty_cfg_ok, "").unwrap();
+        let repo_ok = init_temp_git_repo(&root_ok, &empty_cfg_ok);
+        std::fs::write(
+            repo_ok.join("t3.json"),
+            r#"{"scripts":[{"name":"Setup","command":"echo line1 && echo setup-done > setup.marker","runOnWorktreeCreate":true}]}"#,
+        )
+        .unwrap();
+        {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["add", "t3.json"])
+                .current_dir(&repo_ok)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_ok)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_ok);
+            assert!(cmd.status().unwrap().success());
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["commit", "-m", "add t3.json", "--quiet"])
+                .current_dir(&repo_ok)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_ok)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_ok);
+            assert!(cmd.status().unwrap().success());
+        }
+
+        let mut state_ok = State::new(repo_ok, false);
+        state_ok.data_dir = root_ok.join("data");
+        std::fs::create_dir_all(&state_ok.data_dir).unwrap();
+        state_ok.runtime_enabled = true;
+        state_ok.test_git_context = Some(crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg_ok.clone()),
+            git_config_system: Some(empty_cfg_ok.clone()),
+        });
+        let cmds_ok: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        let cmds_ok_hook = cmds_ok.clone();
+        state_ok.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *cmds_ok_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+        {
+            let t = state_ok.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("After setup succeeds");
+        }
+        state_ok.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_ok.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state_ok.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            state_ok.current().worktree_setup.as_ref().map(|s| s.phase),
+            Some(WorktreeSetupPhase::Running)
+        );
+        assert!(state_ok.current().native.queue_held);
+        assert!(state_ok.test_connect_workspaces.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_ok
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_ok.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let setup = state_ok.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(setup.phase, WorktreeSetupPhase::Succeeded);
+        assert!(setup.output.contains("line1"));
+        assert!(!state_ok.current().native.queue_held);
+        let wt_path = state_ok.current().worktree_path.clone().unwrap();
+        assert!(std::path::Path::new(&wt_path).join("setup.marker").exists());
+        let sent = cmds_ok
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first message released after setup succeeded");
+        assert_eq!(sent["message"], "After setup succeeds");
+
+        // Snapshot + restore preserves setup card state.
+        let snap = state_ok.snapshot();
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&snap).unwrap();
+        assert_eq!(
+            restored.current().worktree_setup.as_ref().map(|s| s.phase),
+            Some(WorktreeSetupPhase::Succeeded)
+        );
+        let _ = std::fs::remove_dir_all(&root_ok);
+
+        // 2. Setup script that fails holds the first message; retry succeeds and releases it.
+        let root_fail =
+            std::env::temp_dir().join(format!("shina-setup-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_fail).unwrap();
+        let empty_cfg_fail = root_fail.join("empty.gitconfig");
+        std::fs::write(&empty_cfg_fail, "").unwrap();
+        let repo_fail = init_temp_git_repo(&root_fail, &empty_cfg_fail);
+        let gate_file = root_fail.join("allow_pass");
+        let cmd_str = format!(
+            "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
+            gate_file.display()
+        );
+        std::fs::write(
+            repo_fail.join("t3.json"),
+            json!({
+                "scripts": [{
+                    "name": "Setup",
+                    "command": cmd_str,
+                    "runOnWorktreeCreate": true
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["add", "t3.json"])
+                .current_dir(&repo_fail)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_fail)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_fail);
+            assert!(cmd.status().unwrap().success());
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(["commit", "-m", "add t3.json", "--quiet"])
+                .current_dir(&repo_fail)
+                .env("GIT_CONFIG_GLOBAL", &empty_cfg_fail)
+                .env("GIT_CONFIG_SYSTEM", &empty_cfg_fail);
+            assert!(cmd.status().unwrap().success());
+        }
+
+        let mut state_fail = State::new(repo_fail, false);
+        state_fail.data_dir = root_fail.join("data");
+        std::fs::create_dir_all(&state_fail.data_dir).unwrap();
+        state_fail.runtime_enabled = true;
+        state_fail.test_git_context = Some(crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg_fail.clone()),
+            git_config_system: Some(empty_cfg_fail.clone()),
+        });
+        let cmds_fail: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        let cmds_fail_hook = cmds_fail.clone();
+        state_fail.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *cmds_fail_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+        {
+            let t = state_fail.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("After retry succeeds");
+        }
+        state_fail.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state_fail.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_fail.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = state_fail.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(failed.phase, WorktreeSetupPhase::Failed);
+        assert_eq!(failed.exit_code, Some(2));
+        assert!(failed.output.contains("failing-tail"));
+        assert!(state_fail.current().native.queue_held);
+        assert!(state_fail.test_connect_workspaces.is_empty());
+
+        // Fix condition and retry: setup succeeds and releases the queued message.
+        std::fs::write(&gate_file, "ok").unwrap();
+        state_fail.retry_worktree_setup();
+        assert_eq!(
+            state_fail
+                .current()
+                .worktree_setup
+                .as_ref()
+                .map(|s| s.phase),
+            Some(WorktreeSetupPhase::Running)
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_fail
+            .current()
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|s| s.phase == WorktreeSetupPhase::Running)
+            && Instant::now() < deadline
+        {
+            state_fail.poll_worktree_setup();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let retried = state_fail.current().worktree_setup.as_ref().unwrap();
+        assert_eq!(retried.phase, WorktreeSetupPhase::Succeeded);
+        assert!(retried.output.contains("retry-ok"));
+        assert!(!state_fail.current().native.queue_held);
+        let sent_retry = cmds_fail
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first message released after retry");
+        assert_eq!(sent_retry["message"], "After retry succeeds");
+
+        let _ = std::fs::remove_dir_all(&root_fail);
+    }
+
+    #[test]
+    fn draft_workspace_mode_and_base_branch_persist_across_thread_switch_and_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-draft-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let index_path = dir.join("index.json");
+        let mut store = crate::store::Store::new(index_path.clone(), Arc::new(|| {}));
+
+        let mut state = State::new(".".into(), false);
+        state.data_dir = dir.clone();
+        state.current_mut().messages.push(Message {
+            id: "u1".into(),
+            role: "You",
+            text: "First thread".into(),
+            images: vec![],
+            context: None,
+        });
+        state.thread_defaults.default_thread_env_mode = ThreadEnvMode::Worktree;
+        state.new_thread();
+        assert_eq!(state.threads.len(), 2);
+        let t2_idx = state.active;
+        assert_eq!(
+            state.threads[t2_idx].env_mode,
+            Some(ThreadEnvMode::Worktree)
+        );
+        state.set_draft_base_branch("main".into());
+        state.set_draft_start_from_origin(false);
+
+        // Switch away to thread 0 and switch back: draft choices persist.
+        state.select_thread(0);
+        state.select_thread(t2_idx);
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(state.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(state.current().start_from_origin, Some(false));
+        assert!(!state.current().effective_start_from_origin());
+
+        // Save to disk and reload from temporary data directory.
+        let snapshot = state.snapshot();
+        store.save(snapshot);
+        store.flush().unwrap();
+        let loaded = crate::store::load(&index_path)
+            .unwrap()
+            .expect("saved index");
+        let mut reloaded = State::new(".".into(), false);
+        reloaded.data_dir = dir.clone();
+        reloaded.restore_global(&loaded).unwrap();
+        assert_eq!(
+            reloaded.thread_defaults.default_thread_env_mode,
+            ThreadEnvMode::Worktree
+        );
+        let restored_t2 = reloaded
+            .threads
+            .iter()
+            .find(|t| t.id == state.threads[t2_idx].id)
+            .expect("restored draft thread");
+        assert_eq!(restored_t2.env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(restored_t2.base_branch.as_deref(), Some("main"));
+        assert_eq!(restored_t2.start_from_origin, Some(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

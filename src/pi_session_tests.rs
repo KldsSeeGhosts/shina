@@ -51,7 +51,7 @@ fn transcript_saved_before_typed_tools_loads_unchanged() {
 }
 
 #[test]
-fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
+fn rpiv_drawer_answers_each_exact_live_native_dialog_independently() {
     let (mut t, commands) = thread(Status::Running);
     let params = json!({"questions":[
         {"header":"Storage","question":"Where?","options":[{"label":"Disk","description":"Local"}]},
@@ -63,18 +63,6 @@ fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
     assert!(t.native.questionnaire.is_some());
     t.questionnaire_toggle(0);
     assert!(t.native_tick(Instant::now() + Duration::from_millis(250)));
-    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 1);
-    assert!(
-        commands
-            .try_iter()
-            .all(|r| r["type"] != "extension_ui_response")
-    );
-    t.questionnaire_toggle(1);
-    t.questionnaire_toggle(0);
-    t.questionnaire_step(true);
-    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 0);
-    t.questionnaire_step(false);
-    t.questionnaire_step(false);
     assert_eq!(
         command(&commands, "extension_ui_response")["value"],
         "1. Disk \u{2014} Local"
@@ -95,13 +83,25 @@ fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
     t.respond(json!({"value":"Manual answer"}));
     command(&commands, "extension_ui_response");
     t.apply(second.clone());
+    assert!(
+        commands
+            .try_iter()
+            .all(|r| r["type"] != "extension_ui_response")
+    );
+    t.questionnaire_toggle(1);
+    t.questionnaire_toggle(0);
+    t.questionnaire_step(false);
     let response = command(&commands, "extension_ui_response");
     assert_eq!(response["id"], "second");
-    assert_eq!(response["value"], "1,2");
+    assert_eq!(response["value"], "2,1");
     assert!(t.request.is_none());
     t.apply(json!({"type":"tool_execution_end","toolCallId":"ask-1","result":{"content":[]}}));
     t.apply(second);
-    assert!(t.native.questionnaire.is_none());
+    assert!(t.native.questionnaire.is_some());
+    assert_eq!(
+        t.native.questionnaire.as_ref().unwrap().questions[0].options[0].label,
+        "Submit empty value"
+    );
     assert!(t.request.is_some());
 }
 
@@ -127,11 +127,8 @@ fn structured_questionnaire_expiry_cancels_auto_advance_and_notifications_expire
     assert!(t.native_deadline().is_some());
     assert!(t.native_tick(Instant::now() + Duration::from_secs(7)));
     assert!(t.native.notifications.is_empty());
-    t.native
-        .questionnaire_replies
-        .push(("tool".into(), "signature".into(), "answer".into()));
     t.cancel_native_dialogs();
-    assert!(t.native.questionnaire_replies.is_empty());
+    assert!(t.native.questionnaire_advance.is_none());
 }
 
 #[test]
@@ -768,6 +765,19 @@ fn session_approvals_are_scoped_to_the_process_and_other_dialogs_still_need_the_
 }
 
 #[test]
+fn failed_session_approval_does_not_remember_a_grant() {
+    let (mut t, commands) = thread(Status::Running);
+    t.apply(
+        json!({"type":"extension_ui_request","id":"failed-grant","method":"confirm",
+        "title":"Allow write?","message":"file"}),
+    );
+    drop(commands);
+    t.approve_for_session();
+    assert!(t.native.session_approvals.is_empty());
+    assert!(t.request.is_some());
+}
+
+#[test]
 fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
     let (mut t, _) = thread(Status::Running);
     t.apply(json!({"type":"tool_execution_start","toolCallId":"parent/1","parentToolCallId":"parent","toolName":"powershell","args":{"command":"exit 7"}}));
@@ -776,4 +786,218 @@ fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
     assert_eq!(t.tools[0].exit_code, Some(7));
     assert_eq!(t.tools[0].structured["details"]["custom"], "value");
     assert_eq!(t.tools[0].output, "Output");
+}
+
+#[test]
+fn access_mode_id_parse_round_trip_and_unknown_fallback() {
+    for mode in AccessMode::ALL {
+        assert_eq!(AccessMode::parse(mode.id()), Some(mode));
+    }
+    assert_eq!(AccessMode::Auto.id(), "auto");
+    assert_eq!(AccessMode::Auto.label(), "Auto");
+    assert_eq!(AccessMode::parse("future-mode"), None);
+
+    let mut state = State::new(PathBuf::new(), false);
+    let mut snapshot = state.snapshot();
+    snapshot["threads"][0]["accessMode"] = json!("future-mode");
+    state.restore_global(&snapshot).unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+
+    state
+        .execute_command(&crate::protocol::Command::new(
+            "thread.configure",
+            json!({"threadId": state.current().id, "access": "future-mode"}),
+        ))
+        .unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+}
+
+#[test]
+fn supported_access_modes_table_and_compatible_resolution() {
+    assert_eq!(
+        supported_access_modes("pi"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("antigravity"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("codex"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("claude"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("opencode"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("deepseek"), &AccessMode::ALL);
+    assert_eq!(
+        supported_access_modes("kiro"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("muse"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("fx"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("grok"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("gemini"), &AccessMode::ALL);
+
+    // Supported current mode is kept.
+    let (modes, resolved) =
+        resolve_compatible_access_mode(AccessMode::Edits, supported_access_modes("pi"));
+    assert!(!modes.contains(&AccessMode::Auto));
+    assert_eq!(resolved, AccessMode::Edits);
+
+    // Read only is preserved when supported.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::ReadOnly, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::ReadOnly);
+
+    // Unsupported current mode falls back to first supported mode skipping Read only.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::Auto, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::Supervised);
+
+    // Empty supported list means all modes are supported.
+    let (modes, resolved) = resolve_compatible_access_mode(AccessMode::Auto, &[]);
+    assert_eq!(modes, AccessMode::ALL);
+    assert_eq!(resolved, AccessMode::Auto);
+}
+
+#[test]
+fn managed_policy_denial_and_clamp_behaviour() {
+    // Missing file means no policy/ceiling.
+    let dir = crate::store::directory().unwrap();
+    let policy_path = dir.join("policy.json");
+    assert_eq!(read_managed_policy_from_path(&policy_path), None);
+    assert_eq!(managed_access_mode_denial(None, AccessMode::Full), None);
+    assert_eq!(
+        clamp_managed_access_mode(None, AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Full)
+    );
+
+    // Policy with extra fields ignores unknown keys and reads only organization + limits.maxRuntimeMode.
+    std::fs::write(
+        &policy_path,
+        r#"{
+            "schemaVersion": 1,
+            "organization": "Example Corp",
+            "supportUrl": "https://example.com/support",
+            "limits": {
+                "maxRuntimeMode": "auto-accept-edits",
+                "webhookTasks": false
+            }
+        }"#,
+    )
+    .unwrap();
+    let policy = read_managed_policy_from_path(&policy_path).unwrap();
+    assert_eq!(policy.organization, "Example Corp");
+    assert_eq!(policy.max_access, Some(AccessMode::Edits));
+
+    // Ceiling above mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Supervised),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Supervised, &AccessMode::ALL),
+        Some(AccessMode::Supervised)
+    );
+
+    // Ceiling equal to mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Edits),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Edits, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+
+    // Ceiling below mode: denied with exact message and clamped to ceiling.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Auto).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Full).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+}
+
+#[test]
+fn pi_session_stats_produce_estimated_and_inferred_breakdown_while_acp_leaves_none() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.apply(json!({
+        "type": "message_start",
+        "message": { "role": "user", "content": [{ "type": "text", "text": &"x".repeat(3500) }] }
+    }));
+    t.refresh_context_usage();
+    let req = command(&commands, "get_session_stats");
+    answer(
+        &mut t,
+        &req,
+        json!({"contextUsage": {"tokens": 5000, "contextWindow": 100000, "percent": 5.0}}),
+    );
+    let breakdown = t
+        .context
+        .usage
+        .breakdown
+        .as_ref()
+        .expect("expected Pi breakdown");
+    assert_eq!(
+        breakdown,
+        &vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "System".into(),
+                tokens: 4000,
+                kind: crate::context_breakdown::BreakdownRowKind::Inferred,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 1000,
+                kind: crate::context_breakdown::BreakdownRowKind::Estimated,
+            },
+        ]
+    );
+
+    let (mut acp_thread, acp_commands) = thread(Status::Ready);
+    acp_thread.harness = "acp-fixture".into();
+    acp_thread.refresh_context_usage();
+    let acp_req = command(&acp_commands, "get_session_stats");
+    answer(&mut acp_thread, &acp_req, json!({"contextUsage": null}));
+    assert_eq!(acp_thread.context.usage.breakdown, None);
 }

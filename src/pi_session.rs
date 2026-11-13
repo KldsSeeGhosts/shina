@@ -81,7 +81,12 @@ pub fn session_history(record: &mut Value) {
 
 fn approval_key(request: &Value) -> String {
     let title = string(request, "title");
-    format!("{}:{}{}", title.len(), title, string(request, "message"))
+    format!(
+        "{}:{}{}",
+        title.encode_utf16().count(),
+        title,
+        string(request, "message")
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -102,15 +107,24 @@ pub enum AccessMode {
     ReadOnly,
     Supervised,
     Edits,
+    Auto,
     #[default]
     Full,
 }
 impl AccessMode {
+    pub const ALL: [Self; 5] = [
+        Self::ReadOnly,
+        Self::Supervised,
+        Self::Edits,
+        Self::Auto,
+        Self::Full,
+    ];
     pub fn id(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised => "approval-required",
             Self::Edits => "auto-accept-edits",
+            Self::Auto => "auto",
             Self::Full => "full-access",
         }
     }
@@ -119,7 +133,17 @@ impl AccessMode {
             Self::ReadOnly => "Read only",
             Self::Supervised => "Supervised",
             Self::Edits => "Auto-accept edits",
+            Self::Auto => "Auto",
             Self::Full => "Full access",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read files and coordinate. Delegate code changes to a thread.",
+            Self::Supervised => "Ask before commands and file changes.",
+            Self::Edits => "Auto-approve edits, ask before other actions.",
+            Self::Auto => "Supported providers approve routine actions; others still ask.",
+            Self::Full => "Allow commands and edits without prompts.",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -127,20 +151,170 @@ impl AccessMode {
             "read-only" => Some(Self::ReadOnly),
             "approval-required" => Some(Self::Supervised),
             "auto-accept-edits" => Some(Self::Edits),
+            "auto" => Some(Self::Auto),
             "full-access" => Some(Self::Full),
             _ => None,
         }
     }
+    fn rank(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::Supervised => 1,
+            Self::Edits => 2,
+            Self::Auto => 3,
+            Self::Full => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedPolicy {
+    pub organization: String,
+    pub max_access: Option<AccessMode>,
+}
+
+/// System policy file location, matching KSG Code's `managedPolicyPath`.
+pub fn managed_policy_path() -> &'static std::path::Path {
+    if cfg!(target_os = "macos") {
+        std::path::Path::new("/Library/Application Support/Shina/policy.json")
+    } else if cfg!(target_os = "windows") {
+        std::path::Path::new(r"C:\Program Files\Shina\policy.json")
+    } else {
+        std::path::Path::new("/etc/shina/policy.json")
+    }
+}
+
+/// Reads only `organization` and `limits.maxRuntimeMode` from `path`.
+/// Missing, unreadable, or malformed files mean no managed ceiling.
+pub fn read_managed_policy_from_path(path: &std::path::Path) -> Option<ManagedPolicy> {
+    let bytes = std::fs::read(path).ok()?;
+    let doc: Value = serde_json::from_slice(&bytes).ok()?;
+    let organization = doc.get("organization")?.as_str()?.trim();
+    if organization.is_empty() {
+        return None;
+    }
+    let max_access = doc
+        .get("limits")
+        .and_then(|limits| limits.get("maxRuntimeMode"))
+        .and_then(Value::as_str)
+        .and_then(AccessMode::parse);
+    Some(ManagedPolicy {
+        organization: organization.to_owned(),
+        max_access,
+    })
+}
+
+pub fn read_managed_policy() -> Option<ManagedPolicy> {
+    read_managed_policy_from_path(managed_policy_path())
+}
+
+fn is_access_mode_above(mode: AccessMode, ceiling: Option<AccessMode>) -> bool {
+    ceiling.is_some_and(|ceiling| mode.rank() > ceiling.rank())
+}
+
+/// Ported from KSG Code's `managedRuntimeModeDenial`.
+pub fn managed_access_mode_denial(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+) -> Option<String> {
+    let policy = policy?;
+    let ceiling = policy.max_access?;
+    is_access_mode_above(mode, Some(ceiling)).then(|| {
+        format!(
+            "{} limits threads to {}.",
+            policy.organization,
+            ceiling.label()
+        )
+    })
+}
+
+/// Ported from KSG Code's `clampManagedRuntimeMode`.
+pub fn clamp_managed_access_mode(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+    modes: &[AccessMode],
+) -> Option<AccessMode> {
+    let ceiling = policy.and_then(|policy| policy.max_access);
+    if !is_access_mode_above(mode, ceiling) {
+        return Some(mode);
+    }
+    modes
+        .iter()
+        .copied()
+        .rfind(|&candidate| !is_access_mode_above(candidate, ceiling))
+}
+
+/// Supported access modes per Shina harness, ported from each KSG provider's
+/// `supportedRuntimeModes` list. Harnesses with no list support all modes.
+/// "Read only" is offered wherever Shina offers it today.
+pub fn supported_access_modes(harness: &str) -> &'static [AccessMode] {
+    match harness {
+        "pi" | "antigravity" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ],
+        "kiro" | "muse" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full,
+        ],
+        "fx" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+        ],
+        "grok" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ],
+        _ => &AccessMode::ALL,
+    }
+}
+
+/// Ported from KSG Code's `resolveCompatibleRuntimeMode`: keeps `current` if supported,
+/// otherwise picks the first supported mode in picker order (skipping "Read only" unless
+/// it was `current`).
+pub fn resolve_compatible_access_mode(
+    current: AccessMode,
+    supported: &[AccessMode],
+) -> (Vec<AccessMode>, AccessMode) {
+    let modes: Vec<AccessMode> = if supported.is_empty() {
+        AccessMode::ALL.to_vec()
+    } else {
+        AccessMode::ALL
+            .iter()
+            .copied()
+            .filter(|mode| supported.contains(mode))
+            .collect()
+    };
+    let mode = if modes.contains(&current) {
+        current
+    } else {
+        modes
+            .iter()
+            .copied()
+            .find(|&mode| mode != AccessMode::ReadOnly)
+            .or_else(|| modes.first().copied())
+            .unwrap_or(current)
+    };
+    (modes, mode)
 }
 
 #[derive(Default)]
 pub struct PiSession {
     pub projected_operating: bool,
     pub projected_queued: bool,
+    pub projected_approvals: Vec<Value>,
     pub questionnaire: Option<questionnaire::Questionnaire>,
+    pub(super) question_message_connect: bool,
+    pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
-    questionnaire_replies: Vec<(String, String, String)>,
     questionnaire_advance: Option<Instant>,
+    pub(super) collapsed_question_id: Option<String>,
     pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
     pub queue_held: bool,
@@ -183,11 +357,12 @@ pub struct PiSession {
     dialog_deadline: Option<Instant>,
     dialogs: VecDeque<(Value, Option<Instant>)>,
     session_approvals: HashSet<String>,
-    dialog_status: Option<Status>,
-    session_name: Option<String>,
+    pub(super) dialog_status: Option<Status>,
+    pub(super) session_name: Option<String>,
     probe: Option<String>,
     request_id: Option<String>,
     state_floor: usize,
+    pub fresh_queue_ids: HashSet<usize>,
 }
 
 pub struct QueuedMessage {
@@ -273,7 +448,19 @@ impl Thread {
         Some(trigger)
     }
 
+    #[cfg(test)]
     pub fn slash_matches(&self) -> Vec<SlashCommand> {
+        self.slash_matches_with_capabilities(
+            self.fresh_session_command_available_local(),
+            crate::usage_limits::has_usage_limits(&self.harness),
+        )
+    }
+
+    pub fn slash_matches_with_capabilities(
+        &self,
+        fresh_session_available: bool,
+        usage_limits_available: bool,
+    ) -> Vec<SlashCommand> {
         let Some(trigger) = self.slash_trigger() else {
             return vec![];
         };
@@ -282,6 +469,25 @@ impl Thread {
             description: "Switch response model for this thread".into(),
             source: "Shina".into(),
         }];
+        if trigger.range.start == 0 && fresh_session_available {
+            commands.push(SlashCommand {
+                name: "clear".into(),
+                description: "Start a fresh session; earlier messages stay visible".into(),
+                source: "Shina".into(),
+            });
+        }
+        if trigger.range.start == 0 && usage_limits_available {
+            commands.push(SlashCommand {
+                name: crate::usage_limits::USAGE_LIMITS_COMMAND_NAME.into(),
+                description: crate::usage_limits::USAGE_LIMITS_COMMAND_DESCRIPTION.into(),
+                source: if self.harness == "claude" {
+                    "Claude"
+                } else {
+                    "Codex"
+                }
+                .into(),
+            });
+        }
         if trigger.range.start == 0 && crate::harness::supports_compaction(&self.harness) {
             commands.push(SlashCommand {
                 name: "compact".into(),
@@ -306,6 +512,9 @@ impl Thread {
                 .iter()
                 .filter(|c| {
                     c.name != "model"
+                        && (!fresh_session_available || c.name != "clear")
+                        && (!usage_limits_available
+                            || c.name != crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
                         && !c.name.starts_with('$')
                         && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
@@ -356,21 +565,21 @@ impl Thread {
     /// Unlike the initial prompt, a steering submission must not reset the current run.
     #[cfg(test)]
     pub fn send_during_run(&mut self) {
-        self.send_during_run_with_peers(None, &[], &str::to_owned);
+        self.send_during_run_with_fresh(None, &[], &str::to_owned, false);
     }
 
-    pub(crate) fn send_during_run_with_peers(
+    pub(crate) fn send_during_run_with_fresh(
         &mut self,
         target_server_id: Option<&str>,
         peers: &[crate::peer::Peer],
         machine_name: &dyn Fn(&str) -> String,
+        fresh_context: bool,
     ) {
         if self.initializing
             || self.configuring
             || self.native.lifecycle_id.is_some()
             || self.native.refreshing_session
             || self.phase == "Stopping"
-            || self.request.is_some()
             || !self.has_draft_content()
             || self.harness == "pi" && self.model_provider != "cpa"
         {
@@ -381,10 +590,11 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt_for_target(
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
             &self.draft,
             &self.draft_images,
             &self.draft_context,
+            self.draft_reply_to.as_ref(),
             Some(&self.machine),
             target_server_id,
             peers,
@@ -398,13 +608,15 @@ impl Thread {
         };
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.follow_up_queues() {
+        // A fresh-context turn never steers or restarts: it queues behind the active run.
+        if self.follow_up_queues() || fresh_context {
             self.native.queue_held = false;
             self.serial += 1;
-            self.native.queue.push_back(QueuedMessage {
-                id: self.serial,
-                prompt,
-            });
+            let id = self.serial;
+            if fresh_context {
+                self.native.fresh_queue_ids.insert(id);
+            }
+            self.native.queue.push_back(QueuedMessage { id, prompt });
         } else {
             self.native.sends.push_back(PendingSend {
                 id: None,
@@ -419,7 +631,9 @@ impl Thread {
         self.draft.replace_text("");
         self.draft_images.clear();
         self.draft_context.clear();
+        self.draft_reply_to = None;
         self.retained_context = Default::default();
+        self.typing_guard.on_blur_or_send();
         self.life.user_sent(lifecycle::now());
         self.drive_native();
     }
@@ -431,6 +645,7 @@ impl Thread {
         ) {
             return;
         }
+        self.native.fresh_queue_ids.remove(&id);
         self.native.queue.retain(|q| q.id != id);
         self.reconcile_queued_edit();
     }
@@ -445,6 +660,12 @@ impl Thread {
         if self.request.is_some() || self.configuring {
             return;
         }
+        if self.status.busy() && self.native.fresh_queue_ids.contains(&id) {
+            self.error = Some(
+                "A fresh-session message cannot steer the active turn. It stays queued.".into(),
+            );
+            return;
+        }
         if self.status.busy() && !self.can_steer() {
             self.error = Some(
                 "This provider cannot steer the active turn. The message stays queued.".into(),
@@ -456,6 +677,7 @@ impl Thread {
         {
             self.reconcile_queued_edit();
             if self.status.busy() {
+                self.native.fresh_queue_ids.remove(&id);
                 self.native.sends.push_back(PendingSend {
                     id: None,
                     prompt: queued.prompt,
@@ -474,6 +696,7 @@ impl Thread {
     pub(super) fn return_local_queue(&mut self) {
         self.cancel_queued_edit();
         let queue = std::mem::take(&mut self.native.queue);
+        self.native.fresh_queue_ids.clear();
         self.native.queue_held = false;
         for queued in queue.into_iter().rev() {
             self.restore_prompt(&queued.prompt);
@@ -586,6 +809,9 @@ impl Thread {
                 self.native.compact_id = Some(self.command_id());
                 self.context.begin_compaction();
             } else {
+                if !self.native.queue.is_empty() {
+                    self.native.queue_held = true;
+                }
                 self.status = Status::Failed;
             }
             return true;
@@ -608,8 +834,9 @@ impl Thread {
             && self.pending_prompt.is_none()
             && let Some(queued) = self.native.queue.pop_front()
         {
+            let fresh_context = self.native.fresh_queue_ids.remove(&queued.id);
             self.reconcile_queued_edit();
-            self.begin_prompt(queued.prompt);
+            self.begin_prompt_with_fresh(queued.prompt, fresh_context);
             return true;
         }
         // One in-flight submission preserves order and gives rejected prompts their own owner.
@@ -697,10 +924,23 @@ impl Thread {
     }
 
     pub(super) fn native_dialog_done(&mut self) {
+        self.question_drafts.clear();
+        self.question_submission = None;
+        self.question_submit_requested = false;
+        self.native.approval_more = false;
         self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
         self.native.questionnaire = None;
         self.native.dialog_deadline = None;
-        self.status = self.native.dialog_status.take().unwrap_or(Status::Running);
+        self.status =
+            self.native
+                .dialog_status
+                .take()
+                .unwrap_or(if self.status == Status::Waiting {
+                    Status::Running
+                } else {
+                    self.status
+                });
         while let Some((request, deadline)) = self.native.dialogs.pop_front() {
             if deadline.is_some_and(|d| d <= Instant::now()) {
                 continue;
@@ -709,7 +949,15 @@ impl Thread {
             self.native.dialog_deadline = deadline;
             self.reply.replace_text(string(&request, "prefill"));
             self.prepare_questionnaire(&request);
+            if let Some(form) = &self.native.questionnaire {
+                self.reply.replace_text(&form.answers[form.index].other);
+            }
             self.request = Some(request);
+            self.refresh_typing_guard();
+            if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+                self.draft.focused = false;
+                self.reply.focused = false;
+            }
             self.status = Status::Waiting;
             break;
         }
@@ -722,6 +970,7 @@ impl Thread {
     }
 
     pub(super) fn cancel_native_dialogs(&mut self) {
+        self.abandon_question("cancelled");
         self.cancel_questionnaire();
         for _ in 0..33 {
             if self.request.is_none() {
@@ -735,18 +984,73 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     pub fn approve_for_session(&mut self) {
-        if self.remote.is_some() {
-            self.respond(json!({"confirmed":true,"allowForSession":true}));
-            return;
+        self.respond(crate::approval::response("acceptForSession"));
+    }
+
+    pub(super) fn remember_session_approval_for(&mut self, request: &Value) {
+        self.native.session_approvals.insert(approval_key(request));
+    }
+
+    pub(crate) fn pending_approvals(&self) -> Vec<Value> {
+        let mut requests = Vec::new();
+        for request in self
+            .request
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(
+                self.native
+                    .projected_approvals
+                    .iter()
+                    .filter(|_| self.remote.is_some()),
+            )
+        {
+            if request["method"] == "confirm"
+                && !requests.iter().any(|r: &Value| r["id"] == request["id"])
+            {
+                requests.push(request.clone());
+            }
         }
-        if let Some(request) = self.request.as_ref().filter(|r| r["method"] == "confirm") {
-            self.native.session_approvals.insert(approval_key(request));
-            self.respond(json!({"confirmed":true}));
+        requests
+    }
+
+    pub(super) fn shown_approvals(&self) -> Vec<Value> {
+        self.pending_approvals()
+            .into_iter()
+            .filter(|r| {
+                let id = r["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| r.to_string());
+                !self.typing_guard.is_held(&id)
+            })
+            .collect()
+    }
+
+    pub(super) fn respond_queued_approval(
+        &mut self,
+        id: &Value,
+        response: Value,
+    ) -> Result<(), String> {
+        let at = self
+            .native
+            .dialogs
+            .iter()
+            .position(|(r, _)| r["id"] == *id && r["method"] == "confirm")
+            .ok_or("Request expired.")?;
+        let (request, deadline) = self.native.dialogs[at].clone();
+        if deadline.is_some_and(|d| d <= Instant::now()) {
+            return Err("Request expired.".into());
         }
+        self.write_approval_response(&request, response)?;
+        self.native.dialogs.remove(at);
+        self.refresh_typing_guard();
+        Ok(())
     }
 
     fn prepare_questionnaire(&mut self, request: &Value) {
+        self.native.collapsed_question_id = None;
         if !matches!(
             request["method"].as_str(),
             Some("select" | "input" | "editor")
@@ -754,17 +1058,13 @@ impl Thread {
             self.native.questionnaire = None;
             return;
         }
-        self.native.questionnaire = questionnaire::Questionnaire::parse(request).or_else(|| {
-            self.native
-                .questionnaires
-                .iter()
-                .find_map(|(id, params)| questionnaire::Questionnaire::rpiv(request, id, params))
-        });
-        // A previously focused, hidden composer must not receive questionnaire shortcuts.
-        if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
-            self.draft.focused = false;
-            self.reply.focused = false;
-        }
+        self.native.questionnaire = questionnaire::Questionnaire::parse(request)
+            .or_else(|| {
+                self.native.questionnaires.iter().find_map(|(id, params)| {
+                    questionnaire::Questionnaire::rpiv(request, id, params)
+                })
+            })
+            .or_else(|| questionnaire::Questionnaire::pi(request));
     }
     pub(super) fn prepare_remote_questionnaire(&mut self) {
         if let Some(request) = self.request.clone() {
@@ -778,6 +1078,9 @@ impl Thread {
     }
     pub(super) fn apply_projected_form(&mut self, value: Value) -> Result<(), String> {
         self.native.questionnaire = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if let Some(form) = &self.native.questionnaire {
+            self.reply.replace_text(&form.answers[form.index].other);
+        }
         Ok(())
     }
     pub(super) fn respond_projected_form(&mut self, answers: Value) -> Result<(), String> {
@@ -792,16 +1095,21 @@ impl Thread {
             return Err("Invalid questionnaire answers.".into());
         }
         for (answer, question) in answers.iter().zip(&form.questions) {
-            if answer.other.len() > 32_768
-                || answer
-                    .selected
-                    .iter()
-                    .any(|value| !question.options.iter().any(|option| option.value == *value))
+            if answer
+                .selected
+                .iter()
+                .any(|value| !question.options.iter().any(|option| option.value == *value))
             {
                 return Err("Invalid questionnaire option.".into());
             }
         }
         form.answers = answers;
+        if !form.can_respond() {
+            return Err("This request is not resumable.".into());
+        }
+        if !form.complete() {
+            return Err("Answer each question before sending.".into());
+        }
         form.index = form.questions.len() - 1;
         self.reply.replace_text(&form.answers[form.index].other);
         self.questionnaire_step(false);
@@ -809,8 +1117,12 @@ impl Thread {
     }
 
     pub fn questionnaire_toggle(&mut self, index: usize) {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+            return;
+        }
+        self.save_question_editor();
         if let Some(form) = &mut self.native.questionnaire {
-            form.answers[form.index].other = self.reply.text.clone();
             if form.toggle(index) {
                 self.reply.replace_text("");
                 if !form.questions[form.index].multi {
@@ -826,48 +1138,211 @@ impl Thread {
         &mut self.reply
     }
 
+    pub fn questionnaire_changed(&mut self) {
+        self.native.questionnaire_advance = None;
+        self.save_question_editor();
+    }
+
+    pub fn questionnaire_can_respond(&self) -> bool {
+        self.responding_request.is_none()
+            && !self.request_held_by_typing_guard()
+            && self.question_submission.is_none()
+            && !self.question_submit_requested
+            && self.question_contract_supported
+            && self
+                .request
+                .as_ref()
+                .is_some_and(crate::approval::can_respond)
+            && self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.can_respond())
+    }
+
+    /// Ported from KSG ComposerPendingUserInputCard's question-scoped collapse state.
+    pub(crate) fn questionnaire_collapsed(&self) -> bool {
+        self.native.questionnaire.as_ref().is_some_and(|form| {
+            self.native.collapsed_question_id.as_deref() == Some(&form.questions[form.index].id)
+        })
+    }
+
+    pub(crate) fn toggle_questionnaire(&mut self) {
+        self.native.collapsed_question_id = if self.questionnaire_collapsed() {
+            None
+        } else {
+            self.native
+                .questionnaire
+                .as_ref()
+                .map(|form| form.questions[form.index].id.clone())
+        };
+    }
+
+    /// KSG Orchestrator.dispatchThreadUserInputDismiss. Never invokes a provider callback.
+    pub(super) fn dismiss_message_question(
+        &mut self,
+        id: &Value,
+        generation: &str,
+    ) -> Result<(), String> {
+        if !self
+            .request
+            .as_ref()
+            .is_some_and(|request| request["id"] == *id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if generation != self.request_generation {
+            return Err("Request or runtime generation changed.".into());
+        }
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|r| r["method"] == "confirm")
+            || !self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.capability == "message")
+        {
+            return Err("This question needs an answer. Answer it or stop the turn.".into());
+        }
+        if self.responding_request.is_some() || self.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        self.abandon_question("cancelled");
+        self.request = None;
+        self.native_dialog_done();
+        Ok(())
+    }
+
+    /// KSG Orchestrator.dispatchRuntimeRequestRespond's message response mode.
+    pub(super) fn respond_message_question(&mut self, response: &Value) -> bool {
+        if !self.native.questionnaire.as_ref().is_some_and(|form| {
+            form.capability == "message" || form.response_mode.as_deref() == Some("message")
+        }) {
+            return false;
+        }
+        if response["cancelled"] == true {
+            self.request = None;
+            self.native_dialog_done();
+            return true;
+        }
+        let answers: Value = response["value"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let mut replies = Vec::new();
+        for question in &self.native.questionnaire.as_ref().unwrap().questions {
+            let answer = &answers[&question.id];
+            let text = answer.as_str().map(str::to_owned).or_else(|| {
+                let values = answer.as_array()?;
+                if values.is_empty() || !values.iter().all(Value::is_string) {
+                    return None;
+                }
+                Some(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            });
+            let Some(text) = text.filter(|s| !s.trim().is_empty()) else {
+                if !question.required {
+                    continue;
+                }
+                self.error = Some("Answer each question before sending.".into());
+                return true;
+            };
+            replies.push(format!("{}\n{}", question.text, text.trim()));
+        }
+        if replies.is_empty() {
+            self.error = Some("Enter an answer before sending.".into());
+            return true;
+        }
+        self.request = None;
+        self.native_dialog_done();
+        let draft = std::mem::replace(&mut self.draft, TextEdit::new(replies.join("\n\n")));
+        let images = std::mem::take(&mut self.draft_images);
+        let context = std::mem::take(&mut self.draft_context);
+        let retained = std::mem::take(&mut self.retained_context);
+        let follow_up = self.native.follow_up;
+        self.native.follow_up = false;
+        if self.status.busy() {
+            self.send_during_run_with_fresh(None, &[], &str::to_owned, false);
+        } else {
+            self.send_with_fresh(None, &[], &str::to_owned, false);
+        }
+        self.draft = draft;
+        self.draft_images = images;
+        self.draft_context = context;
+        self.retained_context = retained;
+        self.native.follow_up = follow_up;
+        self.native.question_message_connect = self.pi.is_none() && self.queued_prompt.is_some();
+        true
+    }
+
+    pub(super) fn expire_live_question(&mut self, reason: &str) {
+        if let Some(form) = &mut self.native.questionnaire
+            && form.capability != "message"
+        {
+            form.capability = "not_resumable".into();
+            if let Some(request) = &mut self.request {
+                request["responseCapability"] = json!({"type":"not_resumable","reason":reason});
+            }
+            self.native.questionnaire_advance = None;
+        }
+    }
+
+    pub(super) fn cancel_questionnaire_advance(&mut self) {
+        self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
+    }
+
     pub fn questionnaire_step(&mut self, previous: bool) {
         self.native.questionnaire_advance = None;
+        if !self.questionnaire_can_respond() {
+            return;
+        }
+        self.save_question_editor();
         let Some(form) = &mut self.native.questionnaire else {
             return;
         };
-        form.answers[form.index].other = self.reply.text.clone();
         if previous {
             form.index = form.index.saturating_sub(1);
         } else if form.answer(form.index).is_some() {
             if form.index + 1 == form.questions.len() {
                 if let Some(response) = form.response() {
-                    let replies = form.remaining_rpc();
-                    let request = self.request.as_ref().map(|r| r["id"].clone());
-                    self.respond(response);
-                    if self.request.as_ref().map(|r| r["id"].clone()) != request {
-                        self.native.questionnaire_replies.extend(replies);
+                    if self.request_question_submission() {
+                        return;
                     }
+                    self.respond(response);
                 }
                 return;
             }
             form.index += 1;
         }
         self.reply.replace_text(&form.answers[form.index].other);
+        self.load_question_editor();
         self.reply.focused = false;
     }
 
     pub(super) fn cancel_questionnaire(&mut self) {
-        self.native.questionnaire_replies.clear();
         self.native.questionnaire_advance = None;
     }
 
     pub(super) fn refresh_typing_guard(&mut self) {
         let request_ids: Vec<String> = self
             .request
-            .as_ref()
-            .and_then(|r| {
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(self.native.projected_approvals.iter())
+            .filter_map(|r| {
                 r["id"]
                     .as_str()
                     .map(str::to_owned)
                     .or_else(|| Some(r.to_string()))
             })
-            .into_iter()
             .collect();
         self.typing_guard
             .on_requests(&request_ids, self.draft.focused, Instant::now());
@@ -913,7 +1388,8 @@ impl Thread {
             "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft,"context":s.prompt.context
         })).collect();
         values.extend(self.native.queue.iter().map(|q| json!({"kind":"queued","inputId":q.id,
-            "held":self.native.queue_held,"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft,"context":q.prompt.context})));
+            "held":self.native.queue_held,"freshContext":self.native.fresh_queue_ids.contains(&q.id),
+            "text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft,"context":q.prompt.context})));
         json!(values)
     }
 
@@ -956,6 +1432,9 @@ impl Thread {
                     .ok_or("Invalid queued input identity.")?;
                 self.serial = self.serial.max(id);
                 self.native.queue_held = true;
+                if item["freshContext"] == true {
+                    self.native.fresh_queue_ids.insert(id);
+                }
                 if !self.native.queue.iter().any(|q| q.id == id) {
                     self.native.queue.push_back(QueuedMessage { id, prompt });
                 }
@@ -1003,10 +1482,9 @@ impl Thread {
                 string(&command, "arguments")
             ));
         }
-        self.native.questionnaire = None;
+        self.expire_live_question("The provider session disconnected.");
         self.native.questionnaire_advance = None;
         self.native.questionnaires.clear();
-        self.native.questionnaire_replies.clear();
         self.native.notifications.clear();
         if !self.native.queue_held {
             self.return_local_queue();
@@ -1035,6 +1513,7 @@ impl Thread {
         self.native.dialog_deadline = None;
         self.native.dialog_status = None;
         self.native.dialogs.clear();
+        self.native.projected_approvals.clear();
         self.native.session_approvals.clear();
         self.native.probe = None;
         self.native.request_id = None;
@@ -1045,12 +1524,24 @@ impl Thread {
     }
 
     pub(super) fn native_tick(&mut self, now: Instant) -> bool {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+        }
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| form.answers[form.index].other != self.current_question_text())
+        {
+            self.save_question_editor();
+        }
         let before = self.native.notifications.len();
         self.native
             .notifications
             .retain(|(_, deadline)| *deadline > now);
         let mut changed = (before != self.native.notifications.len()) | self.tick_stop(now);
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
+            self.abandon_question("expired");
             self.cancel_questionnaire();
             self.native.dialog_deadline = None;
             self.request = None;
@@ -1066,7 +1557,12 @@ impl Thread {
             self.questionnaire_step(false);
             return true;
         }
-        changed |= self.typing_guard.release_if_idle(now);
+        let released = self.typing_guard.release_if_idle(now);
+        if released && self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+            self.draft.focused = false;
+            self.reply.focused = false;
+        }
+        changed |= released;
         changed
     }
 
@@ -1085,6 +1581,7 @@ impl Thread {
                     .as_ref()
                     .is_some_and(|request| request["id"] == record["id"])
                 {
+                    self.abandon_question("cancelled");
                     self.cancel_questionnaire();
                     self.request = None;
                     self.native_dialog_done();
@@ -1103,9 +1600,6 @@ impl Thread {
             "tool_execution_end" => {
                 if let Some(id) = record["toolCallId"].as_str() {
                     self.native.questionnaires.remove(id);
-                    self.native
-                        .questionnaire_replies
-                        .retain(|(tool, _, _)| tool != id);
                 }
             }
             "extension_ui_request" if record["method"] == "notify" => {
@@ -1129,6 +1623,14 @@ impl Thread {
                     if serial.is_some_and(|n| n < self.native.state_floor) {
                         return true;
                     }
+                }
+                if command == "consume_reset_credit" {
+                    self.harness_state["resetCreditOutcome"] = if record["success"] == false {
+                        json!({"error": string(record, "error")})
+                    } else {
+                        json!({"outcome": record["data"]["outcome"]})
+                    };
+                    return true;
                 }
                 if command == "get_commands" {
                     self.native.commands_requested = false;
@@ -1336,6 +1838,9 @@ impl Thread {
                     self.native.compact_id = None;
                     if record["success"] == false {
                         self.error = Some(string(record, "error").into());
+                        if !self.native.queue.is_empty() {
+                            self.native.queue_held = true;
+                        }
                         if !matches!(self.harness.as_str(), "codex" | "claude")
                             || self
                                 .native
@@ -1471,6 +1976,7 @@ impl Thread {
                     self.context.cancel_request();
                     self.context
                         .absorb(&json!({"contextUsage":{"tokens":tokens,"contextWindow":window}}));
+                    self.refresh_estimated_breakdown();
                 }
             }
             "queue_update" => {
@@ -1560,29 +2066,6 @@ impl Thread {
                     "confirm" | "select" | "input" | "editor"
                 ) =>
             {
-                let signature = questionnaire::signature(record);
-                if let Some(at) =
-                    self.native
-                        .questionnaire_replies
-                        .iter()
-                        .position(|(tool, key, _)| {
-                            self.native.questionnaires.len() == 1
-                                && *key == signature
-                                && self.native.questionnaires.contains_key(tool)
-                                && record["timeout"].as_i64().is_none_or(|n| n >= 0)
-                        })
-                {
-                    let (_, _, value) = self.native.questionnaire_replies.remove(at);
-                    if let Some(pi) = &self.pi {
-                        if let Err(error) = pi.send(
-                            json!({"type":"extension_ui_response","id":record["id"],"value":value}),
-                        ) {
-                            self.error = Some(error);
-                        } else {
-                            return true;
-                        }
-                    }
-                }
                 if record["method"] == "confirm"
                     && self
                         .native
@@ -1619,6 +2102,7 @@ impl Thread {
                         );
                     } else {
                         self.native.dialogs.push_back((record.clone(), deadline));
+                        self.refresh_typing_guard();
                     }
                     return true;
                 }
@@ -1687,7 +2171,64 @@ impl Thread {
 }
 
 impl State {
+    pub fn effective_access_mode(&self, thread: &crate::model::Thread) -> AccessMode {
+        let (modes, compatible) = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        );
+        clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible)
+    }
+
+    pub fn reconcile_current_access_mode(&mut self) {
+        let access = self.effective_access_mode(self.current());
+        if self.current().native.access == access {
+            return;
+        }
+        if self.forward(
+            "thread.configure",
+            json!({"threadId":self.current().id,"access":access.id()}),
+        ) {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.demo || self.current().configuring || self.current().archived() {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.current().harness == "claude"
+            && self.current().pi.is_some()
+            && !self.current().initializing
+        {
+            self.current_mut().native.access = access;
+            self.current_mut()
+                .command("set_access_mode", json!({"accessMode":access.id()}));
+            self.checkpoint();
+            return;
+        }
+        if self.current().status.busy() {
+            return;
+        }
+        if self.current().pi.is_some() {
+            self.current_mut().disconnect();
+            self.current_mut().native.access = access;
+            self.connect_thread(self.active);
+        } else {
+            self.current_mut().native.access = access;
+        }
+        self.checkpoint();
+    }
+
+    pub fn open_access_picker(&mut self) {
+        self.reconcile_current_access_mode();
+        self.current_mut().native.access_picker = true;
+    }
+
     pub fn set_access_mode(&mut self, access: AccessMode) {
+        let (modes, compatible) =
+            resolve_compatible_access_mode(access, supported_access_modes(&self.current().harness));
+        let access = clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible);
         if self.forward(
             "thread.configure",
             json!({"threadId":self.current().id,"access":access.id()}),
@@ -1722,6 +2263,14 @@ impl State {
     }
 
     pub fn choose_slash(&mut self, name: String) {
+        if name == "clear" && !self.fresh_session_command_available(self.current()) {
+            return;
+        }
+        if name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME
+            && !self.usage_limits_command_available(self.current())
+        {
+            return;
+        }
         let range = self.current().slash_trigger().map(|t| t.range).or_else(|| {
             (name == "model" && self.current().draft.text.trim() == "/model")
                 .then(|| 0..self.current().draft.text.len())
@@ -1729,7 +2278,10 @@ impl State {
         let Some(range) = range else {
             return;
         };
-        let replacement = if name == "model" {
+        let replacement = if name == "model"
+            || name == "clear"
+            || name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME
+        {
             String::new()
         } else {
             format!("/{name} ")
@@ -1742,6 +2294,12 @@ impl State {
         edit.focused = true;
         if name == "model" {
             self.open_model_picker(SettingsPicker::Model);
+        } else if name == "clear" {
+            let thread_id = self.current().id;
+            self.arm_fresh_session(thread_id);
+            self.checkpoint();
+        } else if name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME {
+            self.open_usage_limits();
         }
     }
 
@@ -1831,5 +2389,54 @@ impl State {
         self.select_thread(self.threads.len() - 1);
         self.connect_thread(self.active);
         self.checkpoint();
+    }
+
+    pub(crate) fn dismiss_question(
+        &mut self,
+        thread_id: usize,
+        request_id: &Value,
+    ) -> Result<(), String> {
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread_id)
+            .ok_or("The thread is unavailable.")?;
+        if !thread
+            .request
+            .as_ref()
+            .is_some_and(|r| r["id"] == *request_id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if thread.responding_request.is_some() || thread.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        if let Some(client) = &self.client {
+            if !client
+                .supports_capability(&self.machines.selected, crate::protocol::QUESTION_DISMISS)
+            {
+                return Err(crate::protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into());
+            }
+            if !client.can_approve(&self.machines.selected) {
+                return Err("This connection cannot answer requests.".into());
+            }
+            let request = thread.request.as_ref().expect("checked");
+            let generation = request["runtimeGeneration"]
+                .as_str()
+                .unwrap_or(&thread.request_generation);
+            let id = client
+                .commands_for(&self.machines.selected)
+                .ok_or("This machine is disconnected.")?
+                .send(
+                    "thread.user-input.dismiss",
+                    json!({
+                        "threadId":thread_id,"requestId":request_id,"generation":generation
+                    }),
+                )?;
+            thread.responding_request = Some(id);
+            return Ok(());
+        }
+        let generation = thread.request_generation.clone();
+        thread.dismiss_message_question(request_id, &generation)
     }
 }

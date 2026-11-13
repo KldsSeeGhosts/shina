@@ -818,18 +818,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
         let mut actions = row().gap(6.0).flex_wrap().center_y();
         actions = if approval {
             actions
-                .child(
-                    solid_button(format!("approve-{id}"), "Approve", p, move |s| {
-                        let _ = s.respond_to_request(id, json!({"confirmed": true}));
-                    })
-                    .disabled(!can_answer),
-                )
-                .child(
-                    ghost_button(s, format!("decline-{id}"), "Decline", p, move |s| {
-                        let _ = s.respond_to_request(id, json!({"confirmed": false}));
-                    })
-                    .disabled(!can_answer),
-                )
+                .child(super::approval_actions(s, id, true, can_answer, p))
                 .child(ghost_button(
                     s,
                     format!("open-request-{id}"),

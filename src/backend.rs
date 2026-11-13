@@ -889,4 +889,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pi_fresh_session_source_omits_session_resume_flag() {
+        let new_launch = Launch {
+            workspace: PathBuf::from("."),
+            session: None,
+            fork_source: None,
+            instructions: None,
+            host: None,
+            ephemeral: false,
+            #[cfg(test)]
+            session_directory: PathBuf::from("."),
+        };
+        let resume_launch = Launch {
+            workspace: PathBuf::from("."),
+            session: Some("old-session.jsonl".into()),
+            fork_source: None,
+            instructions: None,
+            host: None,
+            ephemeral: false,
+            #[cfg(test)]
+            session_directory: PathBuf::from("."),
+        };
+        // SessionSource::New clears session and fork_source so Pi starts a new session without --session.
+        assert!(new_launch.session.is_none() && new_launch.fork_source.is_none());
+        assert_eq!(resume_launch.session.as_deref(), Some("old-session.jsonl"));
+        let mut thread = crate::model::Thread::new(1);
+        thread.harness = "pi".into();
+        thread.session = Some("old-session.jsonl".into());
+        assert!(matches!(
+            thread.planned_session_source(),
+            SessionSource::Resume(ref id) if id == "old-session.jsonl"
+        ));
+        thread.begin_prompt_with_fresh(
+            crate::attachments::Prompt::new("fresh start".into(), vec![]),
+            true,
+        );
+        assert!(matches!(
+            thread.planned_session_source(),
+            SessionSource::New
+        ));
+    }
 }

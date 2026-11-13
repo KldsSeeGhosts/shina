@@ -102,6 +102,12 @@ pub struct ThreadDefaults {
     /// Starting directory when the Add workspace folder browser opens (KSG Code's `addProjectBaseDirectory`).
     /// Empty defaults to `"~/"`.
     pub add_project_base_directory: String,
+    /// KSG Code's `promptSuggestionsEnabled`: off by default.
+    pub prompt_suggestions_enabled: bool,
+    /// KSG Code's `defaultThreadEnvMode`: `"local"` by default.
+    pub default_thread_env_mode: crate::model::ThreadEnvMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model_selection: Option<crate::model_selection::ModelSelection>,
 }
 impl Default for ThreadDefaults {
     fn default() -> Self {
@@ -121,6 +127,9 @@ impl Default for ThreadDefaults {
             ],
             models: BTreeMap::new(),
             add_project_base_directory: String::new(),
+            prompt_suggestions_enabled: false,
+            default_thread_env_mode: crate::model::ThreadEnvMode::Local,
+            fallback_model_selection: None,
         }
     }
 }
@@ -143,6 +152,14 @@ impl ThreadDefaults {
                 .add_project_base_directory
                 .chars()
                 .any(char::is_control)
+            || self.fallback_model_selection.as_ref().is_some_and(|sel| {
+                sel.instance_id.trim().is_empty()
+                    || sel.model.trim().is_empty()
+                    || sel.instance_id.len() > 256
+                    || sel.model.len() > 256
+                    || sel.instance_id.chars().any(char::is_control)
+                    || sel.model.chars().any(char::is_control)
+            })
         {
             return Err("Invalid thread defaults.".into());
         }
@@ -635,7 +652,16 @@ impl State {
         };
         self.settings.notice = result.err();
     }
-    fn save_defaults(&mut self, defaults: ThreadDefaults) {
+    fn save_defaults(&mut self, mut defaults: ThreadDefaults) {
+        if let Some(mode) = crate::model::AccessMode::parse(&defaults.access)
+            && let Some(clamped) = crate::model::clamp_managed_access_mode(
+                self.managed_policy.as_ref(),
+                mode,
+                &crate::model::AccessMode::ALL,
+            )
+        {
+            defaults.access = clamped.id().into();
+        }
         self.settings_command("settings.threadDefaults", json!(defaults));
     }
     fn reveal_settings_file(&mut self, name: &str) {
@@ -807,45 +833,65 @@ pub(super) fn destructive_button(
     settings_button(key, title, Palette { ink: p.danger, ..p }, action)
 }
 
-fn default_access(p: Palette, current: &str) -> El {
+fn default_access(s: &State, p: Palette, current: &str) -> El {
+    let selected = crate::model::AccessMode::parse(current).and_then(|mode| {
+        crate::model::clamp_managed_access_mode(
+            s.managed_policy.as_ref(),
+            mode,
+            &crate::model::AccessMode::ALL,
+        )
+    });
     let mut group = col()
         .key("settings-access-value")
         .role("radiogroup")
         .label("Default access mode")
         .focus_group()
-        .w(160.0)
+        .w(220.0)
         .padding(2.0)
         .gap(2.0)
         .radius(4.0)
         .border(1.0, p.line);
-    for mode in [
-        crate::model::AccessMode::ReadOnly,
-        crate::model::AccessMode::Supervised,
-        crate::model::AccessMode::Edits,
-        crate::model::AccessMode::Full,
-    ] {
-        let on = mode.id() == current;
-        group = group.child(
-            row()
-                .key(format!("settings-default-access-{}", mode.id()))
-                .role("radio")
-                .checked(on)
-                .label(mode.label())
-                .focusable(true)
-                .focus_highlight(p.selected)
-                .h(28.0)
-                .px(8.0)
-                .center_y()
-                .radius(4.0)
-                .fill(if on { p.selected } else { Color::TRANSPARENT })
-                .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
-                .on_press(move |s: &mut State| {
-                    let mut defaults = s.settings_defaults();
-                    defaults.access = mode.id().into();
-                    s.save_defaults(defaults);
-                })
-                .child(label(mode.label(), TextStyle::new(12.0, 500.0), p.ink)),
-        );
+    for mode in crate::model::AccessMode::ALL {
+        let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
+        let disabled = denial.is_some();
+        let on = !disabled && selected == Some(mode);
+        let mut content = col().gap(2.0).min_w(0.0).child(label(
+            mode.label(),
+            TextStyle::new(12.0, 500.0),
+            if disabled { p.muted } else { p.ink },
+        ));
+        if let Some(reason) = denial {
+            content = content.child(
+                label(&reason, TextStyle::new(11.0, 400.0).lh(14.0), p.muted)
+                    .key(format!("settings-default-access-{}-denial", mode.id()))
+                    .wrap(),
+            );
+        }
+        let mut item = row()
+            .key(format!("settings-default-access-{}", mode.id()))
+            .role("radio")
+            .checked(on)
+            .label(mode.label())
+            .disabled(disabled)
+            .min_h(28.0)
+            .px(8.0)
+            .py(4.0)
+            .center_y()
+            .radius(4.0)
+            .fill(if on { p.selected } else { Color::TRANSPARENT })
+            .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
+            .child(content);
+        if !disabled {
+            item =
+                item.focusable(true)
+                    .focus_highlight(p.selected)
+                    .on_press(move |s: &mut State| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.access = mode.id().into();
+                        s.save_defaults(defaults);
+                    });
+        }
+        group = group.child(item);
     }
     group
 }
@@ -1878,6 +1924,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             "Default access mode",
             "Default harness",
             "Default model and effort",
+            "Workspace",
         ],
         2 => &["Pi", "Codex", "Claude", "ACP harnesses"],
         3 => &["Linked machines", "Update all machines"],
@@ -2075,7 +2122,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 "settings-access",
                 "Default access mode",
                 "Used only when a new thread has nothing to inherit.",
-                default_access(p, &access),
+                default_access(s, p, &access),
                 p,
             );
             pane = add(
@@ -2144,6 +2191,67 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         })));
             }
+            let fallback_selection = defaults.fallback_model_selection.clone();
+            let fallback_enabled = fallback_selection.is_some();
+            let fallback_summary = fallback_selection
+                .as_ref()
+                .map(|sel| format!("{} · {}", sel.instance_id, sel.model))
+                .unwrap_or_else(|| "None".into());
+            pane = add(
+                pane,
+                s,
+                "settings-fallback-model",
+                "Fallback model",
+                "Used for new threads when the default model's provider is out of usage.",
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .child(settings_button(
+                        "fallback-model-cycle",
+                        &fallback_summary,
+                        p,
+                        |s| {
+                            let mut defaults = s.settings_defaults();
+                            let candidates = s.fallback_model_candidates();
+                            if candidates.is_empty() {
+                                return;
+                            }
+                            let next = match defaults.fallback_model_selection.as_ref() {
+                                Some(current) => {
+                                    let pos = candidates
+                                        .iter()
+                                        .position(|c| {
+                                            c.instance_id == current.instance_id
+                                                && c.model == current.model
+                                        })
+                                        .unwrap_or(0);
+                                    candidates[(pos + 1) % candidates.len()].clone()
+                                }
+                                None => candidates[0].clone(),
+                            };
+                            defaults.fallback_model_selection = Some(next);
+                            s.save_defaults(defaults);
+                        },
+                    ))
+                    .child(captain_ui::switch(
+                        s,
+                        "fallback-model-toggle",
+                        "Fallback model",
+                        fallback_enabled,
+                        p,
+                        move |s| {
+                            let mut defaults = s.settings_defaults();
+                            if defaults.fallback_model_selection.is_some() {
+                                defaults.fallback_model_selection = None;
+                            } else {
+                                defaults.fallback_model_selection =
+                                    s.fallback_model_candidates().into_iter().next();
+                            }
+                            s.save_defaults(defaults);
+                        },
+                    )),
+                p,
+            );
             pane = add(
                 pane,
                 s,
@@ -2172,6 +2280,53 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         },
                     )),
+                p,
+            );
+            let default_env_mode = defaults.default_thread_env_mode;
+            pane = add(
+                pane,
+                s,
+                "settings-default-env-mode",
+                "Workspace",
+                "Where new threads start. Projects and their t3.json can override it.",
+                settings_button(
+                    "default-env-mode-toggle",
+                    crate::branch_toolbar::resolve_env_mode_label(default_env_mode),
+                    p,
+                    move |s| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.default_thread_env_mode = match defaults.default_thread_env_mode {
+                            crate::model::ThreadEnvMode::Local => {
+                                crate::model::ThreadEnvMode::Worktree
+                            }
+                            crate::model::ThreadEnvMode::Worktree => {
+                                crate::model::ThreadEnvMode::Local
+                            }
+                        };
+                        s.save_defaults(defaults);
+                    },
+                ),
+                p,
+            );
+            let prompt_suggestions_enabled = defaults.prompt_suggestions_enabled;
+            pane = add(
+                pane,
+                s,
+                "settings-prompt-suggestions",
+                "Suggest next prompt",
+                "Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.",
+                captain_ui::switch(
+                    s,
+                    "prompt-suggestions-toggle",
+                    "Suggest next prompt",
+                    prompt_suggestions_enabled,
+                    p,
+                    |s| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.prompt_suggestions_enabled = !defaults.prompt_suggestions_enabled;
+                        s.save_defaults(defaults);
+                    },
+                ),
                 p,
             );
         }

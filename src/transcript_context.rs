@@ -83,6 +83,15 @@ fn machine_key(s: &State, environment: &str) -> String {
     }
 }
 
+fn environment_known(s: &State, environment_id: &str) -> bool {
+    let key = machine_key(s, environment_id);
+    key == "local"
+        || s.peers.iter().any(|p| p.server_id == key)
+        || s.client
+            .as_ref()
+            .is_some_and(|c| c.linked.contains_key(&key))
+}
+
 fn display_label(s: &State, record: &Record, fallback: &str) -> String {
     match &record.data {
         Data::Thread {
@@ -113,6 +122,14 @@ fn display_label(s: &State, record: &Record, fallback: &str) -> String {
             pull_request: Some(pr),
             ..
         } => format!("#{}", pr.number),
+        Data::Environment { environment_id } if environment_known(s, environment_id) => {
+            let label = s.machine_label(&machine_key(s, environment_id));
+            if label.trim().is_empty() {
+                record.label.clone()
+            } else {
+                label
+            }
+        }
         _ => {
             if record.label.is_empty() {
                 fallback.into()
@@ -438,27 +455,47 @@ impl<'a> Document<'a> {
                 p,
             );
             el = el.pill(a..b, rune::PillStyle::default().bg(bg).fg(fg).icon(icon));
+            let copy_markdown = match record.map(|r| &r.data) {
+                Some(Data::Model {
+                    instance_id, model, ..
+                }) => format!("model:{instance_id}/{model}"),
+                _ => {
+                    context::format_composer_context_reference(&kind, &id, &original_labels[index])
+                }
+            };
             copied.push(CopyLink {
                 range: a..b,
-                markdown: context::format_composer_context_reference(
-                    &kind,
-                    &id,
-                    &original_labels[index],
-                ),
+                markdown: copy_markdown,
                 context_id: id,
             });
-            if record.is_some() {
-                el = el.link(
-                    rune::Link::new(a..b, &href)
-                        .role("button")
-                        .label(format!("{kind}, {}", &text[a..b]))
-                        .help(match kind.as_str() {
-                            "thread" => "Open thread",
-                            "file" | "mention" | "image" => "Preview file",
-                            _ => "Show details",
-                        })
-                        .hover(rune::LinkPaint::new().underline(fg)),
-                );
+            if let Some(rec) = record {
+                if let Data::Environment { environment_id } = &rec.data {
+                    el = el.link(
+                        rune::Link::new(a..b, &href)
+                            .role("button")
+                            .label(format!("Machine, {}", &text[a..b]))
+                            .help(if environment_known(self.state, environment_id) {
+                                "Shina machine"
+                            } else {
+                                "Machine not in this app"
+                            }),
+                    );
+                } else {
+                    el = el.link(
+                        rune::Link::new(a..b, &href)
+                            .role("button")
+                            .label(match kind.as_str() {
+                                "model" => format!("Model, {}", &text[a..b]),
+                                _ => format!("{kind}, {}", &text[a..b]),
+                            })
+                            .help(match kind.as_str() {
+                                "thread" => "Open thread",
+                                "file" | "mention" | "image" => "Preview file",
+                                _ => "Show details",
+                            })
+                            .hover(rune::LinkPaint::new().underline(fg)),
+                    );
+                }
             } else {
                 el = el.help("This context is no longer available.");
             }
@@ -599,14 +636,9 @@ pub(super) fn activate(s: &mut State, message_id: &str, href: &str, tx: &mut Tx)
         } => {
             let _ = tx.open_url(&pr.url);
         }
-        Data::Environment { environment_id } => {
-            s.select_machine(&machine_key(s, environment_id));
-        }
+        Data::Environment { .. } => {}
         Data::Response { citation, .. } => {
-            if let Ok(id) = citation.thread_id.parse::<usize>() {
-                s.open_machine_thread(&machine_key(s, &citation.environment_id), id);
-                tx.scroll_into_view(format!("row-{id}-{}", citation.message_id));
-            }
+            s.navigate_to_citation(citation, tx);
         }
         _ => {
             s.transcript_preview = Some(Preview {
@@ -680,6 +712,17 @@ fn details(record: &Record) -> String {
         Data::Response { citation, .. } => citation.text.clone(),
         Data::Skill { name } => name.clone(),
         Data::Environment { environment_id } => environment_id.clone(),
+        Data::Model {
+            instance_id,
+            model,
+            provider_label,
+        } => {
+            let provider = provider_label
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(instance_id.as_str());
+            format!("{}\n{provider}\nmodel:{instance_id}/{model}", record.label)
+        }
         _ => record.label.clone(),
     }
 }

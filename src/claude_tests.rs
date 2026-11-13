@@ -36,6 +36,116 @@ fn native_image_budget_falls_back_to_the_attachment_path() {
 }
 
 #[test]
+fn ask_user_question_mapping_trims_discards_blank_rows_and_uses_question_text_ids() {
+    let mut client = client("full-access");
+    client
+        .server_request(
+            &json!({"request_id":"questions","request":{"subtype":"can_use_tool",
+            "tool_name":"AskUserQuestion","tool_use_id":"tool","input":{"questions":[
+                {"question":"   ","options":[]},
+                {"id":"ignore-native-id","question":"  Where?  ","header":" ","multiSelect":true,
+                 "allowCustomAnswer":false,"initialAnswer":"ignore","options":[
+                     {"label":" "},{"label":" Disk ","description":" ","preview":"Preview"}]}
+            ]}}}),
+        )
+        .unwrap();
+    let request = client.events.last().unwrap();
+    assert_eq!(
+        request["questions"],
+        json!([{"id":"Where?","header":"Question 2",
+        "question":"Where?","multiSelect":true,"options":[
+            {"label":"Disk","description":"Disk","preview":"Preview"}]}])
+    );
+    assert_eq!(request["responseCapability"]["type"], "live");
+}
+
+#[test]
+fn approval_cancel_interrupts_decline_does_not_and_session_uses_session_rules() {
+    for decision in ["accept", "acceptForSession", "decline", "cancel"] {
+        let mut client = client("approval-required");
+        client.answer_decision(
+            Approval {
+                request_id: "decision".into(),
+                input: json!({"command":"echo hello"}),
+                name: "Bash".into(),
+                tool_id: json!("tool"),
+                hook: false,
+                suggestions: vec![],
+            },
+            decision,
+            None,
+        );
+        let response = &client.wire.last().unwrap()["response"]["response"];
+        assert_eq!(response["interrupt"] == true, decision == "cancel");
+        assert_eq!(
+            response["behavior"],
+            if decision.starts_with("accept") {
+                "allow"
+            } else {
+                "deny"
+            }
+        );
+        if decision == "acceptForSession" {
+            assert_eq!(response["updatedPermissions"][0]["destination"], "session");
+            assert_eq!(
+                response["updatedPermissions"][0]["rules"][0]["toolName"],
+                "Bash"
+            );
+        }
+    }
+}
+
+#[test]
+fn forwarded_requests_keep_suppressed_options_and_mcp_session_grants() {
+    let mut client = client("full-access");
+    client
+        .server_request(
+            &json!({"request_id":"ask-rule","request":{"subtype":"can_use_tool",
+        "tool_name":"Bash","tool_use_id":"tool","input":{"command":"echo test"},
+        "suppress_always_allow_rule":true,"matched_ask_rule":{"source":"settings"},
+        "decision_reason":"\u{1b}[31mCheck this command.\u{1b}[0m"}}),
+        )
+        .unwrap();
+    let request = client.events.last().unwrap();
+    assert_eq!(
+        request["approvalOptions"],
+        json!([
+        {"decision":"decline","label":"Decline"},{"decision":"accept","label":"Approve"}])
+    );
+    assert_eq!(request["fullAccessOverride"], "ask_rule");
+    assert!(!request["message"].as_str().unwrap().contains('\u{1b}'));
+    client
+        .command(json!({"type":"extension_ui_response","id":"ask-rule","decision":"cancel"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["interrupt"],
+        true
+    );
+
+    client.running = true;
+    let request = json!({"request_id":"mcp","request":{"subtype":"elicitation",
+        "mcp_server_name":"browser","message":"Allow browser?","mode":"form",
+        "requested_schema":{"properties":{}}}});
+    client.server_request(&request).unwrap();
+    assert_eq!(
+        client.events.last().unwrap()["approvalOptions"],
+        json!(crate::approval::defaults())
+    );
+    client
+        .command(json!({"type":"extension_ui_response","id":"mcp","decision":"acceptForSession"}))
+        .unwrap();
+    let count = client.events.len();
+    let mut repeat = request;
+    repeat["request_id"] = json!("repeat");
+    client.server_request(&repeat).unwrap();
+    assert_eq!(client.events.len(), count);
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["action"],
+        "accept"
+    );
+}
+
+#[test]
 fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
     let dir = crate::store::directory().unwrap();
     let script = dir.join("claude-probe.py");
@@ -125,6 +235,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         }),
         owner: Arc::default(),
         context_sent: false,
+        prompt_suggestions: false,
     }
 }
 
@@ -293,8 +404,8 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
                 "tool_name":name,"tool_use_id":"call","input":{"path":"x"}}}),
                 )
                 .unwrap();
-            let ask = access == "approval-required" && name != "Read"
-                || access == "auto-accept-edits" && !matches!(name, "Read" | "Edit");
+            // A CLI-forwarded ask requires consent even under bypass or an ask rule for Read.
+            let ask = access != "read-only" || name == "Read";
             assert_eq!(!client.approvals.is_empty(), ask, "{access} {name}");
             if ask {
                 client
@@ -985,4 +1096,220 @@ fn claude_reports_manifest_descriptors_and_applies_options_and_1m_suffix() {
     let req = client.wire.last().unwrap();
     assert_eq!(req["request"]["subtype"], "apply_flag_settings");
     assert_eq!(req["request"]["settings"]["fastMode"], true);
+}
+
+#[test]
+fn auto_mode_maps_to_claude_auto_permission_mode() {
+    let client = Client::new(spec(SessionSource::New, "auto"));
+    let mut command = Command::new("claude");
+    client.launch(&mut command);
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let index = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .unwrap();
+    assert_eq!(args[index + 1], "auto");
+
+    let mut client = client;
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "models": []
+        }))
+        .unwrap();
+    client.wire.clear();
+    client
+        .command(json!({"type":"set_access_mode","accessMode":"auto"}))
+        .unwrap();
+    assert_eq!(client.wire[0]["request"]["subtype"], "set_permission_mode");
+    assert_eq!(client.wire[0]["request"]["mode"], "auto");
+}
+
+#[test]
+fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn() {
+    let mut client = client("read-only");
+    client.running = true;
+    client
+        .incoming(json!({
+            "type": "assistant",
+            "uuid": "u1",
+            "message": {
+                "role": "assistant",
+                "id": "m1",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Done"}],
+                "usage": {
+                    "input_tokens": 10000,
+                    "cache_read_input_tokens": 5000,
+                    "cache_creation_input_tokens": 2000,
+                    "output_tokens": 500
+                }
+            }
+        }))
+        .unwrap();
+    client.wire.clear();
+    client
+        .incoming(json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "queued_turn_count": 0,
+            "modelUsage": {
+                "claude-sonnet-4-6": { "contextWindow": 200000 }
+            }
+        }))
+        .unwrap();
+    let req = client
+        .wire
+        .iter()
+        .find(|r| r["request"]["subtype"] == "get_context_usage")
+        .expect("expected get_context_usage control_request")
+        .clone();
+    assert_eq!(req["request"]["detail"], "summary");
+    let req_id = req["request_id"].as_str().unwrap().to_owned();
+
+    client.events.clear();
+    client
+        .incoming(json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": req_id,
+                "response": {
+                    "categories": [
+                        {"name": "System prompt", "tokens": 3200, "kind": "used"},
+                        {"name": "Messages", "tokens": 14300, "kind": "used"},
+                        {"name": "Autocompact buffer", "tokens": 30000, "kind": "buffer"},
+                        {"name": "Free space", "tokens": 152500, "kind": "free"},
+                        {"name": "Deferred tools", "tokens": 4100, "kind": "deferred"}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+    let mut thread = Thread::new(32);
+    thread.harness = "claude".into();
+    for event in client.events {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.context.usage.breakdown,
+        Some(vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "System prompt".into(),
+                tokens: 3200,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 14300,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Autocompact buffer".into(),
+                tokens: 30000,
+                kind: crate::context_breakdown::BreakdownRowKind::Buffer,
+            },
+        ])
+    );
+}
+
+#[test]
+fn claude_fresh_session_passes_session_id_and_not_resume() {
+    let client = Client::new(Start {
+        prompt_suggestions: false,
+        id: "claude".into(),
+        workspace: PathBuf::from("."),
+        source: SessionSource::New,
+        instructions: None,
+        link: None,
+        owner: Arc::default(),
+        context_sent: false,
+    });
+    let mut command = Command::new("claude");
+    client.launch(&mut command);
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.iter().any(|arg| arg == "--session-id"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg == "--resume"), "{args:?}");
+}
+
+#[test]
+fn claude_prompt_suggestion_stores_for_settled_run_and_discards_late_answer() {
+    let mut start = spec(SessionSource::New, "read-only");
+    start.prompt_suggestions = true;
+    let mut client = Client::new(start);
+    client.initialize();
+    let init_req = client
+        .wire
+        .iter()
+        .find(|r| r["request"]["subtype"] == "initialize")
+        .expect("expected initialize request");
+    assert_eq!(init_req["request"]["promptSuggestions"], true);
+    client
+        .incoming(json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": init_req["request_id"],
+                "response": { "hook_on_failure_supported": true, "commands": [], "models": [{ "value": "default", "displayName": "Default" }] }
+            }
+        }))
+        .unwrap();
+
+    let mut thread = Thread::new(33);
+    thread.harness = "claude".into();
+    thread.run_id = Some("run-1".into());
+    let (pi, _commands, _events) = crate::backend::Pi::test_connection();
+    thread.pi = Some(pi);
+
+    client
+        .command(json!({"type": "prompt", "id": "p1", "message": "hello", "runId": "run-1"}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "result", "is_error": false, "queued_turn_count": 0}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "prompt_suggestion", "suggestion": "  Run cargo test  "}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.prompt_suggestion,
+        Some(crate::model::PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        })
+    );
+
+    // Start a second run, then deliver a late suggestion for run-1: it must be discarded.
+    thread.run_id = Some("run-2".into());
+    client
+        .command(json!({"type": "prompt", "id": "p2", "message": "next", "runId": "run-2"}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "prompt_suggestion", "suggestion": "Stale suggestion"}))
+        .unwrap();
+    // Even if run-2 settles and a late payload carrying run-1 arrives, it is discarded.
+    client
+        .incoming(json!({"type": "result", "is_error": false, "queued_turn_count": 0}))
+        .unwrap();
+    client
+        .incoming(
+            json!({"type": "prompt_suggestion", "runId": "run-1", "suggestion": "Stale for run-1"}),
+        )
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(thread.prompt_suggestion, None);
 }

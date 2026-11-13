@@ -1,11 +1,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod approval;
+mod assistant_citation;
 mod attachment_intake;
 mod attachment_picker;
 mod attachment_uploads;
 mod attachments;
 mod backend;
+mod branch_toolbar;
 mod brand;
 mod cache_persistence;
 mod captains;
@@ -16,12 +19,14 @@ mod client_history;
 mod codex;
 mod composer;
 mod composer_context;
+mod composer_notices;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;
 mod composer_sources;
 mod composer_tokens;
 mod context;
+mod context_breakdown;
 mod crisp;
 mod database;
 mod descriptors;
@@ -45,12 +50,14 @@ mod model_picker;
 mod model_selection;
 mod outbox;
 mod peer;
+mod plan_export;
 mod portraits;
 mod power;
 mod process;
 mod projection_store;
 mod projects;
 mod protocol;
+mod question_document;
 mod routines;
 mod runtime;
 mod server;
@@ -68,6 +75,7 @@ mod tray;
 mod ui;
 mod update;
 mod usage_limits;
+mod vcs;
 mod visuals;
 mod work;
 
@@ -448,7 +456,11 @@ fn dispatch_global_command(
             let open = !t.native.access_picker;
             state.settings_picker = None;
             state.machines.picker = false;
-            state.current_mut().native.access_picker = open;
+            if open {
+                state.open_access_picker();
+            } else {
+                state.current_mut().native.access_picker = false;
+            }
         }
         "modelPicker.previousProvider" => {
             if key_repeat {
@@ -603,6 +615,7 @@ fn fleet_demo(state: &mut State) {
                 host: host.into(),
                 device_id: "example".into(),
                 token: "unused-offline-fixture".into(),
+                enabled: true,
             });
             client.linked.insert(server.into(), remote);
         }

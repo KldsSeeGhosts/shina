@@ -33,6 +33,8 @@ struct Shared {
     remote: bool,
     pairing: Arc<Mutex<server_auth::Pairing>>,
     uploads: Arc<Mutex<HashMap<String, Upload>>>,
+    answer_preparations:
+        Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<(), String>>>>>>,
     discovery: Discovery,
     directory: PathBuf,
     database: crate::database::Database,
@@ -99,7 +101,7 @@ async fn upload_start(
             _ => return Err("Invalid attachment type.".into()),
         };
         let staged = body["staged"] == true;
-        if staged && shared.discovery.protocol_minor < 11 {
+        if staged && shared.discovery.protocol_minor < protocol::STAGED_ATTACHMENTS_MINOR {
             return Err(protocol::STAGED_ATTACHMENTS_UPDATE_REQUIRED.into());
         }
         let name = body["name"].as_str().unwrap_or("Image");
@@ -283,7 +285,7 @@ async fn staged_attachment(
     let Some(device) = authorized(&shared, &headers, "uploads.write") else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if shared.discovery.protocol_minor < 11 {
+    if shared.discovery.protocol_minor < protocol::STAGED_ATTACHMENTS_MINOR {
         return StatusCode::NOT_FOUND.into_response();
     }
     match tokio::task::spawn_blocking(move || {
@@ -722,6 +724,12 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut history_items = false;
     let mut deferred_work = false;
     let mut staged_attachments = false;
+    let mut composer_requests = false;
+    let mut approval_feedback = false;
+    let mut question_contract = false;
+    let mut question_attachments = false;
+    let mut question_dismiss = false;
+    let mut vcs_worktrees = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -791,7 +799,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
                         if minor >= 10 { capabilities.push(protocol::COMPOSER_CONTEXT); }
                         if minor >= 10 { capabilities.push(protocol::FILE_ATTACHMENTS); }
-                        staged_attachments = minor >= 11;
+                        staged_attachments = minor >= u64::from(protocol::STAGED_ATTACHMENTS_MINOR);
                         if staged_attachments { capabilities.extend([protocol::STAGED_ATTACHMENTS, protocol::ATTACHMENT_LIMITS, protocol::PASTED_TEXT_ATTACHMENTS]); }
                         if minor >= 10 {
                             capabilities.extend([
@@ -803,10 +811,29 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         }
                         deferred_work = minor >= 11;
                         if deferred_work { capabilities.push(protocol::DEFERRED_WORK); }
+                        if minor >= 12 { capabilities.push(protocol::PROJECT_WRITE_FILE); }
+                        if minor >= 13 { capabilities.push(protocol::FRESH_CONTEXT); }
+                        if minor >= 14 { capabilities.push(protocol::USAGE_LIMITS); }
+                        composer_requests = minor >= 15;
+                        if composer_requests { capabilities.push(protocol::COMPOSER_REQUESTS); }
+                        approval_feedback = minor >= 16;
+                        if approval_feedback { capabilities.push(protocol::APPROVAL_FEEDBACK); }
+                        question_contract = minor >= 17;
+                        if question_contract { capabilities.push(protocol::QUESTION_CONTRACT); }
+                        question_attachments=minor>=18;
+                        if question_attachments {capabilities.push(protocol::QUESTION_ATTACHMENTS);}
+                        question_dismiss=minor>=19;
+                        if question_dismiss {capabilities.push(protocol::QUESTION_DISMISS);}
+                        vcs_worktrees = minor >= u64::from(protocol::VCS_WORKTREES_MINOR);
+                        if vcs_worktrees {
+                            capabilities.push(protocol::VCS_WORKTREES);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
                             "canUpdate":shared.database.authorize(&device,"server.requestUpdate",&json!({})).is_ok(),
+                            "canApprove":shared.database.authorize(&device,"request.respond",&json!({})).is_ok(),
+                            "canOperate":shared.database.authorize(&device,"thread.send",&json!({})).is_ok(),
                             "capabilities":capabilities,"limits":{"controlBytes":protocol::MAX_CONTROL,"outstandingCommands":32,"pageBytes":protocol::MAX_PAGE_BYTES,
                                 "fileAttachmentBytes":if staged_attachments {Some(crate::attachments::MAX_FILE_BYTES)} else {None},
                                 "historyLeaseCount":crate::history::LEASE_COUNT,"historyLeaseBytes":crate::history::LEASE_BYTES,"historyLeaseIdleSeconds":crate::history::LEASE_IDLE.as_secs(),
@@ -891,6 +918,216 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         database.authorize(&device, "filesystem.browse", &json!({}))?;
                         serde_json::to_value(listing).map_err(|_| "Could not encode the folder listing.".into())
                     }).await.unwrap_or_else(|_| Err("Folder listing failed.".into()))
+                } else if method == "project.writeFile" {
+                    let args = params.get("args").unwrap_or(params);
+                    match serde_json::from_value::<protocol::ProjectWriteFileInput>(args.clone()) {
+                        Err(_) => Err("Invalid project.writeFile parameters.".into()),
+                        Ok(input) => {
+                            let database = shared.database.clone();
+                            let device = device.clone();
+                            tokio::task::spawn_blocking(move || {
+                                database.authorize(&device, "project.writeFile", &json!({}))?;
+                                let written = crate::projects::write_project_file(&input)?;
+                                database.authorize(&device, "project.writeFile", &json!({}))?;
+                                serde_json::to_value(written)
+                                    .map_err(|_| "Could not encode the file write result.".into())
+                            })
+                            .await
+                            .unwrap_or_else(|_| Err("Writing workspace file failed.".into()))
+                        }
+                    }
+                } else if method == "vcs.listBranches" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsListBranchesInput>(args.clone())
+                        {
+                            Err(err) => Err(format!("Invalid vcs.listBranches parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.listBranches", &json!({}))?;
+                                    let result = crate::vcs::list_branches(&input)?;
+                                    database.authorize(&device, "vcs.listBranches", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the branch listing result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Listing branches failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.status" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsStatusInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid vcs.status parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.status", &json!({}))?;
+                                    let result = crate::vcs::status(&input)?;
+                                    database.authorize(&device, "vcs.status", &json!({}))?;
+                                    serde_json::to_value(result)
+                                        .map_err(|_| "Could not encode the status result.".into())
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Reading VCS status failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.listWorktrees" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsListWorktreesInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => Err(format!("Invalid vcs.listWorktrees parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.listWorktrees", &json!({}))?;
+                                    let result = crate::vcs::list_worktrees(&input)?;
+                                    database.authorize(&device, "vcs.listWorktrees", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the worktree listing result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Listing worktrees failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.createWorktree" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsCreateWorktreeInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => {
+                                Err(format!("Invalid vcs.createWorktree parameters: {err}"))
+                            }
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let worktrees_dir = shared.directory.join("worktrees");
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(
+                                        &device,
+                                        "vcs.createWorktree",
+                                        &json!({}),
+                                    )?;
+                                    if let Some(ref target) = input.path {
+                                        let trimmed = target.trim();
+                                        if trimmed.is_empty()
+                                            || !crate::vcs::is_managed_worktree_path(
+                                                std::path::Path::new(trimmed),
+                                                &worktrees_dir,
+                                            )
+                                        {
+                                            return Err("Worktree target path must be inside the server's worktrees directory.".into());
+                                        }
+                                    }
+                                    let result =
+                                        crate::vcs::create_worktree(&input, &worktrees_dir)?;
+                                    database.authorize(
+                                        &device,
+                                        "vcs.createWorktree",
+                                        &json!({}),
+                                    )?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the created worktree result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Creating worktree failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.removeWorktree" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsRemoveWorktreeInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => {
+                                Err(format!("Invalid vcs.removeWorktree parameters: {err}"))
+                            }
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let worktrees_dir = shared.directory.join("worktrees");
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(
+                                        &device,
+                                        "vcs.removeWorktree",
+                                        &json!({}),
+                                    )?;
+                                    let cwd = crate::vcs::validate_existing_directory(
+                                        &input.cwd, "cwd",
+                                    )?;
+                                    let target = input.path.trim();
+                                    if target.is_empty()
+                                        || !crate::vcs::is_managed_worktree_path(
+                                            std::path::Path::new(target),
+                                            &worktrees_dir,
+                                        )
+                                        || !crate::vcs::is_registered_worktree(
+                                            &cwd,
+                                            std::path::Path::new(target),
+                                        )?
+                                    {
+                                        return Err("Worktree path must be a managed worktree inside the server's worktrees directory.".into());
+                                    }
+                                    crate::vcs::remove_worktree(&input)?;
+                                    database.authorize(
+                                        &device,
+                                        "vcs.removeWorktree",
+                                        &json!({}),
+                                    )?;
+                                    Ok(json!({}))
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Removing worktree failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.runSetup" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsRunSetupInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid vcs.runSetup parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.runSetup", &json!({}))?;
+                                    let result = crate::vcs::run_setup(&input)?;
+                                    database.authorize(&device, "vcs.runSetup", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the setup script result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Running setup script failed.".into()))
+                            }
+                        }
+                    }
                 } else if method == "peer.thread.wait" {
                     crate::model::wait_for_peer_thread(snapshots.clone(), shared.database.clone(),
                         device.clone(), shared.discovery.server_id.clone(), params["args"].clone()).await
@@ -922,6 +1159,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 .expect("history streams")
                                 .find_thread(thread_id, params)
                         })
+                } else if method == "usage.limits" {
+                    let args = params.get("args").unwrap_or(params);
+                    let snapshot = shared.snapshots.borrow().clone();
+                    usage_limits_for_request(&snapshot, args)
                 } else if method == "threads.search" {
                     let index_threads = {
                         let current = shared.snapshots.borrow().clone();
@@ -957,6 +1198,52 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             }
                         }
                     };
+                    if method == "thread.user-input.dismiss" && !question_dismiss {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["requestContract"] == true && !composer_requests {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::REQUESTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["questionContract"] == true
+                        && !question_contract {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTIONS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["questionAttachments"] == true && !question_attachments {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if method=="request.respond" && command.params.get("attachmentsByQuestionId").is_some()
+                        && shared.database.receipt(&device,command.command_id).ok().flatten().is_none() {
+                        if !question_attachments {
+                            if !send(&mut socket,protocol::response(id,Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await {break;}
+                            continue;
+                        }
+                        let params=command.params.clone();
+                        let directory=shared.directory.clone();
+                        use sha2::Digest;
+                        let key=format!("{device}:{}:{:x}",command.command_id,sha2::Sha256::digest(params.to_string().as_bytes()));
+                        let preparation={
+                            let mut preparations=shared.answer_preparations.lock().expect("answer preparations");
+                            preparations.retain(|candidate,cell|candidate==&key || cell.get().is_none());
+                            preparations.entry(key).or_default().clone()
+                        };
+                        let prepared=preparation.get_or_init(||async move {
+                            tokio::task::spawn_blocking(move ||crate::question_document::prepare_answer_attachments(&params,&directory))
+                                .await.map_err(|e|e.to_string()).and_then(|r|r)
+                        }).await;
+                        if let Err(error)=prepared {
+                            if !send(&mut socket,protocol::response(id,Err(error.clone()))).await {break;}
+                            continue;
+                        }
+                    }
+                    if method == "request.respond" && command.params["response"].get("feedback").is_some()
+                        && !approval_feedback {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
                     if method == "server.prepareRestart" {
                         let clients = {
                             let clients = shared.client_pids.lock().expect("clients");
@@ -1206,6 +1493,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         remote: false,
         pairing: Arc::default(),
         uploads: Arc::default(),
+        answer_preparations: Arc::default(),
         discovery: discovery.clone(),
         directory: directory.clone(),
         database: runtime.database.clone().expect("durable runtime"),
@@ -1369,6 +1657,64 @@ pub fn machine_label() -> String {
         })
 }
 
+fn usage_limits_for_request(snapshot: &Value, params: &Value) -> Result<Value, String> {
+    let state = if snapshot["state"].is_object() {
+        &snapshot["state"]
+    } else {
+        snapshot
+    };
+    let thread_id = params["threadId"].as_u64();
+    let index_thread = thread_id.and_then(|id| {
+        state["index"]["threads"]
+            .as_array()
+            .and_then(|threads| threads.iter().find(|t| t["id"].as_u64() == Some(id)))
+    });
+    let view_thread = thread_id.and_then(|id| {
+        state["threads"]
+            .as_array()
+            .and_then(|threads| threads.iter().find(|t| t["id"].as_u64() == Some(id)))
+    });
+    let harness = if let Some(entry) = index_thread {
+        entry["harness"]
+            .as_str()
+            .ok_or_else(|| "Thread harness missing.".to_owned())?
+    } else if params["draft"].as_bool() == Some(true) {
+        params["harness"]
+            .as_str()
+            .ok_or_else(|| "Draft harness is required.".to_owned())?
+    } else {
+        return Err("Thread not found.".into());
+    };
+    if !crate::usage_limits::has_usage_limits(harness) {
+        return Err("Usage limits are unavailable for this provider.".into());
+    }
+    let catalog = &state["nativeCatalogs"][harness];
+    let hs = view_thread.map(|t| &t["harness_state"]);
+    let usage_limits = hs
+        .map(|h| &h["usageLimits"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageLimits"]).filter(|v| !v.is_null()));
+    let usage_limits_raw = hs
+        .map(|h| &h["usageLimitsRaw"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageLimitsRaw"]).filter(|v| !v.is_null()));
+    let usage_account = hs
+        .map(|h| &h["usageAccount"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageAccount"]).filter(|v| !v.is_null()));
+    let report = crate::usage_limits::build_usage_limits_report(
+        crate::usage_limits::UsageLimitsReportInput {
+            harness,
+            now_ms: crate::lifecycle::now() as i64,
+            usage_limits,
+            usage_limits_raw,
+            usage_account,
+        },
+    )
+    .ok_or_else(|| "Usage limits are unavailable for this provider.".to_owned())?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,6 +1801,7 @@ mod tests {
                 remote: true,
                 pairing: Arc::default(),
                 uploads: Arc::default(),
+                answer_preparations: Arc::default(),
                 discovery: Discovery {
                     server_id: uuid::Uuid::new_v4().to_string(),
                     instance_id: uuid::Uuid::new_v4().to_string(),
@@ -1767,6 +2114,82 @@ mod tests {
             assert!(fallback.contains("needs an update") && fallback.contains("Type a path"));
             let typed = crate::client::remote_rpc(&older_link, "project.put", json!({"path":folder})).await.unwrap();
             assert_eq!(typed["status"], "accepted");
+        });
+    }
+
+    #[test]
+    fn project_write_file_writes_inside_cwd_and_rejects_escapes() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("write-file").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+            let workspace = fixture.shared.directory.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(hello["protocolMinor"].as_u64().unwrap_or(0) >= 12);
+            assert!(crate::client::supports_project_write_file(&hello));
+
+            let written = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "docs/plans/my-plan.md",
+                    "contents": "# Plan\n\nBody\n"
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(written["relativePath"], "docs/plans/my-plan.md");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("docs/plans/my-plan.md")).unwrap(),
+                "# Plan\n\nBody\n"
+            );
+
+            let abs_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": workspace.join("abs.md"),
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!abs_err.is_empty());
+            assert!(!workspace.join("abs.md").exists());
+
+            let escape_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "../escaped.md",
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!escape_err.is_empty());
+            assert!(!fixture.shared.directory.join("escaped.md").exists());
+
+            let nested_escape_err = crate::client::remote_rpc(
+                &link,
+                "project.writeFile",
+                json!({
+                    "cwd": workspace,
+                    "relativePath": "docs/../../escaped.md",
+                    "contents": "nope\n"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(!nested_escape_err.is_empty());
+            assert!(!fixture.shared.directory.join("escaped.md").exists());
         });
     }
 
@@ -2496,6 +2919,362 @@ mod tests {
                 large.html.bytes.to_string()
             );
             assert_eq!(response.bytes().await.unwrap().len(), 16);
+        });
+    }
+
+    #[test]
+    fn usage_limits_returns_report_for_supported_thread_and_errors_for_unsupported() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::configured("usage-limits", protocol::MINOR, |runtime| {
+                runtime.state.codex_catalog.usage_limits_raw = json!({
+                    "checkedAtMs": 1_700_000_000_000i64,
+                    "snapshot": {
+                        "limitId": "codex",
+                        "planType": "plus",
+                        "primary": {"usedPercent": 42.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+                    }
+                });
+            })
+            .await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(hello["protocolMinor"].as_u64().unwrap_or(0) >= 14);
+            assert!(
+                hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cap| cap == protocol::USAGE_LIMITS)
+            );
+
+            let codex_created = fixture
+                .local_command("thread.create", json!({"harness": "codex"}))
+                .await;
+            let codex_id = codex_created["result"]["threadId"].as_u64().unwrap();
+            let pi_created = fixture
+                .local_command(
+                    "thread.create",
+                    json!({"harness": "pi", "occupiedDrafts": [codex_id]}),
+                )
+                .await;
+            let pi_id = pi_created["result"]["threadId"].as_u64().unwrap();
+            assert_ne!(codex_id, pi_id);
+
+            // Wait until the fixture snapshots reflect both newly created threads.
+            for _ in 0..40 {
+                let snap = fixture.shared.snapshots.borrow().clone();
+                let state = if snap["state"].is_object() {
+                    &snap["state"]
+                } else {
+                    &snap
+                };
+                let has_both = state["index"]["threads"].as_array().is_some_and(|threads| {
+                    threads.iter().any(|t| t["id"].as_u64() == Some(codex_id))
+                        && threads.iter().any(|t| t["id"].as_u64() == Some(pi_id))
+                });
+                if has_both {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            let report =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": codex_id}))
+                    .await
+                    .unwrap();
+            assert!(report["createdAt"].as_str().is_some());
+            assert_eq!(report["accounts"][0]["driver"], "codex");
+            assert_eq!(report["accounts"][0]["limits"]["windows"][0]["usedPercent"], 42.0);
+
+            let unsupported =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": pi_id}))
+                    .await
+                    .unwrap_err();
+            assert!(
+                unsupported.contains("unavailable"),
+                "expected unavailable error, got: {unsupported}"
+            );
+
+            let missing =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": 999_999}))
+                    .await
+                    .unwrap_err();
+            assert!(!missing.is_empty());
+        });
+    }
+
+    #[test]
+    fn vcs_requests_capabilities_and_authorization() {
+        if !crate::vcs::git_available() {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("vcs-rpc").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            // Capability is present at protocol::MINOR.
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR))
+            );
+            assert!(crate::client::supports_vcs_worktrees(&hello));
+
+            // Capability is absent one minor below, and client wrappers refuse before sending.
+            let older = Fixture::with_minor("vcs-older", protocol::VCS_WORKTREES_MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                older_hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::VCS_WORKTREES_MINOR - 1))
+            );
+            assert!(!crate::client::supports_vcs_worktrees(&older_hello));
+            let err = crate::client::vcs_status(
+                &older_link,
+                &crate::vcs::VcsStatusInput {
+                    cwd: older.shared.directory.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, protocol::VCS_WORKTREES_UPDATE_REQUIRED);
+
+            // Set up a temporary git repo inside the fixture directory.
+            let empty_cfg = fixture.shared.directory.join("empty.gitconfig");
+            std::fs::write(&empty_cfg, "").unwrap();
+            let repo = fixture.shared.directory.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let run_git = |cwd: &std::path::Path, args: &[&str]| {
+                let mut cmd = std::process::Command::new("git");
+                cmd.arg("-c")
+                    .arg("user.name=Test User")
+                    .arg("-c")
+                    .arg("user.email=test@example.com")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+                    .env("GIT_CONFIG_SYSTEM", &empty_cfg);
+                let out =
+                    crate::process::output(&mut cmd, Duration::from_secs(10), 1024 * 1024).unwrap();
+                assert!(out.status.success(), "{:?} failed", args);
+            };
+            run_git(&repo, &["init", "-b", "main", "--quiet"]);
+            std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+            std::fs::write(
+                repo.join("t3.json"),
+                r#"{"scripts":[{"name":"Setup","command":"echo ok","runOnWorktreeCreate":true}]}"#,
+            )
+            .unwrap();
+            run_git(&repo, &["add", "README.md", "t3.json"]);
+            run_git(&repo, &["commit", "-m", "init", "--quiet"]);
+            let repo_str = repo.to_string_lossy().into_owned();
+
+            // 1. vcs.listBranches
+            let branches = crate::client::vcs_list_branches(
+                &link,
+                &crate::vcs::VcsListBranchesInput {
+                    cwd: repo_str.clone(),
+                    query: None,
+                    cursor: None,
+                    include_matching_remote_refs: None,
+                    ref_kind: None,
+                    refresh: None,
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(branches.is_repo);
+            assert_eq!(branches.refs[0].name, "main");
+            assert!(branches.refs[0].current);
+
+            // 2. vcs.status
+            let st = crate::client::vcs_status(
+                &link,
+                &crate::vcs::VcsStatusInput {
+                    cwd: repo_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(st.is_repo);
+            assert_eq!(st.ref_name.as_deref(), Some("main"));
+
+            // 3. vcs.createWorktree outside worktrees dir is rejected.
+            let outside = fixture.shared.directory.join("outside-wt");
+            let outside_err = crate::client::vcs_create_worktree(
+                &link,
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: repo_str.clone(),
+                    ref_name: "main".into(),
+                    new_ref_name: Some("feature/outside".into()),
+                    base_ref_name: None,
+                    path: Some(outside.to_string_lossy().into_owned()),
+                    start_from_origin: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(outside_err.contains("worktrees directory"), "{outside_err}");
+            assert!(!outside.exists());
+
+            // 4. vcs.createWorktree with managed path succeeds.
+            let created = crate::client::vcs_create_worktree(
+                &link,
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: repo_str.clone(),
+                    ref_name: "main".into(),
+                    new_ref_name: Some("feature/rpc-wt".into()),
+                    base_ref_name: Some("main".into()),
+                    path: None,
+                    start_from_origin: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(std::path::Path::new(&created.worktree.path).exists());
+            assert_eq!(created.worktree.ref_name, "feature/rpc-wt");
+
+            // 5. vcs.listWorktrees
+            let wts = crate::client::vcs_list_worktrees(
+                &link,
+                &crate::vcs::VcsListWorktreesInput {
+                    cwd: repo_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(wts.is_repo);
+            assert_eq!(wts.worktrees.len(), 2);
+
+            // 6. vcs.runSetup
+            let setup = crate::client::vcs_run_setup(
+                &link,
+                &crate::vcs::VcsRunSetupInput {
+                    cwd: repo_str.clone(),
+                    worktree_path: Some(created.worktree.path.clone()),
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(setup.status, "completed");
+            assert_eq!(setup.exit_code, Some(0));
+            assert!(setup.output.contains("ok"));
+
+            // 7. Unknown/missing fields rejected clearly.
+            let unknown_err = crate::client::remote_rpc(
+                &link,
+                "vcs.status",
+                json!({"cwd": repo_str, "unexpected": true}),
+            )
+            .await
+            .unwrap_err();
+            assert!(unknown_err.contains("unknown field"), "{unknown_err}");
+
+            // 8. Read-only device can read, cannot operate.
+            fixture
+                .shared
+                .database
+                .issue_scoped_device("vcs-reader", "vcs-reader-secret", &["paired", "read"])
+                .unwrap();
+            let mut reader = link.clone();
+            reader.device_id = "vcs-reader".into();
+            reader.token = "vcs-reader-secret".into();
+            assert!(
+                crate::client::vcs_status(
+                    &reader,
+                    &crate::vcs::VcsStatusInput {
+                        cwd: repo_str.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            );
+            assert!(
+                crate::client::vcs_list_worktrees(
+                    &reader,
+                    &crate::vcs::VcsListWorktreesInput {
+                        cwd: repo_str.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            );
+            for (method, payload) in [
+                (
+                    "vcs.createWorktree",
+                    json!({"cwd": repo_str, "refName": "main", "newRefName": "feature/ro"}),
+                ),
+                (
+                    "vcs.removeWorktree",
+                    json!({"cwd": repo_str, "path": created.worktree.path}),
+                ),
+                ("vcs.runSetup", json!({"cwd": repo_str})),
+            ] {
+                let denied = crate::client::remote_rpc(&reader, method, payload)
+                    .await
+                    .unwrap_err();
+                assert!(denied.contains("operate"), "{method}: {denied}");
+            }
+
+            // 9. vcs.removeWorktree rejects foreign paths (outside worktrees dir and non-worktree inside).
+            std::fs::create_dir_all(&outside).unwrap();
+            let foreign_err = crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str.clone(),
+                    path: outside.to_string_lossy().into_owned(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(foreign_err.contains("managed worktree"), "{foreign_err}");
+
+            let fake_inside = fixture
+                .shared
+                .directory
+                .join("worktrees")
+                .join("repo")
+                .join("not-a-worktree");
+            std::fs::create_dir_all(&fake_inside).unwrap();
+            let fake_err = crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str.clone(),
+                    path: fake_inside.to_string_lossy().into_owned(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(fake_err.contains("managed worktree"), "{fake_err}");
+            assert!(fake_inside.exists());
+
+            // 10. Valid vcs.removeWorktree removes the created worktree.
+            crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str,
+                    path: created.worktree.path.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!std::path::Path::new(&created.worktree.path).exists());
         });
     }
 }

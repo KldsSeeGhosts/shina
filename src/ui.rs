@@ -927,6 +927,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         } else if s.current().messages.is_empty()
             && s.current().tools.is_empty()
             && s.current().native.compactions.is_empty()
+            && s.current().worktree_setup.is_none()
             && !s.current().history_has_more
             && s.current().history_error.is_none()
         {
@@ -986,12 +987,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             s.viewport_width = rect[2];
             s.viewport_height = rect[3];
         })
-        .on_key(|s: &mut State, ev, _| s.undo_key(ev, true))
+        .on_key(|s: &mut State, ev, tx| {
+            if ev.key == rune::Key::Escape
+                && (s.assistant_selection.is_some() || s.citation_highlight.is_some())
+            {
+                s.assistant_selection = None;
+                s.citation_highlight = None;
+                tx.clear_text_selection();
+                return true;
+            }
+            s.undo_key(ev, true)
+        })
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
+    if context_popover_shown && let Some(toolbar) = assistant_selection_toolbar(s, p, cx) {
+        root = root.child(toolbar);
+    }
     if context_popover_shown && composer_menu::trigger(s).is_some() {
         root = root.child(composer_menu::overlay(s, p, cx, s.viewport_width));
     }
@@ -1000,6 +1014,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         && s.current().context.popover_open()
     {
         root = root.child(context_popover(s, p));
+    }
+    if context_popover_shown && let Some(notice) = s.composer_notices.open_details_notice() {
+        root = root.child(composer_notice_details_popover(notice, p));
     }
     if brief && narrow {
         let top = chrome.height.max(40.0 * zoom) / zoom;
@@ -1011,6 +1028,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(transcript_context::preview(s, p));
     } else if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
+    } else if s.plan_save_dialog.is_some() {
+        root = root.child(work_ui::plan_save_dialog(s, p));
     } else if s.confirm_remove_attachment.is_some() {
         root = root.child(remove_attachment_dialog(s, p));
     } else if s.project_picker == Some(ProjectPicker::AddProject) {
@@ -1032,6 +1051,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
+    } else if s.plan_menu.is_some() {
+        root = root.child(work_ui::plan_menu(s, p));
     }
     if s.row_menu.is_some() {
         // A right-click opens the menu where it landed; the keyboard opens it beside the row.
@@ -1052,6 +1073,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if s.machines.picker {
         root = root.child(machine_picker(s, p));
+    }
+    if s.env_mode_picker {
+        root = root.child(env_mode_picker(s, p));
+    }
+    if s.base_branch_picker {
+        root = root.child(base_branch_picker(s, p));
     }
     if s.composer_ui.overflow.get() {
         root = root.child(composer_ui::overflow_menu(s, p));
@@ -1139,25 +1166,35 @@ fn model_vendor(id: &str, label: &str) -> Vendor {
     }
 }
 
+static OPENAI_ICON: Icon = Icon {
+    name: "OPENAI",
+    view: 411.0,
+    body: r#"<g transform="translate(-100 -100)"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z"/></g>"#,
+};
+
+static CLAUDE_ICON: Icon = Icon {
+    name: "CLAUDE",
+    view: 257.0,
+    body: r##"<path fill="#d97757" d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"/>"##,
+};
+
+fn provider_glyph(vendor: Vendor) -> &'static Icon {
+    match vendor {
+        Vendor::OpenAi => &OPENAI_ICON,
+        Vendor::Anthropic => &CLAUDE_ICON,
+        Vendor::Antigravity | Vendor::Other => &pixel_icons::CHIP,
+    }
+}
+
 /// Provider marks ported from KSG Code's `Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`).
 fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
-    static OPENAI: Icon = Icon {
-        name: "OPENAI",
-        view: 411.0,
-        body: r#"<g transform="translate(-100 -100)"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z"/></g>"#,
-    };
-    static CLAUDE: Icon = Icon {
-        name: "CLAUDE",
-        view: 257.0,
-        body: r##"<path fill="#d97757" d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"/>"##,
-    };
     match vendor {
         Vendor::Antigravity => el()
             .size(size, size)
             .pixels_fit(s.artwork.antigravity.pixels(), rune::SurfaceFit::Fit)
             .a11y_hidden(),
-        Vendor::OpenAi => rune::icon(&OPENAI, size).color(p.ink).a11y_hidden(),
-        Vendor::Anthropic => rune::icon(&CLAUDE, size).a11y_hidden(),
+        Vendor::OpenAi => rune::icon(&OPENAI_ICON, size).color(p.ink).a11y_hidden(),
+        Vendor::Anthropic => rune::icon(&CLAUDE_ICON, size).a11y_hidden(),
         Vendor::Other => rune::icon(&pixel_icons::CHIP, size)
             .color(p.muted)
             .a11y_hidden(),
@@ -4696,7 +4733,7 @@ fn toast_stack(s: &State, p: Palette, top: f32) -> El {
     for toast in s.toasts.iter().rev() {
         let id = toast.id;
         let (glyph_name, ink) = match toast.kind {
-            crate::model::ToastKind::Info => ("file", p.sea),
+            crate::model::ToastKind::Info => ("dot", p.sea),
             crate::model::ToastKind::Success => ("check", p.sea),
             crate::model::ToastKind::Warning => ("alert", p.brass),
             crate::model::ToastKind::Error => ("alert", p.danger),
@@ -6273,23 +6310,6 @@ fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
         );
     } else {
         header = header.child(spacer());
-    }
-    // The thread on a machine this desktop cannot reach says so beside its status.
-    if let Some(machine) = s.unreachable_selected() {
-        let text = format!("{machine} is unreachable. Reconnecting.");
-        header = header.child(
-            row()
-                .key("chat-unreachable")
-                .role("status")
-                .label(text.clone())
-                .gap(6.0)
-                .center_y()
-                .min_w(0.0)
-                .shrink()
-                .mr(8.0)
-                .child(status_mark(Status::Waiting, p, 6.0))
-                .child(pixel_text(text, p.brass).truncate().shrink().min_w(0.0)),
-        );
     }
     header = header.child(if s.demo {
         outlined(
@@ -8481,10 +8501,21 @@ fn transcript_part(
             let find_query = (s.thread_find_active()
                 && !s.thread_find.query.text.trim().is_empty())
             .then(|| s.thread_find.query.text.trim());
-            let mut active_occ = None;
-            let find_param = find_query.map(|query| {
+            let cite_query = find_query.is_none().then_some(()).and_then(|()| {
+                s.citation_highlight
+                    .as_ref()
+                    .filter(|hl| {
+                        hl.machine == s.machines.selected
+                            && hl.thread_id == thread_id
+                            && hl.message_id == *message_id
+                            && !hl.text.trim().is_empty()
+                    })
+                    .map(|hl| hl.text.trim())
+            });
+            let mut cite_matched = false;
+            let find_param = if let Some(query) = find_query {
                 let hits = crate::thread_find::find_markdown_occurrences(chunk, query).len();
-                active_occ = s
+                let active_occ = s
                     .thread_find
                     .active_match
                     .as_ref()
@@ -8494,10 +8525,19 @@ fn transcript_part(
                             .then_some(m.occurrence - *occ_base)
                     });
                 *occ_base += hits;
-                (query, active_occ)
-            });
-            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
-            memo(
+                Some((query, active_occ))
+            } else if let Some(query) = cite_query {
+                if !crate::thread_find::find_markdown_occurrences(chunk, query).is_empty() {
+                    cite_matched = true;
+                    Some((query, Some(0)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let memo_find = find_param.map(|(q, occ)| (q.to_owned(), occ));
+            let rendered = memo(
                 format!("message-{}-{message}-body-{from}", t.id),
                 (chunk, s.dark, streaming, wide, memo_find),
                 || {
@@ -8512,7 +8552,12 @@ fn transcript_part(
                         find_param,
                     )
                 },
-            )
+            );
+            if cite_query.is_some() && !cite_matched {
+                rendered.fill(p.coral_bg).radius(4.0)
+            } else {
+                rendered
+            }
         }
     }
 }
@@ -8819,6 +8864,35 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             response = response.child(render_part(index));
         }
     }
+    if !live
+        && !s.demo
+        && !t.archived()
+        && let Some(reply_msg) = t.messages[start..end]
+            .iter()
+            .rev()
+            .find(|m| m.role == "Pi" && !m.text.trim().is_empty())
+    {
+        let reply_id = reply_msg.id.clone();
+        let on_press_id = reply_id.clone();
+        response = response.child(
+            row()
+                .key(format!("assistant-actions-{}-{reply_id}", t.id))
+                .gap(8.0)
+                .center_y()
+                .child(
+                    icon_button(
+                        &format!("reply-message-{reply_id}"),
+                        "Reply to this response",
+                        "back",
+                        p,
+                        move |s| {
+                            s.reply_to_message(&on_press_id);
+                        },
+                    )
+                    .help("Reply to this response"),
+                ),
+        );
+    }
     response
 }
 
@@ -8880,6 +8954,9 @@ enum TimelineRow {
     HistoryControl {
         key: String,
     },
+    WorktreeSetup {
+        key: String,
+    },
     Boundary {
         message_index: usize,
         key: String,
@@ -8904,6 +8981,7 @@ impl TimelineRow {
     fn key(&self) -> &str {
         match self {
             Self::HistoryControl { key }
+            | Self::WorktreeSetup { key }
             | Self::Boundary { key, .. }
             | Self::UserOrSystem { key, .. }
             | Self::AssistantTurn { key, .. }
@@ -8932,6 +9010,11 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
     if t.history_has_more || t.history_error.is_some() {
         rows.push(TimelineRow::HistoryControl {
             key: push_unique_row_key(&mut seen, format!("history-control-{}", t.id)),
+        });
+    }
+    if t.worktree_setup.is_some() {
+        rows.push(TimelineRow::WorktreeSetup {
+            key: push_unique_row_key(&mut seen, format!("worktree-setup-row-{}", t.id)),
         });
     }
     let mut index = 0usize;
@@ -9098,7 +9181,34 @@ fn build_user_or_system_row(
             .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
             .child(lbl)
     };
-    col().w_full().child(body.key(key))
+    let mut wrapper = col().w_full();
+    if message.role == "You" && t.is_fresh_session_message(&message.id) {
+        wrapper = wrapper.gap(8.0).child(fresh_session_row(&message.id, p));
+    }
+    wrapper.child(body.key(key))
+}
+
+/// Ported from KSG Code's `FreshSessionRow` (`components/chat/V2LifecycleRow.tsx`) and
+/// `TimelineSystemDivider` (`components/chat/TimelineSystemDivider.tsx`).
+fn fresh_session_row(message_id: &str, p: Palette) -> El {
+    row()
+        .key(format!("fresh-session-row-{message_id}"))
+        .role("status")
+        .label("New session")
+        .w_full()
+        .min_w(0.0)
+        .py(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .child(icon("alert", p.muted))
+                .child(pixel_text("New session", p.muted)),
+        )
+        .child(el().h(1.0).grow(1.0).fill(p.line))
 }
 
 /// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
@@ -9260,6 +9370,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         && !visible_tools
         && !t.status.busy()
         && t.native.compactions.is_empty()
+        && t.worktree_setup.is_none()
         && !t.history_has_more
         && t.history_error.is_none()
     {
@@ -9321,6 +9432,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             move |s: &State, index| {
                 let row = match &build_rows[index] {
                     TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                    TimelineRow::WorktreeSetup { .. } => {
+                        worktree_setup_card(s, p).unwrap_or_else(el)
+                    }
                     TimelineRow::Boundary { message_index, .. } => {
                         work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
                     }
@@ -9376,6 +9490,47 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         })
         .on_at_bottom(move |s: &mut State, at| {
             s.set_timeline_at_bottom(thread_id, at);
+        })
+        .on_selection_change(move |s: &mut State, change, tx| {
+            if change.dragging() {
+                if s.assistant_selection.is_some() {
+                    s.assistant_selection = None;
+                } else {
+                    tx.live_only();
+                }
+                return;
+            }
+            let next = change.selection().and_then(|sel| {
+                let t = s.current();
+                if t.id != thread_id {
+                    return None;
+                }
+                let paths: Vec<&str> = sel
+                    .texts()
+                    .iter()
+                    .filter(|st| st.is_selected())
+                    .map(|st| st.path())
+                    .collect();
+                let target = crate::assistant_citation::validate_single_assistant_selection(
+                    t.id,
+                    &t.messages,
+                    &paths,
+                    sel.text(),
+                )?;
+                Some(crate::model::AssistantSelection {
+                    thread_id: t.id,
+                    machine: t.machine.clone(),
+                    message_index: target.message_index,
+                    message_id: target.message_id,
+                    chunk_from: target.chunk_from,
+                    text: sel.text().to_owned(),
+                })
+            });
+            if s.assistant_selection != next {
+                s.assistant_selection = next;
+            } else {
+                tx.live_only();
+            }
         })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
         // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
@@ -9442,6 +9597,278 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
 
     wrapper
+}
+
+/// Ported from KSG Code's `WorktreeSetupCard.tsx`, skinned in Pixel Voyage.
+fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
+    let t = s.current();
+    let setup = t.worktree_setup.as_ref()?;
+    let (status, status_word, title) = match setup.phase {
+        crate::model::WorktreeSetupPhase::Running => {
+            (Status::Running, "RUNNING", "Setting up worktree…")
+        }
+        crate::model::WorktreeSetupPhase::Succeeded => (
+            Status::Completed,
+            if setup.skipped { "SKIPPED" } else { "READY" },
+            if setup.skipped {
+                "Worktree setup skipped"
+            } else {
+                "Worktree ready"
+            },
+        ),
+        crate::model::WorktreeSetupPhase::Failed => {
+            (Status::Failed, "FAILED", "Worktree setup failed")
+        }
+    };
+    let tone = status_ink(status, p);
+    let mut header = row()
+        .w_full()
+        .min_h(24.0)
+        .center_y()
+        .gap(8.0)
+        .child(status_mark(status, p, 6.0))
+        .child(
+            label(title, TextStyle::new(14.0, 500.0).lh(20.0), p.ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(pixel_text(status_word, tone));
+    if setup.duration_ms > 0 {
+        let dur = if setup.duration_ms < 1000 {
+            format!("{}ms", setup.duration_ms)
+        } else {
+            format!("{:.1}s", setup.duration_ms as f64 / 1000.0)
+        };
+        header = header.child(pixel_text(dur, p.muted));
+    }
+
+    let mut card = col()
+        .w_full()
+        .padding(12.0)
+        .gap(8.0)
+        .radius(6.0)
+        .fill(p.card)
+        .child(header);
+
+    if let Some(script_name) = &setup.script_name {
+        let desc = match &setup.script_command {
+            Some(cmd) if !cmd.trim().is_empty() => format!("{script_name}: {cmd}"),
+            _ => script_name.clone(),
+        };
+        card = card.child(label(desc, SMALL, p.muted).wrap());
+    }
+    if let Some(err) = &setup.error {
+        card = card.child(label(err, SMALL, p.danger).wrap().selectable(true));
+    }
+
+    let tail_lines: Vec<&str> = setup.output.lines().collect();
+    if !tail_lines.is_empty() {
+        let start = tail_lines.len().saturating_sub(4);
+        let tail = tail_lines[start..].join("\n");
+        let open = t.worktree_setup_output_open;
+        let toggle = row()
+            .key("worktree-setup-output")
+            .role("button")
+            .label(if open { "Hide output" } else { "Show output" })
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .center_y()
+            .gap(6.0)
+            .h(24.0)
+            .px(6.0)
+            .radius(4.0)
+            .hover(p.selected)
+            .on_press(|s: &mut State| {
+                s.current_mut().worktree_setup_output_open =
+                    !s.current().worktree_setup_output_open;
+            })
+            .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted).size(12.0, 12.0))
+            .child(pixel_text("Output", p.muted));
+        card = card.child(toggle);
+        if open {
+            let mono = TextStyle::new(12.0, 400.0)
+                .lh(17.0)
+                .family(rune::Family::SystemMono);
+            card = card.child(
+                col()
+                    .key("worktree-setup-output-tail")
+                    .w_full()
+                    .px(10.0)
+                    .py(6.0)
+                    .radius(4.0)
+                    .fill(if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+                        p.coral_bg
+                    } else {
+                        p.code_bg
+                    })
+                    .border(1.0, p.line)
+                    .child(
+                        label(
+                            tail,
+                            mono,
+                            if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+                                p.danger
+                            } else {
+                                p.muted
+                            },
+                        )
+                        .wrap_anywhere()
+                        .selectable(true),
+                    ),
+            );
+        }
+    }
+
+    let mut actions = row().w_full().gap(8.0).center_y();
+    let mut has_actions = false;
+    if setup.phase == crate::model::WorktreeSetupPhase::Failed {
+        has_actions = true;
+        actions = actions.child(framed(
+            button("worktree-setup-retry", "Retry", p, |s| {
+                s.retry_worktree_setup();
+            }),
+            p,
+        ));
+    }
+    if matches!(
+        setup.phase,
+        crate::model::WorktreeSetupPhase::Running | crate::model::WorktreeSetupPhase::Failed
+    ) {
+        has_actions = true;
+        actions = actions.child(button("worktree-setup-skip", "Skip", p, |s| {
+            s.skip_worktree_setup();
+        }));
+    }
+    if has_actions {
+        card = card.child(actions);
+    }
+
+    Some(
+        col().w_full().child(
+            card.key("worktree-setup-card")
+                .w_full()
+                .radius(6.0)
+                .border(2.0, p.frame),
+        ),
+    )
+}
+
+/// Ported from KSG Code's `AssistantSelectionToolbar` (`chat/AssistantSelectionToolbar.tsx`).
+fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let sel = s.assistant_selection.as_ref()?;
+    let t = s.current();
+    if s.demo
+        || sel.thread_id != t.id
+        || sel.machine != t.machine
+        || t.archived()
+        || t.request.is_some()
+        || t.native.questionnaire.is_some()
+    {
+        return None;
+    }
+    if s.transcript_preview.is_some()
+        || s.rename_thread.is_some()
+        || s.delete_thread.is_some()
+        || s.plan_save_dialog.is_some()
+        || s.confirm_remove_attachment.is_some()
+        || s.project_picker.is_some()
+        || s.captain_editor.is_some()
+        || s.settings_picker.is_some()
+        || s.captain_picker
+        || s.env_mode_picker
+        || s.base_branch_picker
+        || s.machines.picker
+        || s.settings.archive.is_some()
+        || s.attention_menu
+    {
+        return None;
+    }
+    let rects = cx.selection_rects();
+    if rects.is_empty() {
+        return None;
+    }
+    let viewport = cx.layout_with(&format!("conversation-{}", t.id), |r| r);
+    let first_visible = match viewport {
+        Some([vx, vy, vw, vh]) => rects.into_iter().find(|&[rx, ry, rw, rh]| {
+            rx + rw.max(1.0) > vx && rx < vx + vw && ry + rh.max(1.0) > vy && ry < vy + vh
+        })?,
+        None => rects[0],
+    };
+    let anchor_rect = match viewport {
+        Some([vx, vy, vw, vh]) => {
+            let left = first_visible[0].clamp(vx, vx + vw);
+            let right = (first_visible[0] + first_visible[2]).clamp(left, vx + vw);
+            let top = first_visible[1].clamp(vy, vy + vh);
+            let bottom = (first_visible[1] + first_visible[3]).clamp(top, vy + vh);
+            [left, top, (right - left).max(1.0), (bottom - top).max(1.0)]
+        }
+        None => first_visible,
+    };
+    let zoom = s.zoom.clamp(0.5, 2.0);
+    let anchor = el()
+        .key("assistant-selection-anchor")
+        .absolute(anchor_rect[0] / zoom, anchor_rect[1] / zoom)
+        .size(anchor_rect[2] / zoom, anchor_rect[3] / zoom)
+        .inert()
+        .a11y_hidden();
+    let too_long = crate::assistant_citation::utf16_len(&sel.text)
+        > crate::assistant_citation::ASSISTANT_CITATION_MAX_TEXT_LENGTH;
+    let mut cite_btn = row()
+        .key("assistant-selection-cite")
+        .role("button")
+        .label(if too_long {
+            "Selection is too long to cite"
+        } else {
+            "Cite selection in composer"
+        })
+        .h(28.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(4.0)
+        .fill(p.card)
+        .keeps_text_selection()
+        .disabled(too_long)
+        .child(icon("thread", if too_long { p.muted } else { p.ink }))
+        .child(pixel_text(
+            if too_long {
+                "Shorten selection"
+            } else {
+                "Cite"
+            },
+            if too_long { p.muted } else { p.ink },
+        ));
+    if !too_long {
+        cite_btn = cite_btn
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .hover(p.selected)
+            .press(p.selected)
+            .on_press_tx(|s: &mut State, tx| {
+                s.cite_assistant_selection(tx);
+            });
+    }
+    let toolbar = row()
+        .key("assistant-selection-toolbar")
+        .role("toolbar")
+        .label("Assistant selection actions")
+        .keeps_text_selection()
+        .gap(4.0)
+        .child(framed(cite_btn, p))
+        .anchored_fit(
+            "assistant-selection-anchor",
+            rune::Side::Top,
+            rune::Align::Start,
+            6.0,
+        );
+    Some(
+        el().key("assistant-selection-layer")
+            .absolute(0.0, 0.0)
+            .size(0.0, 0.0)
+            .child(anchor)
+            .child(toolbar),
+    )
 }
 
 /// The opaque strip under the chat header's rule, inside the transcript viewport.
@@ -10365,6 +10792,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
 fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
     let machine = s.machines.selected.clone();
+    let question = s.current().question_scope();
     let options = rune::FileDialogOptions {
         title: if folder {
             "Attach a folder"
@@ -10375,6 +10803,9 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
         ..Default::default()
     };
     let callback = move |s: &mut State, result, _: &mut Tx| {
+        if !crate::attachment_picker::target_accepts(s, &machine, thread, question.as_deref()) {
+            return;
+        }
         match result {
             Ok(Some(path)) => s.attach_paths_on_to(&machine, thread, &[path]),
             Ok(None) => {}
@@ -10544,6 +10975,11 @@ fn context_toggle(s: &mut State) {
 fn context_ring(t: &Thread, p: Palette) -> El {
     let limit = context_limit(t);
     let open = t.context.popover_open();
+    let first_legend_key = open
+        .then(|| context_legend_for_thread(t))
+        .flatten()
+        .and_then(|legend| breakdown_keys(&legend).into_iter().next())
+        .map(|(_, legend_key)| legend_key);
     el().key("context-usage-ring")
         .role("button")
         .cursor(rune::Cursor::Pointer)
@@ -10556,9 +10992,17 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         .fill(if open { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(context_toggle)
-        .on_key(|s: &mut State, event, _| {
+        .on_key(move |s: &mut State, event, tx| {
             if event.key == rune::Key::Enter {
                 context_toggle(s);
+                return true;
+            }
+            if event.key == rune::Key::Tab
+                && !event.mods.shift
+                && let Some(first) = &first_legend_key
+            {
+                tx.focus(first.as_str(), true);
+                s.current_mut().context.focus_segment(Some(0));
                 return true;
             }
             context_escape(s, event)
@@ -10605,15 +11049,647 @@ fn context_cost_text(cost: f64) -> String {
     }
 }
 
-/// The usage popover, ported from KSG Code's `ContextWindowMeter` popup (the branch without a
-/// breakdown, which is what Pi reports): a `w-64` tooltip-style card above the ring, aligned to
-/// its end, with "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, a
-/// `h-1.5` usage bar, total processed and cost rows, the compaction state, and a full-width
+fn attach_composer_notices(s: &State, p: Palette, lane: f32, composer_card: El) -> El {
+    if let Some(notices) = composer_notice_stack(s, p, lane) {
+        col().w_full().gap(0.0).child(notices).child(composer_card)
+    } else {
+        composer_card
+    }
+}
+
+/// Ported from KSG Code's `ComposerBannerStack` and `ComposerBanner` (`attached`,
+/// `density="comfortable"`), skinned per Pixel Voyage: 2 px `outlined` frame, 6 px outer corners
+/// only on the top card, variant colour on the icon and a 2 px left edge.
+fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
+    use crate::composer_notices::Variant;
+    let notices = s.composer_notices.ordered();
+    if notices.is_empty() {
+        return None;
+    }
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let action_style = TextStyle::new(12.0, 450.0);
+    let mut stack = col().key("composer-notices").w_full().gap(0.0);
+    for (index, notice) in notices.iter().enumerate() {
+        let top = index == 0;
+        let corners = if top { [6.0, 6.0, 0.0, 0.0] } else { [0.0; 4] };
+        let variant_color = match notice.variant {
+            Variant::Error => p.danger,
+            Variant::Warning => p.brass,
+            Variant::Success | Variant::Info => p.sea,
+            Variant::Default => p.muted,
+        };
+        let role = match notice.variant {
+            Variant::Error | Variant::Warning => "alert",
+            Variant::Default | Variant::Info | Variant::Success => "status",
+        };
+        let a11y_label = match &notice.description {
+            Some(desc) if !desc.is_empty() => format!("{}: {desc}", notice.title),
+            _ => notice.title.clone(),
+        };
+        let mut actions_width = 0.0;
+        for act in &notice.actions {
+            actions_width +=
+                20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
+        }
+        let dismiss_width = if notice.dismiss_label.is_some() {
+            24.0 + 4.0
+        } else {
+            0.0
+        };
+        let available_text =
+            (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
+        let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
+        let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
+            4.0 + rune::text::measure(desc, &[], desc_style, None).0
+        });
+        let overflows = title_width + desc_width > available_text + 0.5;
+
+        let mut content = row()
+            .key(format!("composer-notice-content-{}", notice.id))
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .center_y()
+            .gap(4.0)
+            .child(
+                label(&notice.title, title_style, p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        if let Some(desc) = &notice.description {
+            content = content.child(
+                label(desc, desc_style, p.muted)
+                    .truncate()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0),
+            );
+        }
+
+        let mut actions = row().center_y().gap(4.0);
+        if overflows {
+            let details_id = notice.id.clone();
+            actions = actions.child(button(
+                &format!("composer-notice-details-{}", notice.id),
+                "Details",
+                p,
+                move |s| s.composer_notices.toggle_details(&details_id),
+            ));
+        }
+        for (action_index, act) in notice.actions.iter().enumerate() {
+            let handler = act.handler.clone();
+            let mut btn = button(
+                &format!("composer-notice-action-{}-{action_index}", notice.id),
+                &act.label,
+                p,
+                move |s| handler.call(s),
+            )
+            .disabled(act.disabled);
+            if let Some(tip) = &act.tooltip {
+                btn = btn.help(tip.clone());
+            }
+            actions = actions.child(btn);
+        }
+        if let Some(dismiss_label) = &notice.dismiss_label {
+            let dismiss_id = notice.id.clone();
+            actions = actions.child(icon_button(
+                &format!("composer-notice-dismiss-{}", notice.id),
+                dismiss_label,
+                "close",
+                p,
+                move |s| s.dismiss_composer_notice(&dismiss_id),
+            ));
+        }
+
+        let card_row = row()
+            .min_h(24.0)
+            .w_full()
+            .min_w(0.0)
+            .center_y()
+            .gap(4.0)
+            .child(
+                el().size(24.0, 24.0)
+                    .center()
+                    .child(icon(notice.icon, variant_color)),
+            )
+            .child(content)
+            .child(actions);
+
+        let mut card = col()
+            .key(format!("composer-notice-{}", notice.id))
+            .role(role)
+            .label(a11y_label)
+            .w_full()
+            .px(4.0)
+            .py(5.0)
+            .corners(corners)
+            .clip_corners(corners)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .child(
+                el().w(2.0)
+                    .fill(variant_color)
+                    .pin(Some(0.0), Some(0.0), None, Some(0.0))
+                    .a11y_hidden(),
+            )
+            .child(card_row);
+        if let Some(body) = &notice.body {
+            match body {
+                crate::composer_notices::NoticeBody::UsageLimits(report) => {
+                    card = card.child(usage_limits_notice_body(s, report, p));
+                }
+            }
+        }
+
+        stack = stack.child(card);
+    }
+    Some(stack)
+}
+
+fn usage_progress_bar(key: String, fill_key: Option<String>, percent: f64, p: Palette) -> El {
+    let fraction = percent.clamp(0.0, 100.0) as f32 / 100.0;
+    let mut fill = el()
+        .w_frac(fraction)
+        .h_full()
+        .radius(2.0)
+        .fill(if percent >= 90.0 { p.coral } else { p.faint });
+    if let Some(fill_key) = fill_key {
+        fill = fill.key(fill_key);
+    }
+    row()
+        .key(key)
+        .role("progressbar")
+        .label(format!("{} used", context_percent_text(percent)))
+        .w_full()
+        .h(6.0)
+        .radius(2.0)
+        .clip_rounded(2.0)
+        .fill(p.line)
+        .child(fill)
+}
+
+/// Ported from KSG Code's `UsageLimitsBannerBody` (`ComposerUsageLimits.tsx`) and
+/// `ComposerBanner.Scroll` (`ComposerBanner.tsx`: `max-h-[min(24rem,40dvh)]`), skinned per
+/// Pixel Voyage using `usage_progress_bar` and 11 px Departure Mono figures.
+fn usage_limits_notice_body(
+    s: &State,
+    report: &crate::usage_limits::UsageLimitsReport,
+    p: Palette,
+) -> El {
+    let max_h = if s.viewport_height > 0.0 {
+        384.0_f32.min((s.viewport_height * 0.4).max(120.0))
+    } else {
+        384.0
+    };
+    let now_ms = crate::usage_limits::parse_iso_ms(&report.created_at)
+        .unwrap_or_else(|| crate::lifecycle::now() as i64);
+    let mut body = col()
+        .w_full()
+        .min_w(0.0)
+        .pl(28.0)
+        .pr(8.0)
+        .pt(4.0)
+        .pb(6.0)
+        .gap(8.0);
+    for (acc_idx, account) in report.accounts.iter().enumerate() {
+        let mut acc_col = col()
+            .key(format!("usage-limits-account-{acc_idx}"))
+            .w_full()
+            .min_w(0.0)
+            .gap(4.0);
+        if report.accounts.len() > 1 {
+            acc_col = acc_col.child(
+                label(
+                    crate::usage_limits::account_summary(account),
+                    SMALL,
+                    p.muted,
+                )
+                .truncate()
+                .w_full(),
+            );
+        }
+        if let Some(notice_text) = crate::usage_limits::limits_notice(&account.limits) {
+            acc_col = acc_col.child(label(notice_text, SMALL, p.muted).wrap().w_full());
+        } else {
+            for (win_idx, window) in account.limits.windows.iter().enumerate() {
+                let reset_text =
+                    crate::usage_limits::format_resets_in(window, now_ms).unwrap_or_default();
+                let bar = usage_progress_bar(
+                    format!("usage-limits-bar-{acc_idx}-{win_idx}"),
+                    None,
+                    window.used_percent,
+                    p,
+                );
+                let win_row = row()
+                    .key(format!("usage-limits-window-{acc_idx}-{win_idx}"))
+                    .w_full()
+                    .min_w(0.0)
+                    .center_y()
+                    .gap(12.0)
+                    .child(
+                        row()
+                            .w(136.0)
+                            .min_w(0.0)
+                            .center_y()
+                            .gap(6.0)
+                            .child(
+                                label(&window.label, SMALL, p.muted)
+                                    .truncate()
+                                    .min_w(0.0)
+                                    .grow(1.0),
+                            )
+                            .child(pixel_text(context_percent_text(window.used_percent), p.ink)),
+                    )
+                    .child(row().grow(1.0).min_w(48.0).center_y().child(bar))
+                    .child(
+                        row()
+                            .min_w(84.0)
+                            .justify_end()
+                            .center_y()
+                            .child(pixel_text(reset_text, p.muted)),
+                    );
+                acc_col = acc_col.child(win_row);
+            }
+        }
+        if let Some(external) = &account.limits.external_usage {
+            let url = external.url.clone();
+            acc_col = acc_col.child(row().w_full().child(button(
+                &format!("usage-limits-manage-{acc_idx}"),
+                "Manage usage",
+                p,
+                move |s| s.open_external_url(&url),
+            )));
+        }
+        if let Some(input) = &account.reset_credit_input
+            && let Some(credits) = &account.limits.reset_credits
+            && credits.available_count > 0
+        {
+            for (c_idx, choice) in
+                crate::usage_limits::reset_credit_choices(credits, input, now_ms, false)
+                    .into_iter()
+                    .enumerate()
+            {
+                if choice.available_count == 0 {
+                    continue;
+                }
+                let btn_key = if c_idx == 0 {
+                    format!("usage-limits-reset-{acc_idx}")
+                } else {
+                    format!("usage-limits-reset-{acc_idx}-{c_idx}")
+                };
+                let choice_input = choice.input.clone();
+                acc_col = acc_col.child(
+                    row()
+                        .w_full()
+                        .min_w(0.0)
+                        .center_y()
+                        .gap(12.0)
+                        .child(pixel_text(choice.summary, p.muted))
+                        .child(button(&btn_key, &choice.action_label, p, move |s| {
+                            s.redeem_usage_reset_credit(choice_input.clone())
+                        })),
+                );
+            }
+        }
+        body = body.child(acc_col);
+    }
+    for notice_line in &report.notices {
+        body = body.child(label(notice_line, SMALL, p.muted).wrap().w_full());
+    }
+    col()
+        .key("usage-limits-scroll")
+        .w_full()
+        .min_w(0.0)
+        .max_h(max_h)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(body)
+}
+
+/// Overflow details popover for a composer notice, reusing `context_popover` styling.
+fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: Palette) -> El {
+    let mut card = col()
+        .key("composer-notice-details-popover")
+        .role("dialog")
+        .label("Notice details")
+        .w(360.0)
+        .max_w(480.0)
+        .padding(12.0)
+        .gap(8.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .anchored(
+            &format!("composer-notice-details-{}", notice.id),
+            rune::Side::Top,
+            rune::Align::End,
+            4.0,
+        )
+        .modal(true, |s: &mut State| s.composer_notices.close_details())
+        .on_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Escape {
+                s.composer_notices.close_details();
+                true
+            } else {
+                false
+            }
+        })
+        .child(
+            row()
+                .center_y()
+                .gap(12.0)
+                .child(pixel_label("Notice details", p.muted))
+                .child(spacer())
+                .child(icon_button(
+                    "close-notice-details",
+                    "Close",
+                    "close",
+                    p,
+                    |s| s.composer_notices.close_details(),
+                )),
+        )
+        .child(
+            label(&notice.title, TextStyle::new(12.0, 500.0).lh(16.0), p.ink)
+                .wrap()
+                .selectable(true),
+        );
+    if let Some(desc) = &notice.description {
+        card = card.child(
+            label(desc, SMALL.lh(16.0), p.muted)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    card
+}
+
+/// Derives the breakdown legend for a thread when breakdown rows are available.
+fn context_legend_for_thread(
+    t: &Thread,
+) -> Option<Vec<crate::context_breakdown::ContextLegendItem>> {
+    let limit = context_limit(t);
+    let usage = &t.context.usage;
+    let used_tokens = usage.tokens.unwrap_or_else(|| {
+        usage
+            .breakdown
+            .as_deref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.kind != crate::context_breakdown::BreakdownRowKind::Buffer)
+                    .map(|r| r.tokens)
+                    .sum()
+            })
+            .unwrap_or(0)
+    });
+    crate::context_breakdown::build_context_legend(usage.breakdown.as_deref(), limit, used_tokens)
+}
+
+fn breakdown_slug(label: &str, kind: crate::context_breakdown::ContextLegendKind) -> String {
+    use crate::context_breakdown::ContextLegendKind;
+    match kind {
+        ContextLegendKind::Other => "other".into(),
+        ContextLegendKind::Buffer => "buffer".into(),
+        ContextLegendKind::Free => "free".into(),
+        ContextLegendKind::Used | ContextLegendKind::Estimated | ContextLegendKind::Inferred => {
+            let mut slug = String::with_capacity(label.len());
+            let mut prev_dash = false;
+            for ch in label.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    slug.push(ch.to_ascii_lowercase());
+                    prev_dash = false;
+                } else if !prev_dash && !slug.is_empty() {
+                    slug.push('-');
+                    prev_dash = true;
+                }
+            }
+            while slug.ends_with('-') {
+                slug.pop();
+            }
+            if slug.is_empty() {
+                "segment".into()
+            } else {
+                slug
+            }
+        }
+    }
+}
+
+fn breakdown_keys(legend: &[crate::context_breakdown::ContextLegendItem]) -> Vec<(String, String)> {
+    use crate::context_breakdown::ContextLegendKind;
+    let mut seen = std::collections::HashSet::new();
+    legend
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let base = breakdown_slug(&item.label, item.kind);
+            let unique = if seen.insert(base.clone()) {
+                base
+            } else {
+                let disambiguated = format!("{base}-{index}");
+                seen.insert(disambiguated.clone());
+                disambiguated
+            };
+            let segment_key = if item.kind == ContextLegendKind::Buffer {
+                "context-breakdown-reserve".to_owned()
+            } else {
+                format!("context-breakdown-segment-{unique}")
+            };
+            let legend_key = format!("context-breakdown-legend-{unique}");
+            (segment_key, legend_key)
+        })
+        .collect()
+}
+
+/// Distinct existing Palette fills per segment kind, ordered by preference:
+/// primary accent for the largest conversational segment, then status/existing fields.
+fn breakdown_segment_color(
+    kind: crate::context_breakdown::ContextLegendKind,
+    conversational_index: usize,
+    p: Palette,
+) -> Color {
+    use crate::context_breakdown::ContextLegendKind;
+    match kind {
+        ContextLegendKind::Used | ContextLegendKind::Estimated => {
+            let colors = [p.coral, p.sea, p.brass, p.ink, p.frame, p.message_bg];
+            colors[conversational_index % colors.len()]
+        }
+        ContextLegendKind::Inferred => p.muted,
+        ContextLegendKind::Other => p.field_line,
+        ContextLegendKind::Free => p.line,
+        ContextLegendKind::Buffer => p.faint,
+    }
+}
+
+/// Segmented context breakdown bar and legend, ported from KSG Code's
+/// `ContextWindowMeter.tsx` (`ContextWindowBreakdown`).
+fn context_breakdown_view(
+    legend: &[crate::context_breakdown::ContextLegendItem],
+    approximate: bool,
+    active_segment: Option<usize>,
+    p: Palette,
+) -> El {
+    use crate::context_breakdown::ContextLegendKind;
+    let keys = breakdown_keys(legend);
+    let legend_keys: Vec<String> = keys.iter().map(|(_, lk)| lk.clone()).collect();
+    let total_tokens: u64 = legend.iter().map(|item| item.tokens).sum();
+
+    let mut conversational_count = 0usize;
+    let mut bar = row()
+        .key("context-breakdown-bar")
+        .role("img")
+        .label("Context window breakdown")
+        .w_full()
+        .h(6.0);
+    let mut rows = col().key("context-breakdown-legend").w_full().gap(2.0);
+
+    for (index, item) in legend.iter().enumerate() {
+        let color = breakdown_segment_color(item.kind, conversational_count, p);
+        if matches!(
+            item.kind,
+            ContextLegendKind::Used | ContextLegendKind::Estimated
+        ) {
+            conversational_count += 1;
+        }
+        let (segment_key, legend_key) = &keys[index];
+        let opacity = if active_segment.is_none() || active_segment == Some(index) {
+            1.0
+        } else {
+            0.35
+        };
+
+        let mut segment = el()
+            .key(segment_key.clone())
+            .w(0.0)
+            .grow(item.tokens.max(1) as f32)
+            .min_w(0.0)
+            .h_full()
+            .opacity(opacity);
+        if item.kind == ContextLegendKind::Buffer {
+            segment = segment.border(2.0, p.faint);
+        } else {
+            segment = segment.fill(color);
+        }
+        bar = bar.child(segment);
+
+        let prefix = if approximate
+            && !matches!(
+                item.kind,
+                ContextLegendKind::Free | ContextLegendKind::Buffer
+            ) {
+            "~"
+        } else {
+            ""
+        };
+        let count_label = format!("{prefix}{}", context_tokens_text(item.tokens));
+        let pct_label = if total_tokens > 0 {
+            context_percent_text(item.tokens as f64 * 100.0 / total_tokens as f64)
+        } else {
+            "0%".into()
+        };
+
+        let mut swatch = el().size(8.0, 8.0);
+        if item.kind == ContextLegendKind::Buffer {
+            swatch = swatch.border(2.0, p.faint);
+        } else {
+            swatch = swatch.fill(color);
+        }
+
+        let nav_keys = legend_keys.clone();
+        let legend_row = row()
+            .key(legend_key.clone())
+            .role("button")
+            .focusable(true)
+            .w_full()
+            .min_h(16.0)
+            .px(2.0)
+            .gap(6.0)
+            .center_y()
+            .hover(p.selected)
+            .focus_fill(p.selected)
+            .label(format!("{}, {}, {}", item.label, count_label, pct_label))
+            .on_hover_change(move |s: &mut State, inside, _| {
+                s.current_mut().context.hover_segment(index, inside);
+            })
+            .on_press(move |s: &mut State| {
+                s.current_mut().context.focus_segment(Some(index));
+            })
+            .on_key(move |s: &mut State, event, tx| {
+                let count = nav_keys.len();
+                match event.key {
+                    rune::Key::Tab if !event.mods.shift => {
+                        if index + 1 < count {
+                            tx.focus(nav_keys[index + 1].as_str(), true);
+                            s.current_mut().context.focus_segment(Some(index + 1));
+                            true
+                        } else {
+                            s.current_mut().context.focus_segment(None);
+                            false
+                        }
+                    }
+                    rune::Key::Tab if event.mods.shift => {
+                        if index > 0 {
+                            tx.focus(nav_keys[index - 1].as_str(), true);
+                            s.current_mut().context.focus_segment(Some(index - 1));
+                            true
+                        } else {
+                            s.current_mut().context.focus_segment(None);
+                            false
+                        }
+                    }
+                    rune::Key::Down | rune::Key::Right => {
+                        let next = (index + 1) % count;
+                        tx.focus(nav_keys[next].as_str(), true);
+                        s.current_mut().context.focus_segment(Some(next));
+                        true
+                    }
+                    rune::Key::Up | rune::Key::Left => {
+                        let prev = (index + count - 1) % count;
+                        tx.focus(nav_keys[prev].as_str(), true);
+                        s.current_mut().context.focus_segment(Some(prev));
+                        true
+                    }
+                    _ => context_escape(s, event),
+                }
+            })
+            .child(swatch)
+            .child(
+                label(&item.label, SMALL.lh(16.0), p.muted)
+                    .truncate()
+                    .min_w(0.0)
+                    .grow(1.0),
+            )
+            .child(label(count_label, TIMER, p.ink))
+            .child(label(pct_label, TIMER, p.muted));
+        rows = rows.child(legend_row);
+    }
+
+    let framed_bar = el()
+        .w_full()
+        .border(2.0, p.frame)
+        .border_layout()
+        .child(bar);
+    col().w_full().gap(8.0).child(framed_bar).child(rows)
+}
+
+/// The usage popover, ported from KSG Code's `ContextWindowMeter` popup: a `w-64` (or `w-80`
+/// with a segmented breakdown) tooltip-style card above the ring, aligned to its end, with
+/// "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, the breakdown or
+/// aggregate usage bar, total processed and cost rows, the compaction state, and a full-width
 /// "Compact context" button.
 fn context_popover(s: &State, p: Palette) -> El {
     let t = s.current();
     let limit = context_limit(t);
     let usage = &t.context.usage;
+    let legend = context_legend_for_thread(t);
+    let last_legend_key = legend
+        .as_deref()
+        .and_then(|items| breakdown_keys(items).into_iter().last())
+        .map(|(_, legend_key)| legend_key);
     // Figures are Departure Mono with tabular digits; their names stay Inter.
     let secondary = TIMER;
     let strong = TIMER;
@@ -10640,7 +11716,7 @@ fn context_popover(s: &State, p: Palette) -> El {
         .key("context-details")
         .role("dialog")
         .label("Context window")
-        .w(256.0)
+        .w(if legend.is_some() { 320.0 } else { 256.0 })
         .padding(12.0)
         .gap(8.0)
         .radius(6.0)
@@ -10660,7 +11736,16 @@ fn context_popover(s: &State, p: Palette) -> El {
                 .child(spacer())
                 .child(figures),
         );
-    if let Some(limit) = limit
+    if let Some(legend) = &legend {
+        let approximate =
+            crate::context_breakdown::is_approximate(usage.breakdown.as_deref(), Some(legend));
+        card = card.child(context_breakdown_view(
+            legend,
+            approximate,
+            t.context.active_segment(),
+            p,
+        ));
+    } else if let Some(limit) = limit
         && limit > 0
     {
         let fraction = usage.percent.unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0;
@@ -10713,16 +11798,10 @@ fn context_popover(s: &State, p: Palette) -> El {
             let Some(percent) = window["usedPercent"].as_f64().filter(|n| n.is_finite()) else {
                 continue;
             };
-            let fraction = percent.clamp(0.0, 100.0) as f32 / 100.0;
             let reset = window["resetsAt"]
                 .as_i64()
-                .and_then(chrono::DateTime::from_timestamp_secs)
-                .map(|time| {
-                    format!(
-                        "Resets {}",
-                        time.with_timezone(&chrono::Local).format("%b %d %H:%M")
-                    )
-                })
+                .and_then(crate::usage_limits::format_reset_clock_secs)
+                .map(|clock| format!("Resets {clock}"))
                 .unwrap_or_else(|| "Reset not reported".into());
             block = block.child(
                 col()
@@ -10743,24 +11822,12 @@ fn context_popover(s: &State, p: Palette) -> El {
                                     .key(format!("usage-percent-{index}")),
                             ),
                     )
-                    .child(
-                        row()
-                            .key(format!("usage-bar-{index}"))
-                            .role("progressbar")
-                            .label(format!("{} used", context_percent_text(percent)))
-                            .w_full()
-                            .h(6.0)
-                            .radius(2.0)
-                            .clip_rounded(2.0)
-                            .fill(p.line)
-                            .child(
-                                el().key(format!("usage-fill-{index}"))
-                                    .w_frac(fraction)
-                                    .h_full()
-                                    .radius(2.0)
-                                    .fill(if percent >= 90.0 { p.coral } else { p.faint }),
-                            ),
-                    )
+                    .child(usage_progress_bar(
+                        format!("usage-bar-{index}"),
+                        Some(format!("usage-fill-{index}")),
+                        percent,
+                        p,
+                    ))
                     .child(
                         pixel_text(reset, p.muted)
                             .key(format!("usage-reset-{index}"))
@@ -10803,10 +11870,26 @@ fn context_popover(s: &State, p: Palette) -> El {
         .child(icon("minimize", p.ink).size(14.0, 14.0))
         .child(label("Compact context", TextStyle::new(12.0, 500.0), p.ink));
     if can_compact {
-        compact = compact.focusable(true).on_press(|s: &mut State| {
-            s.current_mut().context.close_popover();
-            s.compact_context(None);
-        });
+        let legend_count = legend.as_ref().map(|items| items.len()).unwrap_or(0);
+        compact = compact
+            .focusable(true)
+            .on_press(|s: &mut State| {
+                s.current_mut().context.close_popover();
+                s.compact_context(None);
+            })
+            .on_key(move |s: &mut State, event, tx| {
+                if event.key == rune::Key::Tab
+                    && event.mods.shift
+                    && let Some(last) = &last_legend_key
+                {
+                    tx.focus(last.as_str(), true);
+                    s.current_mut()
+                        .context
+                        .focus_segment(Some(legend_count - 1));
+                    return true;
+                }
+                context_escape(s, event)
+            });
     }
     card = card.child(compact);
     if !can_compact {
@@ -10869,6 +11952,102 @@ fn composer_caret_edges(cx: &Cx<State>, zoom: f32) -> Option<[bool; 2]> {
         top + height - COMPOSER_FIELD_PAD - (caret[1] + caret[3]) < half
     };
     Some([first, last])
+}
+
+/// Ported from KSG Code's `replyBannerItems` (`chat/ChatComposer.tsx`) and `ComposerBanner`
+/// (`chat/ComposerBanner.tsx`, `px-1 py-1.25 min-h-6 gap-x-1 text-xs/4`).
+fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
+    let reply_to = t.draft_reply_to.as_ref()?;
+    let crate::composer_context::ComposerContextData::Response {
+        citation,
+        subagents,
+        ..
+    } = &reply_to.data
+    else {
+        return None;
+    };
+    let title = match subagents.as_deref() {
+        Some(list) if !list.is_empty() => format!(
+            "Replying to {}",
+            list.iter()
+                .map(|subagent| subagent.title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => "Replying to".to_owned(),
+    };
+    let target_label = crate::assistant_citation::assistant_citation_label(citation);
+    let nav_citation = citation.clone();
+    let text_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let aria_label = format!("{title} {target_label}");
+    let has_subagents = subagents.as_deref().is_some_and(|list| !list.is_empty());
+    let title_el = if has_subagents {
+        label(title, title_style, p.muted)
+            .truncate()
+            .min_w(0.0)
+            .shrink()
+    } else {
+        label(title, title_style, p.muted)
+    };
+    Some(
+        row()
+            .key("composer-reply-banner")
+            .keeps_text_selection()
+            .on_key(composer_ui::control_key)
+            .w_full()
+            .min_h(24.0)
+            .px(4.0)
+            .py(5.0)
+            .gap(4.0)
+            .center_y()
+            .child(
+                el().size(24.0, 24.0)
+                    .center()
+                    .child(icon("back", p.muted).size(12.0, 12.0)),
+            )
+            .child(
+                row()
+                    .role("button")
+                    .label(aria_label)
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(4.0)
+                    .hover(p.selected)
+                    .press(p.selected)
+                    .on_press_tx(move |s: &mut State, tx| {
+                        s.navigate_to_citation(&nav_citation, tx);
+                    })
+                    .child(title_el)
+                    .child(
+                        label(target_label, text_style, p.muted)
+                            .truncate()
+                            .min_w(0.0)
+                            .grow(1.0),
+                    ),
+            )
+            .child(
+                el().key("composer-reply-remove")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Remove reply")
+                    .focusable(true)
+                    .size(20.0, 20.0)
+                    .center()
+                    .radius(4.0)
+                    .hover(p.selected)
+                    .press(p.selected)
+                    .on_press(|s: &mut State| {
+                        s.clear_reply_to();
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit);
+                    })
+                    .child(icon("close", p.muted).size(12.0, 12.0)),
+            ),
+    )
 }
 
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
@@ -10943,19 +12122,50 @@ fn composer(
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
     if t.native.questionnaire.is_some() && request_visible {
-        return area.child(pi_ui::questionnaire_drawer(s, p));
+        return area.child(pi_ui::questionnaire_drawer(s, p, lane));
     }
     if request_visible {
         area = area.child(dialog(s, p));
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
+    let compact_before_send_tokens = if !collapsed && !show_resume && t.queued_edit.is_none() {
+        s.resume_compaction_tokens(t, crate::lifecycle::now())
+    } else {
+        None
+    };
+    let keep_full_history = s.keep_full_history(t);
+    let compacts_before_send = compact_before_send_tokens.is_some() && !keep_full_history;
+    let approval_send_allowed = t
+        .request
+        .as_ref()
+        .filter(|r| r["method"] == "confirm")
+        .is_none_or(|request| {
+            (crate::approval::can_respond(request) || crate::approval::not_resumable(request))
+                && t.requests_supported
+                && s.client.as_ref().is_none_or(|client| {
+                    (crate::approval::not_resumable(request)
+                        || client.can_approve(&s.machines.selected))
+                        && client.supports_capability(
+                            &s.machines.selected,
+                            crate::protocol::COMPOSER_REQUESTS,
+                        )
+                        && (request["responseCapability"]["supportsFeedback"] != true
+                            || client.supports_capability(
+                                &s.machines.selected,
+                                crate::protocol::APPROVAL_FEEDBACK,
+                            ))
+                })
+        });
     let can_send = !s.demo
         && s.attachment_send_block_reason().is_none()
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
         && !t.configuring
-        && !request_visible
+        && (!request_visible || t.request.as_ref().is_some_and(|r| r["method"] == "confirm"))
+        && !t.approval_send_pending()
+        && t.responding_request.is_none()
+        && approval_send_allowed
         && (!t.native.operating() || t.queued_edit.is_some())
         && (t.phase != "Stopping" || t.queued_edit.is_some())
         && !t.queued_edit_saving()
@@ -10976,6 +12186,8 @@ fn composer(
             } else {
                 "Update queued message"
             }
+        } else if compacts_before_send {
+            "Compact and send"
         } else if t.status.busy() {
             if t.follow_up_queues() {
                 "Queue message"
@@ -11033,6 +12245,46 @@ fn composer(
             .center_y(),
     );
     if collapsed || !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+        if let Some(tokens) = compact_before_send_tokens {
+            let amount = crate::context::format_context_window_tokens(tokens);
+            let tooltip = if keep_full_history {
+                format!("Next send keeps all {amount} tokens.\nClick to compact first")
+            } else {
+                format!("Next send compacts {amount} tokens first.\nClick to keep full history")
+            };
+            let mut toggle = row()
+                .key("composer-compact-send")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Compact {amount} tokens of history before sending"))
+                .help(tooltip)
+                .focusable(true)
+                .h(28.0)
+                .px(8.0)
+                .radius(4.0)
+                .center_y()
+                .gap(6.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .disabled(
+                    composer_disabled(s)
+                        || (s.client.is_some() && !s.machine_connected(&s.machines.selected)),
+                )
+                .on_press(|s: &mut State| s.toggle_keep_full_history())
+                .child(icon("minimize", p.muted));
+            if !keep_full_history {
+                toggle = toggle.fill(p.selected);
+            }
+            if lane >= 480.0 {
+                toggle = toggle.child(label(
+                    if keep_full_history { "Keep" } else { "Compact" },
+                    TextStyle::new(12.0, 500.0),
+                    p.ink,
+                ));
+            }
+            toggle = toggle.child(label(&amount, PIXEL.features(TABULAR), p.muted));
+            action = action.child(toggle);
+        }
         action = action.child(send);
     }
     if !collapsed
@@ -11124,6 +12376,9 @@ fn composer(
     if !collapsed && let Some(rows) = attachment_upload_file_rows(s, p) {
         card = card.child(rows);
     }
+    if let Some(banner) = composer_reply_banner(t, p) {
+        card = card.child(banner).child(rule(p));
+    }
     // Ported from KSG Code's composer body (`px-4 pt-4 pb-2`, `ChatComposer.tsx`) and its
     // editor (`max-h-52 overflow-y-auto p-1 -m-1`, `ComposerPromptEditorTiptap.tsx`): the field
     // grows with the draft up to a 200 pt text window, then scrolls inside its own viewport,
@@ -11132,6 +12387,7 @@ fn composer(
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
     let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let offered_suggestion = s.offered_prompt_suggestion();
     let blank_preview = rune::TextEdit::default();
     let field = text_input(
         if collapsed && t.draft.text.trim().is_empty() {
@@ -11161,6 +12417,17 @@ fn composer(
             "Open a real workspace to send messages".to_string()
         } else if let Some(machine) = s.unreachable_selected() {
             format!("{machine} is unreachable. Reconnecting.")
+        } else if request_visible && t.request.as_ref().is_some_and(|r| r["method"] == "confirm") {
+            if t.request
+                .as_ref()
+                .is_some_and(|r| r["responseCapability"]["supportsFeedback"] == true)
+            {
+                "Send feedback to decline this request".into()
+            } else {
+                "Send a message to decline and redirect the agent".into()
+            }
+        } else if offered_suggestion.is_some() {
+            String::new()
         } else if collapsed {
             "Ask anything...".to_string()
         } else {
@@ -11179,6 +12446,22 @@ fn composer(
         quote_bar: p.muted,
         marker: Some(p.muted),
     })
+    .block_style(rune::BlockStyle {
+        heading_scale: [
+            20.0 / 15.0,
+            18.0 / 15.0,
+            16.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+        ],
+        heading_weight: [600.0; 6],
+        checkbox_size: 14.0,
+        checkbox_stroke: 2.0,
+        checkbox_color: Some(p.ink),
+        rule_thickness: 2.0,
+        rule_color: Some(p.line),
+    })
     .caret(p.coral, p.coral_bg)
     .w_full()
     .min_h(COMPOSER_FIELD_MIN)
@@ -11193,14 +12476,30 @@ fn composer(
             composer_menu::scroll_selected(s, tx);
             return true;
         }
-        if (event.is_command('c') || event.is_command('x'))
-            && !event.mods.shift
-            && !event.mods.alt
-            && s.current().draft.anchor != s.current().draft.focus
-            && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+        if (event.is_command('c') || event.is_command('x')) && !event.mods.shift && !event.mods.alt
         {
-            tx.copy_rich(content);
-            return true;
+            if s.current().draft.anchor != s.current().draft.focus
+                && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+            {
+                tx.copy_rich(content);
+                return true;
+            }
+            if matches!(
+                s.current().draft.selection(),
+                rune::EditorSelection::Block(_)
+            ) && !s.current().draft.is_secure()
+            {
+                let cut = event.is_command('x');
+                let d = &mut s.current_mut().draft;
+                let content =
+                    rune::ClipboardContent::new(d.selected()).with_html(d.selected_html());
+                tx.copy_rich(content);
+                if cut {
+                    d.insert("");
+                    s.current_mut().update_submission_error();
+                }
+                return true;
+            }
         }
         if event.is_command('v') && event.mods.shift && !event.mods.alt {
             let id = s.current().id;
@@ -11262,7 +12561,10 @@ fn composer(
                 el().key("composer-preview")
                     .role("button")
                     .label(if t.draft.text.trim().is_empty() {
-                        "Expand composer. Ask anything...".to_owned()
+                        format!(
+                            "Expand composer. {}",
+                            offered_suggestion.unwrap_or("Ask anything...")
+                        )
                     } else {
                         format!("Expand composer. {}", t.draft.display().0)
                     })
@@ -11276,7 +12578,32 @@ fn composer(
                     })
                     .child(composer_ui::prompt_surface(
                         s,
-                        field.single_line().padding(0.0).h(28.0).min_h(0.0).inert(),
+                        {
+                            let preview_field =
+                                field.single_line().padding(0.0).h(28.0).min_h(0.0).inert();
+                            let mut host = el().w_full().h(28.0).child(preview_field);
+                            if let Some(suggestion) = offered_suggestion {
+                                host = host.child(
+                                    row()
+                                        .key("composer-suggestion")
+                                        .inert()
+                                        .h(28.0)
+                                        .center_y()
+                                        .gap(8.0)
+                                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                                        .child(
+                                            label(suggestion, composer_style, p.muted)
+                                                .truncate()
+                                                .min_w(0.0)
+                                                .shrink(),
+                                        )
+                                        .child(
+                                            keycap_chip("Tab", p).key("composer-suggestion-key"),
+                                        ),
+                                );
+                            }
+                            host
+                        },
                         true,
                     )),
             );
@@ -11315,16 +12642,13 @@ fn composer(
         }
         preview = preview.child(action);
         let controls = composer_ui::controls(s, p, lane - 32.0, true, locked);
+        let composer_card = composer_ui::frame_card(s, p, card.child(preview).child(controls));
         return col()
             .key("composer-lane")
             .w_full()
             .px(lane_gutter(pane_width))
             .items_center()
-            .child(area.child(composer_ui::frame_card(
-                s,
-                p,
-                card.child(preview).child(controls),
-            )));
+            .child(area.child(attach_composer_notices(s, p, lane, composer_card)));
     }
     card = card.child(
         col()
@@ -11350,7 +12674,55 @@ fn composer(
                     })
                     // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
                     .scroll_margin(4.0)
-                    .child(field),
+                    .child({
+                        let mut host = el().key("composer-input-host").w_full();
+                        let field = if let Some(suggestion) = offered_suggestion {
+                            let content_w = (lane - 24.0 - COMPOSER_FIELD_PAD * 2.0).max(40.0);
+                            let (natural_w, _) =
+                                rune::text::measure(suggestion, &[], composer_style, None);
+                            let min_h = if natural_w + 48.0 <= content_w {
+                                COMPOSER_FIELD_MIN
+                            } else {
+                                let (_, text_h) = rune::text::measure(
+                                    suggestion,
+                                    &[],
+                                    composer_style,
+                                    Some(content_w),
+                                );
+                                (text_h + 24.0 + COMPOSER_FIELD_PAD * 2.0).max(COMPOSER_FIELD_MIN)
+                            };
+                            host = host.min_h(min_h);
+                            field.min_h(min_h)
+                        } else {
+                            host = host.min_h(COMPOSER_FIELD_MIN);
+                            field
+                        };
+                        host = host.child(field);
+                        if let Some(suggestion) = offered_suggestion {
+                            host = host.child(
+                                row()
+                                    .key("composer-suggestion")
+                                    .inert()
+                                    .flex_wrap()
+                                    .center_y()
+                                    .gap(8.0)
+                                    .pin(
+                                        Some(COMPOSER_FIELD_PAD),
+                                        Some(COMPOSER_FIELD_PAD),
+                                        None,
+                                        Some(COMPOSER_FIELD_PAD),
+                                    )
+                                    .child(
+                                        label(suggestion, composer_style, p.muted)
+                                            .wrap()
+                                            .min_w(0.0)
+                                            .shrink(),
+                                    )
+                                    .child(keycap_chip("Tab", p).key("composer-suggestion-key")),
+                            );
+                        }
+                        host
+                    }),
                 false,
             )),
     );
@@ -11406,11 +12778,8 @@ fn composer(
                 .child(label(error, SMALL, p.danger).wrap().selectable(true)),
         );
     }
-    area = area.child(composer_ui::frame_card(
-        s,
-        p,
-        card.child(actions.child(action.ml(4.0))),
-    ));
+    let composer_card = composer_ui::frame_card(s, p, card.child(actions.child(action.ml(4.0))));
+    area = area.child(attach_composer_notices(s, p, lane, composer_card));
     // KSG Code's context strip: a bare muted row under the card, machine on the left and the
     // access mode on the right, inset to line up with the card's controls.
     let mut footer = row()
@@ -11500,6 +12869,157 @@ fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
                 .min_w(0.0)
         })
         .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Ported from KSG Code's `BranchToolbarEnvModeSelector` and `ComposerControl` size `xs`.
+fn env_mode_trigger(
+    s: &State,
+    p: Palette,
+    icon_only: bool,
+    mode: crate::model::ThreadEnvMode,
+) -> El {
+    let title = crate::branch_toolbar::resolve_env_mode_label(mode);
+    let glyph = if mode == crate::model::ThreadEnvMode::Worktree {
+        "branch"
+    } else {
+        "folder"
+    };
+    row()
+        .key("env-mode-trigger")
+        .role("button")
+        .label(format!("Workspace: {title}"))
+        .help(title)
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .radius(4.0)
+        .hover(p.selected)
+        .preserve_focus_on_press(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let opening = !s.env_mode_picker;
+            s.begin_composer_menu();
+            s.env_mode_picker = opening;
+        })
+        .child(icon(glyph, p.muted).size(12.0, 12.0))
+        .child(if icon_only {
+            el()
+        } else {
+            label(title, SMALL, p.muted)
+                .key("env-mode-trigger-label")
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+        })
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Ported from KSG Code's `BranchToolbarBranchSelector` and `ComposerControl` size `xs`.
+fn base_branch_trigger(
+    s: &State,
+    p: Palette,
+    base_branch: Option<&str>,
+    start_from_origin: bool,
+    max_w: f32,
+) -> El {
+    let t = s.current();
+    let is_remote = base_branch.and_then(|name| {
+        s.thread_vcs_repo_key(t).and_then(|key| {
+            s.vcs_branches
+                .get(&key)
+                .and_then(|entry| entry.refs.iter().find(|r| r.name == name))
+                .map(|r| r.is_remote == Some(true))
+        })
+    });
+    let title = crate::branch_toolbar::resolve_branch_trigger_label(
+        None,
+        crate::model::ThreadEnvMode::Worktree,
+        base_branch,
+        is_remote,
+        start_from_origin,
+    );
+    row()
+        .key("base-branch-trigger")
+        .role("button")
+        .label(format!("Base branch: {title}"))
+        .help(title.clone())
+        .h(if s.client.is_some() && s.viewport_width < 640.0 {
+            28.0
+        } else {
+            24.0
+        })
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .max_w(max_w)
+        .shrink()
+        .radius(4.0)
+        .hover(p.selected)
+        .preserve_focus_on_press(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let opening = !s.base_branch_picker;
+            s.begin_composer_menu();
+            s.base_branch_picker = opening;
+            if opening {
+                s.base_branch_query = rune::TextEdit::default();
+                s.base_branch_query.focused = true;
+                s.ensure_vcs_branches(true);
+            }
+        })
+        .child(icon("branch", p.muted).size(12.0, 12.0))
+        .child(
+            label(
+                title,
+                PIXEL,
+                if base_branch.is_some() {
+                    p.ink
+                } else {
+                    p.muted
+                },
+            )
+            .key("base-branch-trigger-label")
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        )
+        .child(icon("chevron", p.muted).size(12.0, 12.0))
+}
+
+/// Read-only branch indicator for an active worktree thread, ported from KSG Code's
+/// `BranchToolbarBranchSelector` / `BranchToolbarEnvModeSelector`.
+fn worktree_branch_indicator(
+    p: Palette,
+    branch: Option<&str>,
+    worktree_path: &str,
+    max_w: f32,
+) -> El {
+    let fallback = crate::branch_toolbar::resolve_locked_workspace_label(
+        Some(worktree_path),
+        crate::model::ThreadEnvMode::Worktree,
+    );
+    let title = branch.unwrap_or(&fallback);
+    row()
+        .key("worktree-branch-indicator")
+        .label(format!("Worktree branch: {title}"))
+        .help(worktree_path)
+        .h(24.0)
+        .px(7.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .max_w(max_w)
+        .shrink()
+        .child(icon("branch", p.muted).size(12.0, 12.0))
+        .child(label(title, PIXEL, p.muted).truncate().shrink().min_w(0.0))
 }
 
 pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool {
@@ -11664,6 +13184,266 @@ fn machine_picker(s: &State, p: Palette) -> El {
     })
 }
 
+/// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
+fn env_mode_picker(s: &State, p: Palette) -> El {
+    let active = s.effective_env_mode(s.current());
+    let mut menu = col()
+        .key("env-mode-picker")
+        .role("menu")
+        .focus_group()
+        .label("Workspace")
+        .w(240.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(pixel_label("Workspace", p.muted).px(8.0).py(6.0));
+    for (mode, slug, glyph) in [
+        (crate::model::ThreadEnvMode::Local, "local", "folder"),
+        (crate::model::ThreadEnvMode::Worktree, "worktree", "branch"),
+    ] {
+        let title = crate::branch_toolbar::resolve_env_mode_label(mode);
+        let selected = active == mode;
+        let mut item = row()
+            .key(format!("env-mode-option-{slug}"))
+            .role("menuitemradio")
+            .checked(selected)
+            .label(title)
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .center_y()
+            .gap(8.0)
+            .h(30.0)
+            .px(8.0)
+            .radius(4.0)
+            .fill(if selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .on_press(move |s: &mut State| {
+                s.set_draft_env_mode(mode);
+                s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+            })
+            .child(icon(glyph, p.muted).size(14.0, 14.0))
+            .child(
+                label(title, TextStyle::new(13.0, 450.0), p.ink)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        if selected {
+            item = item.child(icon("check", p.sea));
+        }
+        menu = menu.child(item);
+    }
+    menu.anchored_fit("env-mode-trigger", rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.env_mode_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
+}
+
+/// Ported from KSG Code's `BranchPicker` and `BranchToolbarBranchSelector`.
+fn base_branch_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let selected_branch = t.base_branch.as_deref();
+    let start_from_origin = t.effective_start_from_origin();
+    let query = s.base_branch_query.text.trim().to_ascii_lowercase();
+    let repo_key = s.thread_vcs_repo_key(t);
+    let project_cwd = t
+        .project
+        .and_then(|id| s.project(Some(id)))
+        .map(|proj| proj.path.to_string_lossy().into_owned());
+    let entry = repo_key.as_ref().and_then(|k| s.vcs_branches.get(k));
+
+    let header = row().center_y().gap(8.0).px(10.0).py(8.0).child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .h(30.0)
+            .px(10.0)
+            .radius(4.0)
+            .fill(p.selected)
+            .field_focus(&s.base_branch_query, p)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(icon("search", p.muted))
+            .child(
+                text_input(&s.base_branch_query, TextStyle::new(13.0, 420.0))
+                    .key("base-branch-search")
+                    .label("Search refs")
+                    .placeholder("Search refs...", p.muted)
+                    .color(p.ink)
+                    .caret(p.coral, p.coral_bg)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .autofocus()
+                    .on_edit(|s: &mut State| &mut s.base_branch_query)
+                    .on_input_key(|s: &mut State, event, tx| {
+                        if matches!(event.key, rune::Key::Down)
+                            && !event.mods.cmd
+                            && !event.mods.ctrl
+                            && !event.mods.alt
+                            && !event.mods.shift
+                        {
+                            s.base_branch_query.focused = false;
+                            tx.focus("base-branch-list", true);
+                            return true;
+                        }
+                        false
+                    }),
+            ),
+    );
+
+    let mut list = col()
+        .key("base-branch-list")
+        .role("listbox")
+        .label("Branches")
+        .focus_group()
+        .w_full()
+        .max_h(224.0)
+        .pb(4.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+
+    if let Some(err) = entry.and_then(|e| e.error.as_deref()) {
+        list = list.child(label(err, SMALL, p.danger).wrap().px(12.0).py(8.0));
+    } else if entry.is_none_or(|e| e.loading && e.refs.is_empty()) {
+        list = list.child(label("Loading refs...", SMALL, p.muted).px(12.0).py(8.0));
+    } else if let Some(entry) = entry {
+        let ordered = crate::branch_toolbar::order_branches_for_picker(&entry.refs);
+        let filtered: Vec<&crate::vcs::VcsRef> = ordered
+            .into_iter()
+            .filter(|r| {
+                crate::branch_toolbar::should_include_branch_picker_item(
+                    &r.name, &query, None, None,
+                )
+            })
+            .collect();
+        if filtered.is_empty() {
+            list = list.child(label("No refs found.", SMALL, p.muted).px(12.0).py(8.0));
+        } else {
+            for r in filtered {
+                let name = r.name.clone();
+                let selected = selected_branch == Some(name.as_str());
+                let has_secondary_worktree = r
+                    .worktree_path
+                    .as_deref()
+                    .is_some_and(|wp| project_cwd.as_deref().is_some_and(|cwd| wp != cwd));
+                let badge = if r.current {
+                    Some("current")
+                } else if has_secondary_worktree {
+                    Some("worktree")
+                } else if r.is_remote == Some(true) {
+                    Some("remote")
+                } else if r.is_default {
+                    Some("default")
+                } else {
+                    None
+                };
+                let mut item = row()
+                    .key(format!("base-branch-option-{name}"))
+                    .role("option")
+                    .checked(selected)
+                    .label(&name)
+                    .focusable(true)
+                    .cursor(rune::Cursor::Pointer)
+                    .center_y()
+                    .gap(8.0)
+                    .h(30.0)
+                    .mx(4.0)
+                    .px(8.0)
+                    .radius(4.0)
+                    .fill(if selected {
+                        p.coral_bg
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .hover(if selected { p.coral_bg } else { p.selected })
+                    .focus_fill(p.selected)
+                    .focus_selected(selected)
+                    .on_press(move |s: &mut State| {
+                        s.set_draft_base_branch(name.clone());
+                        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+                    })
+                    .child(
+                        label(&r.name, TextStyle::new(13.0, 450.0), p.ink)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    );
+                if selected {
+                    item = item.child(icon("check", p.sea));
+                }
+                if let Some(badge) = badge {
+                    item = item.child(pixel_text(badge, p.faint));
+                }
+                list = list.child(item);
+            }
+        }
+    }
+
+    let origin_row = row()
+        .key("start-from-remote-row")
+        .center_y()
+        .justify_between()
+        .gap(12.0)
+        .px(12.0)
+        .py(8.0)
+        .help("Uses the latest commit of the base branch's tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.")
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .min_w(0.0)
+                .child(icon("cloud", p.muted).size(12.0, 12.0))
+                .child(label("Start from remote", SMALL, p.muted).truncate()),
+        )
+        .child(captain_ui::switch(
+            s,
+            "start-from-remote-toggle",
+            "Start worktree from remote",
+            start_from_origin,
+            p,
+            |s: &mut State| {
+                let next = !s.current().effective_start_from_origin();
+                s.set_draft_start_from_origin(next);
+            },
+        ));
+
+    col()
+        .key("base-branch-picker")
+        .role("dialog")
+        .label("Base branch")
+        .w(320.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .child(header)
+        .child(rule(p))
+        .child(list)
+        .child(rule(p))
+        .child(origin_row)
+        .anchored_fit(
+            "base-branch-trigger",
+            rune::Side::Top,
+            rune::Align::Start,
+            6.0,
+        )
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.base_branch_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
+}
+
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
 fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     let busy = s.machines.pending.is_some();
@@ -11712,6 +13492,8 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     if let Some(client) = &s.client {
         for (id, remote) in &client.linked {
             let server = id.clone();
+            let toggle_id = id.clone();
+            let enabled = remote.enabled();
             let version = remote.version().unwrap_or_else(|| {
                 s.machines
                     .views
@@ -11721,51 +13503,76 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                     .to_owned()
             });
             card = card.child(
-                row()
+                col()
                     .key(format!("settings-linked-{id}"))
-                    .center_y()
-                    .gap(8.0)
+                    .gap(6.0)
                     .child(
-                        col()
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .gap(4.0)
+                        row()
+                            .center_y()
+                            .gap(8.0)
                             .child(
-                                label(
-                                    remote
-                                        .remote
-                                        .as_ref()
-                                        .map(|link| link.host.as_str())
-                                        .unwrap_or(id),
-                                    TextStyle::new(14.0, 500.0),
-                                    p.ink,
-                                )
-                                .truncate()
-                                .min_w(0.0),
+                                col()
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .gap(4.0)
+                                    .child(
+                                        label(
+                                            remote
+                                                .remote
+                                                .as_ref()
+                                                .map(|link| link.host.as_str())
+                                                .unwrap_or(id),
+                                            TextStyle::new(14.0, 500.0),
+                                            p.ink,
+                                        )
+                                        .truncate()
+                                        .min_w(0.0),
+                                    )
+                                    .child(
+                                        row()
+                                            .gap(8.0)
+                                            .flex_wrap()
+                                            .child(pixel_text(version, p.muted))
+                                            .child(pixel_text(
+                                                if !enabled {
+                                                    "Disabled"
+                                                } else if s.machine_connected(id) {
+                                                    "Reachable"
+                                                } else {
+                                                    "Offline"
+                                                },
+                                                p.muted,
+                                            )),
+                                    ),
                             )
                             .child(
-                                row()
-                                    .gap(8.0)
-                                    .flex_wrap()
-                                    .child(pixel_text(version, p.muted))
-                                    .child(pixel_text(
-                                        if s.machine_connected(id) {
-                                            "Reachable"
-                                        } else {
-                                            "Offline"
-                                        },
-                                        p.muted,
-                                    )),
+                                settings_ui::destructive_button(
+                                    &format!("unlink-{id}"),
+                                    "Unlink and revoke",
+                                    p,
+                                    move |s| s.machine_action("unlink", &server),
+                                )
+                                .disabled(busy),
                             ),
                     )
                     .child(
-                        settings_ui::destructive_button(
-                            &format!("unlink-{id}"),
-                            "Unlink and revoke",
-                            p,
-                            move |s| s.machine_action("unlink", &server),
-                        )
-                        .disabled(busy),
+                        row()
+                            .key(format!("settings-linked-enabled-row-{id}"))
+                            .center_y()
+                            .gap(8.0)
+                            .child(pixel_text("Enabled", p.muted))
+                            .child(spacer())
+                            .child(
+                                captain_ui::switch(
+                                    s,
+                                    &format!("linked-enabled-{id}"),
+                                    "Enabled",
+                                    enabled,
+                                    p,
+                                    move |s| s.toggle_machine_enabled(&toggle_id),
+                                )
+                                .disabled(busy),
+                            ),
                     ),
             );
         }
@@ -12052,6 +13859,144 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
     )
 }
 
+/// Ported from KSG Code's ComposerPendingApprovalActions.
+fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palette) -> El {
+    let Some(t) = s.threads.iter().find(|t| t.id == id) else {
+        return el();
+    };
+    let Some(request) = &t.request else {
+        return el();
+    };
+    let server = s
+        .remote_task(id)
+        .map(|r| r.server_id.as_str())
+        .unwrap_or(&s.machines.selected);
+    let disabled = !allowed
+        || !t.requests_supported
+        || t.responding_request.is_some()
+        || !crate::approval::can_respond(request)
+        || s.client.as_ref().is_some_and(|client| {
+            !client.can_approve(server)
+                || !client.supports_capability(server, crate::protocol::COMPOSER_REQUESTS)
+        });
+    let options = crate::approval::options(request);
+    let option_button = |option: &crate::approval::OptionItem| {
+        let decision = option.decision.clone();
+        let ink = if decision == "accept" {
+            p.on_coral
+        } else {
+            p.ink
+        };
+        let key = match (inline, decision.as_str()) {
+            (false, "accept") => "dialog-confirm".to_owned(),
+            (false, "acceptForSession") => "dialog-session".to_owned(),
+            (false, "cancel") => "dialog-cancel".to_owned(),
+            (false, "decline") => "dialog-decline".to_owned(),
+            (true, "accept") => format!("approve-{id}"),
+            (true, "decline") => format!("decline-{id}"),
+            _ => format!("approval-{id}-{decision}"),
+        };
+        let mut content = row().gap(4.0).center_y();
+        if option.warning.is_some() {
+            content = content.child(icon("alert", ink));
+        }
+        content = content.child(if inline {
+            label(&option.label, LABEL, ink).wrap().min_w(0.0)
+        } else {
+            label(&option.label, LABEL, ink).max_w(160.0).truncate()
+        });
+        let request_id = request["id"].clone();
+        framed(
+            row()
+                .key(&key)
+                .role("button")
+                .label(&option.label)
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .center_y()
+                .gap(4.0)
+                .px(8.0)
+                .min_h(24.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .fill(if option.decision == "accept" {
+                    p.coral
+                } else {
+                    p.card
+                })
+                .child(content),
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            if !disabled
+                && s.threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.request.as_ref())
+                    .is_some_and(|r| r["id"] == request_id)
+            {
+                let _ = s.respond_to_request(id, crate::approval::response(&decision));
+            }
+        })
+        .disabled(disabled)
+        .help(option.warning.as_deref().unwrap_or(&option.label))
+    };
+    let mut actions = row().gap(6.0).center_y().flex_wrap();
+    for option in options
+        .iter()
+        .filter(|o| matches!(o.decision.as_str(), "decline" | "accept"))
+    {
+        actions = actions.child(option_button(option));
+    }
+    let more: Vec<_> = options
+        .iter()
+        .filter(|o| !matches!(o.decision.as_str(), "decline" | "accept"))
+        .collect();
+    if !more.is_empty() {
+        let mut control = col().child(
+            button(
+                &format!("approval-more-{id}"),
+                if inline { "More" } else { "..." },
+                p,
+                move |s| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = !t.native.approval_more;
+                    }
+                },
+            )
+            .label("More approval options")
+            .disabled(disabled),
+        );
+        if t.native.approval_more {
+            let mut menu = popover(
+                &format!("approval-menu-{id}"),
+                "More approval options",
+                s,
+                p,
+            );
+            for option in more {
+                menu = menu.child(option_button(option));
+            }
+            control = control.child(
+                menu.anchored_fit(
+                    format!("approval-more-{id}"),
+                    rune::Side::Top,
+                    rune::Align::End,
+                    4.0,
+                )
+                .modal(true, move |s: &mut State| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = false;
+                    }
+                }),
+            );
+        }
+        actions = actions.child(control);
+    }
+    actions
+}
+
 fn dialog(s: &State, p: Palette) -> El {
     let t = s.current();
     let request = t.request.as_ref().expect("pending dialog");
@@ -12078,19 +14023,13 @@ fn dialog(s: &State, p: Palette) -> El {
         .border(1.0, p.line)
         .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
         .child(label(crate::model::string(request, "message"), BODY, p.ink).wrap());
+    if !t.requests_supported {
+        card = card.child(label(crate::protocol::REQUESTS_UPDATE_REQUIRED, SMALL, p.danger).wrap());
+    }
     let mut actions = row().gap(6.0).flex_wrap();
     match crate::model::string(request, "method") {
         "confirm" => {
-            actions = actions
-                .child(button("dialog-confirm", "Confirm", p, |s| {
-                    let _ = s.respond_to_request(s.current().id, json!({"confirmed":true}));
-                }))
-                .child(button("dialog-session", "Allow for session", p, |s| {
-                    let _ = s.respond_to_request(
-                        s.current().id,
-                        json!({"confirmed":true,"allowForSession":true}),
-                    );
-                }));
+            actions = approval_actions(s, t.id, false, can_answer, p);
         }
         "select" => {
             if let Some(options) = request["options"].as_array() {
@@ -12133,13 +14072,12 @@ fn dialog(s: &State, p: Palette) -> El {
             }));
         }
     }
-    card = card.child(
-        actions
-            .child(button("dialog-cancel", "Cancel", p, |s| {
-                let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
-            }))
-            .disabled(!can_answer),
-    );
+    if request["method"] != "confirm" {
+        actions = actions.child(button("dialog-cancel", "Cancel", p, |s| {
+            let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
+        }));
+    }
+    card = card.child(actions.disabled(!can_answer));
     if !linked && let Some(remote) = remote {
         card = card
             .child(
@@ -13484,14 +15422,20 @@ pub(crate) mod tests {
         );
         assert!(rt.presented("machine-unreachable").is_some());
         // Rows still say nothing about the connection.
-        assert!(!rt.accessibility_json().to_string().contains("offline"));
-        // The open thread on an unreachable machine says so.
+        let tree = rt.accessibility_json();
+        let sidebar = find(&tree, "sidebar").expect("sidebar");
+        assert!(!sidebar.to_string().contains("offline"));
+        // The open thread on an unreachable machine says so in the composer notice stack.
         rt.state.open_machine_thread("example-studio", 3);
         poll(&mut rt);
         assert_eq!(rt.state.machines.selected, "example-studio");
         let tree = rt.accessibility_json();
-        let header = find(&tree, "chat-unreachable").expect("the header says so");
-        assert_eq!(header["name"], "Studio is unreachable. Reconnecting.");
+        let notice = find(
+            &tree,
+            "composer-notice-environment-unavailable:example-studio",
+        )
+        .expect("the composer notice says so");
+        assert_eq!(notice["name"], "Studio is offline: This device is offline");
         // Another message is never replaced or cleared by it.
         rt.state.machines.notice = Some("Something else".into());
         poll(&mut rt);
@@ -13987,6 +15931,7 @@ pub(crate) mod tests {
                 host: "studio-mac".into(),
                 device_id: "fixture-device".into(),
                 token: "fixture".into(),
+                enabled: true,
             });
             client.linked.insert("fixture-server".into(), remote);
             rt.state.client = Some(client);
@@ -14187,7 +16132,6 @@ pub(crate) mod tests {
                 "dialog-option-1",
                 "dialog-reply",
                 "questionnaire-next",
-                "dialog-cancel",
             ] {
                 let (rect, _) = rt
                     .presented(key)
@@ -14400,6 +16344,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn choice_only_questions_and_markdown_fit_at_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"choice","method":"input",
+                "responseCapability":{"type":"live"},"questions":[{"id":"one","header":"Choice",
+                    "question":"Choose **one** option.\n\nUse `exact` values.","allowCustomAnswer":false,
+                    "options":[{"label":"A","description":"A","value":""},{"label":"B","value":" B "}]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-reply").is_none(), "{width}");
+            for key in [
+                "questionnaire-drawer",
+                "questionnaire-markdown",
+                "dialog-option-0",
+                "dialog-option-1",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-option-0");
+            assert!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .answers[0]
+                    .selected
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn attachment_previews_open_from_tray_and_messages_and_fit_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -14584,6 +16570,165 @@ pub(crate) mod tests {
                     assert!(rt.state.attachment_send_block_reason().is_some());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn question_collapse_reopens_preserves_drafts_and_blocks_hidden_shortcuts_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"collapse",
+                "method":"input","responseCapability":{"type":"message"},"questions":[
+                    {"id":"one","header":"Storage","question":"Choose **working storage**.",
+                        "multiSelect":true,"options":[{"label":"Disk"}]},
+                    {"id":"two","header":"Details","question":"Any details?","options":[]}
+                ]}));
+            rt.state.current_mut().reply.replace_text("Unsent answer");
+            rt.frame(0.0);
+            let expanded = rt.presented("questionnaire-drawer").unwrap().0;
+            press(&mut rt, "questionnaire-toggle");
+            assert!(rt.state.current().questionnaire_collapsed(), "{width}");
+            rt.frame(0.25);
+            assert!(rt.find("questionnaire-markdown").is_none());
+            assert!(rt.find("dialog-option-0").is_none());
+            assert!(rt.presented("questionnaire-summary").is_some());
+            assert!(rt.presented("questionnaire-count").is_some());
+            assert!(rt.presented("dialog-reply").is_some());
+            let collapsed = rt.presented("questionnaire-drawer").unwrap().0;
+            assert!(
+                collapsed[3] < expanded[3],
+                "{width}: {collapsed:?} {expanded:?}"
+            );
+            for key in [
+                "questionnaire-toggle",
+                "questionnaire-summary",
+                "dialog-cancel",
+            ] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5);
+                assert!(rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5);
+            }
+            assert!(!pi_ui::questionnaire_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Text("1".into()),
+                    mods: Default::default()
+                }
+            ));
+            press(&mut rt, "questionnaire-toggle");
+            rt.frame(0.25);
+            assert!(rt.presented("dialog-option-0").is_some());
+            assert_eq!(rt.state.current().reply.text, "Unsent answer");
+            press(&mut rt, "questionnaire-toggle");
+            press(&mut rt, "questionnaire-next");
+            rt.frame(0.25);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-summary").is_none());
+            rt.state.current_mut().respond(json!({"cancelled":true}));
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"new-request",
+                "method":"input","questions":[{"id":"one","question":"New request?","options":[]}]}));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-count").is_none());
+            assert!(
+                rt.find("dialog-cancel").is_none(),
+                "live questions cannot dismiss"
+            );
+        }
+    }
+
+    #[test]
+    fn question_dismissal_does_not_toggle_and_respects_responding_permissions_and_old_peers() {
+        for capability in ["message", "live", "not_resumable"] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":capability},"responseMode":"message",
+                "questions":[{"id":"one","question":"An asynchronous question?","options":[]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-cancel").is_some(), "{capability}");
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            rt.state.current_mut().responding_request = None;
+            press(&mut rt, "dialog-cancel");
+            assert_eq!(
+                rt.state.current().request.is_none(),
+                capability == "message"
+            );
+            if capability != "message" {
+                assert!(rt.presented("questionnaire-markdown").is_some());
+            }
+        }
+        for (can_approve, supports_dismissal) in [(false, true), (true, false)] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":"message"},
+                "questions":[{"id":"one","question":"Still pending?","options":[]}]}));
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            let mut capabilities = vec![
+                crate::protocol::COMPOSER_REQUESTS,
+                crate::protocol::QUESTION_CONTRACT,
+            ];
+            if supports_dismissal {
+                capabilities.push(crate::protocol::QUESTION_DISMISS);
+            }
+            *client.info.lock().unwrap() =
+                json!({"canApprove":can_approve,"capabilities":capabilities});
+            rt.state.client = Some(client);
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(commands.try_recv().is_err());
+            assert!(rt.presented("questionnaire-markdown").is_some());
+        }
+    }
+
+    #[test]
+    fn question_answer_files_fit_without_changing_the_ordinary_composer_at_all_widths() {
+        let path = crate::store::directory().unwrap().join("answer-file.txt");
+        std::fs::write(&path, "Question attachment").unwrap();
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("Ordinary draft");
+            rt.state.current_mut().apply(
+                json!({"type":"extension_ui_request","id":"files","method":"input",
+                "questions":[{"id":"one","question":"Attach the file.","options":[]}]}),
+            );
+            rt.state.attach_paths(&[path.clone()]);
+            rt.frame(0.0);
+            let key = format!("attachment-{}", rt.state.current().question_files()[0].id);
+            for key in [
+                "questionnaire-drawer",
+                "dialog-reply",
+                "attach-image",
+                key.as_str(),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[0] + rect[2] <= width + 1.0
+                        && rect[1] >= 0.0
+                        && rect[1] + rect[3] <= 721.0,
+                    "{width}: {key} {rect:?}"
+                );
+            }
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
         }
     }
 
@@ -15412,6 +17557,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn heading_task_rule_and_fence_render_inside_the_composer_card_at_620_and_1280() {
+        let source = "# Title\n- [x] Done\n---\n```rs\nlet x = 1;\n```";
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.draft = crate::composer_rich::draft("");
+                crate::composer_rich::paste_with_path_query(&mut t.draft, source, false, &|_| None);
+                t.draft.focused = true;
+            }
+            rt.frame(0.0);
+            let (card, _) = rt.presented("composer-natural").unwrap();
+            let (input, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input[0] >= card[0]
+                    && input[0] + input[2] <= card[0] + card[2] + 1.0
+                    && input[1] >= card[1]
+                    && input[1] + input[3] <= card[1] + card[3] + 1.0,
+                "{width}: input {input:?} outside card {card:?}"
+            );
+            assert!(
+                input[3] > 60.0,
+                "{width}: expected multiline height, got {input:?}"
+            );
+            let draft = &rt.state.current().draft;
+            let kinds: Vec<_> = draft.logical_blocks().map(|b| b.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    rune::BlockKind::Heading { level: 1 },
+                    rune::BlockKind::Task {
+                        level: 0,
+                        checked: true,
+                    },
+                    rune::BlockKind::Rule,
+                    rune::BlockKind::Code,
+                ]
+            );
+            assert_eq!(crate::composer_rich::markdown(draft), source);
+        }
+    }
+
+    #[test]
     fn steering_and_rewind_controls_send_native_commands_without_overflow() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -15510,6 +17698,7 @@ pub(crate) mod tests {
                 tokens: Some(60_000),
                 context_window: Some(200_000),
                 percent: Some(30.0),
+                breakdown: None,
             };
             t.draft.replace_text("A short draft");
             t.draft.focused = true;
@@ -17314,6 +19503,7 @@ pub(crate) mod tests {
             tokens: Some(60_000),
             context_window: Some(200_000),
             percent: Some(30.0),
+            breakdown: None,
         };
         thread.draft.replace_text("Ready");
         rt.invalidate();
@@ -17439,6 +19629,7 @@ pub(crate) mod tests {
             tokens: None,
             context_window: Some(200_000),
             percent: None,
+            breakdown: None,
         };
         thread.context.phase = ContextPhase::AwaitingUsage;
         thread.draft.replace_text("Ready");
@@ -17514,6 +19705,7 @@ pub(crate) mod tests {
             tokens: Some(61_400),
             context_window: Some(200_000),
             percent: Some(30.7),
+            breakdown: None,
         };
         thread.native.stats = json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
         thread.draft.replace_text("Ready");
@@ -17910,6 +20102,147 @@ pub(crate) mod tests {
         assert!((quarter[0][0] - 13.0).abs() < 0.001 && quarter[0][1] < 4.0);
         let last = quarter.last().unwrap();
         assert!(last[0] > 22.0 && (last[1] - 13.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn context_breakdown_segments_sum_to_bar_width_and_focus_dims_others() {
+        use crate::context_breakdown::{BreakdownRowKind, ContextBreakdownRow};
+
+        for width in [620.0, 1280.0] {
+            let mut rt = context_fixture(width);
+            rt.state.current_mut().context.details_open = true;
+            rt.invalidate();
+            rt.frame(0.3);
+            assert!(rt.presented("context-details-bar").is_some(), "{width}");
+            assert!(rt.presented("context-breakdown-bar").is_none(), "{width}");
+            rt.state.current_mut().context.close_popover();
+            rt.invalidate();
+            rt.frame(0.3);
+
+            {
+                let thread = rt.state.current_mut();
+                thread.context_window = Some(200_000);
+                thread.context.usage = ContextUsage {
+                    tokens: Some(70_000),
+                    context_window: Some(200_000),
+                    percent: Some(35.0),
+                    breakdown: Some(vec![
+                        ContextBreakdownRow {
+                            label: "Messages".into(),
+                            tokens: 40_000,
+                            kind: BreakdownRowKind::Estimated,
+                        },
+                        ContextBreakdownRow {
+                            label: "Tool output".into(),
+                            tokens: 20_000,
+                            kind: BreakdownRowKind::Estimated,
+                        },
+                        ContextBreakdownRow {
+                            label: "System".into(),
+                            tokens: 10_000,
+                            kind: BreakdownRowKind::Inferred,
+                        },
+                        ContextBreakdownRow {
+                            label: "Autocompact buffer".into(),
+                            tokens: 30_000,
+                            kind: BreakdownRowKind::Buffer,
+                        },
+                    ]),
+                };
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+
+            // Open via keyboard from the ring, then Tab onto the first legend row.
+            for _ in 0..120 {
+                if focused_key(&rt).as_deref() == Some("context-usage-ring") {
+                    break;
+                }
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Tab,
+                    mods: Default::default(),
+                });
+                rt.frame(0.0);
+            }
+            assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+
+            assert!(rt.presented("context-details-bar").is_none(), "{width}");
+            let (card, _) = rt.presented("context-details").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5,
+                "{width}: breakdown popover leaves window {card:?}"
+            );
+            let (bar, _) = rt.presented("context-breakdown-bar").unwrap();
+            let segment_keys = [
+                "context-breakdown-segment-messages",
+                "context-breakdown-segment-tool-output",
+                "context-breakdown-segment-system",
+                "context-breakdown-reserve",
+                "context-breakdown-segment-free",
+            ];
+            let width_sum: f32 = segment_keys
+                .iter()
+                .map(|key| rt.presented(key).unwrap().0[2])
+                .sum();
+            assert!(
+                (width_sum - bar[2]).abs() <= 1.0,
+                "{width}: segment sum {width_sum} vs bar {}",
+                bar[2]
+            );
+
+            let elements = rt.elements();
+            let legend_label = |key: &str| {
+                elements
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .and_then(|e| e.label.clone())
+                    .unwrap()
+            };
+            assert!(legend_label("context-breakdown-legend-messages").contains("~40k"));
+            assert!(legend_label("context-breakdown-legend-buffer").contains("30k"));
+            assert!(!legend_label("context-breakdown-legend-buffer").contains("~30k"));
+
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert_eq!(
+                focused_key(&rt).as_deref(),
+                Some("context-breakdown-legend-messages")
+            );
+            assert_eq!(rt.state.current().context.focused_segment, Some(0));
+            let opacity = |rt: &Runtime<State>, key: &str| {
+                rt.presented(key)
+                    .map(|(_, opacity)| opacity)
+                    .unwrap_or_else(|| panic!("missing {key}"))
+            };
+            assert_eq!(opacity(&rt, "context-breakdown-segment-messages"), 1.0);
+            for other in &segment_keys[1..] {
+                let op = opacity(&rt, other);
+                assert!(
+                    (op - 0.35).abs() < 0.01,
+                    "{width}: expected {other} dimmed to 0.35, got {op}"
+                );
+            }
+
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Down,
+                mods: Default::default(),
+            });
+            rt.frame(0.5);
+            assert_eq!(
+                focused_key(&rt).as_deref(),
+                Some("context-breakdown-legend-tool-output")
+            );
+            assert_eq!(opacity(&rt, "context-breakdown-segment-tool-output"), 1.0);
+            assert!((opacity(&rt, "context-breakdown-segment-messages") - 0.35).abs() < 0.01);
+        }
     }
 
     #[test]
@@ -21195,6 +23528,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn approval_options_warnings_and_responding_guards_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({
+                "type":"extension_ui_request","id":"options","method":"confirm",
+                "title":"Allow this command?","message":"Check the requested command.",
+                "approvalOptions":[
+                    {"decision":"decline","label":"Deny"},
+                    {"decision":"accept","label":"Allow once","warning":"This command changes files."},
+                    {"decision":"acceptForSession","label":"Allow for this thread","warning":"Future commands can run."},
+                    {"decision":"cancel","label":"Cancel"}
+                ]
+            }));
+            rt.frame(0.0);
+            for key in ["dialog-confirm", "dialog-decline"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            assert!(rt.find("dialog-session").is_none());
+            let id = rt.state.current().id;
+            press(&mut rt, &format!("approval-more-{id}"));
+            for key in ["dialog-session", "dialog-cancel"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-confirm");
+            assert_eq!(
+                rt.state.current().request.as_ref().unwrap()["id"],
+                "options"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_feedback_and_redirect_composer_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for feedback in [false, true] {
+                let mut rt = runtime(width);
+                rt.state.current_mut().status = Status::Running;
+                rt.state.current_mut().context_window = Some(200_000);
+                rt.state.current_mut().apply(json!({
+                    "type":"extension_ui_request","id":"send-over-approval","method":"confirm",
+                    "title":"Run this command?","message":"Check the requested command.",
+                    "responseCapability":{"type":"live","supportsFeedback":feedback}
+                }));
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("Use the safer command.");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let (rect, _) = rt.presented("send-message").unwrap();
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                press(&mut rt, "send-message");
+                assert!(
+                    rt.state.current().approval_send_pending(),
+                    "{width}: {feedback}"
+                );
+                assert_eq!(rt.state.current().draft.text, "Use the safer command.");
+                assert!(rt.state.current().request.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn command_menu_escape_dismissal_persists_until_trigger_changes_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -22303,7 +24717,7 @@ pub(crate) mod tests {
                 assert!(rt.state.current().error.is_some());
             }
 
-            // 5. Guards: empty prompt, submission_error, pending request, archived, unfocused, repeat, IME composition.
+            // 5. Guards: empty prompt, submission_error, pending question, archived, unfocused, repeat, IME composition.
             {
                 let mut rt = runtime(width);
                 rt.on_key = Some(crate::key);
@@ -22339,7 +24753,7 @@ pub(crate) mod tests {
                 assert_eq!(rt.state.current().draft.text, "Unfocused");
                 rt.state.current_mut().life.archived_at = None;
 
-                // Pending request blocks sendAndNewThread
+                // A pending question blocks sendAndNewThread. Approvals use the redirect transaction.
                 rt.state.current_mut().messages.push(crate::model::Message {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
@@ -22347,7 +24761,7 @@ pub(crate) mod tests {
                     images: vec![],
                     context: None,
                 });
-                rt.state.current_mut().request = Some(json!({"id":"r1","method":"confirm"}));
+                rt.state.current_mut().request = Some(json!({"id":"r1","method":"input"}));
                 rt.key(enter_chord(true));
                 rt.frame(0.0);
                 assert_eq!(rt.state.current().id, id);
@@ -22397,6 +24811,1100 @@ pub(crate) mod tests {
                 assert!(rt.state.current().is_draft());
                 assert!(rt.state.current().draft.focused);
             }
+        }
+    }
+
+    #[test]
+    fn mention_menu_shows_model_and_machine_rows_at_620_and_1280_px() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.peers.push(crate::peer::Peer {
+                server_id: "server-b".into(),
+                host: "127.0.0.1:47329".into(),
+                label: "StudioSol".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": [crate::protocol::THREAD_READ]}),
+                last_reached_at: None,
+                last_error: None,
+            });
+            rt.state.codex_catalog.models = vec![
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6.1-sol".into(),
+                    name: "GPT-6.1 Sol".into(),
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-5.0-sol-legacy".into(),
+                    name: "GPT-5.0 Sol Legacy".into(),
+                    is_legacy: true,
+                    ..Default::default()
+                },
+                crate::session::AgentModel {
+                    provider: "codex".into(),
+                    id: "gpt-6.2-sol-unavail".into(),
+                    name: "GPT-6.2 Sol Unavailable".into(),
+                    is_unavailable: true,
+                    ..Default::default()
+                },
+            ];
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("@sol".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("mention-menu").expect("mention menu");
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                rt.presented("mention-item-0").is_some(),
+                "{width}: machine row"
+            );
+            assert!(
+                rt.presented("mention-item-1").is_some(),
+                "{width}: model row"
+            );
+            // Legacy and unavailable models are hidden, matching KSG.
+            assert!(
+                rt.presented("mention-item-2").is_none(),
+                "{width}: hidden models"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_mention_leaves_thread_host_unchanged_after_insertion_and_send() {
+        let mut rt = runtime(1280.0);
+        rt.state.peers.push(crate::peer::Peer {
+            server_id: "server-b".into(),
+            host: "127.0.0.1:47329".into(),
+            label: "Studio".into(),
+            linked_at: 0,
+            capabilities: json!({"contracts": [crate::protocol::THREAD_READ]}),
+            last_reached_at: None,
+            last_error: None,
+        });
+        let initial_host = rt.state.current().machine.clone();
+        let initial_selected = rt.state.machines.selected.clone();
+        let initial_project = rt.state.current().project;
+        rt.frame(0.0);
+        press(&mut rt, "composer-input");
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("@Studio".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        rt.frame(0.25);
+        assert!(rt.presented("mention-menu").is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+
+        assert_eq!(rt.state.current().machine, initial_host);
+        assert_eq!(rt.state.machines.selected, initial_selected);
+        assert_eq!(rt.state.current().project, initial_project);
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(
+            crate::composer_rich::markdown(&rt.state.current().draft),
+            "[Studio](t3-context://v1/environment/environment_server-b) "
+        );
+
+        rt.state.current_mut().send();
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().machine, initial_host);
+        assert_eq!(rt.state.machines.selected, initial_selected);
+        assert_eq!(rt.state.current().project, initial_project);
+        assert_eq!(rt.state.current().messages.len(), 1);
+        assert!(transcript_context::has_context(
+            &rt.state.current().messages[0]
+        ));
+    }
+
+    #[test]
+    fn composer_notice_stack_attaches_above_composer_and_shows_details_on_overflow() {
+        use crate::composer_notices::{Group, Notice, NoticeAction, Variant};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_action = clicks.clone();
+            rt.state.composer_notices.push(
+                Notice::new("att-long", Variant::Info, "alert", "Attention notice")
+                    .description(Some(
+                        "This description is deliberately very long so that it overflows a single line even on wide composer lanes and triggers the Details popover button across every width under test."
+                            .into(),
+                    ))
+                    .dismiss_label("Dismiss attention notice"),
+            );
+            rt.state.composer_notices.push(
+                Notice::new("env-first", Variant::Warning, "alert", "Studio is offline")
+                    .group(Group::Environment)
+                    .description(Some("This device is offline".into()))
+                    .actions(vec![NoticeAction::new("Retry", move |_| {
+                        clicks_action.fetch_add(1, Ordering::Relaxed);
+                    })]),
+            );
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (stack_rect, _) = rt.presented("composer-notices").expect("notice stack");
+            let (env_rect, _) = rt
+                .presented("composer-notice-env-first")
+                .expect("environment notice");
+            let (att_rect, _) = rt
+                .presented("composer-notice-att-long")
+                .expect("attention notice");
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+
+            // Environment notice precedes Attention notice, consecutive cards touch, and the
+            // last card touches the composer with no gap at the same lane width.
+            assert!(
+                env_rect[1] < att_rect[1],
+                "{width}: env should be above att"
+            );
+            assert!(
+                (att_rect[1] - (env_rect[1] + env_rect[3])).abs() < 0.5,
+                "{width}: gap between notices: env={env_rect:?} att={att_rect:?}"
+            );
+            assert!(
+                (composer_rect[1] - (att_rect[1] + att_rect[3])).abs() < 0.5,
+                "{width}: gap before composer: att={att_rect:?} composer={composer_rect:?}"
+            );
+            assert!(
+                (stack_rect[2] - composer_rect[2]).abs() < 0.5,
+                "{width}: stack width {stack_rect:?} vs composer {composer_rect:?}"
+            );
+
+            // Long description shows Details and opens the details popover; Retry triggers action;
+            // Dismiss hides the attention notice.
+            assert!(
+                rt.presented("composer-notice-details-att-long").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "composer-notice-details-att-long");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-details-popover").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "close-notice-details");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-details-popover").is_none(),
+                "{width}"
+            );
+
+            press(&mut rt, "composer-notice-action-env-first-0");
+            rt.frame(1.0);
+            assert_eq!(clicks.load(Ordering::Relaxed), 1, "{width}");
+
+            press(&mut rt, "composer-notice-dismiss-att-long");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-att-long").is_none(),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn armed_fresh_session_notice_and_transcript_row_render_at_narrow_and_wide_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "u1".into(),
+                role: "You",
+                text: "Old question".into(),
+                images: vec![],
+                context: None,
+            });
+            rt.state.current_mut().status = Status::Completed;
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            assert!(rt.state.current().fresh_session_arm.is_some(), "{width}");
+            assert!(
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .any(|n| n.id == "fresh-session"),
+                "{width}: notices={:?}",
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .map(|n| &n.id)
+                    .collect::<Vec<_>>()
+            );
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-dismiss-fresh-session")
+                    .is_some(),
+                "{width}"
+            );
+
+            // Dismissing the notice disarms the fresh session.
+            press(&mut rt, "composer-notice-dismiss-fresh-session");
+            rt.frame(1.0);
+            assert!(rt.state.current().fresh_session_arm.is_none(), "{width}");
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_none(),
+                "{width}"
+            );
+
+            // Re-arm and send a fresh turn; the fresh-session divider row appears in transcript.
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            rt.state.current_mut().draft.replace_text("Fresh question");
+            rt.state.send();
+            rt.invalidate();
+            rt.frame(0.0);
+            let fresh_msg_id = rt.state.current().messages[1].id.clone();
+            assert!(
+                rt.presented(&format!("fresh-session-row-{fresh_msg_id}"))
+                    .is_some(),
+                "{width}"
+            );
+
+            // Part B: disarm /clear (it's already disarmed after send) and verify the
+            // Compact / Keep toggle appears for a stale Claude session >= 200k tokens.
+            let stale_at = crate::lifecycle::now().saturating_sub(80 * 60_000);
+            {
+                let t = rt.state.current_mut();
+                t.harness = "claude".into();
+                t.model_provider = "claude".into();
+                t.session = Some("11111111-1111-4111-8111-111111111111".into());
+                t.status = Status::Completed;
+                t.context.absorb(&json!({
+                    "contextUsage": {
+                        "tokens": 220_000,
+                        "contextWindow": 1_000_000,
+                        "updatedAt": stale_at
+                    }
+                }));
+            }
+            press(&mut rt, "composer-input");
+            rt.frame(1.0);
+            assert!(rt.presented("composer-compact-send").is_some(), "{width}");
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                tree.contains("Compact 220k tokens of history before sending"),
+                "{width}: {tree}"
+            );
+            assert!(tree.contains("220k"), "{width}: {tree}");
+            press(&mut rt, "composer-compact-send");
+            rt.frame(1.0);
+            assert!(
+                rt.state.keep_full_history(rt.state.current()),
+                "{width}: clicking toggle switches to Keep"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_prompt_suggestion_tab_and_escape_behavior() {
+        let mut rt = runtime(1280.0);
+        rt.state.thread_defaults.prompt_suggestions_enabled = true;
+        {
+            let t = rt.state.current_mut();
+            t.harness = "codex".into();
+            t.status = Status::Completed;
+            t.run_id = Some("run-1".into());
+            t.prompt_suggestion = Some(crate::model::PromptSuggestion {
+                run_id: "run-1".into(),
+                text: "Run cargo test".into(),
+            });
+            t.draft.focused = true;
+        }
+        rt.frame(0.0);
+        rt.frame(1.0);
+        press(&mut rt, "composer-input");
+        rt.frame(1.0);
+
+        // Tab inserts the suggestion as editable text with caret at the end, and does not send.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.text, "Run cargo test");
+        assert_eq!(rt.state.current().draft.focus, "Run cargo test".len());
+        assert_eq!(rt.state.current().draft.anchor, "Run cargo test".len());
+        assert_eq!(rt.state.current().status, Status::Completed);
+        assert!(rt.state.current().messages.is_empty());
+
+        // Tab with the slash menu open keeps the menu's behaviour.
+        rt.state.current_mut().apply(json!({
+            "type": "response",
+            "command": "get_commands",
+            "success": true,
+            "data": {"commands": [{"name": "skill:review", "description": "Review", "source": "skill"}]}
+        }));
+        rt.state.current_mut().draft.replace_text("/skill:");
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.presented("slash-menu").is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.text, "/skill:review ");
+        assert!(rt.find("slash-menu").is_none());
+
+        // Deleting back to empty shows the suggestion again; Escape dismisses only the suggestion
+        // and does not close anything else on that press.
+        rt.state.current_mut().draft.replace_text("");
+        rt.state.open_thread_find();
+        rt.invalidate();
+        rt.frame(1.0);
+        press(&mut rt, "composer-input");
+        rt.frame(1.0);
+        assert_eq!(rt.state.offered_prompt_suggestion(), Some("Run cargo test"));
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.offered_prompt_suggestion(), None);
+        assert!(rt.state.thread_find_active());
+        assert_eq!(focused_key(&rt).as_deref(), Some("composer-input"));
+    }
+
+    #[test]
+    fn composer_prompt_suggestion_layout_at_620_and_1280() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.thread_defaults.prompt_suggestions_enabled = true;
+            let t = rt.state.current_mut();
+            t.harness = "claude".into();
+            t.status = Status::Completed;
+            t.run_id = Some("run-1".into());
+            t.prompt_suggestion = Some(crate::model::PromptSuggestion {
+                run_id: "run-1".into(),
+                text: "Run cargo test".into(),
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+            let (suggestion_rect, _) = rt
+                .presented("composer-suggestion")
+                .expect("composer-suggestion");
+            let (keycap_rect, _) = rt
+                .presented("composer-suggestion-key")
+                .expect("composer-suggestion-key");
+
+            assert!(
+                suggestion_rect[0] >= composer_rect[0]
+                    && suggestion_rect[1] >= composer_rect[1]
+                    && suggestion_rect[0] + suggestion_rect[2]
+                        <= composer_rect[0] + composer_rect[2]
+                    && suggestion_rect[1] + suggestion_rect[3]
+                        <= composer_rect[1] + composer_rect[3],
+                "suggestion outside composer card at {width}"
+            );
+            assert!(
+                keycap_rect[0] >= composer_rect[0]
+                    && keycap_rect[1] >= composer_rect[1]
+                    && keycap_rect[0] + keycap_rect[2] <= composer_rect[0] + composer_rect[2]
+                    && keycap_rect[1] + keycap_rect[3] <= composer_rect[1] + composer_rect[3],
+                "keycap outside composer card at {width}"
+            );
+
+            let elements = rt.elements();
+            assert!(
+                elements
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("Run cargo test")),
+                "suggestion text missing at {width}"
+            );
+            assert!(
+                elements.iter().any(|e| e.text.as_deref() == Some("Tab")),
+                "Tab keycap text missing at {width}"
+            );
+            assert!(
+                !elements.iter().any(|e| {
+                    e.text
+                        .as_deref()
+                        .is_some_and(|t| t.contains("Ask anything"))
+                        || e.label
+                            .as_deref()
+                            .is_some_and(|l| l.contains("Ask anything"))
+                }),
+                "default placeholder still present at {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_limits_notice_shows_windows_above_composer_and_scrolls_when_many_accounts() {
+        use crate::usage_limits::{
+            ServerProviderUsageLimits, ServerProviderUsageWindow, UsageLimitsAccount,
+            UsageLimitsReport, UsageWindowKind,
+        };
+
+        let make_account = |idx: usize| UsageLimitsAccount {
+            id: format!("acc-{idx}"),
+            driver: "codex".into(),
+            label: format!("Codex [acc-{idx}]"),
+            plan: Some("ChatGPT Plus Subscription".into()),
+            email: None,
+            source_label: None,
+            instance_id: Some("codex".into()),
+            reset_credit_input: None,
+            display_name: Some(format!("Account {idx}")),
+            accent_color: None,
+            limits: ServerProviderUsageLimits {
+                checked_at: "2026-01-01T00:00:00.000Z".into(),
+                windows: vec![
+                    ServerProviderUsageWindow {
+                        id: "primary".into(),
+                        kind: UsageWindowKind::Session,
+                        label: "Session".into(),
+                        used_percent: 40.0,
+                        resets_at: Some("2026-01-01T03:00:00.000Z".into()),
+                        window_duration_mins: Some(300),
+                        estimated: None,
+                    },
+                    ServerProviderUsageWindow {
+                        id: "secondary".into(),
+                        kind: UsageWindowKind::Weekly,
+                        label: "Weekly".into(),
+                        used_percent: 75.0,
+                        resets_at: Some("2026-01-05T00:00:00.000Z".into()),
+                        window_duration_mins: Some(10080),
+                        estimated: None,
+                    },
+                ],
+                credential_fingerprint: None,
+                reset_credits: None,
+                external_usage: None,
+                unavailable: None,
+            },
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.show_usage_limits_report(UsageLimitsReport {
+                created_at: "2026-01-01T00:00:00.000Z".into(),
+                accounts: vec![make_account(0)],
+                notices: vec![],
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (notice_rect, _) = rt
+                .presented("composer-notice-usage-limits")
+                .expect("usage-limits notice");
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+            assert!(
+                (composer_rect[1] - (notice_rect[1] + notice_rect[3])).abs() < 0.5,
+                "{width}: notice should sit directly above composer: notice={notice_rect:?} composer={composer_rect:?}"
+            );
+            assert!(rt.presented("usage-limits-account-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-window-0-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-bar-0-0").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-window-0-1").is_some(), "{width}");
+            assert!(rt.presented("usage-limits-bar-0-1").is_some(), "{width}");
+
+            // With many accounts, the body scrolls inside the max-h-[min(24rem,40dvh)] cap.
+            let accounts = (0..12).map(make_account).collect();
+            rt.state.show_usage_limits_report(UsageLimitsReport {
+                created_at: "2026-01-01T00:00:00.000Z".into(),
+                accounts,
+                notices: vec![],
+            });
+            rt.frame(1.0);
+            let (scroll_rect, _) = rt
+                .presented("usage-limits-scroll")
+                .expect("usage-limits scroll container");
+            assert!(
+                scroll_rect[3] <= 384.0_f32.min(720.0 * 0.4) + 1.0,
+                "{width}: scroll height {scroll_rect:?} exceeded KSG max-h cap"
+            );
+            assert!(rt.presented("usage-limits-account-0").is_some(), "{width}");
+            assert!(
+                rt.presented("usage-limits-account-11").is_none(),
+                "{width}: last account should be clipped outside scroll viewport before scrolling"
+            );
+            rt.update(|_, tx| tx.scroll_to_bottom_instant("usage-limits-scroll"));
+            rt.frame(1.0);
+            assert!(
+                rt.presented("usage-limits-account-11").is_some(),
+                "{width}: scrolling to bottom reveals last account"
+            );
+        }
+    }
+
+    #[test]
+    fn cite_inserts_chip_and_record_undoes_both_and_round_trips_through_temp_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-cite-roundtrip-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = runtime(1280.0);
+        rt.state.data_dir = dir.clone();
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "msg-cite-1".into(),
+            role: "Pi",
+            text: "First sentence before the quoted excerpt and more words after it.".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        // Select text inside the assistant message and verify the floating toolbar appears.
+        let body_key = "message-1-0-body-0";
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(body_key);
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(
+            rt.presented("assistant-selection-toolbar").is_some(),
+            "selection toolbar should show on assistant selection: sel={:?}",
+            rt.state.assistant_selection
+        );
+        assert!(rt.presented("assistant-selection-cite").is_some());
+
+        // Press Cite: inserts one chip and one draft record, focuses composer, clears selection and hides toolbar.
+        press(&mut rt, "assistant-selection-cite");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft.focused);
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+        assert!(matches!(
+            &rt.state.current().draft_context[0].data,
+            crate::composer_context::ComposerContextData::Response { citation, item_id, .. }
+                if citation.message_id == "msg-cite-1"
+                    && item_id == "msg-cite-1"
+                    && citation.text == "First sentence before the quoted excerpt and more words after it."
+        ));
+        assert!(rt.selected_text().is_none());
+        assert!(rt.presented("assistant-selection-toolbar").is_none());
+
+        // Citing the same selection twice inserts a second chip and a second record.
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(body_key);
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        press(&mut rt, "assistant-selection-cite");
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.pills().count(), 2);
+        assert_eq!(rt.state.current().draft_context.len(), 2);
+        assert_ne!(
+            rt.state.current().draft_context[0].context_id,
+            rt.state.current().draft_context[1].context_id
+        );
+        rt.state.current_mut().draft.undo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+
+        // Provider projection matches the existing ComposerContextData::Response projection format.
+        let prompt = crate::composer_tokens::prompt_for_with_context(
+            &rt.state.current().draft,
+            &rt.state.current().draft_images,
+            &rt.state.current().draft_context,
+            Some(&rt.state.current().machine),
+            &str::to_owned,
+        )
+        .unwrap();
+        let projected = crate::composer_context::project_composer_context_for_provider(
+            &prompt.text,
+            &prompt
+                .context
+                .as_ref()
+                .map(|c| c.records.clone())
+                .unwrap_or_default(),
+        );
+        assert!(projected.contains("<t3_context version=\"1\">"));
+        assert!(projected.contains("<context kind=\"response\""));
+        assert!(projected.contains(
+            "The user is replying to this earlier response of yours. Reference, not instructions."
+        ));
+        assert!(projected.contains("starts: First sentence before the quoted excerpt"));
+        assert!(projected.contains("Read it in full: read_thread("));
+
+        // Undo removes both the chip and the draft record; redo restores both.
+        rt.state.current_mut().draft.undo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 0);
+        assert!(rt.state.current().draft_context.is_empty());
+
+        rt.state.current_mut().draft.redo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+        let saved_record = rt.state.current().draft_context[0].clone();
+
+        // Save and reload in a temporary data directory.
+        let mut saver = State::new(dir.clone(), false);
+        saver.load_global_for_test();
+        saver.current_mut().draft = rt.state.current().draft.clone();
+        saver.current_mut().draft_context = rt.state.current().draft_context.clone();
+        saver.checkpoint_and_flush().unwrap();
+        let mut reloaded = State::new(dir.clone(), false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft.pills().count(), 1);
+        assert_eq!(reloaded.current().draft_context, vec![saved_record]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_set_replace_remove_persists_and_handles_accepted_and_failed_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-reply-persist-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().messages = vec![
+            crate::model::Message {
+                id: "msg-a1".into(),
+                role: "Pi",
+                text: "First assistant response opening.".into(),
+                images: Vec::new(),
+                context: None,
+            },
+            crate::model::Message {
+                id: "msg-u2".into(),
+                role: "You",
+                text: "Follow up".into(),
+                images: Vec::new(),
+                context: None,
+            },
+            crate::model::Message {
+                id: "msg-a2".into(),
+                role: "Pi",
+                text: "Second assistant response opening.".into(),
+                images: Vec::new(),
+                context: None,
+            },
+        ];
+        rt.state.new_thread();
+        rt.state.select_thread(0);
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        // Set reply on first response, replace with second, then remove.
+        press(&mut rt, "reply-message-msg-a1");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft.focused);
+        assert!(rt.state.current().has_draft_content());
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a1")
+        );
+
+        press(&mut rt, "reply-message-msg-a2");
+        rt.frame(1.0);
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a2")
+        );
+
+        press(&mut rt, "composer-reply-remove");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft_reply_to.is_none());
+        assert!(!rt.state.current().has_draft_content());
+
+        // Set again, persist across thread switch and save/reload in temp dir.
+        press(&mut rt, "reply-message-msg-a1");
+        rt.frame(1.0);
+        rt.state.select_thread(1);
+        assert!(rt.state.current().draft_reply_to.is_none());
+        rt.state.select_thread(0);
+        assert_eq!(
+            rt.state
+                .current()
+                .draft_reply_to
+                .as_ref()
+                .map(|r| r.context_id.as_str()),
+            Some("response_msg-a1")
+        );
+
+        let saved_reply = rt.state.current().draft_reply_to.clone().unwrap();
+        let mut saver = State::new(dir.clone(), false);
+        saver.load_global_for_test();
+        saver.current_mut().draft_reply_to = Some(saved_reply.clone());
+        saver.checkpoint_and_flush().unwrap();
+        let mut reloaded = State::new(dir.clone(), false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft_reply_to, Some(saved_reply.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Local failed send keeps draft_reply_to.
+        {
+            let t = rt.state.current_mut();
+            t.harness = "pi".into();
+            t.model_provider = "direct-disallowed".into();
+        }
+        rt.state.send();
+        assert_eq!(rt.state.current().draft_reply_to, Some(saved_reply.clone()));
+
+        // Remote failed send restores draft_reply_to; remote accepted send clears it.
+        let mut remote_rt = runtime(1280.0);
+        let (client, _local_rx) =
+            crate::client::Client::test_connected(remote_rt.state.data_dir.clone());
+        remote_rt.state.client = Some(client);
+        remote_rt.state.current_mut().draft_reply_to = Some(saved_reply.clone());
+        remote_rt.state.send();
+        let cmd_id = remote_rt.state.current().remote_send.as_ref().unwrap().0;
+        assert!(remote_rt.state.current().draft_reply_to.is_none());
+        assert!(
+            remote_rt
+                .state
+                .current_mut()
+                .finish_remote_send(cmd_id, false)
+        );
+        assert_eq!(
+            remote_rt.state.current().draft_reply_to,
+            Some(saved_reply.clone())
+        );
+        remote_rt.state.send();
+        let cmd_id_ok = remote_rt.state.current().remote_send.as_ref().unwrap().0;
+        assert!(
+            remote_rt
+                .state
+                .current_mut()
+                .finish_remote_send(cmd_id_ok, true)
+        );
+        assert!(remote_rt.state.current().draft_reply_to.is_none());
+
+        // Local accepted send attaches the response reference + context record and clears draft_reply_to.
+        let (pi, commands, _) = crate::backend::Pi::test_connection();
+        {
+            let t = rt.state.current_mut();
+            t.pi = Some(pi);
+            t.model_provider = "cpa".into();
+            t.error = None;
+            t.draft.replace_text("");
+        }
+        rt.state.send();
+        assert!(rt.state.current().draft_reply_to.is_none());
+        let sent_msg = rt.state.current().messages.last().unwrap();
+        assert_eq!(sent_msg.role, "You");
+        assert!(sent_msg.text.starts_with(
+            "[First assistant response opening.](t3-context://v1/response/response_msg-a1)"
+        ));
+        assert!(
+            sent_msg
+                .context
+                .as_ref()
+                .is_some_and(|c| c.records.contains(&saved_reply))
+        );
+        let sent_cmd = commands
+            .try_iter()
+            .find(|cmd| cmd["type"] == "prompt")
+            .expect("prompt command dispatched");
+        assert!(
+            sent_cmd["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("The user is replying to this earlier response of yours.")
+        );
+    }
+
+    #[test]
+    fn reply_banner_and_selection_toolbar_layout_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "msg-layout".into(),
+                role: "Pi",
+                text: "Assistant response text available for selection and reply.".into(),
+                images: Vec::new(),
+                context: None,
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            press(&mut rt, "reply-message-msg-layout");
+            rt.frame(1.0);
+            rt.frame(1.0);
+
+            let (composer_rect, _) = rt.presented("composer").expect("composer");
+            let (banner_rect, _) = rt
+                .presented("composer-reply-banner")
+                .expect("composer-reply-banner");
+            let (remove_rect, _) = rt
+                .presented("composer-reply-remove")
+                .expect("composer-reply-remove");
+            let (input_rect, _) = rt.presented("composer-input").expect("composer-input");
+
+            assert!(
+                banner_rect[0] >= composer_rect[0] - 0.5
+                    && banner_rect[0] + banner_rect[2] <= composer_rect[0] + composer_rect[2] + 0.5
+                    && banner_rect[1] >= composer_rect[1] - 0.5,
+                "{width}: banner inside composer: banner={banner_rect:?} composer={composer_rect:?}"
+            );
+            assert!(
+                banner_rect[1] + banner_rect[3] <= input_rect[1] + 0.5,
+                "{width}: banner above composer text: banner={banner_rect:?} input={input_rect:?}"
+            );
+            assert!(
+                remove_rect[0] + remove_rect[2] <= banner_rect[0] + banner_rect[2] + 0.5
+                    && (remove_rect[2] - 20.0).abs() < 0.5
+                    && (remove_rect[3] - 20.0).abs() < 0.5,
+                "{width}: remove button at right of banner: remove={remove_rect:?} banner={banner_rect:?}"
+            );
+
+            // Now select text on the assistant message and verify the selection toolbar fits.
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text("message-1-0-body-0");
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let (toolbar_rect, _) = rt
+                .presented("assistant-selection-toolbar")
+                .expect("assistant-selection-toolbar");
+            assert!(
+                rt.presented("assistant-selection-cite").is_some(),
+                "{width}: cite button"
+            );
+            assert!(
+                toolbar_rect[0] >= 0.0 && toolbar_rect[0] + toolbar_rect[2] <= width + 1.0,
+                "{width}: toolbar fits width: {toolbar_rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_controls_hidden_for_non_git_messages_and_missing_capability() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.focused = true;
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+
+        // 1. Non-git project: controls hidden.
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: false,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: Vec::new(),
+            },
+        );
+        rt.frame(0.0);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        // 2. Git repo with 0 messages: env-mode-trigger shown; selecting Worktree shows base-branch-trigger.
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![
+                    crate::vcs::VcsRef {
+                        name: "feature/a".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: true,
+                        is_default: false,
+                        worktree_path: None,
+                    },
+                    crate::vcs::VcsRef {
+                        name: "main".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: false,
+                        is_default: true,
+                        worktree_path: None,
+                    },
+                ],
+            },
+        );
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("env-mode-trigger").is_some());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        press(&mut rt, "env-mode-trigger");
+        assert!(rt.presented("env-mode-picker").is_some());
+        press(&mut rt, "env-mode-option-worktree");
+        assert_eq!(
+            rt.state.current().env_mode,
+            Some(crate::model::ThreadEnvMode::Worktree)
+        );
+        assert_eq!(rt.state.current().base_branch.as_deref(), Some("main"));
+        assert!(rt.presented("base-branch-trigger").is_some());
+
+        press(&mut rt, "base-branch-trigger");
+        assert!(rt.presented("base-branch-picker").is_some());
+        assert!(rt.presented("base-branch-search").is_some());
+        assert!(rt.presented("base-branch-option-main").is_some());
+        assert!(rt.presented("base-branch-option-feature/a").is_some());
+        press(&mut rt, "base-branch-option-feature/a");
+        assert_eq!(rt.state.current().base_branch.as_deref(), Some("feature/a"));
+
+        // 3. Thread with messages (in local mode): controls hidden.
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Local);
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Hello".into(),
+            images: vec![],
+            context: None,
+        });
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
+
+        // 4. Machine without vcs-worktrees-v1 capability: controls hidden.
+        rt.state.current_mut().messages.clear();
+        let (client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": ["fresh-context"]});
+        rt.state.client = Some(client);
+        rt.invalidate();
+        rt.frame(0.75);
+        assert!(rt.presented("env-mode-trigger").is_none());
+        assert!(rt.presented("base-branch-trigger").is_none());
+    }
+
+    #[test]
+    fn worktree_toolbar_and_setup_card_layout_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.current_mut().draft.focused = true;
+            let project_path = rt
+                .state
+                .project(rt.state.current().project)
+                .unwrap()
+                .path
+                .to_string_lossy()
+                .into_owned();
+            rt.state.vcs_branches.insert(
+                ("local".into(), project_path),
+                crate::model::VcsBranchCacheEntry {
+                    is_repo: true,
+                    loaded: true,
+                    loading: false,
+                    error: None,
+                    refs: vec![crate::vcs::VcsRef {
+                        name: "main".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: true,
+                        is_default: true,
+                        worktree_path: None,
+                    }],
+                },
+            );
+            rt.state.current_mut().env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+            rt.state.current_mut().base_branch = Some("main".into());
+            rt.state.current_mut().worktree_setup = Some(crate::model::WorktreeSetupState {
+                phase: crate::model::WorktreeSetupPhase::Failed,
+                script_name: Some("Setup".into()),
+                script_command: Some("npm ci".into()),
+                error: Some("Setup script exited with code 1.".into()),
+                output: "line 1\nline 2\nline 3\nline 4".into(),
+                exit_code: Some(1),
+                timed_out: false,
+                duration_ms: 420,
+                skipped: false,
+            });
+            rt.state.current_mut().worktree_setup_output_open = true;
+            rt.frame(0.0);
+            rt.frame(0.25);
+
+            let (footer_rect, _) = rt
+                .presented("composer-footer")
+                .unwrap_or_else(|| panic!("{width}: composer-footer"));
+            for key in ["env-mode-trigger", "base-branch-trigger"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= footer_rect[0] - 0.5
+                        && rect[0] + rect[2] <= footer_rect[0] + footer_rect[2] + 0.5
+                        && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {key} overflowed footer: rect={rect:?} footer={footer_rect:?}"
+                );
+            }
+
+            let (lane_rect, _) = rt
+                .presented("chat-lane")
+                .unwrap_or_else(|| panic!("{width}: chat-lane"));
+            let (card_rect, _) = rt
+                .presented("worktree-setup-card")
+                .unwrap_or_else(|| panic!("{width}: worktree-setup-card"));
+            assert!(
+                card_rect[0] >= lane_rect[0] - 0.5
+                    && card_rect[0] + card_rect[2] <= lane_rect[0] + lane_rect[2] + 0.5,
+                "{width}: setup card outside conversation lane: card={card_rect:?} lane={lane_rect:?}"
+            );
+            for key in [
+                "worktree-setup-retry",
+                "worktree-setup-skip",
+                "worktree-setup-output",
+                "worktree-setup-output-tail",
+            ] {
+                assert!(rt.presented(key).is_some(), "{width}: missing {key}");
+            }
+            press(&mut rt, "worktree-setup-output");
+            assert!(
+                !rt.state.current().worktree_setup_output_open,
+                "{width}: toggle should flip state"
+            );
+            rt.frame(0.5);
+            assert!(
+                rt.presented("worktree-setup-output-tail").is_none(),
+                "{width}: output should collapse"
+            );
         }
     }
 }

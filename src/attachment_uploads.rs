@@ -232,6 +232,7 @@ fn connection(state: &State, machine: &str) -> (Capability, bool, Option<Link>) 
             return None;
         }
         Some(Link {
+            enabled: true,
             server_id: discovery.server_id,
             host: format!("127.0.0.1:{}", discovery.port),
             device_id: saved["deviceId"].as_str()?.into(),
@@ -1895,6 +1896,7 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (mut client, _commands) = crate::client::Client::test_connected(state.data_dir.clone());
         let link = Link {
+            enabled: true,
             server_id: uuid::Uuid::new_v4().to_string(),
             host: "127.0.0.1:1".into(),
             device_id: uuid::Uuid::new_v4().to_string(),
