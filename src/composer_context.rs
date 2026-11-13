@@ -1571,6 +1571,16 @@ fn format_composer_context_provider_payload(
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(format!("starts: {starts}"));
+            // KSG's `assistantCitationsToPlainText`: the optional comment is
+            // user-authored text about the quote, distinct from the quote.
+            if let Some(comment) = citation
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                lines.push(format!("Comment: {comment}"));
+            }
             let read_args = serde_json::json!({
                 "threadId": citation.thread_id,
                 "itemId": item_id
@@ -3292,5 +3302,60 @@ mod tests {
             )),
             "{projected}"
         );
+    }
+
+    #[test]
+    fn response_projection_distinguishes_the_comment_from_the_quote() {
+        // KSG's `assistantCitationsToPlainText`: the trimmed comment follows the
+        // quote as `Comment: ...`; none (or a blank one) omits the line.
+        let citation = AssistantCitation {
+            version: 1,
+            environment_id: "local".into(),
+            thread_id: "1".into(),
+            message_id: "m1".into(),
+            text: "quoted   excerpt".into(),
+            comment: Some("  this part matters  ".into()),
+            start: 0,
+            end: 15,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let record = ComposerContextRecord {
+            version: 1,
+            context_id: "ctx_r".into(),
+            label: "quoted excerpt".into(),
+            data: ComposerContextData::Response {
+                citation: citation.clone(),
+                item_id: "m1".into(),
+                subagents: None,
+            },
+        };
+        let href = format_composer_context_href("response", "ctx_r");
+        let projected = project_composer_context_for_provider(
+            &format!("check [q]({href})"),
+            std::slice::from_ref(&record),
+        );
+        assert!(projected.contains("starts: quoted excerpt"), "{projected}");
+        assert!(
+            projected.contains("Comment: this part matters"),
+            "{projected}"
+        );
+
+        for comment in [None, Some("   ".to_owned())] {
+            let bare = ComposerContextRecord {
+                data: ComposerContextData::Response {
+                    citation: AssistantCitation {
+                        comment,
+                        ..citation.clone()
+                    },
+                    item_id: "m1".into(),
+                    subagents: None,
+                },
+                ..record.clone()
+            };
+            let projected =
+                project_composer_context_for_provider(&format!("check [q]({href})"), &[bare]);
+            assert!(!projected.contains("Comment:"), "{projected}");
+        }
     }
 }

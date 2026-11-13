@@ -284,12 +284,13 @@ pub(crate) fn tick(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(reason) = restore {
         s.restore_composer_focus(reason);
     }
+    let comment_changed = super::citation_comment::settle(s);
     let transition = s.composer_ui.transition.get();
     let active = transition.duration > 0.0 && now < transition.start + transition.duration + 0.050;
     if active {
         tx.wake_after(std::time::Duration::from_millis(16));
     }
-    active || restore.is_some()
+    active || restore.is_some() || comment_changed
 }
 
 /// Keep the expanded form mounted while Tab moves among its controls. Rune routes a field's

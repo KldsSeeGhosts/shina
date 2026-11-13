@@ -25,6 +25,8 @@ mod attachment_table_preview;
 mod attachment_text_preview;
 #[path = "captain_ui.rs"]
 mod captain_ui;
+#[path = "citation_comment.rs"]
+pub(crate) mod citation_comment;
 #[path = "composer_menu.rs"]
 pub(crate) mod composer_menu;
 #[path = "composer_press.rs"]
@@ -1026,6 +1028,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if context_popover_shown && let Some(notice) = s.composer_notices.open_details_notice() {
         root = root.child(composer_notice_details_popover(notice, p));
     }
+    // Citation chips get a comment action pinned over each pill's right end,
+    // mounted at the root like the other composer overlays so nothing clips it.
+    // The collapsed preview shares the field's key, so check it is not showing.
+    if context_popover_shown && cx.layout_with("composer-preview", |_| ()).is_none() {
+        for action in citation_comment::chip_actions(s, p, cx, zoom) {
+            root = root.child(action);
+        }
+    }
     if brief && narrow {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
@@ -1094,6 +1104,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if composer_stash::menu_open(s) {
         // KSG's drawer portal, mounted beside the other composer popovers.
         root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+    }
+    if let Some(popover) = citation_comment::popover(s, p) {
+        root = root.child(popover);
     }
     if s.machines.dialog {
         root = root.child(machine_dialog(s, p));
@@ -26189,9 +26202,14 @@ pub(crate) mod tests {
         );
         assert!(rt.presented("assistant-selection-cite").is_some());
 
-        // Press Cite: inserts one chip and one draft record, focuses composer, clears selection and hides toolbar.
+        // Press Cite: inserts one chip and one draft record, opens the comment
+        // editor (KSG auto-opens it on cite), clears selection and hides toolbar.
         press(&mut rt, "assistant-selection-cite");
         rt.frame(1.0);
+        assert!(rt.presented("citation-comment-popover").is_some());
+        press(&mut rt, "citation-comment-save");
+        rt.frame(1.0);
+        assert!(rt.presented("citation-comment-popover").is_none());
         assert!(rt.state.current().draft.focused);
         assert_eq!(rt.state.current().draft.pills().count(), 1);
         assert_eq!(rt.state.current().draft_context.len(), 1);
@@ -26216,6 +26234,10 @@ pub(crate) mod tests {
         rt.frame(1.0);
         assert_eq!(rt.state.current().draft.pills().count(), 2);
         assert_eq!(rt.state.current().draft_context.len(), 2);
+        // The editor re-opens for the second chip; close it without a comment.
+        press(&mut rt, "citation-comment-save");
+        rt.frame(1.0);
+        assert!(rt.presented("citation-comment-popover").is_none());
         assert_ne!(
             rt.state.current().draft_context[0].context_id,
             rt.state.current().draft_context[1].context_id
@@ -26273,6 +26295,116 @@ pub(crate) mod tests {
         assert_eq!(reloaded.current().draft.pills().count(), 1);
         assert_eq!(reloaded.current().draft_context, vec![saved_record]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn citation_comment_popover_saves_escapes_and_stays_in_window() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // A newline keeps the composer expanded below the sm breakpoint.
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("A prompt line\nwith a second line");
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "msg-cite-c".into(),
+                role: "Pi",
+                text: "the quoted passage".into(),
+                images: Vec::new(),
+                context: None,
+            });
+            let citation = crate::assistant_citation::build_assistant_citation(
+                "local",
+                &rt.state.current().id.to_string(),
+                "msg-cite-c",
+                "the quoted passage",
+                0,
+                18,
+            )
+            .unwrap();
+            let record =
+                crate::assistant_citation::citation_context_record(citation, "msg-cite-c", None);
+            let context_id = record.context_id.clone();
+            rt.state.current_mut().insert_context_chip(record);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.25);
+            assert!(
+                rt.presented(&format!("citation-comment-{context_id}"))
+                    .is_some(),
+                "{width}"
+            );
+
+            // The chip's comment action opens the popover, anchored inside the window.
+            press(&mut rt, &format!("citation-comment-{context_id}"));
+            let (rect, _) = rt
+                .presented("citation-comment-popover")
+                .unwrap_or_else(|| panic!("{width}"));
+            assert!(
+                rect[0] >= -1.0 && rect[0] + rect[2] <= width + 1.0,
+                "{width}: {rect:?}"
+            );
+            assert!(
+                rect[1] >= -1.0 && rect[1] + rect[3] <= 720.0 + 1.0,
+                "{width}: {rect:?}"
+            );
+
+            // Type a comment and press Enter: it commits to the record and closes.
+            rt.update(|s, _| {
+                s.citation_comment
+                    .as_mut()
+                    .unwrap()
+                    .draft
+                    .insert("why this")
+            });
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+            assert!(
+                rt.presented("citation-comment-popover").is_none(),
+                "{width}"
+            );
+            let comment = |t: &Thread| {
+                t.draft_context
+                    .iter()
+                    .find(|r| r.context_id == context_id)
+                    .and_then(|r| match &r.data {
+                        crate::composer_context::ComposerContextData::Response {
+                            citation, ..
+                        } => citation.comment.clone(),
+                        _ => None,
+                    })
+            };
+            assert_eq!(
+                comment(rt.state.current()).as_deref(),
+                Some("why this"),
+                "{width}"
+            );
+
+            // Reopen, type more and Escape: the saved comment is unchanged.
+            press(&mut rt, &format!("citation-comment-{context_id}"));
+            assert!(
+                rt.presented("citation-comment-popover").is_some(),
+                "{width}"
+            );
+            rt.update(|s, _| s.citation_comment.as_mut().unwrap().draft.insert(" more"));
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+            assert!(
+                rt.presented("citation-comment-popover").is_none(),
+                "{width}"
+            );
+            assert_eq!(
+                comment(rt.state.current()).as_deref(),
+                Some("why this"),
+                "{width}"
+            );
+        }
     }
 
     #[test]
