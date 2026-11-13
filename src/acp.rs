@@ -94,7 +94,10 @@ struct Pending {
 struct Permission {
     id: Value,
     allow: Option<String>,
+    session: Option<String>,
     reject: Option<String>,
+    offered: Option<Vec<crate::approval::OptionItem>>,
+    question: Option<Value>,
 }
 
 /// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
@@ -540,12 +543,55 @@ impl Client {
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
             if let Some(permission) = self.permissions.remove(key) {
-                let option = if record["cancelled"] == true {
-                    None
-                } else if record["confirmed"] == true {
-                    permission.allow
+                if let Some(question) = &permission.question {
+                    let supplied: Value = record["value"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(Value::Null);
+                    let answer = &supplied[question["id"].as_str().unwrap_or("")];
+                    let answer = answer.as_str().or_else(|| {
+                        answer
+                            .as_array()
+                            .filter(|a| a.len() == 1)?
+                            .first()?
+                            .as_str()
+                    });
+                    let options = question["options"].as_array().expect("validated");
+                    let option = if record["cancelled"] == true {
+                        None
+                    } else {
+                        answer.and_then(|answer| {
+                            options
+                                .iter()
+                                .find(|o| o["value"] == answer)
+                                .or_else(|| {
+                                    let matching: Vec<_> =
+                                        options.iter().filter(|o| o["label"] == answer).collect();
+                                    (matching.len() == 1).then(|| matching[0])
+                                })
+                                .and_then(|o| o["value"].as_str())
+                                .map(str::to_owned)
+                        })
+                    };
+                    self.wire.push(permission_response(permission.id, option));
+                    return Ok(());
+                }
+                let decision = crate::approval::decision(&record)?;
+                let decision = if decision == "acceptForSession"
+                    && permission
+                        .offered
+                        .as_ref()
+                        .is_some_and(|options| !options.iter().any(|o| o.decision == decision))
+                {
+                    "accept"
                 } else {
-                    permission.reject
+                    decision
+                };
+                let option = match decision {
+                    "accept" => permission.allow,
+                    "acceptForSession" => permission.session.or(permission.allow),
+                    "decline" => permission.reject,
+                    _ => None,
                 };
                 self.wire.push(permission_response(permission.id, option));
             }
@@ -837,19 +883,34 @@ impl Client {
         let options = params["options"]
             .as_array()
             .ok_or("ACP permission request has no options.")?;
+        let interaction = self.start.id.contains("antigravity")
+            && params["toolCall"]["toolCallId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("interaction_"));
+        let question = interaction.then(|| antigravity_question(params)).flatten();
+        if interaction && question.is_none() {
+            self.wire
+                .push(permission_response(record["id"].clone(), None));
+            return Ok(());
+        }
         let option = |kinds: &[&str]| -> Option<String> {
             kinds.iter().find_map(|kind| {
                 options
                     .iter()
                     .find(|o| o["kind"] == *kind)
                     .and_then(|o| o["optionId"].as_str())
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
                     .map(str::to_owned)
             })
         };
         let permission = Permission {
             id: record["id"].clone(),
-            allow: option(&["allow_once", "allow_always"]),
-            reject: option(&["reject_once", "reject_always"]),
+            allow: option(&["allow_once"]),
+            session: option(&["allow_always"]),
+            reject: option(&["reject_once"]),
+            offered: acp_approval_options(&self.start.id, params),
+            question,
         };
         let tool = &params["toolCall"];
         let access = self
@@ -858,16 +919,17 @@ impl Client {
             .as_ref()
             .map(|h| h.access_mode.as_str())
             .unwrap_or("");
-        let auto = access == "full-access"
+        let auto = (access == "full-access"
             || matches!(tool["kind"].as_str(), Some("read" | "search"))
-            || access == "auto-accept-edits" && tool["kind"] == "edit";
-        if auto || self.cancelling {
+            || access == "auto-accept-edits" && tool["kind"] == "edit")
+            && (!self.start.id.contains("kiro") || permission.allow.is_some());
+        if auto && !interaction || self.cancelling {
             self.wire.push(permission_response(
                 permission.id,
                 if self.cancelling {
                     None
                 } else {
-                    permission.allow
+                    permission.allow.or(permission.session)
                 },
             ));
         } else if self.permissions.len() >= 32 {
@@ -875,10 +937,18 @@ impl Client {
         } else {
             self.serial += 1;
             let key = format!("acp-permission-{}", self.serial);
-            self.events.push(json!({"type":"extension_ui_request","id":key,"method":"confirm",
+            let mut event = json!({"type":"extension_ui_request","id":key,"method":"confirm",
                 "title":params["title"].as_str().or_else(||tool["title"].as_str()).unwrap_or("Allow ACP tool?"),
                 "message":format!("{}\n{}",params["description"].as_str().unwrap_or(""),tool["rawInput"]),
-            }));
+            });
+            if let Some(question) = &permission.question {
+                event = json!({"type":"extension_ui_request","id":key,"method":"input",
+                    "title":"Question","questions":[question],"responseCapability":{"type":"live"}});
+            }
+            if let Some(options) = &permission.offered {
+                event["approvalOptions"] = json!(options);
+            }
+            self.events.push(event);
             self.permissions.insert(key, permission);
         }
         Ok(())
@@ -1084,6 +1154,138 @@ impl Client {
             }
         }
     }
+}
+
+/// KSG AntigravityProtocol, provider-kiro/acpSupport, provider-grok/acpSupport.
+fn acp_approval_options(
+    provider: &str,
+    params: &Value,
+) -> Option<Vec<crate::approval::OptionItem>> {
+    let options = params["options"].as_array()?;
+    let find = |kind: &str| {
+        options.iter().find(|o| {
+            o["kind"] == kind
+                && o["optionId"]
+                    .as_str()
+                    .is_some_and(|id| !id.trim().is_empty())
+        })
+    };
+    let option = |decision: &str, label: &str| crate::approval::OptionItem {
+        decision: decision.into(),
+        label: label.into(),
+        warning: None,
+    };
+    if provider.contains("antigravity") {
+        if params["toolCall"]["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("interaction_"))
+        {
+            return Some(vec![]);
+        }
+        let mut result = vec![];
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Allow once"));
+        }
+        if let Some(always) = find("allow_always") {
+            let warning = &always["_meta"]["agy.security.warning"];
+            let text = warning["message"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    warning["title"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
+            let mut entry = option("acceptForSession", "Allow for this thread");
+            entry.warning = text.map(|s| {
+                if s.encode_utf16().count() > 512 {
+                    format!(
+                        "{}...",
+                        String::from_utf16_lossy(&s.encode_utf16().take(509).collect::<Vec<_>>())
+                    )
+                } else {
+                    s.to_owned()
+                }
+            });
+            result.push(entry);
+        }
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Deny"));
+        }
+        result.push(option("cancel", "Cancel"));
+        Some(result)
+    } else if provider.contains("kiro") {
+        let mut result = vec![];
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Allow once"));
+        } else if find("allow_always").is_some() {
+            result.push(option("acceptForSession", "Always allow"));
+        }
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Deny"));
+        }
+        result.push(option("cancel", "Cancel"));
+        Some(result)
+    } else if provider.contains("grok") {
+        let mut result = vec![option("cancel", "Cancel")];
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Decline"));
+        }
+        if options.iter().any(|o| {
+            o["kind"] == "allow_always"
+                && o["optionId"]
+                    .as_str()
+                    .is_some_and(|id| id.trim() == "allow-edits-session")
+        }) {
+            result.push(option("acceptForSession", "Allow all edits this session"));
+        }
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Approve"));
+        }
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// KSG AntigravityProtocol.extractAntigravityUserInputQuestion.
+fn antigravity_question(params: &Value) -> Option<Value> {
+    fn bounded(text: &str, limit: usize) -> String {
+        if text.encode_utf16().count() <= limit {
+            return text.to_owned();
+        }
+        format!(
+            "{}...",
+            String::from_utf16_lossy(&text.encode_utf16().take(limit - 3).collect::<Vec<_>>())
+        )
+    }
+    let options = params["options"].as_array().filter(|a| !a.is_empty())?;
+    let mut seen = std::collections::HashSet::new();
+    let options = options
+        .iter()
+        .map(|o| {
+            let id = o["optionId"].as_str().filter(|id| !id.trim().is_empty())?;
+            if !seen.insert(id) {
+                return None;
+            }
+            let label = bounded(
+                o["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id),
+                512,
+            );
+            Some(json!({"value":id,"label":label,"description":label}))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        json!({"id":params["toolCall"]["toolCallId"],"header":"Question",
+        "question":bounded(params["toolCall"]["title"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Choose an option."),8_000),
+        "multiSelect":false,"allowCustomAnswer":false,"options":options}),
+    )
 }
 
 fn permission_response(id: Value, option: Option<String>) -> Value {

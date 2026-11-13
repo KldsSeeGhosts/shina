@@ -1,7 +1,13 @@
 //! KSG provider-pi/userInput.ts and ComposerPendingUserInputPanel behavior.
-//! RPIV uses sequential select/input RPCs. Collect answers before replying to the first RPC,
-//! then answer only the exact remaining dialogs from that same live tool call.
+//! RPIV uses one select/input RPC per question. Preserve that native response boundary.
 use serde_json::{Value, json};
+
+#[cfg(test)]
+#[path = "question_attachment_contract_tests.rs"]
+mod attachment_contract_tests;
+#[cfg(test)]
+#[path = "questionnaire_contract_tests.rs"]
+mod contract_tests;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OptionItem {
@@ -16,6 +22,12 @@ pub struct Question {
     pub header: String,
     pub text: String,
     pub multi: bool,
+    #[serde(default = "yes")]
+    pub allow_custom: bool,
+    #[serde(default)]
+    pub initial_answer: Option<String>,
+    #[serde(default = "yes")]
+    pub required: bool,
     pub options: Vec<OptionItem>,
 }
 
@@ -23,6 +35,12 @@ pub struct Question {
 pub struct Answer {
     pub selected: Vec<String>,
     pub other: String,
+    #[serde(default)]
+    pub attachment_count: usize,
+    #[serde(default)]
+    pub attachments_blocked: bool,
+    #[serde(default)]
+    pub touched: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -30,46 +48,50 @@ pub struct Questionnaire {
     pub questions: Vec<Question>,
     pub answers: Vec<Answer>,
     pub index: usize,
-    rpc: Option<(String, Vec<String>)>,
+    #[serde(default)]
+    direct: bool,
+    #[serde(default = "live")]
+    pub capability: String,
+    #[serde(default)]
+    pub response_mode: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+fn live() -> String {
+    "live".into()
 }
 
 fn text(value: &Value, field: &str) -> Option<String> {
     let text = value[field].as_str()?.trim();
-    (!text.is_empty() && text.len() <= 32_768).then(|| text.to_owned())
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn questions(value: &Value) -> Option<Vec<Question>> {
     let values = value["questions"].as_array()?;
-    if values.is_empty() || values.len() > 32 {
+    if values.is_empty() {
         return None;
     }
-    let mut seen = std::collections::HashSet::new();
     values
         .iter()
         .enumerate()
         .map(|(i, q)| {
             let id = text(q, "id").unwrap_or_else(|| format!("question-{i}"));
-            if !seen.insert(id.clone()) {
-                return None;
-            }
             let options = q["options"].as_array()?;
-            if options.len() > 64 {
-                return None;
-            }
-            let mut seen = std::collections::HashSet::new();
             let options = options
                 .iter()
                 .map(|option| {
                     let label =
                         text(option, "label").or_else(|| option.as_str().map(str::to_owned))?;
-                    let value = text(option, "value").unwrap_or_else(|| label.clone());
-                    if !seen.insert(value.clone()) {
-                        return None;
-                    }
+                    let value = option["value"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| label.trim().to_owned());
                     Some(OptionItem {
                         label,
                         value,
-                        description: text(option, "description").unwrap_or_default(),
+                        description: option["description"].as_str().unwrap_or("").to_owned(),
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -78,6 +100,9 @@ fn questions(value: &Value) -> Option<Vec<Question>> {
                 header: text(q, "header").unwrap_or_else(|| "Question".into()),
                 text: text(q, "question")?,
                 multi: q["multiSelect"] == true,
+                allow_custom: q["allowCustomAnswer"] != false,
+                initial_answer: q["initialAnswer"].as_str().map(str::to_owned),
+                required: q["required"] != false,
                 options,
             })
         })
@@ -100,17 +125,114 @@ pub fn signature(request: &Value) -> String {
 impl Questionnaire {
     pub fn parse(request: &Value) -> Option<Self> {
         let questions = questions(request)?;
-        let answers = vec![Answer::default(); questions.len()];
+        let mut drafts = std::collections::HashMap::new();
+        let answers = questions
+            .iter()
+            .map(|q| {
+                drafts
+                    .entry(q.id.clone())
+                    .or_insert_with(|| Answer {
+                        other: if q.allow_custom {
+                            q.initial_answer.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
+                        ..Default::default()
+                    })
+                    .clone()
+            })
+            .collect();
         Some(Self {
             questions,
             answers,
             index: 0,
-            rpc: None,
+            direct: false,
+            capability: request["responseCapability"]["type"]
+                .as_str()
+                .unwrap_or("live")
+                .into(),
+            response_mode: request["responseMode"].as_str().map(str::to_owned),
         })
     }
 
+    /// KSG provider-pi adapter's piQuestion and piUiResponse.
+    pub fn pi(request: &Value) -> Option<Self> {
+        let method = request["method"].as_str()?;
+        if !matches!(method, "select" | "input" | "editor") {
+            return None;
+        }
+        let title = request["title"].as_str().unwrap_or("Question");
+        let detail = ["message", "placeholder"]
+            .into_iter()
+            .find_map(|k| request[k].as_str().filter(|s| !s.trim().is_empty()));
+        let options = if method == "select" {
+            request["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|v| {
+                    json!({"label":if v.is_empty() {"Empty value"} else {v},
+                    "description":if v.is_empty() {"Empty value"} else {v},"value":v})
+                })
+                .collect()
+        } else if method == "input" {
+            vec![
+                json!({"label":"Submit empty value","description":"Send an empty string to the extension.","value":""}),
+            ]
+        } else {
+            vec![]
+        };
+        let mut q = json!({"id":request["id"].as_str().unwrap_or("question"),
+            "header":if detail.is_some() {title} else {"Question"},
+            "question":detail.unwrap_or(title),"options":options});
+        if method == "editor" {
+            q["initialAnswer"] = json!(request["prefill"].as_str().unwrap_or(""));
+        }
+        let mut form = Self::parse(
+            &json!({"questions":[q],"responseCapability":request["responseCapability"]}),
+        )?;
+        form.direct = true;
+        Some(form)
+    }
+
+    pub fn can_respond(&self) -> bool {
+        matches!(self.capability.as_str(), "live" | "message")
+    }
+
+    pub fn edit(&mut self, value: String) {
+        let q = &self.questions[self.index];
+        if !q.allow_custom {
+            return;
+        }
+        let answer = &mut self.answers[self.index];
+        if q.initial_answer.is_some() || !value.trim().is_empty() {
+            answer.selected.clear();
+        }
+        answer.other = value;
+        answer.touched = true;
+        self.share_answer();
+    }
+
+    pub fn edit_at(&mut self, at: usize, value: String) {
+        let previous = self.index;
+        self.index = at;
+        self.edit(value);
+        self.index = previous;
+    }
+
+    fn share_answer(&mut self) {
+        let id = &self.questions[self.index].id;
+        let answer = self.answers[self.index].clone();
+        for (question, draft) in self.questions.iter().zip(&mut self.answers) {
+            if question.id == *id {
+                *draft = answer.clone();
+            }
+        }
+    }
+
     /// Match every title and serialized option exactly, as KSG's piQuestionnaireQuestion does.
-    pub fn rpiv(request: &Value, tool_id: &str, params: &Value) -> Option<Self> {
+    pub fn rpiv(request: &Value, _tool_id: &str, params: &Value) -> Option<Self> {
         let mut questions = questions(params)?;
         let raw = params["questions"].as_array()?;
         let mut signatures = Vec::new();
@@ -178,12 +300,27 @@ impl Questionnaire {
         // Earlier questions have already been answered through RPC.
         questions.drain(..at);
         signatures.drain(..at);
+        questions.truncate(1);
+        signatures.truncate(1);
+        if raw[at]["header"]
+            .as_str()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            questions[0].header = if questions[0].multi {
+                "Select options"
+            } else {
+                "Select an option"
+            }
+            .into();
+        }
         let answers = vec![Answer::default(); questions.len()];
         Some(Self {
             questions,
             answers,
             index: 0,
-            rpc: Some((tool_id.into(), signatures)),
+            direct: true,
+            capability: live(),
+            response_mode: None,
         })
     }
 
@@ -203,6 +340,7 @@ impl Questionnaire {
         } else {
             answer.selected = vec![option.value.clone()];
         }
+        self.share_answer();
         true
     }
 
@@ -227,18 +365,32 @@ impl Questionnaire {
     pub fn answer(&self, at: usize) -> Option<Value> {
         let q = &self.questions[at];
         let answer = &self.answers[at];
-        if !answer.other.trim().is_empty() {
-            return Some(json!(answer.other.trim()));
+        if answer.attachments_blocked {
+            return None;
         }
-        // Option order, not click order.
-        let selected: Vec<_> = q
-            .options
-            .iter()
-            .filter(|o| answer.selected.contains(&o.value))
-            .map(|o| o.value.clone())
-            .collect();
+        let custom = q
+            .allow_custom
+            .then(|| {
+                if q.initial_answer.is_some() {
+                    answer.other.as_str()
+                } else {
+                    answer.other.trim()
+                }
+            })
+            .filter(|s| q.initial_answer.is_some() || !s.is_empty());
+        if let Some(custom) = custom.filter(|s| !s.is_empty()) {
+            return Some(json!(custom));
+        }
+        let mut selected = Vec::new();
+        for value in &answer.selected {
+            if q.options.iter().any(|o| o.value == *value) && !selected.contains(value) {
+                selected.push(value.clone());
+            }
+        }
         if selected.is_empty() {
-            None
+            custom
+                .map(|value| json!(value))
+                .or_else(|| (q.allow_custom && answer.attachment_count > 0).then(|| json!("")))
         } else if q.multi {
             Some(json!(selected))
         } else {
@@ -251,49 +403,39 @@ impl Questionnaire {
     }
 
     pub fn response(&self) -> Option<Value> {
-        if !self.complete() {
+        if !self.can_respond() || !self.complete() {
             return None;
         }
-        if self.rpc.is_some() {
-            return Some(json!({"value": self.rpc_value(0)?}));
-        }
-        let answers = self
-            .questions
+        self.response_with_answers(&self.resolved_answers()?)
+    }
+
+    pub fn resolved_answers(&self) -> Option<serde_json::Map<String, Value>> {
+        self.questions
             .iter()
             .enumerate()
             .map(|(i, q)| Some((q.id.clone(), self.answer(i)?)))
-            .collect::<Option<serde_json::Map<_, _>>>()?;
-        // Pi input/editor transports text. Keep the structured answer in that string.
-        Some(json!({"value": Value::Object(answers).to_string()}))
+            .collect()
     }
 
-    fn rpc_value(&self, at: usize) -> Option<String> {
-        let answer = self.answer(at)?;
-        Some(if let Some(values) = answer.as_array() {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            answer.as_str()?.to_owned()
-        })
-    }
-
-    pub fn remaining_rpc(&self) -> Vec<(String, String, String)> {
-        self.rpc
-            .as_ref()
-            .map(|(tool, signatures)| {
-                signatures
+    pub fn response_with_answers(&self, answers: &serde_json::Map<String, Value>) -> Option<Value> {
+        if !self.can_respond() {
+            return None;
+        }
+        if self.direct {
+            let answer = answers.get(&self.questions.first()?.id)?;
+            let value = if let Some(values) = answer.as_array() {
+                values
                     .iter()
-                    .enumerate()
-                    .skip(1)
-                    .filter_map(|(i, signature)| {
-                        Some((tool.clone(), signature.clone(), self.rpc_value(i)?))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                answer.as_str()?.to_owned()
+            };
+            return Some(json!({"value":value}));
+        }
+        // Pi input/editor transports text. Keep the structured answer in that string.
+        Some(json!({"value": Value::Object(answers.clone()).to_string()}))
     }
 }
 
@@ -320,7 +462,7 @@ mod tests {
         form.index = 1;
         form.digit("2");
         form.digit("1");
-        assert_eq!(form.answer(1), Some(json!(["A", "B"])));
+        assert_eq!(form.answer(1), Some(json!(["B", "A"])));
         form.digit("2");
         assert_eq!(form.answer(1), Some(json!(["A"])));
         let response = form.response().unwrap();
@@ -333,23 +475,17 @@ mod tests {
     }
 
     #[test]
-    fn rpiv_matches_exact_wire_format_and_builds_sequential_responses() {
+    fn rpiv_matches_exact_wire_format_and_answers_only_the_current_native_dialog() {
         let params = fixture();
         let request = json!({"method":"select","title":"[Storage] Where?",
             "options":["1. Local \u{2014} On disk","2. Remote \u{2014} On server","3. Type something."]});
         let mut form = Questionnaire::rpiv(&request, "tool-1", &params).unwrap();
         form.digit("1");
-        form.index = 1;
-        form.digit("2");
-        form.digit("1");
+        assert_eq!(form.questions.len(), 1);
         assert_eq!(
             form.response(),
             Some(json!({"value":"1. Local \u{2014} On disk"}))
         );
-        let replies = form.remaining_rpc();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, "tool-1");
-        assert_eq!(replies[0].2, "1,2");
         let mut unrelated = request.clone();
         unrelated["options"][0] = json!("different");
         assert!(Questionnaire::rpiv(&unrelated, "tool-1", &params).is_none());
@@ -359,13 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_duplicate_questions_fall_back_to_native_dialog() {
+    fn empty_questions_fall_back_and_duplicate_ids_share_their_drafts() {
         assert!(Questionnaire::parse(&json!({"questions":[]})).is_none());
         let mut params = fixture();
         params["questions"][1]["id"] = json!("one");
-        assert!(Questionnaire::parse(&params).is_none());
+        let mut form = Questionnaire::parse(&params).unwrap();
+        form.edit("shared answer".into());
+        assert_eq!(form.answers[1].other, "shared answer");
         params = fixture();
         params["questions"][0]["options"][1]["label"] = json!("Local");
-        assert!(Questionnaire::parse(&params).is_none());
+        assert!(Questionnaire::parse(&params).is_some());
     }
 }

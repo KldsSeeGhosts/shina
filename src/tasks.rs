@@ -469,6 +469,26 @@ impl State {
 
     /// User-only entry point. The response has the same shape as Thread::respond.
     pub fn respond_to_request(&mut self, thread_id: usize, response: Value) -> Result<(), String> {
+        let server = self
+            .remote_task(thread_id)
+            .map(|r| r.server_id.as_str())
+            .unwrap_or(&self.machines.selected);
+        if let Some(client) = &self.client {
+            if !client.supports_capability(server, crate::protocol::COMPOSER_REQUESTS) {
+                return Err(crate::protocol::REQUESTS_UPDATE_REQUIRED.into());
+            }
+            if !client.can_approve(server) {
+                return Err("This connection cannot answer requests.".into());
+            }
+        }
+        if self
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .is_some_and(|t| t.responding_request.is_some())
+        {
+            return Err("A response to this request is already in flight.".into());
+        }
         if let Some(remote) = self.remote_task(thread_id) {
             let reference = remote.request.as_ref().ok_or("This request has expired.")?;
             let commands = self
@@ -476,12 +496,15 @@ impl State {
                 .as_ref()
                 .and_then(|c| c.commands_for(&remote.server_id))
                 .ok_or_else(|| format!("Link this desktop to {} to answer.", remote.label))?;
-            commands.send(
+            let command_id = commands.send(
                 "request.respond",
                 json!({"threadId":remote.thread_id,
                 "requestId":reference["requestId"],"generation":reference["generation"],
-                "session":response["allowForSession"] == true,"response":response}),
+                "requestContract":true,"response":response}),
             )?;
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                thread.responding_request = Some(command_id);
+            }
             return Ok(());
         }
         if self.client.is_some() {
@@ -498,9 +521,12 @@ impl State {
             .find(|t| t.id == thread_id && !t.archived())
             .ok_or("The thread is unavailable.")?;
         let request = thread.request.as_ref().ok_or("This request has expired.")?;
+        let request_id = request["id"].clone();
+        if thread.responding_request.is_some() {
+            return Err("A response to this request is already in flight.".into());
+        }
         match request["method"].as_str() {
-            Some("confirm")
-                if response["confirmed"].is_boolean() || response["cancelled"] == true => {}
+            Some("confirm") => crate::approval::validate(request, &response)?,
             Some("select")
                 if response["cancelled"] == true
                     || request["options"]
@@ -510,15 +536,15 @@ impl State {
                 if response["value"].is_string() || response["cancelled"] == true => {}
             _ => return Err("The response does not match the pending request.".into()),
         }
-        if response["allowForSession"] == true {
-            if request["method"] != "confirm" {
-                return Err("Session approval requires a confirmation request.".into());
-            }
-            thread.approve_for_session();
-        } else {
-            thread.respond(response);
+        if response["allowForSession"] == true && request["method"] != "confirm" {
+            return Err("Session approval requires a confirmation request.".into());
         }
-        if thread.request.is_some() {
+        thread.respond(response);
+        if thread
+            .request
+            .as_ref()
+            .is_some_and(|remaining| remaining["id"] == request_id)
+        {
             return Err(thread
                 .error
                 .clone()

@@ -33,6 +33,466 @@ struct Profile {
     children: Vec<Child>,
 }
 
+#[test]
+fn question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"dismiss-question-fixture",
+        "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until(|state| {
+        state["threads"][0]["request"]["id"] == "dismiss-question"
+            && state["threads"][0]["status"] == "Completed"
+    });
+    let request = client.snapshot["threads"][0]["request"].clone();
+    let args = json!({"threadId":1,"requestId":request["id"],
+        "generation":request["runtimeGeneration"]});
+    for minor in [18, protocol::MINOR] {
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,
+            "protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("dismiss-{minor}")),
+        );
+        assert_eq!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == "question-dismiss-v1"),
+            minor >= 19
+        );
+        let id = uuid::Uuid::new_v4();
+        let result = client.command("thread.user-input.dismiss", args.clone(), id);
+        if minor < 19 {
+            assert_eq!(
+                result["error"]["message"],
+                "Update required. Update Shina on the client and server to dismiss questions."
+            );
+            assert_eq!(
+                client.snapshot["threads"][0]["request"]["id"],
+                "dismiss-question"
+            );
+        } else {
+            assert_eq!(result["result"]["status"], "accepted", "{result}");
+            client.until_sequence(result["result"]["seq"].as_u64().unwrap(), |state| {
+                state["threads"][0]["request"].is_null()
+            });
+            assert_eq!(
+                client.command("thread.user-input.dismiss", args.clone(), id)["result"],
+                result["result"],
+                "receipt replay"
+            );
+        }
+    }
+    let repeated = client.command("thread.user-input.dismiss", args, uuid::Uuid::new_v4());
+    assert!(
+        repeated.to_string().contains("already been answered"),
+        "{repeated}"
+    );
+    assert_eq!(
+        fs::read_to_string(profile.root.join("Shina/chats/1/fixture-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        !profile
+            .root
+            .join("Shina/chats/1/fixture-question-replies.jsonl")
+            .exists()
+    );
+    assert_eq!(client.snapshot["threads"][0]["status"], "Completed");
+    profile.stop();
+}
+
+#[test]
+fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    for minor in [14, protocol::MINOR] {
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("request-capability-{minor}")),
+        );
+        assert_eq!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == protocol::COMPOSER_REQUESTS),
+            minor >= 15
+        );
+        let response = client.command(
+            "request.respond",
+            json!({"threadId":1,"requestId":"expired","generation":"expired",
+                "requestContract":true,"response":{"decision":"cancel"}}),
+            uuid::Uuid::new_v4(),
+        );
+        if minor < 15 {
+            assert_eq!(
+                response["error"]["message"],
+                protocol::REQUESTS_UPDATE_REQUIRED
+            );
+        } else {
+            assert!(
+                response.to_string().contains("Request expired."),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[test]
+fn question_files_use_server_paths_and_document_text_in_the_native_answer() {
+    use sha2::Digest;
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("file-answer-hello"),
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"claude"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"question-file-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "input");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    let bytes = br##"{"cells":[{"cell_type":"markdown","source":["# File answer"]}]}"##;
+    let base = format!("http://127.0.0.1:{}", profile.discovery()["port"]);
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let started: Value = http
+        .post(format!("{base}/v1/uploads"))
+        .bearer_auth(&client.token)
+        .json(
+            &json!({"type":"file","name":"answer.ipynb","mimeType":"application/octet-stream",
+            "length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(bytes))}),
+        )
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let upload = started["uploadId"].as_str().unwrap();
+    assert!(
+        http.put(format!("{base}/v1/uploads/{upload}?offset=0"))
+            .bearer_auth(&client.token)
+            .body(bytes.to_vec())
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let file: Value = http
+        .post(format!("{base}/v1/uploads/{upload}/commit"))
+        .bearer_auth(&client.token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let args = json!({"threadId":1,"requestId":request["id"],"generation":request["runtimeGeneration"],
+        "requestContract":true,"questionContract":true,"questionAttachments":true,
+        "answers":[{"selected":[],"other":"Review the attached notebook."}],
+        "attachmentsByQuestionId":{"Attach a file.":[file]},"questionTextById":{"Attach a file.":"Attach a file."},
+        "response":{"value":""}});
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":17,"projectionSchema":1}),
+        json!("file-answer-old"),
+    );
+    assert_eq!(
+        client.command("request.respond", args.clone(), uuid::Uuid::new_v4())["error"]["message"],
+        protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED
+    );
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("file-answer-new"),
+    );
+    let response = client.command("request.respond", args, uuid::Uuid::new_v4());
+    assert_eq!(response["result"]["status"], "accepted", "{response}");
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let records: Vec<Value> =
+        fs::read_to_string(profile.root.join("Shina/chats/1/claude-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let native = records
+        .iter()
+        .find(|r| r["response"]["request_id"] == request["id"])
+        .unwrap();
+    let answer = native["response"]["response"]["updatedInput"]["answers"]["Attach a file."]
+        .as_str()
+        .unwrap();
+    assert!(
+        answer.contains("Review the attached notebook.\n\nAttached file \"answer.ipynb\": "),
+        "{answer}"
+    );
+    assert!(answer.contains(" (text extracted to: "), "{answer}");
+    assert!(answer.contains(profile.root.to_str().unwrap()), "{answer}");
+    profile.stop();
+}
+
+#[test]
+fn choice_only_questions_use_native_option_ids_and_refuse_an_older_peer() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("Shina/harnesses.json"), json!([{
+        "id":"antigravity-fixture","name":"Antigravity fixture",
+        "command":if cfg!(windows) {"python"} else {"python3"},
+        "args":["-u",profile.root.join("fake_acp.py"),"--log",profile.root.join("choice-log.jsonl")]
+    }]).to_string()).unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("questions-hello"),
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"antigravity-fixture"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"choice-only","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "input");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(request["questions"][0]["allowCustomAnswer"], false);
+    assert_eq!(request["questions"][0]["options"][1]["value"], "choice-2");
+    let answer = json!({"threadId":1,"requestId":request["id"],"generation":request["runtimeGeneration"],
+        "requestContract":true,"questionContract":true,
+        "answers":[{"selected":["choice-2"],"other":"Ignore this unoffered custom answer."}],
+        "response":{"value":"{}"}});
+    let old = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":16,"projectionSchema":1}),
+        json!("old-questions"),
+    );
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::QUESTION_CONTRACT)
+    );
+    assert_eq!(
+        client.command("request.respond", answer.clone(), uuid::Uuid::new_v4())["error"]["message"],
+        protocol::QUESTIONS_UPDATE_REQUIRED
+    );
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("new-questions"),
+    );
+    assert_eq!(
+        client.command("request.respond", answer, uuid::Uuid::new_v4())["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let records: Vec<Value> = fs::read_to_string(profile.root.join("choice-log.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let response = records
+        .iter()
+        .find(|r| r["id"] == 71 && r["result"].is_object())
+        .unwrap();
+    assert_eq!(
+        response["result"]["outcome"],
+        json!({"outcome":"selected","optionId":"choice-2"})
+    );
+    profile.stop();
+}
+
+#[test]
+fn approval_feedback_and_decline_redirect_use_native_decisions_and_refuse_an_older_peer() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let negotiate = |client: &mut Client, minor| {
+        client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("approval-hello-{minor}")),
+        )
+    };
+    let hello = negotiate(&mut client, protocol::MINOR);
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::APPROVAL_FEEDBACK)
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"claude"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"approval-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "confirm");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(request["responseCapability"]["supportsFeedback"], true);
+    let args = json!({"threadId":1,"requestId":request["id"],
+        "generation":request["runtimeGeneration"],"requestContract":true,
+        "response":{"decision":"decline","feedback":"Use a safer command."}});
+    let old = negotiate(&mut client, 15);
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::APPROVAL_FEEDBACK)
+    );
+    let refused = client.command("request.respond", args.clone(), uuid::Uuid::new_v4());
+    assert_eq!(
+        refused["error"]["message"],
+        protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED
+    );
+    negotiate(&mut client, protocol::MINOR);
+    assert_eq!(
+        client.command("request.respond", args, uuid::Uuid::new_v4())["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    assert!(
+        read_full_history(&mut client, 48_000)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Use a safer command.")
+    );
+
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"approval-fixture again","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "confirm");
+    let next = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(
+        client.command(
+            "request.respond",
+            json!({"threadId":1,"requestId":next["id"],
+        "generation":next["runtimeGeneration"],"requestContract":true,
+        "response":{"decision":"decline"}}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(client.command("thread.send",
+        json!({"threadId":1,"text":"Redirect to another task.","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4())["result"]["status"], "accepted");
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let redirected_history = read_full_history(&mut client, 48_000);
+    assert!(
+        redirected_history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Redirect to another task."),
+        "{redirected_history}"
+    );
+    let records: Vec<Value> =
+        fs::read_to_string(profile.root.join("Shina/chats/1/claude-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let feedback = records
+        .iter()
+        .find(|r| r["response"]["request_id"] == request["id"])
+        .unwrap();
+    assert_eq!(
+        feedback["response"]["response"]["message"],
+        "Use a safer command."
+    );
+    assert_ne!(feedback["response"]["response"]["interrupt"], true);
+    let decline = records
+        .iter()
+        .position(|r| r["response"]["request_id"] == next["id"])
+        .unwrap();
+    let redirect = records
+        .iter()
+        .position(|r| {
+            r["type"] == "user"
+                && r["message"]["content"]
+                    .to_string()
+                    .contains("Redirect to another task.")
+        })
+        .unwrap();
+    assert!(decline < redirect);
+    assert_eq!(
+        records[decline]["response"]["response"]["message"],
+        "User declined tool execution."
+    );
+    assert!(!records.iter().any(|r| {
+        r["type"] == "user"
+            && r["message"]["content"]
+                .to_string()
+                .contains("Use a safer command.")
+    }));
+    profile.stop();
+    profile.launch(&["serve"]);
+    let client = profile.client(uuid::Uuid::new_v4());
+    assert!(
+        client.snapshot["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Use a safer command.")
+    );
+}
+
 fn read_fixture_thread(workspace: &std::path::Path, args: Value) -> Value {
     let response = call_fixture_tool(workspace, "read_thread", args);
     assert_ne!(response["result"]["isError"], true, "{response}");
@@ -89,6 +549,11 @@ impl Profile {
             include_str!("../assets/tests/fake_acp.py"),
         )
         .unwrap();
+        fs::write(
+            root.join("fake_claude_requests.js"),
+            include_str!("../assets/tests/fake_claude_requests.cjs"),
+        )
+        .unwrap();
         fs::write(root.join("Shina/harnesses.json"), json!([{"id":"fixture-acp","name":"Fixture ACP",
             "command":if cfg!(windows) { "python" } else { "python3" },
             "args":["-u",root.join("fake_acp.py"),"--log",root.join("acp-log.jsonl"),"--delay-seconds","0.6","--resume","--no-history"]}]).to_string()).unwrap();
@@ -120,6 +585,14 @@ impl Profile {
             );
         if let Some(fault) = fault {
             command.env("SHINA_TEST_CRASH_EFFECT", fault);
+        }
+        if self.root.join("use-native-approval-fixture").exists() {
+            command
+                .env(
+                    "SHINA_CLAUDE_CLI",
+                    self.root.join("fake_claude_requests.js"),
+                )
+                .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"));
         }
         if self.root.join("measure-storage").exists() {
             command.env(

@@ -51,7 +51,7 @@ fn transcript_saved_before_typed_tools_loads_unchanged() {
 }
 
 #[test]
-fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
+fn rpiv_drawer_answers_each_exact_live_native_dialog_independently() {
     let (mut t, commands) = thread(Status::Running);
     let params = json!({"questions":[
         {"header":"Storage","question":"Where?","options":[{"label":"Disk","description":"Local"}]},
@@ -63,18 +63,6 @@ fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
     assert!(t.native.questionnaire.is_some());
     t.questionnaire_toggle(0);
     assert!(t.native_tick(Instant::now() + Duration::from_millis(250)));
-    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 1);
-    assert!(
-        commands
-            .try_iter()
-            .all(|r| r["type"] != "extension_ui_response")
-    );
-    t.questionnaire_toggle(1);
-    t.questionnaire_toggle(0);
-    t.questionnaire_step(true);
-    assert_eq!(t.native.questionnaire.as_ref().unwrap().index, 0);
-    t.questionnaire_step(false);
-    t.questionnaire_step(false);
     assert_eq!(
         command(&commands, "extension_ui_response")["value"],
         "1. Disk \u{2014} Local"
@@ -95,13 +83,25 @@ fn rpiv_drawer_collects_answers_then_replies_only_to_exact_live_tool_dialogs() {
     t.respond(json!({"value":"Manual answer"}));
     command(&commands, "extension_ui_response");
     t.apply(second.clone());
+    assert!(
+        commands
+            .try_iter()
+            .all(|r| r["type"] != "extension_ui_response")
+    );
+    t.questionnaire_toggle(1);
+    t.questionnaire_toggle(0);
+    t.questionnaire_step(false);
     let response = command(&commands, "extension_ui_response");
     assert_eq!(response["id"], "second");
-    assert_eq!(response["value"], "1,2");
+    assert_eq!(response["value"], "2,1");
     assert!(t.request.is_none());
     t.apply(json!({"type":"tool_execution_end","toolCallId":"ask-1","result":{"content":[]}}));
     t.apply(second);
-    assert!(t.native.questionnaire.is_none());
+    assert!(t.native.questionnaire.is_some());
+    assert_eq!(
+        t.native.questionnaire.as_ref().unwrap().questions[0].options[0].label,
+        "Submit empty value"
+    );
     assert!(t.request.is_some());
 }
 
@@ -127,11 +127,8 @@ fn structured_questionnaire_expiry_cancels_auto_advance_and_notifications_expire
     assert!(t.native_deadline().is_some());
     assert!(t.native_tick(Instant::now() + Duration::from_secs(7)));
     assert!(t.native.notifications.is_empty());
-    t.native
-        .questionnaire_replies
-        .push(("tool".into(), "signature".into(), "answer".into()));
     t.cancel_native_dialogs();
-    assert!(t.native.questionnaire_replies.is_empty());
+    assert!(t.native.questionnaire_advance.is_none());
 }
 
 #[test]
@@ -765,6 +762,19 @@ fn session_approvals_are_scoped_to_the_process_and_other_dialogs_still_need_the_
     assert!(t.request.is_some());
     t.disconnect();
     assert!(t.native.session_approvals.is_empty());
+}
+
+#[test]
+fn failed_session_approval_does_not_remember_a_grant() {
+    let (mut t, commands) = thread(Status::Running);
+    t.apply(
+        json!({"type":"extension_ui_request","id":"failed-grant","method":"confirm",
+        "title":"Allow write?","message":"file"}),
+    );
+    drop(commands);
+    t.approve_for_session();
+    assert!(t.native.session_approvals.is_empty());
+    assert!(t.request.is_some());
 }
 
 #[test]

@@ -30,6 +30,7 @@ struct ContextAssetDownload {
     mime_type: String,
     kind: &'static str,
     result: Result<Vec<u8>, String>,
+    question_scope: Option<String>,
 }
 
 fn fetch_linked_blob(
@@ -103,6 +104,19 @@ pub use pi_session::{
     managed_access_mode_denial, read_managed_policy, resolve_compatible_access_mode,
     session_history, supported_access_modes,
 };
+#[path = "approval_send.rs"]
+mod approval_send;
+#[cfg(test)]
+#[path = "approval_send_tests.rs"]
+mod approval_send_tests;
+#[path = "question_answers.rs"]
+mod question_answers;
+#[cfg(test)]
+#[path = "question_attachment_tests.rs"]
+mod question_attachment_tests;
+#[cfg(test)]
+#[path = "question_flow_tests.rs"]
+mod question_flow_tests;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -186,6 +200,7 @@ impl Selection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
+    Info,
     Success,
     Warning,
     Error,
@@ -566,7 +581,17 @@ pub struct Thread {
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
+    pub(crate) requests_supported: bool,
+    pub(crate) question_contract_supported: bool,
+    pub(crate) responding_request: Option<uuid::Uuid>,
+    approval_send: Option<approval_send::ApprovalSend>,
     pub reply: TextEdit,
+    question_drafts: std::collections::HashMap<String, question_answers::Draft>,
+    pub(super) answer_intake: bool,
+    pub(super) answer_scope: Option<String>,
+    pub(super) question_submit_requested: bool,
+    question_submission: Option<question_answers::Submission>,
+    question_resolutions: Vec<question_answers::Resolution>,
     pub session: Option<String>,
     /// A thread made here as a new thread. Until a prompt is sent, a session on it is only a
     /// warmed harness and the thread is still a draft. Restored records without the flag keep
@@ -739,14 +764,23 @@ impl Thread {
         attachments: &[Attachment],
         skip_image_inline_chip: bool,
     ) {
-        if attachments.is_empty() || self.request.is_some() {
+        if attachments.is_empty()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+                && !self.answer_intake
+                && !self.request_held_by_typing_guard()
+        {
             return;
         }
         let prose = crate::composer_context::strip_inline_context_references(
             &crate::composer_rich::markdown(&self.draft),
         );
         let image_attachments_get_chips = !skip_image_inline_chip
-            && (self.draft.anchor != self.draft.focus || !prose.trim().is_empty());
+            && (self.answer_intake
+                || self.draft.anchor != self.draft.focus
+                || !prose.trim().is_empty());
         let mut records = Vec::new();
         for attachment in attachments {
             if attachment.is_image() && !image_attachments_get_chips {
@@ -805,14 +839,27 @@ impl Thread {
         }
         let mut proposed = self.draft_images.clone();
         proposed.push(image);
-        attachments::validate_prompt_images(&proposed)?;
+        if self.answer_intake {
+            if self.question_reserved_count() >= attachments::MAX_ATTACHMENTS {
+                return Err(format!(
+                    "You can attach up to {} files per message.",
+                    attachments::MAX_ATTACHMENTS
+                ));
+            }
+        } else {
+            attachments::validate_prompt_images(&proposed)?;
+        }
         self.draft_images = proposed;
         self.attachment_error = None;
         Ok(())
     }
     pub fn remove_attachment(&mut self, id: &str) {
         self.draft_images.retain(|image| image.id != id);
-        self.attachment_error = attachments::validate_prompt_images(&self.draft_images).err();
+        self.attachment_error = if self.answer_intake {
+            None
+        } else {
+            attachments::validate_prompt_images(&self.draft_images).err()
+        };
     }
     fn image_model_error(&self) -> String {
         let model = if self.model.is_empty() {
@@ -904,7 +951,17 @@ impl Thread {
             error: None,
             diagnostics: vec![],
             request: None,
+            requests_supported: true,
+            question_contract_supported: true,
+            responding_request: None,
+            approval_send: None,
             reply: TextEdit::default(),
+            question_drafts: Default::default(),
+            answer_intake: false,
+            answer_scope: None,
+            question_submit_requested: false,
+            question_submission: None,
+            question_resolutions: Vec::new(),
             session: None,
             never_sent: true,
             life: Lifecycle::new(lifecycle::now()),
@@ -1503,10 +1560,66 @@ impl Thread {
     }
 
     pub fn respond(&mut self, mut response: Value) {
+        if self.responding_request.is_some() {
+            return;
+        }
+        if self.native.questionnaire.is_some() && !self.question_contract_supported {
+            self.error = Some(crate::protocol::QUESTIONS_UPDATE_REQUIRED.into());
+            return;
+        }
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| !form.can_respond())
+        {
+            self.error = Some("This request is not resumable.".into());
+            return;
+        }
+        if let Some(request) = &self.request {
+            if !crate::approval::can_respond(request) {
+                self.error = Some("This request is not resumable.".into());
+                return;
+            }
+            if request["method"] == "confirm" {
+                if let Err(error) = crate::approval::validate(request, &response) {
+                    self.error = Some(error);
+                    return;
+                }
+                let decision = crate::approval::decision(&response)
+                    .expect("validated")
+                    .to_owned();
+                let feedback = response.get("feedback").cloned();
+                response = crate::approval::response(&decision);
+                if let Some(feedback) = feedback {
+                    response["feedback"] = feedback;
+                }
+                if self.remote.is_none() && self.harness == "pi" && decision == "acceptAlways" {
+                    response = json!({"cancelled":true});
+                }
+            }
+        }
         if self.remote.is_some() {
+            if !self.requests_supported {
+                self.error = Some(crate::protocol::REQUESTS_UPDATE_REQUIRED.into());
+                return;
+            }
             let request = self.request.clone().unwrap_or(Value::Null);
-            self.forward("request.respond", json!({"requestId":request["id"],"generation":request["runtimeGeneration"],
-                "session":response["allowForSession"] == true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response}));
+            let params = json!({"threadId":self.id,"requestId":request["id"],"generation":request["runtimeGeneration"],
+                "requestContract":true,"questionContract":self.native.questionnaire.is_some(),
+                "answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response});
+            match self
+                .remote
+                .as_ref()
+                .expect("remote")
+                .send("request.respond", params)
+            {
+                Ok(id) => self.responding_request = Some(id),
+                Err(error) => self.error = Some(error),
+            }
+            return;
+        }
+        if self.respond_message_question(&response) {
             return;
         }
         if response["cancelled"] == true {
@@ -1515,8 +1628,33 @@ impl Thread {
         let Some(request) = &self.request else {
             return;
         };
+        if request["method"] == "confirm" {
+            let request = request.clone();
+            match self.write_approval_response(&request, response) {
+                Ok(()) => {
+                    self.request = None;
+                    self.forwarded_question = None;
+                    self.native_dialog_done();
+                }
+                Err(error) => self.error = Some(error),
+            }
+            return;
+        }
+        if response.get("feedback").is_some() {
+            self.error = Some(
+                "Feedback requires a live approval that supports it and a decline decision.".into(),
+            );
+            return;
+        }
         response["type"] = "extension_ui_response".into();
         response["id"] = request["id"].clone();
+        if self.harness == "pi"
+            && let Some(fields) = response.as_object_mut()
+        {
+            // Pi's extension transport consumes only its boolean reply, not our contract.
+            fields.remove("decision");
+            fields.remove("allowForSession");
+        }
         let result = self
             .pi
             .as_ref()
@@ -1549,7 +1687,9 @@ impl Thread {
         self.pi = None;
         self.status = Status::Ready;
         self.assistant = None;
-        self.request = None;
+        if self.native.questionnaire.is_none() {
+            self.request = None;
+        }
         self.forwarded_question = None;
         self.initializing = false;
         self.session_started = None;
@@ -2388,8 +2528,16 @@ impl Thread {
                                     .rev()
                                     .collect();
                             }
-                            for (history_index, message) in messages.iter().enumerate() {
-                                self.anchor_compactions(history_index);
+                            let messages = approval_send::history_with_approval_feedback(
+                                messages,
+                                &saved_messages,
+                            );
+                            let mut native_history_index = 0;
+                            for message in &messages {
+                                if message["shinaFeedbackId"].is_null() {
+                                    self.anchor_compactions(native_history_index);
+                                    native_history_index += 1;
+                                }
                                 let role = string(message, "role");
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
@@ -2405,7 +2553,12 @@ impl Thread {
                                             self.ensure_work();
                                         }
                                         self.messages.push(Message {
-                                            id: uuid::Uuid::new_v4().to_string(),
+                                            id: message["shinaFeedbackId"]
+                                                .as_str()
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    uuid::Uuid::new_v4().to_string()
+                                                }),
                                             role: if role != "user" {
                                                 "Pi"
                                             } else if text.starts_with(INJECTION_PREFIX) {
@@ -2465,6 +2618,11 @@ impl Thread {
                                     let found =
                                         saved_messages.iter().enumerate().find(|(i, old)| {
                                             !used.contains(i)
+                                                && if message.id.starts_with("approval-feedback:") {
+                                                    old.id == message.id
+                                                } else {
+                                                    !old.id.starts_with("approval-feedback:")
+                                                }
                                                 && old.role == message.role
                                                 && old.text == message.text
                                         });
@@ -2477,15 +2635,16 @@ impl Thread {
                             for (i, message) in self.messages.iter_mut().enumerate() {
                                 if let Some(id) = identities[i].take() {
                                     message.id = id;
-                                } else if let Some(old) = saved_messages
-                                    .get(i)
-                                    .filter(|old| old.role == message.role && !used.contains(&i))
-                                {
+                                } else if let Some(old) = saved_messages.get(i).filter(|old| {
+                                    old.role == message.role
+                                        && !used.contains(&i)
+                                        && !old.id.starts_with("approval-feedback:")
+                                }) {
                                     used.insert(i);
                                     message.id = old.id.clone();
                                 }
                             }
-                            self.anchor_compactions(messages.len());
+                            self.anchor_compactions(native_history_index);
                             for tool in &mut self.tools {
                                 if let Some(order) = saved_orders.get(&tool.id) {
                                     tool.order = *order;
@@ -2635,7 +2794,10 @@ impl Thread {
                     self.operation_deadline = None;
                 }
                 self.life.last_completed_at = Some(lifecycle::now());
-                self.request = None;
+                self.expire_live_question("The provider turn ended.");
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 let aborted = record["aborted"] == true;
                 if aborted {
                     self.mark_stopped();
@@ -2643,6 +2805,14 @@ impl Thread {
                     self.resumable_run_id = None;
                 }
                 self.finish_run();
+                if self
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .is_some_and(|form| form.capability == "message")
+                {
+                    self.native.dialog_status = Some(self.status);
+                }
                 // A stopped run is idle, not a finished task.
                 if aborted && self.status == Status::Completed {
                     self.status = Status::Ready;
@@ -2662,7 +2832,9 @@ impl Thread {
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
-                self.request = None;
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 self.status = Status::Running;
                 self.assistant();
             }
@@ -2798,9 +2970,19 @@ impl Thread {
                     string(&record, "method"),
                     "confirm" | "select" | "input" | "editor"
                 ) {
-                    self.reply.replace_text(string(&record, "prefill"));
+                    self.reply.replace_text(
+                        self.native
+                            .questionnaire
+                            .as_ref()
+                            .map(|form| form.answers[form.index].other.as_str())
+                            .unwrap_or_else(|| string(&record, "prefill")),
+                    );
                     self.request = Some(record);
                     self.refresh_typing_guard();
+                    if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+                        self.draft.focused = false;
+                        self.reply.focused = false;
+                    }
                     self.status = Status::Waiting;
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
@@ -3213,6 +3395,7 @@ pub struct State {
     pub delete_thread: Option<usize>,
     pub delete_roots: Vec<usize>,
     pub confirm_remove_attachment: Option<(usize, String)>,
+    answer_remove_scope: Option<String>,
     pub(crate) pending_context_imports: Vec<(String, usize, String)>,
     context_import_rxs: Vec<std::sync::mpsc::Receiver<ContextAssetDownload>>,
     pub project_scope: ProjectScope,
@@ -3439,6 +3622,7 @@ impl State {
             delete_thread: None,
             delete_roots: vec![],
             confirm_remove_attachment: None,
+            answer_remove_scope: None,
             pending_context_imports: Vec::new(),
             context_import_rxs: Vec::new(),
             project_scope: ProjectScope::All,
@@ -3625,6 +3809,7 @@ impl State {
         let previous = self.active;
         if previous != index && previous < self.threads.len() {
             self.threads[previous].draft.focused = false;
+            self.threads[previous].cancel_questionnaire_advance();
         }
         self.active = index;
         self.plan_menu = None;
@@ -6969,7 +7154,20 @@ impl State {
                 records.push(crate::composer_context::attachment_context_record(att));
             }
         }
-        if let Err(error) = attachments::stage_clipboard_files(&mut records, &mut copied_files) {
+        let staged = if self.current().answer_intake {
+            (|| -> Result<(), String> {
+                let files = std::mem::take(&mut copied_files);
+                for (id, file) in files {
+                    let mut single = std::collections::HashMap::from([(id, file)]);
+                    attachments::stage_clipboard_files(&mut records, &mut single)?;
+                    copied_files.extend(single);
+                }
+                Ok(())
+            })()
+        } else {
+            attachments::stage_clipboard_files(&mut records, &mut copied_files)
+        };
+        if let Err(error) = staged {
             self.current_mut().attachment_error = Some(error);
             return None;
         }
@@ -7028,6 +7226,20 @@ impl State {
         content: &rune::ClipboardContent,
         bypass_fold: bool,
     ) -> bool {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            if !self.question_attachments_allowed(self.active) {
+                self.current_mut().attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return true;
+            }
+            return self
+                .with_question_draft(self.active, scope, |s| {
+                    s.paste_composer_content(content, bypass_fold)
+                })
+                .unwrap_or(true);
+        }
         let has_image = content.image().is_some();
         if let Some(image) = content.image() {
             self.attach_image_with_options("Pasted image.png", image.png(), bypass_fold);
@@ -7036,6 +7248,17 @@ impl State {
             self.attach_paths(content.files());
         }
         if !content.text().is_empty() && !has_image && content.files().is_empty() {
+            if self.current().answer_intake
+                && self
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .is_some_and(|f| f.questions[f.index].initial_answer.is_some())
+            {
+                self.current_mut().draft.insert(content.text());
+                return true;
+            }
             if !bypass_fold && self.fold_paste(content.text()) {
                 return true;
             }
@@ -7056,6 +7279,16 @@ impl State {
                 &self.current().draft_context,
                 &self.current().draft_images,
             );
+            if self.current().answer_intake
+                && outcome
+                    .imported_records
+                    .iter()
+                    .any(|r| !matches!(r.kind(), "thread" | "file" | "image"))
+            {
+                self.current_mut().attachment_error =
+                    Some("Answer or dismiss the question first, then add it to chat.".into());
+                return true;
+            }
             for rec in outcome.imported_records {
                 let t = self.current_mut();
                 if let Some(existing) = t
@@ -7085,6 +7318,15 @@ impl State {
         target_thread_id: usize,
         pending: crate::composer_context::PendingAttachmentImport,
     ) {
+        if self.current().answer_intake
+            && self.current().question_reserved_count() >= attachments::MAX_ATTACHMENTS
+        {
+            self.current_mut().attachment_error = Some(format!(
+                "You can attach up to {} files per message.",
+                attachments::MAX_ATTACHMENTS
+            ));
+            return;
+        }
         let (attachment_id, name, mime_type, kind) = match &pending.record.data {
             crate::composer_context::ComposerContextData::Image {
                 attachment_id,
@@ -7233,6 +7475,16 @@ impl State {
         let wake = self.wake.clone();
         let target_machine = target_machine.to_owned();
         let new_context_id = pending.new_context_id.clone();
+        let question_scope = self
+            .threads
+            .iter()
+            .find(|t| t.id == target_thread_id)
+            .and_then(|t| t.answer_scope.clone());
+        if let Some(scope) = &question_scope
+            && let Some(t) = self.threads.iter_mut().find(|t| t.id == target_thread_id)
+        {
+            t.question_drafts.entry(scope.clone()).or_default().pending += 1;
+        }
         self.pending_context_imports.push((
             target_machine.clone(),
             target_thread_id,
@@ -7254,6 +7506,7 @@ impl State {
                 mime_type,
                 kind,
                 result,
+                question_scope,
             });
             wake();
         });
@@ -7272,15 +7525,46 @@ impl State {
                             && *tid == download.thread_id
                             && cid == &download.new_context_id)
                     });
-                    self.apply_imported_attachment_bytes(
-                        &download.machine,
-                        download.thread_id,
-                        &download.new_context_id,
-                        &download.name,
-                        &download.mime_type,
-                        download.kind,
-                        download.result,
-                    );
+                    if let Some(scope) = download.question_scope {
+                        if download.machine == self.machines.selected
+                            && let Some(index) =
+                                self.threads.iter().position(|t| t.id == download.thread_id)
+                        {
+                            if let Some(draft) = self.threads[index].question_drafts.get_mut(&scope)
+                            {
+                                draft.pending = draft.pending.saturating_sub(1);
+                            }
+                            self.with_question_draft(index, scope, |s| {
+                                s.apply_imported_attachment_bytes(
+                                    &download.machine,
+                                    download.thread_id,
+                                    &download.new_context_id,
+                                    &download.name,
+                                    &download.mime_type,
+                                    download.kind,
+                                    download.result,
+                                )
+                            });
+                        } else if let Some(t) = self
+                            .machines
+                            .threads
+                            .get_mut(&download.machine)
+                            .and_then(|ts| ts.iter_mut().find(|t| t.id == download.thread_id))
+                            && let Some(draft) = t.question_drafts.get_mut(&scope)
+                        {
+                            draft.pending = draft.pending.saturating_sub(1);
+                        }
+                    } else {
+                        self.apply_imported_attachment_bytes(
+                            &download.machine,
+                            download.thread_id,
+                            &download.new_context_id,
+                            &download.name,
+                            &download.mime_type,
+                            download.kind,
+                            download.result,
+                        );
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
@@ -7324,7 +7608,12 @@ impl State {
                 return;
             }
         };
-        if t.draft_images.len() >= attachments::MAX_ATTACHMENTS {
+        if (if t.answer_intake {
+            t.question_reserved_count()
+        } else {
+            t.draft_images.len()
+        }) >= attachments::MAX_ATTACHMENTS
+        {
             t.attachment_error = Some(format!(
                 "Couldn't bring {name} into this message. The attachment limit has been reached. Remove the chip or attach the file again."
             ));
@@ -7379,8 +7668,14 @@ impl State {
             Some("Open a real workspace before attaching files.".into())
         } else if self.threads[index].archived() {
             Some("Restore this thread before attaching files.".into())
-        } else if self.threads[index].request.is_some() {
-            Some("Answer the current question before attaching files.".into())
+        } else if !self.threads[index].answer_intake
+            && !self.threads[index].request_held_by_typing_guard()
+            && self.threads[index]
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+        {
+            Some("This question cannot accept attachments.".into())
         } else if self.threads[index].status.busy() {
             if self.threads[index].native.operating() {
                 Some("Wait for the current operation before attaching files.".into())
@@ -7415,7 +7710,11 @@ impl State {
                             })
                     })
             || self.attachment_guard(self.active).is_some()
-            || self.current().draft_images.len() >= attachments::MAX_ATTACHMENTS
+            || (if self.current().answer_intake {
+                self.current().question_reserved_count()
+            } else {
+                self.current().draft_images.len()
+            }) >= attachments::MAX_ATTACHMENTS
         {
             return false;
         }
@@ -7443,6 +7742,17 @@ impl State {
         let Some(index) = self.threads.iter().position(|t| t.id == thread) else {
             return;
         };
+        if !self.threads[index].answer_intake
+            && let Some(scope) = self.threads[index].question_scope()
+        {
+            if !self.question_attachments_allowed(index) {
+                self.threads[index].attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return;
+            }
+            self.with_question_draft(index, scope, |s| s.attach_paths_to(thread, paths));
+            return;
+        }
         if let Some(error) = self.attachment_guard(index) {
             self.threads[index].attachment_error = Some(error);
             return;
@@ -7450,7 +7760,12 @@ impl State {
         let mut errors = Vec::new();
         let mut attached = Vec::new();
         for path in paths {
-            if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
+            if (if self.threads[index].answer_intake {
+                self.threads[index].question_reserved_count()
+            } else {
+                self.threads[index].draft_images.len()
+            }) >= attachments::MAX_ATTACHMENTS
+            {
                 errors.push(format!(
                     "A message can carry up to {} attachments. The remaining files were not attached.",
                     attachments::MAX_ATTACHMENTS
@@ -7486,6 +7801,19 @@ impl State {
         self.attach_image_with_options(name, bytes, false);
     }
     pub fn attach_image_with_options(&mut self, name: &str, bytes: &[u8], skip_inline_chip: bool) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            if !self.question_attachments_allowed(self.active) {
+                self.current_mut().attachment_error =
+                    Some("This question cannot accept attachments.".into());
+                return;
+            }
+            self.with_question_draft(self.active, scope, |s| {
+                s.attach_image_with_options(name, bytes, skip_inline_chip)
+            });
+            return;
+        }
         if let Some(error) = self.attachment_guard(self.active) {
             self.current_mut().attachment_error = Some(error);
             return;
@@ -7514,6 +7842,13 @@ impl State {
         self.checkpoint();
     }
     pub fn request_remove_attachment(&mut self, id: &str) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            self.answer_remove_scope = Some(scope.clone());
+            self.with_question_draft(self.active, scope, |s| s.request_remove_attachment(id));
+            return;
+        }
         let t = self.current();
         if let Some(attachment) = t.draft_images.iter().find(|a| a.id == id && a.is_image()) {
             let ctx_id = crate::composer_context::to_kind_scoped_composer_context_id(
@@ -7530,6 +7865,18 @@ impl State {
         self.remove_attachment(id);
     }
     pub fn confirm_remove_attachment_dialog(&mut self) {
+        if let Some(scope) = self.answer_remove_scope.clone()
+            && !self.current().answer_intake
+        {
+            if self.current().question_scope().as_ref() != Some(&scope) {
+                self.confirm_remove_attachment = None;
+                self.answer_remove_scope = None;
+                return;
+            }
+            self.with_question_draft(self.active, scope, |s| s.confirm_remove_attachment_dialog());
+            self.answer_remove_scope = None;
+            return;
+        }
         let Some((thread_id, id)) = self.confirm_remove_attachment.take() else {
             return;
         };
@@ -7572,6 +7919,12 @@ impl State {
         self.checkpoint();
     }
     pub fn remove_attachment(&mut self, id: &str) {
+        if !self.current().answer_intake
+            && let Some(scope) = self.current().question_scope()
+        {
+            self.with_question_draft(self.active, scope, |s| s.remove_attachment(id));
+            return;
+        }
         self.current_mut().remove_attachment(id);
         self.checkpoint();
     }
@@ -7876,6 +8229,10 @@ impl State {
     /// on a draft thread, starts in the background and opens a fresh composer; on an existing
     /// thread, dispatches the turn and opens a new draft once accepted.
     pub fn send_background(&mut self) {
+        self.send_background_intent(false);
+    }
+
+    fn send_background_intent(&mut self, approval_redirect: bool) {
         let source_index = self.active;
         let source_id = self.current().id;
         let was_draft = self.current().is_draft();
@@ -7883,7 +8240,7 @@ impl State {
         let seed = self.composer_seed();
         let server = self.machines.selected.clone();
 
-        if !self.dispatch_send() {
+        if !self.dispatch_send_intent(true, approval_redirect) {
             return;
         }
         if self.client.is_some() {
@@ -8653,11 +9010,30 @@ impl State {
     }
 
     fn dispatch_send(&mut self) -> bool {
-        self.dispatch_send_with_options(None, None)
+        self.dispatch_send_full(false, false, None, None)
     }
 
     pub(crate) fn dispatch_send_with_options(
         &mut self,
+        forced_fresh_context: Option<bool>,
+        forced_compact_before_send: Option<bool>,
+    ) -> bool {
+        self.dispatch_send_full(
+            false,
+            false,
+            forced_fresh_context,
+            forced_compact_before_send,
+        )
+    }
+
+    fn dispatch_send_intent(&mut self, background: bool, approval_redirect: bool) -> bool {
+        self.dispatch_send_full(background, approval_redirect, None, None)
+    }
+
+    fn dispatch_send_full(
+        &mut self,
+        background: bool,
+        approval_redirect: bool,
         forced_fresh_context: Option<bool>,
         forced_compact_before_send: Option<bool>,
     ) -> bool {
@@ -8671,7 +9047,7 @@ impl State {
             );
             return false;
         }
-        if self.current().resume_pending() {
+        if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
         }
         if self.current().queued_edit.is_some() {
@@ -8696,8 +9072,39 @@ impl State {
             self.checkpoint();
             return false;
         }
-        if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
+        if self.current().approval_send.is_some() {
             return false;
+        }
+        if !self.headless
+            && !self.current().request_held_by_typing_guard()
+            && (self.current().native.questionnaire.is_some()
+                || self
+                    .current()
+                    .request
+                    .as_ref()
+                    .is_some_and(|r| r["method"] != "confirm"))
+        {
+            return false;
+        }
+        if self.current().request.is_some() {
+            if self.current().draft.text.trim() == "/model" {
+                self.choose_slash("model".into());
+                return false;
+            }
+            if self.client.is_none() && self.handle_composer_local_command() {
+                return false;
+            }
+            if !self.approval_send_is_local_command()
+                && !approval_redirect
+                && !self.headless
+                && !self.current().request_held_by_typing_guard()
+            {
+                if let Some(error) = self.approval_send_command_error() {
+                    self.current_mut().error = Some(error);
+                    return false;
+                }
+                return self.begin_approval_send(background);
+            }
         }
         self.reconcile_current_access_mode();
         let fresh_session_available = self.fresh_session_available(self.current());
@@ -8847,6 +9254,7 @@ impl State {
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    thread.typing_guard.on_blur_or_send();
                     self.usage_limits_notice_key = None;
                     self.composer_notices.remove("usage-limits");
                     true
@@ -8962,6 +9370,14 @@ impl State {
                 }
             }
             _ => {}
+        }
+        if self
+            .current()
+            .request
+            .as_ref()
+            .is_some_and(crate::approval::not_resumable)
+        {
+            self.current_mut().request = None;
         }
         self.release_task_results(self.current().id);
         if compact_before_send && !self.current().status.busy() {
@@ -10280,6 +10696,9 @@ impl State {
         Ok(())
     }
     pub fn checkpoint(&mut self) {
+        if self.threads.iter().any(|t| t.answer_intake) {
+            return;
+        }
         if self.demo {
             return;
         }
@@ -10832,6 +11251,15 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
+    changed |= state.poll_question_answers();
+    if state.runtime_enabled && state.client.is_none() {
+        for index in 0..state.threads.len() {
+            if std::mem::take(&mut state.threads[index].native.question_message_connect) {
+                state.connect_thread(index);
+                changed = true;
+            }
+        }
+    }
     if state.runtime_enabled
         && !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())
@@ -11209,6 +11637,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     {
         state.storage_error = None;
         changed = true;
+    }
+    changed |= state.poll_approval_sends();
+    if state.approval_sends_pending() {
+        tx.wake_after(Duration::from_millis(16));
     }
     if changed {
         state.checkpoint();

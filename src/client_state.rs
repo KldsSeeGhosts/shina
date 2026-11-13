@@ -126,7 +126,15 @@ struct ThreadView {
     error: Option<String>,
     diagnostics: Vec<String>,
     request: Option<Value>,
+    #[serde(default)]
+    pending_approvals: Vec<Value>,
+    #[serde(default)]
+    requests_supported: bool,
+    #[serde(default)]
+    question_contract_supported: bool,
     questionnaire: Value,
+    #[serde(default)]
+    question_resolutions: Vec<super::question_answers::Resolution>,
     elapsed: Option<u64>,
     #[serde(default)]
     started_at: Option<u64>,
@@ -245,7 +253,18 @@ impl ThreadView {
                 request["runtimeGeneration"] = json!(thread.request_generation);
                 request
             }),
+            pending_approvals: thread
+                .pending_approvals()
+                .into_iter()
+                .map(|mut request| {
+                    request["runtimeGeneration"] = json!(thread.request_generation);
+                    request
+                })
+                .collect(),
+            requests_supported: true,
+            question_contract_supported: true,
             questionnaire: thread.projected_form(),
+            question_resolutions: thread.question_resolutions.clone(),
             elapsed: thread.elapsed,
             started_at: thread.started.map(stable_timestamp),
             tool_started_at: thread
@@ -433,8 +452,31 @@ impl ThreadView {
                 .request
                 .as_ref()
                 .map(|r| (&r["id"], &r["runtimeGeneration"]));
+        if changed_request
+            && thread.request.as_ref().is_some_and(|request| {
+                self.question_resolutions.iter().any(|r| {
+                    r.request == request["id"]
+                        && matches!(r.reason.as_str(), "cancelled" | "expired")
+                        && (request["runtimeGeneration"]
+                            .as_str()
+                            .is_none_or(|generation| generation == r.generation))
+                })
+            })
+        {
+            thread.return_unsent_question_answers();
+        }
+        thread.question_resolutions = self.question_resolutions;
         thread.request = self.request;
+        thread.native.projected_approvals = self.pending_approvals;
+        thread.refresh_typing_guard();
+        thread.requests_supported = self.requests_supported;
+        thread.question_contract_supported = self.question_contract_supported;
         if changed_request {
+            thread.native.collapsed_question_id = None;
+            thread.question_drafts.clear();
+            thread.question_submission = None;
+            thread.question_submit_requested = false;
+            thread.native.approval_more = false;
             thread.reply.replace_text(
                 thread
                     .request
@@ -444,6 +486,10 @@ impl ThreadView {
             );
             thread.prepare_remote_questionnaire();
             thread.apply_projected_form(self.questionnaire)?;
+            if thread.native.questionnaire.is_some() && !thread.request_held_by_typing_guard() {
+                thread.draft.focused = false;
+                thread.reply.focused = false;
+            }
         }
         thread.elapsed = self.elapsed;
         thread.started = self
@@ -735,7 +781,7 @@ impl State {
                 }
                 thread.native.steering.clear();
                 thread.native.follow_ups.clear();
-                thread.native.questionnaire = None;
+                thread.expire_live_question("The provider session ended when Shina restarted.");
                 if thread.status.busy() || thread.configuring || thread.request.is_some() {
                     thread.resumable_run_id = thread.run_id.clone();
                     thread.native.queue_held = true;
@@ -746,7 +792,9 @@ impl State {
                         }
                     }
                     thread.configuring = false;
-                    thread.request = None;
+                    if thread.native.questionnaire.is_none() {
+                        thread.request = None;
+                    }
                     thread.started = None;
                     thread.phase.clear();
                     thread.error = Some("Shina restarted during this run. Check partial work before retrying. No prompt was replayed.".into());
@@ -1199,6 +1247,31 @@ impl State {
             if let crate::client::Event::Receipt(command, value) = &event
                 && matches!(
                     command.method.as_str(),
+                    "request.respond" | "thread.user-input.dismiss"
+                )
+            {
+                self.approval_response_receipt(command, value);
+                // Linked task cards live on their parent's machine, not the answering host.
+                for thread in self
+                    .threads
+                    .iter_mut()
+                    .chain(self.machines.threads.values_mut().flatten())
+                    .filter(|thread| thread.responding_request == Some(command.command_id))
+                {
+                    thread.responding_request = None;
+                    if value["result"]["status"] != "accepted" {
+                        thread.error = Some(
+                            value["error"]["message"]
+                                .as_str()
+                                .unwrap_or("Could not answer request.")
+                                .into(),
+                        );
+                    }
+                }
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
+                && matches!(
+                    command.method.as_str(),
                     "queue.update" | "queue.returnDraft"
                 )
             {
@@ -1516,6 +1589,11 @@ impl State {
         }
         if let Some(wait) = crate::ui::tick_portraits(self, Instant::now()) {
             tx.wake_after(wait);
+        }
+        changed |= self.poll_approval_sends();
+        changed |= self.poll_question_answers();
+        if self.approval_sends_pending() {
+            tx.wake_after(Duration::from_millis(16));
         }
         if changed {
             self.checkpoint_client();
@@ -2063,6 +2141,9 @@ impl State {
             self.machines.scope_remote.clone(),
         );
         self.checkpoint_client();
+        for thread in &mut self.threads {
+            thread.cancel_questionnaire_advance();
+        }
         self.machines.threads.insert(
             self.machines.selected.clone(),
             std::mem::take(&mut self.threads),
@@ -3267,12 +3348,29 @@ impl State {
             } else {
                 ConversationMode::Fork
             }),
+            "thread.user-input.dismiss" => {
+                if args.get("requestId").is_none_or(Value::is_null) {
+                    return Err("requestId is required.".into());
+                }
+                self.current_mut()
+                    .dismiss_message_question(&args["requestId"], &text("generation")?)?;
+            }
             "request.respond" => {
                 let input: crate::protocol::RequestResponse =
                     serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
-                let request = self.current().request.as_ref().ok_or("Request expired.")?;
+                let request = self
+                    .current()
+                    .pending_approvals()
+                    .into_iter()
+                    .find(|r| r["id"] == input.request_id)
+                    .or_else(|| {
+                        self.current()
+                            .request
+                            .clone()
+                            .filter(|r| r["id"] == input.request_id)
+                    })
+                    .ok_or("Request expired.")?;
                 if self.current().id != input.thread_id
-                    || request["id"] != input.request_id
                     || input.generation != self.current().request_generation
                 {
                     return Err("Request or runtime generation changed.".into());
@@ -3280,14 +3378,31 @@ impl State {
                 if input.session && request["method"] != "confirm" {
                     return Err("Session approval requires a confirmation request.".into());
                 }
-                if let Some(answers) = input
+                if request["method"] == "confirm" {
+                    let response = if input.session && input.response.get("decision").is_none() {
+                        crate::approval::response("acceptForSession")
+                    } else {
+                        input.response
+                    };
+                    self.respond_to_approval_id(input.thread_id, &input.request_id, response)?;
+                } else if let Some(answers) = input
                     .answers
                     .filter(Value::is_array)
                     .filter(|_| input.response["cancelled"] != true)
                 {
-                    self.current_mut().respond_projected_form(answers)?;
-                } else if input.session {
-                    self.current_mut().approve_for_session();
+                    if args.get("attachmentsByQuestionId").is_some() {
+                        self.current_mut().respond_question_with_files(
+                            answers,
+                            &args["attachmentsByQuestionId"],
+                        )?;
+                    } else {
+                        self.current_mut().respond_projected_form(answers)?;
+                    }
+                } else if input.session && input.response.get("decision").is_none() {
+                    self.respond_to_request(
+                        input.thread_id,
+                        crate::approval::response("acceptForSession"),
+                    )?;
                 } else {
                     self.respond_to_request(input.thread_id, input.response)?;
                 }
@@ -3522,6 +3637,100 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_collapse_survives_matching_projections_but_not_a_new_request_or_navigation() {
+        let mut server = Thread::new(1);
+        server.apply(
+            json!({"type":"extension_ui_request","id":"one","method":"input",
+            "questions":[{"id":"same-question","question":"Keep the draft?","options":[]}]}),
+        );
+        let mut desktop = Thread::new(1);
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        desktop.reply.replace_text("Local answer");
+        desktop.toggle_questionnaire();
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        assert!(desktop.questionnaire_collapsed());
+        assert_eq!(desktop.reply.text, "Local answer");
+        server.request.as_mut().unwrap()["id"] = json!("two");
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        assert!(!desktop.questionnaire_collapsed());
+        desktop.toggle_questionnaire();
+        assert!(desktop.questionnaire_collapsed());
+        desktop.cancel_questionnaire_advance();
+        assert!(!desktop.questionnaire_collapsed());
+    }
+
+    #[test]
+    fn question_dismissal_receipts_release_only_the_owning_lock_after_navigation() {
+        let mut state = State::new(".".into(), false);
+        let (client, mut commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"canApprove":true,
+            "capabilities":[crate::protocol::QUESTION_DISMISS]});
+        state.client = Some(client);
+        state.current_mut().apply(
+            json!({"type":"extension_ui_request","id":"dismiss","method":"input",
+            "responseCapability":{"type":"message"},
+            "questions":[{"id":"one","question":"Keep it?","options":[]}]}),
+        );
+        state.dismiss_question(1, &json!("dismiss")).unwrap();
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.method, "thread.user-input.dismiss");
+        assert_eq!(command.params["requestId"], "dismiss");
+        assert!(command.params.get("answers").is_none());
+        assert!(command.params.get("response").is_none());
+        assert_eq!(
+            state.threads[0].responding_request,
+            Some(command.command_id)
+        );
+        assert!(state.dismiss_question(1, &json!("dismiss")).is_err());
+        state.threads.push(Thread::new(2));
+        state.active = 1;
+        state.client.as_ref().unwrap().test_receipt(
+            command,
+            json!({"error":{"message":"This question has already been answered."}}),
+        );
+        state.poll_client(&mut Tx::default());
+        assert!(state.threads[0].responding_request.is_none());
+        assert!(state.threads[0].request.is_some());
+        assert_eq!(
+            state.threads[0].error.as_deref(),
+            Some("This question has already been answered.")
+        );
+        assert!(state.threads[1].error.is_none());
+    }
+
+    #[test]
+    fn cancelled_question_projections_recover_unsent_custom_text_but_answers_do_not() {
+        for cancelled in [true, false] {
+            let mut server = Thread::new(1);
+            let (pi, _commands, _) = Pi::test_connection();
+            server.pi = Some(pi);
+            server.apply(
+                json!({"type":"extension_ui_request","method":"input","id":"scoped-question",
+                "questions":[{"id":"one","question":"Answer?","options":[]}]}),
+            );
+            let mut client = Thread::new(1);
+            client.draft.replace_text("Ordinary");
+            ThreadView::capture(&server).apply(&mut client).unwrap();
+            client.reply.replace_text("Unsent local answer");
+            client.questionnaire_changed();
+            if cancelled {
+                server.apply(json!({"type":"extension_ui_cancel","id":"scoped-question"}));
+            } else {
+                server.respond(json!({"value":json!({"one":"Other client answered"}).to_string()}));
+            }
+            ThreadView::capture(&server).apply(&mut client).unwrap();
+            assert_eq!(
+                crate::composer_rich::markdown(&client.draft),
+                if cancelled {
+                    "Ordinary\n\nUnsent local answer"
+                } else {
+                    "Ordinary"
+                }
+            );
+        }
+    }
     use crate::runtime::RuntimeState;
 
     fn tab_client() -> (State, State, tokio::sync::mpsc::Receiver<Command>) {

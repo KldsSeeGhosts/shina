@@ -33,6 +33,8 @@ struct Shared {
     remote: bool,
     pairing: Arc<Mutex<server_auth::Pairing>>,
     uploads: Arc<Mutex<HashMap<String, Upload>>>,
+    answer_preparations:
+        Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<(), String>>>>>>,
     discovery: Discovery,
     directory: PathBuf,
     database: crate::database::Database,
@@ -588,6 +590,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut paged = false;
     let mut history_items = false;
     let mut deferred_work = false;
+    let mut composer_requests = false;
+    let mut approval_feedback = false;
+    let mut question_contract = false;
+    let mut question_attachments = false;
+    let mut question_dismiss = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -670,10 +677,22 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 12 { capabilities.push(protocol::PROJECT_WRITE_FILE); }
                         if minor >= 13 { capabilities.push(protocol::FRESH_CONTEXT); }
                         if minor >= 14 { capabilities.push(protocol::USAGE_LIMITS); }
+                        composer_requests = minor >= 15;
+                        if composer_requests { capabilities.push(protocol::COMPOSER_REQUESTS); }
+                        approval_feedback = minor >= 16;
+                        if approval_feedback { capabilities.push(protocol::APPROVAL_FEEDBACK); }
+                        question_contract = minor >= 17;
+                        if question_contract { capabilities.push(protocol::QUESTION_CONTRACT); }
+                        question_attachments=minor>=18;
+                        if question_attachments {capabilities.push(protocol::QUESTION_ATTACHMENTS);}
+                        question_dismiss=minor>=19;
+                        if question_dismiss {capabilities.push(protocol::QUESTION_DISMISS);}
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
                             "canUpdate":shared.database.authorize(&device,"server.requestUpdate",&json!({})).is_ok(),
+                            "canApprove":shared.database.authorize(&device,"request.respond",&json!({})).is_ok(),
+                            "canOperate":shared.database.authorize(&device,"thread.send",&json!({})).is_ok(),
                             "capabilities":capabilities,"limits":{"controlBytes":protocol::MAX_CONTROL,"outstandingCommands":32,"pageBytes":protocol::MAX_PAGE_BYTES,
                                 "historyLeaseCount":crate::history::LEASE_COUNT,"historyLeaseBytes":crate::history::LEASE_BYTES,"historyLeaseIdleSeconds":crate::history::LEASE_IDLE.as_secs(),
                                 "threadReplayEvents":crate::history::REPLAY_EVENTS,"threadReplayBytes":crate::history::REPLAY_BYTES}}))
@@ -845,6 +864,52 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             }
                         }
                     };
+                    if method == "thread.user-input.dismiss" && !question_dismiss {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["requestContract"] == true && !composer_requests {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::REQUESTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["questionContract"] == true
+                        && !question_contract {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTIONS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["questionAttachments"] == true && !question_attachments {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if method=="request.respond" && command.params.get("attachmentsByQuestionId").is_some()
+                        && shared.database.receipt(&device,command.command_id).ok().flatten().is_none() {
+                        if !question_attachments {
+                            if !send(&mut socket,protocol::response(id,Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await {break;}
+                            continue;
+                        }
+                        let params=command.params.clone();
+                        let directory=shared.directory.clone();
+                        use sha2::Digest;
+                        let key=format!("{device}:{}:{:x}",command.command_id,sha2::Sha256::digest(params.to_string().as_bytes()));
+                        let preparation={
+                            let mut preparations=shared.answer_preparations.lock().expect("answer preparations");
+                            preparations.retain(|candidate,cell|candidate==&key || cell.get().is_none());
+                            preparations.entry(key).or_default().clone()
+                        };
+                        let prepared=preparation.get_or_init(||async move {
+                            tokio::task::spawn_blocking(move ||crate::question_document::prepare_answer_attachments(&params,&directory))
+                                .await.map_err(|e|e.to_string()).and_then(|r|r)
+                        }).await;
+                        if let Err(error)=prepared {
+                            if !send(&mut socket,protocol::response(id,Err(error.clone()))).await {break;}
+                            continue;
+                        }
+                    }
+                    if method == "request.respond" && command.params["response"].get("feedback").is_some()
+                        && !approval_feedback {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
                     if method == "server.prepareRestart" {
                         let clients = {
                             let clients = shared.client_pids.lock().expect("clients");
@@ -1048,6 +1113,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         remote: false,
         pairing: Arc::default(),
         uploads: Arc::default(),
+        answer_preparations: Arc::default(),
         discovery: discovery.clone(),
         directory: directory.clone(),
         database: runtime.database.clone().expect("durable runtime"),
@@ -1348,6 +1414,7 @@ mod tests {
                 remote: true,
                 pairing: Arc::default(),
                 uploads: Arc::default(),
+                answer_preparations: Arc::default(),
                 discovery: Discovery {
                     server_id: uuid::Uuid::new_v4().to_string(),
                     instance_id: uuid::Uuid::new_v4().to_string(),

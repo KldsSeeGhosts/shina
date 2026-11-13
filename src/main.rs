@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod approval;
 mod attachments;
 mod backend;
 mod brand;
@@ -50,6 +51,7 @@ mod process;
 mod projection_store;
 mod projects;
 mod protocol;
+mod question_document;
 mod routines;
 mod runtime;
 mod server;

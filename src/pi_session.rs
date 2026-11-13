@@ -81,7 +81,12 @@ pub fn session_history(record: &mut Value) {
 
 fn approval_key(request: &Value) -> String {
     let title = string(request, "title");
-    format!("{}:{}{}", title.len(), title, string(request, "message"))
+    format!(
+        "{}:{}{}",
+        title.encode_utf16().count(),
+        title,
+        string(request, "message")
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -303,10 +308,13 @@ pub fn resolve_compatible_access_mode(
 pub struct PiSession {
     pub projected_operating: bool,
     pub projected_queued: bool,
+    pub projected_approvals: Vec<Value>,
     pub questionnaire: Option<questionnaire::Questionnaire>,
+    pub(super) question_message_connect: bool,
+    pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
-    questionnaire_replies: Vec<(String, String, String)>,
     questionnaire_advance: Option<Instant>,
+    pub(super) collapsed_question_id: Option<String>,
     pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
     pub queue_held: bool,
@@ -349,7 +357,7 @@ pub struct PiSession {
     dialog_deadline: Option<Instant>,
     dialogs: VecDeque<(Value, Option<Instant>)>,
     session_approvals: HashSet<String>,
-    dialog_status: Option<Status>,
+    pub(super) dialog_status: Option<Status>,
     pub(super) session_name: Option<String>,
     probe: Option<String>,
     request_id: Option<String>,
@@ -572,7 +580,6 @@ impl Thread {
             || self.native.lifecycle_id.is_some()
             || self.native.refreshing_session
             || self.phase == "Stopping"
-            || self.request.is_some()
             || !self.has_draft_content()
             || self.harness == "pi" && self.model_provider != "cpa"
         {
@@ -624,6 +631,7 @@ impl Thread {
         self.draft_images.clear();
         self.draft_context.clear();
         self.retained_context = Default::default();
+        self.typing_guard.on_blur_or_send();
         self.life.user_sent(lifecycle::now());
         self.drive_native();
     }
@@ -914,10 +922,23 @@ impl Thread {
     }
 
     pub(super) fn native_dialog_done(&mut self) {
+        self.question_drafts.clear();
+        self.question_submission = None;
+        self.question_submit_requested = false;
+        self.native.approval_more = false;
         self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
         self.native.questionnaire = None;
         self.native.dialog_deadline = None;
-        self.status = self.native.dialog_status.take().unwrap_or(Status::Running);
+        self.status =
+            self.native
+                .dialog_status
+                .take()
+                .unwrap_or(if self.status == Status::Waiting {
+                    Status::Running
+                } else {
+                    self.status
+                });
         while let Some((request, deadline)) = self.native.dialogs.pop_front() {
             if deadline.is_some_and(|d| d <= Instant::now()) {
                 continue;
@@ -926,7 +947,15 @@ impl Thread {
             self.native.dialog_deadline = deadline;
             self.reply.replace_text(string(&request, "prefill"));
             self.prepare_questionnaire(&request);
+            if let Some(form) = &self.native.questionnaire {
+                self.reply.replace_text(&form.answers[form.index].other);
+            }
             self.request = Some(request);
+            self.refresh_typing_guard();
+            if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+                self.draft.focused = false;
+                self.reply.focused = false;
+            }
             self.status = Status::Waiting;
             break;
         }
@@ -939,6 +968,7 @@ impl Thread {
     }
 
     pub(super) fn cancel_native_dialogs(&mut self) {
+        self.abandon_question("cancelled");
         self.cancel_questionnaire();
         for _ in 0..33 {
             if self.request.is_none() {
@@ -952,18 +982,73 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     pub fn approve_for_session(&mut self) {
-        if self.remote.is_some() {
-            self.respond(json!({"confirmed":true,"allowForSession":true}));
-            return;
+        self.respond(crate::approval::response("acceptForSession"));
+    }
+
+    pub(super) fn remember_session_approval_for(&mut self, request: &Value) {
+        self.native.session_approvals.insert(approval_key(request));
+    }
+
+    pub(crate) fn pending_approvals(&self) -> Vec<Value> {
+        let mut requests = Vec::new();
+        for request in self
+            .request
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(
+                self.native
+                    .projected_approvals
+                    .iter()
+                    .filter(|_| self.remote.is_some()),
+            )
+        {
+            if request["method"] == "confirm"
+                && !requests.iter().any(|r: &Value| r["id"] == request["id"])
+            {
+                requests.push(request.clone());
+            }
         }
-        if let Some(request) = self.request.as_ref().filter(|r| r["method"] == "confirm") {
-            self.native.session_approvals.insert(approval_key(request));
-            self.respond(json!({"confirmed":true}));
+        requests
+    }
+
+    pub(super) fn shown_approvals(&self) -> Vec<Value> {
+        self.pending_approvals()
+            .into_iter()
+            .filter(|r| {
+                let id = r["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| r.to_string());
+                !self.typing_guard.is_held(&id)
+            })
+            .collect()
+    }
+
+    pub(super) fn respond_queued_approval(
+        &mut self,
+        id: &Value,
+        response: Value,
+    ) -> Result<(), String> {
+        let at = self
+            .native
+            .dialogs
+            .iter()
+            .position(|(r, _)| r["id"] == *id && r["method"] == "confirm")
+            .ok_or("Request expired.")?;
+        let (request, deadline) = self.native.dialogs[at].clone();
+        if deadline.is_some_and(|d| d <= Instant::now()) {
+            return Err("Request expired.".into());
         }
+        self.write_approval_response(&request, response)?;
+        self.native.dialogs.remove(at);
+        self.refresh_typing_guard();
+        Ok(())
     }
 
     fn prepare_questionnaire(&mut self, request: &Value) {
+        self.native.collapsed_question_id = None;
         if !matches!(
             request["method"].as_str(),
             Some("select" | "input" | "editor")
@@ -971,17 +1056,13 @@ impl Thread {
             self.native.questionnaire = None;
             return;
         }
-        self.native.questionnaire = questionnaire::Questionnaire::parse(request).or_else(|| {
-            self.native
-                .questionnaires
-                .iter()
-                .find_map(|(id, params)| questionnaire::Questionnaire::rpiv(request, id, params))
-        });
-        // A previously focused, hidden composer must not receive questionnaire shortcuts.
-        if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
-            self.draft.focused = false;
-            self.reply.focused = false;
-        }
+        self.native.questionnaire = questionnaire::Questionnaire::parse(request)
+            .or_else(|| {
+                self.native.questionnaires.iter().find_map(|(id, params)| {
+                    questionnaire::Questionnaire::rpiv(request, id, params)
+                })
+            })
+            .or_else(|| questionnaire::Questionnaire::pi(request));
     }
     pub(super) fn prepare_remote_questionnaire(&mut self) {
         if let Some(request) = self.request.clone() {
@@ -995,6 +1076,9 @@ impl Thread {
     }
     pub(super) fn apply_projected_form(&mut self, value: Value) -> Result<(), String> {
         self.native.questionnaire = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if let Some(form) = &self.native.questionnaire {
+            self.reply.replace_text(&form.answers[form.index].other);
+        }
         Ok(())
     }
     pub(super) fn respond_projected_form(&mut self, answers: Value) -> Result<(), String> {
@@ -1009,16 +1093,21 @@ impl Thread {
             return Err("Invalid questionnaire answers.".into());
         }
         for (answer, question) in answers.iter().zip(&form.questions) {
-            if answer.other.len() > 32_768
-                || answer
-                    .selected
-                    .iter()
-                    .any(|value| !question.options.iter().any(|option| option.value == *value))
+            if answer
+                .selected
+                .iter()
+                .any(|value| !question.options.iter().any(|option| option.value == *value))
             {
                 return Err("Invalid questionnaire option.".into());
             }
         }
         form.answers = answers;
+        if !form.can_respond() {
+            return Err("This request is not resumable.".into());
+        }
+        if !form.complete() {
+            return Err("Answer each question before sending.".into());
+        }
         form.index = form.questions.len() - 1;
         self.reply.replace_text(&form.answers[form.index].other);
         self.questionnaire_step(false);
@@ -1026,8 +1115,12 @@ impl Thread {
     }
 
     pub fn questionnaire_toggle(&mut self, index: usize) {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+            return;
+        }
+        self.save_question_editor();
         if let Some(form) = &mut self.native.questionnaire {
-            form.answers[form.index].other = self.reply.text.clone();
             if form.toggle(index) {
                 self.reply.replace_text("");
                 if !form.questions[form.index].multi {
@@ -1043,48 +1136,211 @@ impl Thread {
         &mut self.reply
     }
 
+    pub fn questionnaire_changed(&mut self) {
+        self.native.questionnaire_advance = None;
+        self.save_question_editor();
+    }
+
+    pub fn questionnaire_can_respond(&self) -> bool {
+        self.responding_request.is_none()
+            && !self.request_held_by_typing_guard()
+            && self.question_submission.is_none()
+            && !self.question_submit_requested
+            && self.question_contract_supported
+            && self
+                .request
+                .as_ref()
+                .is_some_and(crate::approval::can_respond)
+            && self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.can_respond())
+    }
+
+    /// Ported from KSG ComposerPendingUserInputCard's question-scoped collapse state.
+    pub(crate) fn questionnaire_collapsed(&self) -> bool {
+        self.native.questionnaire.as_ref().is_some_and(|form| {
+            self.native.collapsed_question_id.as_deref() == Some(&form.questions[form.index].id)
+        })
+    }
+
+    pub(crate) fn toggle_questionnaire(&mut self) {
+        self.native.collapsed_question_id = if self.questionnaire_collapsed() {
+            None
+        } else {
+            self.native
+                .questionnaire
+                .as_ref()
+                .map(|form| form.questions[form.index].id.clone())
+        };
+    }
+
+    /// KSG Orchestrator.dispatchThreadUserInputDismiss. Never invokes a provider callback.
+    pub(super) fn dismiss_message_question(
+        &mut self,
+        id: &Value,
+        generation: &str,
+    ) -> Result<(), String> {
+        if !self
+            .request
+            .as_ref()
+            .is_some_and(|request| request["id"] == *id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if generation != self.request_generation {
+            return Err("Request or runtime generation changed.".into());
+        }
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|r| r["method"] == "confirm")
+            || !self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.capability == "message")
+        {
+            return Err("This question needs an answer. Answer it or stop the turn.".into());
+        }
+        if self.responding_request.is_some() || self.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        self.abandon_question("cancelled");
+        self.request = None;
+        self.native_dialog_done();
+        Ok(())
+    }
+
+    /// KSG Orchestrator.dispatchRuntimeRequestRespond's message response mode.
+    pub(super) fn respond_message_question(&mut self, response: &Value) -> bool {
+        if !self.native.questionnaire.as_ref().is_some_and(|form| {
+            form.capability == "message" || form.response_mode.as_deref() == Some("message")
+        }) {
+            return false;
+        }
+        if response["cancelled"] == true {
+            self.request = None;
+            self.native_dialog_done();
+            return true;
+        }
+        let answers: Value = response["value"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let mut replies = Vec::new();
+        for question in &self.native.questionnaire.as_ref().unwrap().questions {
+            let answer = &answers[&question.id];
+            let text = answer.as_str().map(str::to_owned).or_else(|| {
+                let values = answer.as_array()?;
+                if values.is_empty() || !values.iter().all(Value::is_string) {
+                    return None;
+                }
+                Some(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            });
+            let Some(text) = text.filter(|s| !s.trim().is_empty()) else {
+                if !question.required {
+                    continue;
+                }
+                self.error = Some("Answer each question before sending.".into());
+                return true;
+            };
+            replies.push(format!("{}\n{}", question.text, text.trim()));
+        }
+        if replies.is_empty() {
+            self.error = Some("Enter an answer before sending.".into());
+            return true;
+        }
+        self.request = None;
+        self.native_dialog_done();
+        let draft = std::mem::replace(&mut self.draft, TextEdit::new(replies.join("\n\n")));
+        let images = std::mem::take(&mut self.draft_images);
+        let context = std::mem::take(&mut self.draft_context);
+        let retained = std::mem::take(&mut self.retained_context);
+        let follow_up = self.native.follow_up;
+        self.native.follow_up = false;
+        if self.status.busy() {
+            self.send_during_run_with_fresh(None, &[], &str::to_owned, false);
+        } else {
+            self.send_with_fresh(None, &[], &str::to_owned, false);
+        }
+        self.draft = draft;
+        self.draft_images = images;
+        self.draft_context = context;
+        self.retained_context = retained;
+        self.native.follow_up = follow_up;
+        self.native.question_message_connect = self.pi.is_none() && self.queued_prompt.is_some();
+        true
+    }
+
+    pub(super) fn expire_live_question(&mut self, reason: &str) {
+        if let Some(form) = &mut self.native.questionnaire
+            && form.capability != "message"
+        {
+            form.capability = "not_resumable".into();
+            if let Some(request) = &mut self.request {
+                request["responseCapability"] = json!({"type":"not_resumable","reason":reason});
+            }
+            self.native.questionnaire_advance = None;
+        }
+    }
+
+    pub(super) fn cancel_questionnaire_advance(&mut self) {
+        self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
+    }
+
     pub fn questionnaire_step(&mut self, previous: bool) {
         self.native.questionnaire_advance = None;
+        if !self.questionnaire_can_respond() {
+            return;
+        }
+        self.save_question_editor();
         let Some(form) = &mut self.native.questionnaire else {
             return;
         };
-        form.answers[form.index].other = self.reply.text.clone();
         if previous {
             form.index = form.index.saturating_sub(1);
         } else if form.answer(form.index).is_some() {
             if form.index + 1 == form.questions.len() {
                 if let Some(response) = form.response() {
-                    let replies = form.remaining_rpc();
-                    let request = self.request.as_ref().map(|r| r["id"].clone());
-                    self.respond(response);
-                    if self.request.as_ref().map(|r| r["id"].clone()) != request {
-                        self.native.questionnaire_replies.extend(replies);
+                    if self.request_question_submission() {
+                        return;
                     }
+                    self.respond(response);
                 }
                 return;
             }
             form.index += 1;
         }
         self.reply.replace_text(&form.answers[form.index].other);
+        self.load_question_editor();
         self.reply.focused = false;
     }
 
     pub(super) fn cancel_questionnaire(&mut self) {
-        self.native.questionnaire_replies.clear();
         self.native.questionnaire_advance = None;
     }
 
     pub(super) fn refresh_typing_guard(&mut self) {
         let request_ids: Vec<String> = self
             .request
-            .as_ref()
-            .and_then(|r| {
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(self.native.projected_approvals.iter())
+            .filter_map(|r| {
                 r["id"]
                     .as_str()
                     .map(str::to_owned)
                     .or_else(|| Some(r.to_string()))
             })
-            .into_iter()
             .collect();
         self.typing_guard
             .on_requests(&request_ids, self.draft.focused, Instant::now());
@@ -1224,10 +1480,9 @@ impl Thread {
                 string(&command, "arguments")
             ));
         }
-        self.native.questionnaire = None;
+        self.expire_live_question("The provider session disconnected.");
         self.native.questionnaire_advance = None;
         self.native.questionnaires.clear();
-        self.native.questionnaire_replies.clear();
         self.native.notifications.clear();
         if !self.native.queue_held {
             self.return_local_queue();
@@ -1256,6 +1511,7 @@ impl Thread {
         self.native.dialog_deadline = None;
         self.native.dialog_status = None;
         self.native.dialogs.clear();
+        self.native.projected_approvals.clear();
         self.native.session_approvals.clear();
         self.native.probe = None;
         self.native.request_id = None;
@@ -1266,12 +1522,24 @@ impl Thread {
     }
 
     pub(super) fn native_tick(&mut self, now: Instant) -> bool {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+        }
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| form.answers[form.index].other != self.current_question_text())
+        {
+            self.save_question_editor();
+        }
         let before = self.native.notifications.len();
         self.native
             .notifications
             .retain(|(_, deadline)| *deadline > now);
         let mut changed = (before != self.native.notifications.len()) | self.tick_stop(now);
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
+            self.abandon_question("expired");
             self.cancel_questionnaire();
             self.native.dialog_deadline = None;
             self.request = None;
@@ -1287,7 +1555,12 @@ impl Thread {
             self.questionnaire_step(false);
             return true;
         }
-        changed |= self.typing_guard.release_if_idle(now);
+        let released = self.typing_guard.release_if_idle(now);
+        if released && self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+            self.draft.focused = false;
+            self.reply.focused = false;
+        }
+        changed |= released;
         changed
     }
 
@@ -1306,6 +1579,7 @@ impl Thread {
                     .as_ref()
                     .is_some_and(|request| request["id"] == record["id"])
                 {
+                    self.abandon_question("cancelled");
                     self.cancel_questionnaire();
                     self.request = None;
                     self.native_dialog_done();
@@ -1324,9 +1598,6 @@ impl Thread {
             "tool_execution_end" => {
                 if let Some(id) = record["toolCallId"].as_str() {
                     self.native.questionnaires.remove(id);
-                    self.native
-                        .questionnaire_replies
-                        .retain(|(tool, _, _)| tool != id);
                 }
             }
             "extension_ui_request" if record["method"] == "notify" => {
@@ -1793,29 +2064,6 @@ impl Thread {
                     "confirm" | "select" | "input" | "editor"
                 ) =>
             {
-                let signature = questionnaire::signature(record);
-                if let Some(at) =
-                    self.native
-                        .questionnaire_replies
-                        .iter()
-                        .position(|(tool, key, _)| {
-                            self.native.questionnaires.len() == 1
-                                && *key == signature
-                                && self.native.questionnaires.contains_key(tool)
-                                && record["timeout"].as_i64().is_none_or(|n| n >= 0)
-                        })
-                {
-                    let (_, _, value) = self.native.questionnaire_replies.remove(at);
-                    if let Some(pi) = &self.pi {
-                        if let Err(error) = pi.send(
-                            json!({"type":"extension_ui_response","id":record["id"],"value":value}),
-                        ) {
-                            self.error = Some(error);
-                        } else {
-                            return true;
-                        }
-                    }
-                }
                 if record["method"] == "confirm"
                     && self
                         .native
@@ -1852,6 +2100,7 @@ impl Thread {
                         );
                     } else {
                         self.native.dialogs.push_back((record.clone(), deadline));
+                        self.refresh_typing_guard();
                     }
                     return true;
                 }
@@ -2138,5 +2387,54 @@ impl State {
         self.select_thread(self.threads.len() - 1);
         self.connect_thread(self.active);
         self.checkpoint();
+    }
+
+    pub(crate) fn dismiss_question(
+        &mut self,
+        thread_id: usize,
+        request_id: &Value,
+    ) -> Result<(), String> {
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread_id)
+            .ok_or("The thread is unavailable.")?;
+        if !thread
+            .request
+            .as_ref()
+            .is_some_and(|r| r["id"] == *request_id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if thread.responding_request.is_some() || thread.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        if let Some(client) = &self.client {
+            if !client
+                .supports_capability(&self.machines.selected, crate::protocol::QUESTION_DISMISS)
+            {
+                return Err(crate::protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into());
+            }
+            if !client.can_approve(&self.machines.selected) {
+                return Err("This connection cannot answer requests.".into());
+            }
+            let request = thread.request.as_ref().expect("checked");
+            let generation = request["runtimeGeneration"]
+                .as_str()
+                .unwrap_or(&thread.request_generation);
+            let id = client
+                .commands_for(&self.machines.selected)
+                .ok_or("This machine is disconnected.")?
+                .send(
+                    "thread.user-input.dismiss",
+                    json!({
+                        "threadId":thread_id,"requestId":request_id,"generation":generation
+                    }),
+                )?;
+            thread.responding_request = Some(id);
+            return Ok(());
+        }
+        let generation = thread.request_generation.clone();
+        thread.dismiss_message_question(request_id, &generation)
     }
 }

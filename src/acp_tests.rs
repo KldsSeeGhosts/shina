@@ -1,7 +1,137 @@
 use super::*;
+
+#[test]
+fn antigravity_interactions_are_choice_only_questions_even_under_full_access() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.start.id = "antigravity".into();
+    client.start.link.as_mut().unwrap().access_mode = "full-access".into();
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client
+        .permission(&json!({"id":71,"params":{"sessionId":"fixture-session",
+        "toolCall":{"toolCallId":"interaction_fixture","title":"  Choose **one**. ","kind":"read"},
+        "options":[{"kind":"allow_once","optionId":" exact ","name":" First "},
+            {"kind":"reject_once","optionId":"second","name":"Second"}]}}))
+        .unwrap();
+    let request = client
+        .events
+        .last()
+        .expect("question instead of automatic approval")
+        .clone();
+    assert_eq!(request["method"], "input");
+    assert_eq!(request["questions"][0]["allowCustomAnswer"], false);
+    assert_eq!(request["questions"][0]["options"][0]["value"], " exact ");
+    assert_eq!(request["questions"][0]["question"], "Choose **one**.");
+    client
+        .command(json!({"type":"extension_ui_response","id":request["id"],
+        "value":json!({"interaction_fixture":" exact "}).to_string()}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+        " exact "
+    );
+}
 use crate::model::{Status, Thread};
 use std::sync::Arc;
 
+#[test]
+fn approval_options_and_wire_mapping_do_not_promote_decline_to_persistent_rejection() {
+    let request = json!({"id":42,"params":{"sessionId":"session",
+    "toolCall":{"toolCallId":"tool","kind":"execute","title":"Run it?"},
+    "options":[
+        {"optionId":"once","kind":"allow_once","name":"Once"},
+        {"optionId":"always","kind":"allow_always","name":"Always"},
+        {"optionId":"never","kind":"reject_always","name":"Never"}
+    ]}});
+    for (decision, expected) in [
+        ("accept", json!({"outcome":"selected","optionId":"once"})),
+        (
+            "acceptForSession",
+            json!({"outcome":"selected","optionId":"always"}),
+        ),
+        ("decline", json!({"outcome":"cancelled"})),
+        ("cancel", json!({"outcome":"cancelled"})),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.permission(&request).unwrap();
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":decision}))
+            .unwrap();
+        assert_eq!(client.wire.last().unwrap()["result"]["outcome"], expected);
+    }
+}
+
+#[test]
+fn approval_option_ids_trim_whitespace_without_changing_literal_interaction_values() {
+    let request = json!({"id":42,"params":{"sessionId":"session",
+        "toolCall":{"toolCallId":"tool","kind":"execute"},
+        "options":[{"optionId":" once ","kind":"allow_once"},
+            {"optionId":" allow-edits-session ","kind":"allow_always"},
+            {"optionId":" no ","kind":"reject_once"}]}});
+    for (decision, expected) in [
+        ("accept", "once"),
+        ("acceptForSession", "allow-edits-session"),
+        ("decline", "no"),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.permission(&request).unwrap();
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":decision}))
+            .unwrap();
+        assert_eq!(
+            client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+            expected
+        );
+    }
+    assert!(
+        acp_approval_options("grok", &request["params"])
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    let mut blank = request;
+    blank["params"]["options"][0]["optionId"] = json!("   ");
+    let mut client = Client::new(spec(SessionSource::New));
+    client.permission(&blank).unwrap();
+    let key = client.events.last().unwrap()["id"].clone();
+    client
+        .command(json!({"type":"extension_ui_response","id":key,"decision":"accept"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["outcome"],
+        "cancelled"
+    );
+}
+
+#[test]
+fn provider_approval_option_lists_preserve_warnings_and_persistent_grant_restrictions() {
+    let params = json!({"toolCall":{"toolCallId":"tool"},"options":[
+        {"kind":"allow_once","optionId":"once"},
+        {"kind":"allow_always","optionId":"always","_meta":{"agy.security.warning":{"message":" Check this grant. "}}},
+        {"kind":"reject_once","optionId":"no"}
+    ]});
+    let options = acp_approval_options("antigravity", &params).unwrap();
+    assert_eq!(
+        options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(),
+        ["Allow once", "Allow for this thread", "Deny", "Cancel"]
+    );
+    assert_eq!(options[1].warning.as_deref(), Some("Check this grant."));
+    assert!(
+        !acp_approval_options("kiro", &params)
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    assert!(
+        !acp_approval_options("grok", &params)
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    assert!(acp_approval_options("generic-acp", &params).is_none());
+}
 #[test]
 fn steering_requires_the_exact_identity_and_ownership_advertisement() {
     for advertisement in [

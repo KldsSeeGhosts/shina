@@ -4702,6 +4702,7 @@ fn toast_stack(s: &State, p: Palette, top: f32) -> El {
     for toast in s.toasts.iter().rev() {
         let id = toast.id;
         let (glyph_name, ink) = match toast.kind {
+            crate::model::ToastKind::Info => ("dot", p.sea),
             crate::model::ToastKind::Success => ("check", p.sea),
             crate::model::ToastKind::Warning => ("alert", p.brass),
             crate::model::ToastKind::Error => ("alert", p.danger),
@@ -10000,6 +10001,8 @@ fn attach_control(locked: bool, p: Palette) -> El {
 
 fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
+    let machine = s.machines.selected.clone();
+    let question = s.current().question_scope();
     let options = rune::FileDialogOptions {
         title: if folder {
             "Attach a folder"
@@ -10010,6 +10013,14 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
         ..Default::default()
     };
     let callback = move |s: &mut State, result, _: &mut Tx| {
+        if machine != s.machines.selected
+            || !s
+                .threads
+                .iter()
+                .any(|t| t.id == thread && t.question_scope() == question)
+        {
+            return;
+        }
         match result {
             Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
             Ok(None) => {}
@@ -11220,7 +11231,7 @@ fn composer(
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
     if t.native.questionnaire.is_some() && request_visible {
-        return area.child(pi_ui::questionnaire_drawer(s, p));
+        return area.child(pi_ui::questionnaire_drawer(s, p, lane));
     }
     if request_visible {
         area = area.child(dialog(s, p));
@@ -11233,12 +11244,36 @@ fn composer(
     };
     let keep_full_history = s.keep_full_history(t);
     let compacts_before_send = compact_before_send_tokens.is_some() && !keep_full_history;
+    let approval_send_allowed = t
+        .request
+        .as_ref()
+        .filter(|r| r["method"] == "confirm")
+        .is_none_or(|request| {
+            (crate::approval::can_respond(request) || crate::approval::not_resumable(request))
+                && t.requests_supported
+                && s.client.as_ref().is_none_or(|client| {
+                    (crate::approval::not_resumable(request)
+                        || client.can_approve(&s.machines.selected))
+                        && client.supports_capability(
+                            &s.machines.selected,
+                            crate::protocol::COMPOSER_REQUESTS,
+                        )
+                        && (request["responseCapability"]["supportsFeedback"] != true
+                            || client.supports_capability(
+                                &s.machines.selected,
+                                crate::protocol::APPROVAL_FEEDBACK,
+                            ))
+                })
+        });
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
         && !t.configuring
-        && !request_visible
+        && (!request_visible || t.request.as_ref().is_some_and(|r| r["method"] == "confirm"))
+        && !t.approval_send_pending()
+        && t.responding_request.is_none()
+        && approval_send_allowed
         && (!t.native.operating() || t.queued_edit.is_some())
         && (t.phase != "Stopping" || t.queued_edit.is_some())
         && !t.queued_edit_saving()
@@ -11470,6 +11505,15 @@ fn composer(
             "Open a real workspace to send messages".to_string()
         } else if let Some(machine) = s.unreachable_selected() {
             format!("{machine} is unreachable. Reconnecting.")
+        } else if request_visible && t.request.as_ref().is_some_and(|r| r["method"] == "confirm") {
+            if t.request
+                .as_ref()
+                .is_some_and(|r| r["responseCapability"]["supportsFeedback"] == true)
+            {
+                "Send feedback to decline this request".into()
+            } else {
+                "Send a message to decline and redirect the agent".into()
+            }
         } else if offered_suggestion.is_some() {
             String::new()
         } else if collapsed {
@@ -12491,6 +12535,144 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
     )
 }
 
+/// Ported from KSG Code's ComposerPendingApprovalActions.
+fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palette) -> El {
+    let Some(t) = s.threads.iter().find(|t| t.id == id) else {
+        return el();
+    };
+    let Some(request) = &t.request else {
+        return el();
+    };
+    let server = s
+        .remote_task(id)
+        .map(|r| r.server_id.as_str())
+        .unwrap_or(&s.machines.selected);
+    let disabled = !allowed
+        || !t.requests_supported
+        || t.responding_request.is_some()
+        || !crate::approval::can_respond(request)
+        || s.client.as_ref().is_some_and(|client| {
+            !client.can_approve(server)
+                || !client.supports_capability(server, crate::protocol::COMPOSER_REQUESTS)
+        });
+    let options = crate::approval::options(request);
+    let option_button = |option: &crate::approval::OptionItem| {
+        let decision = option.decision.clone();
+        let ink = if decision == "accept" {
+            p.on_coral
+        } else {
+            p.ink
+        };
+        let key = match (inline, decision.as_str()) {
+            (false, "accept") => "dialog-confirm".to_owned(),
+            (false, "acceptForSession") => "dialog-session".to_owned(),
+            (false, "cancel") => "dialog-cancel".to_owned(),
+            (false, "decline") => "dialog-decline".to_owned(),
+            (true, "accept") => format!("approve-{id}"),
+            (true, "decline") => format!("decline-{id}"),
+            _ => format!("approval-{id}-{decision}"),
+        };
+        let mut content = row().gap(4.0).center_y();
+        if option.warning.is_some() {
+            content = content.child(icon("alert", ink));
+        }
+        content = content.child(if inline {
+            label(&option.label, LABEL, ink).wrap().min_w(0.0)
+        } else {
+            label(&option.label, LABEL, ink).max_w(160.0).truncate()
+        });
+        let request_id = request["id"].clone();
+        framed(
+            row()
+                .key(&key)
+                .role("button")
+                .label(&option.label)
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .center_y()
+                .gap(4.0)
+                .px(8.0)
+                .min_h(24.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .fill(if option.decision == "accept" {
+                    p.coral
+                } else {
+                    p.card
+                })
+                .child(content),
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            if !disabled
+                && s.threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.request.as_ref())
+                    .is_some_and(|r| r["id"] == request_id)
+            {
+                let _ = s.respond_to_request(id, crate::approval::response(&decision));
+            }
+        })
+        .disabled(disabled)
+        .help(option.warning.as_deref().unwrap_or(&option.label))
+    };
+    let mut actions = row().gap(6.0).center_y().flex_wrap();
+    for option in options
+        .iter()
+        .filter(|o| matches!(o.decision.as_str(), "decline" | "accept"))
+    {
+        actions = actions.child(option_button(option));
+    }
+    let more: Vec<_> = options
+        .iter()
+        .filter(|o| !matches!(o.decision.as_str(), "decline" | "accept"))
+        .collect();
+    if !more.is_empty() {
+        let mut control = col().child(
+            button(
+                &format!("approval-more-{id}"),
+                if inline { "More" } else { "..." },
+                p,
+                move |s| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = !t.native.approval_more;
+                    }
+                },
+            )
+            .label("More approval options")
+            .disabled(disabled),
+        );
+        if t.native.approval_more {
+            let mut menu = popover(
+                &format!("approval-menu-{id}"),
+                "More approval options",
+                s,
+                p,
+            );
+            for option in more {
+                menu = menu.child(option_button(option));
+            }
+            control = control.child(
+                menu.anchored_fit(
+                    format!("approval-more-{id}"),
+                    rune::Side::Top,
+                    rune::Align::End,
+                    4.0,
+                )
+                .modal(true, move |s: &mut State| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = false;
+                    }
+                }),
+            );
+        }
+        actions = actions.child(control);
+    }
+    actions
+}
+
 fn dialog(s: &State, p: Palette) -> El {
     let t = s.current();
     let request = t.request.as_ref().expect("pending dialog");
@@ -12517,19 +12699,13 @@ fn dialog(s: &State, p: Palette) -> El {
         .border(1.0, p.line)
         .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
         .child(label(crate::model::string(request, "message"), BODY, p.ink).wrap());
+    if !t.requests_supported {
+        card = card.child(label(crate::protocol::REQUESTS_UPDATE_REQUIRED, SMALL, p.danger).wrap());
+    }
     let mut actions = row().gap(6.0).flex_wrap();
     match crate::model::string(request, "method") {
         "confirm" => {
-            actions = actions
-                .child(button("dialog-confirm", "Confirm", p, |s| {
-                    let _ = s.respond_to_request(s.current().id, json!({"confirmed":true}));
-                }))
-                .child(button("dialog-session", "Allow for session", p, |s| {
-                    let _ = s.respond_to_request(
-                        s.current().id,
-                        json!({"confirmed":true,"allowForSession":true}),
-                    );
-                }));
+            actions = approval_actions(s, t.id, false, can_answer, p);
         }
         "select" => {
             if let Some(options) = request["options"].as_array() {
@@ -12572,13 +12748,12 @@ fn dialog(s: &State, p: Palette) -> El {
             }));
         }
     }
-    card = card.child(
-        actions
-            .child(button("dialog-cancel", "Cancel", p, |s| {
-                let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
-            }))
-            .disabled(!can_answer),
-    );
+    if request["method"] != "confirm" {
+        actions = actions.child(button("dialog-cancel", "Cancel", p, |s| {
+            let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
+        }));
+    }
+    card = card.child(actions.disabled(!can_answer));
     if !linked && let Some(remote) = remote {
         card = card
             .child(
@@ -14633,7 +14808,6 @@ pub(crate) mod tests {
                 "dialog-option-1",
                 "dialog-reply",
                 "questionnaire-next",
-                "dialog-cancel",
             ] {
                 let (rect, _) = rt
                     .presented(key)
@@ -14706,6 +14880,207 @@ pub(crate) mod tests {
                     mods: Default::default()
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn choice_only_questions_and_markdown_fit_at_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"choice","method":"input",
+                "responseCapability":{"type":"live"},"questions":[{"id":"one","header":"Choice",
+                    "question":"Choose **one** option.\n\nUse `exact` values.","allowCustomAnswer":false,
+                    "options":[{"label":"A","description":"A","value":""},{"label":"B","value":" B "}]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-reply").is_none(), "{width}");
+            for key in [
+                "questionnaire-drawer",
+                "questionnaire-markdown",
+                "dialog-option-0",
+                "dialog-option-1",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-option-0");
+            assert!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .answers[0]
+                    .selected
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn question_collapse_reopens_preserves_drafts_and_blocks_hidden_shortcuts_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"collapse",
+                "method":"input","responseCapability":{"type":"message"},"questions":[
+                    {"id":"one","header":"Storage","question":"Choose **working storage**.",
+                        "multiSelect":true,"options":[{"label":"Disk"}]},
+                    {"id":"two","header":"Details","question":"Any details?","options":[]}
+                ]}));
+            rt.state.current_mut().reply.replace_text("Unsent answer");
+            rt.frame(0.0);
+            let expanded = rt.presented("questionnaire-drawer").unwrap().0;
+            press(&mut rt, "questionnaire-toggle");
+            assert!(rt.state.current().questionnaire_collapsed(), "{width}");
+            rt.frame(0.25);
+            assert!(rt.find("questionnaire-markdown").is_none());
+            assert!(rt.find("dialog-option-0").is_none());
+            assert!(rt.presented("questionnaire-summary").is_some());
+            assert!(rt.presented("questionnaire-count").is_some());
+            assert!(rt.presented("dialog-reply").is_some());
+            let collapsed = rt.presented("questionnaire-drawer").unwrap().0;
+            assert!(
+                collapsed[3] < expanded[3],
+                "{width}: {collapsed:?} {expanded:?}"
+            );
+            for key in [
+                "questionnaire-toggle",
+                "questionnaire-summary",
+                "dialog-cancel",
+            ] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5);
+                assert!(rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5);
+            }
+            assert!(!pi_ui::questionnaire_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Text("1".into()),
+                    mods: Default::default()
+                }
+            ));
+            press(&mut rt, "questionnaire-toggle");
+            rt.frame(0.25);
+            assert!(rt.presented("dialog-option-0").is_some());
+            assert_eq!(rt.state.current().reply.text, "Unsent answer");
+            press(&mut rt, "questionnaire-toggle");
+            press(&mut rt, "questionnaire-next");
+            rt.frame(0.25);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-summary").is_none());
+            rt.state.current_mut().respond(json!({"cancelled":true}));
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"new-request",
+                "method":"input","questions":[{"id":"one","question":"New request?","options":[]}]}));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-count").is_none());
+            assert!(
+                rt.find("dialog-cancel").is_none(),
+                "live questions cannot dismiss"
+            );
+        }
+    }
+
+    #[test]
+    fn question_dismissal_does_not_toggle_and_respects_responding_permissions_and_old_peers() {
+        for capability in ["message", "live", "not_resumable"] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":capability},"responseMode":"message",
+                "questions":[{"id":"one","question":"An asynchronous question?","options":[]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-cancel").is_some(), "{capability}");
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            rt.state.current_mut().responding_request = None;
+            press(&mut rt, "dialog-cancel");
+            assert_eq!(
+                rt.state.current().request.is_none(),
+                capability == "message"
+            );
+            if capability != "message" {
+                assert!(rt.presented("questionnaire-markdown").is_some());
+            }
+        }
+        for (can_approve, supports_dismissal) in [(false, true), (true, false)] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":"message"},
+                "questions":[{"id":"one","question":"Still pending?","options":[]}]}));
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            let mut capabilities = vec![
+                crate::protocol::COMPOSER_REQUESTS,
+                crate::protocol::QUESTION_CONTRACT,
+            ];
+            if supports_dismissal {
+                capabilities.push(crate::protocol::QUESTION_DISMISS);
+            }
+            *client.info.lock().unwrap() =
+                json!({"canApprove":can_approve,"capabilities":capabilities});
+            rt.state.client = Some(client);
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(commands.try_recv().is_err());
+            assert!(rt.presented("questionnaire-markdown").is_some());
+        }
+    }
+
+    #[test]
+    fn question_answer_files_fit_without_changing_the_ordinary_composer_at_all_widths() {
+        let path = crate::store::directory().unwrap().join("answer-file.txt");
+        std::fs::write(&path, "Question attachment").unwrap();
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("Ordinary draft");
+            rt.state.current_mut().apply(
+                json!({"type":"extension_ui_request","id":"files","method":"input",
+                "questions":[{"id":"one","question":"Attach the file.","options":[]}]}),
+            );
+            rt.state.attach_paths(&[path.clone()]);
+            rt.frame(0.0);
+            let key = format!("attachment-{}", rt.state.current().question_files()[0].id);
+            for key in [
+                "questionnaire-drawer",
+                "dialog-reply",
+                "attach-image",
+                key.as_str(),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[0] + rect[2] <= width + 1.0
+                        && rect[1] >= 0.0
+                        && rect[1] + rect[3] <= 721.0,
+                    "{width}: {key} {rect:?}"
+                );
+            }
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
         }
     }
 
@@ -21447,6 +21822,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn approval_options_warnings_and_responding_guards_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({
+                "type":"extension_ui_request","id":"options","method":"confirm",
+                "title":"Allow this command?","message":"Check the requested command.",
+                "approvalOptions":[
+                    {"decision":"decline","label":"Deny"},
+                    {"decision":"accept","label":"Allow once","warning":"This command changes files."},
+                    {"decision":"acceptForSession","label":"Allow for this thread","warning":"Future commands can run."},
+                    {"decision":"cancel","label":"Cancel"}
+                ]
+            }));
+            rt.frame(0.0);
+            for key in ["dialog-confirm", "dialog-decline"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            assert!(rt.find("dialog-session").is_none());
+            let id = rt.state.current().id;
+            press(&mut rt, &format!("approval-more-{id}"));
+            for key in ["dialog-session", "dialog-cancel"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-confirm");
+            assert_eq!(
+                rt.state.current().request.as_ref().unwrap()["id"],
+                "options"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_feedback_and_redirect_composer_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for feedback in [false, true] {
+                let mut rt = runtime(width);
+                rt.state.current_mut().status = Status::Running;
+                rt.state.current_mut().context_window = Some(200_000);
+                rt.state.current_mut().apply(json!({
+                    "type":"extension_ui_request","id":"send-over-approval","method":"confirm",
+                    "title":"Run this command?","message":"Check the requested command.",
+                    "responseCapability":{"type":"live","supportsFeedback":feedback}
+                }));
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("Use the safer command.");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let (rect, _) = rt.presented("send-message").unwrap();
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                press(&mut rt, "send-message");
+                assert!(
+                    rt.state.current().approval_send_pending(),
+                    "{width}: {feedback}"
+                );
+                assert_eq!(rt.state.current().draft.text, "Use the safer command.");
+                assert!(rt.state.current().request.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn command_menu_escape_dismissal_persists_until_trigger_changes_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -22555,7 +23011,7 @@ pub(crate) mod tests {
                 assert!(rt.state.current().error.is_some());
             }
 
-            // 5. Guards: empty prompt, submission_error, pending request, archived, unfocused, repeat, IME composition.
+            // 5. Guards: empty prompt, submission_error, pending question, archived, unfocused, repeat, IME composition.
             {
                 let mut rt = runtime(width);
                 rt.on_key = Some(crate::key);
@@ -22591,7 +23047,7 @@ pub(crate) mod tests {
                 assert_eq!(rt.state.current().draft.text, "Unfocused");
                 rt.state.current_mut().life.archived_at = None;
 
-                // Pending request blocks sendAndNewThread
+                // A pending question blocks sendAndNewThread. Approvals use the redirect transaction.
                 rt.state.current_mut().messages.push(crate::model::Message {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
@@ -22599,7 +23055,7 @@ pub(crate) mod tests {
                     images: vec![],
                     context: None,
                 });
-                rt.state.current_mut().request = Some(json!({"id":"r1","method":"confirm"}));
+                rt.state.current_mut().request = Some(json!({"id":"r1","method":"input"}));
                 rt.key(enter_chord(true));
                 rt.frame(0.0);
                 assert_eq!(rt.state.current().id, id);

@@ -3,10 +3,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 14;
+pub const MINOR: u32 = 19;
 pub const FRESH_CONTEXT: &str = "fresh-context";
 pub const USAGE_LIMITS: &str = "usage-limits";
 pub const PROJECT_WRITE_FILE: &str = "project-write-file";
+pub const QUESTION_DISMISS: &str = "question-dismiss-v1";
+pub const QUESTION_DISMISS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to dismiss questions.";
+pub const QUESTION_ATTACHMENTS: &str = "question-attachments-v1";
+pub const QUESTION_ATTACHMENTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to attach files to answers.";
+pub const QUESTION_CONTRACT: &str = "question-contract-v1";
+pub const QUESTIONS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer these questions.";
+pub const APPROVAL_FEEDBACK: &str = "approval-feedback-v1";
+pub const APPROVAL_FEEDBACK_UPDATE_REQUIRED: &str = "Update required. Update Shina on the client and server to send approval feedback or redirect pending approvals.";
+pub const COMPOSER_REQUESTS: &str = "composer-requests-v1";
+pub const REQUESTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer composer requests.";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
@@ -88,7 +102,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "blobs.read"
         | "filesystem.browse"
         | "usage.limits" => "read",
-        "request.respond" => "approve",
+        "request.respond" | "thread.user-input.dismiss" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "peer.link"
