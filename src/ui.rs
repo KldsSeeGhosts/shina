@@ -17,6 +17,8 @@ mod attachment_archive_preview;
 mod attachment_notebook_preview;
 #[path = "attachment_preview.rs"]
 pub(crate) mod attachment_preview;
+#[path = "attachment_source_highlight.rs"]
+mod attachment_source_highlight;
 #[path = "attachment_sqlite_preview.rs"]
 mod attachment_sqlite_preview;
 #[path = "attachment_table_preview.rs"]
@@ -17006,6 +17008,24 @@ pub(crate) mod tests {
             press(&mut rt, "notebook-more");
             assert!(rt.presented("notebook-cell-39").is_some(), "{width}");
             assert!(rt.presented("notebook-cell-40").is_none(), "{width}");
+        }
+    }
+
+    #[test]
+    fn source_attachment_preview_renders_text_rows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let path = rt.state.data_dir.join("sample.rs");
+            std::fs::write(&path, "fn main() {\n    let x = 1;\n}\n").unwrap();
+            let source = crate::attachments::attach_file(&path).unwrap();
+            rt.state.current_mut().draft_images = vec![source.clone()];
+            rt.state
+                .preview_attachments(vec![source.clone()], &source.id, true);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.0);
+            assert!(rt.presented("attachment-text-rows").is_some(), "{width}");
+            assert!(rt.presented("attachment-text-row-0").is_some(), "{width}");
         }
     }
 

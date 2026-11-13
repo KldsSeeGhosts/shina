@@ -290,8 +290,8 @@ Item 1 also retains the permitted Windows HEIC/HEIF gap.
   KSG, and the cells draw in an absolutely positioned overlay under the
   virtual rows because Rune keeps mounted row subtrees across scrolls;
   measurement approximates the browser's automatic table layout rather than
-  running it. Small source previews do not yet use KSG-equivalent
-  syntax highlighting.
+  running it. Source previews are now coloured per line by file extension with
+  the conversation's highlighter, so multi-line constructs are coloured per line.
 - Archive previews now use the already-locked `flate2` 1.1.11 and `crc32fast`
   1.5.4 as direct dependencies. ZIP/JAR, TAR and gzip/TGZ are implemented with
   bounded decoding, ZIP64 directory checks, GNU long names and PAX metadata.

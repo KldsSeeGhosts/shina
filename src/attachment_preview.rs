@@ -359,7 +359,9 @@ impl Preview {
                     None
                 };
                 let streaming = kind(&attachment.name, &attachment.mime) == Kind::Text
-                    && (attachment.bytes > 1024 * 1024 || delimiter.is_some());
+                    && (attachment.bytes > 1024 * 1024
+                        || delimiter.is_some()
+                        || attachment_source_highlight::language_for(&attachment.name).is_some());
                 if streaming {
                     let result = (|| -> Result<_, String> {
                         let mut bytes = Vec::new();
@@ -2097,22 +2099,44 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                                 .wrap();
                                         }
                                     };
+                                    let p = palette(s.dark);
+                                    let language = attachment_source_highlight::language_for(
+                                        &preview.selected().name,
+                                    );
                                     let mut line = row().min_h(29.0).min_w(0.0).child(
-                                        label(format!("{}", i + 1), SMALL, palette(s.dark).muted)
+                                        label(format!("{}", i + 1), SMALL, p.muted)
                                             .w(56.0)
                                             .px(8.0)
                                             .py(6.0),
                                     );
                                     for cell in cells {
-                                        let label = label(
+                                        let spans: Vec<rune::text::Span> = language
+                                            .map(|lang| {
+                                                attachment_source_highlight::line_spans(
+                                                    lang, &cell, s.dark, p,
+                                                )
+                                                .into_iter()
+                                                .map(|span| {
+                                                    let mut sp =
+                                                        rune::text::Span::new(span.start, span.end);
+                                                    sp.color = Some(span.color);
+                                                    sp
+                                                })
+                                                .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        let mut label = label(
                                             cell,
                                             TextStyle::new(12.0, 400.0)
                                                 .family(rune::Family::SystemMono),
-                                            palette(s.dark).ink,
+                                            p.ink,
                                         )
                                         .px(12.0)
                                         .py(6.0)
                                         .selectable(true);
+                                        if !spans.is_empty() {
+                                            label = label.spans(spans);
+                                        }
                                         line = line.child(if preview.wrap {
                                             label.w(0.0).grow(1.0).min_w(0.0).wrap_anywhere()
                                         } else {
