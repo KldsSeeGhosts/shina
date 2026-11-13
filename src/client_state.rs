@@ -154,6 +154,8 @@ struct ThreadView {
     #[serde(default)]
     continuation_of_run_id: Option<String>,
     #[serde(default)]
+    prompt_suggestion: Option<PromptSuggestion>,
+    #[serde(default)]
     run_control_supported: bool,
     #[serde(default)]
     turn_capabilities: Option<TurnCapabilities>,
@@ -275,6 +277,7 @@ impl ThreadView {
             run_id: thread.run_id.clone(),
             resumable_run_id: thread.resumable_run_id.clone(),
             continuation_of_run_id: thread.continuation_of_run_id.clone(),
+            prompt_suggestion: thread.prompt_suggestion.clone(),
             run_control_supported: true,
             turn_capabilities: Some(thread.turn_capabilities()),
             steering: thread.native.steering.clone(),
@@ -302,6 +305,7 @@ impl ThreadView {
         thread.run_id = self.run_id;
         thread.resumable_run_id = self.resumable_run_id;
         thread.continuation_of_run_id = self.continuation_of_run_id;
+        thread.prompt_suggestion = self.prompt_suggestion;
         thread.run_control_supported = self.run_control_supported;
         let old_messages = std::mem::take(&mut thread.messages);
         thread.messages = self
@@ -3152,6 +3156,16 @@ impl State {
                     defaults.access = clamped.id().into();
                 }
                 self.thread_defaults = defaults;
+                for thread in &mut self.threads {
+                    thread.prompt_suggestions_enabled =
+                        self.thread_defaults.prompt_suggestions_enabled && !thread.delegated;
+                    if thread.harness == "codex" && thread.pi.is_some() && !thread.delegated {
+                        let _ = thread.command(
+                            "set_prompt_suggestions",
+                            json!({"enabled": self.thread_defaults.prompt_suggestions_enabled}),
+                        );
+                    }
+                }
                 self.checkpoint();
             }
             "settings.defaultHarness" => {

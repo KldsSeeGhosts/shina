@@ -145,6 +145,8 @@ fn policy(access: &str) -> (&'static str, &'static str, &'static str, Value) {
     }
 }
 
+const PROMPT_SUGGESTION_PROMPT: &str = "Predict the next message the user will send in this conversation. Reply with only that message, written as the user would type it, in under 20 words. Do not use tools. If there is no clear next step, reply with nothing.";
+
 struct Pending {
     request: Value,
     deadline: Instant,
@@ -202,10 +204,15 @@ struct Client {
     history_cursors: HashSet<String>,
     child_parents: HashMap<String, String>,
     goal: Value,
+    prompt_suggestions: bool,
+    active_run_id: Option<String>,
+    settled_run_id: Option<String>,
+    turn_serial: u64,
 }
 
 impl Client {
     fn new(start: Start) -> Self {
+        let prompt_suggestions = start.prompt_suggestions;
         Self {
             start,
             session: None,
@@ -252,6 +259,10 @@ impl Client {
             history_cursors: HashSet::new(),
             child_parents: HashMap::new(),
             goal: Value::Null,
+            prompt_suggestions,
+            active_run_id: None,
+            settled_run_id: None,
+            turn_serial: 0,
         }
     }
 
@@ -419,6 +430,9 @@ impl Client {
                     return Ok(());
                 }
                 self.reject(&request["original"], error);
+                return Ok(());
+            }
+            if kind == "prompt_suggestion" {
                 return Ok(());
             }
             self.reject(&request, error);
@@ -671,6 +685,23 @@ impl Client {
                 self.begin_hydration(result.clone(), request)?;
             }
             "steer" => self.reply(&request["original"], json!({})),
+            "prompt_suggestion" => {
+                let req_run_id = request["runId"].as_str();
+                if !self.running
+                    && self.settled_run_id.is_some()
+                    && req_run_id == self.settled_run_id.as_deref()
+                {
+                    let text = result["text"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    self.events.push(json!({
+                        "type": "prompt_suggestion",
+                        "runId": req_run_id,
+                        "text": text,
+                    }));
+                }
+            }
             _ => self.reply(&request, result.clone()),
         }
         Ok(())
@@ -1131,6 +1162,10 @@ impl Client {
                         .push(json!({"type":"agent_settled","aborted":true}));
                 }
             }
+            "set_prompt_suggestions" => {
+                self.prompt_suggestions = record["enabled"] == true;
+                self.reply(&record, json!({}));
+            }
             "prompt" if self.running => {
                 // KSG uses turn/steer with expectedTurnId. Follow-ups retain FIFO ordering.
                 if record["streamingBehavior"] == "steer"
@@ -1246,6 +1281,14 @@ impl Client {
         self.cancelling = false;
         self.interrupt_sent = false;
         self.turn = None;
+        self.turn_serial += 1;
+        self.active_run_id = Some(
+            record["runId"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("codex-turn-{}", self.turn_serial)),
+        );
+        self.settled_run_id = None;
         self.events.push(json!({"type":"agent_start"}));
         self.request("turn/start", params, record);
         Ok(())
@@ -1498,6 +1541,11 @@ impl Client {
                         self.item(item, true, true);
                     }
                 }
+                let was_compacting = self.compacting;
+                let turn_id = turn["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| self.turn.clone());
                 if self.compacting {
                     self.end_compaction(self.compaction_outcome(turn), true);
                 }
@@ -1525,6 +1573,28 @@ impl Client {
                 self.running = false;
                 self.turn = None;
                 self.cancelling = false;
+                if !aborted && !failed && !was_compacting && self.queued.is_empty() {
+                    let run_id = self.active_run_id.take().or_else(|| turn_id.clone());
+                    self.settled_run_id = run_id.clone();
+                    if self.prompt_suggestions
+                        && let (Some(run_id), Some(turn_id), Some(session_id)) =
+                            (run_id, turn_id, self.session.clone())
+                    {
+                        self.request(
+                            "thread/sample",
+                            json!({
+                                "threadId": session_id,
+                                "expectedTurnId": turn_id,
+                                "prompt": PROMPT_SUGGESTION_PROMPT,
+                                "effort": "low",
+                            }),
+                            json!({"type": "prompt_suggestion", "runId": run_id}),
+                        );
+                    }
+                } else {
+                    self.active_run_id = None;
+                    self.settled_run_id = None;
+                }
                 self.events
                     .push(json!({"type":"agent_settled","aborted":aborted}));
                 if !aborted
@@ -2229,11 +2299,11 @@ fn run_mode(
                     pending.deadline = Instant::now() + Duration::from_secs(30);
                 }
             }
-            if client
+            let now = Instant::now();
+            client
                 .pending
-                .values()
-                .any(|p| Instant::now() >= p.deadline)
-            {
+                .retain(|_, p| !(p.request["type"] == "prompt_suggestion" && now >= p.deadline));
+            if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Codex did not acknowledge an operation within 30 seconds.".into());
             }
             for record in std::mem::take(&mut client.wire) {

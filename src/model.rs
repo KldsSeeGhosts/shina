@@ -479,12 +479,21 @@ pub struct BriefUi {
     pub demo_status: Option<background::BackgroundStatus>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSuggestion {
+    pub run_id: String,
+    pub text: String,
+}
+
 pub struct Thread {
     pub peer_origin: Option<PeerOrigin>,
     pub stop_serial: u64,
     pub run_id: Option<String>,
     pub resumable_run_id: Option<String>,
     pub continuation_of_run_id: Option<String>,
+    pub prompt_suggestion: Option<PromptSuggestion>,
+    pub(crate) prompt_suggestions_enabled: bool,
     pub stop_control: StopControl,
     run_control_supported: bool,
     resume_command: Option<uuid::Uuid>,
@@ -816,6 +825,8 @@ impl Thread {
             run_id: None,
             resumable_run_id: None,
             continuation_of_run_id: None,
+            prompt_suggestion: None,
+            prompt_suggestions_enabled: false,
             stop_control: StopControl::default(),
             run_control_supported: true,
             resume_command: None,
@@ -991,6 +1002,7 @@ impl Thread {
                 link: self.host.clone(),
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
+                prompt_suggestions: self.prompt_suggestions_enabled && !self.delegated,
             },
             wake,
         ) {
@@ -1132,9 +1144,25 @@ impl Thread {
         })
     }
 
+    pub fn set_machine(&mut self, machine: impl Into<String>) {
+        let machine = machine.into();
+        if self.machine != machine {
+            self.machine = machine;
+            self.prompt_suggestion = None;
+        }
+    }
+
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
-        if kind == "prompt" && self.harness == "codex" {
-            data["serviceTier"] = self.harness_state["serviceTier"].clone();
+        if kind == "prompt" {
+            self.prompt_suggestion = None;
+            if data.get("runId").is_none()
+                && let Some(run_id) = &self.run_id
+            {
+                data["runId"] = json!(run_id);
+            }
+            if self.harness == "codex" {
+                data["serviceTier"] = self.harness_state["serviceTier"].clone();
+            }
         }
         self.track_learned_turn(kind, &data);
         let context = if kind == "prompt" {
@@ -1307,6 +1335,7 @@ impl Thread {
         self.run_id = Some(uuid::Uuid::new_v4().to_string());
         self.resumable_run_id = None;
         self.continuation_of_run_id = None;
+        self.prompt_suggestion = None;
         self.stop_control = StopControl::default();
         self.native.initial_user = true;
         self.queued_prompt = Some((prompt.clone(), self.messages.len()));
@@ -1540,6 +1569,10 @@ impl Thread {
             return false;
         }
         let text = self.pending_injections[0].text.clone();
+        if !self.status.busy() || self.run_id.is_none() {
+            self.run_id = Some(uuid::Uuid::new_v4().to_string());
+            self.prompt_suggestion = None;
+        }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
         if !self.command(
             "prompt",
@@ -2426,6 +2459,7 @@ impl Thread {
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
                 }
+                self.prompt_suggestion = None;
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
                 self.assistant = None;
@@ -2453,6 +2487,9 @@ impl Thread {
                 // A stopped run is idle, not a finished task.
                 if aborted && self.status == Status::Completed {
                     self.status = Status::Ready;
+                }
+                if aborted || self.status != Status::Completed {
+                    self.prompt_suggestion = None;
                 }
                 self.complete_task(if aborted {
                     "cancelled"
@@ -2605,6 +2642,24 @@ impl Thread {
                     self.status = Status::Waiting;
                 } else if record["method"] == "set_editor_text" {
                     self.draft.replace_text(string(&record, "text"));
+                }
+            }
+            "prompt_suggestion" => {
+                let event_run_id = record["runId"].as_str();
+                if !self.status.busy()
+                    && self.status == Status::Completed
+                    && self.run_id.is_some()
+                    && event_run_id == self.run_id.as_deref()
+                    && crate::harness::supports_prompt_suggestions(&self.harness)
+                {
+                    self.prompt_suggestion = record["text"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| PromptSuggestion {
+                            run_id: event_run_id.unwrap().to_owned(),
+                            text: text.to_owned(),
+                        });
                 }
             }
             _ => {}
@@ -5542,6 +5597,9 @@ impl State {
             return;
         };
         let thread = &mut self.threads[index];
+        if thread.harness != harness {
+            thread.prompt_suggestion = None;
+        }
         thread.harness = harness.into();
         thread.models = models.clone();
         thread.model_provider = model.provider.clone();
@@ -5596,7 +5654,7 @@ impl State {
             thread.harness = self.default_harness.clone();
             thread.project = project;
             if let Some(project) = self.project(project) {
-                thread.machine = project.machine.clone();
+                thread.set_machine(project.machine.clone());
             }
             self.threads.push(thread);
             self.next_id += 1;
@@ -5673,7 +5731,7 @@ impl State {
             thread.captain_home = true;
             thread.native.access = AccessMode::ReadOnly;
             thread.project = project_id;
-            thread.machine = machine;
+            thread.set_machine(machine);
             self.threads.push(thread);
         }
         let index = self
@@ -6140,7 +6198,9 @@ impl State {
                 access_mode: self.threads[index].native.access.id().into(),
             })
         });
+        let prompt_suggestions_enabled = self.thread_defaults.prompt_suggestions_enabled;
         let thread = &mut self.threads[index];
+        thread.prompt_suggestions_enabled = prompt_suggestions_enabled && !thread.delegated;
         match host {
             Ok(host) => thread.host = Some(host),
             Err(error) => {
@@ -8677,6 +8737,12 @@ impl State {
                     {
                         thread.context.usage.breakdown = parsed;
                     }
+                    if let Some(suggestion) = record.get("promptSuggestion")
+                        && let Ok(parsed) =
+                            serde_json::from_value::<Option<PromptSuggestion>>(suggestion.clone())
+                    {
+                        thread.prompt_suggestion = parsed;
+                    }
                     if thread.harness == "codex" {
                         thread.harness_state["serviceTier"] = record["serviceTier"].clone();
                     }
@@ -9533,6 +9599,7 @@ impl Thread {
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,
             "contextBreakdown":self.context.usage.breakdown,
+            "promptSuggestion":self.prompt_suggestion,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
         record
@@ -15811,5 +15878,46 @@ mod tests {
         let old_wire = json!({"tokens": 1000, "context_window": 200000, "percent": 0.5});
         let decoded: crate::context::ContextUsage = serde_json::from_value(old_wire).unwrap();
         assert_eq!(decoded.breakdown, None);
+    }
+
+    #[test]
+    fn prompt_suggestion_metadata_round_trip_and_legacy_decode() {
+        let mut state = State::new(".".into(), false);
+        let suggestion = PromptSuggestion {
+            run_id: "run-42".into(),
+            text: "Run the test suite".into(),
+        };
+        state.current_mut().run_id = Some("run-42".into());
+        state.current_mut().prompt_suggestion = Some(suggestion.clone());
+        let with_suggestion = state.snapshot();
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_suggestion).unwrap();
+        assert_eq!(
+            restored.current().prompt_suggestion,
+            Some(suggestion.clone())
+        );
+
+        // Removing promptSuggestion simulates an older peer / legacy index.
+        let mut legacy = with_suggestion;
+        legacy["threads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("promptSuggestion");
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().prompt_suggestion, None);
+
+        // Without suggestion on the thread, round-trip stays None.
+        state.current_mut().prompt_suggestion = None;
+        let without_suggestion = state.snapshot();
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_suggestion).unwrap();
+        assert_eq!(restored_none.current().prompt_suggestion, None);
+
+        // Changing machine clears the suggestion.
+        state.current_mut().prompt_suggestion = Some(suggestion);
+        state.current_mut().set_machine("remote-host");
+        assert_eq!(state.current().prompt_suggestion, None);
     }
 }
