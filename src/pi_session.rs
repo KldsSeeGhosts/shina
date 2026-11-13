@@ -354,7 +354,17 @@ impl Thread {
     }
 
     /// Unlike the initial prompt, a steering submission must not reset the current run.
+    #[cfg(test)]
     pub fn send_during_run(&mut self) {
+        self.send_during_run_with_peers(None, &[], &str::to_owned);
+    }
+
+    pub(crate) fn send_during_run_with_peers(
+        &mut self,
+        target_server_id: Option<&str>,
+        peers: &[crate::peer::Peer],
+        machine_name: &dyn Fn(&str) -> String,
+    ) {
         if self.initializing
             || self.configuring
             || self.native.lifecycle_id.is_some()
@@ -371,7 +381,15 @@ impl Thread {
             self.attachment_error = Some(self.image_model_error());
             return;
         }
-        let prompt = match crate::composer_tokens::prompt(&self.draft, &self.draft_images) {
+        let prompt = match crate::composer_tokens::prompt_for_target(
+            &self.draft,
+            &self.draft_images,
+            &self.draft_context,
+            Some(&self.machine),
+            target_server_id,
+            peers,
+            machine_name,
+        ) {
             Ok(prompt) => prompt,
             Err(error) => {
                 self.attachment_error = Some(error);
@@ -400,6 +418,8 @@ impl Thread {
         self.paste_history = Default::default();
         self.draft.replace_text("");
         self.draft_images.clear();
+        self.draft_context.clear();
+        self.retained_context = Default::default();
         self.life.user_sent(lifecycle::now());
         self.drive_native();
     }
@@ -890,10 +910,10 @@ impl Thread {
 
     pub(super) fn pending_inputs_value(&self) -> Value {
         let mut values: Vec<_> = self.native.sends.iter().chain(&self.native.queued_inputs).chain(&self.native.recovery).map(|s| json!({
-            "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft
+            "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft,"context":s.prompt.context
         })).collect();
         values.extend(self.native.queue.iter().map(|q| json!({"kind":"queued","inputId":q.id,
-            "held":self.native.queue_held,"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft})));
+            "held":self.native.queue_held,"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft,"context":q.prompt.context})));
         json!(values)
     }
 
@@ -918,10 +938,16 @@ impl Thread {
             if images.len() != saved_images.len() {
                 self.attachment_error = Some("Some queued images are missing. Reattach them before sending the recovered draft.".into());
             }
-            let prompt = crate::composer_tokens::received_prompt(
+            let context = item
+                .get("context")
+                .filter(|v| !v.is_null())
+                .map(crate::composer_context::decode_message_context)
+                .transpose()?;
+            let prompt = crate::composer_tokens::received_prompt_with_context(
                 text.into(),
                 images,
                 item.get("draft").cloned(),
+                context,
             )?;
             if item["kind"] == "queued" {
                 let id = item["inputId"]
@@ -1433,6 +1459,7 @@ impl Thread {
                     role: "Shina",
                     text: content_text(&record["message"]["content"]),
                     images: content_images(&record["message"]["content"]),
+                    context: None,
                 });
             }
             "message_update" => {
@@ -1480,6 +1507,7 @@ impl Thread {
                             role: "Shina",
                             text,
                             images: content_images(&message["content"]),
+                            context: None,
                         });
                     }
                     return false;
@@ -1507,6 +1535,7 @@ impl Thread {
                     role: "You",
                     text: original.text,
                     images: original.images.to_vec(),
+                    context: original.context,
                 });
             }
             "extension_error" => {
@@ -1521,6 +1550,7 @@ impl Thread {
                     role: "Shina",
                     text: message,
                     images: vec![],
+                    context: None,
                 });
                 return true;
             }

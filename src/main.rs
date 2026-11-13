@@ -11,6 +11,7 @@ mod client;
 mod client_history;
 mod codex;
 mod composer;
+mod composer_context;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;
@@ -101,6 +102,9 @@ fn init() -> State {
 }
 
 pub(crate) fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if ui::transcript_context::copy_selection(state, event, tx) {
+        return true;
+    }
     key_inner(
         state,
         event,
@@ -188,6 +192,7 @@ fn composer_controls_blocked(state: &State) -> bool {
         || state.settings.archive.is_some()
         || state.rename_thread.is_some()
         || state.delete_thread.is_some()
+        || state.confirm_remove_attachment.is_some()
         || t.native.conversation.is_some()
         || t.native.questionnaire.is_some()
 }
@@ -543,6 +548,7 @@ fn html_demo(state: &mut State) {
         role: "You",
         text: "Show an example HTML chart.".into(),
         images: vec![],
+        context: None,
     }];
     thread.tools.clear();
     thread.thoughts.clear();
@@ -607,8 +613,8 @@ fn markdown_demo(state: &mut State) {
     thread.work.clear();
     thread.captain = None;
     thread.messages = vec![
-        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Keep the setup order:\nattach the listener\nopen the socket\n\n```rust\nlet ready = true;\n```".into(), images: vec![] },
-        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "Register the listener before opening the socket.\n\n```rust\nlet ready = true;\nif ready {\n    socket.open();\n}\n```\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nBoth blocks have a code-only copy action.".into(), images: vec![] },
+        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Keep the setup order:\nattach the listener\nopen the socket\n\n```rust\nlet ready = true;\n```".into(), images: vec![], context: None },
+        model::Message { id: uuid::Uuid::new_v4().to_string(), role: "Pi", text: "Register the listener before opening the socket.\n\n```rust\nlet ready = true;\nif ready {\n    socket.open();\n}\n```\n\n```diff\n- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();\n```\n\nBoth blocks have a code-only copy action.".into(), images: vec![], context: None },
     ];
 }
 
@@ -628,11 +634,13 @@ fn captain_workspace_demo(state: &mut State) {
             role: "You",
             text: "Refine the sidebar and composer. Keep our captains and existing animations, but give each kind of work one clear place.".into(),
             images: vec![],
+            context: None,
         },
         model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "The workspace filter now applies to every conversation.\n\nI'll keep the sidebar review and reconnect fix under this captain. Independent conversations stay in the thread list, with the same pin, snooze, and settle controls.\n\nThe sidebar review needs your approval. You can open the worker directly without leaving this body of work.".into(),
             images: vec![],
+            context: None,
         },
     ];
     for id in [1, 2] {
@@ -766,6 +774,7 @@ fn crew_tasks_demo(state: &mut State) {
             role: "Pi",
             text: plan.into(),
             images: vec![],
+            context: None,
         },
         model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Shina",
@@ -777,11 +786,13 @@ Last reply:
 Reconnect now retries with backoff and keeps the draft. I added a regression test for a dropped socket, and `cargo test` passes.
 Error: none".into(),
             images: vec![],
+            context: None,
         },
         model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
             text: "The reconnect fix is in and tested. The sidebar review is waiting on your approval below, and the crew tray notes start when a slot frees up.".into(),
             images: vec![],
+            context: None,
         },
     ];
     home.tools = [1, 2, 16, 17, 18, 19]
@@ -902,6 +913,7 @@ fn captain_brief_demo(state: &mut State) {
         role: "You",
         text: "Example message in an earlier conversation.".into(),
         images: vec![],
+        context: None,
     }];
     state.threads.push(earlier);
     state.brief.demo_status = Some(model::BackgroundStatus {
@@ -1186,6 +1198,7 @@ fn main() {
 
 Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                         images: vec![],
+                        context: None,
                     },
                 ];
             }),

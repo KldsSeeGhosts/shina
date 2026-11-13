@@ -901,6 +901,88 @@ mod tests {
         runtime
     }
     #[test]
+    fn row_storage_committed_snapshot_restores_message_draft_and_queue_context() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let directory = runtime.state.data_dir.clone();
+        let record = crate::composer_context::thread_context_record("local", 1, "Reference");
+        let text = format!(
+            "See [Reference]({})",
+            crate::composer_context::format_composer_context_href("thread", &record.context_id)
+        );
+        let context = crate::composer_context::MessageContext {
+            version: 1,
+            records: vec![record.clone()],
+        };
+        let thread = runtime.state.current_mut();
+        thread.messages.push(crate::model::Message {
+            id: "context-message".into(),
+            role: "You",
+            text: text.clone(),
+            images: vec![],
+            context: Some(context.clone()),
+        });
+        thread.draft = crate::composer_rich::draft_from_canonical(&text);
+        thread.draft_context = vec![record.clone()];
+        let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+            &thread.draft,
+            &[],
+            &thread.draft_context,
+        );
+        let mut prompt = crate::attachments::Prompt::new(text.clone(), vec![]);
+        prompt.context = Some(context.clone());
+        prompt.draft = Some(snapshot);
+        thread
+            .native
+            .queue
+            .push_back(crate::model::pi_session::QueuedMessage { id: 7, prompt });
+        database.begin().unwrap();
+        database
+            .write("ui.json", runtime.state.ui_snapshot())
+            .unwrap();
+        runtime.persist(None, vec![]).unwrap();
+        let committed = database.committed_snapshot().unwrap();
+        assert_eq!(
+            committed["state"]["threads"][0]["messages"][0]["id"],
+            "context-message"
+        );
+        assert_eq!(
+            committed["state"]["threads"][0]["messages"][0]["context"],
+            json!(context)
+        );
+        drop(runtime);
+        drop(database);
+
+        let database = crate::database::Database::open(&directory).unwrap();
+        let committed = database.committed_snapshot().unwrap();
+        assert_eq!(
+            committed["state"]["threads"][0]["messages"][0]["context"],
+            json!(context)
+        );
+        let mut restored = State::headless(directory);
+        restored.setup_runtime(std::sync::Arc::new(|| {})).unwrap();
+        restored
+            .restore_ui(&database.read("ui.json").unwrap().unwrap())
+            .unwrap();
+        let thread = restored.current();
+        assert_eq!(thread.messages[0].id, "context-message");
+        assert_eq!(thread.messages[0].context, Some(context.clone()));
+        assert_eq!(thread.draft_context, vec![record]);
+        assert_eq!(crate::composer_rich::markdown(&thread.draft), text);
+        assert_eq!(thread.native.queue.len(), 1);
+        assert_eq!(thread.native.queue[0].prompt.context, Some(context.clone()));
+        assert_eq!(
+            thread.native.queue[0]
+                .prompt
+                .draft
+                .as_ref()
+                .unwrap()
+                .context,
+            context.records
+        );
+    }
+
+    #[test]
     fn startup_reports_an_accepted_update_interrupted_before_helper_handoff() {
         let directory = crate::store::directory().unwrap();
         let db = crate::database::Database::open(&directory).unwrap();

@@ -7,6 +7,7 @@ use crate::{composer::Trigger, composer_tokens::Token};
 enum Action {
     Slash(String),
     Pill(Token, String),
+    Context(crate::composer_context::ComposerContextRecord, String),
 }
 
 struct Item {
@@ -188,20 +189,36 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
         })
         .take(40)
     {
+        let env_id = s.machine_identity(&thread.machine);
+        let record =
+            crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
         items.push(Item {
             label: thread.title.clone(),
             description: format!("Thread {}", thread.id),
             source: "Thread".into(),
-            action: Action::Pill(
-                Token::Thread {
-                    id: thread.id,
-                    title: thread.title.clone(),
-                    machine: Some(thread.machine.clone()),
-                    extra: Default::default(),
-                },
-                thread.title.clone(),
-            ),
+            action: Action::Context(record, thread.title.clone()),
         });
+    }
+    for (machine, remote_threads) in &s.machines.threads {
+        if machine == &s.machines.selected {
+            continue;
+        }
+        let env_id = s.machine_identity(machine);
+        let machine_name = s.machine_label(machine);
+        for thread in remote_threads
+            .iter()
+            .filter(|other| other.title.to_lowercase().contains(&query))
+            .take(40)
+        {
+            let record =
+                crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
+            items.push(Item {
+                label: thread.title.clone(),
+                description: format!("Thread {}", thread.id),
+                source: format!("Thread · {machine_name}"),
+                action: Action::Context(record, thread.title.clone()),
+            });
+        }
     }
     (items, notes)
 }
@@ -216,6 +233,31 @@ fn select(s: &mut State, action: Action) {
             let edit = &mut s.current_mut().draft;
             edit.undo_group(|edit| {
                 edit.replace_with_pill(trigger.range, token.id(), &label);
+                edit.insert(" ");
+            });
+            s.restore_composer_focus(composer_ui::FocusReason::Inserted);
+            s.checkpoint();
+        }
+        Action::Context(record, label) => {
+            let Some(trigger) = trigger(s) else {
+                return;
+            };
+            let pill_id = crate::composer_context::format_composer_context_href(
+                record.kind(),
+                &record.context_id,
+            );
+            let thread = s.current_mut();
+            if let Some(existing) = thread
+                .draft_context
+                .iter_mut()
+                .find(|r| r.context_id == record.context_id)
+            {
+                *existing = record;
+            } else {
+                thread.draft_context.push(record);
+            }
+            thread.draft.undo_group(|edit| {
+                edit.replace_with_pill(trigger.range, pill_id, &label);
                 edit.insert(" ");
             });
             s.restore_composer_focus(composer_ui::FocusReason::Inserted);
@@ -386,6 +428,9 @@ pub(super) fn key(s: &mut State, event: &rune::KeyEvent) -> bool {
 }
 
 pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
+    if let Some((kind, _)) = crate::composer_context::parse_composer_context_href(id) {
+        return Some(context_kind_icon(&kind, false));
+    }
     Some(match Token::decode(id)? {
         Token::File {
             directory: true, ..
@@ -394,6 +439,187 @@ pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
         Token::Thread { .. } => pixel_icons::glyph("thread"),
         Token::Skill { .. } => pixel_icons::glyph("bolt"),
     })
+}
+
+fn context_kind_icon(kind: &str, directory: bool) -> &'static Icon {
+    match kind {
+        "image" => pixel_icons::glyph("image"),
+        "file" | "mention" if directory => pixel_icons::glyph("folder"),
+        "file" | "mention" => pixel_icons::glyph("file"),
+        "thread" => pixel_icons::glyph("thread"),
+        "skill" => pixel_icons::glyph("bolt"),
+        "terminal" => pixel_icons::glyph("terminal"),
+        "environment" => pixel_icons::glyph("monitor"),
+        "preview-annotation" | "element" => pixel_icons::glyph("eye"),
+        "review-comment" => pixel_icons::glyph("issue"),
+        "response" => pixel_icons::glyph("thread"),
+        _ => pixel_icons::glyph("unresolved"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChipStatus {
+    Resolved,
+    Unresolved,
+    Invalid,
+}
+
+pub(super) fn chip_status(s: &State, id: &str) -> ChipStatus {
+    let t = s.current();
+    if let Some((kind, context_id)) = crate::composer_context::parse_composer_context_href(id) {
+        if kind == "image" || kind == "file" {
+            let bound_id = t
+                .draft_context
+                .iter()
+                .find(|r| r.context_id == context_id)
+                .and_then(|r| match &r.data {
+                    crate::composer_context::ComposerContextData::Image {
+                        attachment_id, ..
+                    }
+                    | crate::composer_context::ComposerContextData::File {
+                        attachment_id, ..
+                    } => Some(attachment_id.as_str()),
+                    _ => None,
+                });
+            let attachment = t.draft_images.iter().find(|a| {
+                bound_id.is_some_and(|id| a.id == id)
+                    || crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)
+                        == context_id
+            });
+            let Some(attachment) = attachment else {
+                return ChipStatus::Unresolved;
+            };
+            if !attachment.is_image() && attachment.path.as_ref().is_some_and(|path| !path.exists())
+            {
+                return ChipStatus::Unresolved;
+            }
+            return ChipStatus::Resolved;
+        }
+        let Some(record) = t.draft_context.iter().find(|r| r.context_id == context_id) else {
+            return ChipStatus::Unresolved;
+        };
+        if !record.is_known() {
+            return ChipStatus::Unresolved;
+        }
+        let target_server_id = s.machine_identity(&s.machines.selected);
+        if let crate::composer_context::ComposerContextData::Thread { environment_id, .. } =
+            &record.data
+            && crate::composer_context::outside_thread_reason(
+                environment_id,
+                &s.machines.selected,
+                Some(&target_server_id),
+                &s.peers,
+            )
+            .is_some()
+        {
+            return ChipStatus::Invalid;
+        }
+        return ChipStatus::Resolved;
+    }
+    if let Some(token) = Token::decode(id) {
+        let target_server_id = s.machine_identity(&s.machines.selected);
+        if let Token::Thread {
+            machine: Some(owner),
+            ..
+        } = token
+            && crate::composer_context::outside_thread_reason(
+                &owner,
+                &s.machines.selected,
+                Some(&target_server_id),
+                &s.peers,
+            )
+            .is_some()
+        {
+            return ChipStatus::Invalid;
+        }
+        return ChipStatus::Resolved;
+    }
+    if id.starts_with("shina:") {
+        return ChipStatus::Invalid;
+    }
+    ChipStatus::Unresolved
+}
+
+pub(super) fn pill_appearance(
+    status: ChipStatus,
+    id: &str,
+    records: &[crate::composer_context::ComposerContextRecord],
+    images: &[crate::attachments::Attachment],
+    machine: &str,
+    p: Palette,
+) -> (Color, Color, &'static Icon) {
+    match status {
+        ChipStatus::Unresolved => (
+            p.line.alpha(0.45),
+            p.muted,
+            pixel_icons::glyph("unresolved"),
+        ),
+        ChipStatus::Invalid => (
+            p.danger.alpha(0.16),
+            p.danger,
+            if id.contains("thread") {
+                pixel_icons::glyph("thread")
+            } else {
+                pixel_icons::glyph("unresolved")
+            },
+        ),
+        ChipStatus::Resolved => {
+            let icon = if let Some((kind, context_id)) =
+                crate::composer_context::parse_composer_context_href(id)
+            {
+                let directory = records
+                    .iter()
+                    .find(|r| r.context_id == context_id)
+                    .is_some_and(|r| match &r.data {
+                        crate::composer_context::ComposerContextData::Mention { path } => {
+                            path.ends_with('/')
+                        }
+                        crate::composer_context::ComposerContextData::File {
+                            mime_type, ..
+                        } => mime_type == "inode/directory",
+                        _ => false,
+                    })
+                    || images.iter().any(|a| {
+                        crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)
+                            == context_id
+                            && a.mime == "inode/directory"
+                    });
+                context_kind_icon(&kind, directory)
+            } else if let Some(token) = Token::decode(id) {
+                match token {
+                    Token::File {
+                        directory: true, ..
+                    } => pixel_icons::glyph("folder"),
+                    Token::File { .. } => pixel_icons::glyph("file"),
+                    Token::Thread {
+                        machine: Some(ref owner),
+                        ..
+                    } if owner != machine => pixel_icons::glyph("thread"),
+                    Token::Thread { .. } => pixel_icons::glyph("thread"),
+                    Token::Skill { .. } => pixel_icons::glyph("bolt"),
+                }
+            } else {
+                pixel_icons::glyph("unresolved")
+            };
+            (p.selected, p.ink, icon)
+        }
+    }
+}
+
+pub(super) fn pill_style(s: &State, p: Palette) -> impl Fn(&str) -> rune::PillStyle + 'static {
+    let t = s.current();
+    let records = t.draft_context.clone();
+    let images = t.draft_images.clone();
+    let machine = t.machine.clone();
+    let mut statuses = std::collections::HashMap::new();
+    for (_, id) in t.draft.pills() {
+        statuses.insert(id.to_owned(), chip_status(s, id));
+    }
+    move |id: &str| {
+        let status = statuses.get(id).copied().unwrap_or(ChipStatus::Resolved);
+        let (bg, fg, icon) = pill_appearance(status, id, &records, &images, &machine, p);
+        rune::PillStyle::default().bg(bg).fg(fg).icon(icon)
+    }
 }
 
 pub(super) fn scroll_selected(s: &State, tx: &mut Tx) {
@@ -428,8 +654,8 @@ mod tests {
         let (items, notes) = items(&state, &trigger);
         assert_eq!(items.len(), 1);
         assert!(matches!(
-            items[0].action,
-            Action::Pill(Token::Thread { id: 123, .. }, _)
+            &items[0].action,
+            Action::Context(rec, _) if rec.context_id == "thread_123"
         ));
         assert_eq!(notes, ["File search needs the machine's own Shina."]);
     }

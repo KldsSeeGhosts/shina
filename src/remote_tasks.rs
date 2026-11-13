@@ -604,6 +604,7 @@ mod tests {
             role: "Pi",
             text: "Previous answer".into(),
             images: vec![],
+            context: None,
         });
         state.threads[1].status = Status::Completed;
         state.threads[1].task_result = Some("done");
@@ -650,6 +651,7 @@ mod tests {
             role: "Pi",
             text: text.clone(),
             images: vec![],
+            context: None,
         });
         let first = state
             .mcp_call(
@@ -683,6 +685,7 @@ mod tests {
                 role: "Pi",
                 text: "界".repeat(10_000),
                 images: vec![],
+                context: None,
             });
         }
         let first = transcript_page(
@@ -2157,7 +2160,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -2985,6 +2988,7 @@ impl State {
                         role: "Pi",
                         text: task.result_excerpt.clone(),
                         images: vec![],
+                        context: None,
                     });
                 }
             }

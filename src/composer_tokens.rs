@@ -42,7 +42,7 @@ impl Token {
     pub fn source_for(
         &self,
         target_machine: Option<&str>,
-        machine_name: &dyn Fn(&str) -> String,
+        _machine_name: &dyn Fn(&str) -> String,
     ) -> String {
         match self {
             Self::File { path, source, .. } => source
@@ -55,9 +55,9 @@ impl Token {
                     && owner != target
                 {
                     format!(
-                        "Shina thread {} on {} (not readable from this machine)",
+                        "Shina thread {}, read_thread({})",
                         serde_json::to_string(title).unwrap(),
-                        machine_name(owner)
+                        serde_json::json!({"machine":owner,"threadId":id})
                     )
                 } else {
                     format!(
@@ -71,6 +71,14 @@ impl Token {
             Self::Skill { name, .. } => format!("${name}"),
         }
     }
+}
+
+pub fn collect_inline_context_ids_from_edit(edit: &TextEdit) -> std::collections::HashSet<String> {
+    edit.pills()
+        .filter_map(|(_, id)| {
+            crate::composer_context::parse_composer_context_href(id).map(|(_, cid)| cid)
+        })
+        .collect()
 }
 
 pub fn stamp_thread_owner(edit: &mut TextEdit, owner: &str) {
@@ -101,33 +109,96 @@ pub fn stamp_thread_owner(edit: &mut TextEdit, owner: &str) {
     }
 }
 
+#[cfg(test)]
 pub fn prompt(edit: &TextEdit, images: &[Attachment]) -> Result<Prompt, String> {
     prompt_for(edit, images, None, &|machine| machine.to_owned())
 }
 
+#[cfg(test)]
 pub fn prompt_for(
     edit: &TextEdit,
     images: &[Attachment],
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> Result<Prompt, String> {
+    prompt_for_with_context(edit, images, &[], target_machine, machine_name)
+}
+
+pub fn prompt_for_with_context(
+    edit: &TextEdit,
+    images: &[Attachment],
+    draft_context: &[crate::composer_context::ComposerContextRecord],
+    target_machine: Option<&str>,
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
+    prompt_for_target(
+        edit,
+        images,
+        draft_context,
+        target_machine,
+        None,
+        &[],
+        machine_name,
+    )
+}
+
+pub fn prompt_for_target(
+    edit: &TextEdit,
+    images: &[Attachment],
+    draft_context: &[crate::composer_context::ComposerContextRecord],
+    target_machine: Option<&str>,
+    target_server_id: Option<&str>,
+    peers: &[crate::peer::Peer],
+    machine_name: &dyn Fn(&str) -> String,
+) -> Result<Prompt, String> {
     validate_pill_kinds(edit)?;
     let mut attachments = images.to_vec();
+    let referenced_ids = collect_inline_context_ids_from_edit(edit);
+    if let Some(target) = target_machine {
+        if let Some((record, reason)) =
+            crate::composer_context::thread_contexts_outside_environment(
+                &referenced_ids,
+                draft_context,
+                target,
+                target_server_id,
+                peers,
+            )
+            .into_iter()
+            .next()
+            && let crate::composer_context::ComposerContextData::Thread {
+                environment_id,
+                title,
+                ..
+            } = record.data
+        {
+            return Err(crate::composer_context::format_outside_thread_error(
+                &title,
+                &machine_name(&environment_id),
+                reason,
+            ));
+        }
+    }
     for (_, id) in edit.pills() {
         // Ported from KSG Code's `threadContextsOutsideEnvironment` and its use in
-        // `useComposerSend.ts`: a thread the target machine's agent cannot read blocks the send.
-        // Shina has no read path to a linked machine's threads yet, so any other owner blocks.
+        // `useComposerSend.ts`: block only when the owner machine is unlinked or lacks
+        // `thread-read-v2`, naming which.
         if let Some(Token::Thread {
             title,
             machine: Some(owner),
             ..
         }) = Token::decode(id)
             && let Some(target) = target_machine
-            && owner != target
+            && let Some(reason) = crate::composer_context::outside_thread_reason(
+                &owner,
+                target,
+                target_server_id,
+                peers,
+            )
         {
-            return Err(format!(
-                "Attached thread is on another machine. This machine's agent can't read \"{title}\". Remove it, or switch back to {} to send.",
-                machine_name(&owner)
+            return Err(crate::composer_context::format_outside_thread_error(
+                &title,
+                &machine_name(&owner),
+                reason,
             ));
         }
         if let Some(Token::File { path, .. }) = Token::decode(id) {
@@ -138,11 +209,21 @@ pub fn prompt_for(
         }
     }
     attachments::validate_prompt_images(&attachments)?;
-    let mut prompt = Prompt::new(
+    let context = crate::composer_context::build_message_context(
+        &referenced_ids,
+        draft_context,
+        &attachments,
+    );
+    let mut prompt = Prompt::with_context(
         crate::composer_rich::markdown_for(edit, target_machine, machine_name),
         attachments,
+        context,
     );
-    prompt.draft = Some(crate::composer_rich::Snapshot::capture(edit, images));
+    prompt.draft = Some(crate::composer_rich::Snapshot::capture_with_context(
+        edit,
+        images,
+        draft_context,
+    ));
     Ok(prompt)
 }
 
@@ -158,12 +239,22 @@ fn validate_pill_kinds(edit: &TextEdit) -> Result<(), String> {
 
 /// Validate the additive editor snapshot against the provider text and admitted attachments.
 /// Missing snapshots remain valid for older peers. Unknown snapshot fields are ignored.
+#[cfg(test)]
 pub fn received_prompt(
     text: String,
     images: Vec<Attachment>,
     snapshot: Option<serde_json::Value>,
 ) -> Result<Prompt, String> {
-    let mut prompt = Prompt::new(text, images);
+    received_prompt_with_context(text, images, snapshot, None)
+}
+
+pub fn received_prompt_with_context(
+    text: String,
+    images: Vec<Attachment>,
+    snapshot: Option<serde_json::Value>,
+    context: Option<crate::composer_context::MessageContext>,
+) -> Result<Prompt, String> {
+    let mut prompt = Prompt::with_context(text, images, context);
     if let Some(value) = snapshot.filter(|value| !value.is_null()) {
         let mut snapshot: crate::composer_rich::Snapshot =
             serde_json::from_value(value).map_err(|_| "Invalid composer document.")?;
@@ -184,6 +275,14 @@ pub fn received_prompt(
                     .ok_or("Composer attachment is not in the submitted message.")
             })
             .collect::<Result<_, _>>()?;
+        if prompt.context.is_none() && !snapshot.context.is_empty() {
+            let referenced = collect_inline_context_ids_from_edit(&editor);
+            prompt.context = crate::composer_context::build_message_context(
+                &referenced,
+                &snapshot.context,
+                &prompt.images,
+            );
+        }
         prompt.draft = Some(snapshot);
     }
     Ok(prompt)
@@ -287,7 +386,7 @@ mod tests {
             } else {
                 m.into()
             }),
-            "Shina thread \"Fix \\\"quoted\\\" title\" on Local (not readable from this machine)"
+            "Shina thread \"Fix \\\"quoted\\\" title\", read_thread({\"machine\":\"local\",\"threadId\":42})"
         );
 
         // Missing owner field is treated as owned by its draft's machine; unknown fields are kept.

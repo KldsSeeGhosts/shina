@@ -614,6 +614,7 @@ fn cancelled_rewind_does_not_rebind_or_clear_the_original_conversation() {
         role: "You",
         text: "Keep".into(),
         images: vec![],
+        context: None,
     });
     t.native.fork_points = vec![json!({"entryId":"target"})];
     t.rewind("target".into());
@@ -673,6 +674,7 @@ fn stop_records_a_durable_marker_before_the_provider_acknowledges_it() {
         role: "You",
         text: "Work".into(),
         images: vec![],
+        context: None,
     });
     t.started = Some(Instant::now() - Duration::from_secs(134));
     t.stop();

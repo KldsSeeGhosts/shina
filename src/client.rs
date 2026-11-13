@@ -607,7 +607,7 @@ async fn supervise(
             Err(error) => report(error),
         }
     }
-    while !stop.load(Ordering::Acquire) {
+    'supervisor: while !stop.load(Ordering::Acquire) {
         cache.desired_thread = match history_thread.load(Ordering::Acquire) {
             0 => None,
             id => Some(id as u64),
@@ -641,7 +641,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -658,11 +658,23 @@ async fn supervise(
                         }
                         let mut sent = true;
                         for command in &pending {
-                            match uploaded_command(command, remote.as_ref()).await {
+                            match uploaded_command(
+                                command,
+                                remote.as_ref(),
+                                hello["capabilities"].as_array().is_some_and(|caps| {
+                                    caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS)
+                                }),
+                            )
+                            .await
+                            {
                                 Ok(command) => {
                                     sent &= send(&mut connected, wire_command(&command)).await
                                 }
-                                Err(_) => {
+                                Err(error) => {
+                                    if error.starts_with("Authentication denied.") {
+                                        report(error);
+                                        break 'supervisor;
+                                    }
                                     sent = false;
                                     break;
                                 }
@@ -737,11 +749,19 @@ async fn supervise(
                     wake();
                     continue;
                 }
-                let prepared = match uploaded_command(&command,remote.as_ref()).await {
+                let has_composer_context = info.lock().expect("connection info")["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_CONTEXT));
+                let command_to_send = downgrade_composer_context_command(command.clone(), has_composer_context);
+                let has_file_attachments = info.lock().expect("connection info")["capabilities"]
+                    .as_array().is_some_and(|caps| caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS));
+                let prepared = match uploaded_command(&command_to_send,remote.as_ref(),has_file_attachments).await {
                     Ok(command) => command,
                     Err(error) => {
+                        let denied = error.starts_with("Authentication denied.");
                         let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":error}})));
                         wake();
+                        if denied { break 'supervisor; }
                         continue;
                     }
                 };
@@ -941,6 +961,13 @@ async fn cache_images(
     projected: &mut Value,
     fetch: bool,
 ) -> Result<(), String> {
+    let file_error = cache_files(remote, profile, projected, fetch).await.err();
+    if file_error
+        .as_ref()
+        .is_some_and(|error| error.starts_with("Authentication denied."))
+    {
+        return Err(file_error.unwrap());
+    }
     cache_html(remote, profile, projected, fetch).await?;
     fn paths(value: &Value, prefix: String, out: &mut Vec<String>) {
         match value {
@@ -1050,7 +1077,128 @@ async fn cache_images(
             .pointer_mut(&path)
             .ok_or("Missing image reference.")? = attachment;
     }
-    Ok(())
+    file_error.map_or(Ok(()), Err)
+}
+
+/// KSG stages uploaded file resources per environment. Keep ordinary-file bytes in the
+/// same immutable content store as uploads, never trust the source machine's path.
+pub(crate) async fn cache_files(
+    remote: &crate::peer::Link,
+    profile: &std::path::Path,
+    projected: &mut Value,
+    fetch: bool,
+) -> Result<(), String> {
+    fn references(value: &Value, prefix: String, out: &mut Vec<String>) {
+        match value {
+            Value::Object(object)
+                if object.get("mime").and_then(Value::as_str).is_some()
+                    && object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::attachments::safe_file_id) =>
+            {
+                out.push(prefix)
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    references(
+                        value,
+                        format!("{prefix}/{}", key.replace('~', "~0").replace('/', "~1")),
+                        out,
+                    );
+                }
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    references(value, format!("{prefix}/{index}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    references(projected, String::new(), &mut paths);
+    let http = crate::peer::http()?;
+    let mut failure = None;
+    for path in paths {
+        let result: Result<(),String> = async {
+        let reference = projected.pointer(&path).ok_or("Missing file reference.")?;
+        let id = reference["id"]
+            .as_str()
+            .ok_or("Missing file id.")?
+            .to_owned();
+        let length = reference["bytes"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= crate::attachments::MAX_FILE_BYTES)
+            .ok_or("Invalid file length.")?;
+        let local_path = profile.join("attachments").join(&id);
+        let mut local = reference.clone();
+        local["path"] = json!(local_path);
+        let valid =
+            std::fs::symlink_metadata(&local_path).is_ok_and(|m| m.is_file() && m.len() == length);
+        if !valid && !fetch {
+            // A foreign path may happen to exist locally. It is never a cached file.
+            *projected.pointer_mut(&path).unwrap() = local;
+            return Ok(());
+        }
+        if !valid {
+            let address = remote.address()?;
+            let mut bytes = Vec::new();
+            while (bytes.len() as u64) < length {
+                let response = http
+                    .get(format!(
+                        "http://{address}/v1/blobs/{id}?offset={}&limit={}",
+                        bytes.len(),
+                        protocol::PAGE_BYTES
+                    ))
+                    .bearer_auth(&remote.token)
+                    .send()
+                    .await
+                    .map_err(|_| "The environment it came from is not reachable right now.")?;
+                if matches!(response.status().as_u16(), 401 | 403) {
+                    return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
+                }
+                if !response.status().is_success()
+                    || response
+                        .content_length()
+                        .is_none_or(|n| n > protocol::MAX_PAGE_BYTES as u64)
+                {
+                    return Err("The original attachment is no longer available.".into());
+                }
+                let chunk = response
+                    .bytes()
+                    .await
+                    .map_err(|_| "Downloading it from the source failed.")?;
+                if chunk.is_empty() || bytes.len() + chunk.len() > length as usize {
+                    return Err("Invalid remote file length.".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            use sha2::Digest;
+            if id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+                return Err("File hash mismatch.".into());
+            }
+            local = crate::attachments::store_uploaded_file(
+                &profile.join("attachments"),
+                reference["name"].as_str().ok_or("Missing file name.")?,
+                reference["mime"]
+                    .as_str()
+                    .ok_or("Missing file MIME type.")?,
+                &bytes,
+            )?
+            .to_value();
+        }
+        *projected.pointer_mut(&path).unwrap() = local;
+        Ok(())
+        }.await;
+        if let Err(error) = result {
+            if error.starts_with("Authentication denied.") {
+                return Err(error);
+            }
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn cached_image_valid(profile: &std::path::Path, value: &Value) -> bool {
@@ -1182,9 +1330,43 @@ pub(crate) async fn cache_html(
     Ok(())
 }
 
-async fn uploaded_command(
+/// Strip the additive `context` field and pre-project `t3-context://` references into
+/// `text` when talking to an older server without `composer-context-v1` (whose `SendInput`
+/// has `deny_unknown_fields`).
+pub(crate) fn downgrade_composer_context_command(
+    mut command: Command,
+    has_composer_context: bool,
+) -> Command {
+    if has_composer_context || !matches!(command.method.as_str(), "thread.send" | "queue.update") {
+        return command;
+    }
+    if let Some(obj) = command.params.as_object_mut() {
+        let context = obj.remove("context").filter(|v| !v.is_null());
+        if let Some(text) = obj.get("text").and_then(Value::as_str).map(str::to_owned)
+            && !crate::composer_context::collect_composer_context_references(&text).is_empty()
+        {
+            let records = context
+                .and_then(|v| crate::composer_context::decode_message_context(&v).ok())
+                .map(|c| c.records)
+                .unwrap_or_default();
+            obj.insert(
+                "text".into(),
+                json!(
+                    crate::composer_context::project_composer_context_for_provider(&text, &records)
+                ),
+            );
+            // Older server validates `markdown(&editor) == prompt.text`, which would fail
+            // once `text` is projected; omit `draft` when links were pre-projected.
+            obj.remove("draft");
+        }
+    }
+    command
+}
+
+pub(crate) async fn uploaded_command(
     command: &Command,
     remote: Option<&crate::peer::Link>,
+    files_supported: bool,
 ) -> Result<Command, String> {
     let mut prepared = command.clone();
     let Some(remote) =
@@ -1198,6 +1380,7 @@ async fn uploaded_command(
     let http = crate::peer::http()?;
     let address = remote.address()?;
     let base = format!("http://{address}");
+    let mut replacements = std::collections::HashMap::new();
     for attachment in attachments {
         if command.method == "queue.update"
             && command.params["existingAttachmentIds"]
@@ -1206,18 +1389,44 @@ async fn uploaded_command(
         {
             continue;
         }
-        if !attachment["path"].is_null() {
-            return Err("Local file paths cannot be sent to another machine. Attach an image or reference a path on that server in your message.".into());
+        let ordinary = !attachment["path"].is_null()
+            || attachment["id"]
+                .as_str()
+                .is_some_and(crate::attachments::safe_file_id);
+        if ordinary && !files_supported {
+            return Err(protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED.into());
+        }
+        if ordinary
+            && command.params["draft"]["attachments"]
+                .as_array()
+                .is_some_and(|files| !files.iter().any(|file| file["id"] == attachment["id"]))
+            && !command.params["context"]["records"]
+                .as_array()
+                .is_some_and(|records| {
+                    records.iter().any(|record| {
+                        record["kind"] == "file" && record["attachmentId"] == attachment["id"]
+                    })
+                })
+        {
+            return Err("Local file paths cannot be sent to another machine. Attach the file or reference a path on that server in your message.".into());
         }
         let image = crate::attachments::Attachment::from_value(attachment)
-            .ok_or("The image is missing from this device.")?;
-        let bytes = crate::attachments::read(&image)?;
+            .ok_or("The attachment is missing from this device.")?;
+        let bytes = if ordinary {
+            crate::attachments::transfer_file_bytes(&image)?
+        } else {
+            crate::attachments::read(&image)?
+        };
+        let original_id = image.id.clone();
         use sha2::Digest;
         let response = http.post(format!("{base}/v1/uploads")).bearer_auth(&remote.token)
-            .json(&json!({"name":image.name,"length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}))
-            .send().await.map_err(|_| "Image upload could not start. Your draft was kept.")?;
+            .json(&json!({"type":if ordinary {"file"} else {"image"},"mimeType":image.mime,
+                "name":image.name,"length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}))
+            .send().await.map_err(|_| "Attachment upload could not start. Your draft was kept.")?;
         if !response.status().is_success() {
-            return Err("Image upload refused. Your draft was kept.".into());
+            return Err(
+                upload_error(response, "Attachment upload refused. Your draft was kept.").await,
+            );
         }
         let value: Value = response
             .json()
@@ -1235,9 +1444,13 @@ async fn uploaded_command(
                 .body(chunk.to_vec())
                 .send()
                 .await
-                .map_err(|_| "Image upload interrupted. Your draft was kept.")?;
+                .map_err(|_| "Attachment upload interrupted. Your draft was kept.")?;
             if !response.status().is_success() {
-                return Err("Image upload offset refused. Your draft was kept.".into());
+                return Err(upload_error(
+                    response,
+                    "Attachment upload offset refused. Your draft was kept.",
+                )
+                .await);
             }
             offset += chunk.len();
         }
@@ -1246,16 +1459,71 @@ async fn uploaded_command(
             .bearer_auth(&remote.token)
             .send()
             .await
-            .map_err(|_| "Image commit interrupted. Your draft was kept.")?;
+            .map_err(|_| "Attachment commit interrupted. Your draft was kept.")?;
         if !response.status().is_success() {
-            return Err("Image validation failed. Your draft was kept.".into());
+            return Err(upload_error(
+                response,
+                "Attachment validation failed. Your draft was kept.",
+            )
+            .await);
         }
         *attachment = response
             .json()
             .await
-            .map_err(|_| "Invalid committed image.")?;
+            .map_err(|_| "Invalid committed attachment.")?;
+        if ordinary && attachment["id"] != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+            return Err("File hash mismatch.".into());
+        }
+        replacements.insert(original_id, attachment.clone());
     }
+    rewrite_uploaded_attachments(&mut prepared.params, &replacements);
     Ok(prepared)
+}
+
+async fn upload_error(response: reqwest::Response, fallback: &str) -> String {
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return "Authentication denied. Reconnect this linked machine manually before transferring files.".into();
+    }
+    response
+        .json::<Value>()
+        .await
+        .ok()
+        .and_then(|value| value["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| fallback.into())
+}
+
+fn rewrite_uploaded_attachments(
+    value: &mut Value,
+    replacements: &std::collections::HashMap<String, Value>,
+) {
+    if let Some(replacement) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|_| value.get("mime").is_some())
+        .and_then(|id| replacements.get(id))
+    {
+        *value = replacement.clone();
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(id) = object.get("attachmentId").and_then(Value::as_str)
+                && let Some(replacement) = replacements.get(id)
+            {
+                object.insert("attachmentId".into(), replacement["id"].clone());
+                object.insert("sizeBytes".into(), replacement["bytes"].clone());
+            }
+            for value in object.values_mut() {
+                rewrite_uploaded_attachments(value, replacements);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_uploaded_attachments(value, replacements);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Used by the service CLI and detached updater. Does not register a desktop PID.

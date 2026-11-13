@@ -52,6 +52,7 @@ struct Upload {
     offset: u64,
     hash: String,
     name: String,
+    file_mime: Option<String>,
     expires: Instant,
 }
 impl Drop for Upload {
@@ -84,10 +85,44 @@ async fn upload_start(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let file_mime = match body["type"].as_str() {
+            None | Some("image") => None,
+            Some("file") => Some(
+                body["mimeType"]
+                    .as_str()
+                    .filter(|mime| !mime.trim().is_empty() && mime.encode_utf16().count() <= 100)
+                    .ok_or("Invalid file attachment metadata.")?
+                    .trim()
+                    .to_owned(),
+            ),
+            _ => return Err("Invalid attachment type.".into()),
+        };
+        let name = body["name"].as_str().unwrap_or("Image");
+        if file_mime.is_some() && (name.trim().is_empty() || name.encode_utf16().count() > 255) {
+            return Err("Invalid file attachment metadata.".into());
+        }
+        let maximum = if file_mime.is_some() {
+            crate::attachments::MAX_FILE_BYTES
+        } else {
+            crate::attachments::MAX_IMAGE_BYTES
+        };
         let length = body["length"]
             .as_u64()
-            .filter(|length| *length > 0 && *length <= crate::attachments::MAX_IMAGE_BYTES)
-            .ok_or("Invalid image length.")?;
+            .ok_or("Invalid attachment length.")?;
+        if length == 0 {
+            return Err(if file_mime.is_some() {
+                format!("'{name}' is empty or could not be read.")
+            } else {
+                "Invalid image length.".into()
+            });
+        }
+        if length > maximum {
+            return Err(if file_mime.is_some() {
+                format!("'{name}' exceeds the 50 MB attachment limit.")
+            } else {
+                "Invalid image length.".into()
+            });
+        }
         let hash = body["sha256"]
             .as_str()
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -116,13 +151,10 @@ async fn upload_start(
                 length,
                 offset: 0,
                 hash: hash.to_ascii_lowercase(),
-                name: body["name"]
-                    .as_str()
-                    .unwrap_or("Image")
-                    .chars()
-                    .take(120)
-                    .collect(),
-                expires: Instant::now() + Duration::from_secs(300),
+                name: name.trim().chars().take(255).collect(),
+                expires: Instant::now()
+                    + Duration::from_secs(if file_mime.is_some() { 600 } else { 300 }),
+                file_mime,
             },
         );
         Ok(json!({"uploadId":id,"offset":0}))
@@ -190,16 +222,30 @@ async fn upload_commit(
         }
         let bytes = std::fs::read(&upload.path).map_err(|e| e.to_string())?;
         if format!("{:x}", sha2::Sha256::digest(&bytes)) != upload.hash {
-            return Err("Image hash mismatch.".into());
+            return Err(if upload.file_mime.is_some() {
+                "File hash mismatch."
+            } else {
+                "Image hash mismatch."
+            }
+            .into());
         }
         shared
             .database
             .authorize(&device, "uploads.write", &json!({}))?;
-        let attachment = crate::attachments::store_uploaded(
-            &shared.directory.join("attachments"),
-            &upload.name,
-            &bytes,
-        )?;
+        let attachment = if let Some(mime) = &upload.file_mime {
+            crate::attachments::store_uploaded_file(
+                &shared.directory.join("attachments"),
+                &upload.name,
+                mime,
+                &bytes,
+            )?
+        } else {
+            crate::attachments::store_uploaded(
+                &shared.directory.join("attachments"),
+                &upload.name,
+                &bytes,
+            )?
+        };
         Ok(attachment.to_value())
     })
     .await;
@@ -208,7 +254,12 @@ async fn upload_commit(
 fn upload_response(result: Result<Result<Value, String>, tokio::task::JoinError>) -> Response {
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
-        _ => StatusCode::BAD_REQUEST.into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":error}})),
+        )
+            .into_response(),
+        Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -241,7 +292,10 @@ async fn blob(
     if authorized(&shared, &headers, "blobs.read").is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if !crate::attachments::safe_id(&id) && !crate::html_render::safe_blob(&id) {
+    if !crate::attachments::safe_id(&id)
+        && !crate::attachments::safe_file_id(&id)
+        && !crate::html_render::safe_blob(&id)
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
@@ -252,6 +306,8 @@ async fn blob(
         }
         let limit = if crate::html_render::safe_blob(&id) {
             crate::html_render::MAX_PAGE as u64
+        } else if crate::attachments::safe_file_id(&id) {
+            crate::attachments::MAX_FILE_BYTES
         } else {
             crate::attachments::MAX_IMAGE_BYTES
         };
@@ -599,6 +655,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 8 { capabilities.push(protocol::REMOTE_PROJECT_SCOPE); }
                         if minor >= 8 { capabilities.push(protocol::COMPOSER_TRANSACTIONS); }
                         if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
+                        if minor >= 10 { capabilities.push(protocol::COMPOSER_CONTEXT); }
+                        if minor >= 10 { capabilities.push(protocol::FILE_ATTACHMENTS); }
                         if minor >= 10 {
                             capabilities.extend([
                                 protocol::MODEL_FAVORITES,
@@ -1992,6 +2050,97 @@ mod tests {
         })
         .await
         .expect("fixture client did not reach its expected state");
+    }
+
+    #[test]
+    fn ordinary_file_upload_download_and_context_rewrite_use_negotiated_capability() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let server = Fixture::new("file-transfer-target").await;
+            let profile = crate::store::directory().unwrap().join("file-transfer-client");
+            let link = server.link(&profile).await;
+            let path = crate::store::directory().unwrap().join("source.bin");
+            let bytes = vec![b'X';protocol::PAGE_BYTES*2+17];
+            std::fs::write(&path,&bytes).unwrap();
+            let file = crate::attachments::attach_file(&path).unwrap();
+            let record = crate::composer_context::attachment_context_record(&file);
+            let text = crate::composer_context::format_composer_context_reference("file",&record.context_id,"source.bin");
+            let editor = crate::composer_rich::draft_from_canonical(&text);
+            let command = Command::new("thread.send",json!({"threadId":1,"text":text,
+                "attachments":[file],"context":{"version":1,"records":[record]},
+                "draft":crate::composer_rich::Snapshot::capture_with_context(&editor,&[file.clone()],&[record.clone()]),
+                "mode":"prompt"}));
+            assert_eq!(crate::client::uploaded_command(&command,Some(&link),false).await.unwrap_err(),
+                protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED);
+            assert!(server.shared.uploads.lock().unwrap().is_empty());
+            let prepared = crate::client::uploaded_command(&command,Some(&link),true).await.unwrap();
+            let id = prepared.params["attachments"][0]["id"].as_str().unwrap();
+            assert!(crate::attachments::safe_file_id(id));
+            assert_eq!(prepared.params["context"]["records"][0]["attachmentId"],id);
+            assert_eq!(prepared.params["draft"]["context"][0]["attachmentId"],id);
+            assert_eq!(prepared.params["draft"]["attachments"][0]["id"],id);
+            assert_eq!(prepared.params["context"]["records"][0]["contextId"],record.context_id);
+            assert_eq!(command.params["attachments"][0]["id"],file.id,"source command remains the recovery snapshot");
+            let again = crate::client::uploaded_command(&command,Some(&link),true).await.unwrap();
+            assert_eq!(again.params,prepared.params,"reconnect resubmission has the same command hash");
+            let mut projection = json!({"threads":[{"messages":[{"images":prepared.params["attachments"]}]}]});
+            crate::client::cache_files(&link,&profile,&mut projection,true).await.unwrap();
+            let cached: crate::attachments::Attachment = serde_json::from_value(
+                projection["threads"][0]["messages"][0]["images"][0].clone()).unwrap();
+            assert_eq!(cached.path.as_ref().unwrap(),&profile.join("attachments").join(id).canonicalize().unwrap());
+            assert_eq!(crate::attachments::transfer_file_bytes(&cached).unwrap(),bytes);
+            crate::client::cache_files(&link,&profile,&mut projection,false).await.unwrap();
+            let partial_profile = profile.join("partial-assets");
+            let mut missing = prepared.params["attachments"][0].clone();
+            missing["id"] = json!(format!("file-{}.bin","0".repeat(64)));
+            missing["bytes"] = json!(1);
+            let mut partial = json!({"images":[missing,prepared.params["attachments"][0]]});
+            assert!(crate::client::cache_files(&link,&partial_profile,&mut partial,true).await.is_err());
+            assert!(partial_profile.join("attachments").join(id).is_file(),
+                "a missing file must not block another resource's download");
+            let mut state = crate::model::State::new(PathBuf::new(),false);
+            let (mut desktop,_local_commands) = crate::client::Client::test_connected(state.data_dir.clone());
+            let (mut linked,_remote_commands) = crate::client::Client::test_connected(state.data_dir.clone());
+            linked.remote = Some(link.clone());
+            *linked.info.lock().unwrap() = json!({"capabilities":[protocol::FILE_ATTACHMENTS]});
+            desktop.linked.insert(link.server_id.clone(),linked);
+            state.client = Some(desktop);
+            let fragment = crate::composer_context::ComposerContextClipboardFragment {
+                version:1, source:crate::composer_context::ClipboardSource {
+                    environment_id:link.server_id.clone(),thread_id:Some("1".into()),message_id:None,
+                },
+                records:serde_json::from_value(prepared.params["context"]["records"].clone()).unwrap(),
+            };
+            let encoded = crate::composer_context::encode_composer_context_fragment(&fragment).unwrap();
+            let markdown = prepared.params["text"].as_str().unwrap();
+            let html = crate::composer_context::encode_composer_context_clipboard_html(markdown,&encoded,None);
+            let clipboard = rune::ClipboardContent::new(markdown).with_html(html);
+            state.paste_composer_content(&clipboard,false);
+            assert!(state.has_pending_context_imports("local",state.current().id));
+            let deadline = Instant::now()+Duration::from_secs(5);
+            while state.has_pending_context_imports("local",state.current().id) {
+                state.poll_context_imports();
+                assert!(Instant::now()<deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(state.current().draft_images.len(),1,"{:?}",state.current().attachment_error);
+            assert_eq!(crate::attachments::transfer_file_bytes(&state.current().draft_images[0]).unwrap(),bytes);
+            assert_ne!(state.current().draft_context[0].context_id,record.context_id,"paste rewrites the context identity");
+            state.current_mut().draft = crate::composer_rich::draft("");
+            state.current_mut().draft_images.clear();
+            state.current_mut().draft_context.clear();
+            *state.client.as_ref().unwrap().linked[&link.server_id].info.lock().unwrap() =
+                json!({"capabilities":[]});
+            state.paste_composer_content(&clipboard,false);
+            assert!(!state.has_pending_context_imports("local",state.current().id));
+            assert!(state.current().attachment_error.as_deref().unwrap().contains(protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED));
+            let old = Fixture::with_minor("old-file-target",9).await;
+            let old_link = old.link(&profile).await;
+            let hello = crate::client::remote_rpc(&old_link,"hello",json!({})).await.unwrap();
+            assert!(!hello["capabilities"].as_array().unwrap().iter().any(|c| c == protocol::FILE_ATTACHMENTS));
+            assert_eq!(crate::client::uploaded_command(&command,Some(&old_link),false).await.unwrap_err(),
+                protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED);
+            assert!(old.shared.uploads.lock().unwrap().is_empty());
+        });
     }
 
     #[test]

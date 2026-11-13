@@ -815,6 +815,7 @@ mod tests {
             role,
             text: text.to_owned(),
             images: vec![],
+            context: None,
         };
         let messages = vec![
             msg("You", "hello"),

@@ -89,6 +89,8 @@ struct MessageView {
     role: String,
     text: String,
     images: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<crate::composer_context::MessageContext>,
 }
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -137,8 +139,12 @@ struct ThreadView {
     queue: Vec<(usize, String, Vec<Attachment>)>,
     #[serde(default)]
     queue_drafts: Vec<(usize, crate::composer_rich::Snapshot)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queue_contexts: Vec<(usize, crate::composer_context::MessageContext)>,
     #[serde(default)]
     queue_edit_supported: bool,
+    #[serde(default)]
+    composer_context_supported: bool,
     #[serde(default)]
     queue_held: bool,
     #[serde(default)]
@@ -186,6 +192,7 @@ impl ThreadView {
                     role: m.role.into(),
                     text: m.text.clone(),
                     images: m.images.clone(),
+                    context: m.context.clone(),
                 })
                 .collect(),
             tools: thread
@@ -256,7 +263,14 @@ impl ThreadView {
                 .iter()
                 .filter_map(|q| q.prompt.draft.clone().map(|draft| (q.id, draft)))
                 .collect(),
+            queue_contexts: thread
+                .native
+                .queue
+                .iter()
+                .filter_map(|q| q.prompt.context.clone().map(|ctx| (q.id, ctx)))
+                .collect(),
             queue_edit_supported: true,
+            composer_context_supported: true,
             queue_held: thread.native.queue_held,
             run_id: thread.run_id.clone(),
             resumable_run_id: thread.resumable_run_id.clone(),
@@ -304,6 +318,7 @@ impl ThreadView {
                     },
                     text: message.text,
                     images: message.images,
+                    context: message.context,
                 })
             })
             .collect::<Result<_, String>>()?;
@@ -425,10 +440,16 @@ impl ThreadView {
                     .iter()
                     .find(|(key, _)| *key == id)
                     .map(|(_, draft)| draft.clone());
+                prompt.context = self
+                    .queue_contexts
+                    .iter()
+                    .find(|(key, _)| *key == id)
+                    .map(|(_, ctx)| ctx.clone());
                 pi_session::QueuedMessage { id, prompt }
             })
             .collect();
         thread.queue_edit_supported = self.queue_edit_supported;
+        thread.composer_context_supported = self.composer_context_supported;
         thread.native.queue_held = self.queue_held;
         thread.reconcile_queued_edit();
         thread.tick_stop(Instant::now());
@@ -578,6 +599,7 @@ impl State {
             role: "Pi",
             text: "Retained archived reply".into(),
             images: vec![],
+            context: None,
         });
         state.threads.push(archived);
         state
@@ -712,15 +734,8 @@ impl State {
         for thread in &mut self.threads {
             thread.disconnect();
             thread.recover_native_inputs();
-            if thread.has_draft_content() {
-                self.recovered_inputs.insert(
-                    thread.id,
-                    json!({"text":thread.draft.text,"attachments":thread.draft_images}),
-                );
-                thread.draft.replace_text("");
-                thread.draft_images.clear();
-            }
         }
+        self.collect_recovered_inputs();
     }
     pub fn begin_runtime_shutdown(&mut self) {
         self.runtime_enabled = false;
@@ -776,19 +791,31 @@ impl State {
             if let Some(previous) = self.recovered_inputs.get(&thread.id) {
                 let images: Vec<Attachment> =
                     serde_json::from_value(previous["attachments"].clone()).unwrap_or_default();
-                let editor = serde_json::from_value::<crate::composer_rich::Snapshot>(
+                let snapshot = serde_json::from_value::<crate::composer_rich::Snapshot>(
                     previous["draft"].clone(),
                 )
-                .map(|snapshot| snapshot.editor())
                 .unwrap_or_else(|_| {
-                    crate::composer_rich::draft(previous["text"].as_str().unwrap_or(""))
+                    crate::composer_rich::Snapshot::capture(
+                        &crate::composer_rich::draft(previous["text"].as_str().unwrap_or("")),
+                        &images,
+                    )
                 });
-                thread.restore_editor(&editor, &images);
+                thread.restore_snapshot(&snapshot);
             }
-            self.recovered_inputs.insert(thread.id,json!({"text":thread.draft.text,"attachments":thread.draft_images,
-                "draft":crate::composer_rich::Snapshot::capture(&thread.draft,&thread.draft_images),"commandId":thread.recovery_command}));
+            let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                &thread.draft,
+                &thread.draft_images,
+                &thread.draft_context,
+            );
+            self.recovered_inputs.insert(
+                thread.id,
+                json!({"text":thread.draft.text,"attachments":thread.draft_images,
+                "draft":snapshot,"commandId":thread.recovery_command}),
+            );
             thread.draft.replace_text("");
             thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.retained_context = Default::default();
             changed = true;
         }
         changed
@@ -1002,7 +1029,7 @@ impl State {
             .as_ref()
             .map(|client| client.snapshots())
             .unwrap_or_default();
-        let mut changed = changed || !projections.is_empty();
+        let mut changed = changed || !projections.is_empty() || self.poll_context_imports();
         for (server, projection) in projections {
             self.machines
                 .views
@@ -1058,7 +1085,7 @@ impl State {
                             thread
                                 .remote_send
                                 .as_ref()
-                                .is_some_and(|(id, _, _)| *id == command.command_id)
+                                .is_some_and(|(id, _)| *id == command.command_id)
                         })
                     }) {
                         thread.finish_remote_send(command.command_id, accepted);
@@ -1280,7 +1307,7 @@ impl State {
                                     value["result"]["result"]["draft"].clone(),
                                 )
                             {
-                                thread.restore_editor(&snapshot.editor(), &images);
+                                thread.restore_snapshot(&snapshot);
                             } else {
                                 thread.restore_prompt(&Prompt::new(
                                     value["result"]["result"]["text"]
@@ -1328,7 +1355,7 @@ impl State {
                         };
                         if let Some(threads) = threads {
                             for thread in threads {
-                                if let Some((id, _, _)) = &thread.remote_send {
+                                if let Some((id, _)) = &thread.remote_send {
                                     thread.finish_remote_send(*id, false);
                                     thread.error=Some("This device was paired again. Review the previous send before retrying. Your draft was kept.".into());
                                 }
@@ -1612,6 +1639,8 @@ impl State {
                             thread.id,
                             thread.draft.clone(),
                             thread.draft_images.clone(),
+                            thread.draft_context.clone(),
+                            thread.retained_context.clone(),
                             thread.attachment_error.clone(),
                         )
                     })
@@ -1620,10 +1649,12 @@ impl State {
                 vec![]
             };
             self.restore_ui(&local)?;
-            for (id, draft, images, error) in editors {
+            for (id, draft, images, context, retained, error) in editors {
                 if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
                     thread.draft = draft;
                     thread.draft_images = images;
+                    thread.draft_context = context;
+                    thread.retained_context = retained;
                     thread.attachment_error = error;
                 }
             }
@@ -1731,7 +1762,14 @@ impl State {
         }
     }
     pub fn machine_label(&self, server: &str) -> String {
-        if server == "local" {
+        if server == "local"
+            || self
+                .machines
+                .views
+                .get("local")
+                .and_then(|v| v["serverId"].as_str())
+                == Some(server)
+        {
             "Local".into()
         } else {
             self.client
@@ -1972,6 +2010,8 @@ impl State {
         let source = (self.machines.selected.clone(), self.current().id);
         let draft = self.current().draft.clone();
         let images = self.current().draft_images.clone();
+        let context = self.current().draft_context.clone();
+        let retained = self.current().retained_context.clone();
         self.select_machine(server);
         if self.machines.selected != server {
             return;
@@ -1979,6 +2019,8 @@ impl State {
         self.new_client_draft(None);
         self.current_mut().draft = draft;
         self.current_mut().draft_images = images;
+        self.current_mut().draft_context = context;
+        self.current_mut().retained_context = retained;
         if let Some(thread) = self
             .machines
             .threads
@@ -1987,6 +2029,8 @@ impl State {
         {
             thread.draft.replace_text("");
             thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.retained_context = Default::default();
         }
         // Update the old machine's saved editor too, so a later switch cannot restore a copy.
         self.machines.ui[&source.0]["drafts"][source.1.to_string()] = json!("");
@@ -2068,13 +2112,19 @@ impl State {
             "serviceTier":thread.harness_state["serviceTier"]});
         match self.remote("thread.create", params).expect("client") {
             Ok(command) => {
+                let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                    &self.current().draft,
+                    &self.current().draft_images,
+                    &self.current().draft_context,
+                );
                 let thread = self.current_mut();
                 thread.client_creating = Some(command);
-                thread.remote_send =
-                    Some((command, thread.draft.clone(), thread.draft_images.clone()));
+                thread.remote_send = Some((command, snapshot));
                 thread.life.last_requested_at = Some(lifecycle::now());
                 thread.draft.replace_text("");
                 thread.draft_images.clear();
+                thread.draft_context.clear();
+                thread.retained_context = Default::default();
             }
             Err(error) => self.storage_error = Some(error),
         }
@@ -2087,20 +2137,44 @@ impl State {
             .as_ref()
             .and_then(|client| client.commands_for(server))
             .cloned();
+        let target_server_id = self.machine_identity(server);
+        let target_peers: Vec<crate::peer::Peer> = if server == self.machines.selected {
+            self.peers.clone()
+        } else {
+            self.machines
+                .views
+                .get(server)
+                .and_then(|v| serde_json::from_value(v["peers"].clone()).ok())
+                .unwrap_or_default()
+        };
+        let peer_labels: Vec<(String, String)> = target_peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        let linked_hosts: Vec<(String, String)> = self
+            .client
+            .as_ref()
+            .map(|client| {
+                client
+                    .linked
+                    .iter()
+                    .filter_map(|(k, c)| c.remote.as_ref().map(|l| (k.clone(), l.host.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let peer_label = |machine: &str| -> String {
             if machine == "local" {
                 "Local".into()
             } else {
-                self.client
-                    .as_ref()
-                    .and_then(|client| client.linked.get(machine))
-                    .and_then(|client| client.remote.as_ref())
-                    .map(|link| link.host.clone())
+                linked_hosts
+                    .iter()
+                    .find(|(k, _)| k == machine)
+                    .map(|(_, h)| h.clone())
                     .or_else(|| {
-                        self.peers
+                        peer_labels
                             .iter()
-                            .find(|p| p.server_id == machine)
-                            .map(|p| p.label.clone())
+                            .find(|(id, _)| id == machine)
+                            .map(|(_, l)| l.clone())
                     })
                     .unwrap_or_else(|| machine.into())
             }
@@ -2128,8 +2202,8 @@ impl State {
             draft.client_creating = None;
             let submitted = draft.remote_send.take();
             if value["result"]["status"] != "accepted" {
-                if let Some((_, edit, images)) = submitted {
-                    draft.restore_editor(&edit, &images);
+                if let Some((_, snapshot)) = submitted {
+                    draft.restore_snapshot(&snapshot);
                 }
                 let error = value["error"]["message"]
                     .as_str()
@@ -2140,16 +2214,19 @@ impl State {
                 Outcome::Failed(draft.background_send.take(), draft.id, error)
             } else if let Some(id) = value["result"]["result"]["threadId"].as_u64() {
                 draft.client_promoted = Some(id as usize);
-                if let Some((_, edit, images)) = submitted {
-                    match crate::composer_tokens::prompt_for(
-                        &edit,
-                        &images,
+                if let Some((_, snapshot)) = submitted {
+                    match crate::composer_tokens::prompt_for_target(
+                        &snapshot.editor(),
+                        &snapshot.attachments,
+                        &snapshot.context,
                         Some(server),
+                        Some(&target_server_id),
+                        &target_peers,
                         &peer_label,
                     ) {
                         Ok(prompt) => {
                             let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
-                                "draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+                                "context":prompt.context,"draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
                             let result = commands
                                 .ok_or_else(|| {
                                     "This machine is not linked. Your draft was kept.".to_string()
@@ -2157,18 +2234,18 @@ impl State {
                                 .and_then(|commands| commands.send("thread.send", params));
                             match result {
                                 Ok(cmd_id) => {
-                                    draft.remote_send = Some((cmd_id, edit, images));
+                                    draft.remote_send = Some((cmd_id, snapshot));
                                     Outcome::None
                                 }
                                 Err(error) => {
-                                    draft.restore_editor(&edit, &images);
+                                    draft.restore_snapshot(&snapshot);
                                     draft.error = Some(error.clone());
                                     Outcome::Failed(draft.background_send.take(), draft.id, error)
                                 }
                             }
                         }
                         Err(error) => {
-                            draft.restore_editor(&edit, &images);
+                            draft.restore_snapshot(&snapshot);
                             draft.attachment_error = Some(error.clone());
                             Outcome::Failed(draft.background_send.take(), draft.id, error)
                         }
@@ -2204,10 +2281,14 @@ impl State {
             };
             let text = std::mem::take(&mut self.threads[draft_index].draft);
             let images = std::mem::take(&mut self.threads[draft_index].draft_images);
+            let context = std::mem::take(&mut self.threads[draft_index].draft_context);
+            let retained = std::mem::take(&mut self.threads[draft_index].retained_context);
             let sending = self.threads[draft_index].remote_send.take();
             let background_send = self.threads[draft_index].background_send.take();
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
+            self.threads[index].draft_context = context;
+            self.threads[index].retained_context = retained;
             self.threads[index].remote_send = sending;
             if background_send.is_some() {
                 self.threads[index].background_send = background_send;
@@ -2681,16 +2762,33 @@ impl State {
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
                 attachments::validate_prompt_images(&attachments)?;
-                let prompt =
-                    crate::composer_tokens::received_prompt(text, attachments, input.draft)?;
+                let context = input
+                    .context
+                    .filter(|v| !v.is_null())
+                    .map(|v| crate::composer_context::decode_message_context(&v))
+                    .transpose()?;
+                let mut prompt = crate::composer_tokens::received_prompt_with_context(
+                    text,
+                    attachments,
+                    input.draft,
+                    context,
+                )?;
+                attachments::stage_prompt_files(&mut prompt)?;
                 self.current_mut().draft = prompt.draft.as_ref().map_or_else(
-                    || crate::composer_rich::draft(&prompt.text),
+                    || crate::composer_rich::draft_from_canonical(&prompt.text),
                     crate::composer_rich::Snapshot::editor,
                 );
                 self.current_mut().draft_images = prompt
                     .draft
                     .as_ref()
                     .map_or_else(|| prompt.images.to_vec(), |draft| draft.attachments.clone());
+                self.current_mut().draft_context = prompt
+                    .draft
+                    .as_ref()
+                    .filter(|d| !d.context.is_empty())
+                    .map(|d| d.context.clone())
+                    .or_else(|| prompt.context.as_ref().map(|c| c.records.clone()))
+                    .unwrap_or_default();
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
                 self.send();
@@ -2703,6 +2801,8 @@ impl State {
                         .unwrap_or("The thread cannot accept input now.".into());
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                    self.current_mut().draft_context.clear();
+                    self.current_mut().retained_context = Default::default();
                     return Err(error);
                 }
             }
@@ -2725,10 +2825,12 @@ impl State {
                 self.owe_remote_stops_for(self.current().id);
                 if self.current().has_draft_content() {
                     let input = json!({"text":self.current().draft.text,"attachments":self.current().draft_images,
-                        "draft":crate::composer_rich::Snapshot::capture(&self.current().draft,&self.current().draft_images),"commandId":command.command_id});
+                        "draft":crate::composer_rich::Snapshot::capture_with_context(&self.current().draft,&self.current().draft_images,&self.current().draft_context),"commandId":command.command_id});
                     self.recovered_inputs.insert(self.current().id, input);
                     self.current_mut().draft.replace_text("");
                     self.current_mut().draft_images.clear();
+                    self.current_mut().draft_context.clear();
+                    self.current_mut().retained_context = Default::default();
                 }
             }
             "thread.resume" => {
@@ -2993,11 +3095,18 @@ impl State {
                     .iter()
                     .map(|value| Attachment::from_value(value).ok_or("Invalid local attachment."))
                     .collect::<Result<Vec<_>, _>>()?;
-                let prompt = crate::composer_tokens::received_prompt(
+                let context = args
+                    .get("context")
+                    .filter(|v| !v.is_null())
+                    .map(crate::composer_context::decode_message_context)
+                    .transpose()?;
+                let mut prompt = crate::composer_tokens::received_prompt_with_context(
                     text("text")?,
                     images,
                     args.get("draft").cloned(),
+                    context,
                 )?;
+                attachments::stage_prompt_files(&mut prompt)?;
                 self.current_mut().update_queued(
                     number("inputId")?,
                     &text("generation")?,
@@ -3012,7 +3121,7 @@ impl State {
                     self.current_mut().command("clear_queue", json!({}));
                 }
                 let prompts: Vec<_> = self.current_mut().native.queue.drain(..).map(|q| {
-                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"draft":q.prompt.draft})
+                    json!({"text":q.prompt.text,"attachments":q.prompt.images.as_ref(),"context":q.prompt.context,"draft":q.prompt.draft})
                 }).collect();
                 return Ok(json!({"prompts":prompts}));
             }
@@ -3182,10 +3291,10 @@ impl Thread {
             .cloned()
             .unwrap_or_default();
         if let Some((prompt, after)) = &self.queued_prompt {
-            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after}));
+            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after,"context":prompt.context,"draft":prompt.draft}));
         }
         if let Some((_, prompt, after)) = &self.pending_prompt {
-            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after}));
+            inputs.push(json!({"text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":after,"context":prompt.context,"draft":prompt.draft}));
         }
         json!(inputs)
     }
@@ -4833,6 +4942,7 @@ mod tests {
             role: "Pi",
             text: "durable server reply".into(),
             images: vec![],
+            context: None,
         });
         runtime.state.checkpoint_and_flush().unwrap();
         drop(runtime);
@@ -4973,10 +5083,346 @@ mod tests {
         )
         .err()
         .expect("a thread on another machine blocks the send");
-        assert_eq!(
-            blocked,
-            "Attached thread is on another machine. This machine's agent can't read \"Local seven\". Remove it, or switch back to Local to send."
+        assert!(
+            blocked.contains("Attached thread is on another machine")
+                && blocked.contains("Local seven")
+                && blocked.contains("not linked")
         );
+    }
+
+    #[test]
+    fn older_peer_without_composer_context_receives_preprojected_text_without_context_field() {
+        let mut rec = crate::composer_context::thread_context_record("local", 5, "Design doc");
+        rec.label = "Design doc".into();
+        let command = Command::new(
+            "thread.send",
+            json!({
+                "threadId": 1,
+                "text": "See [Design doc](t3-context://v1/thread/thread_5)",
+                "attachments": [],
+                "context": { "version": 1, "records": [rec] },
+                "draft": { "text": "See Design doc", "html": "<p>See <span data-pill=\"t3-context://v1/thread/thread_5\">Design doc</span></p>", "attachments": [] },
+                "mode": "prompt",
+            }),
+        );
+        let downgraded = crate::client::downgrade_composer_context_command(command.clone(), false);
+        assert!(downgraded.params.get("context").is_none());
+        assert!(downgraded.params.get("draft").is_none());
+        let projected_text = downgraded.params["text"].as_str().unwrap();
+        assert!(projected_text.contains("[Thread: Design doc; ref=thread_5]"));
+        assert!(projected_text.contains("<t3_context version=\"1\">"));
+        // Verify it deserializes into older SendInput with deny_unknown_fields.
+        assert!(serde_json::from_value::<crate::protocol::SendInput>(downgraded.params).is_ok());
+
+        // Newer peer keeps structured context intact.
+        let kept = crate::client::downgrade_composer_context_command(command, true);
+        assert!(kept.params.get("context").is_some());
+        assert!(kept.params.get("draft").is_some());
+    }
+
+    #[test]
+    fn clipboard_paste_fetches_image_asset_from_linked_server_and_shows_unresolved_when_missing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let mut png_cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(&mut png_cursor, image::ImageFormat::Png)
+        .unwrap();
+        let png_bytes = png_cursor.into_inner();
+        let ok_blob_id = "remote-shot.png";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served_bytes = png_bytes.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten().take(4) {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains(&format!("/v1/blobs/{ok_blob_id}")) {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served_bytes.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&served_bytes);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        let mut state = State::new(PathBuf::new(), false);
+        let source_server_id = uuid::Uuid::new_v4().to_string();
+        let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (mut source_client, _rx2) =
+            crate::client::Client::test_connected(state.data_dir.clone());
+        source_client.remote = Some(crate::peer::Link {
+            server_id: source_server_id.clone(),
+            host: format!("127.0.0.1:{port}"),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+        });
+        client
+            .linked
+            .insert(source_server_id.clone(), source_client);
+        state.client = Some(client);
+
+        let fragment = crate::composer_context::ComposerContextClipboardFragment {
+            version: 1,
+            source: crate::composer_context::ClipboardSource {
+                environment_id: source_server_id,
+                thread_id: Some("1".into()),
+                message_id: None,
+            },
+            records: vec![
+                crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "image_ok".into(),
+                    label: "remote.png".into(),
+                    data: crate::composer_context::ComposerContextData::Image {
+                        attachment_id: ok_blob_id.into(),
+                        name: "remote.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: png_bytes.len() as u64,
+                    },
+                },
+                crate::composer_context::ComposerContextRecord {
+                    version: 1,
+                    context_id: "image_missing".into(),
+                    label: "missing.png".into(),
+                    data: crate::composer_context::ComposerContextData::Image {
+                        attachment_id: "missing-blob.png".into(),
+                        name: "missing.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: 10,
+                    },
+                },
+            ],
+        };
+        let encoded = crate::composer_context::encode_composer_context_fragment(&fragment).unwrap();
+        let md = "![remote.png](t3-context://v1/image/image_ok) ![missing.png](t3-context://v1/image/image_missing)";
+        let html =
+            crate::composer_context::encode_composer_context_clipboard_html(md, &encoded, None);
+        assert!(
+            state.paste_composer_content(&rune::ClipboardContent::new(md).with_html(html), false)
+        );
+
+        // While downloads are pending, send is blocked cleanly.
+        assert!(state.has_pending_context_imports("local", state.current().id));
+        state.send();
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Still bringing attached context into this message")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.has_pending_context_imports("local", state.current().id) {
+            state.poll_context_imports();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Valid image resolved with rewritten contextId; missing image stays unresolved with error.
+        assert_eq!(state.current().draft_images.len(), 1);
+        assert_eq!(state.current().draft_images[0].name, "remote.png");
+        assert_eq!(state.current().draft.pills().count(), 2);
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .contains("Couldn't bring missing.png into this message")
+        );
+        assert_eq!(state.current().draft_context.len(), 1);
+        assert_ne!(state.current().draft_context[0].context_id, "image_ok");
+    }
+
+    #[test]
+    fn linked_machine_thread_pill_allows_thread_read_v2_and_names_missing_link_or_capability() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote_client, _rx2) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("server-b".into(), remote_client);
+        state.client = Some(client);
+        state.peers = vec![
+            crate::peer::Peer {
+                server_id: "server-b".into(),
+                host: "studio.local".into(),
+                label: "Studio".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": [crate::protocol::THREAD_READ]}),
+                last_reached_at: None,
+                last_error: None,
+            },
+            crate::peer::Peer {
+                server_id: "server-old".into(),
+                host: "old.local".into(),
+                label: "OldBox".into(),
+                linked_at: 0,
+                capabilities: json!({"contracts": []}),
+                last_reached_at: None,
+                last_error: None,
+            },
+        ];
+
+        // 1. Linked peer WITH thread-read-v2 succeeds and expands machine + threadId.
+        let rec_b = crate::composer_context::thread_context_record("server-b", 7, "Remote seven");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href("thread", &rec_b.context_id),
+            "Remote seven",
+        );
+        state.current_mut().draft_context = vec![rec_b];
+        let prompt = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap();
+        let expanded = crate::attachments::provider_text(&prompt);
+        assert!(
+            expanded.contains(r#"read_thread({"machine":"server-b","threadId":7})"#)
+                || expanded.contains(r#"read_thread({"threadId":7,"machine":"server-b"})"#),
+            "{expanded}"
+        );
+
+        // 2. Linked peer WITHOUT thread-read-v2 blocks and names the missing capability.
+        let rec_old = crate::composer_context::thread_context_record("server-old", 8, "Old seven");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href("thread", &rec_old.context_id),
+            "Old seven",
+        );
+        state.current_mut().draft_context = vec![rec_old];
+        let err_cap = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap_err();
+        assert!(err_cap.contains("thread-read-v2"), "{err_cap}");
+
+        // 3. Unlinked machine blocks and says it is not linked.
+        let rec_unlinked =
+            crate::composer_context::thread_context_record("server-c", 9, "Stranger");
+        state.current_mut().draft = crate::composer_rich::draft("check ");
+        state.current_mut().draft.set_caret(6);
+        state.current_mut().draft.insert_pill(
+            crate::composer_context::format_composer_context_href(
+                "thread",
+                &rec_unlinked.context_id,
+            ),
+            "Stranger",
+        );
+        state.current_mut().draft_context = vec![rec_unlinked];
+        let err_unlinked = crate::composer_tokens::prompt_for_target(
+            &state.current().draft,
+            &[],
+            &state.current().draft_context,
+            Some("local"),
+            None,
+            &state.peers,
+            &|m| state.machine_label(m),
+        )
+        .unwrap_err();
+        assert!(err_unlinked.contains("not linked"), "{err_unlinked}");
+    }
+
+    #[test]
+    fn foreground_and_background_sends_guard_context_and_restore_full_snapshots() {
+        for background in [false, true] {
+            for new_thread in [false, true] {
+                let (mut state, server, mut commands) = tab_client();
+                state.apply_projection(server.projection()).unwrap();
+                if new_thread {
+                    state.new_thread_in(Some(1));
+                }
+                let source_id = state.current().id;
+                let record =
+                    crate::composer_context::thread_context_record("local", 1, "Reference");
+                let text = format!(
+                    "Read [Reference]({})",
+                    crate::composer_context::format_composer_context_href(
+                        "thread",
+                        &record.context_id
+                    )
+                );
+                state.current_mut().draft = crate::composer_rich::draft_from_canonical(&text);
+                state.current_mut().draft_context = vec![record.clone()];
+                let send = |state: &mut State| {
+                    if background {
+                        state.send_background()
+                    } else {
+                        state.send()
+                    }
+                };
+                // A pending import blocks both dispatch paths before promotion/navigation.
+                state
+                    .pending_context_imports
+                    .push(("local".into(), source_id, "pending".into()));
+                send(&mut state);
+                assert_eq!(state.current().id, source_id);
+                assert!(commands.try_recv().is_err());
+                state.pending_context_imports.clear();
+                // An unlinked thread blocks both paths before thread.create as well.
+                state.current_mut().draft_context[0] =
+                    crate::composer_context::thread_context_record("unlinked", 1, "Reference");
+                send(&mut state);
+                assert_eq!(state.current().id, source_id);
+                assert!(commands.try_recv().is_err());
+                assert!(
+                    state
+                        .current()
+                        .attachment_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("not linked")
+                );
+                state.current_mut().draft_context = vec![record.clone()];
+                send(&mut state);
+                let command = commands.try_recv().unwrap();
+                let rejected = json!({"result":{"status":"rejected","result":{"error":"Refused"}}});
+                if new_thread {
+                    assert_eq!(command.method, "thread.create");
+                    state.complete_client_creation("local", &command, &rejected);
+                } else {
+                    assert_eq!(command.method, "thread.send");
+                    state.machines.receipts.insert(
+                        "local".into(),
+                        vec![crate::client::Event::Receipt(command, rejected)],
+                    );
+                    state.poll_client(&mut Tx::default());
+                }
+                let source = state.threads.iter().find(|t| t.id == source_id).unwrap();
+                assert_eq!(crate::composer_rich::markdown(&source.draft), text);
+                assert_eq!(source.draft_context, vec![record]);
+                assert!(source.remote_send.is_none());
+            }
+        }
     }
 
     #[test]
@@ -5099,6 +5545,7 @@ mod tests {
                 role: "You",
                 text: "Prior turn".into(),
                 images: vec![],
+                context: None,
             });
             state.apply_projection(server.projection()).unwrap();
             state.select_thread(0);

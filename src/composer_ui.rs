@@ -307,7 +307,7 @@ pub(super) fn control_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) ->
             "access-mode"
         };
         let leaving = if event.mods.shift {
-            if let Some(image) = s.current().draft_images.first() {
+            if let Some(image) = super::tray_attachments(s.current()).first() {
                 tx.focused() == Some(format!("remove-attachment-{}", image.id).as_str())
             } else {
                 tx.focused() == Some("composer-input")
@@ -623,15 +623,20 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && s.current().native.questionnaire.is_none()
         && s.current().request.is_none()
         && !s.current().context.popover_open()
+        && s.confirm_remove_attachment.is_none()
         && !captain_ui::is_earlier(s)
 }
 
+impl Behavior {
+    pub(crate) fn consume_paste_as_text(&self) -> bool {
+        // Keep a short window after Mod+Shift+V so on_input_paste sees the bypass.
+        self.paste_as_text_until
+            .is_some_and(|until| std::time::Instant::now() <= until)
+    }
+}
+
 pub(crate) fn key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
-    if event.is_command('v')
-        && event.mods.shift
-        && !event.mods.alt
-        && redirect_allowed(s, tx.focused())
-    {
+    if event.is_command('v') && event.mods.shift && !event.mods.alt {
         s.composer_ui.paste_as_text_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
         return false;
@@ -660,6 +665,7 @@ pub(super) fn changed(s: &mut State) {
     let t = s.current_mut();
     t.native.slash_index = 0;
     t.composer_rules.changed(&mut t.draft);
+    t.reconcile_draft_context();
     t.typing_guard.on_type(std::time::Instant::now());
     t.update_submission_error();
     s.ensure_composer_commands();
@@ -667,9 +673,7 @@ pub(super) fn changed(s: &mut State) {
 
 pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx) {
     if !redirect_allowed(s, tx.focused())
-        || content.text().is_empty()
-        || !content.files().is_empty()
-        || content.image().is_some()
+        || content.text().is_empty() && content.files().is_empty() && content.image().is_none()
     {
         return;
     }
@@ -682,10 +686,8 @@ pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx
         .paste_as_text_until
         .take()
         .is_some_and(|until| std::time::Instant::now() <= until);
-    if bypass || !s.fold_paste(content.text()) {
-        s.current_mut().draft.insert(content.text());
-        changed(s);
-    }
+    s.paste_composer_content(content, bypass);
+    changed(s);
     s.checkpoint();
 }
 

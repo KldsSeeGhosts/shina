@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 pub const MAJOR: u32 = 1;
 pub const MINOR: u32 = 11;
 pub const DEFERRED_WORK: &str = "deferred-work";
+pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
+pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
+pub const FILE_ATTACHMENTS_UPDATE_REQUIRED: &str = "This server does not support file attachments.";
 pub const MODEL_FAVORITES: &str = "model-favorites";
 pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
 pub const MODEL_OPTIONS: &str = "model-options";
@@ -333,6 +336,8 @@ pub struct SendInput {
     pub editor_revision: Option<uuid::Uuid>,
     #[serde(default)]
     pub draft: Option<Value>,
+    #[serde(default)]
+    pub context: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

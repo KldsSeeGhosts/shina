@@ -331,6 +331,7 @@ fn find_reveals_a_folded_proposed_plan_and_highlights_its_title_and_body() {
                 role: "You",
                 text: format!("Later message {index}"),
                 images: vec![],
+                context: None,
             });
         }
         rt.frame(0.0);

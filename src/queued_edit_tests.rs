@@ -160,3 +160,71 @@ fn older_servers_block_transactional_edits_without_removing_the_item() {
     assert_eq!(t.native.queue.len(), 1);
     assert!(t.error.as_ref().unwrap().contains("Update required"));
 }
+
+#[test]
+fn context_records_round_trip_through_draft_queued_sent_and_failed_recovery() {
+    let mut t = Thread::new(1);
+    let rec = crate::composer_context::thread_context_record("local", 99, "Context source");
+    let href = crate::composer_context::format_composer_context_href("thread", &rec.context_id);
+    t.draft = crate::composer_rich::draft("check ");
+    t.draft.set_caret(t.draft.text.len());
+    t.draft.insert_pill(href.clone(), "Context source");
+    t.draft_context.push(rec.clone());
+
+    // Queue during run preserves context records.
+    let (pi, _commands, _events) = crate::backend::Pi::test_connection();
+    t.pi = Some(pi);
+    t.model_provider = "cpa".into();
+    t.status = Status::Running;
+    t.native.follow_up = true;
+    t.send_during_run();
+    assert_eq!(t.native.queue.len(), 1);
+    assert_eq!(
+        t.native.queue[0].prompt.text,
+        "check [Context source](t3-context://v1/thread/thread_99)"
+    );
+    assert_eq!(
+        t.native.queue[0].prompt.context.as_ref().unwrap().records,
+        vec![rec.clone()]
+    );
+
+    // Editing queued item restores its context record and keeps ordinary draft context isolated.
+    let ordinary_rec = crate::composer_context::skill_context_record("ordinary", None);
+    let ordinary_href =
+        crate::composer_context::format_composer_context_href("skill", &ordinary_rec.context_id);
+    t.draft = crate::composer_rich::draft("ordinary ");
+    t.draft.set_caret(t.draft.text.len());
+    t.draft.insert_pill(ordinary_href, "$ordinary");
+    t.draft_context.push(ordinary_rec.clone());
+    let id = t.native.queue[0].id;
+    t.edit_queued(id);
+    assert_eq!(t.draft_context, vec![rec.clone()]);
+    t.save_queued_edit();
+    assert_eq!(t.draft_context, vec![ordinary_rec.clone()]);
+
+    // Send & fail recovery restores draft_context alongside later edits.
+    t.status = Status::Ready;
+    t.draft.replace_text("send ");
+    t.draft.set_caret(t.draft.text.len());
+    t.draft.insert_pill(href.clone(), "Context source");
+    t.draft_context = vec![rec.clone()];
+    t.send();
+    assert_eq!(t.messages.len(), 1);
+    assert_eq!(
+        t.messages[0].text,
+        "send [Context source](t3-context://v1/thread/thread_99)"
+    );
+    assert_eq!(
+        t.messages[0].context.as_ref().unwrap().records,
+        vec![rec.clone()]
+    );
+    let later_rec = crate::composer_context::mention_context_record("src/lib.rs", None);
+    let later_href =
+        crate::composer_context::format_composer_context_href("mention", &later_rec.context_id);
+    t.draft.replace_text("later ");
+    t.draft.set_caret(t.draft.text.len());
+    t.draft.insert_pill(later_href, "src/lib.rs");
+    t.draft_context.push(later_rec.clone());
+    t.disconnect();
+    assert_eq!(t.draft_context, vec![rec, later_rec]);
+}

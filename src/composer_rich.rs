@@ -35,14 +35,25 @@ pub struct Snapshot {
     pub text: String,
     pub html: String,
     pub attachments: Vec<crate::attachments::Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<crate::composer_context::ComposerContextRecord>,
 }
 
 impl Snapshot {
     pub fn capture(edit: &TextEdit, attachments: &[crate::attachments::Attachment]) -> Self {
+        Self::capture_with_context(edit, attachments, &[])
+    }
+
+    pub fn capture_with_context(
+        edit: &TextEdit,
+        attachments: &[crate::attachments::Attachment],
+        context: &[crate::composer_context::ComposerContextRecord],
+    ) -> Self {
         Self {
             text: edit.text.clone(),
             html: edit.to_html(),
             attachments: attachments.to_vec(),
+            context: context.to_vec(),
         }
     }
 
@@ -515,6 +526,24 @@ fn inline(
                     .any(|m| m.start <= start && end <= m.end && m.mark == *mark)
             })
             .collect();
+        let context_ref = marks.iter().find_map(|m| {
+            (m.start <= start && end <= m.end)
+                .then(|| m.mark.pill_id())
+                .flatten()
+                .and_then(crate::composer_context::parse_composer_context_href)
+        });
+        if let Some((kind, context_id)) = context_ref {
+            runs.push(Run {
+                text: crate::composer_context::format_composer_context_reference(
+                    &kind,
+                    &context_id,
+                    &edit.text[start..end],
+                ),
+                marks: active,
+                whitespace: false,
+            });
+            continue;
+        }
         let token = marks.iter().find_map(|m| {
             (m.start <= start && end <= m.end)
                 .then(|| m.mark.pill_id())
@@ -711,10 +740,129 @@ pub fn markdown_for(
     out.join("\n")
 }
 
+pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
+    let start = range.start.min(edit.text.len());
+    let end = range.end.min(edit.text.len()).max(start);
+    if start == end {
+        return String::new();
+    }
+    let paragraphs = edit.paragraphs();
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut numbers = [0usize; 4];
+    while at < paragraphs.len() {
+        let p = &paragraphs[at];
+        if p.range.end < start || p.range.start > end {
+            at += 1;
+            continue;
+        }
+        // Only treat a single-line partial selection inside a paragraph as plain inline markdown.
+        if p.range.start <= start && end <= p.range.end && !p.soft_break {
+            if p.block == Block::Code {
+                return edit.text[start..end].to_owned();
+            }
+            return inline(edit, start..end, None, &|machine| machine.to_owned());
+        }
+        let sub_start = p.range.start.max(start);
+        let sub_end = p.range.end.min(end);
+        if sub_start > sub_end {
+            at += 1;
+            continue;
+        }
+        if p.block == Block::Code {
+            let mut code_end = sub_end;
+            at += 1;
+            while at < paragraphs.len()
+                && paragraphs[at].block == Block::Code
+                && paragraphs[at].range.start <= end
+            {
+                code_end = paragraphs[at].range.end.min(end);
+                at += 1;
+            }
+            let content = &edit.text[sub_start..code_end];
+            let ticks = fence(content, 3);
+            let newline = if content.is_empty() { "" } else { "\n" };
+            out.push(format!("{ticks}{newline}{content}\n{ticks}"));
+            numbers.fill(0);
+            continue;
+        }
+        let prefix = if sub_start == p.range.start {
+            match p.block {
+                Block::Bullet(level) => {
+                    numbers[level as usize..].fill(0);
+                    format!("{}- ", "    ".repeat(level as usize))
+                }
+                Block::Numbered(level) => {
+                    if !p.soft_break {
+                        numbers[level as usize] += 1;
+                        numbers[level as usize + 1..].fill(0);
+                    }
+                    if p.soft_break {
+                        "    ".repeat(level as usize + 1)
+                    } else {
+                        format!(
+                            "{}{}. ",
+                            "    ".repeat(level as usize),
+                            numbers[level as usize]
+                        )
+                    }
+                }
+                Block::Quote => {
+                    numbers.fill(0);
+                    "> ".into()
+                }
+                _ => {
+                    numbers.fill(0);
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "{prefix}{}",
+            inline(edit, sub_start..sub_end, None, &|machine| machine
+                .to_owned())
+        ));
+        at += 1;
+    }
+    out.join("\n")
+}
+
 pub fn has_format(edit: &TextEdit) -> bool {
     !edit.marks().is_empty()
         || edit.blocks().iter().any(|b| *b != Block::Paragraph)
         || !edit.soft_breaks().is_empty()
+}
+
+/// Rebuilds a rich `TextEdit` from canonical Markdown containing `t3-context://v1/...`
+/// references when no editor snapshot was sent (e.g., headless RPC clients).
+pub fn draft_from_canonical(text: &str) -> TextEdit {
+    let refs = crate::composer_context::collect_composer_context_references(text);
+    if refs.is_empty() {
+        return draft(text);
+    }
+    let mut plain = String::with_capacity(text.len());
+    let mut pills = Vec::new();
+    let mut cursor = 0;
+    for occ in refs {
+        plain.push_str(&text[cursor..occ.start]);
+        let start = plain.len();
+        plain.push_str(&occ.label);
+        let end = plain.len();
+        pills.push((
+            start..end,
+            crate::composer_context::format_composer_context_href(&occ.kind, &occ.context_id),
+            occ.label,
+        ));
+        cursor = occ.end;
+    }
+    plain.push_str(&text[cursor..]);
+    let mut edit = draft(plain);
+    for (range, id, label) in pills.into_iter().rev() {
+        edit.replace_with_pill(range, id, &label);
+    }
+    edit
 }
 
 pub fn restore(text: &str, html: Option<&str>) -> TextEdit {
