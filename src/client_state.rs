@@ -1238,6 +1238,12 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
+                && (command.method == "thread.send" || command.method == "thread.create")
+                && self.handle_multi_model_remote_receipt(&server, command, value)
+            {
+                continue;
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
                 && command.method == "thread.send"
             {
                 let accepted = value["result"]["status"] == "accepted";

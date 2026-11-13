@@ -809,6 +809,33 @@ pub fn toggle_multi_model_selection(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultipleModelSendBlock {
+    ServerOutdated,
+    NeedsNewGitThread,
+}
+
+/// Ported from KSG Code's `components/chat/composerSend.logic.ts` (`multipleModelSendBlock`).
+pub fn multiple_model_send_block(
+    selection_count: usize,
+    server_supports_worktree_bootstrap: bool,
+    is_local_draft_thread: bool,
+    is_git_repo: bool,
+    branch: Option<&str>,
+) -> Option<MultipleModelSendBlock> {
+    if !server_supports_worktree_bootstrap {
+        return Some(MultipleModelSendBlock::ServerOutdated);
+    }
+    if !is_local_draft_thread
+        || !is_git_repo
+        || branch.is_none_or(|b| b.trim().is_empty())
+        || selection_count == 0
+    {
+        return Some(MultipleModelSendBlock::NeedsNewGitThread);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,5 +1291,34 @@ mod tests {
         let encoded = serde_json::to_value(&draft).unwrap();
         let decoded: DraftModelState = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, draft);
+    }
+
+    // Ported from KSG Code `components/chat/composerSend.logic.test.ts` (`multipleModelSendBlock`).
+    #[test]
+    fn multiple_model_send_block_matches_ksg_test_cases() {
+        assert_eq!(
+            multiple_model_send_block(2, true, true, true, Some("main")),
+            None
+        );
+        assert_eq!(
+            multiple_model_send_block(2, false, true, false, Some("main")),
+            Some(MultipleModelSendBlock::ServerOutdated)
+        );
+        assert_eq!(
+            multiple_model_send_block(2, true, false, true, Some("main")),
+            Some(MultipleModelSendBlock::NeedsNewGitThread)
+        );
+        assert_eq!(
+            multiple_model_send_block(2, true, true, false, Some("main")),
+            Some(MultipleModelSendBlock::NeedsNewGitThread)
+        );
+        assert_eq!(
+            multiple_model_send_block(2, true, true, true, None),
+            Some(MultipleModelSendBlock::NeedsNewGitThread)
+        );
+        assert_eq!(
+            multiple_model_send_block(0, true, true, true, Some("main")),
+            Some(MultipleModelSendBlock::NeedsNewGitThread)
+        );
     }
 }
