@@ -27,7 +27,6 @@ tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", features = ["sink"] }
 pollster = "=1.0.1"
 raw-window-handle = "=0.6.2"
-rfd = { version = "=0.17.2", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
 getrandom = "0.4"
 ignore = "0.4"
@@ -56,6 +55,14 @@ chrono-tz = "0.10"
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 winresource = "0.1"
+
+# Multi-file picking. macOS and Windows use the native dialogs; Linux needs an explicit backend
+# and uses the XDG desktop portal, as Rune's own dialogs do.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
 
 # Rune's Windows integrations require its vendored dependency patches at the app root.
 [patch.crates-io]
