@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use rune::{
-    AppMark, Color, EditMap, EditorSelection, Mark, MarkRange, TextEdit, TextStyle,
+    AppMark, Color, EditMap, EditorSelection, Key, KeyEvent, Mark, MarkRange, TextEdit, TextStyle,
     TransactionOptions, text::Span,
 };
 
@@ -39,22 +39,208 @@ pub struct MarkdownSourceState {
     pub detached: bool,
     pub revealed: Vec<Range<usize>>,
     pub typed_backtick_pairs: Vec<Range<usize>>,
+    pub pending_backtick_pair: Option<Range<usize>>,
+    pub was_composing: bool,
     pub prev_text: String,
     pub pending_typed: bool,
+    pub normalizing: bool,
 }
 
 impl MarkdownSourceState {
+    pub fn on_key_before(&mut self, edit: &TextEdit, ev: &KeyEvent) {
+        self.prev_text = edit.text.clone();
+        self.was_composing = edit.is_composing();
+        self.pending_backtick_pair = None;
+        if !edit.is_composing()
+            && ev.key == Key::Text("`".into())
+            && !ev.mods.cmd
+            && !ev.mods.ctrl
+            && !ev.mods.alt
+            && edit.anchor == edit.focus
+            && !matches!(edit.selection(), EditorSelection::Block(_))
+            && edit.block_kind(edit.line_of_byte(edit.focus)) != rune::BlockKind::Code
+            && !touches_markdown_source(edit, edit.focus, edit.focus)
+            && closes_backtick_pair(edit, edit.focus)
+        {
+            self.pending_backtick_pair = Some(edit.focus - 1..edit.focus + 1);
+        }
+    }
+
+    pub fn on_paste(&mut self, edit: &TextEdit) {
+        self.typed_backtick_pairs.clear();
+        self.pending_backtick_pair = None;
+        self.was_composing = false;
+        self.prev_text = edit.text.clone();
+    }
+
     pub fn on_history_change(&mut self, edit: &TextEdit) {
         self.detached = true;
         self.pending_typed = false;
+        self.typed_backtick_pairs.clear();
+        self.pending_backtick_pair = None;
+        self.was_composing = false;
         self.revealed = source_regions(edit);
         self.prev_text = edit.text.clone();
     }
 
-    pub fn on_doc_change(&mut self, _edit: &TextEdit) {
+    pub fn on_doc_change(&mut self, edit: &TextEdit) {
+        let was_composing = std::mem::take(&mut self.was_composing);
+        if self.prev_text != edit.text {
+            let (del_range, ins_len) = diff_single_edit(&self.prev_text, &edit.text);
+            map_pairs(&mut self.typed_backtick_pairs, &del_range, ins_len);
+            if let Some(pair) = self.pending_backtick_pair.take()
+                && edit.text.get(pair.clone()) == Some("``")
+            {
+                self.typed_backtick_pairs.push(pair);
+            } else if was_composing
+                && del_range.is_empty()
+                && ins_len == 1
+                && edit.text.get(del_range.start..del_range.start + 1) == Some("`")
+                && closes_backtick_pair_on_text(edit, &self.prev_text, del_range.start)
+            {
+                self.typed_backtick_pairs
+                    .push(del_range.start - 1..del_range.start + 1);
+            }
+        } else {
+            self.pending_backtick_pair = None;
+        }
         self.detached = false;
         self.pending_typed = true;
+        self.prev_text = edit.text.clone();
     }
+}
+
+fn diff_single_edit(old: &str, new: &str) -> (Range<usize>, usize) {
+    let old_b = old.as_bytes();
+    let new_b = new.as_bytes();
+    let min_len = old_b.len().min(new_b.len());
+    let mut prefix = 0;
+    while prefix < min_len && old_b[prefix] == new_b[prefix] {
+        prefix += 1;
+    }
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = 0;
+    let rem_old = old_b.len() - prefix;
+    let rem_new = new_b.len() - prefix;
+    let max_suf = rem_old.min(rem_new);
+    while suffix < max_suf && old_b[old_b.len() - 1 - suffix] == new_b[new_b.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    while !old.is_char_boundary(old_b.len() - suffix) || !new.is_char_boundary(new_b.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let del_end = old_b.len() - suffix;
+    let ins_len = new_b.len() - prefix - suffix;
+    (prefix..del_end, ins_len)
+}
+
+fn map_pairs(pairs: &mut Vec<Range<usize>>, del_range: &Range<usize>, ins_len: usize) {
+    let del_len = del_range.len();
+    pairs.retain_mut(|pair| {
+        if del_range.start < pair.start && pair.start < del_range.end
+            || del_range.start < pair.end && pair.end < del_range.end
+            || (del_len > 0 && del_range.start == pair.start && del_range.end > pair.start)
+            || (del_len > 0 && del_range.start < pair.end && del_range.end == pair.end)
+        {
+            return false;
+        }
+        // `from` uses MapBias::After; `to` uses MapBias::Before.
+        if pair.start >= del_range.start && pair.start <= del_range.end {
+            pair.start = del_range.start + ins_len;
+        } else if pair.start > del_range.end {
+            pair.start = pair.start - del_len + ins_len;
+        }
+        if pair.end >= del_range.start && pair.end <= del_range.end {
+            pair.end = del_range.start;
+        } else if pair.end > del_range.end {
+            pair.end = pair.end - del_len + ins_len;
+        }
+        pair.start < pair.end
+    });
+}
+
+fn count_single_backticks(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut count = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'`'
+            && (i == 0 || bytes[i - 1] != b'`')
+            && (i + 1 == bytes.len() || bytes[i + 1] != b'`')
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn literal_backticks_before_in_slice(edit: &TextEdit, line_start: usize, pos: usize) -> usize {
+    let end = pos.min(edit.text.len());
+    if line_start >= end {
+        return 0;
+    }
+    let mut bounds = vec![line_start, end];
+    for m in edit.marks() {
+        if m.start < end
+            && line_start < m.end
+            && (m.mark.pill_id().is_some() || m.mark == Mark::Code)
+        {
+            bounds.push(m.start.max(line_start));
+            bounds.push(m.end.min(end));
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut count = 0usize;
+    for w in bounds.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if edit
+            .marks()
+            .iter()
+            .any(|m| m.mark.pill_id().is_some() && m.start <= a && b <= m.end)
+        {
+            count = 0;
+        } else if edit
+            .marks()
+            .iter()
+            .any(|m| m.mark == Mark::Code && m.start <= a && b <= m.end)
+        {
+            continue;
+        } else {
+            count += count_single_backticks(&edit.text[a..b]);
+        }
+    }
+    count
+}
+
+fn closes_backtick_pair(edit: &TextEdit, pos: usize) -> bool {
+    let line_idx = edit.line_of_byte(pos);
+    if edit.block_kind(line_idx) == rune::BlockKind::Code {
+        return false;
+    }
+    let line = edit.line_range(line_idx);
+    let before = &edit.text[line.start..pos];
+    if !before.ends_with('`') || before.ends_with("``") {
+        return false;
+    }
+    literal_backticks_before_in_slice(edit, line.start, pos) % 2 == 1
+}
+
+fn closes_backtick_pair_on_text(edit_after: &TextEdit, text_before: &str, pos: usize) -> bool {
+    if pos == 0 || pos > text_before.len() {
+        return false;
+    }
+    let line_start = text_before[..pos].rfind('\n').map_or(0, |i| i + 1);
+    if edit_after.block_kind(edit_after.line_of_byte(pos)) == rune::BlockKind::Code {
+        return false;
+    }
+    let before = &text_before[line_start..pos];
+    if !before.ends_with('`') || before.ends_with("``") {
+        return false;
+    }
+    count_single_backticks(before) % 2 == 1
 }
 
 fn is_style_mark(mark: &Mark) -> bool {
@@ -542,7 +728,6 @@ pub fn caret_takes_marks_before(edit: &TextEdit) -> bool {
 
 struct StyledEdge {
     before: Vec<Mark>,
-    #[allow(dead_code)]
     after: Vec<Mark>,
     current: Vec<Mark>,
 }
@@ -604,6 +789,191 @@ fn styled_edge(edit: &TextEdit) -> Option<StyledEdge> {
         after,
         current,
     })
+}
+
+pub fn should_consume_noop_edge_arrow(edit: &TextEdit, direction: i8) -> bool {
+    let Some(edge) = styled_edge(edit) else {
+        return false;
+    };
+    if !same_mark_vec(&edge.current, &edge.before) && !same_mark_vec(&edge.current, &edge.after) {
+        return false;
+    }
+    let target = if direction < 0 {
+        &edge.before
+    } else {
+        &edge.after
+    };
+    same_mark_vec(&edge.current, target)
+        && ((direction < 0 && edit.focus == 0) || (direction > 0 && edit.focus == edit.text.len()))
+}
+
+/// Ported from KSG Code's `stepCaretAcrossStyledEdge`: offers both mark states
+/// at a styled boundary via horizontal arrows (and vertical arrows at document edges).
+pub fn step_caret_across_styled_edge(edit: &mut TextEdit, direction: i8) -> bool {
+    let Some(edge) = styled_edge(edit) else {
+        return false;
+    };
+    if !same_mark_vec(&edge.current, &edge.before) && !same_mark_vec(&edge.current, &edge.after) {
+        return false;
+    }
+    let target = if direction < 0 {
+        &edge.before
+    } else {
+        &edge.after
+    };
+    if same_mark_vec(&edge.current, target) {
+        return false;
+    }
+    for m in &edge.current {
+        if !target.contains(m) {
+            edit.remove_mark(m);
+        }
+    }
+    for m in target {
+        if !edge.current.contains(m) {
+            edit.set_mark(m.clone());
+        }
+    }
+    true
+}
+
+/// Ported from KSG Code's `ComposerMarkdownSourceExtension.addKeyboardShortcuts`:
+/// collapses shown source first when toggling a mark over a selection or just inside
+/// that mark's shown delimiters, so delimiters aren't wrapped in another style.
+pub fn toggle_mark_command(edit: &mut TextEdit, mark: Mark) -> bool {
+    if !is_style_mark(&mark) || edit.is_composing() || edit.is_secure() {
+        return false;
+    }
+    let (anchor, focus) = (edit.anchor, edit.focus);
+    let empty = anchor == focus;
+    #[derive(Clone, Copy)]
+    enum EdgeHit {
+        Selection,
+        AfterOpening,
+        BeforeClosing,
+    }
+    let mut hit: Option<(EdgeHit, Vec<Mark>)> = None;
+    for region in source_regions(edit) {
+        if !touches(anchor, focus, &region) {
+            continue;
+        }
+        if !empty {
+            hit = Some((EdgeHit::Selection, Vec::new()));
+            break;
+        }
+        let units = region_units(edit, region.clone());
+        let before = units
+            .iter()
+            .find(|u| u.range.start < focus && focus <= u.range.end);
+        let after = units
+            .iter()
+            .find(|u| u.range.start <= focus && focus < u.range.end);
+        if let (Some(b), Some(a)) = (before, after) {
+            if b.marks.is_none() && a.marks.as_ref().is_some_and(|m| m.contains(&mark)) {
+                hit = Some((EdgeHit::AfterOpening, a.marks.clone().unwrap_or_default()));
+                break;
+            }
+            if a.marks.is_none() && b.marks.as_ref().is_some_and(|m| m.contains(&mark)) {
+                hit = Some((EdgeHit::BeforeClosing, b.marks.clone().unwrap_or_default()));
+                break;
+            }
+        }
+    }
+    let Some((edge_hit, marks_inside)) = hit else {
+        return false;
+    };
+    collapse_shown_markdown_source(edit);
+    match edge_hit {
+        EdgeHit::Selection | EdgeHit::BeforeClosing => {
+            edit.toggle_mark(mark);
+        }
+        EdgeHit::AfterOpening => {
+            let target: Vec<Mark> = marks_inside.into_iter().filter(|m| m != &mark).collect();
+            let current = style_marks_vec(&edit.active_marks());
+            if target.is_empty() && current.is_empty() {
+                edit.remove_mark(&mark);
+            } else {
+                for m in &current {
+                    if !target.contains(m) {
+                        edit.remove_mark(m);
+                    }
+                }
+                for m in &target {
+                    if !current.contains(m) {
+                        edit.set_mark(m.clone());
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn try_convert_code_pair_on_caret_exit(
+    state: &mut MarkdownSourceState,
+    edit: &mut TextEdit,
+) -> bool {
+    if state.pending_typed
+        || state.typed_backtick_pairs.is_empty()
+        || edit.anchor != edit.focus
+        || edit.is_composing()
+        || edit.is_secure()
+        || matches!(edit.selection(), EditorSelection::Block(_))
+    {
+        return false;
+    }
+    let caret = edit.focus;
+    let Some(idx) = state
+        .typed_backtick_pairs
+        .iter()
+        .position(|p| p.end == caret)
+    else {
+        return false;
+    };
+    let pair = state.typed_backtick_pairs[idx].clone();
+    if pair.end > edit.text.len() || pair.len() < 3 {
+        return false;
+    }
+    let start_line = edit.line_of_byte(pair.start);
+    let end_line = edit.line_of_byte(pair.end);
+    if start_line != end_line || edit.block_kind(start_line) == rune::BlockKind::Code {
+        return false;
+    }
+    let line = edit.line_range(start_line);
+    let bytes = edit.text.as_bytes();
+    if (pair.start > line.start && bytes[pair.start - 1] == b'`')
+        || (pair.end < line.end && bytes[pair.end] == b'`')
+    {
+        return false;
+    }
+    let slice = &edit.text[pair.clone()];
+    if !slice.starts_with('`')
+        || !slice.ends_with('`')
+        || slice[1..slice.len() - 1].contains(['`', '\n'])
+    {
+        return false;
+    }
+    if edit
+        .marks()
+        .iter()
+        .any(|m| m.start < pair.end && pair.start < m.end)
+    {
+        return false;
+    }
+
+    state.typed_backtick_pairs.remove(idx);
+    edit.undo_group(|e| {
+        e.replace_range(pair.end - 1..pair.end, "");
+        e.replace_range(pair.start..pair.start + 1, "");
+        e.set_selection(pair.start, pair.end - 2);
+        e.set_mark(Mark::Code);
+        e.set_caret(pair.end - 2);
+        e.remove_mark(&Mark::Code);
+    });
+    state.detached = false;
+    state.pending_typed = true;
+    state.prev_text = edit.text.clone();
+    true
 }
 
 /// Ported from KSG Code's `revealStyledText`: shows one styled run that the
@@ -708,7 +1078,22 @@ fn normalize_markdown_source_with_typed(
 
     // Step 1: collapse any shown region the selection no longer touches.
     let keep = |region: &Range<usize>| !block_sel && touches(anchor, focus, region);
-    if needs_collapse_step(edit, keep) {
+    let needs_collapse = needs_collapse_step(edit, keep);
+    let current_regions = source_regions(edit);
+
+    // Idempotent fast path: if a region is already revealed and still touched with no
+    // adjacent-delimiter extension needed, leave document and state untouched.
+    if !needs_collapse && !current_regions.is_empty() {
+        if state.revealed != current_regions {
+            state.revealed = current_regions;
+        }
+        if state.prev_text != edit.text {
+            state.prev_text = edit.text.clone();
+        }
+        return;
+    }
+
+    if needs_collapse {
         let _ = edit.transact(TransactionOptions::Transient, |e| {
             collapse_markdown_source_in_tx(e, keep);
         });
@@ -728,13 +1113,42 @@ fn normalize_markdown_source_with_typed(
         });
     }
 
-    state.revealed = source_regions(edit);
-    state.prev_text = edit.text.clone();
+    let next_regions = source_regions(edit);
+    if state.revealed != next_regions {
+        state.revealed = next_regions;
+    }
+    if state.prev_text != edit.text {
+        state.prev_text = edit.text.clone();
+    }
 }
 
 /// Callback entry point registered with `El::on_input_selection_change`.
 pub fn on_selection_change(state: &mut MarkdownSourceState, edit: &mut TextEdit) {
-    normalize_markdown_source(state, edit);
+    if state.normalizing {
+        return;
+    }
+    state.normalizing = true;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if edit.is_composing() {
+            state.was_composing = true;
+            if state.prev_text != edit.text {
+                let (del_range, ins_len) = diff_single_edit(&state.prev_text, &edit.text);
+                map_pairs(&mut state.typed_backtick_pairs, &del_range, ins_len);
+                state.prev_text = edit.text.clone();
+            }
+            return;
+        }
+        if !state.pending_typed && state.prev_text != edit.text {
+            let (del_range, ins_len) = diff_single_edit(&state.prev_text, &edit.text);
+            map_pairs(&mut state.typed_backtick_pairs, &del_range, ins_len);
+        }
+        try_convert_code_pair_on_caret_exit(state, edit);
+        normalize_markdown_source(state, edit);
+    }));
+    state.normalizing = false;
+    if let Err(payload) = res {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// Collapses any shown Markdown source in a transient transaction (for Enter, paste, etc.).

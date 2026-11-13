@@ -213,6 +213,21 @@ impl Rules {
                 }
             }
         }
+        if !ev.mods.shift && !ev.mods.alt && !ev.mods.cmd && !ev.mods.ctrl {
+            let direction = match ev.key {
+                Key::Left => Some(-1),
+                Key::Right => Some(1),
+                Key::Up if edit.focus == 0 => Some(-1),
+                Key::Down if edit.focus == edit.text.len() => Some(1),
+                _ => None,
+            };
+            if let Some(dir) = direction
+                && (crate::composer_source::step_caret_across_styled_edge(edit, dir)
+                    || crate::composer_source::should_consume_noop_edge_arrow(edit, dir))
+            {
+                return true;
+            }
+        }
         for (ch, shift, mark) in [
             ('b', None, Mark::Bold),
             ('i', None, Mark::Italic),
@@ -224,7 +239,9 @@ impl Rules {
                 && !ev.mods.alt
                 && !(cfg!(target_os = "macos") && ev.mods.ctrl)
             {
-                edit.toggle_mark(mark);
+                if !crate::composer_source::toggle_mark_command(edit, mark.clone()) {
+                    edit.toggle_mark(mark);
+                }
                 return true;
             }
         }

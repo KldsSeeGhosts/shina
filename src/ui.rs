@@ -11569,6 +11569,7 @@ fn composer(
         }
         let t = s.current_mut();
         let before = t.draft.text.clone();
+        t.composer_source.on_key_before(&t.draft, event);
         let handled = t.composer_rules.key(&mut t.draft, event);
         if handled {
             t.reconcile_draft_context();
@@ -15536,6 +15537,55 @@ pub(crate) mod tests {
                 ]
             );
             assert_eq!(crate::composer_rich::markdown(draft), source);
+        }
+    }
+
+    #[test]
+    fn composer_reveals_and_collapses_bold_delimiters_in_rendered_text() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                t.draft = crate::composer_rich::draft("");
+                crate::composer_rich::paste(&mut t.draft, "**bold** after", &|_| None);
+                t.draft.focused = true;
+                t.draft.set_caret(t.draft.text.len());
+            });
+            rt.frame(0.0);
+            let outside_text = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("composer-input"))
+                .and_then(|e| e.text)
+                .unwrap();
+            assert_eq!(outside_text, "bold after", "{width}");
+
+            // Move caret inside bold text: delimiters become visible in rendered text.
+            rt.update(|s, _| s.current_mut().draft.set_caret(2));
+            rt.frame(0.0);
+            let inside_text = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("composer-input"))
+                .and_then(|e| e.text)
+                .unwrap();
+            assert_eq!(inside_text, "**bold** after", "{width}");
+
+            // Move caret back outside: delimiters disappear from rendered text.
+            rt.update(|s, _| {
+                let d = &mut s.current_mut().draft;
+                d.set_caret(d.text.len());
+            });
+            rt.frame(0.0);
+            let after_text = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("composer-input"))
+                .and_then(|e| e.text)
+                .unwrap();
+            assert_eq!(after_text, "bold after", "{width}");
         }
     }
 
@@ -21873,7 +21923,13 @@ pub(crate) mod tests {
                 mods: Default::default(),
             });
             rt.frame(0.0);
-            assert!(rt.state.current().draft.has_mark(&rune::Mark::Italic));
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "hello*a*"
+            );
+            assert!(crate::composer_source::has_shown_source(
+                &rt.state.current().draft
+            ));
             rt.key(cmd_ev('i', true));
             rt.key(rune::KeyEvent {
                 key: rune::Key::Text("b".into()),
@@ -21884,6 +21940,14 @@ pub(crate) mod tests {
                 crate::composer_rich::markdown(&rt.state.current().draft),
                 "hello*a*b"
             );
+            assert!(
+                rt.state
+                    .current()
+                    .draft
+                    .marks()
+                    .iter()
+                    .any(|m| m.mark == rune::Mark::Italic)
+            );
 
             // Mod+E toggles Code active mark.
             rt.key(cmd_ev('e', false));
@@ -21892,7 +21956,13 @@ pub(crate) mod tests {
                 mods: Default::default(),
             });
             rt.frame(0.0);
-            assert!(rt.state.current().draft.has_mark(&rune::Mark::Code));
+            assert_eq!(
+                crate::composer_rich::markdown(&rt.state.current().draft),
+                "hello*a*b`c`"
+            );
+            assert!(crate::composer_source::has_shown_source(
+                &rt.state.current().draft
+            ));
             rt.key(cmd_ev('e', false));
             rt.frame(0.0);
 

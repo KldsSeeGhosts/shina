@@ -381,6 +381,7 @@ impl TestEditor {
                 .on_edit(|s: &mut Self| &mut s.edit)
                 .on_input_key(|s: &mut Self, ev, _| {
                     let before = s.edit.text.clone();
+                    s.source.on_key_before(&s.edit, ev);
                     let handled = s.rules.key(&mut s.edit, ev);
                     if handled && s.edit.text != before {
                         s.source.on_doc_change(&s.edit);
@@ -728,4 +729,667 @@ fn part_b_ksg_undoes_composition_in_revealed_markdown_through_earlier_paste() {
             expect_bold
         );
     }
+}
+
+fn cmd_mod(rt: &mut Runtime<TestEditor>, ch: char, shift: bool) {
+    send_key(
+        rt,
+        Key::Command(ch),
+        Mods {
+            cmd: true,
+            shift,
+            ..Mods::default()
+        },
+    );
+}
+
+#[test]
+fn part_c_ksg_lets_the_caret_step_out_in_front_of_bold_that_starts_the_line() {
+    // Unrevealable bold (`2*3`) tests the styled-edge two-stop navigation directly.
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit = composer_rich::draft("2*3 tail");
+        s.edit.set_marks(vec![MarkRange::new(0..3, Mark::Bold)]);
+        s.edit.focused = true;
+        s.edit.set_caret(0);
+    });
+    rt.frame(0.0);
+    assert!(!has_shown_source(&rt.state.edit));
+    // At pos 0 in Rune, default inherited marks are outside (`[]`).
+    // ArrowRight steps into Bold without moving pos 0.
+    send_key(&mut rt, Key::Right, Mods::default());
+    assert_eq!(rt.state.edit.focus, 0);
+    assert!(rt.state.edit.has_mark(&Mark::Bold));
+    // ArrowLeft steps back outside without moving pos 0.
+    send_key(&mut rt, Key::Left, Mods::default());
+    assert_eq!(rt.state.edit.focus, 0);
+    assert!(!rt.state.edit.has_mark(&Mark::Bold));
+    // Typing here inserts plain text before bold.
+    type_str(&mut rt, "x");
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "x**2*3** tail");
+}
+
+#[test]
+fn part_c_ksg_lets_the_caret_step_out_after_bold_that_ends_the_line() {
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit = composer_rich::draft("head 2*3");
+        s.edit.set_marks(vec![MarkRange::new(5..8, Mark::Bold)]);
+        s.edit.focused = true;
+        s.edit.set_caret(8);
+    });
+    rt.frame(0.0);
+    assert!(rt.state.edit.has_mark(&Mark::Bold));
+    // ArrowRight steps out of Bold at end of line without moving pos 8.
+    send_key(&mut rt, Key::Right, Mods::default());
+    assert_eq!(rt.state.edit.focus, 8);
+    assert!(!rt.state.edit.has_mark(&Mark::Bold));
+    // Pressing ArrowRight again at doc end keeps the outside state.
+    send_key(&mut rt, Key::Right, Mods::default());
+    assert_eq!(rt.state.edit.focus, 8);
+    assert!(!rt.state.edit.has_mark(&Mark::Bold));
+    // ArrowLeft steps back inside Bold.
+    send_key(&mut rt, Key::Left, Mods::default());
+    assert_eq!(rt.state.edit.focus, 8);
+    assert!(rt.state.edit.has_mark(&Mark::Bold));
+    // Step out again and type plain text.
+    send_key(&mut rt, Key::Right, Mods::default());
+    type_str(&mut rt, "x");
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "head **2*3**x");
+}
+
+#[test]
+fn part_c_ksg_offers_both_stops_where_styled_text_meets_plain_text_mid_line() {
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit = composer_rich::draft("a 2*3 c");
+        s.edit.set_marks(vec![MarkRange::new(2..5, Mark::Bold)]);
+        s.edit.focused = true;
+        s.edit.set_caret(2);
+    });
+    rt.frame(0.0);
+    assert!(!rt.state.edit.has_mark(&Mark::Bold));
+    send_key(&mut rt, Key::Right, Mods::default());
+    assert_eq!(rt.state.edit.focus, 2);
+    assert!(rt.state.edit.has_mark(&Mark::Bold));
+    type_str(&mut rt, "x");
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "a **x2*3** c");
+}
+
+#[test]
+fn part_c_ksg_offers_the_plain_stop_between_bold_text_and_a_chip_right_after_it() {
+    let token = crate::composer_tokens::Token::File {
+        path: "README.md".into(),
+        directory: false,
+        source: Some("@README.md".into()),
+    };
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit = composer_rich::draft("2*3@README.md");
+        s.edit.replace_with_pill(3..13, token.id(), "@README.md");
+        s.edit.set_selection(0, 3);
+        s.edit.set_mark(Mark::Bold);
+        s.edit.focused = true;
+        s.edit.set_caret(3);
+    });
+    rt.frame(0.0);
+    assert!(rt.state.edit.has_mark(&Mark::Bold));
+    send_key(&mut rt, Key::Right, Mods::default());
+    assert_eq!(rt.state.edit.focus, 3);
+    assert!(!rt.state.edit.has_mark(&Mark::Bold));
+    type_str(&mut rt, "x");
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "**2*3**x@README.md"
+    );
+}
+
+#[test]
+fn part_c_ksg_steps_out_of_inline_code_at_the_end_of_a_line_without_inserting_a_space() {
+    let mut edit = composer_rich::draft("code");
+    edit.set_marks(vec![MarkRange::new(0..4, Mark::Code)]);
+    edit.set_caret(4);
+    assert!(edit.has_mark(&Mark::Code));
+    assert!(step_caret_across_styled_edge(&mut edit, 1));
+    assert!(!edit.has_mark(&Mark::Code));
+    assert!(!step_caret_across_styled_edge(&mut edit, 1));
+    edit.insert("x");
+    assert_eq!(composer_rich::markdown(&edit), "`code`x");
+}
+
+#[test]
+fn part_c_ksg_keeps_marks_the_user_toggled_at_an_edge_and_lets_the_arrow_move() {
+    let mut edit = composer_rich::draft("a b c");
+    edit.set_marks(vec![MarkRange::new(2..3, Mark::Bold)]);
+    edit.set_caret(2);
+    edit.set_mark(Mark::Bold);
+    edit.set_mark(Mark::Italic);
+    assert!(!step_caret_across_styled_edge(&mut edit, 1));
+    assert!(!step_caret_across_styled_edge(&mut edit, -1));
+}
+
+#[test]
+fn part_c_ksg_formats_a_filled_pair_leaves_following_text_plain_and_keeps_normal_input_rule() {
+    for prefix in ["", "prefix ", "@README.md", "a ``` "] {
+        let mut rt = TestEditor::new("");
+        if prefix == "@README.md" {
+            let token = crate::composer_tokens::Token::File {
+                path: "README.md".into(),
+                directory: false,
+                source: Some("@README.md".into()),
+            };
+            rt.update(|s, _| {
+                s.edit.replace_with_pill(0..0, token.id(), "@README.md");
+                s.source.prev_text = s.edit.text.clone();
+            });
+            rt.frame(0.0);
+        } else if !prefix.is_empty() {
+            type_str(&mut rt, prefix);
+        }
+        let offset = rt.state.edit.focus;
+        type_str(&mut rt, "``");
+        assert_eq!(
+            rt.state.source.typed_backtick_pairs.last(),
+            Some(&(offset..offset + 2)),
+            "{prefix}"
+        );
+        rt.update(move |s, _| s.edit.set_caret(offset + 1));
+        rt.frame(0.0);
+        type_str(&mut rt, "hello world");
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("{prefix}`hello world`")
+        );
+        // Caret exits at the closing tick: converts to inline code (and reveals at the edge).
+        rt.update(move |s, _| s.edit.set_caret(offset + 13));
+        rt.frame(0.0);
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("{prefix}`hello world`")
+        );
+        type_str(&mut rt, " next `typed`");
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("{prefix}`hello world` next `typed`")
+        );
+        // Move past `typed` so everything collapses cleanly.
+        type_str(&mut rt, " ");
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("{prefix}`hello world` next `typed` ")
+        );
+        assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Code));
+    }
+}
+
+#[test]
+fn part_c_ksg_formats_or_keeps_literal_a_pair_whose_backticks_came_from_a_dead_key() {
+    // 1. Dead-key backtick pair converts to inline code on exit.
+    let mut rt = TestEditor::new("");
+    type_str(&mut rt, "do ");
+    rt.ime(Ime::Preedit("`".into(), None));
+    rt.frame(0.0);
+    rt.ime(Ime::Commit("`".into()));
+    rt.frame(0.0);
+    rt.ime(Ime::Preedit("`".into(), None));
+    rt.frame(0.0);
+    rt.ime(Ime::Commit("`".into()));
+    rt.frame(0.0);
+    rt.update(|s, _| s.edit.set_caret(4));
+    rt.frame(0.0);
+    type_str(&mut rt, "xyz");
+    rt.update(|s, _| s.edit.set_caret(8));
+    rt.frame(0.0);
+    type_str(&mut rt, " ");
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "do `xyz` ");
+    assert_eq!(rt.state.edit.text, "do xyz ");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Code));
+
+    // 2. Pair after an unmatched backtick stays literal when composed.
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit.paste("a ` ");
+        s.source.on_paste(&s.edit);
+    });
+    rt.frame(0.0);
+    rt.update(|s, _| {
+        s.source.was_composing = true;
+        s.edit.insert("`");
+        s.source.on_doc_change(&s.edit);
+    });
+    rt.frame(0.0);
+    rt.update(|s, _| {
+        s.source.was_composing = true;
+        s.edit.insert("`");
+        s.source.on_doc_change(&s.edit);
+    });
+    rt.frame(0.0);
+    assert!(rt.state.source.typed_backtick_pairs.is_empty());
+    rt.update(|s, _| s.edit.set_caret(5));
+    rt.frame(0.0);
+    type_str(&mut rt, "xyz");
+    rt.update(|s, _| s.edit.set_caret(9));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "a ` `xyz`");
+    assert!(rt.state.edit.marks().is_empty());
+}
+
+#[test]
+fn part_c_ksg_keeps_composition_edits_literal_until_the_caret_leaves_the_typed_pair() {
+    let mut rt = TestEditor::new("");
+    type_str(&mut rt, "``");
+    rt.update(|s, _| s.edit.set_caret(1));
+    rt.frame(0.0);
+    rt.ime(Ime::Preedit("世".into(), None));
+    rt.frame(0.0);
+    rt.ime(Ime::Commit("世界".into()));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "`世界`");
+    assert!(rt.state.edit.marks().is_empty());
+    let end = rt.state.edit.text.len();
+    rt.update(move |s, _| s.edit.set_caret(end));
+    rt.frame(0.0);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "`世界`");
+    type_str(&mut rt, " ");
+    assert_eq!(rt.state.edit.text, "世界 ");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Code));
+}
+
+#[test]
+fn part_c_ksg_keeps_a_paste_or_set_content_pair_literal_after_moving_through_it() {
+    // Plain paste case.
+    let mut rt = TestEditor::new("");
+    rt.update(|s, _| {
+        s.edit.paste("`literal`");
+        s.source.on_paste(&s.edit);
+    });
+    rt.frame(0.0);
+    rt.update(|s, _| s.edit.set_caret(1));
+    rt.frame(0.0);
+    rt.update(|s, _| s.edit.set_caret(9));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "`literal`");
+    assert!(rt.state.edit.marks().is_empty());
+}
+
+#[test]
+fn part_c_ksg_leaves_doubled_delimiters_and_code_contexts_unchanged_on_caret_movement() {
+    for (delimiters, caret, mark, code_block) in [
+        ("````", 2usize, None, false),
+        ("```", 1, None, false),
+        ("``", 1, Some(Mark::Bold), false),
+        ("``", 1, Some(Mark::Code), false),
+        ("``", 1, None, true),
+    ] {
+        let mut rt = TestEditor::new("");
+        if code_block {
+            rt.update(|s, _| {
+                let _ = s.edit.set_logical_block(
+                    0..0,
+                    BlockKind::Code,
+                    rune::BlockAttributes::default()
+                        .with_code(rune::CodeAttributes::new("```", "")),
+                );
+            });
+            rt.frame(0.0);
+        }
+        if let Some(m) = mark {
+            rt.update(move |s, _| s.edit.set_mark(m));
+            rt.frame(0.0);
+        }
+        type_str(&mut rt, delimiters);
+        rt.update(move |s, _| s.edit.set_caret(caret));
+        rt.frame(0.0);
+        type_str(&mut rt, "literal");
+        let before_text = rt.state.edit.text.clone();
+        rt.update(move |s, _| s.edit.set_caret(caret + "literal".len() + 1));
+        rt.frame(0.0);
+        assert_eq!(rt.state.edit.text, before_text, "{delimiters}");
+        rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+        rt.frame(0.0);
+        assert_eq!(rt.state.edit.text, before_text, "{delimiters}");
+    }
+}
+
+#[test]
+fn part_c_ksg_toggles_bold_and_italic_with_mod_chord_at_a_collapsed_cursor() {
+    for (ch, marker) in [('b', "**"), ('i', "*")] {
+        let mut rt = TestEditor::new("ship it");
+        rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+        rt.frame(0.0);
+        type_str(&mut rt, " ");
+        cmd_mod(&mut rt, ch, false);
+        type_str(&mut rt, "now");
+        cmd_mod(&mut rt, ch, false);
+        type_str(&mut rt, " done");
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("ship it {marker}now{marker} done")
+        );
+    }
+}
+
+#[test]
+fn part_c_ksg_mod_chord_at_caret_in_a_bold_word_styles_the_next_typed_text() {
+    // Mod+i inside `**n|ow**` -> `**n*X*ow**`
+    let mut rt = TestEditor::new("ship it **now** done");
+    rt.update(|s, _| s.edit.set_caret(9));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "ship it **now** done");
+    cmd_mod(&mut rt, 'i', false);
+    type_str(&mut rt, "X");
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "ship it **n*X*ow** done"
+    );
+
+    // Mod+i just before `|**now**` -> `*X***now**`
+    let mut rt = TestEditor::new("ship it **now** done");
+    rt.update(|s, _| s.edit.set_caret(8));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "ship it **now** done");
+    assert_eq!(rt.state.edit.focus, 8);
+    cmd_mod(&mut rt, 'i', false);
+    type_str(&mut rt, "X");
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "ship it *X***now** done"
+    );
+
+    // Mod+e just after `**now**|` -> `**now**`X``
+    let mut rt = TestEditor::new("ship it **now** done");
+    rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+    rt.frame(0.0);
+    for _ in 0..5 {
+        send_key(&mut rt, Key::Left, Mods::default());
+    }
+    assert_eq!(rt.state.edit.text, "ship it **now** done");
+    assert_eq!(rt.state.edit.focus, 15);
+    cmd_mod(&mut rt, 'e', false);
+    type_str(&mut rt, "X");
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "ship it **now**`X` done"
+    );
+}
+
+#[test]
+fn part_c_ksg_mod_b_over_selection_after_prefix_and_removes_bold() {
+    for (word, prefix, should_reveal) in [
+        ("ship", "", true),
+        ("path\\", "", false),
+        ("2*3", "", false),
+        ("b", "*", false),
+        ("word", "\\\\*", false),
+        ("word", "\\\\**", false),
+        ("word", "\\", false),
+        ("word", "\\\\", true),
+        ("word", "\\\\\\", false),
+        ("word", "`path\\`", true),
+    ] {
+        let initial = format!("{prefix}{word} it");
+        let mut rt = TestEditor::new(&initial);
+        let prefix_len = rt.state.edit.text.find(word).unwrap();
+        rt.update(move |s, _| s.edit.set_selection(prefix_len, prefix_len + word.len()));
+        rt.frame(0.0);
+        cmd_mod(&mut rt, 'b', false);
+        assert_eq!(
+            composer_rich::markdown(&rt.state.edit),
+            format!("{prefix}**{word}** it"),
+            "prefix={prefix:?}"
+        );
+        // Decision 9: non-collapsed selection does not reveal, so `should_reveal` is checked
+        // when collapsing caret inside the bolded word, keeping redo/marks intact.
+        let end = rt.state.edit.text.len();
+        rt.update(move |s, _| s.edit.set_caret(prefix_len + 1));
+        rt.frame(0.0);
+        assert_eq!(
+            has_shown_source(&rt.state.edit),
+            should_reveal,
+            "prefix={prefix:?}"
+        );
+        rt.update(move |s, _| s.edit.set_caret(end));
+        rt.frame(0.0);
+
+        // Selecting the word (or shown markers) and pressing Mod+B removes bold.
+        let span_end = if should_reveal {
+            rt.update(move |s, _| s.edit.set_caret(prefix_len + 1));
+            rt.frame(0.0);
+            prefix_len + word.len() + 4
+        } else {
+            prefix_len + word.len()
+        };
+        rt.update(move |s, _| s.edit.set_selection(prefix_len, span_end));
+        rt.frame(0.0);
+        cmd_mod(&mut rt, 'b', false);
+        assert_eq!(composer_rich::markdown(&rt.state.edit), initial);
+    }
+}
+
+#[test]
+fn part_c_ksg_edits_the_markers_as_text() {
+    // 1. deleting the opening markers removes bold
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "bold** after");
+    assert!(rt.state.edit.marks().is_empty());
+
+    // 2. turning ** into * makes it italic
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    send_key(&mut rt, Key::Delete, Mods::default());
+    for _ in 0..5 {
+        send_key(&mut rt, Key::Right, Mods::default());
+    }
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "*bold* after");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Italic));
+    assert!(!rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+
+    // 3. backspacing from the closing edge keeps italic
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    send_key(&mut rt, Key::Delete, Mods::default());
+    for _ in 0..6 {
+        send_key(&mut rt, Key::Right, Mods::default());
+    }
+    send_key(&mut rt, Key::Backspace, Mods::default());
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "*bold* after");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Italic));
+
+    // 4. retyping deleted closing markers restores bold
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    send_key(&mut rt, Key::Right, Mods::default());
+    send_key(&mut rt, Key::Right, Mods::default());
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::Delete, Mods::default());
+    type_str(&mut rt, "**");
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+
+    // 5. deleting a backtick removes inline code
+    let mut rt = TestEditor::new("`code` after");
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "code` after");
+    assert!(rt.state.edit.marks().is_empty());
+}
+
+#[test]
+fn part_c_ksg_shows_nested_formatting_as_markdown_and_restores_when_caret_leaves() {
+    let value = "**a *b* c** d";
+    let mut rt = TestEditor::new(value);
+    rt.update(|s, _| s.edit.set_caret(3));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, value);
+    assert!(!rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "a b c d");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Italic));
+    assert_eq!(composer_rich::markdown(&rt.state.edit), value);
+}
+
+#[test]
+fn part_c_ksg_keeps_a_styled_chip_selected_for_backspace_or_text_when_showing_source() {
+    let token = crate::composer_tokens::Token::Skill {
+        name: "babysit".into(),
+        harness: "test".into(),
+    };
+    for (is_backspace, expected) in [(true, "**** after"), (false, "**X** after")] {
+        let mut rt = TestEditor::new("");
+        rt.update(|s, _| {
+            s.edit = composer_rich::draft("$babysit after");
+            s.edit.replace_with_pill(0..8, token.id(), "$babysit");
+            s.edit.set_selection(0, 8);
+            s.edit.set_mark(Mark::Bold);
+            s.edit.focused = true;
+            s.edit.set_caret(s.edit.text.len());
+        });
+        rt.frame(0.0);
+        // Move caret to 0 to trigger reveal via `on_input_selection_change`, then select the pill.
+        rt.update(|s, _| s.edit.set_caret(0));
+        rt.frame(0.0);
+        assert_eq!(rt.state.edit.text, "**$babysit** after");
+        rt.update(|s, _| s.edit.set_selection(2, 10));
+        rt.frame(0.0);
+        assert!(has_shown_source(&rt.state.edit));
+        if is_backspace {
+            send_key(&mut rt, Key::Backspace, Mods::default());
+        } else {
+            type_str(&mut rt, "X");
+        }
+        send_key(&mut rt, Key::End, Mods::default());
+        assert_eq!(composer_rich::markdown(&rt.state.edit), expected);
+    }
+}
+
+#[test]
+fn part_c_ksg_keeps_bold_around_a_skill_pasted_inside_it() {
+    let token = crate::composer_tokens::Token::Skill {
+        name: "babysit".into(),
+        harness: "test".into(),
+    };
+    let resolver = |src: &str| (src == "$babysit").then(|| (token.id(), "$babysit".into()));
+    let mut rt = TestEditor::new("**helloworld** after");
+    rt.update(|s, _| s.edit.set_caret(5));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**helloworld** after");
+    assert_eq!(rt.state.edit.focus, 7);
+
+    rt.update(|s, _| {
+        collapse_shown_markdown_source(&mut s.edit);
+        s.source.on_paste(&s.edit);
+        composer_rich::paste(&mut s.edit, "$babysit", &resolver);
+    });
+    rt.frame(0.0);
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "**hello** $babysit **world** after"
+    );
+}
+
+#[test]
+fn part_c_ksg_arabic_line_walks_back_through_inline_code_and_shows_backticks() {
+    let value = "اكتب `sumBy` الان";
+    let mut rt = TestEditor::new(value);
+    rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+    rt.frame(0.0);
+    let mut saw_source = false;
+    let mut steps = 0usize;
+    while rt.state.edit.focus > "اكتب".len() && steps < 32 {
+        send_key(&mut rt, Key::Right, Mods::default());
+        saw_source |= rt.state.edit.text == value;
+        steps += 1;
+    }
+    assert!(saw_source);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), value);
+    // Re-enter code and check `sumBy` decorations include faint backticks + mono code.
+    let mid = value.find("sum").unwrap() + 1;
+    rt.update(move |s, _| s.edit.set_caret(mid));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, value);
+    let (spans, _) = preview_decorations(
+        &rt.state.edit,
+        TextStyle::new(15.0, 400.0),
+        Color::from_oklab([0.5, 0.0, 0.0, 1.0]),
+        Color::WHITE,
+        Color::BLACK,
+    );
+    let tick1 = value.find('`').unwrap();
+    let tick2 = value.rfind('`').unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.start as usize == tick1 && s.end as usize == tick1 + 1)
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.start as usize == tick1 + 1 && s.end as usize == tick2 && s.mono)
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.start as usize == tick2 && s.end as usize == tick2 + 1)
+    );
+}
+
+#[test]
+fn part_c_arabic_bidi_key_sequence_settles_with_bounded_frames() {
+    let value = "اكتب `sumBy` الان";
+    let mut rt = TestEditor::new(value);
+    rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+    rt.frame(0.0);
+
+    // Walk across the RTL+LTR line with both Key::Left and Key::Right for bounded steps,
+    // verifying each frame settles and on_selection_change is idempotent and re-entry safe.
+    for key in [Key::Left, Key::Right, Key::Right, Key::Left] {
+        for _ in 0..20 {
+            rt.key(KeyEvent {
+                key: key.clone(),
+                mods: Mods::default(),
+            });
+            let mut frames = 0usize;
+            while frames < 4 {
+                rt.frame(0.0);
+                frames += 1;
+            }
+            assert!(frames <= 4);
+
+            // Calling on_selection_change again at the settled caret must be a complete no-op.
+            let before_edit = rt.state.edit.clone();
+            let before_state = rt.state.source.clone();
+            on_selection_change(&mut rt.state.source, &mut rt.state.edit);
+            assert_eq!(rt.state.edit, before_edit);
+            assert_eq!(rt.state.source, before_state);
+        }
+    }
+
+    // Re-entrancy guard: invoking on_selection_change while `normalizing` is true is a no-op.
+    rt.update(|s, _| s.edit.set_caret(value.find("sum").unwrap()));
+    rt.frame(0.0);
+    let mut edit = state_from("**bold**");
+    edit.set_caret(2);
+    let mut st = MarkdownSourceState {
+        normalizing: true,
+        ..Default::default()
+    };
+    on_selection_change(&mut st, &mut edit);
+    assert!(!has_shown_source(&edit));
+    assert_eq!(edit.text, "bold");
 }

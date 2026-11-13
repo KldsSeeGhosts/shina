@@ -7088,6 +7088,8 @@ impl State {
                 }
             }
             crate::composer_source::collapse_shown_markdown_source(&mut self.current_mut().draft);
+            let t = self.current_mut();
+            t.composer_source.on_paste(&t.draft);
             crate::composer_paste::insert(self, &rewritten_text);
             let target_machine = self.machines.selected.clone();
             let target_thread_id = self.current().id;
