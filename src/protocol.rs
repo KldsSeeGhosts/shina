@@ -526,7 +526,8 @@ mod tests {
                 | "command.get"
                 | "server.status"
                 | "blobs.read"
-                | "filesystem.browse" => "read",
+                | "filesystem.browse"
+                | "usage.limits" => "read",
                 "request.respond" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

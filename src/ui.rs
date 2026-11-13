@@ -11003,13 +11003,8 @@ fn context_popover(s: &State, p: Palette) -> El {
             };
             let reset = window["resetsAt"]
                 .as_i64()
-                .and_then(chrono::DateTime::from_timestamp_secs)
-                .map(|time| {
-                    format!(
-                        "Resets {}",
-                        time.with_timezone(&chrono::Local).format("%b %d %H:%M")
-                    )
-                })
+                .and_then(crate::usage_limits::format_reset_clock_secs)
+                .map(|clock| format!("Resets {clock}"))
                 .unwrap_or_else(|| "Reset not reported".into());
             block = block.child(
                 col()

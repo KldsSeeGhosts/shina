@@ -319,6 +319,24 @@ pub fn parse_iso_ms(value: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+/// Formats a reset timestamp in the exact local clock format used by `context_popover` (`%b %d %H:%M`).
+pub fn format_reset_clock_secs(secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_secs(secs).map(|time| {
+        time.with_timezone(&chrono::Local)
+            .format("%b %d %H:%M")
+            .to_string()
+    })
+}
+
+/// Formats an ISO-8601 reset timestamp with `format_reset_clock_secs`.
+pub fn format_reset_clock_iso(iso: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(iso).ok().map(|dt| {
+        dt.with_timezone(&chrono::Local)
+            .format("%b %d %H:%M")
+            .to_string()
+    })
+}
+
 fn clamp_percent(value: f64) -> f64 {
     if !value.is_finite() {
         0.0
@@ -1222,6 +1240,131 @@ pub fn build_usage_limits_report(input: UsageLimitsReportInput<'_>) -> Option<Us
         accounts: vec![account],
         notices: Vec::new(),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FallbackInfo {
+    pub default_selection: crate::model_selection::ModelSelection,
+    pub default_provider_name: String,
+    pub resets_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FallbackResolution {
+    pub selection: Option<crate::model_selection::ModelSelection>,
+    pub fallback: Option<FallbackInfo>,
+}
+
+pub struct ProviderFallbackCandidate<'a> {
+    pub instance_id: &'a str,
+    pub driver_kind: &'a str,
+    pub display_name: &'a str,
+    pub enabled: bool,
+    pub installed: bool,
+    pub authenticated: bool,
+    pub is_available: bool,
+    pub windows: &'a [ServerProviderUsageWindow],
+}
+
+/// Ported from KSG Code's `exhaustedUsageWindow` (`packages/shared/src/usageLimits.ts`).
+pub fn exhausted_usage_window<'a>(
+    driver: &str,
+    windows: &'a [ServerProviderUsageWindow],
+    now_ms: i64,
+    model: Option<&str>,
+) -> Option<&'a ServerProviderUsageWindow> {
+    let exhausted: Vec<&ServerProviderUsageWindow> = windows
+        .iter()
+        .filter(|window| {
+            window.used_percent >= 100.0
+                && window
+                    .resets_at
+                    .as_deref()
+                    .and_then(parse_iso_ms)
+                    .is_none_or(|resets_at| resets_at > now_ms)
+        })
+        .collect();
+    let Some(model) = model else {
+        return exhausted.first().copied();
+    };
+    match driver {
+        "codex" => {
+            // Seat-based plans spend credits only past their plan windows, so the credit cap blocks only plans without them.
+            let has_plan_windows = windows
+                .iter()
+                .any(|window| window.id == "primary" || window.id == "secondary");
+            exhausted
+                .into_iter()
+                .find(|window| window.id != "individual" || !has_plan_windows)
+        }
+        "opencode" => exhausted
+            .into_iter()
+            .find(|window| !window.id.starts_with("go_") || model.starts_with("opencode-go/")),
+        _ => exhausted.first().copied(),
+    }
+}
+
+/// Ported from KSG Code's `resolveNewThreadModelSelection` (`packages/shared/src/usageLimits.ts`).
+pub fn resolve_new_thread_model_selection(
+    default_selection: Option<&crate::model_selection::ModelSelection>,
+    explicit_selection: Option<&crate::model_selection::ModelSelection>,
+    fallback_selection: Option<&crate::model_selection::ModelSelection>,
+    providers: &[ProviderFallbackCandidate<'_>],
+    now_ms: i64,
+) -> FallbackResolution {
+    let selection = explicit_selection.or(default_selection).cloned();
+    let unchanged = FallbackResolution {
+        selection: selection.clone(),
+        fallback: None,
+    };
+    if explicit_selection.is_some() {
+        return unchanged;
+    }
+    let (Some(selection), Some(fallback_sel)) = (selection, fallback_selection) else {
+        return unchanged;
+    };
+    let Some(provider) = providers
+        .iter()
+        .find(|entry| entry.instance_id == selection.instance_id)
+    else {
+        return unchanged;
+    };
+    let Some(window) = exhausted_usage_window(
+        provider.driver_kind,
+        provider.windows,
+        now_ms,
+        Some(&selection.model),
+    ) else {
+        return unchanged;
+    };
+    let Some(fallback) = providers
+        .iter()
+        .find(|entry| entry.instance_id == fallback_sel.instance_id)
+    else {
+        return unchanged;
+    };
+    if !fallback.enabled
+        || !fallback.installed
+        || !fallback.authenticated
+        || !fallback.is_available
+        || exhausted_usage_window(
+            fallback.driver_kind,
+            fallback.windows,
+            now_ms,
+            Some(&fallback_sel.model),
+        )
+        .is_some()
+    {
+        return unchanged;
+    }
+    FallbackResolution {
+        selection: Some(fallback_sel.clone()),
+        fallback: Some(FallbackInfo {
+            default_selection: selection,
+            default_provider_name: provider.display_name.to_owned(),
+            resets_at: window.resets_at.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]

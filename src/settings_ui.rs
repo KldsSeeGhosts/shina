@@ -102,6 +102,8 @@ pub struct ThreadDefaults {
     /// Starting directory when the Add workspace folder browser opens (KSG Code's `addProjectBaseDirectory`).
     /// Empty defaults to `"~/"`.
     pub add_project_base_directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model_selection: Option<crate::model_selection::ModelSelection>,
 }
 impl Default for ThreadDefaults {
     fn default() -> Self {
@@ -121,6 +123,7 @@ impl Default for ThreadDefaults {
             ],
             models: BTreeMap::new(),
             add_project_base_directory: String::new(),
+            fallback_model_selection: None,
         }
     }
 }
@@ -143,6 +146,14 @@ impl ThreadDefaults {
                 .add_project_base_directory
                 .chars()
                 .any(char::is_control)
+            || self.fallback_model_selection.as_ref().is_some_and(|sel| {
+                sel.instance_id.trim().is_empty()
+                    || sel.model.trim().is_empty()
+                    || sel.instance_id.len() > 256
+                    || sel.model.len() > 256
+                    || sel.instance_id.chars().any(char::is_control)
+                    || sel.model.chars().any(char::is_control)
+            })
         {
             return Err("Invalid thread defaults.".into());
         }
@@ -2173,6 +2184,67 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         })));
             }
+            let fallback_selection = defaults.fallback_model_selection.clone();
+            let fallback_enabled = fallback_selection.is_some();
+            let fallback_summary = fallback_selection
+                .as_ref()
+                .map(|sel| format!("{} · {}", sel.instance_id, sel.model))
+                .unwrap_or_else(|| "None".into());
+            pane = add(
+                pane,
+                s,
+                "settings-fallback-model",
+                "Fallback model",
+                "Used for new threads when the default model's provider is out of usage.",
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .child(settings_button(
+                        "fallback-model-cycle",
+                        &fallback_summary,
+                        p,
+                        |s| {
+                            let mut defaults = s.settings_defaults();
+                            let candidates = s.fallback_model_candidates();
+                            if candidates.is_empty() {
+                                return;
+                            }
+                            let next = match defaults.fallback_model_selection.as_ref() {
+                                Some(current) => {
+                                    let pos = candidates
+                                        .iter()
+                                        .position(|c| {
+                                            c.instance_id == current.instance_id
+                                                && c.model == current.model
+                                        })
+                                        .unwrap_or(0);
+                                    candidates[(pos + 1) % candidates.len()].clone()
+                                }
+                                None => candidates[0].clone(),
+                            };
+                            defaults.fallback_model_selection = Some(next);
+                            s.save_defaults(defaults);
+                        },
+                    ))
+                    .child(captain_ui::switch(
+                        s,
+                        "fallback-model-toggle",
+                        "Fallback model",
+                        fallback_enabled,
+                        p,
+                        move |s| {
+                            let mut defaults = s.settings_defaults();
+                            if defaults.fallback_model_selection.is_some() {
+                                defaults.fallback_model_selection = None;
+                            } else {
+                                defaults.fallback_model_selection =
+                                    s.fallback_model_candidates().into_iter().next();
+                            }
+                            s.save_defaults(defaults);
+                        },
+                    )),
+                p,
+            );
             pane = add(
                 pane,
                 s,
