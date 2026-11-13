@@ -4686,6 +4686,7 @@ fn toast_stack(s: &State, p: Palette, top: f32) -> El {
     for toast in s.toasts.iter().rev() {
         let id = toast.id;
         let (glyph_name, ink) = match toast.kind {
+            crate::model::ToastKind::Info => ("file", p.sea),
             crate::model::ToastKind::Success => ("check", p.sea),
             crate::model::ToastKind::Warning => ("alert", p.brass),
             crate::model::ToastKind::Error => ("alert", p.danger),
@@ -14127,6 +14128,7 @@ pub(crate) mod tests {
                     path: None,
                     asset_id: None,
                     uploaded: None,
+                    source: None,
                 };
                 if !matches!(phase, Phase::Preparing) {
                     rt.state.current_mut().draft_images.push(image.clone());
@@ -15256,6 +15258,7 @@ pub(crate) mod tests {
                     .map(|image| Attachment {
                         asset_id: None,
                         uploaded: None,
+                        source: None,
                         id: format!("missing-{message}-{image}.png"),
                         name: format!("image {message}-{image}"),
                         mime: "image/png".into(),
@@ -15529,6 +15532,7 @@ pub(crate) mod tests {
                             vec![Attachment {
                                 asset_id: None,
                                 uploaded: None,
+                                source: None,
                                 id: "img-35.png".into(),
                                 name: "img-35.png".into(),
                                 mime: "image/png".into(),

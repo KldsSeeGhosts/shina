@@ -132,7 +132,7 @@ pub fn format_count_en_us(n: usize) -> String {
 /// Ported from KSG Code's `getComposerPromptLengthValidationMessage`.
 pub fn prompt_length_validation_message(prompt: &str) -> Option<String> {
     let trimmed = prompt.trim();
-    let len = trimmed.chars().count();
+    let len = trimmed.encode_utf16().count();
     let excess = len.saturating_sub(PROVIDER_SEND_TURN_MAX_INPUT_CHARS);
     if excess == 0 {
         return None;

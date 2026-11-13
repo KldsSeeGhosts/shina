@@ -182,6 +182,7 @@ impl Selection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
+    Info,
     Success,
     Warning,
     Error,
@@ -3066,6 +3067,7 @@ pub struct State {
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
+    pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
@@ -3277,6 +3279,7 @@ impl State {
             attachment_cache,
             attachment_drop_hover: false,
             transcript_preview: None,
+            pasted_text_names: None,
             transcript_layout: Default::default(),
             composer_ui: Default::default(),
             captain_picker: false,
@@ -7144,28 +7147,62 @@ impl State {
         self.attach_paths_to(self.current().id, paths);
     }
     pub fn fold_paste(&mut self, text: &str) -> bool {
-        if !crate::composer_paste::should_fold(text)
-            || self.current().machine != "local" && self.client.is_none()
-            || self.client.is_some()
-                && self.machines.selected != "local"
-                && !self
-                    .client
-                    .as_ref()
-                    .and_then(|c| c.linked.get(&self.machines.selected))
-                    .is_some_and(|c| {
-                        c.info.lock().expect("connection info")["capabilities"]
-                            .as_array()
-                            .is_some_and(|caps| {
-                                caps.iter()
-                                    .any(|cap| cap == crate::protocol::FILE_ATTACHMENTS)
-                            })
-                    })
-            || self.attachment_guard(self.active).is_some()
-            || self.current().draft_images.len() >= attachments::MAX_ATTACHMENTS
-        {
+        let exceeds = crate::composer_paste::would_exceed_limit(&self.current().draft, text);
+        if text.is_empty() || !crate::composer_paste::should_fold(text) && !exceeds {
             return false;
         }
-        match crate::composer_paste::stage(text, &self.current().draft_images) {
+        let can_stage = !(self.current().machine != "local" && self.client.is_none())
+            && self.file_attachment_staging_supported_on(&self.machines.selected)
+            && self.attachment_guard(self.active).is_none()
+            && self.current().draft_images.len()
+                + self
+                    .attachment_uploads
+                    .preparing_count(&self.machines.selected, self.current().id)
+                < attachments::MAX_ATTACHMENTS;
+        if !can_stage || text.len() as u64 > attachments::MAX_FILE_BYTES {
+            if !exceeds {
+                return false;
+            }
+            let (title, description) = if can_stage {
+                (
+                    "Pasted text is too large to attach",
+                    "Reduce the clipboard contents or save a smaller excerpt as a file.",
+                )
+            } else {
+                (
+                    "Pasted text is too large for this message",
+                    "Remove some text or an attachment, then paste again.",
+                )
+            };
+            self.current_mut().attachment_error = Some(format!("{title}\n{description}"));
+            self.push_toast(
+                ToastKind::Error,
+                title,
+                Some(description.into()),
+                None,
+                Some(6000),
+            );
+            return true;
+        }
+        let target = (self.machines.selected.clone(), self.current().id);
+        if !self
+            .pasted_text_names
+            .as_ref()
+            .is_some_and(|(machine, thread, _)| (machine, *thread) == (&target.0, target.1))
+        {
+            self.pasted_text_names = Some((target.0, target.1, Default::default()));
+        }
+        let names: Vec<_> = self
+            .current()
+            .draft_images
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        let reserved = &mut self.pasted_text_names.as_mut().unwrap().2;
+        reserved.extend(names);
+        let name = crate::composer_paste::next_name(reserved.iter().map(String::as_str));
+        reserved.insert(name.clone());
+        match crate::composer_paste::stage_named(text, &name) {
             Ok(attachment) => {
                 if let Some(notice) = &mut self.undo {
                     notice.owns_text_key = false;
@@ -7173,12 +7210,32 @@ impl State {
                 let t = self.current_mut();
                 t.draft_images.push(attachment.clone());
                 t.insert_attachment_chips(&[attachment], false);
+                self.push_toast(
+                    ToastKind::Info,
+                    format!("Large paste attached as {name}"),
+                    Some(format!(
+                        "{} · Use {} to keep a large paste inline.",
+                        if text.len().div_ceil(1024) >= 1024 {
+                            format!("{:.1} MB", text.len() as f64 / 1048576.0)
+                        } else {
+                            format!("{} KB", text.len().div_ceil(1024).max(1))
+                        },
+                        if cfg!(target_os = "macos") {
+                            "⌘⇧V"
+                        } else {
+                            "Ctrl+Shift+V"
+                        }
+                    )),
+                    None,
+                    Some(6000),
+                );
                 self.checkpoint();
                 true
             }
             Err(error) => {
+                self.pasted_text_names.as_mut().unwrap().2.remove(&name);
                 self.current_mut().attachment_error = Some(error);
-                false
+                exceeds
             }
         }
     }
@@ -11840,6 +11897,7 @@ mod tests {
         first.draft_images.push(Attachment {
             asset_id: None,
             uploaded: None,
+            source: None,
             id: "image-1.png".into(),
             name: "shot.png".into(),
             mime: "image/png".into(),
@@ -13312,6 +13370,38 @@ mod tests {
     }
 
     #[test]
+    fn paste_prompt_limit_fallback_and_removed_names_follow_ksg() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text(&"x".repeat(119_999));
+        assert!(state.fold_paste("😀"));
+        assert_eq!(state.current().draft_images[0].name, "pasted-text.txt");
+        assert_eq!(
+            state.current().draft_images[0].source,
+            Some(attachments::AttachmentSource::PastedText)
+        );
+        state.current_mut().draft_images.clear();
+        state.current_mut().draft.replace_text("");
+        assert!(state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        assert_eq!(state.current().draft_images[0].name, "pasted-text-2.txt");
+        let attachment = state.current().draft_images[0].clone();
+        state.current_mut().draft_images = vec![attachment; 100];
+        state.current_mut().draft.replace_text("kept");
+        assert!(!state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        state.current_mut().draft.replace_text(&"x".repeat(120_000));
+        let before = state.current().draft.text.clone();
+        assert!(state.fold_paste("a"));
+        assert_eq!(state.current().draft.text, before);
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .starts_with("Pasted text is too large for this message")
+        );
+    }
+
+    #[test]
     fn linked_file_capability_enables_long_paste_folding_and_older_peers_keep_text_inline() {
         let mut state = State::new(".".into(), false);
         let (mut client, _local) = crate::client::Client::test_connected(state.data_dir.clone());
@@ -13321,6 +13411,10 @@ mod tests {
         state.machines.selected = "linked-machine".into();
         state.current_mut().machine = "linked-machine".into();
         let text = "x".repeat(crate::composer_paste::THRESHOLD);
+        *state.client.as_ref().unwrap().linked["linked-machine"]
+            .info
+            .lock()
+            .unwrap() = json!({"capabilities":[]});
         assert!(!state.fold_paste(&text));
         *state.client.as_ref().unwrap().linked["linked-machine"]
             .info

@@ -3664,6 +3664,7 @@ mod tests {
         let image = Attachment {
             asset_id: None,
             uploaded: None,
+            source: None,
             id: "draft.png".into(),
             name: "draft.png".into(),
             mime: "image/png".into(),

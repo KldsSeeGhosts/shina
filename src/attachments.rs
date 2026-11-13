@@ -57,6 +57,15 @@ pub struct Attachment {
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<Uploaded>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AttachmentSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "_tag")]
+pub enum AttachmentSource {
+    #[serde(rename = "pasted-text")]
+    PastedText,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -111,6 +120,7 @@ impl Attachment {
             "path": self.path,
             "asset_id": self.asset_id,
             "uploaded": self.uploaded,
+            "source": self.source,
         })
     }
 
@@ -140,6 +150,7 @@ impl Attachment {
                     && (safe_id(&upload.attachment_id) || safe_file_id(&upload.attachment_id))
             });
         let id = value["id"].as_str()?;
+        let source = serde_json::from_value::<AttachmentSource>(value["source"].clone()).ok();
         if safe_file_id(id) {
             let name = value["name"].as_str()?;
             let mime = value["mime"].as_str()?;
@@ -164,6 +175,7 @@ impl Attachment {
                 path: Some(path),
                 asset_id: None,
                 uploaded,
+                source,
             });
         }
         if let Some(path) = value["path"].as_str() {
@@ -190,6 +202,7 @@ impl Attachment {
                 path: Some(path),
                 asset_id: None,
                 uploaded,
+                source,
             });
         }
         if !safe_id(id) {
@@ -223,6 +236,7 @@ impl Attachment {
             path: None,
             asset_id: None,
             uploaded,
+            source,
         })
     }
 }
@@ -361,6 +375,7 @@ pub(crate) fn store_uploaded_file(
         path: Some(path),
         asset_id: None,
         uploaded: None,
+        source: None,
     })
 }
 
@@ -388,12 +403,14 @@ pub(crate) fn transfer_file_bytes(attachment: &Attachment) -> Result<Vec<u8>, St
 
 pub(crate) fn stage_transfer_file(attachment: &Attachment) -> Result<Attachment, String> {
     let bytes = transfer_file_bytes(attachment)?;
-    store_uploaded_file(
+    let mut staged = store_uploaded_file(
         &directory().ok_or("The attachment directory is unavailable.")?,
         &attachment.name,
         &attachment.mime,
         &bytes,
-    )
+    )?;
+    staged.source = attachment.source.clone();
+    Ok(staged)
 }
 
 /// Stage only submitted/transferred files. Local path mentions and draft editing keep
@@ -621,6 +638,7 @@ fn file_reference(
         path: Some(path),
         asset_id: None,
         uploaded: None,
+        source: None,
     })
 }
 
@@ -675,6 +693,7 @@ pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
         path: None,
         asset_id: None,
         uploaded: None,
+        source: None,
     };
     if let Some(cache) = cache {
         // Cache metadata is optional. The validated blob remains the source of truth.
@@ -723,6 +742,7 @@ pub fn store_uploaded(directory: &Path, name: &str, bytes: &[u8]) -> Result<Atta
         path: None,
         asset_id: None,
         uploaded: None,
+        source: None,
     })
 }
 
@@ -1315,6 +1335,7 @@ mod tests {
             path: None,
             asset_id: None,
             uploaded: None,
+            source: None,
         };
         assert!(validate_prompt_images(&vec![image.clone(); 100]).is_ok());
         assert_eq!(

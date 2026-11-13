@@ -790,7 +790,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 10 { capabilities.push(protocol::COMPOSER_CONTEXT); }
                         if minor >= 10 { capabilities.push(protocol::FILE_ATTACHMENTS); }
                         staged_attachments = minor >= 11;
-                        if staged_attachments { capabilities.extend([protocol::STAGED_ATTACHMENTS, protocol::ATTACHMENT_LIMITS]); }
+                        if staged_attachments { capabilities.extend([protocol::STAGED_ATTACHMENTS, protocol::ATTACHMENT_LIMITS, protocol::PASTED_TEXT_ATTACHMENTS]); }
                         if minor >= 10 {
                             capabilities.extend([
                                 protocol::MODEL_FAVORITES,

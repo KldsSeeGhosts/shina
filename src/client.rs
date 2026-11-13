@@ -684,6 +684,12 @@ async fn supervise(
                                     limits: hello["capabilities"].as_array().is_some_and(|caps| {
                                         caps.iter().any(|cap| cap == protocol::ATTACHMENT_LIMITS)
                                     }),
+                                    pasted_text: hello["capabilities"].as_array().is_some_and(
+                                        |caps| {
+                                            caps.iter()
+                                                .any(|cap| cap == protocol::PASTED_TEXT_ATTACHMENTS)
+                                        },
+                                    ),
                                     environment: hello["serverId"].as_str(),
                                     local_upload: local_upload.as_ref(),
                                 },
@@ -785,8 +791,11 @@ async fn supervise(
                         info["serverId"].as_str().map(str::to_owned))
                 };
                 let local_upload = if remote.is_none() { local_upload_link(&directory, &device_directory) } else { None };
+                let pasted_text = info.lock().expect("connection info")["capabilities"].as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::PASTED_TEXT_ATTACHMENTS));
                 let prepared = match uploaded_command_capabilities(&command_to_send,remote.as_ref(), AttachmentPeer {
                     files:has_file_attachments,staged:has_staged,limits:has_limits,
+                    pasted_text,
                     environment:target_environment.as_deref(),local_upload:local_upload.as_ref(),
                 }).await {
                     Ok(command) => command,
@@ -1416,6 +1425,7 @@ pub(crate) struct AttachmentPeer<'a> {
     pub files: bool,
     pub staged: bool,
     pub limits: bool,
+    pub pasted_text: bool,
     pub environment: Option<&'a str>,
     pub local_upload: Option<&'a crate::peer::Link>,
 }
@@ -1429,10 +1439,37 @@ pub(crate) async fn uploaded_command_capabilities(
         files: files_supported,
         staged: staged_supported,
         limits: limits_supported,
+        pasted_text,
         environment: local_environment,
         local_upload,
     } = peer;
     let mut prepared = command.clone();
+    if !pasted_text {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    if object.contains_key("mime")
+                        && object.contains_key("id")
+                        && object
+                            .get("source")
+                            .is_some_and(|s| s["_tag"] == "pasted-text")
+                    {
+                        object.remove("source");
+                    }
+                    for child in object.values_mut() {
+                        strip(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        strip(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        strip(&mut prepared.params);
+    }
     if !matches!(command.method.as_str(), "thread.send" | "queue.update") {
         return Ok(prepared);
     }

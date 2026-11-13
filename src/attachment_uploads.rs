@@ -376,6 +376,7 @@ impl Queue {
                 path,
                 asset_id: None,
                 uploaded: None,
+                source: None,
             };
             if let Some(index) = replacement {
                 target.draft_images[index] = placeholder;
@@ -1488,6 +1489,7 @@ mod tests {
             path: None,
             asset_id: None,
             uploaded: None,
+            source: None,
         };
         state.current_mut().draft_images.push(attachment.clone());
         let mut entry = Entry::fixture(
@@ -1615,6 +1617,7 @@ mod tests {
             path: None,
             asset_id: None,
             uploaded: None,
+            source: None,
         };
         state.current_mut().draft_images.push(image.clone());
         let mut queue = Queue::default();
