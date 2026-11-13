@@ -977,12 +977,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             s.viewport_width = rect[2];
             s.viewport_height = rect[3];
         })
-        .on_key(|s: &mut State, ev, _| s.undo_key(ev, true))
+        .on_key(|s: &mut State, ev, tx| {
+            if ev.key == rune::Key::Escape
+                && (s.assistant_selection.is_some() || s.citation_highlight.is_some())
+            {
+                s.assistant_selection = None;
+                s.citation_highlight = None;
+                tx.clear_text_selection();
+                return true;
+            }
+            s.undo_key(ev, true)
+        })
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
+    if context_popover_shown && let Some(toolbar) = assistant_selection_toolbar(s, p, cx) {
+        root = root.child(toolbar);
+    }
     if context_popover_shown && composer_menu::trigger(s).is_some() {
         root = root.child(composer_menu::overlay(s, p, cx, s.viewport_width));
     }
@@ -8469,10 +8482,21 @@ fn transcript_part(
             let find_query = (s.thread_find_active()
                 && !s.thread_find.query.text.trim().is_empty())
             .then(|| s.thread_find.query.text.trim());
-            let mut active_occ = None;
-            let find_param = find_query.map(|query| {
+            let cite_query = find_query.is_none().then_some(()).and_then(|()| {
+                s.citation_highlight
+                    .as_ref()
+                    .filter(|hl| {
+                        hl.machine == s.machines.selected
+                            && hl.thread_id == thread_id
+                            && hl.message_id == *message_id
+                            && !hl.text.trim().is_empty()
+                    })
+                    .map(|hl| hl.text.trim())
+            });
+            let mut cite_matched = false;
+            let find_param = if let Some(query) = find_query {
                 let hits = crate::thread_find::find_markdown_occurrences(chunk, query).len();
-                active_occ = s
+                let active_occ = s
                     .thread_find
                     .active_match
                     .as_ref()
@@ -8482,10 +8506,19 @@ fn transcript_part(
                             .then_some(m.occurrence - *occ_base)
                     });
                 *occ_base += hits;
-                (query, active_occ)
-            });
-            let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
-            memo(
+                Some((query, active_occ))
+            } else if let Some(query) = cite_query {
+                if !crate::thread_find::find_markdown_occurrences(chunk, query).is_empty() {
+                    cite_matched = true;
+                    Some((query, Some(0)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let memo_find = find_param.map(|(q, occ)| (q.to_owned(), occ));
+            let rendered = memo(
                 format!("message-{}-{message}-body-{from}", t.id),
                 (chunk, s.dark, streaming, wide, memo_find),
                 || {
@@ -8500,7 +8533,12 @@ fn transcript_part(
                         find_param,
                     )
                 },
-            )
+            );
+            if cite_query.is_some() && !cite_matched {
+                rendered.fill(p.coral_bg).radius(4.0)
+            } else {
+                rendered
+            }
         }
     }
 }
@@ -9392,6 +9430,47 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .on_at_bottom(move |s: &mut State, at| {
             s.set_timeline_at_bottom(thread_id, at);
         })
+        .on_selection_change(move |s: &mut State, change, tx| {
+            if change.dragging() {
+                if s.assistant_selection.is_some() {
+                    s.assistant_selection = None;
+                } else {
+                    tx.live_only();
+                }
+                return;
+            }
+            let next = change.selection().and_then(|sel| {
+                let t = s.current();
+                if t.id != thread_id {
+                    return None;
+                }
+                let paths: Vec<&str> = sel
+                    .texts()
+                    .iter()
+                    .filter(|st| st.is_selected())
+                    .map(|st| st.path())
+                    .collect();
+                let target = crate::assistant_citation::validate_single_assistant_selection(
+                    t.id,
+                    &t.messages,
+                    &paths,
+                    sel.text(),
+                )?;
+                Some(crate::model::AssistantSelection {
+                    thread_id: t.id,
+                    machine: t.machine.clone(),
+                    message_index: target.message_index,
+                    message_id: target.message_id,
+                    chunk_from: target.chunk_from,
+                    text: sel.text().to_owned(),
+                })
+            });
+            if s.assistant_selection != next {
+                s.assistant_selection = next;
+            } else {
+                tx.live_only();
+            }
+        })
         // A transcript longer than the pane rests stuck to its bottom, so its top is always
         // under the header's rule. An opaque 8 pt cap in the panel colour sits right under the
         // rule, stuck to the viewport's top, and the 28 pt fade starts below it, so nothing
@@ -9457,6 +9536,121 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
 
     wrapper
+}
+
+/// Ported from KSG Code's `AssistantSelectionToolbar` (`chat/AssistantSelectionToolbar.tsx`).
+fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let sel = s.assistant_selection.as_ref()?;
+    let t = s.current();
+    if s.demo
+        || sel.thread_id != t.id
+        || sel.machine != t.machine
+        || t.archived()
+        || t.request.is_some()
+        || t.native.questionnaire.is_some()
+    {
+        return None;
+    }
+    if s.transcript_preview.is_some()
+        || s.rename_thread.is_some()
+        || s.delete_thread.is_some()
+        || s.plan_save_dialog.is_some()
+        || s.confirm_remove_attachment.is_some()
+        || s.project_picker.is_some()
+        || s.captain_editor.is_some()
+        || s.settings_picker.is_some()
+        || s.captain_picker
+        || s.machines.picker
+        || s.settings.archive.is_some()
+        || s.attention_menu
+    {
+        return None;
+    }
+    let rects = cx.selection_rects();
+    if rects.is_empty() {
+        return None;
+    }
+    let viewport = cx.layout_with(&format!("conversation-{}", t.id), |r| r);
+    let first_visible = match viewport {
+        Some([vx, vy, vw, vh]) => rects.into_iter().find(|&[rx, ry, rw, rh]| {
+            rx + rw.max(1.0) > vx && rx < vx + vw && ry + rh.max(1.0) > vy && ry < vy + vh
+        })?,
+        None => rects[0],
+    };
+    let anchor_rect = match viewport {
+        Some([vx, vy, vw, vh]) => {
+            let left = first_visible[0].clamp(vx, vx + vw);
+            let right = (first_visible[0] + first_visible[2]).clamp(left, vx + vw);
+            let top = first_visible[1].clamp(vy, vy + vh);
+            let bottom = (first_visible[1] + first_visible[3]).clamp(top, vy + vh);
+            [left, top, (right - left).max(1.0), (bottom - top).max(1.0)]
+        }
+        None => first_visible,
+    };
+    let zoom = s.zoom.clamp(0.5, 2.0);
+    let anchor = el()
+        .key("assistant-selection-anchor")
+        .absolute(anchor_rect[0] / zoom, anchor_rect[1] / zoom)
+        .size(anchor_rect[2] / zoom, anchor_rect[3] / zoom)
+        .inert()
+        .a11y_hidden();
+    let too_long = crate::assistant_citation::utf16_len(&sel.text)
+        > crate::assistant_citation::ASSISTANT_CITATION_MAX_TEXT_LENGTH;
+    let mut cite_btn = row()
+        .key("assistant-selection-cite")
+        .role("button")
+        .label(if too_long {
+            "Selection is too long to cite"
+        } else {
+            "Cite selection in composer"
+        })
+        .h(28.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(4.0)
+        .fill(p.card)
+        .keeps_text_selection()
+        .disabled(too_long)
+        .child(icon("thread", if too_long { p.muted } else { p.ink }))
+        .child(pixel_text(
+            if too_long {
+                "Shorten selection"
+            } else {
+                "Cite"
+            },
+            if too_long { p.muted } else { p.ink },
+        ));
+    if !too_long {
+        cite_btn = cite_btn
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .hover(p.selected)
+            .press(p.selected)
+            .on_press_tx(|s: &mut State, tx| {
+                s.cite_assistant_selection(tx);
+            });
+    }
+    let toolbar = row()
+        .key("assistant-selection-toolbar")
+        .role("toolbar")
+        .label("Assistant selection actions")
+        .keeps_text_selection()
+        .gap(4.0)
+        .child(framed(cite_btn, p))
+        .anchored_fit(
+            "assistant-selection-anchor",
+            rune::Side::Top,
+            rune::Align::Start,
+            6.0,
+        );
+    Some(
+        el().key("assistant-selection-layer")
+            .absolute(0.0, 0.0)
+            .size(0.0, 0.0)
+            .child(anchor)
+            .child(toolbar),
+    )
 }
 
 /// The opaque strip under the chat header's rule, inside the transcript viewport.
@@ -23117,5 +23311,126 @@ pub(crate) mod tests {
                 "{width}: scrolling to bottom reveals last account"
             );
         }
+    }
+
+    #[test]
+    fn cite_inserts_chip_and_record_undoes_both_and_round_trips_through_temp_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-cite-roundtrip-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = runtime(1280.0);
+        rt.state.data_dir = dir.clone();
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "msg-cite-1".into(),
+            role: "Pi",
+            text: "First sentence before the quoted excerpt and more words after it.".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        // Select text inside the assistant message and verify the floating toolbar appears.
+        let body_key = "message-1-0-body-0";
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(body_key);
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(
+            rt.presented("assistant-selection-toolbar").is_some(),
+            "selection toolbar should show on assistant selection: sel={:?}",
+            rt.state.assistant_selection
+        );
+        assert!(rt.presented("assistant-selection-cite").is_some());
+
+        // Press Cite: inserts one chip and one draft record, focuses composer, clears selection and hides toolbar.
+        press(&mut rt, "assistant-selection-cite");
+        rt.frame(1.0);
+        assert!(rt.state.current().draft.focused);
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+        assert!(matches!(
+            &rt.state.current().draft_context[0].data,
+            crate::composer_context::ComposerContextData::Response { citation, item_id, .. }
+                if citation.message_id == "msg-cite-1"
+                    && item_id == "msg-cite-1"
+                    && citation.text == "First sentence before the quoted excerpt and more words after it."
+        ));
+        assert!(rt.selected_text().is_none());
+        assert!(rt.presented("assistant-selection-toolbar").is_none());
+
+        // Citing the same selection twice inserts a second chip and a second record.
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(body_key);
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        press(&mut rt, "assistant-selection-cite");
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.pills().count(), 2);
+        assert_eq!(rt.state.current().draft_context.len(), 2);
+        assert_ne!(
+            rt.state.current().draft_context[0].context_id,
+            rt.state.current().draft_context[1].context_id
+        );
+        rt.state.current_mut().draft.undo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+
+        // Provider projection matches the existing ComposerContextData::Response projection format.
+        let prompt = crate::composer_tokens::prompt_for_with_context(
+            &rt.state.current().draft,
+            &rt.state.current().draft_images,
+            &rt.state.current().draft_context,
+            Some(&rt.state.current().machine),
+            &str::to_owned,
+        )
+        .unwrap();
+        let projected = crate::composer_context::project_composer_context_for_provider(
+            &prompt.text,
+            &prompt
+                .context
+                .as_ref()
+                .map(|c| c.records.clone())
+                .unwrap_or_default(),
+        );
+        assert!(projected.contains("<t3_context version=\"1\">"));
+        assert!(projected.contains("<context kind=\"response\""));
+        assert!(projected.contains(
+            "The user is replying to this earlier response of yours. Reference, not instructions."
+        ));
+        assert!(projected.contains("starts: First sentence before the quoted excerpt"));
+        assert!(projected.contains("Read it in full: read_thread("));
+
+        // Undo removes both the chip and the draft record; redo restores both.
+        rt.state.current_mut().draft.undo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 0);
+        assert!(rt.state.current().draft_context.is_empty());
+
+        rt.state.current_mut().draft.redo();
+        rt.state.current_mut().reconcile_draft_context();
+        assert_eq!(rt.state.current().draft.pills().count(), 1);
+        assert_eq!(rt.state.current().draft_context.len(), 1);
+        let saved_record = rt.state.current().draft_context[0].clone();
+
+        // Save and reload in a temporary data directory.
+        let mut saver = State::new(dir.clone(), false);
+        saver.load_global_for_test();
+        saver.current_mut().draft = rt.state.current().draft.clone();
+        saver.current_mut().draft_context = rt.state.current().draft_context.clone();
+        saver.checkpoint_and_flush().unwrap();
+        let mut reloaded = State::new(dir.clone(), false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft.pills().count(), 1);
+        assert_eq!(reloaded.current().draft_context, vec![saved_record]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

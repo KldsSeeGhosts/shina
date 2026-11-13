@@ -795,6 +795,51 @@ impl Thread {
         });
     }
 
+    pub(crate) fn insert_context_chip(
+        &mut self,
+        record: crate::composer_context::ComposerContextRecord,
+    ) {
+        if self.request.is_some() {
+            return;
+        }
+        let (start, end) = if self.draft.focused {
+            self.draft.range()
+        } else {
+            let end = self.draft.text.len();
+            (end, end)
+        };
+        let prev = self.draft.text[..start].chars().next_back();
+        let needs_leading_space = !matches!(prev, None | Some(' ' | '\n' | '\t' | '\r'));
+        let replace_end = if self.draft.text[end..].starts_with(' ') {
+            end + 1
+        } else {
+            end
+        };
+        let pill_id = crate::composer_context::format_composer_context_href(
+            record.kind(),
+            &record.context_id,
+        );
+        let chip_label = record.label.clone();
+        if let Some(existing) = self
+            .draft_context
+            .iter_mut()
+            .find(|r| r.context_id == record.context_id)
+        {
+            *existing = record;
+        } else {
+            self.draft_context.push(record);
+        }
+        self.draft.undo_group(|e| {
+            e.set_selection(start, replace_end);
+            e.insert(if needs_leading_space { " " } else { "" });
+            let pill_start = e.focus;
+            e.insert(&chip_label);
+            let pill_end = e.focus;
+            e.replace_with_pill(pill_start..pill_end, pill_id, &chip_label);
+            e.insert(" ");
+        });
+    }
+
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
         if self
             .draft_images
@@ -3112,6 +3157,24 @@ impl Thread {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AssistantSelection {
+    pub thread_id: usize,
+    pub machine: String,
+    pub message_index: usize,
+    pub message_id: String,
+    pub chunk_from: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CitationHighlight {
+    pub machine: String,
+    pub thread_id: usize,
+    pub message_id: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 enum TabIntent {
     Open(Option<usize>),
@@ -3277,6 +3340,8 @@ pub struct State {
     pub attachment_drop_hover: bool,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
+    pub(crate) assistant_selection: Option<AssistantSelection>,
+    pub(crate) citation_highlight: Option<CitationHighlight>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
@@ -3461,6 +3526,8 @@ impl State {
             next_plan_save_request_id: 0,
             opened_draft: None,
             composer_sources: crate::composer_sources::Sources::default(),
+            assistant_selection: None,
+            citation_highlight: None,
             snooze_menu: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
@@ -3628,6 +3695,8 @@ impl State {
         }
         self.active = index;
         self.plan_menu = None;
+        self.assistant_selection = None;
+        self.citation_highlight = None;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
@@ -4011,6 +4080,89 @@ impl State {
             format!("conversation-{tid}"),
             format!("{row_key}/thread-find-active"),
         );
+        true
+    }
+
+    pub(crate) fn cite_assistant_selection(&mut self, tx: &mut Tx) -> bool {
+        let Some(sel) = self.assistant_selection.clone() else {
+            return false;
+        };
+        if self.demo {
+            return false;
+        }
+        let current = self.current();
+        if current.id != sel.thread_id
+            || current.machine != sel.machine
+            || current.archived()
+            || current.request.is_some()
+            || current.native.questionnaire.is_some()
+        {
+            return false;
+        }
+        let Some(message) = current.messages.get(sel.message_index) else {
+            return false;
+        };
+        if message.id != sel.message_id || message.role != "Pi" {
+            return false;
+        }
+        let env_id = self.machine_identity(&current.machine);
+        let thread_id_str = current.id.to_string();
+        let Ok(citation) = crate::assistant_citation::build_assistant_citation_from_selection(
+            &env_id,
+            &thread_id_str,
+            &message.id,
+            &message.text,
+            sel.chunk_from,
+            &sel.text,
+        ) else {
+            return false;
+        };
+        let record =
+            crate::assistant_citation::citation_context_record(citation, &message.id, None);
+        self.current_mut().insert_context_chip(record);
+        self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Inserted);
+        self.assistant_selection = None;
+        tx.clear_text_selection();
+        self.checkpoint();
+        true
+    }
+
+    pub(crate) fn navigate_to_citation(
+        &mut self,
+        citation: &crate::composer_context::AssistantCitation,
+        tx: &mut Tx,
+    ) -> bool {
+        let Ok(id) = citation.thread_id.parse::<usize>() else {
+            return false;
+        };
+        let machine = if citation.environment_id == self.machine_identity("local") {
+            "local".to_owned()
+        } else {
+            citation.environment_id.clone()
+        };
+        self.open_machine_thread(&machine, id);
+        if self.current().id != id || self.machines.selected != machine {
+            return false;
+        }
+        let t = self.current();
+        let msg_idx = t.messages.iter().position(|m| m.id == citation.message_id);
+        let row_key = match msg_idx {
+            Some(idx) if t.messages[idx].role == "Pi" => {
+                let start = t.messages[..=idx]
+                    .iter()
+                    .rposition(|m| m.role != "Pi")
+                    .map_or(0, |i| i + 1);
+                format!("turn-{id}-{}", t.messages[start].id)
+            }
+            _ => format!("row-{id}-{}", citation.message_id),
+        };
+        self.citation_highlight = Some(CitationHighlight {
+            machine,
+            thread_id: id,
+            message_id: citation.message_id.clone(),
+            text: citation.text.clone(),
+        });
+        tx.scroll_center_in(format!("conversation-{id}"), row_key);
         true
     }
     pub fn is_captain_home(&self, thread: &Thread) -> bool {
