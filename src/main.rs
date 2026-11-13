@@ -302,6 +302,23 @@ fn dispatch_global_command(
         "composer.focus" => {
             state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
         }
+        "composer.stash" => {
+            if key_repeat {
+                return true;
+            }
+            // KSG's menu handler scopes the shortcut to the composer, the badge and the
+            // menu; dialogs and unrelated fields keep their own Mod+S behavior.
+            let scoped = state.current().draft.focused
+                || state.stash_menu
+                || tx.as_ref().is_some_and(|tx| {
+                    tx.focused()
+                        .is_some_and(|key| key.starts_with("composer-stash-"))
+                });
+            if !scoped || composer_controls_blocked(state) {
+                return false;
+            }
+            ui::composer_stash::command(state);
+        }
         "chat.find" => {
             if composer_controls_blocked(state) {
                 return false;

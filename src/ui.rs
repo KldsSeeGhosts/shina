@@ -1085,6 +1085,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.composer_ui.overflow.get() {
         root = root.child(composer_ui::overflow_menu(s, p));
     }
+    if composer_stash::menu_open(s) {
+        // KSG's drawer portal, mounted beside the other composer popovers.
+        root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+    }
     if s.machines.dialog {
         root = root.child(machine_dialog(s, p));
     }

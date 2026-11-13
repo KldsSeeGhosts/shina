@@ -217,7 +217,6 @@ fn release(s: &State, entry: &Entry) {
 
 /// Stash the current draft, from `useComposerStash.stashPrompt`. The write lands before
 /// the composer clears; a rejected write leaves the composer untouched, as KSG's does.
-#[allow(dead_code)]
 pub fn stash(s: &mut State) {
     let machine = s.machines.selected.clone();
     let t = s.current();
@@ -306,7 +305,6 @@ pub fn stash(s: &mut State) {
 
 /// Restore an entry: it leaves the stash and appends to the draft with a blank line,
 /// from `useComposerStash.restoreEntry` and `composer_rich::prepend`.
-#[allow(dead_code)]
 pub fn restore(s: &mut State, id: &str) {
     let Some(position) = s.stash.entries.iter().position(|e| e.id == id) else {
         return;
@@ -389,7 +387,6 @@ pub fn restore(s: &mut State, id: &str) {
 }
 
 /// Delete an entry and release its attachment holds, KSG's `deleteEntry`.
-#[allow(dead_code)]
 pub fn delete(s: &mut State, id: &str) {
     let Some(position) = s.stash.entries.iter().position(|e| e.id == id) else {
         return;
@@ -405,6 +402,266 @@ pub fn delete(s: &mut State, id: &str) {
         s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
     }
     s.checkpoint();
+}
+
+/// KSG's `--chat-composer-drawer-inset: 1.375rem` leaves 22 px of lane on each side.
+const DRAWER_INSET: f32 = 22.0;
+
+/// KSG's stashCommand dispatch: content stashes; an empty composer restores the only
+/// entry or opens the menu when several exist.
+pub fn command(s: &mut State) {
+    if s.current().has_draft_content() {
+        stash(s);
+        return;
+    }
+    match s.stash.entries.len() {
+        0 => {}
+        1 => {
+            let id = s.stash.entries[0].id.clone();
+            restore(s, &id);
+        }
+        _ => {
+            s.stash_menu = true;
+            s.stash_highlight = 0;
+        }
+    }
+}
+
+/// Whether the menu is on screen. Another composer menu or popover opening takes the
+/// layer, as KSG closes the drawer when the command menu opens.
+pub fn menu_open(s: &State) -> bool {
+    s.stash_menu
+        && !s.stash.entries.is_empty()
+        && super::composer_menu::trigger(s).is_none()
+        && !s.machines.picker
+        && !s.current().native.access_picker
+        && s.settings_picker.is_none()
+}
+
+pub fn close_menu(s: &mut State) {
+    s.stash_menu = false;
+    s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+}
+
+/// KSG's highlighted id resolves to the first entry when its row is gone; the highlight
+/// index clamps the same way here.
+fn highlight(s: &State) -> usize {
+    s.stash_highlight
+        .min(s.stash.entries.len().saturating_sub(1))
+}
+
+/// Menu keys, scoped exactly as KSG's drawer handler: they act only while focus is in
+/// the menu, on the badge, or in the composer, so dialogs and unrelated inputs keep
+/// their own bindings.
+pub fn menu_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> bool {
+    if !menu_open(s) {
+        return false;
+    }
+    let focused = tx.focused().unwrap_or_default();
+    let scoped = focused == "composer-input"
+        || focused == "composer-stash-badge"
+        || focused.starts_with("composer-stash-");
+    if !scoped {
+        return false;
+    }
+    let count = s.stash.entries.len();
+    match event.key {
+        rune::Key::Down => {
+            s.stash_highlight = (highlight(s) + 1).min(count.saturating_sub(1));
+            true
+        }
+        rune::Key::Up => {
+            s.stash_highlight = highlight(s).saturating_sub(1);
+            true
+        }
+        rune::Key::Enter => {
+            let id = s.stash.entries[highlight(s)].id.clone();
+            restore(s, &id);
+            true
+        }
+        rune::Key::Escape => {
+            close_menu(s);
+            true
+        }
+        rune::Key::Backspace if event.mods.cmd || event.mods.ctrl => {
+            let id = s.stash.entries[highlight(s)].id.clone();
+            delete(s, &id);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// KSG's `ComposerStashBadge`: hidden while the stash is empty, archive glyph plus the
+/// count in an `outlined` chip inside a 28 px press target, and a pulse on each stash.
+pub(super) fn badge(s: &State, p: Palette) -> El {
+    let count = s.stash.entries.len();
+    if count == 0 {
+        return el();
+    }
+    el().key("composer-stash-badge")
+        .role("button")
+        .label(format!("Stashed drafts, {count}"))
+        .focusable(true)
+        .size(28.0, 28.0)
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .hover(p.selected)
+        .press(p.selected)
+        .radius(4.0)
+        .preserve_focus_on_press(true)
+        .on_key(|s, event, tx| menu_key(s, event, tx))
+        .on_press(|s: &mut State| {
+            s.stash_menu = !menu_open(s);
+            s.stash_highlight = 0;
+        })
+        .child(outlined(
+            row()
+                .key(format!("composer-stash-badge-chip-{}", s.stash_pulse))
+                .h(20.0)
+                .px(5.0)
+                .gap(4.0)
+                .center_y()
+                .radius(4.0)
+                .fill(p.panel)
+                .sequence(rune::Sequence::new(STASH_PULSE))
+                .child(icon("archive", p.muted))
+                .child(pixel_text(format!("{count}"), p.muted)),
+            p,
+        ))
+}
+
+/// The badge pulse, one shot per stash, replayed by the chip's changing key — KSG's
+/// `stash-pulse-count 1400ms` scale beat.
+static STASH_PULSE: &[rune::Beat] = &[
+    rune::Beat::new(0.0).scale(1.0),
+    rune::Beat::new(0.18).scale(1.15),
+    rune::Beat::new(1.4).scale(1.0),
+];
+
+/// Snippet text as KSG shows it: the draft flattened to one line.
+fn snippet(entry: &Entry) -> String {
+    entry
+        .snapshot
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// KSG's `ComposerStashMenu`: newest-first rows of snippet, relative age and the
+/// attachment/context counts, anchored above the badge at the drawer width
+/// (`calc(100% - 2 * 1.375rem)` of the composer lane).
+pub(super) fn menu(s: &State, p: Palette, lane: f32) -> El {
+    let highlighted = highlight(s);
+    let mut list = col().key("composer-stash-list").w_full();
+    for (index, entry) in s.stash.entries.iter().enumerate() {
+        let id = entry.id.clone();
+        let delete_id = entry.id.clone();
+        let images = entry
+            .snapshot
+            .attachments
+            .iter()
+            .filter(|a| a.is_image())
+            .count();
+        let files = entry.snapshot.attachments.len() - images;
+        let records = entry.snapshot.context.len() + entry.retained.records.len();
+        let mut meta = vec![relative_time(entry.created).unwrap_or_else(|| "now".into())];
+        if images > 0 {
+            meta.push(format!(
+                "{images} image{}",
+                if images == 1 { "" } else { "s" }
+            ));
+        }
+        if files > 0 {
+            meta.push(format!("{files} file{}", if files == 1 { "" } else { "s" }));
+        }
+        if records > 0 {
+            meta.push(format!(
+                "{records} chip{}",
+                if records == 1 { "" } else { "s" }
+            ));
+        }
+        let mut row_el = row()
+            .key(format!("composer-stash-row-{index}"))
+            .role("listitem")
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .w_full()
+            .h(44.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(4.0)
+            .preserve_focus_on_press(true)
+            .on_press(move |s: &mut State| restore(s, &id))
+            .child(
+                col()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .gap(2.0)
+                    .child(label(snippet(entry), SMALL, p.ink).truncate())
+                    .child(label(meta.join(" \u{00b7} "), PIXEL, p.muted).truncate()),
+            )
+            .child(
+                el().key(format!("composer-stash-delete-{index}"))
+                    .role("button")
+                    .label("Delete stashed draft")
+                    .focusable(true)
+                    .size(24.0, 24.0)
+                    .center()
+                    .cursor(rune::Cursor::Pointer)
+                    .hover(p.selected)
+                    .radius(4.0)
+                    .preserve_focus_on_press(true)
+                    .on_press(move |s: &mut State| delete(s, &delete_id))
+                    .child(icon("close", p.muted)),
+            );
+        if index == highlighted {
+            row_el = row_el.fill(p.selected);
+        }
+        row_el = row_el.on_hover_change(move |s: &mut State, hovering: bool, _| {
+            if hovering {
+                s.stash_highlight = index;
+            }
+        });
+        list = list.child(row_el);
+    }
+    outlined(
+        col()
+            .key("composer-stash-menu")
+            .role("list")
+            .focusable(true)
+            .active_descendant(format!("composer-stash-row-{highlighted}"))
+            .label("Stashed drafts")
+            .on_key(|s, event, tx| menu_key(s, event, tx))
+            .fill(p.panel)
+            .radius(6.0)
+            .clip_rounded(6.0)
+            .w((lane - 2.0 * DRAWER_INSET).max(240.0))
+            .max_h(288.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(list)
+            .box_shadow(hard_shadow(p)),
+        p,
+    )
+    .anchored_fit(
+        "composer-stash-badge",
+        rune::Side::Top,
+        rune::Align::End,
+        8.0,
+    )
+    .focus_return("composer-input")
+    .instant_changes()
+    // A light dismiss layer like the composer overflow menu: a press outside the
+    // drawer or Escape closes it without trapping the composer.
+    .modal(true, |s: &mut State| {
+        s.stash_menu = false;
+        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+    })
 }
 
 #[cfg(test)]
@@ -631,5 +888,197 @@ mod tests {
                 .join("kept-alive.png")
                 .is_file()
         );
+    }
+
+    fn key_event(key: rune::Key) -> rune::KeyEvent {
+        rune::KeyEvent {
+            key,
+            mods: Default::default(),
+        }
+    }
+
+    /// A headless frame with the stash file kept in the test profile, not the worktree.
+    fn stash_runtime(width: f32) -> rune::Runtime<State> {
+        let mut rt = crate::ui::tests::runtime(width);
+        rt.on_key = Some(crate::key);
+        rt.state.data_dir = crate::store::directory().unwrap();
+        rt
+    }
+
+    fn stash_texts(rt: &mut rune::Runtime<State>, texts: &[&str]) {
+        for text in texts {
+            rt.state.current_mut().draft.replace_text(*text);
+            stash(&mut rt.state);
+        }
+    }
+
+    #[test]
+    fn the_shortcut_stashes_restores_one_and_opens_the_menu_for_many() {
+        let mut s = state();
+        // Empty composer, empty stash: Mod+S does nothing.
+        command(&mut s);
+        assert!(s.stash.entries.is_empty() && !s.stash_menu);
+        // With content it stashes.
+        s.current_mut().draft.replace_text("only draft");
+        command(&mut s);
+        assert!(s.current().draft.text.is_empty());
+        assert_eq!(s.stash.entries.len(), 1);
+        // Empty composer and exactly one entry restores it.
+        command(&mut s);
+        assert_eq!(s.current().draft.text, "only draft");
+        assert!(s.stash.entries.is_empty());
+        // Several entries open the menu.
+        s.current_mut().draft.replace_text("first");
+        command(&mut s);
+        s.current_mut().draft.replace_text("second");
+        command(&mut s);
+        assert_eq!(s.stash.entries.len(), 2);
+        command(&mut s);
+        assert!(menu_open(&s));
+    }
+
+    #[test]
+    fn the_menu_navigates_restores_deletes_and_closes() {
+        let mut rt = stash_runtime(1280.0);
+        stash_texts(&mut rt, &["one", "two", "three"]);
+        rt.state.stash_menu = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("composer-stash-menu").is_some());
+        assert_eq!(rt.state.stash_highlight, 0);
+        // The drawer takes focus when it mounts, like KSG's list focus.
+        rt.frame(0.0);
+        // Arrows move the highlight.
+        rt.key(key_event(rune::Key::Down));
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash_highlight, 1);
+        rt.key(key_event(rune::Key::Down));
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash_highlight, 2);
+        rt.key(key_event(rune::Key::Down));
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash_highlight, 2, "clamped at the last row");
+        rt.key(key_event(rune::Key::Up));
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash_highlight, 1);
+        // Enter restores the highlighted row and closes the menu.
+        rt.key(key_event(rune::Key::Enter));
+        rt.frame(0.0);
+        assert_eq!(rt.state.current().draft.text, "two");
+        assert_eq!(rt.state.stash.entries.len(), 2);
+        assert!(!menu_open(&rt.state));
+        // Mod+Backspace deletes the highlighted entry; the last one closes the menu.
+        rt.state.stash_menu = true;
+        rt.state.stash_highlight = 0;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Backspace,
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash.entries.len(), 1);
+        assert!(menu_open(&rt.state));
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Backspace,
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(rt.state.stash.entries.is_empty());
+        assert!(!menu_open(&rt.state));
+    }
+
+    #[test]
+    fn the_menu_restores_on_row_click_deletes_per_row_and_closes_outside() {
+        let mut rt = stash_runtime(1280.0);
+        stash_texts(&mut rt, &["alpha", "beta"]);
+        rt.state.stash_menu = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        // A row click restores that entry.
+        crate::ui::tests::press(&mut rt, "composer-stash-row-1");
+        assert_eq!(rt.state.current().draft.text, "alpha");
+        assert_eq!(rt.state.stash.entries.len(), 1);
+        // Reopen: the per-row delete removes its entry.
+        rt.state.stash_menu = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        crate::ui::tests::press(&mut rt, "composer-stash-delete-0");
+        rt.frame(0.0);
+        assert!(rt.state.stash.entries.is_empty());
+        assert!(!menu_open(&rt.state), "the last delete closes the menu");
+        // Reopen, then a press outside the drawer dismisses it as the composer
+        // overflow menu's outside press does.
+        stash_texts(&mut rt, &["again"]);
+        rt.state.stash_menu = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(menu_open(&rt.state));
+        rt.pointer_down(640.0, 240.0);
+        rt.pointer_up(640.0, 240.0);
+        rt.frame(0.0);
+        assert!(!rt.state.stash_menu);
+    }
+
+    #[test]
+    fn escape_closes_and_hover_highlights() {
+        let mut rt = stash_runtime(1280.0);
+        stash_texts(&mut rt, &["one", "two", "three"]);
+        rt.state.stash_menu = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        let (x, y) = rt.find("composer-stash-row-2").expect("row 2");
+        rt.pointer_move(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.stash_highlight, 2);
+        crate::ui::tests::press(&mut rt, "composer-input");
+        rt.key(key_event(rune::Key::Escape));
+        rt.frame(0.0);
+        assert!(!menu_open(&rt.state));
+    }
+
+    #[test]
+    fn the_badge_sits_in_the_footer_and_the_menu_fits_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = stash_runtime(width);
+            stash_texts(&mut rt, &["one", "two", "three"]);
+            rt.state.stash_menu = true;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (badge, _) = rt
+                .presented("composer-stash-badge")
+                .unwrap_or_else(|| panic!("{width}: badge"));
+            let (footer, _) = rt
+                .presented("composer-footer")
+                .unwrap_or_else(|| panic!("{width}: footer"));
+            assert!(
+                badge[1] >= footer[1] - 1.0 && badge[1] + badge[3] <= footer[1] + footer[3] + 1.0,
+                "{width}: badge {badge:?} in footer {footer:?}"
+            );
+            assert!(
+                badge[0] + badge[2] <= footer[0] + footer[2] + 1.0,
+                "{width}: badge inside the footer row {footer:?}"
+            );
+            let (menu_rect, _) = rt
+                .presented("composer-stash-menu")
+                .unwrap_or_else(|| panic!("{width}: menu"));
+            assert!(
+                menu_rect[0] >= -1.0 && menu_rect[0] + menu_rect[2] <= width + 1.0,
+                "{width}: menu {menu_rect:?} inside the window"
+            );
+            assert!(menu_rect[1] >= -1.0, "{width}: menu top {menu_rect:?}");
+            for i in 0..3 {
+                assert!(
+                    rt.presented(&format!("composer-stash-row-{i}")).is_some(),
+                    "{width}: row {i}"
+                );
+            }
+        }
     }
 }
