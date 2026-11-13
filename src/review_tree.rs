@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Used by the diff panel, which lands in a later change.
+#![allow(dead_code)] // The tree-sidebar entries and sorts wait on the diff file tree.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

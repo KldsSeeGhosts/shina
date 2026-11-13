@@ -4167,6 +4167,18 @@ pub struct State {
     pub right_panel_menu_at: Option<(f32, f32)>,
     /// The resize handle is mid-drag: the edge line turns coral.
     pub right_panel_resizing: bool,
+    /// Per-thread diff panel state, keyed like right_panels. Session only.
+    pub(crate) diffs: std::collections::HashMap<String, crate::ui::diff_panel::ThreadDiff>,
+    /// App-wide "hide test files" switch for the diff panel; saved in the UI snapshot
+    /// only when on.
+    pub diff_hide_tests: bool,
+    /// Diff request ids; a newer request supersedes an older one.
+    pub(crate) next_diff_request_id: u64,
+    /// In-flight review.getDiffPreview RPCs: request id -> what it is for.
+    pub(crate) pending_diff_requests:
+        std::collections::HashMap<u64, crate::ui::diff_panel::DiffPending>,
+    /// Finished diff work (local results and parsed remote answers) for the poll drain.
+    pub(crate) diff_rxs: Vec<std::sync::mpsc::Receiver<crate::ui::diff_panel::DiffMsg>>,
     pub ui_store: Option<crate::store::Store>,
     last_sweep: u64,
     last_lifecycle_clock: u64,
@@ -4444,6 +4456,11 @@ impl State {
             right_panel_menu: None,
             right_panel_menu_at: None,
             right_panel_resizing: false,
+            diffs: Default::default(),
+            diff_hide_tests: false,
+            next_diff_request_id: 0,
+            pending_diff_requests: Default::default(),
+            diff_rxs: Vec::new(),
             ui_store: None,
             last_sweep: 0,
             last_lifecycle_clock: 0,
@@ -13636,7 +13653,7 @@ impl State {
                     .map(|val| (t.id.to_string(), val))
             })
             .collect();
-        json!({
+        let mut value = json!({
             "background": self.background.settings,
             "preferences": prefs_value,
             "draftModelStates": draft_model_states,
@@ -13686,7 +13703,12 @@ impl State {
                 };
                 (t.id.to_string(), value)
             }).collect::<serde_json::Map<_,_>>(),
-        })
+        });
+        // Off is the default, so only the on state is saved.
+        if self.diff_hide_tests {
+            value["diffHideTests"] = json!(true);
+        }
+        value
     }
     pub(crate) fn runtime_input_snapshot(
         &self,
@@ -13742,6 +13764,7 @@ impl State {
             })
             .transpose()?
             .unwrap_or(crate::right_panel::DEFAULT_WIDTH);
+        self.diff_hide_tests = ui["diffHideTests"].as_bool().unwrap_or(false);
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
@@ -14403,7 +14426,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         return browsing | composer_changed;
     }
     if state.client.is_some() {
-        return state.poll_client(tx) | browsing | composer_changed;
+        return state.poll_client(tx)
+            | crate::ui::diff_panel::tick(state, tx)
+            | browsing
+            | composer_changed;
     }
     let browsing = browsing | state.poll_fleet();
     let background_changed = state.poll_background_start(tx);
@@ -14450,6 +14476,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     changed |= state.prewarm_current();
     changed |= state.poll_vcs_branches();
+    changed |= crate::ui::diff_panel::tick(state, tx);
     changed |= state.poll_worktree_bootstraps();
     changed |= state.poll_worktree_setup();
     changed |= state.poll_question_answers();
@@ -14488,6 +14515,9 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         .map(|t| t.child_thread_id)
         .collect();
     let mut connect_indices = Vec::new();
+    // Threads whose provider turn ended or reported a file change: their diff
+    // panels are marked stale below (KSG's workspace-mutation refresh bump).
+    let mut diff_notes = Vec::new();
     for (index, thread) in state.threads.iter_mut().enumerate() {
         if remote_children.contains(&thread.id) {
             continue;
@@ -14511,6 +14541,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 Event::Record(record) => {
                     state.background.observe_record(&record);
                     let settled = record["type"] == "agent_settled";
+                    // A tool ending can grow `changes`; remember where they stood.
+                    let changes_before = (record["type"] == "tool_execution_end").then(|| {
+                        thread
+                            .tools
+                            .iter()
+                            .map(|tool| tool.changes.len())
+                            .sum::<usize>()
+                    });
                     if matches!(
                         record["type"].as_str(),
                         Some("agent_start" | "message_start" | "agent_settled")
@@ -14542,6 +14580,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     }
                     run_ended |= settled;
                     thread.apply(record);
+                    if settled
+                        || changes_before.is_some_and(|before| {
+                            thread
+                                .tools
+                                .iter()
+                                .map(|tool| tool.changes.len())
+                                .sum::<usize>()
+                                > before
+                        })
+                    {
+                        diff_notes.push(index);
+                    }
                     if settled {
                         thread.command("get_state", json!({}));
                     }
@@ -14551,11 +14601,13 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 }
                 Event::Error(error) => {
                     run_ended = true;
+                    diff_notes.push(index);
                     thread.fail_session(error);
                 }
                 Event::Diagnostic(diagnostic) => thread.diagnostic(&diagnostic),
                 Event::Exited => {
                     run_ended = true;
+                    diff_notes.push(index);
                     if !matches!(thread.status, Status::Failed | Status::Paused) {
                         thread.fail_session(
                             "Pi stopped unexpectedly. Retry to resume the saved conversation."
@@ -14642,6 +14694,9 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     for index in connect_indices {
         state.connect_thread(index);
         changed = true;
+    }
+    for index in diff_notes {
+        state.diff_note_event(index);
     }
     for (parent, question) in crew_questions {
         state.persistence_scope = None;

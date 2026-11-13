@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Used by the diff panel, which lands in a later change.
+#![allow(dead_code)] // `fnv1a32` waits on the rest of the diff-panel port.
 
 const UNSUPPORTED_DIFF_REASON: &str = "Unsupported diff format. Showing raw patch.";
 const FAILED_PARSE_REASON: &str = "Failed to parse patch. Showing raw patch.";
@@ -105,15 +105,26 @@ pub fn identity_key(file: &FileDiff) -> String {
     format!("{previous}\0{path}\0{kind}")
 }
 
-pub fn all_collapsed(files: &[FileDiff], collapsed: &std::collections::HashSet<String>) -> bool {
-    !files.is_empty()
-        && files
-            .iter()
-            .all(|file| collapsed.contains(&identity_key(file)))
+pub fn all_collapsed<'a>(
+    files: impl IntoIterator<Item = &'a FileDiff>,
+    collapsed: &std::collections::HashSet<String>,
+) -> bool {
+    let mut any = false;
+    for file in files {
+        if !collapsed.contains(&identity_key(file)) {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
-pub fn toggle_all(files: &[FileDiff], collapsed: &mut std::collections::HashSet<String>) {
-    if all_collapsed(files, collapsed) {
+pub fn toggle_all<'a>(
+    files: impl IntoIterator<Item = &'a FileDiff>,
+    collapsed: &mut std::collections::HashSet<String>,
+) {
+    let files: Vec<&FileDiff> = files.into_iter().collect();
+    if all_collapsed(files.iter().copied(), collapsed) {
         collapsed.clear();
     } else {
         collapsed.clear();
