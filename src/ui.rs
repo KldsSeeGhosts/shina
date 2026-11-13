@@ -26408,6 +26408,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn citation_chip_body_press_jumps_to_source() {
+        let mut rt = runtime(1280.0);
+        rt.poll = Some(|s, now, tx| composer_ui::tick(s, now, tx));
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "msg-jump".into(),
+            role: "Pi",
+            text: "the cited passage".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        let passage = "the cited passage";
+        let citation = crate::assistant_citation::build_assistant_citation(
+            "local",
+            &rt.state.current().id.to_string(),
+            "msg-jump",
+            passage,
+            0,
+            passage.len(),
+        )
+        .unwrap();
+        let record = crate::assistant_citation::citation_context_record(citation, "msg-jump", None);
+        let context_id = record.context_id.clone();
+        rt.state.current_mut().insert_context_chip(record);
+        rt.invalidate();
+        rt.frame(0.0);
+        // The chip body's pill press defers to the composer tick, which scrolls
+        // and marks the message (KSG's composerSourceLink).
+        let href = crate::composer_context::format_composer_context_href("response", &context_id);
+        rt.state.press_composer_pill(&href);
+        assert!(rt.state.composer_ui.pending_citation.is_some());
+        rt.frame(0.0);
+        assert!(rt.state.composer_ui.pending_citation.is_none());
+        assert_eq!(
+            rt.state
+                .citation_highlight
+                .as_ref()
+                .map(|h| h.message_id.as_str()),
+            Some("msg-jump")
+        );
+        // A citation in a thread this machine does not have jumps nowhere.
+        rt.state.citation_highlight = None;
+        let far = crate::assistant_citation::build_assistant_citation(
+            "local",
+            "99",
+            "msg-jump",
+            passage,
+            0,
+            passage.len(),
+        )
+        .unwrap();
+        let record = crate::assistant_citation::citation_context_record(far, "msg-jump", None);
+        let far_href =
+            crate::composer_context::format_composer_context_href("response", &record.context_id);
+        rt.state.current_mut().insert_context_chip(record);
+        rt.state.press_composer_pill(&far_href);
+        rt.frame(0.0);
+        assert!(rt.state.citation_highlight.is_none());
+    }
+
+    #[test]
     fn reply_set_replace_remove_persists_and_handles_accepted_and_failed_send() {
         let dir = std::env::temp_dir().join(format!(
             "shina-reply-persist-{}-{}",
