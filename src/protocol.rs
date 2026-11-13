@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 13;
+pub const MINOR: u32 = 14;
+pub const QUESTION_CONTRACT: &str = "question-contract-v1";
+pub const QUESTIONS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer these questions.";
 pub const APPROVAL_FEEDBACK: &str = "approval-feedback-v1";
 pub const APPROVAL_FEEDBACK_UPDATE_REQUIRED: &str = "Update required. Update Shina on the client and server to send approval feedback or redirect pending approvals.";
 pub const COMPOSER_REQUESTS: &str = "composer-requests-v1";

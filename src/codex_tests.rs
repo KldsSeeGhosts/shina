@@ -2,6 +2,47 @@ use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
 #[test]
+fn user_input_questions_use_ksg_native_defaults_not_unoffered_extensions() {
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.server_request(
+        "item/tool/requestUserInput",
+        &json!({"id":71,"params":{"questions":[
+            {"id":" ","header":"","question":" ","isSecret":true,"multiSelect":true,
+             "allowCustomAnswer":false,"initialAnswer":"not offered","options":[
+                 {"label":"  A  ","description":"  Explanation  ","value":"unoffered"}]}
+        ]}}),
+    );
+    let request = client.events.last().expect("native question");
+    assert_eq!(
+        request["questions"],
+        json!([{"id":"question-1","header":"Question",
+        "question":"Choose an answer.","options":[{"label":"A","description":"Explanation"}]}])
+    );
+    assert_eq!(request["responseCapability"]["type"], "live");
+}
+
+#[test]
+fn async_agent_message_questions_survive_turn_completion_as_message_requests() {
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.ready = true;
+    client.item(
+        &json!({"type":"agentMessage","id":"async-item","delivery":"async",
+        "text":"Question text","questions":[{"title":"Choose one.","options":["A","B"]}]}),
+        true,
+        true,
+    );
+    let request = client
+        .events
+        .iter()
+        .find(|r| r["method"] == "input")
+        .expect("async question");
+    assert_eq!(request["responseMode"], "message");
+    assert_eq!(request["responseCapability"]["type"], "message");
+    assert_eq!(request["questions"][0]["id"], "0");
+    assert_eq!(request["questions"][0]["question"], "Choose one.");
+}
+
+#[test]
 fn approval_decisions_keep_cancel_session_and_legacy_wire_meanings() {
     for (decision, expected) in [
         ("accept", json!("accept")),

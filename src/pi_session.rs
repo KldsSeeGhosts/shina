@@ -144,9 +144,9 @@ pub struct PiSession {
     pub projected_queued: bool,
     pub projected_approvals: Vec<Value>,
     pub questionnaire: Option<questionnaire::Questionnaire>,
+    pub(super) question_message_connect: bool,
     pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
-    questionnaire_replies: Vec<(String, String, String)>,
     questionnaire_advance: Option<Instant>,
     pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
@@ -190,7 +190,7 @@ pub struct PiSession {
     dialog_deadline: Option<Instant>,
     dialogs: VecDeque<(Value, Option<Instant>)>,
     session_approvals: HashSet<String>,
-    dialog_status: Option<Status>,
+    pub(super) dialog_status: Option<Status>,
     session_name: Option<String>,
     probe: Option<String>,
     request_id: Option<String>,
@@ -712,7 +712,15 @@ impl Thread {
         self.native.questionnaire_advance = None;
         self.native.questionnaire = None;
         self.native.dialog_deadline = None;
-        self.status = self.native.dialog_status.take().unwrap_or(Status::Running);
+        self.status =
+            self.native
+                .dialog_status
+                .take()
+                .unwrap_or(if self.status == Status::Waiting {
+                    Status::Running
+                } else {
+                    self.status
+                });
         while let Some((request, deadline)) = self.native.dialogs.pop_front() {
             if deadline.is_some_and(|d| d <= Instant::now()) {
                 continue;
@@ -721,6 +729,9 @@ impl Thread {
             self.native.dialog_deadline = deadline;
             self.reply.replace_text(string(&request, "prefill"));
             self.prepare_questionnaire(&request);
+            if let Some(form) = &self.native.questionnaire {
+                self.reply.replace_text(&form.answers[form.index].other);
+            }
             self.request = Some(request);
             self.status = Status::Waiting;
             break;
@@ -820,12 +831,13 @@ impl Thread {
             self.native.questionnaire = None;
             return;
         }
-        self.native.questionnaire = questionnaire::Questionnaire::parse(request).or_else(|| {
-            self.native
-                .questionnaires
-                .iter()
-                .find_map(|(id, params)| questionnaire::Questionnaire::rpiv(request, id, params))
-        });
+        self.native.questionnaire = questionnaire::Questionnaire::parse(request)
+            .or_else(|| {
+                self.native.questionnaires.iter().find_map(|(id, params)| {
+                    questionnaire::Questionnaire::rpiv(request, id, params)
+                })
+            })
+            .or_else(|| questionnaire::Questionnaire::pi(request));
         // A previously focused, hidden composer must not receive questionnaire shortcuts.
         if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
             self.draft.focused = false;
@@ -844,6 +856,9 @@ impl Thread {
     }
     pub(super) fn apply_projected_form(&mut self, value: Value) -> Result<(), String> {
         self.native.questionnaire = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if let Some(form) = &self.native.questionnaire {
+            self.reply.replace_text(&form.answers[form.index].other);
+        }
         Ok(())
     }
     pub(super) fn respond_projected_form(&mut self, answers: Value) -> Result<(), String> {
@@ -858,16 +873,21 @@ impl Thread {
             return Err("Invalid questionnaire answers.".into());
         }
         for (answer, question) in answers.iter().zip(&form.questions) {
-            if answer.other.len() > 32_768
-                || answer
-                    .selected
-                    .iter()
-                    .any(|value| !question.options.iter().any(|option| option.value == *value))
+            if answer
+                .selected
+                .iter()
+                .any(|value| !question.options.iter().any(|option| option.value == *value))
             {
                 return Err("Invalid questionnaire option.".into());
             }
         }
         form.answers = answers;
+        if !form.can_respond() {
+            return Err("This request is not resumable.".into());
+        }
+        if !form.complete() {
+            return Err("Answer each question before sending.".into());
+        }
         form.index = form.questions.len() - 1;
         self.reply.replace_text(&form.answers[form.index].other);
         self.questionnaire_step(false);
@@ -875,8 +895,12 @@ impl Thread {
     }
 
     pub fn questionnaire_toggle(&mut self, index: usize) {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+            return;
+        }
         if let Some(form) = &mut self.native.questionnaire {
-            form.answers[form.index].other = self.reply.text.clone();
+            form.edit(self.reply.text.clone());
             if form.toggle(index) {
                 self.reply.replace_text("");
                 if !form.questions[form.index].multi {
@@ -892,23 +916,125 @@ impl Thread {
         &mut self.reply
     }
 
+    pub fn questionnaire_changed(&mut self) {
+        self.native.questionnaire_advance = None;
+        if let Some(form) = &mut self.native.questionnaire {
+            form.edit(self.reply.text.clone());
+        }
+    }
+
+    pub fn questionnaire_can_respond(&self) -> bool {
+        self.responding_request.is_none()
+            && self.question_contract_supported
+            && self
+                .request
+                .as_ref()
+                .is_some_and(crate::approval::can_respond)
+            && self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.can_respond())
+    }
+
+    /// KSG Orchestrator.dispatchRuntimeRequestRespond's message response mode.
+    pub(super) fn respond_message_question(&mut self, response: &Value) -> bool {
+        if !self.native.questionnaire.as_ref().is_some_and(|form| {
+            form.capability == "message" || form.response_mode.as_deref() == Some("message")
+        }) {
+            return false;
+        }
+        if response["cancelled"] == true {
+            self.request = None;
+            self.native_dialog_done();
+            return true;
+        }
+        let answers: Value = response["value"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let mut replies = Vec::new();
+        for question in &self.native.questionnaire.as_ref().unwrap().questions {
+            let answer = &answers[&question.id];
+            let text = answer.as_str().map(str::to_owned).or_else(|| {
+                let values = answer.as_array()?;
+                if values.is_empty() || !values.iter().all(Value::is_string) {
+                    return None;
+                }
+                Some(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            });
+            let Some(text) = text.filter(|s| !s.trim().is_empty()) else {
+                if !question.required {
+                    continue;
+                }
+                self.error = Some("Answer each question before sending.".into());
+                return true;
+            };
+            replies.push(format!("{}\n{}", question.text, text.trim()));
+        }
+        if replies.is_empty() {
+            self.error = Some("Enter an answer before sending.".into());
+            return true;
+        }
+        self.request = None;
+        self.native_dialog_done();
+        let draft = std::mem::replace(&mut self.draft, TextEdit::new(replies.join("\n\n")));
+        let images = std::mem::take(&mut self.draft_images);
+        let context = std::mem::take(&mut self.draft_context);
+        let retained = std::mem::take(&mut self.retained_context);
+        let follow_up = self.native.follow_up;
+        self.native.follow_up = false;
+        if self.status.busy() {
+            self.send_during_run_with_peers(None, &[], &str::to_owned);
+        } else {
+            self.send_with_peers(None, &[], &str::to_owned);
+        }
+        self.draft = draft;
+        self.draft_images = images;
+        self.draft_context = context;
+        self.retained_context = retained;
+        self.native.follow_up = follow_up;
+        self.native.question_message_connect = self.pi.is_none() && self.queued_prompt.is_some();
+        true
+    }
+
+    pub(super) fn expire_live_question(&mut self, reason: &str) {
+        if let Some(form) = &mut self.native.questionnaire
+            && form.capability != "message"
+        {
+            form.capability = "not_resumable".into();
+            if let Some(request) = &mut self.request {
+                request["responseCapability"] = json!({"type":"not_resumable","reason":reason});
+            }
+            self.native.questionnaire_advance = None;
+        }
+    }
+
+    pub(super) fn cancel_questionnaire_advance(&mut self) {
+        self.native.questionnaire_advance = None;
+    }
+
     pub fn questionnaire_step(&mut self, previous: bool) {
         self.native.questionnaire_advance = None;
+        if !self.questionnaire_can_respond() {
+            return;
+        }
         let Some(form) = &mut self.native.questionnaire else {
             return;
         };
-        form.answers[form.index].other = self.reply.text.clone();
+        form.edit(self.reply.text.clone());
         if previous {
             form.index = form.index.saturating_sub(1);
         } else if form.answer(form.index).is_some() {
             if form.index + 1 == form.questions.len() {
                 if let Some(response) = form.response() {
-                    let replies = form.remaining_rpc();
-                    let request = self.request.as_ref().map(|r| r["id"].clone());
                     self.respond(response);
-                    if self.request.as_ref().map(|r| r["id"].clone()) != request {
-                        self.native.questionnaire_replies.extend(replies);
-                    }
                 }
                 return;
             }
@@ -919,7 +1045,6 @@ impl Thread {
     }
 
     pub(super) fn cancel_questionnaire(&mut self) {
-        self.native.questionnaire_replies.clear();
         self.native.questionnaire_advance = None;
     }
 
@@ -1070,10 +1195,9 @@ impl Thread {
                 string(&command, "arguments")
             ));
         }
-        self.native.questionnaire = None;
+        self.expire_live_question("The provider session disconnected.");
         self.native.questionnaire_advance = None;
         self.native.questionnaires.clear();
-        self.native.questionnaire_replies.clear();
         self.native.notifications.clear();
         if !self.native.queue_held {
             self.return_local_queue();
@@ -1113,6 +1237,14 @@ impl Thread {
     }
 
     pub(super) fn native_tick(&mut self, now: Instant) -> bool {
+        if !self.questionnaire_can_respond() {
+            self.native.questionnaire_advance = None;
+        }
+        if let Some(form) = &mut self.native.questionnaire
+            && form.answers[form.index].other != self.reply.text
+        {
+            form.edit(self.reply.text.clone());
+        }
         let before = self.native.notifications.len();
         self.native
             .notifications
@@ -1171,9 +1303,6 @@ impl Thread {
             "tool_execution_end" => {
                 if let Some(id) = record["toolCallId"].as_str() {
                     self.native.questionnaires.remove(id);
-                    self.native
-                        .questionnaire_replies
-                        .retain(|(tool, _, _)| tool != id);
                 }
             }
             "extension_ui_request" if record["method"] == "notify" => {
@@ -1628,29 +1757,6 @@ impl Thread {
                     "confirm" | "select" | "input" | "editor"
                 ) =>
             {
-                let signature = questionnaire::signature(record);
-                if let Some(at) =
-                    self.native
-                        .questionnaire_replies
-                        .iter()
-                        .position(|(tool, key, _)| {
-                            self.native.questionnaires.len() == 1
-                                && *key == signature
-                                && self.native.questionnaires.contains_key(tool)
-                                && record["timeout"].as_i64().is_none_or(|n| n >= 0)
-                        })
-                {
-                    let (_, _, value) = self.native.questionnaire_replies.remove(at);
-                    if let Some(pi) = &self.pi {
-                        if let Err(error) = pi.send(
-                            json!({"type":"extension_ui_response","id":record["id"],"value":value}),
-                        ) {
-                            self.error = Some(error);
-                        } else {
-                            return true;
-                        }
-                    }
-                }
                 if record["method"] == "confirm"
                     && self
                         .native

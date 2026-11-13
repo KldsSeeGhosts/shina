@@ -9,7 +9,12 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
     let form = t.native.questionnaire.as_ref().expect("questionnaire");
     let question = &form.questions[form.index];
     let answer = &form.answers[form.index];
-    let custom = !t.reply.text.trim().is_empty();
+    let disabled = !t.questionnaire_can_respond()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_CONTRACT)
+        });
+    let custom = question.allow_custom && !t.reply.text.trim().is_empty();
     let mut options = col().gap(2.0).w_full();
     for (i, option) in question.options.iter().enumerate() {
         let selected = !custom && answer.selected.contains(&option.value);
@@ -65,8 +70,13 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 .wrap_anywhere(),
                         )
                         .child(
-                            label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
-                                .wrap_anywhere(),
+                            if !option.description.is_empty() && option.description != option.label
+                            {
+                                label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
+                                    .wrap_anywhere()
+                            } else {
+                                el()
+                            },
                         ),
                 )
                 .child(el().w(28.0).center().child(if i < 9 {
@@ -74,10 +84,13 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 } else {
                     el()
                 }))
+                .disabled(disabled)
                 .on_press(move |s: &mut State| s.current_mut().questionnaire_toggle(i)),
         );
     }
-    let can_advance = custom || !answer.selected.is_empty();
+    let mut live_form = form.clone();
+    live_form.edit(t.reply.text.clone());
+    let can_advance = live_form.answer(form.index).is_some();
     let last = form.index + 1 == form.questions.len();
     col()
         .key("pi-dialog")
@@ -117,10 +130,22 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .scroll(ScrollSpec {
                             stick_bottom: false,
                         })
-                        .child(label(&question.text, BODY, p.ink).wrap_anywhere())
+                        .child(
+                            markdown_ui::render_with_find(
+                                &question.text,
+                                p,
+                                s.dark,
+                                false,
+                                false,
+                                false,
+                                &format!("question-{}-{}", t.id, question.id),
+                                None,
+                            )
+                            .key("questionnaire-markdown"),
+                        )
                         .child(options),
                 )
-                .child(
+                .child(if question.allow_custom {
                     text_input(&t.reply, BODY)
                         .key("dialog-reply")
                         .label("Other answer")
@@ -134,9 +159,13 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .radius(6.0)
                         .fill(p.card)
                         .field_focus(&t.reply, p)
+                        .disabled(disabled)
                         .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
-                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false)),
-                )
+                        .on_input_change(|s: &mut State, _| s.current_mut().questionnaire_changed())
+                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false))
+                } else {
+                    el()
+                })
                 .child(
                     row()
                         .gap(6.0)
@@ -145,7 +174,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                             button("questionnaire-previous", "Previous", p, |s| {
                                 s.current_mut().questionnaire_step(true)
                             })
-                            .disabled(form.index == 0),
+                            .disabled(disabled || form.index == 0),
                         )
                         .child(
                             button(
@@ -158,11 +187,14 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 p,
                                 |s| s.current_mut().questionnaire_step(false),
                             )
-                            .disabled(!can_advance),
+                            .disabled(disabled || !can_advance || last && !live_form.complete()),
                         )
-                        .child(secondary_button("dialog-cancel", "Cancel", p, |s| {
-                            s.current_mut().respond(json!({"cancelled":true}))
-                        }))
+                        .child(
+                            secondary_button("dialog-cancel", "Cancel", p, |s| {
+                                s.current_mut().respond(json!({"cancelled":true}))
+                            })
+                            .disabled(disabled),
+                        )
                         .child(if t.status.busy() || t.stop_control.phase().is_some() {
                             icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
                                 s.current_mut().stop();
@@ -180,7 +212,13 @@ pub(crate) fn questionnaire_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         || event.mods.cmd
         || event.mods.alt
         || s.current().reply.focused
+        || s.current().draft.focused
         || s.search.focused
+        || !s.current().questionnaire_can_respond()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_CONTRACT)
+        })
     {
         return false;
     }

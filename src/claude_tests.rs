@@ -4,6 +4,30 @@ use crate::model::{AccessMode, Status, Thread};
 const SESSION: &str = "40000000-0000-4000-8000-000000000031";
 
 #[test]
+fn ask_user_question_mapping_trims_discards_blank_rows_and_uses_question_text_ids() {
+    let mut client = client("full-access");
+    client
+        .server_request(
+            &json!({"request_id":"questions","request":{"subtype":"can_use_tool",
+            "tool_name":"AskUserQuestion","tool_use_id":"tool","input":{"questions":[
+                {"question":"   ","options":[]},
+                {"id":"ignore-native-id","question":"  Where?  ","header":" ","multiSelect":true,
+                 "allowCustomAnswer":false,"initialAnswer":"ignore","options":[
+                     {"label":" "},{"label":" Disk ","description":" ","preview":"Preview"}]}
+            ]}}}),
+        )
+        .unwrap();
+    let request = client.events.last().unwrap();
+    assert_eq!(
+        request["questions"],
+        json!([{"id":"Where?","header":"Question 2",
+        "question":"Where?","multiSelect":true,"options":[
+            {"label":"Disk","description":"Disk","preview":"Preview"}]}])
+    );
+    assert_eq!(request["responseCapability"]["type"], "live");
+}
+
+#[test]
 fn approval_cancel_interrupts_decline_does_not_and_session_uses_session_rules() {
     for decision in ["accept", "acceptForSession", "decline", "cancel"] {
         let mut client = client("approval-required");

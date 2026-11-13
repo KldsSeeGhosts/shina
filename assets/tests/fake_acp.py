@@ -89,6 +89,13 @@ for line in sys.stdin:
         if text == "hold":
             pending = req_id
             update("agent_message_chunk", content={"type": "text", "text": "Waiting"})
+        elif text == "choice-only":
+            permission_prompt = req_id
+            send({"id": 71, "method": "session/request_permission", "params": {
+                "sessionId": session, "toolCall": {"toolCallId": "interaction_fixture",
+                    "title": "Choose **one** option.", "kind": "read"},
+                "options": [{"kind": "allow_once", "optionId": "choice-1", "name": "First"},
+                            {"kind": "reject_once", "optionId": "choice-2", "name": "Second"}]}})
         elif text == "permission":
             permission_prompt = req_id
             update("agent_thought_chunk", content={"type": "text", "text": "Checking"})

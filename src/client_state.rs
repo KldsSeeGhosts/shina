@@ -130,6 +130,8 @@ struct ThreadView {
     pending_approvals: Vec<Value>,
     #[serde(default)]
     requests_supported: bool,
+    #[serde(default)]
+    question_contract_supported: bool,
     questionnaire: Value,
     elapsed: Option<u64>,
     #[serde(default)]
@@ -248,6 +250,7 @@ impl ThreadView {
                 })
                 .collect(),
             requests_supported: true,
+            question_contract_supported: true,
             questionnaire: thread.projected_form(),
             elapsed: thread.elapsed,
             started_at: thread.started.map(stable_timestamp),
@@ -425,6 +428,7 @@ impl ThreadView {
         thread.native.projected_approvals = self.pending_approvals;
         thread.refresh_typing_guard();
         thread.requests_supported = self.requests_supported;
+        thread.question_contract_supported = self.question_contract_supported;
         if changed_request {
             thread.native.approval_more = false;
             thread.reply.replace_text(
@@ -726,7 +730,7 @@ impl State {
                 }
                 thread.native.steering.clear();
                 thread.native.follow_ups.clear();
-                thread.native.questionnaire = None;
+                thread.expire_live_question("The provider session ended when Shina restarted.");
                 if thread.status.busy() || thread.configuring || thread.request.is_some() {
                     thread.resumable_run_id = thread.run_id.clone();
                     thread.native.queue_held = true;
@@ -737,7 +741,9 @@ impl State {
                         }
                     }
                     thread.configuring = false;
-                    thread.request = None;
+                    if thread.native.questionnaire.is_none() {
+                        thread.request = None;
+                    }
                     thread.started = None;
                     thread.phase.clear();
                     thread.error = Some("Shina restarted during this run. Check partial work before retrying. No prompt was replayed.".into());
@@ -1926,6 +1932,9 @@ impl State {
             self.machines.scope_remote.clone(),
         );
         self.checkpoint_client();
+        for thread in &mut self.threads {
+            thread.cancel_questionnaire_advance();
+        }
         self.machines.threads.insert(
             self.machines.selected.clone(),
             std::mem::take(&mut self.threads),

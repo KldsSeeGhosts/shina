@@ -14008,6 +14008,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn choice_only_questions_and_markdown_fit_at_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"choice","method":"input",
+                "responseCapability":{"type":"live"},"questions":[{"id":"one","header":"Choice",
+                    "question":"Choose **one** option.\n\nUse `exact` values.","allowCustomAnswer":false,
+                    "options":[{"label":"A","description":"A","value":""},{"label":"B","value":" B "}]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-reply").is_none(), "{width}");
+            for key in [
+                "questionnaire-drawer",
+                "questionnaire-markdown",
+                "dialog-option-0",
+                "dialog-option-1",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-option-0");
+            assert!(
+                rt.state
+                    .current()
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .unwrap()
+                    .answers[0]
+                    .selected
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_file_and_folder_chips_fit_at_all_widths() {
         let path = crate::store::directory()
             .unwrap()

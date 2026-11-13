@@ -590,6 +590,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut deferred_work = false;
     let mut composer_requests = false;
     let mut approval_feedback = false;
+    let mut question_contract = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -673,6 +674,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if composer_requests { capabilities.push(protocol::COMPOSER_REQUESTS); }
                         approval_feedback = minor >= 13;
                         if approval_feedback { capabilities.push(protocol::APPROVAL_FEEDBACK); }
+                        question_contract = minor >= 14;
+                        if question_contract { capabilities.push(protocol::QUESTION_CONTRACT); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -830,6 +833,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     };
                     if command.params["requestContract"] == true && !composer_requests {
                         if !send(&mut socket, protocol::response(id, Err(protocol::REQUESTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if command.params["questionContract"] == true
+                        && !question_contract {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTIONS_UPDATE_REQUIRED.into()))).await { break; }
                         continue;
                     }
                     if method == "request.respond" && command.params["response"].get("feedback").is_some()

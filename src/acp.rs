@@ -97,6 +97,7 @@ struct Permission {
     session: Option<String>,
     reject: Option<String>,
     offered: Option<Vec<crate::approval::OptionItem>>,
+    question: Option<Value>,
 }
 
 /// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
@@ -542,6 +543,39 @@ impl Client {
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
             if let Some(permission) = self.permissions.remove(key) {
+                if let Some(question) = &permission.question {
+                    let supplied: Value = record["value"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(Value::Null);
+                    let answer = &supplied[question["id"].as_str().unwrap_or("")];
+                    let answer = answer.as_str().or_else(|| {
+                        answer
+                            .as_array()
+                            .filter(|a| a.len() == 1)?
+                            .first()?
+                            .as_str()
+                    });
+                    let options = question["options"].as_array().expect("validated");
+                    let option = if record["cancelled"] == true {
+                        None
+                    } else {
+                        answer.and_then(|answer| {
+                            options
+                                .iter()
+                                .find(|o| o["value"] == answer)
+                                .or_else(|| {
+                                    let matching: Vec<_> =
+                                        options.iter().filter(|o| o["label"] == answer).collect();
+                                    (matching.len() == 1).then(|| matching[0])
+                                })
+                                .and_then(|o| o["value"].as_str())
+                                .map(str::to_owned)
+                        })
+                    };
+                    self.wire.push(permission_response(permission.id, option));
+                    return Ok(());
+                }
                 let decision = crate::approval::decision(&record)?;
                 let decision = if decision == "acceptForSession"
                     && permission
@@ -849,6 +883,16 @@ impl Client {
         let options = params["options"]
             .as_array()
             .ok_or("ACP permission request has no options.")?;
+        let interaction = self.start.id.contains("antigravity")
+            && params["toolCall"]["toolCallId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("interaction_"));
+        let question = interaction.then(|| antigravity_question(params)).flatten();
+        if interaction && question.is_none() {
+            self.wire
+                .push(permission_response(record["id"].clone(), None));
+            return Ok(());
+        }
         let option = |kinds: &[&str]| -> Option<String> {
             kinds.iter().find_map(|kind| {
                 options
@@ -864,6 +908,7 @@ impl Client {
             session: option(&["allow_always"]),
             reject: option(&["reject_once"]),
             offered: acp_approval_options(&self.start.id, params),
+            question,
         };
         let tool = &params["toolCall"];
         let access = self
@@ -876,7 +921,7 @@ impl Client {
             || matches!(tool["kind"].as_str(), Some("read" | "search"))
             || access == "auto-accept-edits" && tool["kind"] == "edit")
             && (!self.start.id.contains("kiro") || permission.allow.is_some());
-        if auto || self.cancelling {
+        if auto && !interaction || self.cancelling {
             self.wire.push(permission_response(
                 permission.id,
                 if self.cancelling {
@@ -894,6 +939,10 @@ impl Client {
                 "title":params["title"].as_str().or_else(||tool["title"].as_str()).unwrap_or("Allow ACP tool?"),
                 "message":format!("{}\n{}",params["description"].as_str().unwrap_or(""),tool["rawInput"]),
             });
+            if let Some(question) = &permission.question {
+                event = json!({"type":"extension_ui_request","id":key,"method":"input",
+                    "title":"Question","questions":[question],"responseCapability":{"type":"live"}});
+            }
             if let Some(options) = &permission.offered {
                 event["approvalOptions"] = json!(options);
             }
@@ -1195,6 +1244,44 @@ fn acp_approval_options(
     } else {
         None
     }
+}
+
+/// KSG AntigravityProtocol.extractAntigravityUserInputQuestion.
+fn antigravity_question(params: &Value) -> Option<Value> {
+    fn bounded(text: &str, limit: usize) -> String {
+        if text.encode_utf16().count() <= limit {
+            return text.to_owned();
+        }
+        format!(
+            "{}...",
+            String::from_utf16_lossy(&text.encode_utf16().take(limit - 3).collect::<Vec<_>>())
+        )
+    }
+    let options = params["options"].as_array().filter(|a| !a.is_empty())?;
+    let mut seen = std::collections::HashSet::new();
+    let options = options
+        .iter()
+        .map(|o| {
+            let id = o["optionId"].as_str().filter(|id| !id.trim().is_empty())?;
+            if !seen.insert(id) {
+                return None;
+            }
+            let label = bounded(
+                o["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id),
+                512,
+            );
+            Some(json!({"value":id,"label":label,"description":label}))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        json!({"id":params["toolCall"]["toolCallId"],"header":"Question",
+        "question":bounded(params["toolCall"]["title"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Choose an option."),8_000),
+        "multiSelect":false,"allowCustomAnswer":false,"options":options}),
+    )
 }
 
 fn permission_response(id: Value, option: Option<String>) -> Value {

@@ -810,6 +810,14 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.params["questionContract"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_CONTRACT))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTIONS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if command.method == "request.respond" && command.params["response"].get("feedback").is_some()
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::APPROVAL_FEEDBACK))

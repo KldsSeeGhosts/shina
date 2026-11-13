@@ -1,4 +1,36 @@
 use super::*;
+
+#[test]
+fn antigravity_interactions_are_choice_only_questions_even_under_full_access() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.start.id = "antigravity".into();
+    client.start.link.as_mut().unwrap().access_mode = "full-access".into();
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client
+        .permission(&json!({"id":71,"params":{"sessionId":"fixture-session",
+        "toolCall":{"toolCallId":"interaction_fixture","title":"  Choose **one**. ","kind":"read"},
+        "options":[{"kind":"allow_once","optionId":" exact ","name":" First "},
+            {"kind":"reject_once","optionId":"second","name":"Second"}]}}))
+        .unwrap();
+    let request = client
+        .events
+        .last()
+        .expect("question instead of automatic approval")
+        .clone();
+    assert_eq!(request["method"], "input");
+    assert_eq!(request["questions"][0]["allowCustomAnswer"], false);
+    assert_eq!(request["questions"][0]["options"][0]["value"], " exact ");
+    assert_eq!(request["questions"][0]["question"], "Choose **one**.");
+    client
+        .command(json!({"type":"extension_ui_response","id":request["id"],
+        "value":json!({"interaction_fixture":" exact "}).to_string()}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+        " exact "
+    );
+}
 use crate::model::{Status, Thread};
 use std::sync::Arc;
 

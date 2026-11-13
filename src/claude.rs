@@ -173,6 +173,30 @@ struct Approval {
     suggestions: Vec<Value>,
 }
 
+/// KSG ClaudeAdapterV2.claudeUserInputQuestions.
+fn claude_questions(input: &Value) -> Vec<Value> {
+    let input = if input["type"] == "record" {
+        &input["value"]
+    } else {
+        input
+    };
+    input["questions"].as_array().into_iter().flatten().enumerate().filter_map(|(index,q)| {
+        let question = q["question"].as_str()?.trim();
+        if question.is_empty() { return None; }
+        let header = q["header"].as_str().map(str::trim).filter(|s| !s.is_empty())
+            .map(str::to_owned).unwrap_or_else(|| format!("Question {}",index+1));
+        let options: Vec<_> = q["options"].as_array().into_iter().flatten().filter_map(|o| {
+            let label = o["label"].as_str()?.trim();
+            if label.is_empty() { return None; }
+            let description = o["description"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(label);
+            let mut option = json!({"label":label,"description":description});
+            if let Some(preview) = o["preview"].as_str() { option["preview"] = json!(preview); }
+            Some(option)
+        }).collect();
+        Some(json!({"id":question,"header":header,"question":question,"options":options,"multiSelect":q["multiSelect"]==true}))
+    }).collect()
+}
+
 struct Client {
     start: Start,
     config: PathBuf,
@@ -964,20 +988,13 @@ impl Client {
                 self.approvals.insert(id.into(), approval);
             }
         } else if name == "AskUserQuestion" {
-            let mut questions = input["questions"].as_array().cloned().unwrap_or_default();
-            if questions.is_empty() || questions.len() > 32 {
+            let questions = claude_questions(&input);
+            if questions.is_empty() {
                 self.answer(approval, false, None);
             } else {
-                for q in &mut questions {
-                    // Claude keys its answers by question text, not header or array index.
-                    q["id"] = q["question"].clone();
-                    if !q["options"].is_array() {
-                        q["options"] = json!([]);
-                    }
-                }
                 self.events.push(
                     json!({"type":"extension_ui_request","id":id,"method":"input",
-                    "title":"Claude needs your input","questions":questions}),
+                    "title":"Claude needs your input","questions":questions,"responseCapability":{"type":"live"}}),
                 );
                 self.approvals.insert(id.into(), approval);
             }
@@ -1124,8 +1141,8 @@ impl Client {
                         .unwrap_or(Value::Null);
                     let mut input = approval.input.clone();
                     let mut answers = serde_json::Map::new();
-                    for q in input["questions"].as_array().into_iter().flatten() {
-                        if let Some(key) = q["question"].as_str()
+                    for q in claude_questions(&input) {
+                        if let Some(key) = q["id"].as_str()
                             && let Some(value) = supplied.get(key)
                         {
                             let value = value.as_str().map(str::to_owned).unwrap_or_else(|| {

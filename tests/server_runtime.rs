@@ -73,6 +73,87 @@ fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
 }
 
 #[test]
+fn choice_only_questions_use_native_option_ids_and_refuse_an_older_peer() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("Shina/harnesses.json"), json!([{
+        "id":"antigravity-fixture","name":"Antigravity fixture",
+        "command":if cfg!(windows) {"python"} else {"python3"},
+        "args":["-u",profile.root.join("fake_acp.py"),"--log",profile.root.join("choice-log.jsonl")]
+    }]).to_string()).unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("questions-hello"),
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"antigravity-fixture"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"choice-only","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "input");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(request["questions"][0]["allowCustomAnswer"], false);
+    assert_eq!(request["questions"][0]["options"][1]["value"], "choice-2");
+    let answer = json!({"threadId":1,"requestId":request["id"],"generation":request["runtimeGeneration"],
+        "requestContract":true,"questionContract":true,
+        "answers":[{"selected":["choice-2"],"other":"Ignore this unoffered custom answer."}],
+        "response":{"value":"{}"}});
+    let old = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":13,"projectionSchema":1}),
+        json!("old-questions"),
+    );
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::QUESTION_CONTRACT)
+    );
+    assert_eq!(
+        client.command("request.respond", answer.clone(), uuid::Uuid::new_v4())["error"]["message"],
+        protocol::QUESTIONS_UPDATE_REQUIRED
+    );
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("new-questions"),
+    );
+    assert_eq!(
+        client.command("request.respond", answer, uuid::Uuid::new_v4())["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let records: Vec<Value> = fs::read_to_string(profile.root.join("choice-log.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let response = records
+        .iter()
+        .find(|r| r["id"] == 71 && r["result"].is_object())
+        .unwrap();
+    assert_eq!(
+        response["result"]["outcome"],
+        json!({"outcome":"selected","optionId":"choice-2"})
+    );
+    profile.stop();
+}
+
+#[test]
 fn approval_feedback_and_decline_redirect_use_native_decisions_and_refuse_an_older_peer() {
     let mut profile = Profile::new();
     fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();

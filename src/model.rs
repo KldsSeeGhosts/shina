@@ -104,6 +104,9 @@ mod approval_send;
 #[cfg(test)]
 #[path = "approval_send_tests.rs"]
 mod approval_send_tests;
+#[cfg(test)]
+#[path = "question_flow_tests.rs"]
+mod question_flow_tests;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -545,6 +548,7 @@ pub struct Thread {
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
     pub(crate) requests_supported: bool,
+    pub(crate) question_contract_supported: bool,
     pub(crate) responding_request: Option<uuid::Uuid>,
     approval_send: Option<approval_send::ApprovalSend>,
     pub reply: TextEdit,
@@ -870,6 +874,7 @@ impl Thread {
             diagnostics: vec![],
             request: None,
             requests_supported: true,
+            question_contract_supported: true,
             responding_request: None,
             approval_send: None,
             reply: TextEdit::default(),
@@ -1396,6 +1401,19 @@ impl Thread {
         if self.responding_request.is_some() {
             return;
         }
+        if self.native.questionnaire.is_some() && !self.question_contract_supported {
+            self.error = Some(crate::protocol::QUESTIONS_UPDATE_REQUIRED.into());
+            return;
+        }
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| !form.can_respond())
+        {
+            self.error = Some("This request is not resumable.".into());
+            return;
+        }
         if let Some(request) = &self.request {
             if !crate::approval::can_respond(request) {
                 self.error = Some("This request is not resumable.".into());
@@ -1426,7 +1444,8 @@ impl Thread {
             }
             let request = self.request.clone().unwrap_or(Value::Null);
             let params = json!({"threadId":self.id,"requestId":request["id"],"generation":request["runtimeGeneration"],
-                "requestContract":true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response});
+                "requestContract":true,"questionContract":self.native.questionnaire.is_some(),
+                "answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response});
             match self
                 .remote
                 .as_ref()
@@ -1436,6 +1455,9 @@ impl Thread {
                 Ok(id) => self.responding_request = Some(id),
                 Err(error) => self.error = Some(error),
             }
+            return;
+        }
+        if self.respond_message_question(&response) {
             return;
         }
         if response["cancelled"] == true {
@@ -1503,7 +1525,9 @@ impl Thread {
         self.pi = None;
         self.status = Status::Ready;
         self.assistant = None;
-        self.request = None;
+        if self.native.questionnaire.is_none() {
+            self.request = None;
+        }
         self.forwarded_question = None;
         self.initializing = false;
         self.session_started = None;
@@ -2498,7 +2522,10 @@ impl Thread {
                     self.operation_deadline = None;
                 }
                 self.life.last_completed_at = Some(lifecycle::now());
-                self.request = None;
+                self.expire_live_question("The provider turn ended.");
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 let aborted = record["aborted"] == true;
                 if aborted {
                     self.mark_stopped();
@@ -2506,6 +2533,14 @@ impl Thread {
                     self.resumable_run_id = None;
                 }
                 self.finish_run();
+                if self
+                    .native
+                    .questionnaire
+                    .as_ref()
+                    .is_some_and(|form| form.capability == "message")
+                {
+                    self.native.dialog_status = Some(self.status);
+                }
                 // A stopped run is idle, not a finished task.
                 if aborted && self.status == Status::Completed {
                     self.status = Status::Ready;
@@ -2522,7 +2557,9 @@ impl Thread {
             }
             "message_start" if record["message"]["role"] == "assistant" => {
                 self.assistant = None;
-                self.request = None;
+                if self.native.questionnaire.is_none() {
+                    self.request = None;
+                }
                 self.status = Status::Running;
                 self.assistant();
             }
@@ -2655,7 +2692,13 @@ impl Thread {
                     string(&record, "method"),
                     "confirm" | "select" | "input" | "editor"
                 ) {
-                    self.reply.replace_text(string(&record, "prefill"));
+                    self.reply.replace_text(
+                        self.native
+                            .questionnaire
+                            .as_ref()
+                            .map(|form| form.answers[form.index].other.as_str())
+                            .unwrap_or_else(|| string(&record, "prefill")),
+                    );
                     self.request = Some(record);
                     self.refresh_typing_guard();
                     self.status = Status::Waiting;
@@ -3422,6 +3465,7 @@ impl State {
         let previous = self.active;
         if previous != index && previous < self.threads.len() {
             self.threads[previous].draft.focused = false;
+            self.threads[previous].cancel_questionnaire_advance();
         }
         self.active = index;
         if visit && !self.demo {
@@ -9503,6 +9547,14 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
+    if state.runtime_enabled && state.client.is_none() {
+        for index in 0..state.threads.len() {
+            if std::mem::take(&mut state.threads[index].native.question_message_connect) {
+                state.connect_thread(index);
+                changed = true;
+            }
+        }
+    }
     if state.runtime_enabled
         && !state.demo
         && let Ok(server) = crate::mcp::server(state.wake.clone())

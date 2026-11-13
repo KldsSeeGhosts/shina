@@ -148,6 +148,27 @@ struct Approval {
     params: Value,
 }
 
+/// KSG CodexAdapterV2.buildUserInputRequestArtifacts.
+fn codex_questions(questions: &[Value]) -> Vec<Value> {
+    fn nonempty(value: &Value, fallback: &str) -> String {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+            .to_owned()
+    }
+    questions.iter().enumerate().map(|(index,q)| json!({
+        "id":nonempty(&q["id"],&format!("question-{}",index+1)),
+        "header":nonempty(&q["header"],"Question"),
+        "question":nonempty(&q["question"],"Choose an answer."),
+        "options":q["options"].as_array().into_iter().flatten().enumerate().map(|(index,o)| json!({
+            "label":nonempty(&o["label"],&format!("Option {}",index+1)),
+            "description":nonempty(&o["description"],o["label"].as_str().unwrap_or(""))
+        })).collect::<Vec<_>>()
+    })).collect()
+}
+
 struct Client {
     start: Start,
     session: Option<String>,
@@ -1287,24 +1308,13 @@ impl Client {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            if questions.is_empty()
-                || questions.len() > 32
-                || questions.iter().any(|q| q["isSecret"] == true)
-            {
+            if questions.is_empty() {
                 self.wire
                     .push(json!({"id":record["id"],"error":{"code":-32602,
                     "message":"Shina supports up to 32 non-secret questions."}}));
                 return;
             }
-            let questions: Vec<_> = questions
-                .into_iter()
-                .map(|mut q| {
-                    if !q["options"].is_array() {
-                        q["options"] = json!([]);
-                    }
-                    q
-                })
-                .collect();
+            let questions = codex_questions(&questions);
             if self.cancelling || self.approvals.len() >= 32 {
                 self.wire
                     .push(json!({"id":record["id"],"result":{"answers":{}}}));
@@ -1321,7 +1331,7 @@ impl Client {
                 );
                 self.events.push(
                     json!({"type":"extension_ui_request","id":key,"method":"input",
-                    "title":"Codex needs your input","questions":questions}),
+                    "title":"Codex needs your input","questions":questions,"responseCapability":{"type":"live"}}),
                 );
             }
             return;
@@ -1731,6 +1741,22 @@ impl Client {
                 }
             }
             "agentMessage" if done => {
+                if emit
+                    && item["delivery"] == "async"
+                    && item["questions"].as_array().is_some_and(|q| !q.is_empty())
+                {
+                    let questions: Vec<_> = item["questions"].as_array().unwrap().iter().enumerate()
+                        .map(|(index,q)| json!({"id":index.to_string(),"header":"Question",
+                            "question":q["title"],"options":q["options"].as_array().into_iter().flatten()
+                                .map(|label| json!({"label":label,"description":""})).collect::<Vec<_>>()})).collect();
+                    self.events.push(
+                        json!({"type":"extension_ui_request","id":format!("async:{id}"),
+                        "method":"input","questions":codex_questions(&questions),
+                        "responseMode":"message","responseCapability":{"type":"message"}}),
+                    );
+                    // Async questions are request items, not duplicated final-answer messages.
+                    return;
+                }
                 if emit {
                     self.begin_message(id);
                 }

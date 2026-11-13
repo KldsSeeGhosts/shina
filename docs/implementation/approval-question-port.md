@@ -273,3 +273,59 @@ checks native Claude denial feedback, decline-before-redirect, transcript persis
 no extra feedback prompt and minor-12 refusal.
 `approval_feedback_and_redirect_composer_fit_at_supported_widths` checks all four
 requested widths.
+
+## Item 3 implementation map
+
+`questionnaire::{Questionnaire,Question,Answer}` carries choice-only input,
+literal initial answers, optional requirements and live/message/not-resumable
+capabilities. `Questionnaire::{parse,answer,edit,toggle,response}` implements
+literal option values, first-option and multi-select answers in selection order,
+deduplication, offered-option validation, custom-answer precedence and shared
+drafts for matching question IDs. Initial answers seed only new custom-answer
+drafts. `Thread::{prepare_questionnaire,prepare_remote_questionnaire}` scopes the
+form to the owning thread and request. Authoritative projections with the same
+request identity do not replace local answer drafts.
+
+`Questionnaire::pi` maps native select/input/editor requests.
+`Questionnaire::rpiv` recognizes the native wire title and options and answers
+only that native dialog. The previous collect-and-preanswer mechanism was removed.
+`codex_questions` and `claude_questions` implement the provider normalizations
+listed above. `codex::Client::item` projects async agent-message questions as
+message-mode requests. `acp::{antigravity_question,Client::permission,Client::command}`
+preserves exact native choice IDs, does not automatically approve interaction
+requests, and sends the selected ID on the ACP permission response.
+
+`Thread::{questionnaire_can_respond,questionnaire_toggle,questionnaire_step,
+questionnaire_changed}` applies response locks, literal editing and the
+200-millisecond single-select advance. Question and route changes cancel timers.
+Rune consumes ordinary text-field input before the app shortcut handler,
+per `runtime/input/keys.rs` lines 27 through 85. Digits cannot select an option
+while another editable control owns the key.
+`pi_ui::questionnaire_drawer` hides custom input for choice-only questions,
+suppresses repeated descriptions, renders question Markdown through the existing
+renderer, and disables controls for unauthorized, responding or stale requests.
+
+`Thread::{expire_live_question,respond_message_question}` keeps message-mode
+questions after turn completion or disconnect, marks lost live callbacks as
+not resumable, and formats message answers with KSG's question/newline/answer
+format. Answers steer supported active turns or queue behind unsupported ones.
+Ordinary composer content remains separate. Persisted history preserves the
+question, with explicit non-resumability after restart for lost live callbacks.
+
+Protocol minor 14 adds `question-contract-v1`, the `questionContract` response
+marker and `ThreadView.question_contract_supported`. The missing projection
+field defaults false. New clients disable question responses against an old
+server. The client transport and server connection reject the new marker if
+the capability is absent. Minor-13 clients cannot silently submit new-contract
+answers.
+
+Pi supplies literal native option values and editor prefill. Codex supplies its
+normalized live questions and message-mode async questions, without unsupported
+question extensions. Claude supplies trimmed AskUserQuestion data and
+multi-select. Generic ACP supplies no questions. Antigravity supplies choice-only
+questions through its interaction permission requests.
+
+Tests include `questionnaire_contract_tests.rs`, `question_flow_tests.rs`,
+per-provider fixture messages in each provider's tests, native RPIV transport
+tests, four-width question layout tests and
+`choice_only_questions_use_native_option_ids_and_refuse_an_older_peer`.
