@@ -11490,6 +11490,22 @@ fn composer(
         quote_bar: p.muted,
         marker: Some(p.muted),
     })
+    .block_style(rune::BlockStyle {
+        heading_scale: [
+            20.0 / 15.0,
+            18.0 / 15.0,
+            16.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+            14.0 / 15.0,
+        ],
+        heading_weight: [600.0; 6],
+        checkbox_size: 14.0,
+        checkbox_stroke: 2.0,
+        checkbox_color: Some(p.ink),
+        rule_thickness: 2.0,
+        rule_color: Some(p.line),
+    })
     .caret(p.coral, p.coral_bg)
     .w_full()
     .min_h(COMPOSER_FIELD_MIN)
@@ -11504,14 +11520,30 @@ fn composer(
             composer_menu::scroll_selected(s, tx);
             return true;
         }
-        if (event.is_command('c') || event.is_command('x'))
-            && !event.mods.shift
-            && !event.mods.alt
-            && s.current().draft.anchor != s.current().draft.focus
-            && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+        if (event.is_command('c') || event.is_command('x')) && !event.mods.shift && !event.mods.alt
         {
-            tx.copy_rich(content);
-            return true;
+            if s.current().draft.anchor != s.current().draft.focus
+                && let Some(content) = s.copy_composer_selection(event.is_command('x'))
+            {
+                tx.copy_rich(content);
+                return true;
+            }
+            if matches!(
+                s.current().draft.selection(),
+                rune::EditorSelection::Block(_)
+            ) && !s.current().draft.is_secure()
+            {
+                let cut = event.is_command('x');
+                let d = &mut s.current_mut().draft;
+                let content =
+                    rune::ClipboardContent::new(d.selected()).with_html(d.selected_html());
+                tx.copy_rich(content);
+                if cut {
+                    d.insert("");
+                    s.current_mut().update_submission_error();
+                }
+                return true;
+            }
         }
         if event.is_command('v') && event.mods.shift && !event.mods.alt {
             let id = s.current().id;
@@ -15446,6 +15478,49 @@ pub(crate) mod tests {
                 "{width}: {menu:?}, field {field:?}"
             );
             assert!(menu[1] + menu[3] <= 833.0);
+        }
+    }
+
+    #[test]
+    fn heading_task_rule_and_fence_render_inside_the_composer_card_at_620_and_1280() {
+        let source = "# Title\n- [x] Done\n---\n```rs\nlet x = 1;\n```";
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.draft = crate::composer_rich::draft("");
+                crate::composer_rich::paste_with_path_query(&mut t.draft, source, false, &|_| None);
+                t.draft.focused = true;
+            }
+            rt.frame(0.0);
+            let (card, _) = rt.presented("composer-natural").unwrap();
+            let (input, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input[0] >= card[0]
+                    && input[0] + input[2] <= card[0] + card[2] + 1.0
+                    && input[1] >= card[1]
+                    && input[1] + input[3] <= card[1] + card[3] + 1.0,
+                "{width}: input {input:?} outside card {card:?}"
+            );
+            assert!(
+                input[3] > 60.0,
+                "{width}: expected multiline height, got {input:?}"
+            );
+            let draft = &rt.state.current().draft;
+            let kinds: Vec<_> = draft.logical_blocks().map(|b| b.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    rune::BlockKind::Heading { level: 1 },
+                    rune::BlockKind::Task {
+                        level: 0,
+                        checked: true,
+                    },
+                    rune::BlockKind::Rule,
+                    rune::BlockKind::Code,
+                ]
+            );
+            assert_eq!(crate::composer_rich::markdown(draft), source);
         }
     }
 
