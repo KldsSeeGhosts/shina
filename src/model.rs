@@ -542,6 +542,7 @@ pub struct Thread {
     pub typing_guard: crate::composer::TypingGuard,
     pub paste_history: crate::composer_paste::PasteHistory,
     pub composer_rules: crate::composer_rich::Rules,
+    pub composer_source: crate::composer_source::MarkdownSourceState,
     pub draft_images: Vec<Attachment>,
     pub draft_context: Vec<crate::composer_context::ComposerContextRecord>,
     pub retained_context: crate::composer_context::RetainedContextPayloads,
@@ -883,6 +884,7 @@ impl Thread {
             typing_guard: crate::composer::TypingGuard::default(),
             paste_history: crate::composer_paste::PasteHistory::default(),
             composer_rules: crate::composer_rich::Rules::default(),
+            composer_source: crate::composer_source::MarkdownSourceState::default(),
             draft_images: Vec::new(),
             draft_context: Vec::new(),
             retained_context: Default::default(),
@@ -6932,7 +6934,24 @@ impl State {
         }
         let (start, end) = t.draft.range();
         let selected_markdown = crate::composer_rich::markdown_range(&t.draft, start..end);
-        let selected_html = t.draft.selected_html();
+        let selected_html = if crate::composer_source::has_shown_source(&t.draft) {
+            let (mut collapsed, map) = crate::composer_source::collapsed_copy(&t.draft);
+            let (cs, ce) = if let Some(map) = map {
+                let s = map.map(start, rune::MapBias::After);
+                let e = map.map(end, rune::MapBias::Before).max(s);
+                (s, e)
+            } else {
+                (start, end)
+            };
+            if cs < ce {
+                collapsed.set_selection(cs, ce);
+                collapsed.selected_html()
+            } else {
+                t.draft.selected_html()
+            }
+        } else {
+            t.draft.selected_html()
+        };
         let refs = crate::composer_context::collect_composer_context_references(&selected_markdown);
         let mut wanted: std::collections::HashSet<String> =
             refs.into_iter().map(|r| r.context_id).collect();
@@ -7068,6 +7087,7 @@ impl State {
                     t.draft_context.push(rec);
                 }
             }
+            crate::composer_source::collapse_shown_markdown_source(&mut self.current_mut().draft);
             crate::composer_paste::insert(self, &rewritten_text);
             let target_machine = self.machines.selected.clone();
             let target_thread_id = self.current().id;
@@ -8643,6 +8663,7 @@ impl State {
         t.draft.focus = 0;
         t.draft.insert(&text);
         t.native.slash_index = 0;
+        t.composer_source.pending_typed = true;
         t.composer_rules.changed(&mut t.draft);
         t.reconcile_draft_context();
         t.typing_guard.on_type(std::time::Instant::now());
@@ -10108,6 +10129,13 @@ impl State {
                     (&t.draft, &t.draft_images, &t.draft_context),
                     |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context),
                 );
+                let collapsed_holder;
+                let draft = if crate::composer_source::has_shown_source(draft) {
+                    collapsed_holder = crate::composer_source::collapsed_copy(draft).0;
+                    &collapsed_holder
+                } else {
+                    draft
+                };
                 let value = if images.is_empty()
                     && context.is_empty()
                     && !crate::composer_rich::has_format(draft)
@@ -10226,6 +10254,7 @@ impl State {
                 .and_then(|id| self.threads.iter_mut().find(|t| t.id == id))
             {
                 t.draft = crate::composer_rich::restore(text, draft["richHtml"].as_str());
+                t.composer_source = Default::default();
                 crate::composer_tokens::stamp_thread_owner(&mut t.draft, &t.machine);
                 t.draft_images = images;
                 t.draft_context = draft

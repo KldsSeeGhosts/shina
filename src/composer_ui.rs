@@ -680,6 +680,7 @@ pub(super) fn changed(s: &mut State) {
     composer_menu::clear_dismissed_if_changed(s);
     let t = s.current_mut();
     t.native.slash_index = 0;
+    t.composer_source.pending_typed = true;
     t.composer_rules.changed(&mut t.draft);
     t.reconcile_draft_context();
     t.typing_guard.on_type(std::time::Instant::now());

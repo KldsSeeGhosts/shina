@@ -11573,6 +11573,7 @@ fn composer(
         if handled {
             t.reconcile_draft_context();
             if t.draft.text != before {
+                t.composer_source.pending_typed = true;
                 t.typing_guard.on_type(std::time::Instant::now());
             }
             t.update_submission_error();
@@ -11592,6 +11593,20 @@ fn composer(
             s.send();
         }
     });
+    let (source_spans, source_strikes) = crate::composer_source::preview_decorations(
+        &t.draft,
+        composer_style,
+        p.faint,
+        p.ink,
+        p.code_bg,
+    );
+    let field = field
+        .on_input_selection_change(|s: &mut State, _| {
+            let t = s.current_mut();
+            crate::composer_source::on_selection_change(&mut t.composer_source, &mut t.draft);
+        })
+        .decorations(source_spans)
+        .strikes(source_strikes);
     if collapsed {
         // KSG's CollapsedComposerPromptPreview is inert. Reuse the real pill renderer without
         // edit handlers or focus, so files, skills and thread chips have exactly the editor's ink.
