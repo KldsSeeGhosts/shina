@@ -825,6 +825,7 @@ impl Thread {
             && self.unused_session()
             && self.messages.is_empty()
             && !self.has_draft_content()
+            && self.draft_model_state.additional_models.is_empty()
             && self.remote_send.is_none()
             && self.client_creating.is_none()
             && !self.configuring
@@ -8848,8 +8849,13 @@ impl State {
         if !is_repo {
             return ComposerVcsControls::Hidden;
         }
+        let mode = if !thread.draft_model_state.additional_models.is_empty() {
+            ThreadEnvMode::Worktree
+        } else {
+            self.effective_env_mode(thread)
+        };
         ComposerVcsControls::Editable {
-            mode: self.effective_env_mode(thread),
+            mode,
             base_branch: thread.base_branch.clone(),
             start_from_origin: thread.effective_start_from_origin(),
         }
@@ -11835,10 +11841,15 @@ impl State {
         let draft_model_states: serde_json::Map<String, Value> = self
             .threads
             .iter()
-            .filter(|t| t.draft_model_state.model_selection_explicit || t.has_draft_content())
+            .filter(|t| {
+                t.draft_model_state.model_selection_explicit
+                    || !t.draft_model_state.additional_models.is_empty()
+                    || t.has_draft_content()
+            })
             .filter(|t| {
                 !t.draft_model_state.model_selection_by_provider.is_empty()
                     || t.draft_model_state.active_provider.is_some()
+                    || !t.draft_model_state.additional_models.is_empty()
             })
             .filter_map(|t| {
                 serde_json::to_value(&t.draft_model_state)

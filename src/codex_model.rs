@@ -872,6 +872,7 @@ impl State {
             self.current_mut()
                 .set_option(opt.id.clone(), opt.value.clone());
         }
+        draft_state.additional_models.clear();
         self.current_mut().draft_model_state = draft_state;
         self.current_mut().fallback_active = None;
         self.current_mut().fallback_explicit_override = true;
@@ -879,6 +880,124 @@ impl State {
         self.preferences.sticky_composer = sticky;
         self.reconcile_current_access_mode();
         self.checkpoint();
+    }
+
+    pub fn multiple_models_enabled(&self) -> bool {
+        let thread = self.current();
+        !self.demo
+            && thread.is_draft()
+            && !thread.worktree_bootstrapping()
+            && !thread.native.queue_held
+            && matches!(
+                self.composer_vcs_controls(),
+                crate::model::ComposerVcsControls::Editable { .. }
+            )
+    }
+
+    pub fn is_multi_model_active(&self) -> bool {
+        self.multiple_models_enabled()
+            && !self
+                .current()
+                .draft_model_state
+                .additional_models
+                .is_empty()
+    }
+
+    pub fn multi_model_selections(&self) -> Vec<crate::model_selection::ModelSelection> {
+        let (instance_id, model, options) = self.resolved_composer_model_selection();
+        let primary = crate::model_selection::ModelSelection {
+            instance_id,
+            model,
+            options,
+        };
+        if !self.is_multi_model_active() {
+            return vec![primary];
+        }
+        crate::model_selection::multi_model_selections(
+            &primary,
+            &self.current().draft_model_state.additional_models,
+        )
+    }
+
+    pub fn toggle_model_in_multi_selection(&mut self, instance_id: &str, model_id: &str) {
+        if !self.multiple_models_enabled() {
+            return;
+        }
+        let (primary_instance, primary_model, primary_options) =
+            self.resolved_composer_model_selection();
+        let primary = crate::model_selection::ModelSelection {
+            instance_id: primary_instance,
+            model: primary_model,
+            options: primary_options,
+        };
+        let entries = self.provider_instance_entries();
+        let models_by_instance = self.picker_models_by_instance();
+        let additional = self.current().draft_model_state.additional_models.clone();
+        match crate::model_selection::toggle_multi_model_selection(
+            &primary,
+            &additional,
+            &entries,
+            &models_by_instance,
+            instance_id,
+            model_id,
+        ) {
+            crate::model_selection::MultiModelToggleResult::Unchanged => {}
+            crate::model_selection::MultiModelToggleResult::Updated {
+                new_primary,
+                additional,
+            } => {
+                if let Some(next_primary) = new_primary {
+                    self.select_model_from_picker(&next_primary.instance_id, &next_primary.model);
+                    if !next_primary.options.is_empty() {
+                        for opt in &next_primary.options {
+                            self.current_mut()
+                                .set_option(opt.id.clone(), opt.value.clone());
+                        }
+                        crate::model_selection::set_model_selection(
+                            &mut self.current_mut().draft_model_state,
+                            Some(next_primary),
+                            true,
+                            true,
+                        );
+                    }
+                    self.current_mut().draft_model_state.additional_models = additional;
+                } else {
+                    if self
+                        .current()
+                        .draft_model_state
+                        .model_selection_by_provider
+                        .get(&primary.instance_id)
+                        .is_none()
+                    {
+                        crate::model_selection::set_model_selection(
+                            &mut self.current_mut().draft_model_state,
+                            Some(primary),
+                            true,
+                            true,
+                        );
+                    } else {
+                        self.current_mut()
+                            .draft_model_state
+                            .model_selection_explicit = true;
+                    }
+                    self.current_mut().draft_model_state.additional_models = additional;
+                }
+                if !self
+                    .current()
+                    .draft_model_state
+                    .additional_models
+                    .is_empty()
+                    && self.current().base_branch.is_none()
+                    && let Some(key) = self.thread_vcs_repo_key(self.current())
+                    && let Some(entry) = self.vcs_branches.get(&key)
+                    && let Some(default_branch) =
+                        crate::branch_toolbar::default_worktree_base_branch(&entry.refs, None)
+                {
+                    self.current_mut().base_branch = Some(default_branch);
+                }
+                self.checkpoint();
+            }
+        }
     }
 
     pub fn set_composer_thinking_sticky(&mut self, level: String) {

@@ -57,6 +57,8 @@ pub struct DraftModelState {
     pub model_selection_by_provider: BTreeMap<String, ModelSelection>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub model_selection_explicit: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_models: Vec<ModelSelection>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -692,8 +694,119 @@ pub fn select_model_from_picker(
         options: remembered_options,
     };
     set_model_selection(draft, Some(next_selection.clone()), true, true);
+    draft.additional_models.clear();
     set_sticky_model_selection(sticky, next_selection.clone());
     Some(next_selection)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MultiModelToggleResult {
+    Unchanged,
+    Updated {
+        new_primary: Option<ModelSelection>,
+        additional: Vec<ModelSelection>,
+    },
+}
+
+fn resolved_picker_slug_for_selection(
+    entries: &[ProviderInstanceEntry],
+    models_by_instance: &BTreeMap<String, Vec<PickerModelOption>>,
+    instance_id: &str,
+    model: &str,
+) -> String {
+    resolve_app_model_selection_for_instance(
+        instance_id,
+        entries,
+        models_by_instance,
+        Some(model),
+        true,
+    )
+    .unwrap_or_else(|| model.to_owned())
+}
+
+/// Ordered multi-model selections: primary selection followed by unique additional selections.
+pub fn multi_model_selections(
+    primary: &ModelSelection,
+    additional: &[ModelSelection],
+) -> Vec<ModelSelection> {
+    let mut out = vec![primary.clone()];
+    for sel in additional {
+        if !out
+            .iter()
+            .any(|existing| existing.instance_id == sel.instance_id && existing.model == sel.model)
+        {
+            out.push(sel.clone());
+        }
+    }
+    out
+}
+
+/// Ported from KSG Code's `ComposerFooterControls.tsx` (`toggleModel`):
+/// clicking a row's multi-select toggle adds `createModelSelection(instanceId, model)` or removes
+/// an already-selected model while keeping at least one model selected.
+pub fn toggle_multi_model_selection(
+    primary: &ModelSelection,
+    additional: &[ModelSelection],
+    entries: &[ProviderInstanceEntry],
+    models_by_instance: &BTreeMap<String, Vec<PickerModelOption>>,
+    instance_id: &str,
+    model: &str,
+) -> MultiModelToggleResult {
+    let resolved_model = resolve_app_model_selection_for_instance(
+        instance_id,
+        entries,
+        models_by_instance,
+        Some(model),
+        false,
+    )
+    .unwrap_or_else(|| model.to_owned());
+    if resolved_model.is_empty() {
+        return MultiModelToggleResult::Unchanged;
+    }
+
+    let current = multi_model_selections(primary, additional);
+    let matches = |sel: &ModelSelection| {
+        sel.instance_id == instance_id
+            && resolved_picker_slug_for_selection(
+                entries,
+                models_by_instance,
+                &sel.instance_id,
+                &sel.model,
+            ) == resolved_model
+    };
+    if let Some(removed_index) = current.iter().position(matches) {
+        if current.len() <= 1 {
+            return MultiModelToggleResult::Unchanged;
+        }
+        let mut remaining: Vec<ModelSelection> =
+            current.into_iter().filter(|sel| !matches(sel)).collect();
+        if remaining.is_empty() {
+            return MultiModelToggleResult::Unchanged;
+        }
+        if removed_index == 0 {
+            let next_primary = remaining.remove(0);
+            MultiModelToggleResult::Updated {
+                new_primary: Some(next_primary),
+                additional: remaining,
+            }
+        } else {
+            MultiModelToggleResult::Updated {
+                new_primary: None,
+                additional: remaining.into_iter().skip(1).collect(),
+            }
+        }
+    } else {
+        let mut next_additional = current.into_iter().skip(1).collect::<Vec<_>>();
+        next_additional.push(ModelSelection {
+            instance_id: instance_id.to_owned(),
+            model: resolved_model,
+            options: Vec::new(),
+        });
+        MultiModelToggleResult::Updated {
+            new_primary: None,
+            additional: next_additional,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1124,7 @@ mod tests {
                 },
             )]),
             model_selection_explicit: false,
+            additional_models: vec![],
         };
         apply_sticky_state(&mut new_draft, &sticky);
         assert_eq!(new_draft.active_provider.as_deref(), Some("cursor"));
@@ -1050,5 +1164,105 @@ mod tests {
         assert!(draft.active_provider.is_none());
         assert!(draft.model_selection_by_provider.is_empty());
         assert!(!draft.model_selection_explicit);
+    }
+
+    #[test]
+    fn multi_model_toggle_adds_removes_keeps_last_and_roundtrips_json() {
+        let entries = vec![
+            entry("codex", "codex", true),
+            entry("claude", "claudeAgent", true),
+        ];
+        let mut models = BTreeMap::new();
+        models.insert(
+            "codex".into(),
+            vec![
+                model_opt("gpt-6-astra", true),
+                model_opt("gpt-6-sol", false),
+            ],
+        );
+        models.insert(
+            "claude".into(),
+            vec![
+                model_opt("claude-opus-5-5", true),
+                model_opt("claude-sonnet-5-5", false),
+            ],
+        );
+
+        let primary = ModelSelection {
+            instance_id: "codex".into(),
+            model: "gpt-6-astra".into(),
+            options: vec![opt_str("reasoningEffort", "high")],
+        };
+
+        // Toggling the sole primary model is a no-op.
+        assert_eq!(
+            toggle_multi_model_selection(&primary, &[], &entries, &models, "codex", "gpt-6-astra",),
+            MultiModelToggleResult::Unchanged
+        );
+
+        // Adding additional models preserves primary options and starts additions with empty options.
+        let MultiModelToggleResult::Updated {
+            new_primary,
+            additional,
+        } = toggle_multi_model_selection(
+            &primary,
+            &[],
+            &entries,
+            &models,
+            "claude",
+            "claude-opus-5-5",
+        )
+        else {
+            panic!("expected Updated");
+        };
+        assert!(new_primary.is_none());
+        assert_eq!(
+            additional,
+            vec![ModelSelection {
+                instance_id: "claude".into(),
+                model: "claude-opus-5-5".into(),
+                options: vec![],
+            }]
+        );
+
+        // Removing the primary model promotes the next model to primary.
+        let MultiModelToggleResult::Updated {
+            new_primary,
+            additional,
+        } = toggle_multi_model_selection(
+            &primary,
+            &additional,
+            &entries,
+            &models,
+            "codex",
+            "gpt-6-astra",
+        )
+        else {
+            panic!("expected Updated");
+        };
+        assert_eq!(
+            new_primary,
+            Some(ModelSelection {
+                instance_id: "claude".into(),
+                model: "claude-opus-5-5".into(),
+                options: vec![],
+            })
+        );
+        assert!(additional.is_empty());
+
+        // Round-trips DraftModelState with additionalModels through JSON.
+        let draft = DraftModelState {
+            active_provider: Some("codex".into()),
+            model_selection_by_provider: BTreeMap::from([("codex".into(), primary)]),
+            model_selection_explicit: true,
+            additional_models: vec![ModelSelection {
+                instance_id: "claude".into(),
+                model: "claude-opus-5-5".into(),
+                options: vec![opt_str("effort", "medium")],
+            }],
+        };
+        let encoded = serde_json::to_value(&draft).unwrap();
+        let decoded: DraftModelState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, draft);
     }
 }
