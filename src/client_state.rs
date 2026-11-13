@@ -3662,6 +3662,8 @@ mod tests {
     fn retargeting_keeps_the_editor_and_images_and_creates_only_on_send() {
         let (mut state, mut local, mut remote, projection) = paired_client_fixture();
         let image = Attachment {
+            asset_id: None,
+            uploaded: None,
             id: "draft.png".into(),
             name: "draft.png".into(),
             mime: "image/png".into(),

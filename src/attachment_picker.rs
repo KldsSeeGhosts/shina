@@ -28,6 +28,7 @@ impl HasDisplayHandle for Parent<'_> {
 }
 
 pub fn open(state: &mut State, thread: usize, options: rune::FileDialogOptions) {
+    let machine = state.machines.selected.clone();
     let handle = state.background.handle.clone();
     let window = WINDOW.lock().expect("attachment picker window").clone();
     let result = window
@@ -60,17 +61,18 @@ pub fn open(state: &mut State, thread: usize, options: rune::FileDialogOptions) 
                 });
                 handle.update(move |state, _| {
                     if let Some(paths) = paths {
-                        state.attach_paths_to(thread, &paths);
+                        state.attach_paths_on_to(&machine, thread, &paths);
                     }
                     state.checkpoint();
                 });
             });
         }
         (Err(error), _) => {
-            if let Some(target) = state.threads.iter_mut().find(|t| t.id == thread) {
-                target.attachment_error =
-                    Some(format!("Could not open the attachment picker: {error}"));
-            }
+            state.set_attachment_target_error(
+                &machine,
+                thread,
+                format!("Could not open the attachment picker: {error}"),
+            );
         }
         _ => {}
     }

@@ -3,6 +3,7 @@
 mod acp;
 mod attachment_intake;
 mod attachment_picker;
+mod attachment_uploads;
 mod attachments;
 mod backend;
 mod brand;
@@ -58,6 +59,7 @@ mod server_lock;
 mod service;
 mod session;
 mod shell_env;
+mod staged_uploads;
 mod store;
 mod thread_find;
 mod thread_search;

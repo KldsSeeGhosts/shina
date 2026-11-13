@@ -7,6 +7,10 @@ pub const MINOR: u32 = 11;
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
+pub const STAGED_ATTACHMENTS: &str = "staged-attachments-v1";
+pub const ATTACHMENT_LIMITS: &str = "attachment-limits-v1";
+pub const STAGED_ATTACHMENTS_UPDATE_REQUIRED: &str =
+    "This server does not support staged attachments.";
 pub const FILE_ATTACHMENTS_UPDATE_REQUIRED: &str = "This server does not support file attachments.";
 pub const MODEL_FAVORITES: &str = "model-favorites";
 pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";

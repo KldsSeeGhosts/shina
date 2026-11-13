@@ -53,6 +53,7 @@ struct Upload {
     hash: String,
     name: String,
     file_mime: Option<String>,
+    staged: bool,
     expires: Instant,
 }
 impl Drop for Upload {
@@ -97,6 +98,10 @@ async fn upload_start(
             ),
             _ => return Err("Invalid attachment type.".into()),
         };
+        let staged = body["staged"] == true;
+        if staged && shared.discovery.protocol_minor < 11 {
+            return Err(protocol::STAGED_ATTACHMENTS_UPDATE_REQUIRED.into());
+        }
         let name = body["name"].as_str().unwrap_or("Image");
         if file_mime.is_some() && (name.trim().is_empty() || name.encode_utf16().count() > 255) {
             return Err("Invalid file attachment metadata.".into());
@@ -129,12 +134,13 @@ async fn upload_start(
             .ok_or("Invalid hash.")?;
         let mut uploads = shared.uploads.lock().expect("uploads");
         uploads.retain(|_, upload| upload.expires > Instant::now());
-        if uploads.len() >= 32
-            || uploads
-                .values()
-                .filter(|upload| upload.device == device)
-                .count()
-                >= 8
+        if !staged
+            && (uploads.values().filter(|upload| !upload.staged).count() >= 32
+                || uploads
+                    .values()
+                    .filter(|upload| !upload.staged && upload.device == device)
+                    .count()
+                    >= 8)
         {
             return Err("Upload limit reached.".into());
         }
@@ -153,8 +159,13 @@ async fn upload_start(
                 hash: hash.to_ascii_lowercase(),
                 name: name.trim().chars().take(255).collect(),
                 expires: Instant::now()
-                    + Duration::from_secs(if file_mime.is_some() { 600 } else { 300 }),
+                    + Duration::from_secs(if staged || file_mime.is_some() {
+                        600
+                    } else {
+                        300
+                    }),
                 file_mime,
+                staged,
             },
         );
         Ok(json!({"uploadId":id,"offset":0}))
@@ -232,6 +243,16 @@ async fn upload_commit(
         shared
             .database
             .authorize(&device, "uploads.write", &json!({}))?;
+        if upload.staged {
+            return crate::staged_uploads::publish(
+                &shared.directory,
+                &id,
+                &device,
+                &upload.name,
+                upload.file_mime.as_deref(),
+                &bytes,
+            );
+        }
         let attachment = if let Some(mime) = &upload.file_mime {
             crate::attachments::store_uploaded_file(
                 &shared.directory.join("attachments"),
@@ -251,6 +272,116 @@ async fn upload_commit(
     .await;
     upload_response(result)
 }
+
+async fn staged_attachment(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(device) = authorized(&shared, &headers, "uploads.write") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if shared.discovery.protocol_minor < 11 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        crate::staged_uploads::read(&shared.directory, &id, &device)
+            .map(|lease| lease.attachment.to_value())
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn release_staged_attachment(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(device) = authorized(&shared, &headers, "uploads.write") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        {
+            let mut uploads = shared.uploads.lock().expect("uploads");
+            if uploads
+                .get(&id)
+                .is_some_and(|upload| upload.device == device)
+            {
+                uploads.remove(&id);
+                return Ok(());
+            }
+        }
+        crate::staged_uploads::release(&shared.directory, &id, &device)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+fn rewrite_claimed_paths(value: &mut Value, replacements: &HashMap<String, Value>) {
+    if let Some(id) = value["id"].as_str()
+        && !value["mime"].is_null()
+        && let Some(replacement) = replacements.get(id)
+    {
+        // Equal bytes may have different display names in the same draft.
+        value["path"] = replacement["path"].clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("asset_id");
+            object.remove("uploaded");
+        }
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                rewrite_claimed_paths(value, replacements);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                rewrite_claimed_paths(value, replacements);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn staged_blob(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(page): Query<BlobPage>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(device) = authorized(&shared, &headers, "uploads.write") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        crate::staged_uploads::blob_page(&shared.directory, &id, &device, page.offset, page.limit)
+    })
+    .await
+    {
+        Ok(Ok((bytes, length))) => {
+            let next = page.offset + bytes.len() as u64;
+            (
+                [
+                    ("content-type", "application/octet-stream".to_owned()),
+                    ("x-blob-length", length.to_string()),
+                    ("x-next-offset", next.to_string()),
+                    ("cache-control", "no-store".to_owned()),
+                    ("x-content-type-options", "nosniff".to_owned()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn upload_response(result: Result<Result<Value, String>, tokio::task::JoinError>) -> Response {
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
@@ -588,6 +719,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut paged = false;
     let mut history_items = false;
     let mut deferred_work = false;
+    let mut staged_attachments = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -657,6 +789,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }
                         if minor >= 10 { capabilities.push(protocol::COMPOSER_CONTEXT); }
                         if minor >= 10 { capabilities.push(protocol::FILE_ATTACHMENTS); }
+                        staged_attachments = minor >= 11;
+                        if staged_attachments { capabilities.extend([protocol::STAGED_ATTACHMENTS, protocol::ATTACHMENT_LIMITS]); }
                         if minor >= 10 {
                             capabilities.extend([
                                 protocol::MODEL_FAVORITES,
@@ -840,6 +974,52 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if registered.is_none() || command.params["pid"].as_u64() != registered.map(u64::from) {
                             if !send(&mut socket, protocol::response(id, Err("Only a registered local client may acknowledge its own PID.".into()))).await { break; }
                             continue;
+                        }
+                    }
+                    if command.params["stagedUploadIds"].as_array().is_some_and(|ids| !ids.is_empty()) {
+                        if !staged_attachments {
+                            if !send(&mut socket, protocol::response(id, Err(protocol::STAGED_ATTACHMENTS_UPDATE_REQUIRED.into()))).await { break; }
+                            continue;
+                        }
+                        let directory = shared.directory.clone();
+                        let database = shared.database.clone();
+                        let device = device.clone();
+                        let prepared = tokio::task::spawn_blocking(move || -> Result<Command, String> {
+                            database.authorize(&device, &command.method, &command.params)?;
+                            let already_received = database.receipt(&device, command.command_id)?.is_some();
+                            let ids = command.params["stagedUploadIds"].as_array().cloned().unwrap_or_default();
+                            let mut replacements = HashMap::new();
+                            for id in ids {
+                                let id = id.as_str().ok_or("Invalid staged upload identity.")?;
+                                if !already_received {
+                                    let attachment = crate::staged_uploads::claim(&directory, id, &device)?;
+                                    replacements.insert(attachment.id.clone(), attachment.to_value());
+                                }
+                            }
+                            if already_received {
+                                for value in command.params["attachments"].as_array().into_iter().flatten() {
+                                    let id = value["id"].as_str().ok_or("Invalid attachment identity.")?;
+                                    let mut value = value.clone();
+                                    if crate::attachments::safe_file_id(id) {
+                                        value["path"] = json!(directory.join("attachments").join(id));
+                                    }
+                                    replacements.insert(id.to_owned(), value);
+                                }
+                            }
+                            rewrite_claimed_paths(&mut command.params, &replacements);
+                            command.params.as_object_mut().ok_or("Invalid command parameters.")?.remove("stagedUploadIds");
+                            Ok(command)
+                        }).await;
+                        match prepared {
+                            Ok(Ok(prepared)) => command = prepared,
+                            Ok(Err(error)) => {
+                                if !send(&mut socket, protocol::response(id, Err(error))).await { break; }
+                                continue;
+                            }
+                            Err(_) => {
+                                if !send(&mut socket, protocol::response(id, Err("Attachment claim failed.".into()))).await { break; }
+                                continue;
+                            }
                         }
                     }
                     let (reply, response) = oneshot::channel();
@@ -1039,6 +1219,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
     let app = router(shared);
     let _guard = network.enter();
     let uploads = remote.uploads.clone();
+    let staged_directory = remote.directory.clone();
     let cleanup = network.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -1047,6 +1228,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
                 .lock()
                 .expect("uploads")
                 .retain(|_, upload| upload.expires > Instant::now());
+            crate::staged_uploads::sweep(&staged_directory);
         }
     });
     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
@@ -1150,6 +1332,11 @@ fn router(shared: Shared) -> Router {
         .route("/v1/uploads", post(upload_start))
         .route("/v1/uploads/{id}", axum::routing::put(upload_chunk))
         .route("/v1/uploads/{id}/commit", post(upload_commit))
+        .route(
+            "/v1/staged/{id}",
+            get(staged_attachment).delete(release_staged_attachment),
+        )
+        .route("/v1/staged/{id}/blob", get(staged_blob))
         .layer(axum::extract::DefaultBodyLimit::max(protocol::MAX_CONTROL))
         .with_state(shared)
 }

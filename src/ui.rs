@@ -10,6 +10,7 @@ use rune::{
 };
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
+use std::time::Duration;
 #[path = "captain_ui.rs"]
 mod captain_ui;
 #[path = "composer_menu.rs"]
@@ -9799,7 +9800,8 @@ fn image_size(image: &Attachment, maximum: f32) -> (f32, f32) {
 const ATTACHMENT_THUMB: f32 = 64.0;
 fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
     let id = image.id.clone();
-    el().key(format!("attachment-{}", image.id))
+    let mut tile = el()
+        .key(format!("attachment-{}", image.id))
         .role("group")
         .label(format!(
             "Attached {}: {}",
@@ -9835,7 +9837,154 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 .hover(Color::BLACK.alpha(0.8))
                 .on_press(move |s: &mut State| s.request_remove_attachment(&id))
                 .child(icon("close", Color::WHITE).size(12.0, 12.0)),
-        )
+        );
+    if let Some(status) = attachment_upload_status(s, p, &image.id) {
+        tile = tile.child(status);
+    }
+    tile
+}
+
+// Ported from KSG Code's ComposerAttachmentMediaRow and ComposerAttachmentUploadProgress.
+fn attachment_upload_status(s: &State, p: Palette, id: &str) -> Option<El> {
+    use crate::attachment_uploads::Phase;
+    let phase = s
+        .attachment_uploads
+        .phase(&s.machines.selected, s.current().id, id)?;
+    let entry = s
+        .attachment_uploads
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)?;
+    if !entry.image {
+        return None;
+    }
+    let elapsed = match phase {
+        Phase::Uploading { since, .. } => since.elapsed(),
+        _ => Duration::ZERO,
+    };
+    if let Phase::Failed(reason) = phase {
+        let retry_id = id.to_owned();
+        return Some(
+            row()
+                .key(format!("attachment-status-{id}"))
+                .pin(Some(4.0), None, None, Some(4.0))
+                .child(
+                    icon_button(
+                        &format!("retry-attachment-{id}"),
+                        &format!("Retry upload for {}", entry.name),
+                        "reload",
+                        p,
+                        move |s| s.retry_attachment_upload(&retry_id),
+                    )
+                    .help(reason)
+                    .fill(p.card)
+                    .size(18.0, 18.0),
+                ),
+        );
+    }
+    phase.label(elapsed).map(|status| {
+        row()
+            .key(format!("attachment-status-{id}"))
+            .pin(Some(0.0), Some(0.0), None, Some(0.0))
+            .px(4.0)
+            .justify_center()
+            .fill(p.card)
+            .child(pixel_text(status, p.ink))
+    })
+}
+
+// Ported from KSG Code's preparingComposerImages tiles in ComposerAttachmentMediaRow.
+fn preparing_attachment_chip(
+    s: &State,
+    p: Palette,
+    entry: &crate::attachment_uploads::Entry,
+) -> El {
+    let id = entry.id.clone();
+    let mut tile = el()
+        .key(format!("attachment-{id}"))
+        .size(64.0, 64.0)
+        .radius(4.0)
+        .border(0.5, p.line)
+        .fill(p.selected)
+        .center()
+        .label(format!("Preparing {}", entry.name))
+        .child(icon("image", p.muted))
+        .child(
+            icon_button(
+                &format!("remove-attachment-{id}"),
+                &format!("Remove {}", entry.name),
+                "close",
+                p,
+                move |s| s.remove_attachment(&id),
+            )
+            .pin(None, Some(4.0), Some(4.0), None)
+            .size(18.0, 18.0)
+            .fill(p.card),
+        );
+    if let Some(status) = attachment_upload_status(s, p, &entry.id) {
+        tile = tile.child(status);
+    }
+    tile
+}
+
+// Ported from KSG Code's ComposerAttachmentFileList. Rune's editable pill has no
+// suffix/adornment slot, so pending inline files use the reference implementation's file row.
+fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
+    use crate::attachment_uploads::Phase;
+    let mut rows = col().w_full().gap(4.0).px(12.0).pt(8.0);
+    let mut any = false;
+    for entry in s.attachment_uploads.entries.iter().filter(|entry| {
+        entry.machine == s.machines.selected
+            && entry.thread == s.current().id
+            && !entry.image
+            && !matches!(entry.phase, Phase::Ready | Phase::Legacy)
+    }) {
+        any = true;
+        let elapsed = match entry.phase {
+            Phase::Uploading { since, .. } => since.elapsed(),
+            _ => Duration::ZERO,
+        };
+        let status = entry.phase.label(elapsed).unwrap_or_default();
+        let mut file = row()
+            .key(format!("attachment-upload-file-{}", entry.id))
+            .w_full()
+            .min_w(0.0)
+            .gap(8.0)
+            .py(4.0)
+            .center_y()
+            .child(icon("file", p.muted))
+            .child(
+                label(&entry.name, BODY, p.ink)
+                    .truncate()
+                    .w(0.0)
+                    .grow(1.0)
+                    .min_w(0.0),
+            )
+            .child(pixel_text(status, p.muted).key(format!("attachment-status-{}", entry.id)));
+        if let Phase::Failed(reason) = &entry.phase {
+            let id = entry.id.clone();
+            file = file.child(
+                icon_button(
+                    &format!("retry-attachment-{id}"),
+                    &format!("Retry upload for {}", entry.name),
+                    "reload",
+                    p,
+                    move |s| s.retry_attachment_upload(&id),
+                )
+                .help(reason),
+            );
+        }
+        let id = entry.id.clone();
+        file = file.child(icon_button(
+            &format!("remove-pending-attachment-{id}"),
+            &format!("Remove {}", entry.name),
+            "close",
+            p,
+            move |s| s.remove_attachment(&id),
+        ));
+        rows = rows.child(file);
+    }
+    any.then_some(rows)
 }
 
 pub(crate) fn tray_attachments(t: &Thread) -> Vec<&Attachment> {
@@ -9974,6 +10123,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
 // Ported from KSG Code's ComposerAttachButton in ComposerAttachmentStrip.tsx.
 fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
+    let machine = s.machines.selected.clone();
     let options = rune::FileDialogOptions {
         title: if folder {
             "Attach a folder"
@@ -9985,13 +10135,14 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     };
     let callback = move |s: &mut State, result, _: &mut Tx| {
         match result {
-            Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
+            Ok(Some(path)) => s.attach_paths_on_to(&machine, thread, &[path]),
             Ok(None) => {}
             Err(error) => {
-                if let Some(target) = s.threads.iter_mut().find(|t| t.id == thread) {
-                    target.attachment_error =
-                        Some(format!("Could not open the attachment picker: {error}"));
-                }
+                s.set_attachment_target_error(
+                    &machine,
+                    thread,
+                    format!("Could not open the attachment picker: {error}"),
+                );
             }
         }
         s.checkpoint();
@@ -10490,7 +10641,11 @@ fn composer(
 ) -> El {
     let t = s.current();
     let lane = lane_width(pane_width, wide);
-    let collapsed = composer_ui::collapsed(s, s.composer_ui.viewport.get(), lane - 32.0);
+    let collapsed = s
+        .attachment_uploads
+        .block_reason(&s.machines.selected, t.id)
+        .is_none()
+        && composer_ui::collapsed(s, s.composer_ui.viewport.get(), lane - 32.0);
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
         area = area.child(pi_ui::notifications(s, p));
@@ -10549,6 +10704,7 @@ fn composer(
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
     let can_send = !s.demo
+        && s.attachment_send_block_reason().is_none()
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
@@ -10690,7 +10846,18 @@ fn composer(
         })
         .on_drop_hover(|s: &mut State, over, _| s.attachment_drop_hover = over);
     let tray_items = tray_attachments(t);
-    if !collapsed && !tray_items.is_empty() {
+    let preparing: Vec<_> = s
+        .attachment_uploads
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.machine == s.machines.selected
+                && entry.thread == t.id
+                && entry.image
+                && matches!(entry.phase, crate::attachment_uploads::Phase::Preparing)
+        })
+        .collect();
+    if !collapsed && (!tray_items.is_empty() || !preparing.is_empty()) {
         let mut tray = row()
             .key("composer-attachments")
             .keeps_text_selection()
@@ -10703,7 +10870,13 @@ fn composer(
         for image in tray_items {
             tray = tray.child(attachment_chip(s, p, image));
         }
+        for entry in preparing {
+            tray = tray.child(preparing_attachment_chip(s, p, entry));
+        }
         card = card.child(tray);
+    }
+    if !collapsed && let Some(rows) = attachment_upload_file_rows(s, p) {
+        card = card.child(rows);
     }
     // Ported from KSG Code's composer body (`px-4 pt-4 pb-2`, `ChatComposer.tsx`) and its
     // editor (`max-h-52 overflow-y-auto p-1 -m-1`, `ComposerPromptEditorTiptap.tsx`): the field
@@ -13844,6 +14017,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn staged_attachment_preparation_progress_and_retry_fit_at_all_widths() {
+        use crate::attachment_uploads::{Entry, Phase};
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for phase in [
+                Phase::Preparing,
+                Phase::Uploading {
+                    progress: 0.499,
+                    since: std::time::Instant::now() - Duration::from_secs(1),
+                },
+                Phase::Failed("Upload failed".into()),
+            ] {
+                let mut rt = runtime(width);
+                rt.state.current_mut().draft.replace_text("Inspect this");
+                rt.state.current_mut().draft.focused = true;
+                let image = Attachment {
+                    id: "staged-fixture.png".into(),
+                    name: "fixture.png".into(),
+                    mime: "image/png".into(),
+                    width: 2,
+                    height: 2,
+                    bytes: 1,
+                    path: None,
+                    asset_id: None,
+                    uploaded: None,
+                };
+                if !matches!(phase, Phase::Preparing) {
+                    rt.state.current_mut().draft_images.push(image.clone());
+                }
+                rt.state.attachment_uploads.entries.push(Entry::fixture(
+                    "local",
+                    1,
+                    &image,
+                    phase.clone(),
+                ));
+                rt.frame(0.0);
+                let (composer, _) = rt.presented("composer").unwrap();
+                let (tile, _) = rt.presented("attachment-staged-fixture.png").unwrap();
+                assert!(
+                    tile[0] >= composer[0] - 0.5
+                        && tile[0] + tile[2] <= composer[0] + composer[2] + 0.5
+                );
+                assert!(
+                    rt.presented("attachment-status-staged-fixture.png")
+                        .is_some(),
+                    "{width}: {phase:?}"
+                );
+                if matches!(phase, Phase::Failed(_)) {
+                    assert!(
+                        rt.presented("retry-attachment-staged-fixture.png")
+                            .is_some()
+                    );
+                } else {
+                    assert!(rt.state.attachment_send_block_reason().is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_file_and_folder_chips_fit_at_all_widths() {
         let path = crate::store::directory()
             .unwrap()
@@ -13869,6 +14101,58 @@ pub(crate) mod tests {
                     rt.presented(&format!("attachment-{}", attachment.id))
                         .is_none()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_file_preparation_progress_and_retry_fit_at_all_widths() {
+        use crate::attachment_uploads::{Entry, Phase};
+        let path = crate::store::directory()
+            .unwrap()
+            .join("a long staged file name.txt");
+        std::fs::write(&path, "Fixture file").unwrap();
+        let file = crate::attachments::attach_file(&path).unwrap();
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for phase in [
+                Phase::Preparing,
+                Phase::Uploading {
+                    progress: 0.499,
+                    since: std::time::Instant::now() - Duration::from_secs(1),
+                },
+                Phase::Failed("Upload failed".into()),
+            ] {
+                let mut rt = runtime(width);
+                let target = rt.state.current_mut();
+                target.draft.replace_text("Inspect");
+                target.draft.focused = true;
+                target.draft_images.push(file.clone());
+                target.insert_attachment_chips(&[file.clone()], false);
+                rt.state.attachment_uploads.entries.push(Entry::fixture(
+                    "local",
+                    1,
+                    &file,
+                    phase.clone(),
+                ));
+                rt.frame(0.0);
+                let (composer, _) = rt.presented("composer").unwrap();
+                let (row, _) = rt
+                    .presented(&format!("attachment-upload-file-{}", file.id))
+                    .unwrap();
+                assert!(
+                    row[0] >= composer[0] - 0.5
+                        && row[0] + row[2] <= composer[0] + composer[2] + 0.5
+                );
+                assert!(
+                    rt.presented(&format!("attachment-status-{}", file.id))
+                        .is_some()
+                );
+                if matches!(phase, Phase::Failed(_)) {
+                    assert!(
+                        rt.presented(&format!("retry-attachment-{}", file.id))
+                            .is_some()
+                    );
+                }
             }
         }
     }
@@ -14884,6 +15168,8 @@ pub(crate) mod tests {
                 text: format!("Screenshot batch {message}"),
                 images: (0..8)
                     .map(|image| Attachment {
+                        asset_id: None,
+                        uploaded: None,
                         id: format!("missing-{message}-{image}.png"),
                         name: format!("image {message}-{image}"),
                         mime: "image/png".into(),
@@ -15155,6 +15441,8 @@ pub(crate) mod tests {
                         text: format!("Question {turn}: keeping anchor steady."),
                         images: if turn == 35 {
                             vec![Attachment {
+                                asset_id: None,
+                                uploaded: None,
                                 id: "img-35.png".into(),
                                 name: "img-35.png".into(),
                                 mime: "image/png".into(),
