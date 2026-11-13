@@ -10552,7 +10552,7 @@ fn composer(
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
     if t.native.questionnaire.is_some() && request_visible {
-        return area.child(pi_ui::questionnaire_drawer(s, p));
+        return area.child(pi_ui::questionnaire_drawer(s, p, lane));
     }
     if request_visible {
         area = area.child(dialog(s, p));
@@ -13941,7 +13941,6 @@ pub(crate) mod tests {
                 "dialog-option-1",
                 "dialog-reply",
                 "questionnaire-next",
-                "dialog-cancel",
             ] {
                 let (rect, _) = rt
                     .presented(key)
@@ -14056,6 +14055,130 @@ pub(crate) mod tests {
                     .selected
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn question_collapse_reopens_preserves_drafts_and_blocks_hidden_shortcuts_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"collapse",
+                "method":"input","responseCapability":{"type":"message"},"questions":[
+                    {"id":"one","header":"Storage","question":"Choose **working storage**.",
+                        "multiSelect":true,"options":[{"label":"Disk"}]},
+                    {"id":"two","header":"Details","question":"Any details?","options":[]}
+                ]}));
+            rt.state.current_mut().reply.replace_text("Unsent answer");
+            rt.frame(0.0);
+            let expanded = rt.presented("questionnaire-drawer").unwrap().0;
+            press(&mut rt, "questionnaire-toggle");
+            assert!(rt.state.current().questionnaire_collapsed(), "{width}");
+            rt.frame(0.25);
+            assert!(rt.find("questionnaire-markdown").is_none());
+            assert!(rt.find("dialog-option-0").is_none());
+            assert!(rt.presented("questionnaire-summary").is_some());
+            assert!(rt.presented("questionnaire-count").is_some());
+            assert!(rt.presented("dialog-reply").is_some());
+            let collapsed = rt.presented("questionnaire-drawer").unwrap().0;
+            assert!(
+                collapsed[3] < expanded[3],
+                "{width}: {collapsed:?} {expanded:?}"
+            );
+            for key in [
+                "questionnaire-toggle",
+                "questionnaire-summary",
+                "dialog-cancel",
+            ] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5);
+                assert!(rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5);
+            }
+            assert!(!pi_ui::questionnaire_key(
+                &mut rt.state,
+                &rune::KeyEvent {
+                    key: rune::Key::Text("1".into()),
+                    mods: Default::default()
+                }
+            ));
+            press(&mut rt, "questionnaire-toggle");
+            rt.frame(0.25);
+            assert!(rt.presented("dialog-option-0").is_some());
+            assert_eq!(rt.state.current().reply.text, "Unsent answer");
+            press(&mut rt, "questionnaire-toggle");
+            press(&mut rt, "questionnaire-next");
+            rt.frame(0.25);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-summary").is_none());
+            rt.state.current_mut().respond(json!({"cancelled":true}));
+            rt.state.current_mut().apply(json!({"type":"extension_ui_request","id":"new-request",
+                "method":"input","questions":[{"id":"one","question":"New request?","options":[]}]}));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            assert!(rt.find("questionnaire-count").is_none());
+            assert!(
+                rt.find("dialog-cancel").is_none(),
+                "live questions cannot dismiss"
+            );
+        }
+    }
+
+    #[test]
+    fn question_dismissal_does_not_toggle_and_respects_responding_permissions_and_old_peers() {
+        for capability in ["message", "live", "not_resumable"] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":capability},"responseMode":"message",
+                "questions":[{"id":"one","question":"An asynchronous question?","options":[]}]}));
+            rt.frame(0.0);
+            assert!(rt.presented("dialog-cancel").is_some(), "{capability}");
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(rt.presented("questionnaire-markdown").is_some());
+            rt.state.current_mut().responding_request = None;
+            press(&mut rt, "dialog-cancel");
+            assert_eq!(
+                rt.state.current().request.is_none(),
+                capability == "message"
+            );
+            if capability != "message" {
+                assert!(rt.presented("questionnaire-markdown").is_some());
+            }
+        }
+        for (can_approve, supports_dismissal) in [(false, true), (true, false)] {
+            let mut rt = runtime(960.0);
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"extension_ui_request","id":"dismiss",
+                "method":"input","responseCapability":{"type":"message"},
+                "questions":[{"id":"one","question":"Still pending?","options":[]}]}));
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            let mut capabilities = vec![
+                crate::protocol::COMPOSER_REQUESTS,
+                crate::protocol::QUESTION_CONTRACT,
+            ];
+            if supports_dismissal {
+                capabilities.push(crate::protocol::QUESTION_DISMISS);
+            }
+            *client.info.lock().unwrap() =
+                json!({"canApprove":can_approve,"capabilities":capabilities});
+            rt.state.client = Some(client);
+            rt.frame(0.0);
+            press(&mut rt, "dialog-cancel");
+            assert!(rt.state.current().request.is_some());
+            assert!(commands.try_recv().is_err());
+            assert!(rt.presented("questionnaire-markdown").is_some());
         }
     }
 

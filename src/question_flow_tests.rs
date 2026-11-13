@@ -96,3 +96,111 @@ fn question_editor_prefill_and_independent_question_drafts_are_not_reseeded() {
     thread.questionnaire_step(false);
     assert_eq!(thread.reply.text, "edited second");
 }
+
+#[test]
+fn dismissal_only_accepts_a_pending_message_capability_and_sends_nothing() {
+    for (capability, mode, accepted) in [
+        ("message", None, true),
+        ("live", None, false),
+        ("live", Some("message"), false),
+        ("not_resumable", Some("message"), false),
+    ] {
+        let (thread, commands) = question(capability);
+        let mut state = State::new(".".into(), false);
+        state.threads = vec![thread];
+        if let Some(mode) = mode {
+            state.current_mut().request.as_mut().unwrap()["responseMode"] = json!(mode);
+            state.current_mut().prepare_remote_questionnaire();
+        }
+        state.current_mut().reply.replace_text("  Unsent answer  ");
+        let generation = state.current().request_generation.clone();
+        let command = crate::protocol::Command::new(
+            "thread.user-input.dismiss",
+            json!({"threadId":1,"requestId":"question","generation":generation}),
+        );
+        let result = state.execute_command(&command);
+        assert_eq!(result.is_ok(), accepted, "{capability}: {result:?}");
+        assert_eq!(state.current().request.is_none(), accepted);
+        let sent: Vec<_> = commands.try_iter().collect();
+        assert!(
+            !sent.iter().any(|r| matches!(
+                r["type"].as_str(),
+                Some("extension_ui_response" | "prompt" | "steer")
+            )),
+            "{sent:?}"
+        );
+        assert!(state.current().messages.is_empty());
+        if accepted {
+            assert_eq!(
+                crate::composer_rich::markdown(&state.current().draft),
+                "Ordinary draft\n\nUnsent answer"
+            );
+            assert!(
+                state
+                    .execute_command(&command)
+                    .unwrap_err()
+                    .contains("already been answered")
+            );
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                "This question needs an answer. Answer it or stop the turn."
+            );
+        }
+    }
+}
+
+#[test]
+fn dismissal_rejects_a_stale_identity_generation_and_an_approval() {
+    let (thread, commands) = question("message");
+    let mut state = State::new(".".into(), false);
+    state.threads = vec![thread];
+    for (id, generation) in [
+        ("question", "stale".to_owned()),
+        ("stale", state.current().request_generation.clone()),
+    ] {
+        assert!(
+            state
+                .execute_command(&crate::protocol::Command::new(
+                    "thread.user-input.dismiss",
+                    json!({"threadId":1,"requestId":id,"generation":generation}),
+                ))
+                .is_err()
+        );
+        assert!(state.current().request.is_some());
+    }
+    state.current_mut().request = Some(json!({"id":"approval","method":"confirm",
+        "responseCapability":{"type":"message"}}));
+    let generation = state.current().request_generation.clone();
+    assert!(
+        state
+            .execute_command(&crate::protocol::Command::new(
+                "thread.user-input.dismiss",
+                json!({"threadId":1,"requestId":"approval","generation":generation}),
+            ))
+            .is_err()
+    );
+    let sent: Vec<_> = commands.try_iter().collect();
+    assert!(
+        !sent.iter().any(|r| matches!(
+            r["type"].as_str(),
+            Some("extension_ui_response" | "prompt" | "steer")
+        )),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn message_question_dismissal_needs_no_provider_session_and_does_not_restore_an_archived_thread() {
+    let (mut thread, _) = question("message");
+    thread.pi = None;
+    thread.status = Status::Completed;
+    thread.native.dialog_status = Some(Status::Completed);
+    thread.life.archived_at = Some(lifecycle::now());
+    let mut state = State::new(".".into(), false);
+    state.threads = vec![thread];
+    state.dismiss_question(1, &json!("question")).unwrap();
+    assert!(state.current().request.is_none());
+    assert!(state.current().archived());
+    assert_eq!(state.current().status, Status::Completed);
+}

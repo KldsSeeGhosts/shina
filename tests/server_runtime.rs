@@ -34,6 +34,84 @@ struct Profile {
 }
 
 #[test]
+fn question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.command(
+        "thread.send",
+        json!({"threadId":1,"text":"dismiss-question-fixture",
+        "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    client.until(|state| {
+        state["threads"][0]["request"]["id"] == "dismiss-question"
+            && state["threads"][0]["status"] == "Completed"
+    });
+    let request = client.snapshot["threads"][0]["request"].clone();
+    let args = json!({"threadId":1,"requestId":request["id"],
+        "generation":request["runtimeGeneration"]});
+    for minor in [15, protocol::MINOR] {
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,
+            "protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("dismiss-{minor}")),
+        );
+        assert_eq!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == "question-dismiss-v1"),
+            minor >= 16
+        );
+        let id = uuid::Uuid::new_v4();
+        let result = client.command("thread.user-input.dismiss", args.clone(), id);
+        if minor < 16 {
+            assert_eq!(
+                result["error"]["message"],
+                "Update required. Update Shina on the client and server to dismiss questions."
+            );
+            assert_eq!(
+                client.snapshot["threads"][0]["request"]["id"],
+                "dismiss-question"
+            );
+        } else {
+            assert_eq!(result["result"]["status"], "accepted", "{result}");
+            client.until_sequence(result["result"]["seq"].as_u64().unwrap(), |state| {
+                state["threads"][0]["request"].is_null()
+            });
+            assert_eq!(
+                client.command("thread.user-input.dismiss", args.clone(), id)["result"],
+                result["result"],
+                "receipt replay"
+            );
+        }
+    }
+    let repeated = client.command("thread.user-input.dismiss", args, uuid::Uuid::new_v4());
+    assert!(
+        repeated.to_string().contains("already been answered"),
+        "{repeated}"
+    );
+    assert_eq!(
+        fs::read_to_string(profile.root.join("Shina/chats/1/fixture-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        !profile
+            .root
+            .join("Shina/chats/1/fixture-question-replies.jsonl")
+            .exists()
+    );
+    assert_eq!(client.snapshot["threads"][0]["status"], "Completed");
+    profile.stop();
+}
+
+#[test]
 fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
     let mut profile = Profile::new();
     profile.launch(&["serve"]);

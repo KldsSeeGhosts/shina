@@ -1,6 +1,6 @@
 # Approval and question port rules
 
-Reference checkout: `/Volumes/DevDrive/AiStack/ksgcode`.
+Reference checkout: `/Volumes/DevDrive/AiStack/ksgcode`, commit `e5ad051f44`.
 This is the source inventory recorded before implementation. Completion and
 verification are recorded separately, not implied by this inventory.
 
@@ -58,6 +58,9 @@ verification are recorded separately, not implied by this inventory.
   to reject_once, and cancel to cancelled. Automatic approval prefers
   allow_once. At 6690 an unavailable session decision downgrades to accept.
   Accept/session records turn/session policy grants.
+  At 1349 native approval option IDs trim surrounding whitespace, and empty
+  trimmed IDs are unavailable. This does not normalize the literal IDs of
+  Antigravity question choices.
 - Generic ACP supplies no custom options. Antigravity supplies Allow once,
   Allow for this thread, Deny when corresponding kinds exist, then Cancel,
   per `apps/server/src/provider/acp/AntigravityProtocol.ts:74`. It copies
@@ -67,6 +70,12 @@ verification are recorded separately, not implied by this inventory.
   offers Always allow only if no once option exists, offers Deny only for
   reject_once, and always offers Cancel. Its automatic approval cannot
   choose allow_always because that persists beyond the thread.
+- `packages/provider-grok/src/server/acpSupport.ts:103` exposes session
+  approval only for a trimmed `allow-edits-session` option ID of kind
+  allow_always. At 106 the order and wording are Cancel, Decline when
+  reject_once exists, Allow all edits this session when that session option
+  exists, and Approve when allow_once exists. Other persistent grants do
+  not appear as session approval.
 
 ## 2. Feedback and redirect
 
@@ -246,6 +255,22 @@ verification are recorded separately, not implied by this inventory.
 - At 253 dismissal says "Dismiss question without answering", does not toggle
   the card, and disables while responding. The pending request projection
   determines eligibility from the response capability and response mode.
+- `packages/client-runtime/src/state/threadRequests.ts:259` offers dismissal
+  when the response capability or recorded response mode is message. A live
+  question without that mode has no dismissal action.
+- `packages/client-runtime/src/operations/commands.ts:968` dispatches the
+  dedicated `thread.user-input.dismiss` command with thread and request IDs.
+  `Orchestrator.ts:10476` rejects absent or resolved requests with
+  "This question has already been answered." At 10500 it requires a user-input
+  request with message response capability, otherwise "This question needs an
+  answer. Answer it or stop the turn." It resolves the request as cancel.
+  `Orchestrator.ts:10338` returns without dispatching any message or provider
+  response for a cancelled message-mode request. Dismissal does not need a
+  provider session and does not require restoring an archived thread.
+- The cancelled resolution invokes the unsent-answer recovery in
+  `questionAttachments.ts:140` through `threadRequests.ts:224`. Edited custom
+  answers and their referenced thread records return to the ordinary draft,
+  but no answer is sent. Suggested, unedited prefills do not return.
 
 ## Item 1 implementation map
 
@@ -457,7 +482,8 @@ checks all four required widths.
 Cancelled/expired question resolution records travel in the minor-15 projection.
 `Thread::{abandon_question,return_unsent_question_answers}` and `ThreadView::apply`
 recover edited custom answers and referenced thread chips before pruning their
-question drafts. Explicit answers and dismissals do not recover discarded drafts.
+question drafts. Explicit answers do not recover submitted drafts.
+Dismissals recover edited, unsent custom answers as described under item 5.
 Older projections default these resolution records to an empty list, so this
 new recovery behavior is unavailable against an older server. Basic text answers
 still use the minor-14 contract.
@@ -467,6 +493,121 @@ Item 4 validation passed `cargo fmt --check`, `cargo build` and the full
 The main suite passed 1,084 tests with 11 opt-in tests ignored. The integration
 target passed all 70 tests. Native desktop interaction and paid providers remain
 unverified.
+
+## Item 5 implementation map
+
+`Thread::{questionnaire_collapsed,toggle_questionnaire}` stores the collapsed
+question ID, not a request-wide boolean. A different active question opens.
+Reopening restores the same editor and attachments. The collapse state remains
+local across a matching server projection and resets on a new request or
+unmount through thread or machine navigation.
+`pi_ui::{questionnaire_drawer,questionnaire_key}` hides only the question and
+options, not the answer editor or footer, and disables digit shortcuts while
+collapsed. The header uses KSG's exact show/hide tooltip, a truncated question
+summary when collapsed, and a position count only for multiple questions.
+
+The header preserves the existing `dialog-cancel` key for the eligible dismissal
+action and uses KSG's "Dismiss question without answering" wording. Live questions
+without message response mode no longer offer the former generic Cancel button.
+The dismiss control has its own Rune press target, so it does not toggle the
+card. Rune's `runtime/input/pointer.rs:383` dispatches a press only to its held
+target. Enter and Space use the existing focusable button behavior.
+
+`State::dismiss_question` checks capability, permission, request ownership and
+the responding lock before sending the dedicated command. Receipt handling in
+`State::poll_client` releases only that command's owning thread, including after
+navigation. `Thread::dismiss_message_question` validates the request ID,
+runtime generation, question kind and message capability before recording its
+cancelled resolution and clearing it. It calls the existing unsent-answer
+recovery, never the provider response transport or prompt send functions.
+Approvals, live callbacks and non-resumable questions cannot use this command.
+An eligible message-mode question can be dismissed without a provider session
+or restoring its archived thread.
+Provider mappings do not change in item 5. Codex's asynchronous agent-message
+questions supply message capability and are eligible. Pi, Claude and
+Antigravity's live questions are not eligible.
+
+Protocol minor 16 adds `question-dismiss-v1`. The new method requires the
+existing `approve` grant. The UI disables dismissal when the capability is
+missing. Both desktop transport and direct linked-server calls explicitly
+refuse it against an older peer. Reconnect also checks pending dismissals before
+replay. A server connection negotiated below minor 16 returns the explicit
+update-required error before the reducer. Collapse itself is local and requires
+no protocol change.
+
+The final source review also corrected item 1's ACP approval-ID trimming and
+Grok's trimmed session-option check in `acp::Client::permission` and
+`acp::acp_approval_options`. The new whitespace fixture failed before the fix.
+Antigravity question choices continue to preserve their exact native IDs.
+
+New tests first failed for the missing collapse control and unsupported dismissal
+command. Unit tests cover eligibility, stale IDs and generations, approval
+rejection, no provider answer or new turn, unsent-answer recovery, matching
+projections, new request identity and response receipts after navigation.
+The headless tests cover collapse, reopen, hidden shortcuts, preserved drafts,
+question advance, single versus multiple counts, independent dismissal,
+responding, permission and older-peer guards at the required widths.
+`question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn` checks
+minor-15 refusal, current negotiation, durable receipt replay, repeated
+dismissal rejection and no extra native answer or provider turn.
+
+## Provider summary
+
+| Provider | Approval options and warnings | Feedback | Questions and attachment answers | Dismissal |
+| --- | --- | --- | --- | --- |
+| Pi | No custom options. Uses the four defaults. Session grants last for the process-local session. | No | Native select, input and editor, plus exact RPIV recognition. Literal option values and editor prefill. Custom answers receive server-owned file references in the native string response. | No live-question dismissal |
+| Codex | Defaults for command, file-change, legacy and permission approvals. MCP form schema supplies representable persistence options and labels. | No | Normalized live questions and asynchronous message-mode questions. Live file answers use native answer arrays. Message-mode answers use KSG's question/newline/answer message format. | Message-capability asynchronous questions only |
+| Claude | Ordinary permissions use defaults or only Decline and Approve when standing grants are suppressed. MCP uses the four defaults. Reasons and safety explanations follow the adapter rules above. | Ordinary permissions only, not MCP | Trimmed AskUserQuestion data and native multi-select. File answers enter the same updatedInput answers, not another turn. | No live-question dismissal |
+| Generic ACP | No custom list. Native permission kinds select allow_once, allow_always, reject_once or cancelled, with KSG's fallback and trimming rules. | No | No user-input questions supplied | No |
+| Antigravity ACP | Native kinds supply Allow once, Allow for this thread, Deny, then Cancel. The thread option carries the bounded security warning. | No | interaction_ requests supply choice-only questions with exact native IDs. No attachments or custom answers. | No live-question dismissal |
+| Kiro ACP | Prefer Allow once. Always allow appears only when no once option exists. Deny requires reject_once. Cancel always appears. | No | No additional question contract | No |
+| Grok ACP | Cancel, optional Decline, optional Allow all edits this session for allow-edits-session only, optional Approve. | No | No additional question contract | No |
+
+## Compatibility summary
+
+Protocol major remains 1. Missing capability entries mean unsupported, not an
+optimistic fallback. Older peers retain ordinary messaging and the older
+confirmation contract. New operations do not silently become older decisions.
+
+| Minor | Capability | Behavior without it |
+| --- | --- | --- |
+| 12 | `composer-requests-v1` | New request controls are disabled. Client transport and server negotiation refuse `requestContract` decisions with the explicit update-required error. Missing projected request support is false. |
+| 13 | `approval-feedback-v1` | Feedback and approval redirect are refused before declining anything. The older projection cannot safely identify all pending approvals. |
+| 14 | `question-contract-v1` | New question responses are disabled or explicitly refused. Missing projected question support is false. |
+| 15 | `question-attachments-v1` | Question attachment intake and the attach action are unavailable. Attachment-bearing answers are explicitly refused. Minor-14 text answers remain available. Older projections do not provide the new cancelled/expired recovery records. |
+| 16 | `question-dismiss-v1` | Dismissal is disabled or explicitly refused, including after reconnect and in direct linked-server calls. Local collapse remains available. |
+
+No Rune limitation blocked a rule in this port. The frontend-design skill
+kept the new controls within Shina's existing pixel palette, fonts and helpers.
+No new visual style or provider authentication setup was introduced.
+
+## Final verification and limits
+
+The final code passed `cargo fmt --check`, `cargo build` and `cargo test`,
+with temporary `XDG_DATA_HOME` and `LOCALAPPDATA` profiles and
+`RUST_TEST_THREADS=4`. The main suite passed 1,092 tests with 11 opt-in tests
+ignored. All 71 tests in `tests/server_runtime.rs` passed.
+Three additional final runs of `cargo test --test server_runtime` each passed
+all 71 tests, in 64.35, 64.31 and 65.58 seconds.
+
+| Item | Regression tests |
+| --- | --- |
+| 1 | `approval.rs` unit tests, Pi approval/session tests, Codex and Claude native request fixtures, ACP permission fixtures, older-connection negotiation and the four-width approval-options/warnings layout test |
+| 2 | `approval_send_tests.rs`, native Claude feedback/redirect integration, old-peer refusal, background sends, upload/draft/navigation/arrival races and the four-width feedback/redirect layout test |
+| 3 | `questionnaire_contract_tests.rs`, `question_flow_tests.rs`, Pi/RPIV, Codex, Claude and Antigravity question fixtures, native choice-only integration with an older peer and the four-width choice-only/Markdown layout test |
+| 4 | `question_attachment_contract_tests.rs`, `question_attachment_tests.rs`, `question_answers.rs` and `question_document.rs` unit tests, cancelled-projection recovery tests, native file-answer/notebook-sidecar integration with an older peer and the four-width scoped-file layout test |
+| 5 | Collapse/projection/navigation tests, request/generation/capability/permission/response-lock guards, archived/sessionless dismissal, native no-answer/no-turn integration with receipt replay and old-peer refusal, and four-width collapse/reopen layout tests |
+
+No identified KSG rule remains blocked by a Shina or Rune limitation.
+Unverified work is manual native macOS and Windows interaction, installed or
+paid-provider end-to-end calls, and two actual installed mixed-build machines.
+Version-skew checks negotiate older capabilities against the current test server.
+The added document tests exercise notebook extraction and failure/cache behavior.
+Other format-specific paths use the unchanged bundled KSG worker but do not have
+separate added Rust fixtures for every parser branch and extraction bound.
+
+No subagents, push or PR were used. The protected application, live user-data
+directory, running application processes and CPA services were not modified.
 Literal pastes remain literal and do not fold into files. Copy, cut and undo use
 the existing rich-context functions on the scoped answer editor. Question images
 use file-path references, not native prompt image parts, so preparation validates

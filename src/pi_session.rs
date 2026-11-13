@@ -148,6 +148,7 @@ pub struct PiSession {
     pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
     questionnaire_advance: Option<Instant>,
+    pub(super) collapsed_question_id: Option<String>,
     pub notifications: VecDeque<(String, Instant)>,
     pub queue: VecDeque<QueuedMessage>,
     pub queue_held: bool,
@@ -709,6 +710,7 @@ impl Thread {
         self.question_submit_requested = false;
         self.native.approval_more = false;
         self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
         self.native.questionnaire = None;
         self.native.dialog_deadline = None;
         self.status =
@@ -829,6 +831,7 @@ impl Thread {
     }
 
     fn prepare_questionnaire(&mut self, request: &Value) {
+        self.native.collapsed_question_id = None;
         if !matches!(
             request["method"].as_str(),
             Some("select" | "input" | "editor")
@@ -938,6 +941,61 @@ impl Thread {
                 .is_some_and(|form| form.can_respond())
     }
 
+    /// Ported from KSG ComposerPendingUserInputCard's question-scoped collapse state.
+    pub(crate) fn questionnaire_collapsed(&self) -> bool {
+        self.native.questionnaire.as_ref().is_some_and(|form| {
+            self.native.collapsed_question_id.as_deref() == Some(&form.questions[form.index].id)
+        })
+    }
+
+    pub(crate) fn toggle_questionnaire(&mut self) {
+        self.native.collapsed_question_id = if self.questionnaire_collapsed() {
+            None
+        } else {
+            self.native
+                .questionnaire
+                .as_ref()
+                .map(|form| form.questions[form.index].id.clone())
+        };
+    }
+
+    /// KSG Orchestrator.dispatchThreadUserInputDismiss. Never invokes a provider callback.
+    pub(super) fn dismiss_message_question(
+        &mut self,
+        id: &Value,
+        generation: &str,
+    ) -> Result<(), String> {
+        if !self
+            .request
+            .as_ref()
+            .is_some_and(|request| request["id"] == *id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if generation != self.request_generation {
+            return Err("Request or runtime generation changed.".into());
+        }
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|r| r["method"] == "confirm")
+            || !self
+                .native
+                .questionnaire
+                .as_ref()
+                .is_some_and(|form| form.capability == "message")
+        {
+            return Err("This question needs an answer. Answer it or stop the turn.".into());
+        }
+        if self.responding_request.is_some() || self.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        self.abandon_question("cancelled");
+        self.request = None;
+        self.native_dialog_done();
+        Ok(())
+    }
+
     /// KSG Orchestrator.dispatchRuntimeRequestRespond's message response mode.
     pub(super) fn respond_message_question(&mut self, response: &Value) -> bool {
         if !self.native.questionnaire.as_ref().is_some_and(|form| {
@@ -1019,6 +1077,7 @@ impl Thread {
 
     pub(super) fn cancel_questionnaire_advance(&mut self) {
         self.native.questionnaire_advance = None;
+        self.native.collapsed_question_id = None;
     }
 
     pub fn questionnaire_step(&mut self, previous: bool) {
@@ -2021,5 +2080,54 @@ impl State {
         self.select_thread(self.threads.len() - 1);
         self.connect_thread(self.active);
         self.checkpoint();
+    }
+
+    pub(crate) fn dismiss_question(
+        &mut self,
+        thread_id: usize,
+        request_id: &Value,
+    ) -> Result<(), String> {
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread_id)
+            .ok_or("The thread is unavailable.")?;
+        if !thread
+            .request
+            .as_ref()
+            .is_some_and(|r| r["id"] == *request_id)
+        {
+            return Err("This question has already been answered.".into());
+        }
+        if thread.responding_request.is_some() || thread.question_submission_pending() {
+            return Err("A response to this request is already in flight.".into());
+        }
+        if let Some(client) = &self.client {
+            if !client
+                .supports_capability(&self.machines.selected, crate::protocol::QUESTION_DISMISS)
+            {
+                return Err(crate::protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into());
+            }
+            if !client.can_approve(&self.machines.selected) {
+                return Err("This connection cannot answer requests.".into());
+            }
+            let request = thread.request.as_ref().expect("checked");
+            let generation = request["runtimeGeneration"]
+                .as_str()
+                .unwrap_or(&thread.request_generation);
+            let id = client
+                .commands_for(&self.machines.selected)
+                .ok_or("This machine is disconnected.")?
+                .send(
+                    "thread.user-input.dismiss",
+                    json!({
+                        "threadId":thread_id,"requestId":request_id,"generation":generation
+                    }),
+                )?;
+            thread.responding_request = Some(id);
+            return Ok(());
+        }
+        let generation = thread.request_generation.clone();
+        thread.dismiss_message_question(request_id, &generation)
     }
 }

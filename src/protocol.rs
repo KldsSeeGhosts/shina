@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 15;
+pub const MINOR: u32 = 16;
+pub const QUESTION_DISMISS: &str = "question-dismiss-v1";
+pub const QUESTION_DISMISS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to dismiss questions.";
 pub const QUESTION_ATTACHMENTS: &str = "question-attachments-v1";
 pub const QUESTION_ATTACHMENTS_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to attach files to answers.";
@@ -81,7 +84,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.status"
         | "blobs.read"
         | "filesystem.browse" => "read",
-        "request.respond" => "approve",
+        "request.respond" | "thread.user-input.dismiss" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "peer.link"

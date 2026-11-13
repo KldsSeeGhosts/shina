@@ -4,11 +4,31 @@ use crate::model::ConversationMode;
 
 /// Ported from KSG Code's ComposerPendingUserInputPanel: header, 14 px option labels,
 /// descriptions, digit shortcuts, radio/checkbox rows and a scrollable composer replacement.
-pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
+pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
     let t = s.current();
     let form = t.native.questionnaire.as_ref().expect("questionnaire");
     let question = &form.questions[form.index];
     let answer = &form.answers[form.index];
+    let thread_id = t.id;
+    let request_id = t.request.as_ref().expect("question request")["id"].clone();
+    let question_scope = t.question_scope();
+    let toggle_scope = question_scope.clone();
+    let machine = s.machines.selected.clone();
+    let toggle_machine = machine.clone();
+    let collapsed = t.questionnaire_collapsed();
+    let toggle_title = if collapsed {
+        "Show the question and its options"
+    } else {
+        "Hide the question and its options"
+    };
+    let dismissible =
+        form.capability == "message" || form.response_mode.as_deref() == Some("message");
+    let dismissal_disabled = t.responding_request.is_some()
+        || t.question_submission_pending()
+        || s.client.as_ref().is_some_and(|c| {
+            !c.can_approve(&s.machines.selected)
+                || !c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_DISMISS)
+        });
     let disabled = !t.questionnaire_can_respond()
         || s.client.as_ref().is_some_and(|c| {
             !c.can_approve(&s.machines.selected)
@@ -109,20 +129,88 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                 .box_shadow(hard_shadow(p))
                 .child(
                     row()
+                        .key("questionnaire-toggle")
+                        .role("button")
+                        .label(toggle_title)
+                        .help(toggle_title)
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .py(6.0)
                         .gap(8.0)
+                        .on_press(move |s: &mut State| {
+                            if s.current().id == thread_id
+                                && s.machines.selected == toggle_machine
+                                && s.current().question_scope() == toggle_scope
+                            {
+                                s.current_mut().toggle_questionnaire();
+                            }
+                        })
                         .child(
                             pixel_label(&question.header, p.muted)
-                                .grow(1.0)
+                                .grow(if collapsed { 0.0 } else { 1.0 })
+                                .max_w(if collapsed {
+                                    (lane - 32.0).max(0.0) * 0.5
+                                } else {
+                                    f32::INFINITY
+                                })
                                 .min_w(0.0)
                                 .truncate(),
                         )
-                        .child(label(
-                            format!("{}/{}", form.index + 1, form.questions.len()),
-                            TIMER,
-                            p.muted,
-                        )),
+                        .child(if collapsed {
+                            row()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(4.0)
+                                .child(label("·", SMALL, p.faint))
+                                .child(
+                                    label(&question.text, SMALL, p.muted)
+                                        .key("questionnaire-summary")
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate(),
+                                )
+                        } else {
+                            el()
+                        })
+                        .child(if form.questions.len() > 1 {
+                            label(
+                                format!("{}/{}", form.index + 1, form.questions.len()),
+                                TIMER,
+                                p.muted,
+                            )
+                            .key("questionnaire-count")
+                        } else {
+                            el()
+                        })
+                        .child(
+                            icon(if collapsed { "chevron-up" } else { "chevron" }, p.muted)
+                                .a11y_hidden(),
+                        )
+                        .child(if dismissible {
+                            icon_button(
+                                "dialog-cancel",
+                                "Dismiss question without answering",
+                                "close",
+                                p,
+                                move |s| {
+                                    if s.current().id != thread_id
+                                        || s.machines.selected != machine
+                                        || s.current().question_scope() != question_scope
+                                    {
+                                        return;
+                                    }
+                                    if let Err(error) = s.dismiss_question(thread_id, &request_id) {
+                                        s.current_mut().error = Some(error);
+                                    }
+                                },
+                            )
+                            .help("Dismiss question without answering")
+                            .disabled(dismissal_disabled)
+                        } else {
+                            el()
+                        }),
                 )
-                .child(
+                .child(if !collapsed {
                     col()
                         .key("questionnaire-scroll")
                         .w_full()
@@ -143,8 +231,10 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                             )
                             .key("questionnaire-markdown"),
                         )
-                        .child(options),
-                )
+                        .child(options)
+                } else {
+                    el()
+                })
                 .child(if question.allow_custom {
                     text_input(&t.reply, BODY)
                         .key("dialog-reply")
@@ -256,12 +346,6 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                             )
                             .disabled(disabled || !can_advance || last && !live_form.complete()),
                         )
-                        .child(
-                            secondary_button("dialog-cancel", "Cancel", p, |s| {
-                                s.current_mut().respond(json!({"cancelled":true}))
-                            })
-                            .disabled(disabled),
-                        )
                         .child(if t.status.busy() || t.stop_control.phase().is_some() {
                             icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
                                 s.current_mut().stop();
@@ -281,6 +365,7 @@ pub(crate) fn questionnaire_key(s: &mut State, event: &rune::KeyEvent) -> bool {
         || s.current().reply.focused
         || s.current().draft.focused
         || s.search.focused
+        || s.current().questionnaire_collapsed()
         || !s.current().questionnaire_can_respond()
         || s.client.as_ref().is_some_and(|c| {
             !c.can_approve(&s.machines.selected)

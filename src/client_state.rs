@@ -447,6 +447,7 @@ impl ThreadView {
         thread.requests_supported = self.requests_supported;
         thread.question_contract_supported = self.question_contract_supported;
         if changed_request {
+            thread.native.collapsed_question_id = None;
             thread.question_drafts.clear();
             thread.question_submission = None;
             thread.question_submit_requested = false;
@@ -1202,7 +1203,10 @@ impl State {
                 }
             }
             if let crate::client::Event::Receipt(command, value) = &event
-                && command.method == "request.respond"
+                && matches!(
+                    command.method.as_str(),
+                    "request.respond" | "thread.user-input.dismiss"
+                )
             {
                 self.approval_response_receipt(command, value);
                 // Linked task cards live on their parent's machine, not the answering host.
@@ -3135,6 +3139,13 @@ impl State {
             } else {
                 ConversationMode::Fork
             }),
+            "thread.user-input.dismiss" => {
+                if args.get("requestId").is_none_or(Value::is_null) {
+                    return Err("requestId is required.".into());
+                }
+                self.current_mut()
+                    .dismiss_message_question(&args["requestId"], &text("generation")?)?;
+            }
             "request.respond" => {
                 let input: crate::protocol::RequestResponse =
                     serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
@@ -3417,6 +3428,68 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_collapse_survives_matching_projections_but_not_a_new_request_or_navigation() {
+        let mut server = Thread::new(1);
+        server.apply(
+            json!({"type":"extension_ui_request","id":"one","method":"input",
+            "questions":[{"id":"same-question","question":"Keep the draft?","options":[]}]}),
+        );
+        let mut desktop = Thread::new(1);
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        desktop.reply.replace_text("Local answer");
+        desktop.toggle_questionnaire();
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        assert!(desktop.questionnaire_collapsed());
+        assert_eq!(desktop.reply.text, "Local answer");
+        server.request.as_mut().unwrap()["id"] = json!("two");
+        ThreadView::capture(&server).apply(&mut desktop).unwrap();
+        assert!(!desktop.questionnaire_collapsed());
+        desktop.toggle_questionnaire();
+        assert!(desktop.questionnaire_collapsed());
+        desktop.cancel_questionnaire_advance();
+        assert!(!desktop.questionnaire_collapsed());
+    }
+
+    #[test]
+    fn question_dismissal_receipts_release_only_the_owning_lock_after_navigation() {
+        let mut state = State::new(".".into(), false);
+        let (client, mut commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"canApprove":true,
+            "capabilities":[crate::protocol::QUESTION_DISMISS]});
+        state.client = Some(client);
+        state.current_mut().apply(
+            json!({"type":"extension_ui_request","id":"dismiss","method":"input",
+            "responseCapability":{"type":"message"},
+            "questions":[{"id":"one","question":"Keep it?","options":[]}]}),
+        );
+        state.dismiss_question(1, &json!("dismiss")).unwrap();
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.method, "thread.user-input.dismiss");
+        assert_eq!(command.params["requestId"], "dismiss");
+        assert!(command.params.get("answers").is_none());
+        assert!(command.params.get("response").is_none());
+        assert_eq!(
+            state.threads[0].responding_request,
+            Some(command.command_id)
+        );
+        assert!(state.dismiss_question(1, &json!("dismiss")).is_err());
+        state.threads.push(Thread::new(2));
+        state.active = 1;
+        state.client.as_ref().unwrap().test_receipt(
+            command,
+            json!({"error":{"message":"This question has already been answered."}}),
+        );
+        state.poll_client(&mut Tx::default());
+        assert!(state.threads[0].responding_request.is_none());
+        assert!(state.threads[0].request.is_some());
+        assert_eq!(
+            state.threads[0].error.as_deref(),
+            Some("This question has already been answered.")
+        );
+        assert!(state.threads[1].error.is_none());
+    }
 
     #[test]
     fn cancelled_question_projections_recover_unsent_custom_text_but_answers_do_not() {

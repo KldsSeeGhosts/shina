@@ -899,6 +899,8 @@ impl Client {
                     .iter()
                     .find(|o| o["kind"] == *kind)
                     .and_then(|o| o["optionId"].as_str())
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
                     .map(str::to_owned)
             })
         };
@@ -1231,10 +1233,12 @@ fn acp_approval_options(
         if find("reject_once").is_some() {
             result.push(option("decline", "Decline"));
         }
-        if options
-            .iter()
-            .any(|o| o["kind"] == "allow_always" && o["optionId"] == "allow-edits-session")
-        {
+        if options.iter().any(|o| {
+            o["kind"] == "allow_always"
+                && o["optionId"]
+                    .as_str()
+                    .is_some_and(|id| id.trim() == "allow-edits-session")
+        }) {
             result.push(option("acceptForSession", "Allow all edits this session"));
         }
         if find("allow_once").is_some() {

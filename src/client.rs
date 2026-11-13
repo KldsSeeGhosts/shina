@@ -734,6 +734,19 @@ async fn supervise(
                             owned_instance = Some(discovery.instance_id);
                         }
                         let mut sent = true;
+                        pending.retain(|command| {
+                            if command.method == "thread.user-input.dismiss"
+                                && !hello["capabilities"].as_array().is_some_and(|caps| {
+                                    caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS)
+                                })
+                            {
+                                let _ = output.try_send(Event::Receipt(command.clone(), json!({"error":{"message":protocol::QUESTION_DISMISS_UPDATE_REQUIRED}})));
+                                wake();
+                                false
+                            } else {
+                                true
+                            }
+                        });
                         for command in &pending {
                             match uploaded_command(
                                 command,
@@ -810,6 +823,14 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.method == "thread.user-input.dismiss"
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTION_DISMISS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if command.params["questionAttachments"] == true
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_ATTACHMENTS))
@@ -1772,6 +1793,15 @@ async fn remote_request_outcome(
         .await?;
         if command.method == "hello" {
             return Ok(RemoteResponse::Receipt(hello));
+        }
+        if command.method == "thread.user-input.dismiss"
+            && !hello["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_DISMISS))
+        {
+            return Ok(RemoteResponse::Refused(
+                protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into(),
+            ));
         }
         for (marker, capability, error) in [
             (

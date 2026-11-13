@@ -63,6 +63,49 @@ fn approval_options_and_wire_mapping_do_not_promote_decline_to_persistent_reject
 }
 
 #[test]
+fn approval_option_ids_trim_whitespace_without_changing_literal_interaction_values() {
+    let request = json!({"id":42,"params":{"sessionId":"session",
+        "toolCall":{"toolCallId":"tool","kind":"execute"},
+        "options":[{"optionId":" once ","kind":"allow_once"},
+            {"optionId":" allow-edits-session ","kind":"allow_always"},
+            {"optionId":" no ","kind":"reject_once"}]}});
+    for (decision, expected) in [
+        ("accept", "once"),
+        ("acceptForSession", "allow-edits-session"),
+        ("decline", "no"),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.permission(&request).unwrap();
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":decision}))
+            .unwrap();
+        assert_eq!(
+            client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+            expected
+        );
+    }
+    assert!(
+        acp_approval_options("grok", &request["params"])
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    let mut blank = request;
+    blank["params"]["options"][0]["optionId"] = json!("   ");
+    let mut client = Client::new(spec(SessionSource::New));
+    client.permission(&blank).unwrap();
+    let key = client.events.last().unwrap()["id"].clone();
+    client
+        .command(json!({"type":"extension_ui_response","id":key,"decision":"accept"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["outcome"],
+        "cancelled"
+    );
+}
+
+#[test]
 fn provider_approval_option_lists_preserve_warnings_and_persistent_grant_restrictions() {
     let params = json!({"toolCall":{"toolCallId":"tool"},"options":[
         {"kind":"allow_once","optionId":"once"},
