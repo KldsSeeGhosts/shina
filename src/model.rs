@@ -4156,6 +4156,17 @@ pub struct State {
     pub viewport_height: f32,
     pub viewport_width: f32,
     pub sidebar_width: f32,
+    /// The right panel's width, one app-wide value saved in the UI snapshot.
+    pub right_panel_width: f32,
+    /// Per-thread right-panel state: surfaces, open and maximized. Session only; only the
+    /// width is saved.
+    pub right_panels: crate::right_panel::RightPanels,
+    /// The right-panel tab context menu: the surface it opened on, and its anchor in window
+    /// points, as `row_menu_at` holds the thread menu's. The panel view uses both.
+    pub right_panel_menu: Option<String>,
+    pub right_panel_menu_at: Option<(f32, f32)>,
+    /// The resize handle is mid-drag: the edge line turns coral.
+    pub right_panel_resizing: bool,
     pub ui_store: Option<crate::store::Store>,
     last_sweep: u64,
     last_lifecycle_clock: u64,
@@ -4428,6 +4439,11 @@ impl State {
             viewport_height: 720.0,
             viewport_width: 1280.0,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            right_panel_width: crate::right_panel::DEFAULT_WIDTH,
+            right_panels: Default::default(),
+            right_panel_menu: None,
+            right_panel_menu_at: None,
+            right_panel_resizing: false,
             ui_store: None,
             last_sweep: 0,
             last_lifecycle_clock: 0,
@@ -4552,6 +4568,51 @@ impl State {
     }
     pub fn current_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.active]
+    }
+    /// The key the current thread's right-panel state lives under: machine plus thread id, so
+    /// the same numeric id on two hosts stays separate.
+    pub fn panel_key(&self) -> String {
+        let t = self.current();
+        crate::right_panel::key(&t.machine, t.id)
+    }
+    /// The current thread's panel state; a default (closed, empty) one when it has none.
+    pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
+        self.right_panels.get(&self.panel_key())
+    }
+    /// `rightPanel.toggle`: hide an open panel, show it when it has surfaces, and open the
+    /// Diff surface on a thread that has none yet (KSG's `toggleRightPanel`).
+    pub fn right_panel_toggle(&mut self) {
+        let key = self.panel_key();
+        if self.right_panels.get(&key).surfaces.is_empty() {
+            self.right_panels
+                .open(&key, crate::right_panel::SingletonKind::Diff);
+        } else {
+            self.right_panels.toggle_visibility(&key);
+        }
+    }
+    /// `diff.toggle`: KSG's `onToggleDiff`, the Diff surface's toggle.
+    pub fn right_panel_toggle_diff(&mut self) {
+        let key = self.panel_key();
+        self.right_panels
+            .toggle(&key, crate::right_panel::SingletonKind::Diff);
+    }
+    /// `rightPanel.toggleMaximized`: KSG gates it on the panel being open.
+    pub fn right_panel_toggle_maximized(&mut self) {
+        let key = self.panel_key();
+        let panel = self.right_panels.get(&key);
+        if panel.open {
+            self.right_panels.set_maximized(&key, !panel.maximized);
+        }
+    }
+    /// `rightPanel.close`: closes the active surface; returns false when the panel has none,
+    /// so the shortcut can fall through, as KSG's handler does.
+    pub fn right_panel_close_active(&mut self) -> bool {
+        let key = self.panel_key();
+        let Some(surface) = self.right_panels.active_surface(&key) else {
+            return false;
+        };
+        self.right_panels.close_surface(&key, &surface.id());
+        true
     }
     pub fn expire_undo(&mut self) -> bool {
         let at = lifecycle::now();
@@ -6169,8 +6230,10 @@ impl State {
                     .copied()
             });
         let mut parents = Vec::new();
+        let mut panel_keys = Vec::new();
         for thread in &mut self.threads {
             if ids.contains(&thread.id) {
+                panel_keys.push(crate::right_panel::key(&thread.machine, thread.id));
                 let _ = thread.stop_task();
                 thread.disconnect();
                 if let Some(parent) = thread.parent.filter(|id| !ids.contains(id)) {
@@ -6198,6 +6261,10 @@ impl State {
             }
         });
         self.deleted_threads.extend(removed);
+        // Panel state is per thread: a deleted thread's goes with it.
+        for key in panel_keys {
+            self.right_panels.forget(&key);
+        }
         self.captain_homes.retain(|_, home| !ids.contains(home));
         self.sync_memory_links();
         self.tasks.retain(|task| {
@@ -13574,6 +13641,7 @@ impl State {
             "preferences": prefs_value,
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "rightPanelWidth":self.right_panel_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
@@ -13663,6 +13731,17 @@ impl State {
             })
             .transpose()?
             .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+        // Panel state itself is session-only; the width is the one saved value.
+        self.right_panel_width = ui
+            .get("rightPanelWidth")
+            .map(|v| {
+                v.as_f64()
+                    .filter(|n| n.is_finite())
+                    .map(|n| n.max(crate::right_panel::MIN_WIDTH as f64) as f32)
+                    .ok_or("Invalid right panel width.")
+            })
+            .transpose()?
+            .unwrap_or(crate::right_panel::DEFAULT_WIDTH);
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
@@ -22349,5 +22428,196 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // `rightPanel.toggle`: an empty thread opens the Diff surface; an open one hides and
+    // re-shows keeping its surfaces (KSG `toggleRightPanel`).
+    #[test]
+    fn right_panel_toggle_opens_diff_then_hides_and_reshows() {
+        let mut state = State::new(".".into(), false);
+
+        // Empty thread: opens the Diff surface.
+        state.right_panel_toggle();
+        let panel = state.right_panel();
+        assert!(panel.open);
+        assert_eq!(panel.active.as_deref(), Some("diff"));
+
+        // Open panel on Diff: hides, keeping the surface and the tab selection.
+        state.right_panel_toggle();
+        let hidden = state.right_panel();
+        assert!(!hidden.open);
+        assert_eq!(hidden.active.as_deref(), Some("diff"));
+        assert_eq!(hidden.surfaces.len(), 1);
+
+        // Hidden with surfaces: re-shows on the same tab.
+        state.right_panel_toggle();
+        let shown = state.right_panel();
+        assert!(shown.open);
+        assert_eq!(shown.active.as_deref(), Some("diff"));
+
+        // Open on a file: hides too.
+        let key = state.panel_key();
+        state.right_panels.open_file(&key, "src/main.rs", Some(7));
+        state.right_panel_toggle();
+        let hidden = state.right_panel();
+        assert!(!hidden.open);
+        assert_eq!(hidden.active.as_deref(), Some("file:src/main.rs"));
+    }
+
+    // `diff.toggle` on an open file tab activates Diff without hiding; on Diff it hides.
+    #[test]
+    fn right_panel_toggle_diff_switches_or_hides() {
+        let mut state = State::new(".".into(), false);
+
+        state.right_panel_toggle_diff();
+        assert_eq!(state.right_panel().active.as_deref(), Some("diff"));
+
+        let key = state.panel_key();
+        state.right_panels.open_file(&key, "src/main.rs", None);
+        state.right_panel_toggle_diff();
+        let switched = state.right_panel();
+        assert!(switched.open);
+        assert_eq!(switched.active.as_deref(), Some("diff"));
+
+        state.right_panel_toggle_diff();
+        assert!(!state.right_panel().open);
+    }
+
+    // `rightPanel.toggleMaximized` flips a maximized flag, but only on an open panel
+    // (KSG's `canMaximizeRightPanel`).
+    #[test]
+    fn right_panel_toggle_maximized_needs_an_open_panel() {
+        let mut state = State::new(".".into(), false);
+
+        // Closed and empty: nothing to maximize, and no stale flag is kept.
+        state.right_panel_toggle_maximized();
+        assert_eq!(
+            state.right_panel(),
+            crate::right_panel::ThreadPanel::default()
+        );
+
+        state.right_panel_toggle();
+        state.right_panel_toggle_maximized();
+        assert!(state.right_panel().maximized);
+        state.right_panel_toggle_maximized();
+        assert!(!state.right_panel().maximized);
+    }
+
+    // `rightPanel.close` closes only the active surface and reports whether it did.
+    #[test]
+    fn right_panel_close_active_closes_one_surface() {
+        let mut state = State::new(".".into(), false);
+
+        // No surfaces: reports false so the key can fall through.
+        assert!(!state.right_panel_close_active());
+
+        state.right_panel_toggle();
+        let key = state.panel_key();
+        state.right_panels.open_file(&key, "src/main.rs", None);
+        assert!(state.right_panel_close_active());
+        let panel = state.right_panel();
+        assert!(panel.open);
+        assert_eq!(panel.active.as_deref(), Some("diff"));
+
+        // Closing the last surface closes the panel too.
+        assert!(state.right_panel_close_active());
+        assert_eq!(
+            state.right_panel(),
+            crate::right_panel::ThreadPanel::default()
+        );
+        assert!(!state.right_panel_close_active());
+    }
+
+    // Two threads keep separate panel state: machine plus thread id is the key.
+    #[test]
+    fn right_panel_state_is_per_thread() {
+        let mut state = State::new(".".into(), false);
+        let first_key = state.panel_key();
+        state.right_panel_toggle();
+        state.right_panel_toggle_maximized();
+
+        // A second thread with its own key starts closed and empty.
+        let other = Thread::new(state.current().id + 1);
+        state.threads.push(other);
+        state.select_thread(1);
+        let second_key = state.panel_key();
+        assert_ne!(first_key, second_key);
+        assert_eq!(
+            state.right_panel(),
+            crate::right_panel::ThreadPanel::default()
+        );
+
+        state.right_panel_toggle();
+        let key = state.panel_key();
+        state.right_panels.open_file(&key, "src/lib.rs", None);
+
+        // Back on the first thread its Diff surface is still open and maximized.
+        state.select_thread(0);
+        let panel = state.right_panel();
+        assert!(panel.open);
+        assert!(panel.maximized);
+        assert_eq!(panel.active.as_deref(), Some("diff"));
+
+        // Deleting a thread forgets its panel state.
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(state.threads[1].id);
+        state.remove_threads(&ids);
+        assert_eq!(
+            state.right_panels.get(&second_key),
+            crate::right_panel::ThreadPanel::default()
+        );
+    }
+
+    // The width is the one panel value saved with the UI snapshot.
+    #[test]
+    fn right_panel_width_survives_the_ui_snapshot() {
+        let mut state = State::new(".".into(), false);
+        state.right_panel_width = 620.0;
+        // Panel state itself is session-only and never serialized.
+        state.right_panel_toggle();
+        state.right_panel_toggle_maximized();
+
+        let ui = state.ui_snapshot();
+        assert_eq!(ui["rightPanelWidth"].as_f64(), Some(620.0));
+        assert!(ui.get("rightPanels").is_none());
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&ui).unwrap();
+        assert_eq!(restored.right_panel_width, 620.0);
+        assert_eq!(
+            restored.right_panel(),
+            crate::right_panel::ThreadPanel::default()
+        );
+
+        // Snapshots from before the field existed keep the default width.
+        let mut legacy = state.ui_snapshot();
+        legacy.as_object_mut().unwrap().remove("rightPanelWidth");
+        let mut restored = State::new(".".into(), false);
+        restored.restore_ui(&legacy).unwrap();
+        assert_eq!(
+            restored.right_panel_width,
+            crate::right_panel::DEFAULT_WIDTH
+        );
+
+        // Garbage values fail validation instead of sticking.
+        let mut bad = state.ui_snapshot();
+        bad["rightPanelWidth"] = serde_json::json!("wide");
+        assert!(restored.restore_ui(&bad).is_err());
+        // A width below the minimum restores clamped to it.
+        let mut low = state.ui_snapshot();
+        low["rightPanelWidth"] = serde_json::json!(10.0);
+        restored.restore_ui(&low).unwrap();
+        assert_eq!(restored.right_panel_width, crate::right_panel::MIN_WIDTH);
+    }
+
+    // `rightPanelOpen` in the shortcut context follows the current thread's panel.
+    #[test]
+    fn right_panel_open_flag_follows_the_panel() {
+        let mut state = State::new(".".into(), false);
+        assert!(!state.shortcut_context(false).right_panel_open);
+        state.right_panel_toggle();
+        assert!(state.shortcut_context(false).right_panel_open);
+        state.right_panel_toggle();
+        assert!(!state.shortcut_context(false).right_panel_open);
     }
 }

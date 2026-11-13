@@ -817,6 +817,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
     let zoom = s.zoom.clamp(0.5, 2.0);
+    // The right panel's tab strip matches the native titlebar's strip height, so tabs and
+    // the window's controls sit on the same centre line as the thread tabs.
+    let strip_h = chrome.height.max(40.0 * zoom) / zoom;
     // Pixel art is scaled to whole device pixels for this scale, so tell it what that is.
     s.artwork.set_scale(cx.env().scale * zoom);
     let leading = if chrome.leading > 0.0 {
@@ -924,7 +927,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.show_activity && !brief && (narrow || s.activity_full) {
         pane = pane.child(activity(s, p, true));
     } else {
-        let mut body = row().grow(1.0).min_h(0.0);
+        let mut body = row().key("chat-body").grow(1.0).min_h(0.0);
         let main = composer_ui::motion_host(
             s,
             col()
@@ -974,7 +977,33 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     composer_caret_edges(cx, zoom),
                 ))
         };
-        body = body.child(main);
+        // The thread's right panel sits at the conversation's right edge inside this row
+        // (KSG Code's `ChatRightPanel`). Where it cannot fit beside a 360 px conversation
+        // it covers the conversation column instead, like KSG's `RightPanelSheet`; a
+        // maximized panel covers it at any width.
+        let panel = s.right_panel();
+        let panel_open = panel.open && !panel.surfaces.is_empty();
+        let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
+            let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+            cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
+                .unwrap_or(900.0)
+        });
+        let covering = panel_open && (panel.maximized || crate::right_panel::covers(body_width));
+        let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
+        if covering {
+            main_wrap = main_wrap.child(right_panel(s, p, zoom, strip_h, None).pin(
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+            ));
+        }
+        body = body.child(main_wrap);
+        if panel_open && !covering {
+            let max = crate::right_panel::max_width(s.viewport_width, body_width);
+            let width = crate::right_panel::clamp_width(s.right_panel_width, max);
+            body = body.child(right_panel(s, p, zoom, strip_h, Some(max)).w(width));
+        }
         context_popover_shown = true;
         if brief && !narrow {
             body = body
@@ -1087,6 +1116,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             );
         }
         root = root.child(row_menu(s, p));
+    }
+    if s.right_panel_menu.is_some() {
+        if let Some((x, y)) = s.right_panel_menu_at {
+            root = root.child(
+                el().key("right-panel-tab-menu-point")
+                    .absolute(x / zoom, y / zoom)
+                    .size(0.0, 0.0),
+            );
+        }
+        root = root.child(right_panel_tab_menu(s, p));
     }
     if s.snooze_menu.is_some() {
         root = root.child(snooze_menu(s, p));
@@ -6457,6 +6496,406 @@ fn reveal_active_tab(s: &State, tab_width: f32, tabs_width: f32) -> El {
                 tx.scroll_into_view("active-tab");
             }
         })
+}
+
+/// Ported from KSG Code's `surfaceTitle`: the diff view and the file explorer name
+/// themselves; a file or attachment tab shows its base name.
+fn right_panel_title(surface: &crate::right_panel::Surface) -> String {
+    match surface {
+        crate::right_panel::Surface::Diff => "Diff".to_string(),
+        crate::right_panel::Surface::Files => "Files".to_string(),
+        crate::right_panel::Surface::File { path, .. } => base_name(path).to_string(),
+        crate::right_panel::Surface::Attachment { name, .. } => base_name(name).to_string(),
+    }
+}
+
+fn base_name(path: &str) -> &str {
+    let after = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    &path[after..]
+}
+
+/// Ported from KSG Code's `RightPanelTab`: `h-6 max-w-36 rounded-md gap-0.5 pl-1.5 pr-2`.
+/// The slot at the left shows the surface icon and swaps to the close button on hover or
+/// when the tab is active, like the thread tabs' `attachment_remove` overlay.
+fn right_panel_tab(
+    s: &State,
+    p: Palette,
+    panel: &crate::right_panel::ThreadPanel,
+    surface: &crate::right_panel::Surface,
+) -> El {
+    let id = surface.id();
+    let active = panel.active.as_deref() == Some(id.as_str());
+    let title = right_panel_title(surface);
+    let glyph = match surface {
+        crate::right_panel::Surface::Diff => "list",
+        crate::right_panel::Surface::Files => "folder",
+        crate::right_panel::Surface::File { .. } => "file",
+        crate::right_panel::Surface::Attachment { .. } => "paperclip",
+    };
+    // The close button sits in the icon slot only while it can be seen: on hover of the
+    // tab, or on the active tab (KSG's `group-hover:visible / isActive && visible`).
+    let close_face = {
+        let thread_key = s.panel_key();
+        let surface_id = id.clone();
+        el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .key(format!("right-panel-tab-close-{id}"))
+            .role("button")
+            .label("Close tab")
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .center()
+            .radius(4.0)
+            .hover(p.selected)
+            .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
+            .on_press(move |s: &mut State| {
+                s.right_panels.close_surface(&thread_key, &surface_id);
+            })
+            .child(tool_icon("close", p.ink))
+    };
+    let tab_key = format!("right-panel-tab-{id}");
+    let key_for_press = s.panel_key();
+    let id_for_press = id.clone();
+    let id_for_menu = id.clone();
+    tab_frame(
+        row()
+            .key(tab_key.clone())
+            .role("tab")
+            .label(format!("{title} tab"))
+            .focusable(true)
+            .cursor(rune::Cursor::Pointer)
+            .pointer_buttons([rune::PointerButton::Middle])
+            .hover_group()
+            .center_y()
+            .h(24.0)
+            .min_w(0.0)
+            .max_w(144.0)
+            .pl(6.0)
+            .pr(8.0)
+            .gap(2.0)
+            .on_press_tx(move |s: &mut State, tx| {
+                // KSG: a middle click closes the tab; any other press activates it.
+                if tx.button() == rune::PointerButton::Middle {
+                    s.right_panels.close_surface(&key_for_press, &id_for_press);
+                } else {
+                    s.right_panels.activate(&key_for_press, &id_for_press);
+                    tx.scroll_into_view_in("right-panel-tabs", tab_key.clone());
+                }
+            })
+            .on_secondary_press(move |s: &mut State, at, _| {
+                s.right_panel_menu = Some(id_for_menu.clone());
+                s.right_panel_menu_at = Some((at.x, at.y));
+            })
+            .child(
+                el().size(20.0, 20.0)
+                    .radius(4.0)
+                    .center()
+                    .child(icon(glyph, p.ink).size(12.0, 12.0))
+                    .child(close_face),
+            )
+            .child(
+                label(
+                    title,
+                    TextStyle::new(13.0, 450.0),
+                    if active { p.ink } else { p.muted },
+                )
+                .truncate(),
+            ),
+        active,
+        p,
+    )
+}
+
+/// Scrolls the strip so the active panel tab shows whole, each time the selection or the
+/// tab list changes, on the `reveal_active_tab` marker trick.
+fn reveal_right_panel_tab(panel: &crate::right_panel::ThreadPanel) -> El {
+    use std::hash::{Hash, Hasher};
+    let mut signature = std::collections::hash_map::DefaultHasher::new();
+    panel.surfaces.len().hash(&mut signature);
+    for surface in &panel.surfaces {
+        surface.id().hash(&mut signature);
+    }
+    panel.active.hash(&mut signature);
+    let key = panel.active.clone().unwrap_or_default();
+    el().key(format!("right-panel-tab-reveal-{:x}", signature.finish()))
+        .absolute(0.0, 0.0)
+        .size(1.0, 1.0)
+        .a11y_hidden()
+        .on_visible(move |_: &mut State, visible, tx| {
+            if visible && !key.is_empty() {
+                tx.instant();
+                tx.scroll_into_view_in("right-panel-tabs", format!("right-panel-tab-{key}"));
+            }
+        })
+}
+
+/// Ported from KSG Code's `RightPanelTabs` strip: `h-(--workspace-topbar-height) pl-2`,
+/// a horizontally scrolling tab list, then the maximize and close controls `gap-0.5`
+/// apart. Shina's strip matches the native titlebar height instead of the web's 52 px.
+fn right_panel_strip(s: &State, p: Palette, strip_h: f32) -> El {
+    let panel = s.right_panel();
+    let mut tabs = row()
+        .key("right-panel-tabs")
+        .grow(1.0)
+        .min_w(0.0)
+        .center_y()
+        .gap(4.0)
+        .scroll_x()
+        // Tabs hidden past an edge fade out, so a clipped strip reads as scrollable.
+        .scroll_edge_fade(12.0);
+    for surface in &panel.surfaces {
+        tabs = tabs.child(right_panel_tab(s, p, &panel, surface));
+    }
+    row()
+        .key("right-panel-strip")
+        .h(strip_h)
+        .pl(8.0)
+        .pr(12.0)
+        .center_y()
+        .gap(4.0)
+        .child(tabs)
+        .child(reveal_right_panel_tab(&panel))
+        .child(
+            row()
+                .center_y()
+                .gap(2.0)
+                .child(icon_button(
+                    "right-panel-maximize",
+                    if panel.maximized {
+                        "Restore panel"
+                    } else {
+                        "Maximize panel"
+                    },
+                    if panel.maximized {
+                        "minimize"
+                    } else {
+                        "expand"
+                    },
+                    p,
+                    |s: &mut State| s.right_panel_toggle_maximized(),
+                ))
+                .child(icon_button(
+                    "right-panel-close",
+                    "Close panel",
+                    "close",
+                    p,
+                    move |s: &mut State| {
+                        let key = s.panel_key();
+                        s.right_panels.close(&key);
+                    },
+                )),
+        )
+}
+
+/// Ported from KSG Code's `RightPanelResizeHandle`: a 4 px hit strip pinned on the panel's
+/// left edge, holding a 1 px line that shows `p.frame` on hover and `p.coral` while
+/// dragging. Left/Right step by KSG's 16 px; Home/End jump to the minimum and maximum.
+fn right_panel_resize(s: &State, p: Palette, zoom: f32, max: f32) -> El {
+    let dragging = s.right_panel_resizing;
+    el().key("right-panel-resize")
+        .role("separator")
+        .label("Resize panel")
+        .focusable(true)
+        .w(4.0)
+        .h_full()
+        .cursor(rune::Cursor::ResizeColumn)
+        .hover_group()
+        .center()
+        .pin(Some(0.0), Some(0.0), None, Some(0.0))
+        .on_drag(move |s: &mut State, drag, _| {
+            if drag.phase == rune::Phase::Down {
+                drag.data = s.right_panel_width;
+                s.right_panel_resizing = true;
+            }
+            if drag.cancelled() {
+                s.right_panel_width = drag.data;
+            } else {
+                // The handle sits on the left edge, so dragging left widens the panel.
+                let width = drag.data - drag.dx / zoom;
+                s.right_panel_width = crate::right_panel::clamp_width(width, max);
+            }
+            if drag.phase == rune::Phase::Up {
+                s.right_panel_resizing = false;
+                s.checkpoint();
+            }
+        })
+        .on_key(move |s: &mut State, ev, _| {
+            use crate::right_panel::{KEYBOARD_STEP, MIN_WIDTH};
+            let next = match ev.key {
+                rune::Key::Left => Some(s.right_panel_width - KEYBOARD_STEP),
+                rune::Key::Right => Some(s.right_panel_width + KEYBOARD_STEP),
+                rune::Key::Home => Some(MIN_WIDTH),
+                rune::Key::End => Some(max),
+                _ => None,
+            };
+            let Some(next) = next else {
+                return false;
+            };
+            s.right_panel_width = crate::right_panel::clamp_width(next, max);
+            s.checkpoint();
+            true
+        })
+        .child(
+            el().w(1.0)
+                .h_full()
+                .a11y_hidden()
+                .fill(if dragging { p.coral } else { p.frame })
+                .group_opacity(if dragging { 1.0 } else { 0.0 }, 1.0),
+        )
+}
+
+/// Ported from KSG Code's `ChatRightPanel` + `PreviewPanelShell`: the 2 px `p.frame` left
+/// edge line, the tab strip, KSG's `DiffPanelShell` embedded header row (`h-7 mb-3`, empty
+/// for now so the diff and explorer headers of later tasks slot in), then the active
+/// surface's placeholder body. `resize_max` is `Some` only when the panel sits inline, so
+/// a covering sheet has no resize handle, matching KSG's `PreviewPanel`.
+fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Option<f32>) -> El {
+    let panel = s.right_panel();
+    let active = panel
+        .active
+        .as_deref()
+        .and_then(|id| panel.surfaces.iter().find(|surface| surface.id() == id));
+    let (key, body) = match active {
+        Some(crate::right_panel::Surface::Diff) => (
+            "right-panel-body-diff".to_string(),
+            label("Changes will appear here", SMALL, p.muted),
+        ),
+        Some(crate::right_panel::Surface::Files) => (
+            "right-panel-body-files".to_string(),
+            label("Files will appear here", SMALL, p.muted),
+        ),
+        Some(crate::right_panel::Surface::File { path, .. }) => (
+            format!("right-panel-body-file:{path}"),
+            label(
+                path.clone(),
+                TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
+                p.muted,
+            )
+            .truncate(),
+        ),
+        Some(crate::right_panel::Surface::Attachment { id, name, .. }) => (
+            format!("right-panel-body-attachment:{id}"),
+            label(
+                name.clone(),
+                TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
+                p.muted,
+            )
+            .truncate(),
+        ),
+        None => ("right-panel-body-empty".to_string(), el()),
+    };
+    let panel_el = el()
+        .key("right-panel")
+        .role("group")
+        .label("Workspace panel")
+        .h_full()
+        .min_h(0.0)
+        .fill(p.panel)
+        .child(el().w(2.0).h_full().a11y_hidden().fill(p.frame))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .min_h(0.0)
+                .child(right_panel_strip(s, p, strip_h))
+                .child(el().key("right-panel-header").h(28.0).px(8.0))
+                .child(el().h(12.0))
+                .child(
+                    el().key(key)
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .min_w(0.0)
+                        .center()
+                        .child(body),
+                ),
+        );
+    match resize_max {
+        Some(max) => panel_el.child(right_panel_resize(s, p, zoom, max)),
+        None => panel_el,
+    }
+}
+
+/// A menu row that stays greyed out because acting on it would do nothing, like KSG's
+/// `disabled` DropdownMenuItem: faint ink, no press, not a tab stop.
+fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
+    menu_item_in(key, title, glyph, p, p.faint, p.faint)
+        .focusable(false)
+        .cursor(rune::Cursor::Default)
+}
+
+/// Ported from KSG Code's tab context menu in `RightPanelTabs` (Close, Close others,
+/// Close to the right, Close all) on the `row_menu` pattern. Items that would do nothing
+/// are disabled, as KSG does.
+fn right_panel_tab_menu(s: &State, p: Palette) -> El {
+    let surface_id = s
+        .right_panel_menu
+        .clone()
+        .expect("tab menu only mounts with a surface");
+    let thread_key = s.panel_key();
+    let panel = s.right_panels.get(&thread_key);
+    let index = panel
+        .surfaces
+        .iter()
+        .position(|surface| surface.id() == surface_id);
+    let last = panel.surfaces.len().saturating_sub(1);
+    let anchor = if s.right_panel_menu_at.is_some() {
+        "right-panel-tab-menu-point".to_string()
+    } else {
+        format!("right-panel-tab-{surface_id}")
+    };
+    enum TabMenu {
+        Close,
+        Others,
+        ToRight,
+        All,
+    }
+    let item = |key: &str, title: &str, glyph: &str, action: Option<TabMenu>| {
+        let Some(action) = action else {
+            return disabled_menu_item(key, title, glyph, p);
+        };
+        let thread_key = thread_key.clone();
+        let surface_id = surface_id.clone();
+        menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
+            s.right_panel_menu = None;
+            match action {
+                TabMenu::Close => s.right_panels.close_surface(&thread_key, &surface_id),
+                TabMenu::Others => s.right_panels.close_others(&thread_key, &surface_id),
+                TabMenu::ToRight => s.right_panels.close_to_right(&thread_key, &surface_id),
+                TabMenu::All => s.right_panels.close_all(&thread_key),
+            }
+        })
+    };
+    let others = (panel.surfaces.len() > 1).then_some(TabMenu::Others);
+    let to_right = index.is_some_and(|i| i < last).then_some(TabMenu::ToRight);
+    let all = (!panel.surfaces.is_empty()).then_some(TabMenu::All);
+    col()
+        .key("right-panel-tab-menu")
+        .role("menu")
+        .focus_group()
+        .label("Panel tab actions")
+        .autofocus()
+        .w(222.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .anchored_fit(anchor, rune::Side::Right, rune::Align::Start, 2.0)
+        .modal(true, |s: &mut State| s.right_panel_menu = None)
+        .child(item(
+            "menu-tab-close",
+            "Close",
+            "close",
+            Some(TabMenu::Close),
+        ))
+        .child(item("menu-tab-others", "Close others", "close", others))
+        .child(item(
+            "menu-tab-right",
+            "Close to the right",
+            "chevron",
+            to_right,
+        ))
+        .child(item("menu-tab-all", "Close all", "close", all))
 }
 
 fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
@@ -16540,6 +16979,100 @@ pub(crate) mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
+    }
+
+    #[test]
+    fn right_panel_lays_out_inline_or_covering_and_restores_the_conversation() {
+        use crate::right_panel::SingletonKind;
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("A draft");
+            // The diff view plus two opened file tabs, as KSG's panel tests set up.
+            let key = rt.state.panel_key();
+            rt.state.right_panels.open(&key, SingletonKind::Diff);
+            rt.state.right_panels.open_file(&key, "src/one.rs", None);
+            rt.state.right_panels.open_file(&key, "src/two.rs", None);
+            rt.state.right_panels.activate(&key, "diff");
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.5);
+            rt.frame(0.5);
+
+            let (panel, _) = rt
+                .presented("right-panel")
+                .unwrap_or_else(|| panic!("panel mounts at {width}"));
+            let (main, _) = rt
+                .presented("chat-main")
+                .unwrap_or_else(|| panic!("conversation column mounts at {width}"));
+            let inside = |rect: [f32; 4]| {
+                rect[0] >= -0.5
+                    && rect[1] >= -0.5
+                    && rect[0] + rect[2] <= width + 0.5
+                    && rect[1] + rect[3] <= 720.0 + 0.5
+            };
+            assert!(
+                inside(panel),
+                "panel stays in the window at {width}: {panel:?}"
+            );
+            assert!(
+                inside(main),
+                "conversation stays in the window at {width}: {main:?}"
+            );
+            // `chat-body` is the window less the workspace's 8 px gutters on each side;
+            // `covers` flips below 720 px of it.
+            let covering = crate::right_panel::covers(width - 16.0);
+            if covering {
+                // KSG's sheet mode: the panel covers the conversation column outright.
+                assert!(
+                    panel[0] <= main[0] + 0.5 && panel[0] + panel[2] >= main[0] + main[2] - 0.5,
+                    "panel covers the conversation at {width}: {panel:?} vs {main:?}"
+                );
+            } else {
+                assert!(
+                    panel[0] >= main[0] + main[2] - 0.5,
+                    "panel and conversation do not overlap at {width}: {panel:?} vs {main:?}"
+                );
+                assert!(rt.presented("composer-input").is_some(), "{width}");
+            }
+
+            // Pressing a file tab activates it and shows its body.
+            press(&mut rt, "right-panel-tab-file:src/one.rs");
+            rt.frame(0.5);
+            let key = rt.state.panel_key();
+            assert_eq!(
+                rt.state.right_panels.get(&key).active.as_deref(),
+                Some("file:src/one.rs"),
+                "{width}"
+            );
+            assert!(
+                rt.presented("right-panel-body-file:src/one.rs").is_some(),
+                "{width}"
+            );
+
+            // The active tab's close button removes it; the next tab takes over.
+            press(&mut rt, "right-panel-tab-close-file:src/one.rs");
+            rt.frame(0.5);
+            let state = rt.state.right_panels.get(&key);
+            assert!(
+                state.surfaces.iter().all(|s| s.id() != "file:src/one.rs"),
+                "{width}"
+            );
+            assert_eq!(state.surfaces.len(), 2, "{width}");
+
+            // Hiding the panel restores the conversation's full width.
+            press(&mut rt, "right-panel-close");
+            rt.frame(0.5);
+            assert!(rt.presented("right-panel").is_none(), "{width}");
+            let (restored, _) = rt.presented("chat-main").unwrap();
+            if covering {
+                assert!(
+                    (restored[2] - main[2]).abs() <= 0.5,
+                    "{width}: {restored:?}"
+                );
+            } else {
+                assert!(restored[2] > main[2] + 100.0, "{width}: {restored:?}");
+            }
+        }
     }
 
     #[test]

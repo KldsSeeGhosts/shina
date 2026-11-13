@@ -1,6 +1,48 @@
-#![allow(dead_code)] // Used by the right panel view, which lands in a later change.
-
 use std::collections::HashMap;
+
+/// KSG `useResizableWidth`'s minimum panel width.
+pub const MIN_WIDTH: f32 = 360.0;
+/// KSG `useResizableWidth`'s starting width.
+pub const DEFAULT_WIDTH: f32 = 540.0;
+/// KSG's keyboard resize step for the panel's Left and Right keys. The resize
+/// handle's key handler uses it.
+pub const KEYBOARD_STEP: f32 = 16.0;
+const MAX_FRACTION: f32 = 0.7;
+/// KSG keeps the conversation at least this wide beside an inline panel.
+const SIBLING_MIN: f32 = 360.0;
+
+/// The key a thread's panel state lives under: machine plus thread id, so the
+/// same numeric id on two hosts stays separate.
+pub fn key(machine: &str, thread: usize) -> String {
+    format!("{machine}:{thread}")
+}
+
+/// KSG `getPreviewPanelMaxWidth`: seventy percent of the viewport, further
+/// capped so the conversation keeps [`SIBLING_MIN`], never below [`MIN_WIDTH`].
+/// `container` is the width of the row the panel shares with the conversation.
+/// The panel view and resize handle use it.
+pub fn max_width(viewport: f32, container: f32) -> f32 {
+    (viewport * MAX_FRACTION)
+        .floor()
+        .min((container - SIBLING_MIN).floor())
+        .max(MIN_WIDTH)
+}
+
+/// KSG's `clamp`: a non-finite stored width falls back to the default. The
+/// panel view and resize handle use it.
+pub fn clamp_width(width: f32, max: f32) -> f32 {
+    if !width.is_finite() {
+        return DEFAULT_WIDTH;
+    }
+    width.clamp(MIN_WIDTH, max.max(MIN_WIDTH))
+}
+
+/// When the row the panel shares with the conversation is narrower than the
+/// panel's minimum plus the conversation's, the panel covers it instead (KSG's
+/// sheet mode). The panel view uses it.
+pub fn covers(container: f32) -> bool {
+    container < MIN_WIDTH + SIBLING_MIN
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Surface {
@@ -31,6 +73,8 @@ impl Surface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingletonKind {
     Diff,
+    // The Files explorer's opener lands in a later change; tests construct it now.
+    #[cfg_attr(not(test), allow(dead_code))]
     Files,
 }
 
@@ -75,6 +119,9 @@ impl RightPanels {
         });
     }
 
+    // The diff rows and file explorer that open files land in a later change; the tests below
+    // and the panel's layout tests exercise this now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_file(&mut self, thread: &str, path: &str, line: Option<u32>) {
         self.update_thread(thread, |current| {
             if path == "." {
@@ -111,6 +158,8 @@ impl RightPanels {
         });
     }
 
+    // Attachment surfaces open from a later change; tests exercise this now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_attachment(&mut self, thread: &str, id: &str, name: &str) {
         self.update_thread(thread, |current| {
             current
@@ -217,6 +266,8 @@ impl RightPanels {
         });
     }
 
+    // KSG reorders tabs by drag; that gesture lands with a later change. Tests exercise this now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn move_surface(&mut self, thread: &str, surface_id: &str, to_index: usize) {
         self.update_thread(thread, |current| {
             let Some(from_index) = current
@@ -836,5 +887,43 @@ mod tests {
         let mut panels = RightPanels::default();
         panels.set_maximized(THREAD_A, true);
         assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
+    }
+
+    #[test]
+    fn key_scopes_panel_state_to_machine_and_thread() {
+        assert_eq!(key("local", 7), "local:7");
+        assert_ne!(key("local", 7), key("studio", 7));
+    }
+
+    // KSG `getPreviewPanelMaxWidth`: `min(70vw, container - 360)`, never under the 360 minimum.
+    #[test]
+    fn max_width_is_the_viewport_cap_limited_by_the_conversation() {
+        // The viewport cap binds: 0.7 * 1920 = 1344 < 1920 - 360 = 1560.
+        assert_eq!(max_width(1920.0, 1920.0), 1344.0);
+        // At 1280 the caps are nearly even; the viewport cap still wins: 896 < 920.
+        assert_eq!(max_width(1280.0, 1280.0), 896.0);
+        // A narrow shared row leaves the conversation its 360 and no more.
+        assert_eq!(max_width(960.0, 724.0), 364.0);
+        // A container smaller than the minimum plus the conversation's keeps the floor.
+        assert_eq!(max_width(620.0, 604.0), MIN_WIDTH);
+    }
+
+    // KSG's `clamp`: stored widths clamp into [minimum, maximum].
+    #[test]
+    fn clamp_width_holds_the_stored_width_inside_the_limits() {
+        assert_eq!(clamp_width(200.0, 896.0), MIN_WIDTH);
+        assert_eq!(clamp_width(1200.0, 896.0), 896.0);
+        assert_eq!(clamp_width(500.0, 896.0), 500.0);
+        assert_eq!(clamp_width(f32::NAN, 896.0), DEFAULT_WIDTH);
+        // A maximum under the floor still clamps up to the minimum.
+        assert_eq!(clamp_width(540.0, 300.0), MIN_WIDTH);
+    }
+
+    // KSG's sheet switch: under the panel's minimum plus the conversation's, the panel covers.
+    #[test]
+    fn covers_only_below_the_shared_minimum() {
+        assert!(!covers(MIN_WIDTH + 360.0));
+        assert!(covers(MIN_WIDTH + 359.0));
+        assert!(covers(604.0));
     }
 }
