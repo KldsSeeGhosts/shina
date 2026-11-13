@@ -118,10 +118,12 @@ fn measured_sizes(
     let columns = document.columns;
     let mut lo = vec![0.0f32; columns];
     let mut hi = vec![0.0f32; columns];
+    let mut sampled = vec![false; columns];
     let mut grow = |column: usize, text: &str, style: TextStyle| {
         let (min, max) = rune::text::content_widths(text, &[], style);
         lo[column] = lo[column].max(min);
         hi[column] = hi[column].max(max);
+        sampled[column] = true;
     };
     for (column, text) in header.iter().enumerate().take(columns) {
         grow(column, text, header_style);
@@ -138,15 +140,17 @@ fn measured_sizes(
         lo[column] = (lo[column] + CELL_PAD_X).clamp(MIN_COLUMN, MAX_COLUMN);
         hi[column] = (hi[column] + CELL_PAD_X).clamp(lo[column], MAX_COLUMN);
     }
+    // A ragged file's unsampled columns are absent from KSG's measure table;
+    // there they keep the `columnWidth` formula rather than the floor.
+    let fallback = fallback(viewport, columns);
     // The hidden table is `max(viewport - GUTTER, columns * MIN_COLUMN)` wide:
     // columns between their bounds share the table width, capped at `MAX_COLUMN`.
     let target = (viewport - GUTTER).max(columns as f32 * MIN_COLUMN);
     let sum_lo: f32 = lo.iter().sum();
     let sum_hi: f32 = hi.iter().sum();
-    if sum_lo >= target {
-        return lo;
-    }
-    if sum_hi <= target {
+    let mut sizes = if sum_lo >= target {
+        lo
+    } else if sum_hi <= target {
         let mut sizes = hi;
         for _ in 0..DISTRIBUTE_PASSES {
             let spare = target - sizes.iter().sum::<f32>();
@@ -163,13 +167,34 @@ fn measured_sizes(
                 }
             }
         }
-        return sizes;
+        sizes
+    } else {
+        let share = (target - sum_lo) / (sum_hi - sum_lo);
+        lo.iter()
+            .zip(&hi)
+            .map(|(lo, hi)| lo + (hi - lo) * share)
+            .collect()
+    };
+    for column in 0..columns {
+        if !sampled[column] {
+            sizes[column] = fallback;
+        }
     }
-    let share = (target - sum_lo) / (sum_hi - sum_lo);
-    lo.iter()
-        .zip(&hi)
-        .map(|(lo, hi)| lo + (hi - lo) * share)
-        .collect()
+    sizes
+}
+
+/// KSG `countLabel`: the count comma-grouped, then the noun pluralized
+/// English-style.
+pub(crate) fn count_label(count: usize, noun: &str) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    format!("{grouped} {noun}{}", if count == 1 { "" } else { "s" })
 }
 
 /// KSG `columnLabel`: A..Z, AA..AZ, BA.. — the text a header cell past the
@@ -269,6 +294,15 @@ mod tests {
                 "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD"
             ]
         );
+    }
+
+    #[test]
+    fn count_labels_group_and_pluralize_like_ksg() {
+        assert_eq!(count_label(0, "row"), "0 rows");
+        assert_eq!(count_label(1, "row"), "1 row");
+        assert_eq!(count_label(4999, "row"), "4,999 rows");
+        assert_eq!(count_label(1024, "column"), "1,024 columns");
+        assert_eq!(count_label(5_000_000, "line"), "5,000,000 lines");
     }
 
     #[test]
