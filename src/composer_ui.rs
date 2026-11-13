@@ -570,6 +570,7 @@ impl State {
         if self.headless
             || self.settings_picker.is_some()
             || self.captain_picker
+            || crate::ui::composer_code_picker::menu_open(self)
             || self.project_picker.is_some()
             || self.rename_thread.is_some()
             || self.captain_editor.is_some()
@@ -604,6 +605,8 @@ impl State {
         self.composer_ui.scope_focused.set(false);
         self.env_mode_picker = false;
         self.base_branch_picker = false;
+        self.code_picker.open = None;
+        self.code_picker.query = rune::TextEdit::default();
     }
 }
 
@@ -621,6 +624,7 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && !s.env_mode_picker
         && !s.base_branch_picker
         && s.project_picker.is_none()
+        && !crate::ui::composer_code_picker::menu_open(s)
         && s.captain_editor.is_none()
         && s.rename_thread.is_none()
         && s.delete_thread.is_none()

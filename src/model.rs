@@ -4180,6 +4180,8 @@ pub struct State {
     pub env_mode_picker: bool,
     pub base_branch_picker: bool,
     pub base_branch_query: TextEdit,
+    /// The per-code-block language picker, KSG Code's ComposerCodeBlockLanguagePicker.
+    pub code_picker: crate::ui::composer_code_picker::Picker,
     pub(crate) vcs_branches: std::collections::BTreeMap<(String, String), VcsBranchCacheEntry>,
     vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
     worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
@@ -4442,6 +4444,7 @@ impl State {
             env_mode_picker: false,
             base_branch_picker: false,
             base_branch_query: TextEdit::default(),
+            code_picker: Default::default(),
             vcs_branches: Default::default(),
             vcs_branch_rxs: Vec::new(),
             worktree_bootstrap_rxs: Vec::new(),

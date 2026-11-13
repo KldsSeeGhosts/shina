@@ -18,6 +18,7 @@ mod client;
 mod client_history;
 mod codex;
 mod composer;
+mod composer_code_languages;
 mod composer_context;
 mod composer_notices;
 mod composer_paste;
