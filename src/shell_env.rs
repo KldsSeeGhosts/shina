@@ -10,11 +10,14 @@ pub fn reconcile_path() {
     {
         let inherited = std::env::var_os("PATH").and_then(|value| value.into_string().ok());
         let shell_path = read_login_shell_path();
-        let launchctl_path = if cfg!(target_os = "macos") && shell_path.is_none() {
+        #[cfg(target_os = "macos")]
+        let launchctl_path = if shell_path.is_none() {
             read_launchctl_path()
         } else {
             None
         };
+        #[cfg(not(target_os = "macos"))]
+        let launchctl_path: Option<String> = None;
         if let Some(merged) = merge_path_entries(
             shell_path.as_deref().or(launchctl_path.as_deref()),
             inherited.as_deref(),
