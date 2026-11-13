@@ -657,6 +657,7 @@ mod tests {
             host: "old-machine".into(),
             device_id: "fixture".into(),
             token: "not-real".into(),
+            enabled: true,
         });
         client.linked.insert("old".into(), remote);
         state.client = Some(client);

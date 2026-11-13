@@ -12,6 +12,7 @@ mod client_history;
 mod codex;
 mod composer;
 mod composer_context;
+mod composer_notices;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;
@@ -602,6 +603,7 @@ fn fleet_demo(state: &mut State) {
                 host: host.into(),
                 device_id: "example".into(),
                 token: "unused-offline-fixture".into(),
+                enabled: true,
             });
             client.linked.insert(server.into(), remote);
         }

@@ -82,6 +82,70 @@ impl Commands {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionPhase {
+    Available,
+    Connecting,
+    Reconnecting,
+    Error,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    Outdated,
+    AuthDenied,
+    Timeout,
+    Refused,
+    Dns,
+    InvalidResponse,
+    ServerNotAnswering,
+}
+
+impl FailureKind {
+    fn from_error(error: &str) -> Self {
+        if error.contains("mismatch") || error.contains("older") {
+            Self::Outdated
+        } else if error.contains("Authentication denied") || error.contains("handshake refused") {
+            Self::AuthDenied
+        } else if error.contains("timed out") {
+            Self::Timeout
+        } else if error.contains("did not resolve") {
+            Self::Dns
+        } else if error.contains("refused") {
+            Self::Refused
+        } else if error.contains("Invalid")
+            || error.contains("unexpected")
+            || error.contains("closed before hello")
+        {
+            Self::InvalidResponse
+        } else {
+            Self::ServerNotAnswering
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionState {
+    pub phase: ConnectionPhase,
+    pub attempt: u32,
+    pub attempt_seq: u64,
+    pub last_failure: Option<FailureKind>,
+    pub last_error: Option<String>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            phase: ConnectionPhase::Offline,
+            attempt: 0,
+            attempt_seq: 0,
+            last_failure: None,
+            last_error: None,
+        }
+    }
+}
+
 pub enum Event {
     Receipt(Command, Value),
     Rpc {
@@ -94,6 +158,7 @@ pub enum Event {
 
 pub struct Client {
     pub remote: Option<crate::peer::Link>,
+    enabled: bool,
     pub linked: std::collections::BTreeMap<String, Client>,
     directory: PathBuf,
     device_directory: PathBuf,
@@ -105,6 +170,9 @@ pub struct Client {
     snapshot: Arc<Mutex<Option<Value>>>,
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
+    worker_finished: Arc<AtomicBool>,
+    retry_notify: Arc<tokio::sync::Notify>,
+    connection: Arc<Mutex<ConnectionState>>,
     history_thread: Arc<AtomicUsize>,
     history_requests: Arc<Mutex<VecDeque<HistoryRequest>>>,
     rpc_requests: Arc<Mutex<VecDeque<(String, String, Value)>>>,
@@ -114,7 +182,98 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn test_commands(&mut self) -> tokio::sync::mpsc::Receiver<Command> {
         self.commands.ready.store(true, Ordering::Release);
+        *self.connection.lock().expect("connection state") = ConnectionState {
+            phase: ConnectionPhase::Available,
+            attempt: 0,
+            attempt_seq: 0,
+            last_failure: None,
+            last_error: None,
+        };
         self.input.take().expect("unused test client")
+    }
+    #[cfg(test)]
+    pub(crate) fn set_test_connection_state(&self, state: ConnectionState) {
+        *self.connection.lock().expect("connection state") = state;
+    }
+    pub fn connection_state(&self) -> ConnectionState {
+        self.connection.lock().expect("connection state").clone()
+    }
+    pub fn connection_state_for(&self, server: &str) -> Option<ConnectionState> {
+        if server == "local" {
+            Some(self.connection_state())
+        } else {
+            self.linked.get(server).map(Client::connection_state)
+        }
+    }
+    pub fn enabled(&self) -> bool {
+        self.remote
+            .as_ref()
+            .map_or(self.enabled, |link| link.enabled)
+    }
+    pub fn set_enabled(&mut self, enabled: bool, wake: rune::Waker) -> Result<(), String> {
+        if let Some(link) = &self.remote {
+            let mut updated = link.clone();
+            updated.enabled = enabled;
+            updated.save(&self.directory)?;
+            self.remote = Some(updated);
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.shutdown();
+            self.commands.ready.store(false, Ordering::Release);
+            *self.connection.lock().expect("connection state") = ConnectionState::default();
+            return Ok(());
+        }
+        let running = self.worker.lock().expect("client worker").is_some()
+            && !self.worker_finished.load(Ordering::Acquire);
+        if running {
+            let _ = self.retry_now();
+        } else {
+            self.shutdown();
+            if self.input.is_none() {
+                let (sender, input) = tokio::sync::mpsc::channel(32);
+                let (output, events) = mpsc::sync_channel(64);
+                self.commands = Commands {
+                    sender,
+                    ready: Arc::default(),
+                };
+                self.input = Some(input);
+                self.output = output;
+                self.events = events;
+            }
+            self.stop.store(false, Ordering::Release);
+            self.worker_finished.store(false, Ordering::Release);
+            {
+                let mut state = self.connection.lock().expect("connection state");
+                state.phase = ConnectionPhase::Connecting;
+                state.attempt = 0;
+                state.attempt_seq = state.attempt_seq.saturating_add(1);
+                state.last_failure = None;
+                state.last_error = None;
+            }
+            self.start(wake);
+        }
+        Ok(())
+    }
+    pub fn retry_now(&self) -> Result<(), String> {
+        let mut state = self.connection.lock().expect("connection state");
+        if self.worker_finished.load(Ordering::Acquire)
+            || self.worker.lock().expect("client worker").is_none()
+        {
+            return Err(state
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Server connection is offline.".into()));
+        }
+        state.phase = if state.attempt == 0 && state.last_failure.is_none() {
+            ConnectionPhase::Connecting
+        } else {
+            ConnectionPhase::Reconnecting
+        };
+        state.attempt_seq = state.attempt_seq.saturating_add(1);
+        drop(state);
+        self.retry_notify.notify_one();
+        Ok(())
     }
     #[cfg(test)]
     pub(crate) fn test_snapshot(&self, projection: Value) {
@@ -138,6 +297,7 @@ impl Client {
         Self {
             info: Arc::default(),
             remote: None,
+            enabled: true,
             linked: Default::default(),
             device_directory: directory.clone(),
             directory,
@@ -151,6 +311,9 @@ impl Client {
             snapshot: Arc::default(),
             stop: Arc::default(),
             worker: Arc::default(),
+            worker_finished: Arc::default(),
+            retry_notify: Arc::default(),
+            connection: Arc::default(),
             history_thread: Arc::default(),
             history_requests: Arc::default(),
             rpc_requests: Arc::default(),
@@ -160,6 +323,9 @@ impl Client {
         self.device_directory = directory;
     }
     pub fn start(&mut self, wake: rune::Waker) {
+        if !self.enabled() {
+            return;
+        }
         if self.remote.is_none() {
             match crate::peer::Link::load_all(&self.directory) {
                 Ok(links) => {
@@ -181,11 +347,15 @@ impl Client {
         let snapshot = self.snapshot.clone();
         let stop = self.stop.clone();
         let ready = self.commands.ready.clone();
+        let worker_finished = self.worker_finished.clone();
+        let retry_notify = self.retry_notify.clone();
+        let connection = self.connection.clone();
         let history_thread = self.history_thread.clone();
         let history_requests = self.history_requests.clone();
         let rpc_requests = self.rpc_requests.clone();
         let remote = self.remote.clone();
         let info = self.info.clone();
+        worker_finished.store(false, Ordering::Release);
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -206,6 +376,9 @@ impl Client {
                 snapshot,
                 stop,
                 ready,
+                worker_finished,
+                retry_notify,
+                connection,
                 wake,
             ));
         }));
@@ -220,8 +393,12 @@ impl Client {
             .device_directory
             .join("linked-views")
             .join(&link.server_id);
+        client.enabled = link.enabled;
+        let enabled = link.enabled;
         client.remote = Some(link.clone());
-        client.start(wake);
+        if enabled {
+            client.start(wake);
+        }
         self.linked.insert(link.server_id, client);
     }
     pub fn commands_for(&self, server: &str) -> Option<&Commands> {
@@ -237,7 +414,9 @@ impl Client {
             views.push(("local".into(), value));
         }
         for (id, client) in &self.linked {
-            if let Some(value) = client.snapshot() {
+            if client.enabled()
+                && let Some(value) = client.snapshot()
+            {
                 views.push((id.clone(), value));
             }
         }
@@ -522,6 +701,9 @@ async fn supervise(
     snapshot: Arc<Mutex<Option<Value>>>,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    worker_finished: Arc<AtomicBool>,
+    retry_notify: Arc<tokio::sync::Notify>,
+    connection: Arc<Mutex<ConnectionState>>,
     wake: rune::Waker,
 ) {
     let (directory, device_directory, history_thread, history_requests, rpc_requests, remote) =
@@ -554,6 +736,7 @@ async fn supervise(
     let mut child: Option<Child> = None;
     let mut pending = VecDeque::<Command>::new();
     let mut attempt = 0;
+    let mut was_connected = false;
     let mut next_spawn = Instant::now();
     let mut owned_instance = None;
     let mut socket: Option<Socket> = None;
@@ -636,6 +819,17 @@ async fn supervise(
                 .map(Ok)
                 .unwrap_or_else(|| Discovery::read(&directory));
             if let Ok(discovery) = discovery {
+                {
+                    let mut state = connection.lock().expect("connection state");
+                    state.phase = if attempt == 0 && !was_connected {
+                        ConnectionPhase::Connecting
+                    } else {
+                        ConnectionPhase::Reconnecting
+                    };
+                    state.attempt = attempt;
+                    state.attempt_seq = state.attempt_seq.saturating_add(1);
+                }
+                wake();
                 match tokio::select! {
                     result = connect(&discovery, &device, &device_directory, &cache, true, remote.as_ref()) => result,
                     _ = stopped(&stop) => break,
@@ -647,6 +841,11 @@ async fn supervise(
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
                         wake();
                         if let Err(error) = cache.reconnect(&hello) {
+                            let mut state = connection.lock().expect("connection state");
+                            state.phase = ConnectionPhase::Error;
+                            state.last_failure = Some(FailureKind::from_error(&error));
+                            state.last_error = Some(error.clone());
+                            drop(state);
                             report(error);
                             break;
                         }
@@ -672,6 +871,12 @@ async fn supervise(
                                 }
                                 Err(error) => {
                                     if error.starts_with("Authentication denied.") {
+                                        let mut state =
+                                            connection.lock().expect("connection state");
+                                        state.phase = ConnectionPhase::Error;
+                                        state.last_failure = Some(FailureKind::AuthDenied);
+                                        state.last_error = Some(error.clone());
+                                        drop(state);
                                         report(error);
                                         break 'supervisor;
                                     }
@@ -683,6 +888,7 @@ async fn supervise(
                         if sent {
                             socket = Some(connected);
                             attempt = 0;
+                            was_connected = true;
                             continue;
                         }
                     }
@@ -691,18 +897,33 @@ async fn supervise(
                             || error.contains("mismatch")
                             || error.contains("handshake refused") =>
                     {
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Error;
+                        state.last_failure = Some(FailureKind::from_error(&error));
+                        state.last_error = Some(error.clone());
+                        drop(state);
                         report(error);
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         next_spawn = Instant::now() + restart_delay(attempt);
                         attempt = attempt.saturating_add(1);
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Reconnecting;
+                        state.attempt = attempt;
+                        state.last_failure = Some(FailureKind::from_error(&error));
+                        state.last_error = Some(error);
+                        drop(state);
+                        wake();
                     }
                 }
             }
             if remote.is_some() {
                 tokio::select! {
                     _ = tokio::time::sleep(next_spawn.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))) => {},
+                    _ = retry_notify.notified() => {
+                        next_spawn = Instant::now();
+                    },
                     _ = stopped(&stop) => break,
                 }
                 continue;
@@ -726,7 +947,13 @@ async fn supervise(
                     ),
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                _ = retry_notify.notified() => {
+                    next_spawn = Instant::now();
+                },
+                _ = stopped(&stop) => break,
+            }
             continue;
         }
         let connected = socket.as_mut().expect("connected");
@@ -812,7 +1039,15 @@ async fn supervise(
                                 let phase = cache.maintenance["phase"].as_str().unwrap_or("ready");
                                 server_stopped |= phase == "stopping";
                                 updating |= phase == "restarting";
-                                ready.store(cache.seq.is_some() && phase == "ready",Ordering::Release);
+                                let is_ready = cache.seq.is_some() && phase == "ready";
+                                ready.store(is_ready, Ordering::Release);
+                                if is_ready {
+                                    let mut state = connection.lock().expect("connection state");
+                                    state.phase = ConnectionPhase::Available;
+                                    state.attempt = 0;
+                                    state.last_failure = None;
+                                    state.last_error = None;
+                                }
                             }
                             if let Some(id) = value["id"].as_str()
                                 && let Some(tag) = pending_rpcs.remove(id)
@@ -842,7 +1077,15 @@ async fn supervise(
                     }
                     Some(Ok(Message::Ping(payload))) => { if !send(connected, Message::Pong(payload)).await { socket = None; } }
                     Some(Ok(Message::Pong(_))) => {}
-                    _ => { socket = None; report("Server disconnected. Reconnecting with the same command IDs.".into()); }
+                    _ => {
+                        socket = None;
+                        let mut state = connection.lock().expect("connection state");
+                        state.phase = ConnectionPhase::Reconnecting;
+                        state.last_failure = Some(FailureKind::ServerNotAnswering);
+                        state.last_error = Some("Server disconnected.".into());
+                        drop(state);
+                        report("Server disconnected. Reconnecting with the same command IDs.".into());
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
@@ -883,6 +1126,14 @@ async fn supervise(
         }
     }
     ready.store(false, Ordering::Release);
+    worker_finished.store(true, Ordering::Release);
+    {
+        let mut state = connection.lock().expect("connection state");
+        if state.phase != ConnectionPhase::Error {
+            state.phase = ConnectionPhase::Offline;
+        }
+    }
+    wake();
     if let Some(job) = image_job {
         job.abort();
     }
@@ -1795,7 +2046,7 @@ mod tests {
             let host=listener.local_addr().unwrap();
             let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
             let profile=crate::store::directory().unwrap().join("stable-blob-test");
-            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into()};
+            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into(),enabled:true};
             let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
             let snapshot=Arc::new(Mutex::new(Some(view(1))));
             let generation=Arc::new(AtomicUsize::new(1));

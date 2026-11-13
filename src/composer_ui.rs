@@ -323,10 +323,15 @@ pub(super) fn control_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) ->
 pub(super) fn frame_card(s: &State, p: Palette, card: El) -> El {
     let now = s.composer_ui.clock.get();
     let transition = s.composer_ui.transition.get();
+    let has_notices = !s.composer_notices.ordered().is_empty();
     let mut frame = col()
         .key("composer")
         .w_full()
-        .radius(6.0)
+        .corners(if has_notices {
+            [0.0, 0.0, 6.0, 6.0]
+        } else {
+            [6.0; 4]
+        })
         .fill(p.card)
         .border(2.0, composer_frame(s, p))
         // The numerical transition owns geometry. Rune must not spring each sampled height.
