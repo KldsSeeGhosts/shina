@@ -144,6 +144,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.fork"
         | "thread.rewind"
         | "thread.forkPoints"
+        | "thread.worktreeSetup"
         | "settings.autoSettle"
         | "settings.defaultHarness"
         | "settings.threadDefaults"
@@ -367,6 +368,14 @@ pub fn text_page_revision(text: &str, revision: &str, params: &Value) -> Result<
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadEnvMode {
+    #[default]
+    Local,
+    Worktree,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendInput {
@@ -384,6 +393,12 @@ pub struct SendInput {
     pub fresh_context: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_before_send: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_mode: Option<ThreadEnvMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_from_origin: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

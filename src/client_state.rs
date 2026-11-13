@@ -224,6 +224,24 @@ struct ThreadView {
         deserialize_with = "deserialize_lenient_env_mode"
     )]
     env_mode: Option<crate::model::ThreadEnvMode>,
+    #[serde(
+        rename = "startFromOrigin",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    start_from_origin: Option<bool>,
+    #[serde(
+        rename = "submissionError",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    submission_error: Option<String>,
+    #[serde(
+        rename = "worktreeSetup",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    worktree_setup: Option<crate::model::WorktreeSetupState>,
 }
 
 impl ThreadView {
@@ -365,6 +383,9 @@ impl ThreadView {
             branch: thread.branch.clone(),
             base_branch: thread.base_branch.clone(),
             env_mode: thread.env_mode,
+            start_from_origin: thread.start_from_origin,
+            submission_error: thread.submission_error.clone(),
+            worktree_setup: thread.worktree_setup.clone(),
         }
     }
 
@@ -373,6 +394,27 @@ impl ThreadView {
         thread.branch = self.branch;
         thread.base_branch = self.base_branch;
         thread.env_mode = self.env_mode;
+        thread.start_from_origin = self.start_from_origin;
+        thread.submission_error = self.submission_error;
+        if let Some(setup) = self.worktree_setup.as_ref()
+            && setup.phase == crate::model::WorktreeSetupPhase::Failed
+            && thread.worktree_setup.as_ref().map(|s| s.phase)
+                != Some(crate::model::WorktreeSetupPhase::Failed)
+        {
+            thread.worktree_setup_output_open = true;
+        }
+        thread.worktree_setup = self.worktree_setup;
+        if thread.worktree_path.is_some() {
+            thread.remote_bootstrap_snapshot = None;
+        } else if let Some(ref _err) = thread.submission_error
+            && !thread.has_draft_content()
+            && let Some((snapshot, reply_to)) = thread.remote_bootstrap_snapshot.take()
+        {
+            thread.restore_snapshot(&snapshot);
+            if thread.draft_reply_to.is_none() {
+                thread.draft_reply_to = reply_to;
+            }
+        }
         thread.memory_suggestions = self.memory_suggestions;
         thread.fresh_session_messages = self.fresh_session_messages;
         if thread.remote.is_some() {
@@ -1089,11 +1131,23 @@ impl State {
             self.threads
                 .iter()
                 .filter(|t| t.client_draft)
-                .map(|t| json!({
-                    "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
-                    "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life,
-                    "serviceTier":t.harness_state["serviceTier"]
-                }))
+                .map(|t| {
+                    let mut entry = json!({
+                        "id":t.id,"project":t.project,"harness":t.harness,"model":t.selected_model,
+                        "thinking":t.selected_thinking,"access":t.native.access.id(),"life":t.life,
+                        "serviceTier":t.harness_state["serviceTier"]
+                    });
+                    if let Some(env_mode) = t.env_mode {
+                        entry["envMode"] = json!(env_mode);
+                    }
+                    if let Some(base_branch) = &t.base_branch {
+                        entry["baseBranch"] = json!(base_branch);
+                    }
+                    if let Some(start_from_origin) = t.start_from_origin {
+                        entry["startFromOrigin"] = json!(start_from_origin);
+                    }
+                    entry
+                })
                 .collect::<Vec<_>>()
         );
         ui["pendingMessages"] = json!({});
@@ -1414,6 +1468,11 @@ impl State {
                                 .map_err(|e| e.to_string())
                         });
                         self.apply_usage_limits_result(req_id, parsed);
+                    } else if let Some(req_id) = tag
+                        .strip_prefix("vcs-branches:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.handle_vcs_branches_rpc(req_id, result);
                     } else if let Some(rest) = tag.strip_prefix("search:")
                         && let Some((seq_str, target_srv)) = rest.split_once(':')
                         && let Ok(seq) = seq_str.parse::<u64>()
@@ -1696,6 +1755,8 @@ impl State {
                 local.branch = thread.branch;
                 local.base_branch = thread.base_branch;
                 local.env_mode = thread.env_mode;
+                local.start_from_origin = thread.start_from_origin;
+                local.worktree_setup = thread.worktree_setup;
                 local.machine = thread.machine;
                 local.updated = thread.updated;
                 local.captain = thread.captain;
@@ -1754,6 +1815,15 @@ impl State {
                     thread.life = serde_json::from_value(life.clone())
                         .map_err(|_| "Invalid saved client draft lifecycle.")?;
                 }
+                thread.env_mode = draft.get("envMode").and_then(|v| {
+                    serde_json::from_value::<crate::model::ThreadEnvMode>(v.clone()).ok()
+                });
+                thread.base_branch = draft
+                    .get("baseBranch")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                thread.start_from_origin = draft.get("startFromOrigin").and_then(Value::as_bool);
                 self.threads.push(thread);
             }
         }
@@ -1886,6 +1956,7 @@ impl State {
         {
             self.forward("project.put", json!({"path":path}));
         }
+        self.ensure_vcs_branches(false);
         Ok(())
     }
 
@@ -2285,6 +2356,7 @@ impl State {
             self.machines.scope_remote,
         ) = filter;
         self.tick_composer_notices_at(Instant::now(), None);
+        self.ensure_vcs_branches(false);
     }
 
     /// KSG useDraftEnvironmentRouting locks promoted, started and running conversations.
@@ -2381,6 +2453,7 @@ impl State {
             thread.client_draft = true;
             thread.harness = self.default_harness.clone();
             thread.project = project;
+            thread.env_mode = Some(self.effective_default_thread_env_mode());
             self.threads.push(thread);
             self.threads.len() - 1
         });
@@ -2398,9 +2471,13 @@ impl State {
         if self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
             && self.current().client_draft
         {
+            if self.current().project != project {
+                self.current_mut().base_branch = None;
+            }
             self.current_mut().project = project;
             self.project_picker = None;
             self.machines.draft_picker = None;
+            self.ensure_vcs_branches(false);
             self.checkpoint();
         } else {
             self.new_thread_in(project);
@@ -2443,6 +2520,10 @@ impl State {
 
     /// Follow the owning server after Send, even if the user navigated before its receipt.
     fn complete_client_creation(&mut self, server: &str, command: &Command, value: &Value) {
+        let supports_vcs_cap = self
+            .client
+            .as_ref()
+            .is_some_and(|c| c.supports_capability(server, crate::protocol::VCS_WORKTREES));
         let commands = self
             .client
             .as_ref()
@@ -2541,8 +2622,19 @@ impl State {
                         &peer_label,
                     ) {
                         Ok(prompt) => {
-                            let params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
+                            let mut params = json!({"threadId":id,"text":prompt.text,"attachments":prompt.images.as_ref(),
                                 "context":prompt.context,"draft":prompt.draft,"editorRevision":uuid::Uuid::new_v4(),"mode":"prompt"});
+                            let sending_worktree_bootstrap = supports_vcs_cap
+                                && draft.worktree_path.is_none()
+                                && draft.env_mode == Some(crate::model::ThreadEnvMode::Worktree);
+                            if sending_worktree_bootstrap {
+                                params["envMode"] = json!(crate::model::ThreadEnvMode::Worktree);
+                                if let Some(base) = &draft.base_branch {
+                                    params["baseBranch"] = json!(base);
+                                }
+                                params["startFromOrigin"] =
+                                    json!(draft.effective_start_from_origin());
+                            }
                             let result = commands
                                 .ok_or_else(|| {
                                     "This machine is not linked. Your draft was kept.".to_string()
@@ -2550,6 +2642,10 @@ impl State {
                                 .and_then(|commands| commands.send("thread.send", params));
                             match result {
                                 Ok(cmd_id) => {
+                                    if sending_worktree_bootstrap {
+                                        draft.remote_bootstrap_snapshot =
+                                            Some((snapshot.clone(), sent_reply_to.clone()));
+                                    }
                                     draft.remote_send = Some((cmd_id, snapshot));
                                     draft.remote_send_reply_to = sent_reply_to;
                                     Outcome::None
@@ -2610,6 +2706,11 @@ impl State {
             let sending = self.threads[draft_index].remote_send.take();
             let sending_reply_to = self.threads[draft_index].remote_send_reply_to.take();
             let background_send = self.threads[draft_index].background_send.take();
+            let remote_bootstrap_snapshot =
+                self.threads[draft_index].remote_bootstrap_snapshot.take();
+            let draft_env_mode = self.threads[draft_index].env_mode;
+            let draft_base_branch = self.threads[draft_index].base_branch.clone();
+            let draft_start_from_origin = self.threads[draft_index].start_from_origin;
             self.threads[index].draft = text;
             self.threads[index].draft_images = images;
             self.threads[index].draft_context = context;
@@ -2617,6 +2718,18 @@ impl State {
             self.threads[index].retained_context = retained;
             self.threads[index].remote_send = sending;
             self.threads[index].remote_send_reply_to = sending_reply_to;
+            if remote_bootstrap_snapshot.is_some() {
+                self.threads[index].remote_bootstrap_snapshot = remote_bootstrap_snapshot;
+            }
+            if self.threads[index].env_mode.is_none() {
+                self.threads[index].env_mode = draft_env_mode;
+            }
+            if self.threads[index].base_branch.is_none() {
+                self.threads[index].base_branch = draft_base_branch;
+            }
+            if self.threads[index].start_from_origin.is_none() {
+                self.threads[index].start_from_origin = draft_start_from_origin;
+            }
             if background_send.is_some() {
                 self.threads[index].background_send = background_send;
             }
@@ -3125,6 +3238,20 @@ impl State {
                 self.current_mut().draft_reply_to = reply_to;
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
+                if self.current().messages.is_empty()
+                    && self.current().worktree_path.is_none()
+                    && !self.current().worktree_bootstrapping()
+                {
+                    if let Some(mode) = input.env_mode {
+                        self.current_mut().env_mode = Some(mode);
+                    }
+                    if let Some(base) = input.base_branch {
+                        self.current_mut().base_branch = Some(base);
+                    }
+                    if let Some(origin) = input.start_from_origin {
+                        self.current_mut().start_from_origin = Some(origin);
+                    }
+                }
                 let _ = self.dispatch_send_with_options(
                     Some(input.fresh_context == Some(true)),
                     input.compact_before_send,
@@ -3134,6 +3261,7 @@ impl State {
                         .current()
                         .error
                         .clone()
+                        .or(self.current().submission_error.clone())
                         .or(self.current().attachment_error.clone())
                         .unwrap_or("The thread cannot accept input now.".into());
                     self.current_mut().draft.replace_text("");
@@ -3220,6 +3348,11 @@ impl State {
                 }
             }
             "thread.retry" => self.retry(),
+            "thread.worktreeSetup" => match args["action"].as_str() {
+                Some("retry") => self.retry_worktree_setup(),
+                Some("skip") => self.skip_worktree_setup(),
+                _ => return Err("action must be retry or skip.".into()),
+            },
             "thread.visit" => self.current_mut().life.last_visited_at = Some(lifecycle::now()),
             "thread.create" => {
                 let project = args["project"].as_u64().map(|id| id as usize);
@@ -6394,5 +6527,59 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&bad_dir);
+    }
+
+    #[test]
+    fn thread_send_includes_worktree_fields_only_when_server_supports_vcs_worktrees() {
+        let dir = std::env::temp_dir().join(format!("shina-vcs-wire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (client, mut commands) = crate::client::Client::test_connected(dir.clone());
+        *client.info.lock().unwrap() = json!({
+            "capabilities": [crate::protocol::VCS_WORKTREES, crate::protocol::FRESH_CONTEXT],
+            "protocolMinor": crate::protocol::MINOR
+        });
+        let mut state = State::headless(dir.clone());
+        state.client = Some(client);
+        state.projects.entries.push(Project::new(1, dir.clone()));
+        state.current_mut().project = Some(1);
+        state.current_mut().env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+        state.current_mut().base_branch = Some("main".into());
+        state.current_mut().start_from_origin = Some(false);
+        state.current_mut().draft.replace_text("Start on worktree");
+        state.send();
+
+        let cmd = commands.try_recv().expect("thread.send emitted");
+        assert_eq!(cmd.method, "thread.send");
+        assert_eq!(cmd.params["envMode"], "worktree");
+        assert_eq!(cmd.params["baseBranch"], "main");
+        assert_eq!(cmd.params["startFromOrigin"], false);
+
+        // Older server without vcs-worktrees-v1 never receives worktree fields on thread.send.
+        let (old_client, mut old_commands) = crate::client::Client::test_connected(dir.clone());
+        *old_client.info.lock().unwrap() = json!({
+            "capabilities": [crate::protocol::FRESH_CONTEXT],
+            "protocolMinor": crate::protocol::MINOR
+        });
+        let mut old_state = State::headless(dir.clone());
+        old_state.client = Some(old_client);
+        old_state
+            .projects
+            .entries
+            .push(Project::new(1, dir.clone()));
+        old_state.current_mut().project = Some(1);
+        old_state.current_mut().env_mode = Some(crate::model::ThreadEnvMode::Local);
+        old_state
+            .current_mut()
+            .draft
+            .replace_text("Plain local send");
+        old_state.send();
+
+        let old_cmd = old_commands.try_recv().expect("thread.send emitted");
+        assert_eq!(old_cmd.method, "thread.send");
+        assert!(old_cmd.params.get("envMode").is_none());
+        assert!(old_cmd.params.get("baseBranch").is_none());
+        assert!(old_cmd.params.get("startFromOrigin").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
