@@ -669,6 +669,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if deferred_work { capabilities.push(protocol::DEFERRED_WORK); }
                         if minor >= 12 { capabilities.push(protocol::PROJECT_WRITE_FILE); }
                         if minor >= 13 { capabilities.push(protocol::FRESH_CONTEXT); }
+                        if minor >= 14 { capabilities.push(protocol::USAGE_LIMITS); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -805,6 +806,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 .expect("history streams")
                                 .find_thread(thread_id, params)
                         })
+                } else if method == "usage.limits" {
+                    let args = params.get("args").unwrap_or(params);
+                    let snapshot = shared.snapshots.borrow().clone();
+                    usage_limits_for_request(&snapshot, args)
                 } else if method == "threads.search" {
                     let index_threads = {
                         let current = shared.snapshots.borrow().clone();
@@ -1197,6 +1202,64 @@ pub fn machine_label() -> String {
                 .map(|s| s.trim().to_owned())
                 .unwrap_or_else(|| "Shina".into())
         })
+}
+
+fn usage_limits_for_request(snapshot: &Value, params: &Value) -> Result<Value, String> {
+    let state = if snapshot["state"].is_object() {
+        &snapshot["state"]
+    } else {
+        snapshot
+    };
+    let thread_id = params["threadId"].as_u64();
+    let index_thread = thread_id.and_then(|id| {
+        state["index"]["threads"]
+            .as_array()
+            .and_then(|threads| threads.iter().find(|t| t["id"].as_u64() == Some(id)))
+    });
+    let view_thread = thread_id.and_then(|id| {
+        state["threads"]
+            .as_array()
+            .and_then(|threads| threads.iter().find(|t| t["id"].as_u64() == Some(id)))
+    });
+    let harness = if let Some(entry) = index_thread {
+        entry["harness"]
+            .as_str()
+            .ok_or_else(|| "Thread harness missing.".to_owned())?
+    } else if params["draft"].as_bool() == Some(true) {
+        params["harness"]
+            .as_str()
+            .ok_or_else(|| "Draft harness is required.".to_owned())?
+    } else {
+        return Err("Thread not found.".into());
+    };
+    if !crate::usage_limits::has_usage_limits(harness) {
+        return Err("Usage limits are unavailable for this provider.".into());
+    }
+    let catalog = &state["nativeCatalogs"][harness];
+    let hs = view_thread.map(|t| &t["harness_state"]);
+    let usage_limits = hs
+        .map(|h| &h["usageLimits"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageLimits"]).filter(|v| !v.is_null()));
+    let usage_limits_raw = hs
+        .map(|h| &h["usageLimitsRaw"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageLimitsRaw"]).filter(|v| !v.is_null()));
+    let usage_account = hs
+        .map(|h| &h["usageAccount"])
+        .filter(|v| !v.is_null())
+        .or_else(|| Some(&catalog["usageAccount"]).filter(|v| !v.is_null()));
+    let report = crate::usage_limits::build_usage_limits_report(
+        crate::usage_limits::UsageLimitsReportInput {
+            harness,
+            now_ms: crate::lifecycle::now() as i64,
+            usage_limits,
+            usage_limits_raw,
+            usage_account,
+        },
+    )
+    .ok_or_else(|| "Usage limits are unavailable for this provider.".to_owned())?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2402,6 +2465,91 @@ mod tests {
                 large.html.bytes.to_string()
             );
             assert_eq!(response.bytes().await.unwrap().len(), 16);
+        });
+    }
+
+    #[test]
+    fn usage_limits_returns_report_for_supported_thread_and_errors_for_unsupported() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::configured("usage-limits", protocol::MINOR, |runtime| {
+                runtime.state.codex_catalog.usage_limits_raw = json!({
+                    "checkedAtMs": 1_700_000_000_000i64,
+                    "snapshot": {
+                        "limitId": "codex",
+                        "planType": "plus",
+                        "primary": {"usedPercent": 42.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+                    }
+                });
+            })
+            .await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(hello["protocolMinor"].as_u64().unwrap_or(0) >= 14);
+            assert!(
+                hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cap| cap == protocol::USAGE_LIMITS)
+            );
+
+            let codex_created = fixture
+                .local_command("thread.create", json!({"harness": "codex"}))
+                .await;
+            let codex_id = codex_created["result"]["threadId"].as_u64().unwrap();
+            let pi_created = fixture
+                .local_command(
+                    "thread.create",
+                    json!({"harness": "pi", "occupiedDrafts": [codex_id]}),
+                )
+                .await;
+            let pi_id = pi_created["result"]["threadId"].as_u64().unwrap();
+            assert_ne!(codex_id, pi_id);
+
+            // Wait until the fixture snapshots reflect both newly created threads.
+            for _ in 0..40 {
+                let snap = fixture.shared.snapshots.borrow().clone();
+                let state = if snap["state"].is_object() {
+                    &snap["state"]
+                } else {
+                    &snap
+                };
+                let has_both = state["index"]["threads"].as_array().is_some_and(|threads| {
+                    threads.iter().any(|t| t["id"].as_u64() == Some(codex_id))
+                        && threads.iter().any(|t| t["id"].as_u64() == Some(pi_id))
+                });
+                if has_both {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            let report =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": codex_id}))
+                    .await
+                    .unwrap();
+            assert!(report["createdAt"].as_str().is_some());
+            assert_eq!(report["accounts"][0]["driver"], "codex");
+            assert_eq!(report["accounts"][0]["limits"]["windows"][0]["usedPercent"], 42.0);
+
+            let unsupported =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": pi_id}))
+                    .await
+                    .unwrap_err();
+            assert!(
+                unsupported.contains("unavailable"),
+                "expected unavailable error, got: {unsupported}"
+            );
+
+            let missing =
+                crate::client::remote_rpc(&link, "usage.limits", json!({"threadId": 999_999}))
+                    .await
+                    .unwrap_err();
+            assert!(!missing.is_empty());
         });
     }
 }

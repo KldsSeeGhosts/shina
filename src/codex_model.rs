@@ -279,6 +279,7 @@ impl State {
                 thread.harness_state["codexNativeExtensions"] = json!(catalog.extensions);
             }
         }
+        self.sync_fallback_model(crate::lifecycle::now() as i64);
     }
 
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
@@ -872,6 +873,9 @@ impl State {
                 .set_option(opt.id.clone(), opt.value.clone());
         }
         self.current_mut().draft_model_state = draft_state;
+        self.current_mut().fallback_active = None;
+        self.current_mut().fallback_explicit_override = true;
+        self.composer_notices.sync("fallback-model", None);
         self.preferences.sticky_composer = sticky;
         self.reconcile_current_access_mode();
         self.checkpoint();

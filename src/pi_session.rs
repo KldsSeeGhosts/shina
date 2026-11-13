@@ -442,10 +442,17 @@ impl Thread {
 
     #[cfg(test)]
     pub fn slash_matches(&self) -> Vec<SlashCommand> {
-        self.slash_matches_with_fresh(self.fresh_session_command_available_local())
+        self.slash_matches_with_capabilities(
+            self.fresh_session_command_available_local(),
+            crate::usage_limits::has_usage_limits(&self.harness),
+        )
     }
 
-    pub fn slash_matches_with_fresh(&self, fresh_session_available: bool) -> Vec<SlashCommand> {
+    pub fn slash_matches_with_capabilities(
+        &self,
+        fresh_session_available: bool,
+        usage_limits_available: bool,
+    ) -> Vec<SlashCommand> {
         let Some(trigger) = self.slash_trigger() else {
             return vec![];
         };
@@ -459,6 +466,18 @@ impl Thread {
                 name: "clear".into(),
                 description: "Start a fresh session; earlier messages stay visible".into(),
                 source: "Shina".into(),
+            });
+        }
+        if trigger.range.start == 0 && usage_limits_available {
+            commands.push(SlashCommand {
+                name: crate::usage_limits::USAGE_LIMITS_COMMAND_NAME.into(),
+                description: crate::usage_limits::USAGE_LIMITS_COMMAND_DESCRIPTION.into(),
+                source: if self.harness == "claude" {
+                    "Claude"
+                } else {
+                    "Codex"
+                }
+                .into(),
             });
         }
         if trigger.range.start == 0 && crate::harness::supports_compaction(&self.harness) {
@@ -486,6 +505,8 @@ impl Thread {
                 .filter(|c| {
                     c.name != "model"
                         && (!fresh_session_available || c.name != "clear")
+                        && (!usage_limits_available
+                            || c.name != crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
                         && !c.name.starts_with('$')
                         && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
@@ -1330,6 +1351,14 @@ impl Thread {
                         return true;
                     }
                 }
+                if command == "consume_reset_credit" {
+                    self.harness_state["resetCreditOutcome"] = if record["success"] == false {
+                        json!({"error": string(record, "error")})
+                    } else {
+                        json!({"outcome": record["data"]["outcome"]})
+                    };
+                    return true;
+                }
                 if command == "get_commands" {
                     self.native.commands_requested = false;
                     if record["success"] == false {
@@ -1986,6 +2015,11 @@ impl State {
         if name == "clear" && !self.fresh_session_command_available(self.current()) {
             return;
         }
+        if name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME
+            && !self.usage_limits_command_available(self.current())
+        {
+            return;
+        }
         let range = self.current().slash_trigger().map(|t| t.range).or_else(|| {
             (name == "model" && self.current().draft.text.trim() == "/model")
                 .then(|| 0..self.current().draft.text.len())
@@ -1993,7 +2027,10 @@ impl State {
         let Some(range) = range else {
             return;
         };
-        let replacement = if name == "model" || name == "clear" {
+        let replacement = if name == "model"
+            || name == "clear"
+            || name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME
+        {
             String::new()
         } else {
             format!("/{name} ")
@@ -2010,6 +2047,8 @@ impl State {
             let thread_id = self.current().id;
             self.arm_fresh_session(thread_id);
             self.checkpoint();
+        } else if name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME {
+            self.open_usage_limits();
         }
     }
 

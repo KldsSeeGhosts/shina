@@ -134,6 +134,11 @@ impl NoticeAction {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum NoticeBody {
+    UsageLimits(crate::usage_limits::UsageLimitsReport),
+}
+
 #[derive(Clone, Debug)]
 pub struct Notice {
     pub id: String,
@@ -142,6 +147,7 @@ pub struct Notice {
     pub icon: &'static str,
     pub title: String,
     pub description: Option<String>,
+    pub body: Option<NoticeBody>,
     pub actions: Vec<NoticeAction>,
     pub dismiss_label: Option<String>,
 }
@@ -161,6 +167,7 @@ impl Notice {
             icon,
             title: title.into(),
             description: None,
+            body: None,
             actions: Vec::new(),
             dismiss_label: None,
         }
@@ -173,6 +180,11 @@ impl Notice {
 
     pub fn description(mut self, description: Option<String>) -> Self {
         self.description = description;
+        self
+    }
+
+    pub fn body(mut self, body: NoticeBody) -> Self {
+        self.body = Some(body);
         self
     }
 
@@ -230,6 +242,7 @@ impl Store {
                         || existing.icon != notice.icon
                         || existing.title != notice.title
                         || existing.description != notice.description
+                        || existing.body != notice.body
                         || existing.dismiss_label != notice.dismiss_label
                         || existing.actions.len() != notice.actions.len()
                         || existing.actions.iter().zip(&notice.actions).any(|(a, b)| {

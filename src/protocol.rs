@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 13;
+pub const MINOR: u32 = 14;
 pub const FRESH_CONTEXT: &str = "fresh-context";
+pub const USAGE_LIMITS: &str = "usage-limits";
 pub const PROJECT_WRITE_FILE: &str = "project-write-file";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
@@ -85,7 +86,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "command.get"
         | "server.status"
         | "blobs.read"
-        | "filesystem.browse" => "read",
+        | "filesystem.browse"
+        | "usage.limits" => "read",
         "request.respond" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
@@ -524,7 +526,8 @@ mod tests {
                 | "command.get"
                 | "server.status"
                 | "blobs.read"
-                | "filesystem.browse" => "read",
+                | "filesystem.browse"
+                | "usage.limits" => "read",
                 "request.respond" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

@@ -506,6 +506,8 @@ pub struct Thread {
     pub(crate) remote_send_fresh_arm: Option<u64>,
     pub fresh_session_arm: Option<u64>,
     pub fresh_session_messages: Vec<String>,
+    pub fallback_active: Option<crate::usage_limits::FallbackInfo>,
+    pub fallback_explicit_override: bool,
     pub composer_context_supported: bool,
     pub(crate) background_start_pending: bool,
     pub(crate) background_send: Option<String>,
@@ -836,6 +838,8 @@ impl Thread {
             fresh_session_arm: None,
             fresh_session_messages: Vec::new(),
             composer_context_supported: true,
+            fallback_active: None,
+            fallback_explicit_override: false,
             background_start_pending: false,
             background_send: None,
             pending_send_and_new_thread: None,
@@ -3297,6 +3301,10 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub pending_open_urls: Vec<String>,
+    pub next_usage_limits_request_id: u64,
+    pub pending_usage_limits_request: Option<(u64, String, usize, String)>,
+    pub usage_limits_notice_key: Option<(String, usize, String)>,
     pub timeline_far_from_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
@@ -3516,6 +3524,10 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            pending_open_urls: Vec::new(),
+            next_usage_limits_request_id: 0,
+            pending_usage_limits_request: None,
+            usage_limits_notice_key: None,
             timeline_far_from_bottom: std::collections::HashMap::new(),
             timeline_at_bottom: std::collections::HashMap::new(),
             timeline_positions: std::cell::RefCell::default(),
@@ -3630,6 +3642,15 @@ impl State {
         if self.opened_draft.map(|(opened, _)| opened) != Some(id) {
             self.capture_opened_draft();
         }
+        let current_key = (
+            self.machines.selected.clone(),
+            id,
+            self.current().harness.clone(),
+        );
+        if self.usage_limits_notice_key.as_ref() != Some(&current_key) {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove("usage-limits");
+        }
         self.current_mut().life.last_visited_at = Some(lifecycle::now());
         if !self.headless {
             self.composer_thread_opened();
@@ -3639,6 +3660,7 @@ impl State {
             self.scope_additional.clear();
         }
         self.sync_fresh_session_notice();
+        self.sync_fallback_model(lifecycle::now() as i64);
         self.checkpoint();
     }
     /// Closing a blank draft also deletes it. Written drafts survive without a tab.
@@ -5852,6 +5874,7 @@ impl State {
             }
         }
         self.select_thread(index);
+        self.sync_fallback_model(lifecycle::now() as i64);
     }
     pub fn open_captain(&mut self, captain: usize) {
         if self.forward("captain.open", json!({"captain":captain,"project":self.captain_project.unwrap_or(self.current().project),"assignProject":self.projects.captain_target})) {
@@ -7943,9 +7966,204 @@ impl State {
             && thread.native.questionnaire.is_none()
     }
 
+    pub fn usage_limits_command_available(&self, thread: &Thread) -> bool {
+        !self.demo
+            && crate::usage_limits::has_usage_limits(&thread.harness)
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::USAGE_LIMITS)
+            })
+    }
+
     pub fn slash_matches(&self) -> Vec<pi_session::SlashCommand> {
-        self.current()
-            .slash_matches_with_fresh(self.fresh_session_command_available(self.current()))
+        self.current().slash_matches_with_capabilities(
+            self.fresh_session_command_available(self.current()),
+            self.usage_limits_command_available(self.current()),
+        )
+    }
+
+    pub fn open_external_url(&mut self, url: &str) {
+        self.pending_open_urls.push(url.to_owned());
+    }
+
+    pub fn open_usage_limits(&mut self) -> bool {
+        let machine = self.machines.selected.clone();
+        let thread = self.current();
+        let thread_id = thread.id;
+        let harness = thread.harness.clone();
+        let client_draft = thread.client_draft;
+        if !self.usage_limits_command_available(thread) {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        }
+        if let Some(client) = &self.client {
+            let target = if machine == "local" {
+                Some(client)
+            } else {
+                client.linked.get(&machine)
+            };
+            let Some(target) = target else {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            };
+            if !target.has_capability(crate::protocol::USAGE_LIMITS) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            }
+            self.next_usage_limits_request_id += 1;
+            let req_id = self.next_usage_limits_request_id;
+            self.pending_usage_limits_request = Some((req_id, machine, thread_id, harness.clone()));
+            let params = if client_draft {
+                json!({"threadId": thread_id, "draft": true, "harness": harness})
+            } else {
+                json!({"threadId": thread_id})
+            };
+            target.call_rpc(format!("usage-limits:{req_id}"), "usage.limits", params);
+            return true;
+        }
+
+        let catalog = match harness.as_str() {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            _ => None,
+        };
+        let hs = &thread.harness_state;
+        let usage_limits = (!hs["usageLimits"].is_null())
+            .then_some(&hs["usageLimits"])
+            .or_else(|| catalog.map(|c| &c.usage_limits).filter(|v| !v.is_null()));
+        let usage_limits_raw = (!hs["usageLimitsRaw"].is_null())
+            .then_some(&hs["usageLimitsRaw"])
+            .or_else(|| {
+                catalog
+                    .map(|c| &c.usage_limits_raw)
+                    .filter(|v| !v.is_null())
+            });
+        let usage_account = (!hs["usageAccount"].is_null())
+            .then_some(&hs["usageAccount"])
+            .or_else(|| catalog.map(|c| &c.usage_account).filter(|v| !v.is_null()));
+        let Some(report) = crate::usage_limits::build_usage_limits_report(
+            crate::usage_limits::UsageLimitsReportInput {
+                harness: &harness,
+                now_ms: lifecycle::now() as i64,
+                usage_limits,
+                usage_limits_raw,
+                usage_account,
+            },
+        ) else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Usage limits are unavailable for this provider",
+                None,
+                None,
+                Some(5_000),
+            );
+            return false;
+        };
+        self.show_usage_limits_report(report);
+        true
+    }
+
+    pub(crate) fn apply_usage_limits_result(
+        &mut self,
+        req_id: u64,
+        result: Result<crate::usage_limits::UsageLimitsReport, String>,
+    ) {
+        let Some((pending_id, machine, thread_id, harness)) =
+            self.pending_usage_limits_request.as_ref()
+        else {
+            return;
+        };
+        if *pending_id != req_id {
+            return;
+        }
+        let matches_current = self.machines.selected == *machine
+            && self.current().id == *thread_id
+            && self.current().harness == *harness;
+        self.pending_usage_limits_request = None;
+        if !matches_current {
+            return;
+        }
+        match result {
+            Ok(report) => self.show_usage_limits_report(report),
+            Err(_) => {
+                self.usage_limits_notice_key = None;
+                self.composer_notices.remove("usage-limits");
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Usage limits are unavailable for this provider",
+                    None,
+                    None,
+                    Some(5_000),
+                );
+            }
+        }
+    }
+
+    pub fn show_usage_limits_report(&mut self, report: crate::usage_limits::UsageLimitsReport) {
+        let description = if report.accounts.len() == 1 {
+            report
+                .accounts
+                .first()
+                .map(crate::usage_limits::account_summary)
+        } else {
+            Some(format!("{} accounts", report.accounts.len()))
+        };
+        self.usage_limits_notice_key = Some((
+            self.machines.selected.clone(),
+            self.current().id,
+            self.current().harness.clone(),
+        ));
+        self.composer_notices.remove("usage-limits");
+        self.composer_notices.push(
+            crate::composer_notices::Notice::new(
+                "usage-limits",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                "Usage limits",
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(description)
+            .body(crate::composer_notices::NoticeBody::UsageLimits(report))
+            .dismiss_label("Dismiss usage limits"),
+        );
+    }
+
+    pub fn redeem_usage_reset_credit(
+        &mut self,
+        input: crate::usage_limits::ProviderConsumeResetCreditInput,
+    ) {
+        let _ = input;
+        if self.client.is_none() && self.current().harness == "codex" && self.current().pi.is_some()
+        {
+            let key = uuid::Uuid::new_v4().to_string();
+            self.current_mut()
+                .command("consume_reset_credit", json!({"idempotencyKey": key}));
+            return;
+        }
+        self.push_toast(
+            ToastKind::Error,
+            "Could not use the reset credit.",
+            None,
+            None,
+            Some(5_000),
+        );
     }
 
     pub fn arm_fresh_session(&mut self, thread_id: usize) {
@@ -7972,8 +8190,294 @@ impl State {
             self.disarm_fresh_session(thread_id, None);
             self.composer_notices.remove(id);
             self.checkpoint();
+        } else if id == "usage-limits" {
+            self.usage_limits_notice_key = None;
+            self.composer_notices.remove(id);
         } else {
             self.composer_notices.dismiss(id);
+        }
+    }
+
+    pub fn fallback_model_candidates(&self) -> Vec<crate::model_selection::ModelSelection> {
+        let entries = self.provider_instance_entries();
+        let models_by_instance = self.picker_models_by_instance();
+        let mut out = Vec::new();
+        // Order non-default providers first so toggling on prefers an alternate provider.
+        let mut ordered_entries = entries.clone();
+        ordered_entries.sort_by_key(|e| e.instance_id == self.default_harness);
+        for entry in ordered_entries {
+            if !entry.enabled || !entry.is_available {
+                continue;
+            }
+            if let Some(opts) = models_by_instance.get(&entry.instance_id)
+                && !opts.is_empty()
+            {
+                for opt in opts {
+                    out.push(crate::model_selection::ModelSelection {
+                        instance_id: entry.instance_id.clone(),
+                        model: opt.slug.clone(),
+                        options: Vec::new(),
+                    });
+                }
+            } else {
+                out.push(crate::model_selection::ModelSelection {
+                    instance_id: entry.instance_id.clone(),
+                    model: crate::model_selection::default_model_by_provider(&entry.driver_kind)
+                        .to_owned(),
+                    options: Vec::new(),
+                });
+            }
+        }
+        out
+    }
+
+    fn default_model_selection_for_fallback(
+        &self,
+    ) -> Option<crate::model_selection::ModelSelection> {
+        let harness = &self.default_harness;
+        if let Some(def) = self.thread_defaults.models.get(harness)
+            && !def.model.trim().is_empty()
+        {
+            let mut options = Vec::new();
+            if !def.effort.trim().is_empty() {
+                let key = if harness == "codex" {
+                    "reasoningEffort"
+                } else {
+                    "effort"
+                };
+                options.push(crate::model_selection::ProviderOptionSelection {
+                    id: key.into(),
+                    value: crate::model_selection::OptionValue::Str(def.effort.clone()),
+                });
+            }
+            return Some(crate::model_selection::ModelSelection {
+                instance_id: harness.clone(),
+                model: def.model.clone(),
+                options,
+            });
+        }
+        let models = self.harness_models(harness);
+        let model = models
+            .iter()
+            .find(|m| m.is_default)
+            .or_else(|| models.first())
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                crate::model_selection::default_model_by_provider(harness).to_owned()
+            });
+        Some(crate::model_selection::ModelSelection {
+            instance_id: harness.clone(),
+            model,
+            options: Vec::new(),
+        })
+    }
+
+    fn provider_usage_windows(
+        &self,
+        harness: &str,
+        now_ms: i64,
+    ) -> Vec<crate::usage_limits::ServerProviderUsageWindow> {
+        if !crate::usage_limits::has_usage_limits(harness) {
+            return Vec::new();
+        }
+        let catalog = match harness {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            _ => None,
+        };
+        let thread = if self.current().harness == harness {
+            Some(self.current())
+        } else {
+            self.threads.iter().find(|t| {
+                t.harness == harness
+                    && (!t.harness_state["usageLimitsRaw"].is_null()
+                        || !t.harness_state["usageLimits"].is_null())
+            })
+        };
+        let hs = thread.map(|t| &t.harness_state);
+        let usage_limits = hs
+            .map(|h| &h["usageLimits"])
+            .filter(|v| !v.is_null())
+            .or_else(|| catalog.map(|c| &c.usage_limits).filter(|v| !v.is_null()));
+        let usage_limits_raw = hs
+            .map(|h| &h["usageLimitsRaw"])
+            .filter(|v| !v.is_null())
+            .or_else(|| {
+                catalog
+                    .map(|c| &c.usage_limits_raw)
+                    .filter(|v| !v.is_null())
+            });
+        let usage_account = hs
+            .map(|h| &h["usageAccount"])
+            .filter(|v| !v.is_null())
+            .or_else(|| catalog.map(|c| &c.usage_account).filter(|v| !v.is_null()));
+        crate::usage_limits::build_usage_limits_report(
+            crate::usage_limits::UsageLimitsReportInput {
+                harness,
+                now_ms,
+                usage_limits,
+                usage_limits_raw,
+                usage_account,
+            },
+        )
+        .and_then(|r| r.accounts.into_iter().next())
+        .map(|a| a.limits.windows)
+        .unwrap_or_default()
+    }
+
+    fn friendly_model_name(&self, harness: &str, model_id: &str) -> String {
+        if self.current().harness == harness
+            && let Some(m) = self.current().models.iter().find(|m| m.id == model_id)
+        {
+            return m.name.clone();
+        }
+        self.harness_models(harness)
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.name)
+            .unwrap_or_else(|| model_id.to_owned())
+    }
+
+    fn apply_selection_to_thread(
+        &mut self,
+        index: usize,
+        selection: &crate::model_selection::ModelSelection,
+    ) {
+        let prev_active = self.active;
+        self.active = index;
+        if self.threads[index].harness != selection.instance_id {
+            self.choose_harness(&selection.instance_id);
+        }
+        let provider = if selection.instance_id == "pi" {
+            "cpa".to_owned()
+        } else {
+            selection.instance_id.clone()
+        };
+        let models = self.harness_models(&selection.instance_id);
+        if self.threads[index].models.is_empty() && !models.is_empty() {
+            self.threads[index].models = models;
+        }
+        self.threads[index].set_model(provider, selection.model.clone());
+        for opt in &selection.options {
+            self.threads[index].set_option(opt.id.clone(), opt.value.clone());
+        }
+        self.reconcile_current_access_mode();
+        self.active = prev_active;
+    }
+
+    pub fn use_default_from_fallback(&mut self) {
+        let Some(info) = self.current().fallback_active.clone() else {
+            return;
+        };
+        self.current_mut().fallback_active = None;
+        self.current_mut().fallback_explicit_override = true;
+        self.apply_selection_to_thread(self.active, &info.default_selection);
+        self.composer_notices.sync("fallback-model", None);
+        self.checkpoint();
+    }
+
+    /// Evaluates KSG's new-thread fallback rule for the active thread and syncs the
+    /// `fallback-model` composer notice.
+    pub(crate) fn sync_fallback_model(&mut self, now_ms: i64) -> bool {
+        let t = self.current();
+        let eligible = !self.demo
+            && t.messages.is_empty()
+            && t.life.latest_user_message_at.is_none()
+            && t.session.is_none()
+            && !t.fallback_explicit_override;
+        if !eligible {
+            self.current_mut().fallback_active = None;
+            return self.composer_notices.sync("fallback-model", None);
+        }
+        let Some(fallback_sel) = self.thread_defaults.fallback_model_selection.clone() else {
+            if let Some(prev) = self.current_mut().fallback_active.take() {
+                self.apply_selection_to_thread(self.active, &prev.default_selection);
+            }
+            return self.composer_notices.sync("fallback-model", None);
+        };
+        let default_sel = self
+            .current()
+            .fallback_active
+            .as_ref()
+            .map(|f| f.default_selection.clone())
+            .or_else(|| self.default_model_selection_for_fallback());
+        let entries = self.provider_instance_entries();
+        let windows_by_id: Vec<(String, Vec<crate::usage_limits::ServerProviderUsageWindow>)> =
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.instance_id.clone(),
+                        self.provider_usage_windows(&e.instance_id, now_ms),
+                    )
+                })
+                .collect();
+        let candidates: Vec<crate::usage_limits::ProviderFallbackCandidate<'_>> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::usage_limits::ProviderFallbackCandidate {
+                instance_id: &e.instance_id,
+                driver_kind: &e.driver_kind,
+                display_name: &e.display_name,
+                enabled: e.enabled,
+                installed: e.installed,
+                authenticated: !matches!(
+                    e.auth_status,
+                    crate::model_picker::ProviderAuthStatus::Unauthenticated
+                ),
+                is_available: e.is_available,
+                windows: &windows_by_id[i].1,
+            })
+            .collect();
+        let res = crate::usage_limits::resolve_new_thread_model_selection(
+            default_sel.as_ref(),
+            None,
+            Some(&fallback_sel),
+            &candidates,
+            now_ms,
+        );
+        if let (Some(target_sel), Some(info)) = (res.selection, res.fallback) {
+            let needs_apply = self.current().fallback_active.as_ref() != Some(&info)
+                || self.current().harness != target_sel.instance_id
+                || self.current().model_id != target_sel.model;
+            if needs_apply {
+                self.apply_selection_to_thread(self.active, &target_sel);
+                self.current_mut().fallback_active = Some(info.clone());
+            }
+            let fallback_model_name =
+                self.friendly_model_name(&target_sel.instance_id, &target_sel.model);
+            let default_model_name = self.friendly_model_name(
+                &info.default_selection.instance_id,
+                &info.default_selection.model,
+            );
+            let resets_suffix = info
+                .resets_at
+                .as_deref()
+                .and_then(crate::usage_limits::format_reset_clock_iso)
+                .map(|clock| format!(" · resets {clock}"))
+                .unwrap_or_default();
+            let notice = crate::composer_notices::Notice::new(
+                "fallback-model",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                format!("Using {fallback_model_name}"),
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(Some(format!(
+                "{} is out of usage{resets_suffix}",
+                info.default_provider_name
+            )))
+            .actions(vec![crate::composer_notices::NoticeAction::new(
+                format!("Use {default_model_name}"),
+                |s| s.use_default_from_fallback(),
+            )])
+            .dismiss_label("Dismiss fallback model notice");
+            self.composer_notices.sync("fallback-model", Some(notice))
+        } else {
+            if let Some(prev) = self.current_mut().fallback_active.take() {
+                self.apply_selection_to_thread(self.active, &prev.default_selection);
+            }
+            self.composer_notices.sync("fallback-model", None)
         }
     }
 
@@ -8218,6 +8722,22 @@ impl State {
             self.checkpoint();
             return false;
         }
+        if composer_holds_only_text
+            && self.usage_limits_command_available(self.current())
+            && crate::usage_limits::is_usage_limits_command(&draft_markdown)
+        {
+            if self.open_usage_limits() {
+                let t = self.current_mut();
+                t.prompt_history.reset();
+                t.typing_guard.on_blur_or_send();
+                t.paste_history = Default::default();
+                t.draft.replace_text("");
+                t.submission_error = None;
+                t.attachment_error = None;
+                self.checkpoint();
+            }
+            return false;
+        }
         // Read once: an arm made while this send is in flight belongs to the next message.
         let fresh_arm = if forced_fresh_context.is_some() {
             None
@@ -8327,6 +8847,8 @@ impl State {
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    self.usage_limits_notice_key = None;
+                    self.composer_notices.remove("usage-limits");
                     true
                 }
                 Some(Err(error)) => {
@@ -8370,6 +8892,9 @@ impl State {
                 return false;
             }
             Some(command) if command.eq_ignore_ascii_case("/clear") => {}
+            Some(command)
+                if command.eq_ignore_ascii_case("/usage-limits")
+                    && self.usage_limits_command_available(self.current()) => {}
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
@@ -8588,6 +9113,8 @@ impl State {
             }
             self.current_mut().submission_error = None;
         }
+        self.usage_limits_notice_key = None;
+        self.composer_notices.remove("usage-limits");
         let local_server_id = self.machine_identity(&self.machines.selected);
         let peers = self.peers.clone();
         let labels: Vec<(String, String)> = peers
@@ -10230,6 +10757,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     state.html_windows.theme(state.dark);
+    for url in std::mem::take(&mut state.pending_open_urls) {
+        html_changed = true;
+        if let Err(error) = tx.open_url(&url) {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not open the link",
+                Some(error.to_string()),
+                None,
+                Some(5_000),
+            );
+        }
+    }
     let keybindings_changed = !state.headless && state.poll_keybindings();
     let browsing = state.poll_folder_browser()
         | state.poll_settings()
@@ -10494,6 +11033,41 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
     changed |= state.sync_fresh_session_notice();
+    changed |= state.sync_fallback_model(lifecycle::now() as i64);
+    if let Some(outcome) = state
+        .current_mut()
+        .harness_state
+        .as_object_mut()
+        .and_then(|obj| obj.remove("resetCreditOutcome"))
+    {
+        changed = true;
+        if let Some(err) = outcome["error"].as_str() {
+            state.push_toast(
+                ToastKind::Error,
+                "Could not use the reset credit.",
+                Some(err.to_owned()),
+                None,
+                Some(5_000),
+            );
+        } else {
+            let msg = match outcome["outcome"].as_str() {
+                Some("reset") => "Reset applied. Your windows have cleared.",
+                Some("nothingToReset") => "Nothing to reset right now.",
+                Some("noCredit") => "No reset credit left.",
+                Some("alreadyRedeemed") => "That credit was already redeemed.",
+                _ => "Could not use the reset credit.",
+            };
+            let kind = if outcome["outcome"].as_str() == Some("reset") {
+                ToastKind::Success
+            } else {
+                ToastKind::Warning
+            };
+            state.push_toast(kind, msg, None, None, Some(5_000));
+            if state.usage_limits_notice_key.is_some() {
+                state.open_usage_limits();
+            }
+        }
+    }
     if global_changed {
         state.persistence_scope = None;
         changed = true;
@@ -16955,5 +17529,193 @@ mod tests {
             text: "Inspect the diff".into(),
         });
         assert_eq!(state.offered_prompt_suggestion(), Some("Inspect the diff"));
+    }
+
+    #[test]
+    fn usage_limits_command_raises_notice_without_sending_and_requires_capability() {
+        let mut state = State::new(".".into(), false);
+        // Pi has no report, so `/usage-limits` is not offered and sends as ordinary text.
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        let (pi, commands, _events) = Pi::test_connection();
+        {
+            let t = state.current_mut();
+            t.harness = "codex".into();
+            t.model_provider = "codex".into();
+            t.pi = Some(pi);
+            t.harness_state["usageLimitsRaw"] = json!({
+                "checkedAtMs": 1_700_000_000_000i64,
+                "snapshot": {
+                    "limitId": "codex",
+                    "planType": "plus",
+                    "primary": {"usedPercent": 35.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+                }
+            });
+            t.draft.replace_text("/");
+        }
+        assert!(
+            state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+
+        // Sending `/usage-limits` alone raises the notice, clears the draft, and sends nothing.
+        state.current_mut().draft.replace_text("/usage-limits");
+        state.send();
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "usage-limits");
+        assert_eq!(notices[0].title, "Usage limits");
+        assert!(matches!(
+            notices[0].body,
+            Some(crate::composer_notices::NoticeBody::UsageLimits(_))
+        ));
+
+        // Dismissing removes it; choosing from the slash menu raises it again without sending.
+        state.dismiss_composer_notice("usage-limits");
+        assert!(state.composer_notices.ordered().is_empty());
+        state.current_mut().draft.replace_text("/usage");
+        state.choose_slash(crate::usage_limits::USAGE_LIMITS_COMMAND_NAME.into());
+        assert!(state.current().draft.text.is_empty());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(state.composer_notices.ordered().len(), 1);
+
+        // Sending `/usage-limits` with extra text sends as ordinary text (KSG `isUsageLimitsCommand`).
+        state
+            .current_mut()
+            .draft
+            .replace_text("/usage-limits explain");
+        state.send();
+        let sent = commands.try_recv().expect("ordinary prompt sent");
+        assert_eq!(sent["type"], "prompt");
+        assert_eq!(sent["message"], "/usage-limits explain");
+
+        // Machine lacking `usage-limits` capability hides the command.
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": []});
+        state.client = Some(client);
+        state.current_mut().draft.focused = true;
+        state.current_mut().draft.replace_text("/");
+        assert!(
+            !state
+                .slash_matches()
+                .iter()
+                .any(|c| c.name == crate::usage_limits::USAGE_LIMITS_COMMAND_NAME)
+        );
+    }
+
+    #[test]
+    fn fallback_model_switches_when_out_of_usage_restores_on_reset_and_use_default_clears_notice() {
+        let mut state = State::new(".".into(), false);
+        state.default_harness = "codex".into();
+        state.codex_catalog.models.push(
+            AgentModel::from_harness_value(
+                &json!({
+                    "provider": "codex",
+                    "id": "gpt-6-astra",
+                    "name": "GPT-6 Astra",
+                    "isDefault": true,
+                    "thinkingLevels": ["medium"]
+                }),
+                "codex",
+            )
+            .unwrap(),
+        );
+        state.claude_catalog.models.push(
+            AgentModel::from_harness_value(
+                &json!({
+                    "provider": "claude",
+                    "id": "claude-opus-5-5",
+                    "name": "Claude Opus 5.5",
+                    "isDefault": true,
+                    "thinkingLevels": ["high"]
+                }),
+                "claude",
+            )
+            .unwrap(),
+        );
+        state.thread_defaults.fallback_model_selection =
+            Some(crate::model_selection::ModelSelection {
+                instance_id: "claude".into(),
+                model: "claude-opus-5-5".into(),
+                options: vec![],
+            });
+        let now_ms = 1_700_000_000_000i64;
+        // Codex primary window is exhausted (100% used, resets 1h from now_ms).
+        state.codex_catalog.usage_limits_raw = json!({
+            "checkedAtMs": now_ms,
+            "snapshot": {
+                "limitId": "codex",
+                "planType": "plus",
+                "primary": {"usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1_700_003_600}
+            }
+        });
+
+        state.sync_fallback_model(now_ms);
+        assert_eq!(state.current().harness, "claude");
+        assert_eq!(state.current().model_id, "claude-opus-5-5");
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "fallback-model");
+        assert_eq!(notices[0].title, "Using Claude Opus 5.5");
+        assert!(
+            notices[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("Codex is out of usage · resets ")
+        );
+        assert_eq!(notices[0].actions.len(), 1);
+        assert_eq!(notices[0].actions[0].label, "Use GPT-6 Astra");
+        assert_eq!(
+            notices[0].dismiss_label.as_deref(),
+            Some("Dismiss fallback model notice")
+        );
+
+        // Dismissing keeps the notice hidden while the fallback state continues.
+        state.dismiss_composer_notice("fallback-model");
+        assert!(state.composer_notices.ordered().is_empty());
+        state.sync_fallback_model(now_ms + 60_000);
+        assert!(state.composer_notices.ordered().is_empty());
+
+        // When usage resets (now passes resetsAt), the thread restores its default model and
+        // clears dismissal so a later exhaustion can show the notice again.
+        state.sync_fallback_model(1_700_003_601_000);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().model_id, "gpt-6-astra");
+        assert!(state.composer_notices.ordered().is_empty());
+
+        // Out of usage again -> switches and re-raises notice; clicking "Use default" switches back and removes notice.
+        state.codex_catalog.usage_limits_raw = json!({
+            "checkedAtMs": 1_700_010_000_000i64,
+            "snapshot": {
+                "limitId": "codex",
+                "planType": "plus",
+                "primary": {"usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1_700_020_000}
+            }
+        });
+        state.sync_fallback_model(1_700_010_000_000);
+        assert_eq!(state.current().harness, "claude");
+        let action = state.composer_notices.ordered()[0].actions[0]
+            .handler
+            .clone();
+        action.call(&mut state);
+        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().model_id, "gpt-6-astra");
+        assert!(state.composer_notices.ordered().is_empty());
+        // Explicit override persists while staying on that thread.
+        state.sync_fallback_model(1_700_010_060_000);
+        assert_eq!(state.current().harness, "codex");
+        assert!(state.composer_notices.ordered().is_empty());
     }
 }
