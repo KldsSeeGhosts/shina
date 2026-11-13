@@ -57,6 +57,72 @@ pub enum RenderablePatch {
     Raw { text: String, reason: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineStat {
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+pub fn line_stat(files: &[FileDiff]) -> LineStat {
+    let mut additions: u32 = 0;
+    let mut deletions: u32 = 0;
+    for file in files {
+        additions = additions.saturating_add(file.additions);
+        deletions = deletions.saturating_add(file.deletions);
+    }
+    LineStat {
+        additions,
+        deletions,
+    }
+}
+
+pub fn fnv1a32(text: &str) -> u32 {
+    const FNV_OFFSET_BASIS_32: u32 = 0x811c_9dc5;
+    const FNV_PRIME_32: u32 = 0x0100_0193;
+
+    let mut hash = FNV_OFFSET_BASIS_32;
+    for code_unit in text.encode_utf16() {
+        hash ^= u32::from(code_unit);
+        hash = hash.wrapping_mul(FNV_PRIME_32);
+    }
+    hash
+}
+
+pub fn identity_key(file: &FileDiff) -> String {
+    let path = if file.path.is_empty() {
+        file.previous_path.as_deref().unwrap_or("")
+    } else {
+        file.path.as_str()
+    };
+    let previous = file.previous_path.as_deref().unwrap_or(path);
+    let kind = match file.change {
+        ChangeKind::Added => "added",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Renamed => "renamed",
+        ChangeKind::Copied => "copied",
+    };
+    format!("{previous}\0{path}\0{kind}")
+}
+
+pub fn all_collapsed(files: &[FileDiff], collapsed: &std::collections::HashSet<String>) -> bool {
+    !files.is_empty()
+        && files
+            .iter()
+            .all(|file| collapsed.contains(&identity_key(file)))
+}
+
+pub fn toggle_all(files: &[FileDiff], collapsed: &mut std::collections::HashSet<String>) {
+    if all_collapsed(files, collapsed) {
+        collapsed.clear();
+    } else {
+        collapsed.clear();
+        for file in files {
+            collapsed.insert(identity_key(file));
+        }
+    }
+}
+
 struct FileBuilder {
     diff_old_path: String,
     diff_new_path: String,
@@ -1006,5 +1072,93 @@ diff --git a/two.txt b/two.txt
             let _ = parse(&sample[..byte_idx]);
         }
         let _ = parse(sample);
+    }
+
+    #[test]
+    fn fnv1a32_matches_ksg_utf16() {
+        assert_eq!(fnv1a32(""), 0x811c_9dc5);
+        assert_eq!(fnv1a32("abc"), 0x1a47_e90b);
+        assert_eq!(fnv1a32("é"), 0x6c0b_6c44);
+    }
+
+    #[test]
+    fn line_stat_identity_key_and_collapse_helpers() {
+        use std::collections::HashSet;
+
+        let patch = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,2 +1,3 @@
+ keep
+-old
++new1
++new2
+diff --git a/b.rs b/c.rs
+rename from b.rs
+rename to c.rs
+--- a/b.rs
++++ b/c.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let files = expect_files(patch);
+        assert_eq!(
+            line_stat(&[]),
+            LineStat {
+                additions: 0,
+                deletions: 0
+            }
+        );
+        assert_eq!(
+            line_stat(&files),
+            LineStat {
+                additions: 3,
+                deletions: 2
+            }
+        );
+
+        assert_eq!(identity_key(&files[0]), "a.rs\0a.rs\0modified");
+        assert_eq!(identity_key(&files[1]), "b.rs\0c.rs\0renamed");
+
+        let deleted_pair = FileDiff {
+            path: "link.txt".to_string(),
+            previous_path: None,
+            change: ChangeKind::Deleted,
+            binary: false,
+            old_mode: None,
+            new_mode: None,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 1,
+        };
+        let added_pair = FileDiff {
+            change: ChangeKind::Added,
+            additions: 1,
+            deletions: 0,
+            ..deleted_pair.clone()
+        };
+        assert_ne!(identity_key(&deleted_pair), identity_key(&added_pair));
+
+        let mut collapsed = HashSet::new();
+        assert!(!all_collapsed(&[], &collapsed));
+        assert!(!all_collapsed(&files, &collapsed));
+
+        collapsed.insert(identity_key(&files[0]));
+        assert!(!all_collapsed(&files, &collapsed));
+
+        collapsed.insert("stale\0key\0modified".to_string());
+        toggle_all(&files, &mut collapsed);
+        assert!(all_collapsed(&files, &collapsed));
+        assert_eq!(collapsed.len(), 2);
+        assert!(!collapsed.contains("stale\0key\0modified"));
+
+        toggle_all(&files, &mut collapsed);
+        assert!(!all_collapsed(&files, &collapsed));
+        assert!(collapsed.is_empty());
+
+        toggle_all(&[], &mut collapsed);
+        assert!(collapsed.is_empty());
     }
 }
