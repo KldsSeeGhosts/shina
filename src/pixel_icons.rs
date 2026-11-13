@@ -41,6 +41,16 @@ glyph!(
     CLOSE,
     r#"<path d="M7 19H5V17H7V19ZM19 19H17V17H19V19ZM9 15V17H7V15H9ZM17 17H15V15H17V17ZM11 15H9V13H11V15ZM15 15H13V13H15V15ZM13 13H11V11H13V13ZM11 11H9V9H11V11ZM15 11H13V9H15V11ZM9 9H7V7H9V9ZM17 9H15V7H17V9ZM7 7H5V5H7V7ZM19 7H17V5H19V7Z"/>"#
 );
+// The speaker glyphs are drawn here on the same grid: a 4 unit body, a cone
+// stepping 2 units, then either a sound wave or a cross.
+glyph!(
+    VOLUME,
+    r#"<path d="M2 9h4v6H2zM6 7h2v10H6zM8 5h2v14H8zM12 10h2v4h-2zM16 6h2v2h-2zM18 8h2v8h-2zM16 16h2v2h-2z"/>"#
+);
+glyph!(
+    VOLUME_MUTED,
+    r#"<path d="M2 9h4v6H2zM6 7h2v10H6zM8 5h2v14H8zM14 8h2v2h-2zM20 8h2v2h-2zM16 10h4v4h-4zM14 14h2v2h-2zM20 14h2v2h-2z"/>"#
+);
 // The check is 4 unit blocks stepping 2 units, as heavy as the chevrons.
 glyph!(
     CHECK,
@@ -304,6 +314,8 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "open" => &CHEVRON_RIGHT,
         "lock" => &LOCK,
         "close" => &CLOSE,
+        "volume" => &VOLUME,
+        "volume-muted" => &VOLUME_MUTED,
         "file" => &FILE,
         "terminal" => &TERMINAL,
         "expand" => &EXPAND,

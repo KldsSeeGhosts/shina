@@ -16942,6 +16942,140 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn attachment_video_preview_has_volume_slider_and_rate_menu() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let movie_path = rt.state.data_dir.join("preview.mp4");
+            std::fs::write(
+                &movie_path,
+                include_bytes!("../assets/tests/attachment-preview.mp4"),
+            )
+            .unwrap();
+            let video = crate::attachments::attach_file(&movie_path).unwrap();
+            rt.state.current_mut().draft_images = vec![video.clone()];
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.update(|s, _| s.preview_attachments(vec![video.clone()], &video.id, true));
+            rt.frame(0.0);
+            let (dialog, _) = rt.presented("attachment-preview").unwrap();
+            for key in [
+                "attachment-preview-media-controls",
+                "attachment-preview-seek",
+                "attachment-preview-play",
+                "attachment-preview-mute",
+                "attachment-preview-volume",
+                "attachment-preview-rate",
+                "attachment-preview-fullscreen",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= dialog[0] - 0.5
+                        && rect[1] >= dialog[1] - 0.5
+                        && rect[0] + rect[2] <= dialog[0] + dialog[2] + 0.5
+                        && rect[1] + rect[3] <= dialog[1] + dialog[3] + 0.5,
+                    "{width}: {key} at {rect:?} in {dialog:?}"
+                );
+            }
+            // Rune has no video playback on Linux yet, so only the
+            // layout is checked there.
+            if cfg!(any(target_os = "macos", windows)) {
+                rt.frame(0.25);
+                let player = rt
+                    .state
+                    .attachment_preview
+                    .as_ref()
+                    .unwrap()
+                    .player()
+                    .unwrap()
+                    .clone();
+                assert!(
+                    !matches!(player.state(), rune::PlayerState::Failed(_)),
+                    "{:?}",
+                    player.state()
+                );
+                press(&mut rt, "attachment-preview-mute");
+                assert_eq!(player.volume(), 0.0);
+                press(&mut rt, "attachment-preview-mute");
+                assert_eq!(player.volume(), 1.0);
+                press(&mut rt, "attachment-preview-rate");
+                assert!(rt.presented("attachment-preview-rate-menu").is_some());
+                press(&mut rt, "attachment-preview-rate-1.5");
+                assert!(rt.presented("attachment-preview-rate-menu").is_none());
+                assert_eq!(player.rate(), 1.5);
+                assert!(
+                    rt.elements()
+                        .iter()
+                        .any(|e| e.text.as_deref() == Some("1.5x")),
+                    "{width}: rate button text"
+                );
+                // Down roves onto a rate option and Up stays in the menu; Enter
+                // picks the focused option and closes.
+                press(&mut rt, "attachment-preview-rate");
+                assert!(rt.presented("attachment-preview-rate-menu").is_some());
+                tap(&mut rt, rune::Key::Down);
+                assert!(
+                    focused(&rt)
+                        .key
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("attachment-preview-rate-")),
+                    "{width}: Down focuses a rate option"
+                );
+                tap(&mut rt, rune::Key::Up);
+                let chosen: Option<f32> = focused(&rt)
+                    .key
+                    .as_deref()
+                    .and_then(|k| k.strip_prefix("attachment-preview-rate-"))
+                    .and_then(|v| v.parse().ok());
+                tap(&mut rt, rune::Key::Enter);
+                assert!(rt.presented("attachment-preview-rate-menu").is_none());
+                if let Some(chosen) = chosen {
+                    assert_eq!(player.rate(), chosen, "{width}: Enter picks the option");
+                }
+                let rate_before = player.rate();
+                press(&mut rt, "attachment-preview-rate");
+                assert!(rt.presented("attachment-preview-rate-menu").is_some());
+                tap(&mut rt, rune::Key::Escape);
+                assert!(rt.presented("attachment-preview-rate-menu").is_none());
+                assert_eq!(player.rate(), rate_before, "{width}: Escape keeps the rate");
+            }
+            press(&mut rt, "close-attachment-preview");
+            assert!(rt.state.attachment_preview.is_none());
+        }
+        // Where the control bar runs out of room, the volume slider hides first.
+        let mut rt = runtime(360.0);
+        let movie_path = rt.state.data_dir.join("preview.mp4");
+        std::fs::write(
+            &movie_path,
+            include_bytes!("../assets/tests/attachment-preview.mp4"),
+        )
+        .unwrap();
+        let video = crate::attachments::attach_file(&movie_path).unwrap();
+        rt.state.current_mut().draft_images = vec![video.clone()];
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.update(|s, _| s.preview_attachments(vec![video.clone()], &video.id, true));
+        rt.frame(0.0);
+        let (dialog, _) = rt.presented("attachment-preview").unwrap();
+        assert!(rt.presented("attachment-preview-volume").is_none());
+        for key in [
+            "attachment-preview-media-controls",
+            "attachment-preview-play",
+            "attachment-preview-mute",
+            "attachment-preview-rate",
+            "attachment-preview-fullscreen",
+        ] {
+            let (rect, _) = rt.presented(key).unwrap_or_else(|| panic!("360: {key}"));
+            assert!(
+                rect[0] >= dialog[0] - 0.5 && rect[0] + rect[2] <= dialog[0] + dialog[2] + 0.5,
+                "360: {key} at {rect:?} in {dialog:?}"
+            );
+        }
+        press(&mut rt, "close-attachment-preview");
+    }
+
+    #[test]
     fn notebook_attachment_preview_pages_cells_and_fits_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
