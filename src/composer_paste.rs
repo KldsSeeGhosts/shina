@@ -8,6 +8,27 @@ pub fn should_fold(text: &str) -> bool {
     text.len() >= THRESHOLD
 }
 
+pub fn would_exceed_limit(edit: &TextEdit, text: &str) -> bool {
+    let (markdown, selected) = crate::composer_rich::markdown_selection(edit);
+    markdown.encode_utf16().count() - markdown[selected].encode_utf16().count()
+        + text.encode_utf16().count()
+        > crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS
+}
+
+pub fn next_name<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let names: std::collections::HashSet<_> = names.into_iter().map(str::to_lowercase).collect();
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                "pasted-text.txt".into()
+            } else {
+                format!("pasted-text-{n}.txt")
+            }
+        })
+        .find(|name| !names.contains(name))
+        .unwrap()
+}
+
 /// KSG's handlePaste ignores HTML and parses the normalized plain-text Markdown.
 /// File mentions use this draft's workspace, not this process's working directory.
 pub fn insert(state: &mut crate::model::State, text: &str) {
@@ -63,17 +84,12 @@ pub fn insert(state: &mut crate::model::State, text: &str) {
     thread.update_submission_error();
 }
 
+#[cfg(test)]
 pub fn stage(text: &str, existing: &[Attachment]) -> Result<Attachment, String> {
-    let name = (1..)
-        .map(|n| {
-            if n == 1 {
-                "pasted-text.txt".into()
-            } else {
-                format!("pasted-text-{n}.txt")
-            }
-        })
-        .find(|name: &String| !existing.iter().any(|a| a.name.eq_ignore_ascii_case(name)))
-        .unwrap();
+    stage_named(text, &next_name(existing.iter().map(|a| a.name.as_str())))
+}
+
+pub fn stage_named(text: &str, name: &str) -> Result<Attachment, String> {
     let directory = attachments::directory()
         .ok_or("The attachment directory is unavailable.")?
         .join(format!("paste-{}", uuid::Uuid::new_v4()));
@@ -81,7 +97,8 @@ pub fn stage(text: &str, existing: &[Attachment]) -> Result<Attachment, String> 
     let path = directory.join(name);
     std::fs::write(&path, text.as_bytes()).map_err(|e| e.to_string())?;
     let mut attachment = attachments::attach_file(&path)?;
-    attachment.mime = "text/plain".into();
+    attachment.mime = "text/plain;charset=utf-8".into();
+    attachment.source = Some(attachments::AttachmentSource::PastedText);
     Ok(attachment)
 }
 
@@ -168,12 +185,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paste_limits_keep_main_heading_task_rule_and_fence_serialization() {
+        for source in [
+            "# Heading",
+            "- [X] Task",
+            "1. Ordered",
+            "~~~rust\nlet x = 1;\n~~~",
+            "---",
+        ] {
+            let mut edit = crate::composer_rich::draft_from_canonical(source);
+            assert_eq!(crate::composer_rich::markdown(&edit), source);
+            assert_eq!(crate::composer_rich::markdown_selection(&edit).0, source);
+            edit.set_selection(edit.text.len(), edit.text.len());
+            let remaining =
+                crate::composer::PROVIDER_SEND_TURN_MAX_INPUT_CHARS - source.encode_utf16().count();
+            assert!(
+                !would_exceed_limit(&edit, &"x".repeat(remaining)),
+                "{source}"
+            );
+            assert!(
+                would_exceed_limit(&edit, &"x".repeat(remaining + 1)),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_limit_counts_serialized_markdown_and_selection_boundaries() {
+        let mut edit = TextEdit::new(&"x".repeat(119_996));
+        edit.set_marks(vec![rune::MarkRange::new(
+            0..edit.text.len(),
+            rune::Mark::Bold,
+        )]);
+        assert!(
+            would_exceed_limit(&edit, "a"),
+            "the bold delimiters fill the prompt"
+        );
+        edit.set_selection(1, 3);
+        assert!(!would_exceed_limit(&edit, "xx"));
+        assert!(would_exceed_limit(&edit, "xxx"));
+        edit.set_selection(0, edit.text.len());
+        assert!(!would_exceed_limit(&edit, &"a".repeat(119_998)));
+        assert!(
+            would_exceed_limit(&edit, &"a".repeat(119_999)),
+            "flatToMarkdown starts inside the opening bold delimiter"
+        );
+    }
+
+    #[test]
+    fn prompt_limit_counts_utf16_and_replaces_the_selection() {
+        let mut edit = TextEdit::new(&"x".repeat(119_999));
+        assert!(!would_exceed_limit(&edit, "a"));
+        assert!(would_exceed_limit(&edit, "😀"));
+        edit.set_selection(0, 4);
+        assert!(!would_exceed_limit(&edit, "four"));
+        assert!(would_exceed_limit(&edit, "sixsix"));
+        assert_eq!(
+            next_name(["PASTED-TEXT.TXT", "pasted-text-2.txt"]),
+            "pasted-text-3.txt"
+        );
+    }
+
+    #[test]
+    fn pasted_source_is_negotiated_and_older_peers_keep_the_path_only_file() {
+        let attachment = stage("exact text", &[]).unwrap();
+        let parts = attachments::acp_parts(
+            &[attachment.clone()],
+            &serde_json::json!({"embeddedContext":true}),
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("saved at:"));
+        assert!(!parts[0]["text"].as_str().unwrap().contains("exact text"));
+        let mut command = crate::protocol::Command::new(
+            "thread.send",
+            serde_json::json!({
+                "attachments":[attachment.to_value()]
+            }),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let legacy = runtime
+            .block_on(crate::client::uploaded_command(&command, None, true))
+            .unwrap();
+        assert!(legacy.params["attachments"][0]["source"].is_null());
+        let modern = runtime
+            .block_on(crate::client::uploaded_command_capabilities(
+                &command,
+                None,
+                crate::client::AttachmentPeer {
+                    files: true,
+                    pasted_text: true,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            modern.params["attachments"][0]["source"]["_tag"],
+            "pasted-text"
+        );
+        command.params = legacy.params;
+        assert!(Attachment::from_value(&command.params["attachments"][0]).is_some());
+    }
+
+    #[test]
     fn threshold_is_utf8_bytes_and_staged_text_is_exact_and_uniquely_named() {
         assert!(!should_fold(&"x".repeat(THRESHOLD - 1)));
         assert!(should_fold(&"x".repeat(THRESHOLD)));
         let text = "猫".repeat(THRESHOLD / 3 + 1);
         assert!(should_fold(&text));
         let a = stage(&text, &[]).unwrap();
+        assert_eq!(a.source, Some(attachments::AttachmentSource::PastedText));
+        assert_eq!(Attachment::from_value(&a.to_value()), Some(a.clone()));
         assert_eq!(
             std::fs::read_to_string(a.path.as_ref().unwrap()).unwrap(),
             text

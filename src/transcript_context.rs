@@ -606,7 +606,9 @@ pub(super) fn activate(s: &mut State, message_id: &str, href: &str, tx: &mut Tx)
         }
         Data::Image { attachment_id, .. } | Data::File { attachment_id, .. } => {
             if let Some(attachment) = message.images.iter().find(|a| a.id == *attachment_id) {
-                s.transcript_preview = Some(file_preview(attachment));
+                let images = message.images.clone();
+                let id = attachment.id.clone();
+                s.preview_attachments(images, &id, false);
             }
         }
         Data::Mention { path } => {

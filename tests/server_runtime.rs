@@ -880,6 +880,386 @@ impl Client {
 }
 
 #[test]
+fn staged_files_linked_servers_failure_retry_claim_and_older_peer_negotiation() {
+    use sha2::Digest;
+    fn start(
+        http: &reqwest::blocking::Client,
+        base: &str,
+        token: &str,
+        name: &str,
+        bytes: &[u8],
+        staged: bool,
+    ) -> String {
+        let response = http
+            .post(format!("{base}/v1/uploads"))
+            .bearer_auth(token)
+            .json(
+                &json!({"staged":staged,"type":"file","name":name,"mimeType":"text/plain",
+                "length":bytes.len(),"sha256":format!("{:x}", sha2::Sha256::digest(bytes))}),
+            )
+            .send()
+            .unwrap();
+        assert!(response.status().is_success(), "{response:?}");
+        response.json::<Value>().unwrap()["uploadId"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    fn complete(
+        http: &reqwest::blocking::Client,
+        base: &str,
+        token: &str,
+        id: &str,
+        bytes: &[u8],
+    ) -> Value {
+        let mut offset = 0;
+        for chunk in bytes.chunks(protocol::MAX_PAGE_BYTES) {
+            let response = http
+                .put(format!("{base}/v1/uploads/{id}?offset={offset}"))
+                .bearer_auth(token)
+                .body(chunk.to_vec())
+                .send()
+                .unwrap();
+            assert!(response.status().is_success(), "{response:?}");
+            offset += chunk.len();
+        }
+        let response = http
+            .post(format!("{base}/v1/uploads/{id}/commit"))
+            .bearer_auth(token)
+            .send()
+            .unwrap();
+        assert!(response.status().is_success(), "{response:?}");
+        response.json().unwrap()
+    }
+    let mut a = Profile::new();
+    let mut b = Profile::new();
+    a.launch(&["serve"]);
+    b.launch(&["serve"]);
+    let discovery_a = a.discovery();
+    let discovery_b = b.discovery();
+    let base_a = format!("http://127.0.0.1:{}", discovery_a["port"]);
+    let base_b = format!("http://127.0.0.1:{}", discovery_b["port"]);
+    let paired = a.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let linked = b.cli(&["link", &format!("127.0.0.1:{}", discovery_a["port"]), &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            b.root
+                .join("Shina/linked")
+                .join(discovery_a["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let token_a = credential["token"].as_str().unwrap();
+    let mut client_a = Client::with_token(&discovery_a, token_a.into());
+    let mut client_b = b.client(uuid::Uuid::new_v4());
+    client_b.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("staged-b-hello"),
+    );
+    let hello = client_a.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("staged-hello"),
+    );
+    assert_eq!(
+        hello["result"]["limits"]["fileAttachmentBytes"],
+        protocol::FILE_ATTACHMENT_MAX_BYTES
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::STAGED_ATTACHMENTS)
+    );
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let bytes = "Staged text remains available until claim and release.\n"
+        .repeat(12000)
+        .into_bytes();
+    let failed = start(&http, &base_a, token_a, "notes.txt", &bytes, true);
+    assert_eq!(
+        http.put(format!("{base_a}/v1/uploads/{failed}?offset=1"))
+            .bearer_auth(token_a)
+            .body("wrong offset")
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        http.delete(format!("{base_a}/v1/staged/{failed}"))
+            .bearer_auth(token_a)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let retry = start(&http, &base_a, token_a, "notes.txt", &bytes, true);
+    let first = complete(&http, &base_a, token_a, &retry, &bytes);
+    assert_eq!(
+        http.get(format!(
+            "{base_a}/v1/blobs/{}",
+            first["id"].as_str().unwrap()
+        ))
+        .bearer_auth(token_a)
+        .send()
+        .unwrap()
+        .status(),
+        404
+    );
+    assert!(
+        http.get(format!("{base_a}/v1/staged/{retry}"))
+            .bearer_auth(token_a)
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let mut downloaded = Vec::new();
+    while downloaded.len() < bytes.len() {
+        let response = http
+            .get(format!(
+                "{base_a}/v1/staged/{retry}/blob?offset={}&limit={}",
+                downloaded.len(),
+                protocol::MAX_PAGE_BYTES
+            ))
+            .bearer_auth(token_a)
+            .send()
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers()["x-blob-length"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            bytes.len()
+        );
+        let page = response.bytes().unwrap();
+        assert!(!page.is_empty() && page.len() <= protocol::MAX_PAGE_BYTES);
+        downloaded.extend_from_slice(&page);
+    }
+    assert!(
+        downloaded == bytes,
+        "Pending upload bytes changed during transfer"
+    );
+    let second_id = start(
+        &http,
+        &base_b,
+        &client_b.token,
+        "notes.txt",
+        &downloaded,
+        true,
+    );
+    let second = complete(&http, &base_b, &client_b.token, &second_id, &downloaded);
+    let renamed_id = start(
+        &http,
+        &base_b,
+        &client_b.token,
+        "renamed.txt",
+        &downloaded,
+        true,
+    );
+    let renamed = complete(&http, &base_b, &client_b.token, &renamed_id, &downloaded);
+    for (client, attachments, leases) in [
+        (&mut client_a, vec![first.clone()], vec![retry.clone()]),
+        (
+            &mut client_b,
+            vec![second.clone(), renamed],
+            vec![second_id.clone(), renamed_id.clone()],
+        ),
+    ] {
+        let sent = client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"Inspect staged files",
+            "attachments":attachments,"stagedUploadIds":leases,"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+        client.until(|state| state["threads"][0]["status"] == "Completed");
+    }
+    let history = client_b.rpc(
+        "thread.history",
+        json!({"threadId":1,"byteBudget":protocol::MAX_PAGE_BYTES}),
+        json!("staged-history"),
+    );
+    assert!(history["error"].is_null(), "{history}");
+    assert!(history["result"]["nextFragment"].is_null());
+    let history: Value = serde_json::from_str(history["result"]["data"].as_str().unwrap()).unwrap();
+    let message = &history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["field"] == "messages" && row["item"]["role"] == "You")
+        .expect("sent message in scoped history")["item"];
+    assert_eq!(message["images"][0]["name"], "notes.txt");
+    assert_eq!(message["images"][1]["name"], "renamed.txt");
+    assert_eq!(
+        http.delete(format!("{base_b}/v1/staged/{second_id}"))
+            .bearer_auth(&client_b.token)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let claimed = http
+        .get(format!(
+            "{base_b}/v1/blobs/{}",
+            second["id"].as_str().unwrap()
+        ))
+        .bearer_auth(&client_b.token)
+        .send()
+        .unwrap();
+    assert!(claimed.status().is_success());
+    assert_eq!(
+        claimed.headers()["x-blob-length"]
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        bytes.len()
+    );
+    let page = claimed.bytes().unwrap();
+    assert!(page.as_ref() == &bytes[..page.len()]);
+    assert!(
+        fs::read(
+            b.root
+                .join("Shina/attachments")
+                .join(second["id"].as_str().unwrap())
+        )
+        .unwrap()
+            == bytes
+    );
+    // Images use the same pending lease lifecycle, including failure and retry,
+    // without invoking the fixture model, which deliberately does not declare vision.
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(4, 2, image::Rgba([10, 20, 30, 255]))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let png = encoded.into_inner();
+    let start_image = |base: &str, token: &str, hash: &str, staged: bool| {
+        let response = http.post(format!("{base}/v1/uploads")).bearer_auth(token)
+            .json(&json!({"staged":staged,"type":"image","name":"pixel.png","length":png.len(),"sha256":hash}))
+            .send().unwrap();
+        assert!(response.status().is_success());
+        response.json::<Value>().unwrap()["uploadId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let bad_image = start_image(&base_a, token_a, &"0".repeat(64), true);
+    assert!(
+        http.put(format!("{base_a}/v1/uploads/{bad_image}?offset=0"))
+            .bearer_auth(token_a)
+            .body(png.clone())
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        http.post(format!("{base_a}/v1/uploads/{bad_image}/commit"))
+            .bearer_auth(token_a)
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    let image_hash = format!("{:x}", sha2::Sha256::digest(&png));
+    let mut image_identity = None;
+    for (base, token) in [(&base_a, token_a), (&base_b, client_b.token.as_str())] {
+        let upload = start_image(base, token, &image_hash, true);
+        let image = complete(&http, base, token, &upload, &png);
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(image["width"], 4);
+        assert_eq!(image["height"], 2);
+        if let Some(id) = &image_identity {
+            assert_eq!(&image["id"], id);
+        }
+        image_identity = Some(image["id"].clone());
+        let page = http
+            .get(format!("{base}/v1/staged/{upload}/blob?offset=0"))
+            .bearer_auth(token)
+            .send()
+            .unwrap();
+        assert!(page.status().is_success());
+        assert_eq!(page.bytes().unwrap().as_ref(), png.as_slice());
+        assert_eq!(
+            http.delete(format!("{base}/v1/staged/{upload}"))
+                .bearer_auth(token)
+                .send()
+                .unwrap()
+                .status(),
+            204
+        );
+    }
+    let old = client_b.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::STAGED_ATTACHMENTS_MINOR - 1,"projectionSchema":1}),
+        json!("legacy-staged-hello"),
+    );
+    assert_eq!(
+        protocol::file_attachment_limit(&old["result"]),
+        Some(protocol::FILE_ATTACHMENT_MAX_BYTES)
+    );
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::STAGED_ATTACHMENTS)
+    );
+    let unsupported = client_b.command(
+        "thread.send",
+        json!({"threadId":1,"text":"Must not use staged fields",
+        "attachments":[second.clone()],"stagedUploadIds":[second_id],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(
+        unsupported["error"]["message"],
+        protocol::STAGED_ATTACHMENTS_UPDATE_REQUIRED
+    );
+    let legacy_image = start_image(&base_b, &client_b.token, &image_hash, false);
+    let legacy_image = complete(&http, &base_b, &client_b.token, &legacy_image, &png);
+    assert!(legacy_image.get("stagedUploadId").is_none());
+    assert_eq!(legacy_image["id"], image_identity.unwrap());
+    let legacy_id = start(&http, &base_b, &client_b.token, "legacy.txt", &bytes, false);
+    let legacy = complete(&http, &base_b, &client_b.token, &legacy_id, &bytes);
+    assert!(legacy.get("stagedUploadId").is_none());
+    let sent = client_b.command(
+        "thread.send",
+        json!({"threadId":1,"text":"Legacy deferred upload",
+        "attachments":[legacy],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+    a.stop();
+    b.stop();
+}
+
+#[test]
 fn ordinary_files_transfer_between_linked_servers_and_survive_restart() {
     use sha2::Digest;
     fn upload(http: &reqwest::blocking::Client, base: &str, token: &str, bytes: &[u8]) -> Value {

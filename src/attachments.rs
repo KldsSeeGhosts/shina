@@ -17,18 +17,26 @@ use std::{
     },
 };
 
-/// A message carries at most this many images.
-pub const MAX_IMAGES: usize = 8;
 pub const MAX_ATTACHMENTS: usize = 100;
 /// KSG contracts/chatAttachment.PROVIDER_SEND_TURN_MAX_FILE_BYTES.
-pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = crate::protocol::FILE_ATTACHMENT_MAX_BYTES;
 pub const MAX_TEXT_BYTES: u64 = 256 * 1024;
 /// The largest single image Shina accepts, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// The largest combined image payload in one draft.
-pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
-/// Caps one decode at 32 megapixels, below Rune's 64 megapixel clipboard limit.
-pub(crate) const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 80 * 1024 * 1024;
+pub fn legacy_peer_limit_error(images: usize, bytes: u64) -> Option<String> {
+    if images > 8 {
+        Some(
+            "This server supports up to 8 images per message. Update it to send more images."
+                .into(),
+        )
+    } else if bytes > 20 * 1024 * 1024 {
+        Some("This server supports up to 20 MiB of images per message. Update it to send larger image batches.".into())
+    } else {
+        None
+    }
+}
 const NAME_LIMIT: usize = 255;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,9 +51,60 @@ pub struct Attachment {
     pub bytes: u64,
     /// An ordinary file or folder, including a staged file's owned blob path.
     pub path: Option<PathBuf>,
+    /// A draft keeps its logical identity while preparation and upload replace its bytes.
+    /// Removed at the transport boundary for older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded: Option<Uploaded>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AttachmentSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "_tag")]
+pub enum AttachmentSource {
+    #[serde(rename = "pasted-text")]
+    PastedText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Uploaded {
+    pub environment_id: String,
+    pub lease_id: String,
+    pub attachment_id: String,
 }
 
 impl Attachment {
+    /// KSG composerDraftStore.composerFileNeedsReattach.
+    pub fn needs_reattach(&self) -> bool {
+        !self.is_image()
+            && self.mime != "inode/directory"
+            && self.uploaded.is_none()
+            && !path_for(self).is_some_and(|path| {
+                fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == self.bytes)
+            })
+    }
+
+    /// KSG composerDraftStore.composerFileMatchesReattachMarker.
+    pub fn matches_reattach(&self, name: &str, mime: &str, bytes: u64) -> bool {
+        if !self.needs_reattach() || self.name != name || self.bytes != bytes {
+            return false;
+        }
+        self.mime == mime
+            || crate::attachment_intake::file_mime(&self.name, &self.mime) == "image/x-adobe-dng"
+                && crate::attachment_intake::file_mime(name, mime) == "image/x-adobe-dng"
+            || matches!(
+                self.mime.to_ascii_lowercase().as_str(),
+                "" | "application/octet-stream"
+            ) && crate::attachment_intake::file_mime(&self.name, &self.mime)
+                .starts_with("video/")
+                && crate::attachment_intake::file_mime(name, mime).starts_with("video/")
+    }
+
+    pub fn asset_id(&self) -> &str {
+        self.asset_id.as_deref().unwrap_or(&self.id)
+    }
     pub fn is_image(&self) -> bool {
         self.path.is_none()
     }
@@ -59,12 +118,41 @@ impl Attachment {
             "height": self.height,
             "bytes": self.bytes,
             "path": self.path,
+            "asset_id": self.asset_id,
+            "uploaded": self.uploaded,
+            "source": self.source,
         })
     }
 
     /// Restore image blobs only at their expected size. Retain missing ordinary-file references.
     pub fn from_value(value: &Value) -> Option<Self> {
+        // Local draft-only fields never change an older peer's attachment schema.
+        if let Some(asset_id) = value["asset_id"].as_str() {
+            let id = value["id"].as_str()?;
+            if !(safe_id(id) && safe_id(asset_id)
+                || logical_file_id(id) && logical_file_id(asset_id))
+            {
+                return None;
+            }
+            let mut source = value.clone();
+            source.as_object_mut()?.remove("asset_id");
+            source["id"] = json!(asset_id);
+            let mut attachment = Self::from_value(&source)?;
+            attachment.id = id.into();
+            attachment.asset_id = Some(asset_id.into());
+            return Some(attachment);
+        }
+        let uploaded = value
+            .get("uploaded")
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value::<Uploaded>(value.clone()).ok())
+            .filter(|upload| {
+                !upload.environment_id.is_empty()
+                    && uuid::Uuid::parse_str(&upload.lease_id).is_ok()
+                    && (safe_id(&upload.attachment_id) || safe_file_id(&upload.attachment_id))
+            });
         let id = value["id"].as_str()?;
+        let source = serde_json::from_value::<AttachmentSource>(value["source"].clone()).ok();
         if safe_file_id(id) {
             let name = value["name"].as_str()?;
             let mime = value["mime"].as_str()?;
@@ -87,6 +175,9 @@ impl Attachment {
                 height: 0,
                 bytes,
                 path: Some(path),
+                asset_id: None,
+                uploaded,
+                source,
             });
         }
         if let Some(path) = value["path"].as_str() {
@@ -95,11 +186,9 @@ impl Attachment {
             let mime = value["mime"].as_str()?;
             if !path.is_absolute()
                 || name.is_empty()
-                || name.chars().count() > NAME_LIMIT
-                || !matches!(
-                    mime,
-                    "text/plain" | "application/octet-stream" | "inode/directory"
-                )
+                || name.encode_utf16().count() > NAME_LIMIT
+                || mime.trim().is_empty()
+                || mime.encode_utf16().count() > 100
                 || id != file_id(&path)
             {
                 return None;
@@ -113,6 +202,9 @@ impl Attachment {
                 height: 0,
                 bytes: value["bytes"].as_u64()?,
                 path: Some(path),
+                asset_id: None,
+                uploaded,
+                source,
             });
         }
         if !safe_id(id) {
@@ -124,19 +216,14 @@ impl Attachment {
             mime,
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
         ) || name.is_empty()
-            || name.chars().count() > NAME_LIMIT
+            || name.encode_utf16().count() > NAME_LIMIT
         {
             return None;
         }
         let width = u32::try_from(value["width"].as_u64()?).ok()?;
         let height = u32::try_from(value["height"].as_u64()?).ok()?;
         let bytes = value["bytes"].as_u64()?;
-        if width == 0
-            || height == 0
-            || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
-            || bytes == 0
-            || bytes > MAX_IMAGE_BYTES
-        {
+        if width == 0 || height == 0 || bytes == 0 || bytes > MAX_IMAGE_BYTES {
             return None;
         }
         let path = path_for_id(id)?;
@@ -149,6 +236,9 @@ impl Attachment {
             height,
             bytes,
             path: None,
+            asset_id: None,
+            uploaded,
+            source,
         })
     }
 }
@@ -194,14 +284,14 @@ pub fn path_for(attachment: &Attachment) -> Option<PathBuf> {
     attachment
         .path
         .clone()
-        .or_else(|| path_for_id(&attachment.id))
+        .or_else(|| path_for_id(attachment.asset_id()))
 }
 
 pub fn preview_path_for(attachment: &Attachment) -> Option<PathBuf> {
     if !attachment.is_image() {
         return None;
     }
-    let path = path_for_id(&format!("preview-{}.png", attachment.id))?;
+    let path = path_for_id(&format!("preview-{}.png", attachment.asset_id()))?;
     path.is_file().then_some(path)
 }
 
@@ -215,6 +305,16 @@ pub(crate) fn safe_file_id(id: &str) -> bool {
     id.strip_prefix("file-")
         .and_then(|id| id.strip_suffix(".bin"))
         .is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+fn logical_file_id(id: &str) -> bool {
+    safe_file_id(id)
+        || id.strip_prefix("file-").is_some_and(|hash| {
             hash.len() == 64
                 && hash
                     .bytes()
@@ -285,6 +385,9 @@ pub(crate) fn store_uploaded_file(
         height: 0,
         bytes: bytes.len() as u64,
         path: Some(path),
+        asset_id: None,
+        uploaded: None,
+        source: None,
     })
 }
 
@@ -301,9 +404,9 @@ pub(crate) fn transfer_file_bytes(attachment: &Attachment) -> Result<Vec<u8>, St
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     validate_file_metadata(&attachment.name, &attachment.mime, bytes.len() as u64)?;
-    if safe_file_id(&attachment.id) {
+    if safe_file_id(attachment.asset_id()) {
         use sha2::Digest;
-        if attachment.id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+        if attachment.asset_id() != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
             return Err("File hash mismatch.".into());
         }
     }
@@ -312,12 +415,14 @@ pub(crate) fn transfer_file_bytes(attachment: &Attachment) -> Result<Vec<u8>, St
 
 pub(crate) fn stage_transfer_file(attachment: &Attachment) -> Result<Attachment, String> {
     let bytes = transfer_file_bytes(attachment)?;
-    store_uploaded_file(
+    let mut staged = store_uploaded_file(
         &directory().ok_or("The attachment directory is unavailable.")?,
         &attachment.name,
         &attachment.mime,
         &bytes,
-    )
+    )?;
+    staged.source = attachment.source.clone();
+    Ok(staged)
 }
 
 /// Stage only submitted/transferred files. Local path mentions and draft editing keep
@@ -346,6 +451,13 @@ pub(crate) fn stage_prompt_files(prompt: &mut Prompt) -> Result<(), String> {
             .collect::<std::collections::HashSet<_>>()
     });
     for attachment in Arc::make_mut(&mut prompt.images) {
+        if attachment.is_image() && attachment.asset_id.is_some() {
+            let mut normalized = attachment.clone();
+            normalized.id = normalized.asset_id.take().unwrap();
+            normalized.uploaded = None;
+            replacements.insert(attachment.id.clone(), normalized.clone());
+            *attachment = normalized;
+        }
         if attached_ids
             .as_ref()
             .is_some_and(|ids| !ids.contains(&attachment.id))
@@ -368,6 +480,12 @@ pub(crate) fn stage_prompt_files(prompt: &mut Prompt) -> Result<(), String> {
     ) {
         for record in records {
             if let crate::composer_context::ComposerContextData::File {
+                attachment_id,
+                name,
+                mime_type,
+                size_bytes,
+            }
+            | crate::composer_context::ComposerContextData::Image {
                 attachment_id,
                 name,
                 mime_type,
@@ -476,20 +594,20 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         return Err("Choose a file or folder, not a device.".into());
     }
     if metadata.is_file() {
-        let mut header = [0; 32];
-        let count = fs::File::open(&path)
-            .map_err(read_error)?
-            .read(&mut header)
-            .map_err(read_error)?;
-        let image = image::guess_format(&header[..count]).is_ok_and(|format| {
-            matches!(
-                format,
-                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
-            )
-        });
-        if image {
-            return attach_image_file(&path);
+        let mime = crate::attachment_intake::native_mime(&name);
+        match crate::attachment_intake::classify(&name, mime) {
+            crate::attachment_intake::Kind::Image => return attach_image_file(&path),
+            crate::attachment_intake::Kind::UnsupportedImage => {
+                return Err(format!(
+                    "'{name}' is not a supported image type. Attach GIF, HEIC, HEIF, JPEG, PNG, or WebP images."
+                ));
+            }
+            crate::attachment_intake::Kind::File => {}
         }
+        validate_file_metadata(&name, mime, metadata.len())?;
+        let mut attachment = file_reference(path, &metadata, &name)?;
+        attachment.mime = crate::attachment_intake::file_mime(&name, mime);
+        return Ok(attachment);
     }
     file_reference(path, &metadata, &name)
 }
@@ -530,25 +648,39 @@ fn file_reference(
         height: 0,
         bytes: metadata.len(),
         path: Some(path),
+        asset_id: None,
+        uploaded: None,
+        source: None,
     })
 }
 
 fn attach_image_file(path: &Path) -> Result<Attachment, String> {
+    attach_image_file_with_thumbnail(path, |_| {})
+}
+
+pub(crate) fn attach_image_file_with_thumbnail(
+    path: &Path,
+    thumbnail: impl Fn(Vec<u8>),
+) -> Result<Attachment, String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
-    if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(format!(
-            "{}: Choose an image that is {} MB or smaller.",
-            clean_name(&name),
-            MAX_IMAGE_BYTES / (1024 * 1024)
-        ));
+    if metadata.len() > crate::attachment_intake::MAX_SOURCE_BYTES as u64 {
+        return Err(crate::attachment_intake::Failure::TooLarge.message(&name));
     }
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     // Bound the read as well as checking metadata, since the file can grow while we read it.
     let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_BYTES + 1)
+    file.take(crate::attachment_intake::MAX_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Could not read {}: {error}", clean_name(&name)))?;
+    let (name, bytes) = crate::attachment_intake::prepare_with_thumbnail(
+        &name,
+        crate::attachment_intake::native_mime(&name),
+        bytes,
+        MAX_IMAGE_BYTES as usize,
+        thumbnail,
+    )
+    .map_err(|failure| failure.message(&name))?;
     attach_bytes(&name, bytes)
 }
 
@@ -579,6 +711,9 @@ pub fn attach_bytes(name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
         height: validated.height,
         bytes: bytes_len,
         path: None,
+        asset_id: None,
+        uploaded: None,
+        source: None,
     };
     if let Some(cache) = cache {
         // Cache metadata is optional. The validated blob remains the source of truth.
@@ -625,6 +760,9 @@ pub fn store_uploaded(directory: &Path, name: &str, bytes: &[u8]) -> Result<Atta
         height: validated.height,
         bytes: bytes.len() as u64,
         path: None,
+        asset_id: None,
+        uploaded: None,
+        source: None,
     })
 }
 
@@ -723,26 +861,30 @@ pub fn validate_prompt_images(images: &[Attachment]) -> Result<(), String> {
             "You can attach up to {MAX_ATTACHMENTS} files per message or question response."
         ));
     }
-    let count = images.iter().filter(|a| a.is_image()).count();
-    if count > MAX_IMAGES {
-        return Err(format!(
-            "A message can carry up to {MAX_IMAGES} images. This draft has {} images. Remove images until at most {MAX_IMAGES} remain.",
-            count
-        ));
-    }
     if images
         .iter()
-        .filter(|a| a.is_image())
+        .filter(|a| {
+            a.is_image()
+                || matches!(
+                    a.mime.to_ascii_lowercase().as_str(),
+                    "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+                )
+        })
         .map(|image| image.bytes)
-        .sum::<u64>()
+        .fold(0u64, u64::saturating_add)
         > MAX_TOTAL_BYTES
     {
-        return Err(format!(
-            "These images exceed the {} MB message limit. Remove images before sending.",
-            MAX_TOTAL_BYTES / (1024 * 1024)
-        ));
+        return Err("Images can total up to 80 MiB per message or question response. Use smaller images or send fewer at once.".into());
+    }
+    for attachment in images.iter().filter(|a| a.is_image()) {
+        if attachment.bytes > MAX_IMAGE_BYTES {
+            return Err(crate::attachment_intake::Failure::TooLarge.message(&attachment.name));
+        }
     }
     for attachment in images.iter().filter(|a| !a.is_image()) {
+        if attachment.uploaded.is_some() {
+            continue;
+        }
         let path = attachment.path.as_ref().unwrap();
         let metadata = fs::metadata(path).map_err(|e| {
             format!(
@@ -811,6 +953,23 @@ pub fn prompt_record(prompt: &Prompt, pi: bool) -> Result<Value, String> {
         record["images"] = json!(images);
     }
     if !pi {
+        // Internal native-provider record, not a peer protocol field. Claude keeps paths
+        // available when its retained native-image budget is exhausted.
+        record["imageAttachments"] = json!(
+            prompt
+                .images
+                .iter()
+                .filter(|a| a.is_image())
+                .map(Attachment::to_value)
+                .collect::<Vec<_>>()
+        );
+        record["attachmentPaths"] = json!(
+            prompt
+                .images
+                .iter()
+                .map(Attachment::to_value)
+                .collect::<Vec<_>>()
+        );
         record["attachments"] = json!(
             prompt
                 .images
@@ -828,6 +987,11 @@ pub fn acp_parts(attachments: &[Attachment], capabilities: &Value) -> Result<Vec
     let mut parts = Vec::new();
     for attachment in attachments.iter().filter(|a| !a.is_image()) {
         let path = attachment.path.as_ref().unwrap();
+        if attachment.source == Some(AttachmentSource::PastedText) {
+            parts.push(json!({"type":"text","text":format!(
+                "[Attached file \"{}\" is saved at: {}]", attachment.name, path.display())}));
+            continue;
+        }
         let uri = file_uri(path);
         let text = if attachment.mime != "inode/directory" {
             text_content(path)?
@@ -928,11 +1092,8 @@ fn validate(bytes: &[u8]) -> Result<(Validated, image::DynamicImage), String> {
     let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
         .into_dimensions()
         .map_err(|_| "The image is damaged or incomplete. Choose a valid image.".to_owned())?;
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        return Err(format!(
-            "The image is too large to decode. Choose one under {} megapixels.",
-            MAX_IMAGE_PIXELS / (1024 * 1024)
-        ));
+    if width == 0 || height == 0 {
+        return Err("The image has invalid dimensions.".into());
     }
     // A header alone can look valid while the rest of the file is truncated. Decode once here,
     // off the prompt path, so malformed images fail before they reach Pi.
@@ -995,13 +1156,17 @@ fn extension(format: ImageFormat) -> &'static str {
 }
 
 fn clean_name(name: &str) -> String {
+    let mut units = 0;
     let name = name
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("Image")
         .chars()
         .filter(|character| !character.is_control())
-        .take(NAME_LIMIT)
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= NAME_LIMIT
+        })
         .collect::<String>();
     if name.trim().is_empty() {
         "Image".into()
@@ -1166,7 +1331,73 @@ pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reattach_matching_uses_ksg_metadata_not_content_or_case_folding() {
+        let directory = crate::store::directory().unwrap();
+        let path = directory.join("clip.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let mut marker = super::attach_file(&path).unwrap();
+        assert!(!marker.needs_reattach());
+        std::fs::remove_file(&path).unwrap();
+        assert!(marker.needs_reattach());
+        marker.mime = "application/octet-stream".into();
+        assert!(marker.matches_reattach("clip.mp4", "video/mp4", 5));
+        assert!(!marker.matches_reattach("Clip.mp4", "video/mp4", 5));
+        assert!(!marker.matches_reattach("clip.mp4", "video/mp4", 6));
+        marker.name = "raw.dng".into();
+        marker.mime = "image/dng".into();
+        assert!(marker.matches_reattach("raw.dng", "image/x-adobe-dng", 5));
+        assert!(!marker.matches_reattach("raw.dng", "application/pdf", 6));
+    }
+
     use super::*;
+
+    #[test]
+    fn ksg_image_count_and_byte_boundaries() {
+        let image = Attachment {
+            id: "fixture.png".into(),
+            name: "fixture.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            path: None,
+            asset_id: None,
+            uploaded: None,
+            source: None,
+        };
+        assert!(validate_prompt_images(&vec![image.clone(); 100]).is_ok());
+        assert_eq!(
+            validate_prompt_images(&vec![image.clone(); 101]).unwrap_err(),
+            "You can attach up to 100 files per message or question response."
+        );
+        let mut images = vec![image; 8];
+        for image in &mut images {
+            image.bytes = 10 * 1024 * 1024;
+        }
+        assert!(validate_prompt_images(&images).is_ok());
+        images.push(Attachment {
+            bytes: 1,
+            ..images[0].clone()
+        });
+        assert_eq!(
+            validate_prompt_images(&images).unwrap_err(),
+            "Images can total up to 80 MiB per message or question response. Use smaller images or send fewer at once."
+        );
+    }
+
+    #[test]
+    fn supported_image_mime_files_share_the_image_budget_but_dng_does_not() {
+        let path = crate::store::directory().unwrap().join("budget.bin");
+        fs::write(&path, b"file").unwrap();
+        let mut file = attach_file(&path).unwrap();
+        file.bytes = 40 * 1024 * 1024;
+        file.mime = "image/png".into();
+        assert!(validate_prompt_images(&[file.clone(), file.clone()]).is_ok());
+        assert!(validate_prompt_images(&[file.clone(), file.clone(), file.clone()]).is_err());
+        file.mime = "image/x-adobe-dng".into();
+        assert!(validate_prompt_images(&[file.clone(), file.clone(), file]).is_ok());
+    }
 
     #[test]
     fn transferred_files_are_content_addressed_immutable_and_validate_ksg_boundaries() {
@@ -1286,22 +1517,16 @@ mod tests {
     }
 
     #[test]
-    fn file_classification_uses_content_and_retains_missing_references() {
+    fn ordinary_file_classification_uses_content_and_retains_missing_references() {
         let directory = crate::store::directory().unwrap();
         for (name, bytes, expected) in [
-            ("text.bin", b"valid UTF-8 \xc3\xa9".as_slice(), "text/plain"),
-            ("fake.png", b"actually text".as_slice(), "text/plain"),
             (
-                "binary.txt",
-                b"hello\0world".as_slice(),
+                "text.bin",
+                b"valid UTF-8 \xc3\xa9".as_slice(),
                 "application/octet-stream",
             ),
-            (
-                "invalid.txt",
-                b"\xff\xfe".as_slice(),
-                "application/octet-stream",
-            ),
-            ("empty.txt", b"".as_slice(), "text/plain"),
+            ("binary.txt", b"hello\0world".as_slice(), "text/plain"),
+            ("invalid.txt", b"\xff\xfe".as_slice(), "text/plain"),
         ] {
             let path = directory.join(name);
             fs::write(&path, bytes).unwrap();
@@ -1322,9 +1547,16 @@ mod tests {
             );
             assert!(attach_file(&path).unwrap_err().contains("Missing file"));
         }
+        let fake_image = directory.join("fake.png");
+        fs::write(&fake_image, b"actually text").unwrap();
+        assert_eq!(
+            attach_file(&fake_image).unwrap_err(),
+            "'fake.png' could not be read as an image."
+        );
+        assert_eq!(reference_file(&fake_image).unwrap().mime, "text/plain");
         let path = directory.join("large.txt");
         fs::write(&path, vec![b'a'; MAX_TEXT_BYTES as usize + 1]).unwrap();
-        assert_eq!(attach_file(&path).unwrap().mime, "application/octet-stream");
+        assert_eq!(attach_file(&path).unwrap().mime, "text/plain");
         fs::write(&path, vec![b'a'; MAX_TEXT_BYTES as usize]).unwrap();
         assert_eq!(attach_file(&path).unwrap().mime, "text/plain");
         assert_eq!(attach_file(&directory).unwrap().mime, "inode/directory");
@@ -1512,7 +1744,7 @@ mod tests {
     #[test]
     fn file_reads_keep_large_binary_sources_and_directories_as_references() {
         let directory = crate::store::directory().unwrap();
-        let path = directory.join("oversize.png");
+        let path = directory.join("oversize.bin");
         let file = fs::File::create(&path).unwrap();
         file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
         assert_eq!(attach_file(&path).unwrap().mime, "application/octet-stream");

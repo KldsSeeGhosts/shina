@@ -357,30 +357,38 @@ impl Client {
         let info = self.info.clone();
         worker_finished.store(false, Ordering::Release);
         *self.worker.lock().expect("client worker") = Some(std::thread::spawn(move || {
+            #[cfg(test)]
+            let test_directory = directory.clone();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("client runtime");
-            runtime.block_on(supervise(
-                (
-                    directory,
-                    device_directory,
-                    history_thread,
-                    history_requests,
-                    rpc_requests,
-                    remote,
-                ),
-                info,
-                input,
-                output,
-                snapshot,
-                stop,
-                ready,
-                worker_finished,
-                retry_notify,
-                connection,
-                wake,
-            ));
+            let run = move || {
+                runtime.block_on(supervise(
+                    (
+                        directory,
+                        device_directory,
+                        history_thread,
+                        history_requests,
+                        rpc_requests,
+                        remote,
+                    ),
+                    info,
+                    input,
+                    output,
+                    snapshot,
+                    stop,
+                    ready,
+                    worker_finished,
+                    retry_notify,
+                    connection,
+                    wake,
+                ))
+            };
+            #[cfg(test)]
+            crate::store::with_directory(test_directory, run);
+            #[cfg(not(test))]
+            run();
         }));
         SUPERVISORS
             .lock()
@@ -933,6 +941,11 @@ async fn supervise(
                             owned_instance = Some(discovery.instance_id);
                         }
                         let mut sent = true;
+                        let local_upload = if remote.is_none() {
+                            local_upload_link(&directory, &device_directory)
+                        } else {
+                            None
+                        };
                         pending.retain(|command| {
                             if command.method == "thread.user-input.dismiss"
                                 && !hello["capabilities"].as_array().is_some_and(|caps| {
@@ -947,12 +960,28 @@ async fn supervise(
                             }
                         });
                         for command in &pending {
-                            match uploaded_command(
+                            match uploaded_command_capabilities(
                                 command,
                                 remote.as_ref(),
-                                hello["capabilities"].as_array().is_some_and(|caps| {
-                                    caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS)
-                                }),
+                                AttachmentPeer {
+                                    files: hello["capabilities"].as_array().is_some_and(|caps| {
+                                        caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS)
+                                    }),
+                                    staged: hello["capabilities"].as_array().is_some_and(|caps| {
+                                        caps.iter().any(|cap| cap == protocol::STAGED_ATTACHMENTS)
+                                    }),
+                                    limits: hello["capabilities"].as_array().is_some_and(|caps| {
+                                        caps.iter().any(|cap| cap == protocol::ATTACHMENT_LIMITS)
+                                    }),
+                                    pasted_text: hello["capabilities"].as_array().is_some_and(
+                                        |caps| {
+                                            caps.iter()
+                                                .any(|cap| cap == protocol::PASTED_TEXT_ATTACHMENTS)
+                                        },
+                                    ),
+                                    environment: hello["serverId"].as_str(),
+                                    local_upload: local_upload.as_ref(),
+                                },
                             )
                             .await
                             {
@@ -1112,7 +1141,20 @@ async fn supervise(
                 let command_to_send = downgrade_composer_context_command(command.clone(), has_composer_context);
                 let has_file_attachments = info.lock().expect("connection info")["capabilities"]
                     .as_array().is_some_and(|caps| caps.iter().any(|cap| cap == protocol::FILE_ATTACHMENTS));
-                let prepared = match uploaded_command(&command_to_send,remote.as_ref(),has_file_attachments).await {
+                let (has_staged, has_limits, target_environment) = {
+                    let info = info.lock().expect("connection info");
+                    (info["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap == protocol::STAGED_ATTACHMENTS)),
+                        info["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap == protocol::ATTACHMENT_LIMITS)),
+                        info["serverId"].as_str().map(str::to_owned))
+                };
+                let local_upload = if remote.is_none() { local_upload_link(&directory, &device_directory) } else { None };
+                let pasted_text = info.lock().expect("connection info")["capabilities"].as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::PASTED_TEXT_ATTACHMENTS));
+                let prepared = match uploaded_command_capabilities(&command_to_send,remote.as_ref(), AttachmentPeer {
+                    files:has_file_attachments,staged:has_staged,limits:has_limits,
+                    pasted_text,
+                    environment:target_environment.as_deref(),local_upload:local_upload.as_ref(),
+                }).await {
                     Ok(command) => command,
                     Err(error) => {
                         let denied = error.starts_with("Authentication denied.");
@@ -1568,6 +1610,9 @@ pub(crate) async fn cache_files(
                 &bytes,
             )?
             .to_value();
+            // Downloading bytes must not turn a lazy pasted-text file into a
+            // normal embeddable resource when it is copied into another draft.
+            local["source"] = reference["source"].clone();
         }
         *projected.pointer_mut(&path).unwrap() = local;
         Ok(())
@@ -1595,8 +1640,6 @@ fn cached_image_valid(profile: &std::path::Path, value: &Value) -> bool {
         )
         && attachment.width > 0
         && attachment.height > 0
-        && u64::from(attachment.width) * u64::from(attachment.height)
-            <= crate::attachments::MAX_IMAGE_PIXELS
         && attachment.bytes > 0
         && attachment.bytes <= crate::attachments::MAX_IMAGE_BYTES
         && std::fs::metadata(profile.join("attachments").join(&attachment.id))
@@ -1749,12 +1792,161 @@ pub(crate) async fn uploaded_command(
     remote: Option<&crate::peer::Link>,
     files_supported: bool,
 ) -> Result<Command, String> {
+    uploaded_command_capabilities(
+        command,
+        remote,
+        AttachmentPeer {
+            files: files_supported,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[derive(Default)]
+pub(crate) struct AttachmentPeer<'a> {
+    pub files: bool,
+    pub staged: bool,
+    pub limits: bool,
+    pub pasted_text: bool,
+    pub environment: Option<&'a str>,
+    pub local_upload: Option<&'a crate::peer::Link>,
+}
+
+pub(crate) async fn uploaded_command_capabilities(
+    command: &Command,
+    remote: Option<&crate::peer::Link>,
+    peer: AttachmentPeer<'_>,
+) -> Result<Command, String> {
+    let AttachmentPeer {
+        files: files_supported,
+        staged: staged_supported,
+        limits: limits_supported,
+        pasted_text,
+        environment: local_environment,
+        local_upload,
+    } = peer;
     let mut prepared = command.clone();
-    let Some(remote) =
-        remote.filter(|_| matches!(command.method.as_str(), "thread.send" | "queue.update"))
-    else {
+    if !pasted_text {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    if object.contains_key("mime")
+                        && object.contains_key("id")
+                        && object
+                            .get("source")
+                            .is_some_and(|s| s["_tag"] == "pasted-text")
+                    {
+                        object.remove("source");
+                    }
+                    for child in object.values_mut() {
+                        strip(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        strip(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        strip(&mut prepared.params);
+    }
+    if !matches!(command.method.as_str(), "thread.send" | "queue.update") {
         return Ok(prepared);
-    };
+    }
+    if !limits_supported {
+        let images: Vec<_> = prepared.params["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|attachment| {
+                attachment["path"].is_null()
+                    && attachment["width"].as_u64().is_some_and(|width| width > 0)
+            })
+            .collect();
+        let bytes = images
+            .iter()
+            .filter_map(|image| image["bytes"].as_u64())
+            .fold(0u64, u64::saturating_add);
+        if let Some(error) = crate::attachments::legacy_peer_limit_error(images.len(), bytes) {
+            return Err(error);
+        }
+    }
+    let source_ids: Vec<_> = command.params["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|attachment| attachment["id"].as_str().map(str::to_owned))
+        .collect();
+    let target = remote
+        .map(|link| link.server_id.as_str())
+        .or(local_environment);
+    let upload_endpoint = remote
+        .or(local_upload)
+        .filter(|link| target == Some(link.server_id.as_str()));
+    let mut replacements = std::collections::HashMap::new();
+    let mut staged_ids = Vec::new();
+    let mut ready_ids = std::collections::HashSet::new();
+    for value in prepared.params["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = value["id"].as_str() else {
+            continue;
+        };
+        let mut normalized = value.clone();
+        let uploaded =
+            serde_json::from_value::<crate::attachments::Uploaded>(value["uploaded"].clone()).ok();
+        let uploaded = uploaded
+            .filter(|upload| staged_supported && target == Some(upload.environment_id.as_str()));
+        let uploaded = if let (Some(uploaded), Some(link)) = (uploaded, upload_endpoint) {
+            crate::attachment_uploads::verify_upload(link, &uploaded)
+                .await?
+                .then_some(uploaded)
+        } else {
+            None
+        };
+        if let Some(uploaded) = uploaded {
+            if uuid::Uuid::parse_str(&uploaded.lease_id).is_err()
+                || !(crate::attachments::safe_id(&uploaded.attachment_id)
+                    || crate::attachments::safe_file_id(&uploaded.attachment_id))
+            {
+                return Err("Invalid staged upload identity.".into());
+            }
+            normalized["id"] = json!(uploaded.attachment_id);
+            staged_ids.push(uploaded.lease_id);
+            ready_ids.insert(uploaded.attachment_id);
+        } else if let Some(asset_id) = value["asset_id"].as_str() {
+            if !(crate::attachments::safe_id(asset_id)
+                || crate::attachments::safe_file_id(asset_id))
+                && !crate::attachments::Attachment::from_value(value).is_some_and(|a| !a.is_image())
+            {
+                return Err("Invalid local attachment identity.".into());
+            }
+            normalized["id"] = json!(asset_id);
+        }
+        if let Some(object) = normalized.as_object_mut() {
+            object.remove("asset_id");
+            object.remove("uploaded");
+        }
+        replacements.insert(id.to_owned(), normalized);
+    }
+    rewrite_uploaded_attachments(&mut prepared.params, &replacements);
+    let should_stage = staged_supported && upload_endpoint.is_some();
+    if remote.is_none() && !should_stage {
+        if !staged_ids.is_empty() {
+            prepared.params["stagedUploadIds"] = json!(staged_ids);
+        }
+        return Ok(prepared);
+    }
+    let remote_transfer = remote.is_some();
+    let remote = upload_endpoint
+        .or(remote)
+        .ok_or("The attachment upload connection is unavailable. Reconnect before sending.")?;
+    let scope = prepared.params.clone();
     let Some(attachments) = prepared.params["attachments"].as_array_mut() else {
         return Ok(prepared);
     };
@@ -1762,7 +1954,13 @@ pub(crate) async fn uploaded_command(
     let address = remote.address()?;
     let base = format!("http://{address}");
     let mut replacements = std::collections::HashMap::new();
-    for attachment in attachments {
+    for (index, attachment) in attachments.iter_mut().enumerate() {
+        if attachment["id"]
+            .as_str()
+            .is_some_and(|id| ready_ids.contains(id))
+        {
+            continue;
+        }
         if command.method == "queue.update"
             && command.params["existingAttachmentIds"]
                 .as_array()
@@ -1774,14 +1972,28 @@ pub(crate) async fn uploaded_command(
             || attachment["id"]
                 .as_str()
                 .is_some_and(crate::attachments::safe_file_id);
+        let mentioned_path = ordinary
+            && scope["draft"]["attachments"]
+                .as_array()
+                .is_some_and(|files| !files.iter().any(|file| file["id"] == attachment["id"]))
+            && !scope["context"]["records"]
+                .as_array()
+                .is_some_and(|records| {
+                    records.iter().any(|record| {
+                        record["kind"] == "file" && record["attachmentId"] == attachment["id"]
+                    })
+                });
+        if !remote_transfer && mentioned_path {
+            continue;
+        }
         if ordinary && !files_supported {
             return Err(protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED.into());
         }
         if ordinary
-            && command.params["draft"]["attachments"]
+            && scope["draft"]["attachments"]
                 .as_array()
                 .is_some_and(|files| !files.iter().any(|file| file["id"] == attachment["id"]))
-            && !command.params["context"]["records"]
+            && !scope["context"]["records"]
                 .as_array()
                 .is_some_and(|records| {
                     records.iter().any(|record| {
@@ -1793,6 +2005,27 @@ pub(crate) async fn uploaded_command(
         }
         let image = crate::attachments::Attachment::from_value(attachment)
             .ok_or("The attachment is missing from this device.")?;
+        if should_stage {
+            let cancel = AtomicBool::new(false);
+            let mut source = image.clone();
+            source.asset_id = Some(source.asset_id().to_owned());
+            if let Some(Some(id)) = source_ids.get(index) {
+                source.id = id.clone();
+            }
+            let uploaded =
+                crate::attachment_uploads::upload(remote, &source, &cancel, |_| {}).await?;
+            let original = image.id.clone();
+            let mut value = image.to_value();
+            value["id"] = json!(uploaded.attachment_id);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("asset_id");
+                object.remove("uploaded");
+            }
+            staged_ids.push(uploaded.lease_id);
+            replacements.insert(original, value.clone());
+            *attachment = value;
+            continue;
+        }
         let bytes = if ordinary {
             crate::attachments::transfer_file_bytes(&image)?
         } else {
@@ -1858,7 +2091,28 @@ pub(crate) async fn uploaded_command(
         replacements.insert(original_id, attachment.clone());
     }
     rewrite_uploaded_attachments(&mut prepared.params, &replacements);
+    if !staged_ids.is_empty() {
+        prepared.params["stagedUploadIds"] = json!(staged_ids);
+    }
     Ok(prepared)
+}
+
+fn local_upload_link(
+    directory: &std::path::Path,
+    device_directory: &std::path::Path,
+) -> Option<crate::peer::Link> {
+    let discovery = Discovery::read(directory).ok()?;
+    let saved = crate::store::load(&device_directory.join("client-credential.json")).ok()??;
+    if saved["serverId"] != discovery.server_id {
+        return None;
+    }
+    Some(crate::peer::Link {
+        enabled: true,
+        server_id: discovery.server_id,
+        host: format!("127.0.0.1:{}", discovery.port),
+        device_id: saved["deviceId"].as_str()?.into(),
+        token: saved["token"].as_str()?.into(),
+    })
 }
 
 async fn upload_error(response: reqwest::Response, fallback: &str) -> String {
@@ -1873,7 +2127,7 @@ async fn upload_error(response: reqwest::Response, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.into())
 }
 
-fn rewrite_uploaded_attachments(
+pub(crate) fn rewrite_uploaded_attachments(
     value: &mut Value,
     replacements: &std::collections::HashMap<String, Value>,
 ) {

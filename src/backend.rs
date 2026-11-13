@@ -688,9 +688,10 @@ pub(crate) fn write_record(writer: &mut impl Write, record: &Value) -> Result<()
 }
 
 pub(crate) fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
-    // Pi echoes user images in message events and saved history. A single accepted
-    // 20 MiB image prompt expands to almost 28 MiB in base64, before JSON framing.
-    const LIMIT: u64 = 64 * 1024 * 1024;
+    // KSG provider-pi/server/rpc.ts budgets duplicate MCP image content plus 8 MiB.
+    // This also admits an echoed 80 MiB user image payload after base64 expansion.
+    const LIMIT: u64 =
+        2 * 8 * crate::attachments::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 8 * 1024 * 1024;
     let mut bytes = Vec::new();
     let count = Read::by_ref(reader)
         .take(LIMIT + 1)
@@ -701,7 +702,7 @@ pub(crate) fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, St
     }
     if count as u64 > LIMIT {
         return Err(
-            "Pi sent a protocol record larger than 64 MiB. Image-heavy history can exceed this limit. Inspect the saved session with Pi or start a new Shina thread."
+            "The provider sent a protocol record larger than the attachment transport limit. Inspect the saved session or start a new Shina thread."
                 .into(),
         );
     }

@@ -897,6 +897,21 @@ impl Thread {
         attachments: &[Attachment],
         skip_image_inline_chip: bool,
     ) {
+        self.insert_attachment_chips_inner(attachments, skip_image_inline_chip, false);
+    }
+    pub(crate) fn insert_prepared_image_chips(
+        &mut self,
+        attachments: &[Attachment],
+        contextual: bool,
+    ) {
+        self.insert_attachment_chips_inner(attachments, !contextual, contextual);
+    }
+    fn insert_attachment_chips_inner(
+        &mut self,
+        attachments: &[Attachment],
+        skip_image_inline_chip: bool,
+        force_image_chip: bool,
+    ) {
         if attachments.is_empty()
             || self
                 .request
@@ -910,10 +925,11 @@ impl Thread {
         let prose = crate::composer_context::strip_inline_context_references(
             &crate::composer_rich::markdown(&self.draft),
         );
-        let image_attachments_get_chips = !skip_image_inline_chip
-            && (self.answer_intake
-                || self.draft.anchor != self.draft.focus
-                || !prose.trim().is_empty());
+        let image_attachments_get_chips = force_image_chip
+            || !skip_image_inline_chip
+                && (self.answer_intake
+                    || self.draft.anchor != self.draft.focus
+                    || !prose.trim().is_empty());
         let mut records = Vec::new();
         for attachment in attachments {
             if attachment.is_image() && !image_attachments_get_chips {
@@ -1032,6 +1048,57 @@ impl Thread {
         Ok(())
     }
     pub fn remove_attachment(&mut self, id: &str) {
+        let mut context_ids: std::collections::HashSet<_> = self
+            .draft_context
+            .iter()
+            .filter_map(|record| match &record.data {
+                crate::composer_context::ComposerContextData::Image { attachment_id, .. }
+                | crate::composer_context::ComposerContextData::File { attachment_id, .. }
+                    if attachment_id == id =>
+                {
+                    Some(record.context_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(attachment) = self.draft_images.iter().find(|a| a.id == id) {
+            context_ids.insert(crate::composer_context::to_kind_scoped_composer_context_id(
+                if attachment.is_image() {
+                    "image"
+                } else {
+                    "file"
+                },
+                id,
+            ));
+        }
+        let ranges: Vec<_> = self
+            .draft
+            .pills()
+            .filter_map(|(range, href)| {
+                let (_, context_id) = crate::composer_context::parse_composer_context_href(href)?;
+                context_ids.contains(&context_id).then_some(range)
+            })
+            .collect();
+        if !ranges.is_empty() {
+            self.draft.undo_group(|edit| {
+                for range in ranges.into_iter().rev() {
+                    let mut start = range.start;
+                    let mut end = range.end;
+                    if edit.text[end..].starts_with(' ') {
+                        end += 1;
+                    } else if edit.text[..start].ends_with(' ') {
+                        start -= 1;
+                    }
+                    edit.set_selection(start, end);
+                    edit.insert("");
+                }
+            });
+        }
+        self.draft_context
+            .retain(|record| !context_ids.contains(&record.context_id));
+        for id in context_ids {
+            self.retained_context.records.remove(&id);
+        }
         self.draft_images.retain(|image| image.id != id);
         self.attachment_error = if self.answer_intake {
             None
@@ -3595,6 +3662,7 @@ pub struct State {
     client_recover: std::collections::HashMap<usize, uuid::Uuid>,
     recovered_inputs: std::collections::BTreeMap<usize, Value>,
     pub background: background::Background,
+    pub attachment_uploads: crate::attachment_uploads::Queue,
     pub composer_sources: crate::composer_sources::Sources,
     pub data_dir: PathBuf,
     /// The open thread's id and whether it was a draft with content when it was opened. Like
@@ -3689,11 +3757,16 @@ pub struct State {
     pub portraits: crate::runtime::UiResource<crate::portraits::Portraits>,
     /// Decodes composer and conversation thumbnails off the UI thread.
     pub attachment_cache: crate::runtime::UiResource<rune::ImageCache>,
+    pub(crate) attachment_video_posters:
+        std::cell::RefCell<std::collections::HashMap<String, (rune::Player, u64)>>,
+    pub(crate) attachment_poster_clock: std::cell::Cell<u64>,
     pub html_windows: Arc<crate::html_window::Windows>,
     pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
+    pub(crate) attachment_preview: Option<crate::ui::attachment_preview::Preview>,
+    pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
     pub(crate) assistant_selection: Option<AssistantSelection>,
     pub(crate) citation_highlight: Option<CitationHighlight>,
@@ -3848,6 +3921,7 @@ impl State {
             client_recover: Default::default(),
             recovered_inputs: Default::default(),
             background: Default::default(),
+            attachment_uploads: Default::default(),
             data_dir: crate::store::directory()
                 .unwrap_or_else(|| std::env::temp_dir().join("Shina")),
             html_windows: Default::default(),
@@ -3939,8 +4013,12 @@ impl State {
             }),
             artwork,
             attachment_cache,
+            attachment_video_posters: Default::default(),
+            attachment_poster_clock: Default::default(),
             attachment_drop_hover: false,
             transcript_preview: None,
+            attachment_preview: None,
+            pasted_text_names: None,
             transcript_layout: Default::default(),
             composer_ui: Default::default(),
             captain_picker: false,
@@ -7716,10 +7794,18 @@ impl State {
         if let Some(image) = content.image() {
             self.attach_image_with_options("Pasted image.png", image.png(), bypass_fold);
         }
-        if !content.files().is_empty() {
+        let claim_files = content.files().iter().any(|path| {
+            path.is_dir()
+                || crate::attachment_intake::claims_paste(
+                    &path.to_string_lossy(),
+                    crate::attachment_intake::native_mime(&path.to_string_lossy()),
+                    content.text(),
+                )
+        });
+        if claim_files {
             self.attach_paths(content.files());
         }
-        if !content.text().is_empty() && !has_image && content.files().is_empty() {
+        if !content.text().is_empty() && !has_image && !claim_files {
             if self.current().answer_intake
                 && self
                     .current()
@@ -8165,32 +8251,71 @@ impl State {
         self.attach_paths_to(self.current().id, paths);
     }
     pub fn fold_paste(&mut self, text: &str) -> bool {
-        if !crate::composer_paste::should_fold(text)
-            || self.current().machine != "local" && self.client.is_none()
-            || self.client.is_some()
-                && self.machines.selected != "local"
-                && !self
-                    .client
-                    .as_ref()
-                    .and_then(|c| c.linked.get(&self.machines.selected))
-                    .is_some_and(|c| {
-                        c.info.lock().expect("connection info")["capabilities"]
-                            .as_array()
-                            .is_some_and(|caps| {
-                                caps.iter()
-                                    .any(|cap| cap == crate::protocol::FILE_ATTACHMENTS)
-                            })
-                    })
-            || self.attachment_guard(self.active).is_some()
-            || (if self.current().answer_intake {
+        let exceeds = crate::composer_paste::would_exceed_limit(&self.current().draft, text);
+        if text.is_empty() || !crate::composer_paste::should_fold(text) && !exceeds {
+            return false;
+        }
+        let can_stage = !(self.current().machine != "local" && self.client.is_none())
+            && self.pasted_text_staging_supported()
+            && self.file_attachment_staging_supported_on(&self.machines.selected)
+            && self.attachment_guard(self.active).is_none()
+            && (if self.current().answer_intake {
                 self.current().question_reserved_count()
             } else {
                 self.current().draft_images.len()
-            }) >= attachments::MAX_ATTACHMENTS
-        {
-            return false;
+            }) + if self.current().answer_intake {
+                0
+            } else {
+                self.attachment_uploads
+                    .preparing_count(&self.machines.selected, self.current().id)
+            } < attachments::MAX_ATTACHMENTS;
+        let maximum = self
+            .file_attachment_staging_limit_on(&self.machines.selected)
+            .unwrap_or(attachments::MAX_FILE_BYTES);
+        if !can_stage || text.len() as u64 > maximum {
+            if !exceeds {
+                return false;
+            }
+            let (title, description) = if can_stage {
+                (
+                    "Pasted text is too large to attach",
+                    "Reduce the clipboard contents or save a smaller excerpt as a file.",
+                )
+            } else {
+                (
+                    "Pasted text is too large for this message",
+                    "Remove some text or an attachment, then paste again.",
+                )
+            };
+            self.current_mut().attachment_error = Some(format!("{title}\n{description}"));
+            self.push_toast(
+                ToastKind::Error,
+                title,
+                Some(description.into()),
+                None,
+                Some(6000),
+            );
+            return true;
         }
-        match crate::composer_paste::stage(text, &self.current().draft_images) {
+        let target = (self.machines.selected.clone(), self.current().id);
+        if !self
+            .pasted_text_names
+            .as_ref()
+            .is_some_and(|(machine, thread, _)| (machine, *thread) == (&target.0, target.1))
+        {
+            self.pasted_text_names = Some((target.0, target.1, Default::default()));
+        }
+        let names: Vec<_> = self
+            .current()
+            .draft_images
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        let reserved = &mut self.pasted_text_names.as_mut().unwrap().2;
+        reserved.extend(names);
+        let name = crate::composer_paste::next_name(reserved.iter().map(String::as_str));
+        reserved.insert(name.clone());
+        match crate::composer_paste::stage_named(text, &name) {
             Ok(attachment) => {
                 if let Some(notice) = &mut self.undo {
                     notice.owns_text_key = false;
@@ -8198,12 +8323,32 @@ impl State {
                 let t = self.current_mut();
                 t.draft_images.push(attachment.clone());
                 t.insert_attachment_chips(&[attachment], false);
+                self.push_toast(
+                    ToastKind::Info,
+                    format!("Large paste attached as {name}"),
+                    Some(format!(
+                        "{} · Use {} to keep a large paste inline.",
+                        if text.len().div_ceil(1024) >= 1024 {
+                            format!("{:.1} MB", text.len() as f64 / 1048576.0)
+                        } else {
+                            format!("{} KB", text.len().div_ceil(1024).max(1))
+                        },
+                        if cfg!(target_os = "macos") {
+                            "⌘⇧V"
+                        } else {
+                            "Ctrl+Shift+V"
+                        }
+                    )),
+                    None,
+                    Some(6000),
+                );
                 self.checkpoint();
                 true
             }
             Err(error) => {
+                self.pasted_text_names.as_mut().unwrap().2.remove(&name);
                 self.current_mut().attachment_error = Some(error);
-                false
+                exceeds
             }
         }
     }
@@ -8229,43 +8374,163 @@ impl State {
             self.threads[index].attachment_error = Some(error);
             return;
         }
+        self.threads[index].attachment_error = None;
+        let uploads_before = self.attachment_uploads.entries.len();
         let mut errors = Vec::new();
         let mut attached = Vec::new();
+        let mut inserted_folder = false;
         for path in paths {
-            if (if self.threads[index].answer_intake {
-                self.threads[index].question_reserved_count()
-            } else {
-                self.threads[index].draft_images.len()
-            }) >= attachments::MAX_ATTACHMENTS
+            if path.is_dir() {
+                let local = self.machines.selected == "local"
+                    || self
+                        .client
+                        .as_ref()
+                        .and_then(|c| c.linked.get(&self.machines.selected))
+                        .and_then(|c| c.remote.as_ref())
+                        .is_some_and(|link| {
+                            url::Url::parse(&format!("http://{}", link.host))
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_owned))
+                                .is_some_and(|host| {
+                                    host == "localhost"
+                                        || host
+                                            .parse::<std::net::IpAddr>()
+                                            .is_ok_and(|ip| ip.is_loopback())
+                                })
+                        });
+                if !local {
+                    errors.push(
+                        "Folders can only be referenced on a server running on this computer"
+                            .into(),
+                    );
+                    continue;
+                }
+                match path.canonicalize() {
+                    Ok(path) => {
+                        let label = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let token = crate::composer_tokens::Token::File {
+                            path,
+                            directory: true,
+                            source: None,
+                        };
+                        let draft = &mut self.threads[index].draft;
+                        let end = draft.text.len();
+                        let boundary = draft
+                            .text
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| !c.is_whitespace());
+                        draft.undo_group(|e| {
+                            e.set_selection(end, end);
+                            if boundary {
+                                e.insert(" ");
+                            }
+                            let start = e.focus;
+                            e.insert(&label);
+                            e.replace_with_pill(start..e.focus, token.id(), &label);
+                            e.insert(" ");
+                        });
+                        inserted_folder = true;
+                    }
+                    Err(_) => errors.push(format!(
+                        "Couldn't get the path of \"{}\"\nType the folder path with @ instead.",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                }
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let file_kind = crate::attachment_intake::classify(
+                &name,
+                crate::attachment_intake::native_mime(&name),
+            );
+            if file_kind == crate::attachment_intake::Kind::File
+                && let Some(maximum) =
+                    self.file_attachment_staging_limit_on(&self.machines.selected)
+                && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > maximum)
+            {
+                errors.push(crate::protocol::file_attachment_too_large(&name, maximum));
+                continue;
+            }
+            if crate::attachment_intake::classify(
+                &name,
+                crate::attachment_intake::native_mime(&name),
+            ) == crate::attachment_intake::Kind::File
+                && !self.file_attachment_staging_supported_on(&self.machines.selected)
+            {
+                errors.push("This server does not support file attachments.".into());
+                continue;
+            }
+            let replacement = self.threads[index].draft_images.iter().position(|a| {
+                a.matches_reattach(
+                    &name,
+                    &crate::attachment_intake::file_mime(
+                        &name,
+                        crate::attachment_intake::native_mime(&name),
+                    ),
+                    std::fs::metadata(path).map_or(0, |m| m.len()),
+                )
+            });
+            if replacement.is_none()
+                && (if self.threads[index].answer_intake {
+                    self.threads[index].question_reserved_count()
+                } else {
+                    self.threads[index].draft_images.len()
+                }) >= attachments::MAX_ATTACHMENTS
             {
                 errors.push(format!(
-                    "A message can carry up to {} attachments. The remaining files were not attached.",
+                    "You can attach up to {} files per message.",
                     attachments::MAX_ATTACHMENTS
                 ));
                 break;
             }
+            // Question drafts retain main's request-scoped, send-time upload path.
+            // The ordinary tray queue owns thread drafts, not question answer scopes.
+            if self.background.handle.is_some() && !self.threads[index].answer_intake {
+                self.enqueue_attachment_path(index, path.clone());
+                continue;
+            }
             match attachments::attach_file(path) {
-                Ok(image) => match self.threads[index].add_attachment(image.clone()) {
-                    Ok(()) => attached.push(image),
-                    Err(error) => errors.push(error),
-                },
+                Ok(mut image) => {
+                    if let Some(slot) = replacement {
+                        image = match attachments::stage_transfer_file(&image) {
+                            Ok(image) => image,
+                            Err(error) => {
+                                errors.push(error);
+                                continue;
+                            }
+                        };
+                        image.asset_id = Some(image.id.clone());
+                        image.id = self.threads[index].draft_images[slot].id.clone();
+                        self.threads[index].draft_images[slot] = image;
+                    } else {
+                        match self.threads[index].add_attachment(image.clone()) {
+                            Ok(()) => attached.push(image),
+                            Err(error) => errors.push(error),
+                        }
+                    }
+                }
                 Err(error) => errors.push(error),
             }
         }
-        self.threads[index].attachment_error = if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join(" "))
-        };
+        if !errors.is_empty() {
+            self.threads[index].attachment_error = errors.pop();
+        }
         if !attached.is_empty() {
             self.threads[index].insert_attachment_chips(&attached, false);
-            if index == self.active {
-                self.restore_composer_focus(
-                    crate::ui::composer_ui::FocusReason::AttachmentInserted,
-                );
-            }
-            self.checkpoint();
         }
+        if index == self.active
+            && (!attached.is_empty()
+                || inserted_folder
+                || self.attachment_uploads.entries.len() > uploads_before)
+        {
+            self.restore_composer_focus(crate::ui::composer_ui::FocusReason::AttachmentInserted);
+        }
+        self.checkpoint();
     }
     /// Attach a pasted PNG image, inserting an inline chip when contextual.
     #[cfg(test)]
@@ -8290,14 +8555,26 @@ impl State {
             self.current_mut().attachment_error = Some(error);
             return;
         }
-        if bytes.len() as u64 > attachments::MAX_IMAGE_BYTES {
-            self.current_mut().attachment_error = Some(format!(
-                "Choose an image that is {} MB or smaller.",
-                attachments::MAX_IMAGE_BYTES / (1024 * 1024)
-            ));
+        if self.background.handle.is_some() && !self.current().answer_intake {
+            self.current_mut().attachment_error = None;
+            self.enqueue_attachment_image(
+                self.active,
+                name.into(),
+                bytes.to_vec(),
+                skip_inline_chip,
+            );
+            self.checkpoint();
             return;
         }
-        match attachments::attach_bytes(name, bytes.to_vec()) {
+        let prepared = crate::attachment_intake::prepare(
+            name,
+            crate::attachment_intake::native_mime(name),
+            bytes.to_vec(),
+            attachments::MAX_IMAGE_BYTES as usize,
+        )
+        .map_err(|failure| failure.message(name))
+        .and_then(|(name, bytes)| attachments::attach_bytes(&name, bytes));
+        match prepared {
             Ok(image) => {
                 let result = self.current_mut().add_attachment(image.clone());
                 self.current_mut().attachment_error = result.as_ref().err().cloned();
@@ -8319,6 +8596,14 @@ impl State {
         {
             self.answer_remove_scope = Some(scope.clone());
             self.with_question_draft(self.active, scope, |s| s.request_remove_attachment(id));
+            return;
+        }
+        if !self.current().answer_intake
+            && self.attachment_uploads.entries.iter().any(|entry| {
+                entry.id == id && matches!(entry.phase, crate::attachment_uploads::Phase::Preparing)
+            })
+        {
+            self.remove_attachment(id);
             return;
         }
         let t = self.current();
@@ -8388,6 +8673,10 @@ impl State {
         t.draft_context.retain(|r| r.context_id != ctx_id);
         t.retained_context.records.remove(&ctx_id);
         t.remove_attachment(&id);
+        if !t.answer_intake {
+            self.attachment_uploads
+                .remove(&self.machines.selected, thread_id, &id);
+        }
         self.checkpoint();
     }
     pub fn remove_attachment(&mut self, id: &str) {
@@ -8396,6 +8685,11 @@ impl State {
         {
             self.with_question_draft(self.active, scope, |s| s.remove_attachment(id));
             return;
+        }
+        let thread = self.current().id;
+        if !self.current().answer_intake {
+            self.attachment_uploads
+                .remove(&self.machines.selected, thread, id);
         }
         self.current_mut().remove_attachment(id);
         self.checkpoint();
@@ -11214,6 +11508,10 @@ impl State {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
+        if let Some(reason) = self.attachment_send_block_reason() {
+            self.current_mut().attachment_error = Some(reason);
+            return false;
+        }
         if self.has_pending_context_imports(&self.machines.selected, self.current().id) {
             self.current_mut().attachment_error = Some(
                 "Still bringing attached context into this message. Send again once its chip resolves."
@@ -13460,6 +13758,17 @@ pub fn is_compact_command(text: &str) -> bool {
 }
 
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
+    state.expire_attachment_preview();
+    let attachment_changed = state.poll_attachment_uploads();
+    if state.attachment_uploads.entries.iter().any(|entry| {
+        matches!(
+            entry.phase,
+            crate::attachment_uploads::Phase::Preparing
+                | crate::attachment_uploads::Phase::Uploading { .. }
+        )
+    }) {
+        tx.wake_after(Duration::from_millis(30));
+    }
     let composer_changed = state.composer_sources.take_changed()
         | (!state.headless && crate::ui::composer_ui::tick(state, now, tx));
     let mut html_changed = false;
@@ -13492,6 +13801,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | state.poll_thread_find(tx)
         | state.poll_sidebar_search(tx)
         | html_changed
+        | attachment_changed
         | keybindings_changed;
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
@@ -15894,6 +16204,9 @@ mod tests {
         std::fs::create_dir_all(&attachments).unwrap();
         std::fs::write(attachments.join("image-1.png"), b"png").unwrap();
         first.draft_images.push(Attachment {
+            asset_id: None,
+            uploaded: None,
+            source: None,
             id: "image-1.png".into(),
             name: "shot.png".into(),
             mime: "image/png".into(),
@@ -17366,6 +17679,56 @@ mod tests {
     }
 
     #[test]
+    fn paste_prompt_limit_fallback_and_removed_names_follow_ksg() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text(&"x".repeat(119_999));
+        assert!(state.fold_paste("😀"));
+        assert_eq!(state.current().draft_images[0].name, "pasted-text.txt");
+        assert_eq!(
+            state.current().draft_images[0].source,
+            Some(attachments::AttachmentSource::PastedText)
+        );
+        state.current_mut().draft_images.clear();
+        state.current_mut().draft.replace_text("");
+        assert!(state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        assert_eq!(state.current().draft_images[0].name, "pasted-text-2.txt");
+        let attachment = state.current().draft_images[0].clone();
+        state.current_mut().draft_images = vec![attachment; 100];
+        state.current_mut().draft.replace_text("kept");
+        assert!(!state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        state.current_mut().draft.replace_text(&"x".repeat(120_000));
+        let before = state.current().draft.text.clone();
+        assert!(state.fold_paste("a"));
+        assert_eq!(state.current().draft.text, before);
+        assert!(
+            state
+                .current()
+                .attachment_error
+                .as_deref()
+                .unwrap()
+                .starts_with("Pasted text is too large for this message")
+        );
+    }
+
+    #[test]
+    fn an_older_acp_peer_cannot_silently_expand_a_folded_paste() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "fixture-acp".into();
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS]});
+        state.client = Some(client);
+        assert!(!state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        *state.client.as_ref().unwrap().info.lock().unwrap() = json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS,crate::protocol::PASTED_TEXT_ATTACHMENTS]});
+        assert!(state.fold_paste(&"x".repeat(crate::composer_paste::THRESHOLD)));
+        *state.client.as_ref().unwrap().info.lock().unwrap() =
+            json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS]});
+        assert_eq!(
+            state.attachment_send_block_reason().as_deref(),
+            Some(crate::protocol::PASTED_TEXT_UPDATE_REQUIRED)
+        );
+    }
+
+    #[test]
     fn linked_file_capability_enables_long_paste_folding_and_older_peers_keep_text_inline() {
         let mut state = State::new(".".into(), false);
         let (mut client, _local) = crate::client::Client::test_connected(state.data_dir.clone());
@@ -17375,6 +17738,10 @@ mod tests {
         state.machines.selected = "linked-machine".into();
         state.current_mut().machine = "linked-machine".into();
         let text = "x".repeat(crate::composer_paste::THRESHOLD);
+        *state.client.as_ref().unwrap().linked["linked-machine"]
+            .info
+            .lock()
+            .unwrap() = json!({"capabilities":[]});
         assert!(!state.fold_paste(&text));
         *state.client.as_ref().unwrap().linked["linked-machine"]
             .info
@@ -19166,6 +19533,36 @@ mod tests {
     }
 
     #[test]
+    fn intake_batch_keeps_files_and_references_local_folders_without_a_slot() {
+        let root = crate::store::directory().unwrap();
+        let a = root.join("one.txt");
+        let b = root.join("two.txt");
+        let folder = root.join("folder");
+        std::fs::write(&a, "one").unwrap();
+        std::fs::write(&b, "two").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let mut state = State::new(root, false);
+        state.attach_paths(&[a, folder.clone(), b]);
+        assert_eq!(state.current().draft_images.len(), 2);
+        assert_eq!(state.current().draft.pills().count(), 3);
+        assert!(
+            state
+                .current()
+                .draft_images
+                .iter()
+                .all(|a| a.mime != "inode/directory")
+        );
+        assert!(state.current().attachment_error.is_none());
+        state.machines.selected = "remote".into();
+        state.attach_paths(&[folder]);
+        assert_eq!(state.current().draft_images.len(), 2);
+        assert_eq!(
+            state.current().attachment_error.as_deref(),
+            Some("Folders can only be referenced on a server running on this computer")
+        );
+    }
+
+    #[test]
     fn ordinary_file_drafts_round_trip_and_keep_missing_file_errors() {
         let path = crate::store::directory()
             .unwrap()
@@ -19208,15 +19605,15 @@ mod tests {
     fn attachment_count_and_size_limits_keep_the_text_draft_untouched() {
         let mut thread = Thread::new(1);
         thread.draft.replace_text("Keep me");
-        for width in 0..8 {
+        for width in 0..attachments::MAX_ATTACHMENTS {
             thread
-                .add_attachment(test_attachment("image.png", width + 1))
+                .add_attachment(test_attachment("image.png", width as u32 + 1))
                 .unwrap();
         }
         let error = thread
-            .add_attachment(test_attachment("extra.png", 20))
+            .add_attachment(test_attachment("extra.png", 120))
             .unwrap_err();
-        assert!(error.contains("up to 8"));
+        assert!(error.contains("up to 100"));
         assert_eq!(thread.draft.text, "Keep me");
         thread.draft_images.clear();
         let mut oversized = test_attachment("ok.png", 20);
@@ -19228,15 +19625,15 @@ mod tests {
     #[test]
     fn restoring_submitted_images_preserves_a_newer_full_draft() {
         let mut thread = Thread::new(1);
-        let submitted = test_attachment("submitted.png", 30);
+        let submitted = test_attachment("submitted.png", 130);
         let prompt = Prompt::new("Submitted".into(), vec![submitted.clone()]);
-        let newer: Vec<_> = (1..=attachments::MAX_IMAGES as u32)
+        let newer: Vec<_> = (1..=attachments::MAX_ATTACHMENTS as u32)
             .map(|width| test_attachment("newer.png", width))
             .collect();
         thread.draft_images = newer.clone();
         thread.draft.replace_text("Newer draft");
         thread.restore_prompt(&prompt);
-        assert_eq!(thread.draft_images.len(), attachments::MAX_IMAGES + 1);
+        assert_eq!(thread.draft_images.len(), attachments::MAX_ATTACHMENTS + 1);
         assert_eq!(thread.draft_images[0], submitted);
         assert_eq!(&thread.draft_images[1..], newer.as_slice());
         assert_eq!(thread.draft.text, "Submitted\n\nNewer draft");
@@ -19245,7 +19642,7 @@ mod tests {
                 .attachment_error
                 .as_deref()
                 .unwrap()
-                .contains("Remove images")
+                .contains("100 files")
         );
         assert!(attachments::encode_images(&thread.draft_images).is_err());
         thread.remove_attachment(&submitted.id);
@@ -20322,6 +20719,9 @@ mod tests {
             height: 1,
             bytes: 3,
             path: None,
+            asset_id: None,
+            uploaded: None,
+            source: None,
         });
         assert_eq!(state.offered_prompt_suggestion(), None);
         state.current_mut().draft_images.clear();

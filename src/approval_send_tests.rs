@@ -202,6 +202,9 @@ fn feedback_rejects_attachments_and_inflight_responses_leave_approvals_alone() {
         height: 1,
         bytes: 1,
         path: None,
+        asset_id: None,
+        uploaded: None,
+        source: None,
     });
     state.send();
     assert_eq!(

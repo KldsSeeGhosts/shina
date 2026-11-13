@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 20;
+pub const MINOR: u32 = 21;
+pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
+pub const VCS_WORKTREES_MINOR: u32 = 20;
 pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
 pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use branches and worktrees.";
@@ -27,7 +29,85 @@ pub const REQUESTS_UPDATE_REQUIRED: &str =
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
+pub const STAGED_ATTACHMENTS: &str = "staged-attachments-v1";
+pub const ATTACHMENT_LIMITS: &str = "attachment-limits-v1";
+pub const PASTED_TEXT_ATTACHMENTS: &str = "pasted-text-attachments-v1";
+pub const PASTED_TEXT_UPDATE_REQUIRED: &str =
+    "Update this server to send pasted-text attachments without embedding their contents.";
+pub const STAGED_ATTACHMENTS_UPDATE_REQUIRED: &str =
+    "This server does not support staged attachments.";
 pub const FILE_ATTACHMENTS_UPDATE_REQUIRED: &str = "This server does not support file attachments.";
+/// KSG contracts/chatAttachment.PROVIDER_SEND_TURN_MAX_FILE_BYTES.
+pub const FILE_ATTACHMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// KSG fileAttachmentStagingLimit. Missing limits on an older build explicitly
+/// mean the original 50 MiB contract, not a disabled upload service.
+pub fn file_attachment_limit(info: &Value) -> Option<u64> {
+    let Some(capabilities) = info["capabilities"].as_array() else {
+        return Some(FILE_ATTACHMENT_MAX_BYTES);
+    };
+    if !capabilities.iter().any(|cap| cap == FILE_ATTACHMENTS) {
+        return None;
+    }
+    if capabilities.iter().any(|cap| cap == ATTACHMENT_LIMITS)
+        && let Some(limit) = info["limits"].get("fileAttachmentBytes")
+    {
+        return limit
+            .as_u64()
+            .map(|limit| limit.min(FILE_ATTACHMENT_MAX_BYTES));
+    }
+    Some(FILE_ATTACHMENT_MAX_BYTES)
+}
+
+pub fn file_attachment_too_large(name: &str, maximum: u64) -> String {
+    let size = if maximum >= 1024 * 1024 && maximum % (1024 * 1024) == 0 {
+        format!("{} MB", maximum / (1024 * 1024))
+    } else if maximum >= 1024 && maximum % 1024 == 0 {
+        format!("{} KB", maximum / 1024)
+    } else {
+        format!("{maximum} {}", if maximum == 1 { "byte" } else { "bytes" })
+    };
+    format!("'{name}' exceeds the {size} attachment limit.")
+}
+
+#[cfg(test)]
+mod attachment_limit_tests {
+    use super::*;
+    #[test]
+    fn old_unknown_disabled_and_smaller_server_limits_have_explicit_states() {
+        assert_eq!(
+            file_attachment_limit(&json!({})),
+            Some(FILE_ATTACHMENT_MAX_BYTES)
+        );
+        assert_eq!(file_attachment_limit(&json!({"capabilities":[]})), None);
+        assert_eq!(
+            file_attachment_limit(&json!({"capabilities":[FILE_ATTACHMENTS]})),
+            Some(FILE_ATTACHMENT_MAX_BYTES)
+        );
+        for (advertised, expected) in [
+            (json!(1024), Some(1024)),
+            (
+                json!(100 * 1024 * 1024_u64),
+                Some(FILE_ATTACHMENT_MAX_BYTES),
+            ),
+            (Value::Null, None),
+        ] {
+            assert_eq!(
+                file_attachment_limit(&json!({"capabilities":[FILE_ATTACHMENTS,ATTACHMENT_LIMITS],
+                "limits":{"fileAttachmentBytes":advertised}})),
+                expected
+            );
+        }
+        assert_eq!(
+            file_attachment_too_large("a", 1),
+            "'a' exceeds the 1 byte attachment limit."
+        );
+        assert_eq!(
+            file_attachment_too_large("a", 1024),
+            "'a' exceeds the 1 KB attachment limit."
+        );
+    }
+}
 pub const MODEL_FAVORITES: &str = "model-favorites";
 pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
 pub const MODEL_OPTIONS: &str = "model-options";

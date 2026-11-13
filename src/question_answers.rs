@@ -644,10 +644,18 @@ impl State {
                         .enable_all()
                         .build()
                         .map_err(|e| e.to_string())?
-                        .block_on(crate::client::uploaded_command(
+                        .block_on(crate::client::uploaded_command_capabilities(
                             &upload,
                             remote.as_ref(),
-                            supported,
+                            crate::client::AttachmentPeer {
+                                files: supported,
+                                // This synthetic thread.send only transfers answer files.
+                                // Images become references, not native prompt image inputs.
+                                // Preserve main's exemption from the legacy 8-image/20-MiB
+                                // prompt budget; keep its send-time upload path.
+                                limits: true,
+                                ..Default::default()
+                            },
                         ))?;
                     let files = prepared.params["attachments"]
                         .as_array()

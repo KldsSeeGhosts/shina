@@ -15,6 +15,11 @@ macro_rules! glyph {
 }
 
 glyph!(PLUS, r#"<path d="M13 11h7v2h-7v7h-2v-7H4v-2h7V4h2v7Z"/>"#);
+// Pixelarticons reload.svg, MIT, covered by assets/icons-LICENSE.txt.
+glyph!(
+    RELOAD,
+    r#"<path d="M16 4h2v6h-2zm-2-2h2v2h-2zm0 2h2v8h-2zM4 8H2v5h2z"/><path d="M4 6h16v2H4zm4 14H6v-6h2zm2 2H8v-2h2zm0-2H8v-8h2zm10-4h2v-5h-2z"/><path d="M20 18H4v-2h16z"/>"#
+);
 // Chevrons are 2 unit blocks stepping 2 units, as heavy as the other strokes.
 glyph!(
     CHEVRON_RIGHT,
@@ -251,6 +256,7 @@ glyph!(
 pub(super) fn glyph(kind: &str) -> &'static Icon {
     match kind {
         "plus" => &PLUS,
+        "reload" => &RELOAD,
         "minimize" => &MINIMIZE,
         "paperclip" => &PAPERCLIP,
         "back" => &CHEVRON_LEFT,

@@ -3,6 +3,9 @@
 mod acp;
 mod approval;
 mod assistant_citation;
+mod attachment_intake;
+mod attachment_picker;
+mod attachment_uploads;
 mod attachments;
 mod backend;
 mod branch_toolbar;
@@ -10,6 +13,7 @@ mod brand;
 mod cache_persistence;
 mod captains;
 mod claude;
+mod claude_attachment_budget;
 mod client;
 mod client_history;
 mod codex;
@@ -62,6 +66,7 @@ mod server_lock;
 mod service;
 mod session;
 mod shell_env;
+mod staged_uploads;
 mod store;
 mod thread_find;
 mod thread_search;
@@ -201,6 +206,7 @@ fn composer_controls_blocked(state: &State) -> bool {
         || state.rename_thread.is_some()
         || state.delete_thread.is_some()
         || state.confirm_remove_attachment.is_some()
+        || state.attachment_preview.is_some()
         || t.native.conversation.is_some()
         || t.native.questionnaire.is_some()
 }
@@ -1398,7 +1404,11 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
     // Portraits rest while the window is in the background or minimized.
+    .on_window(attachment_picker::set_window)
     .on_focus(|state, focused, _| state.portraits.set_focused(focused))
+    .on_visibility(|state, visible, _| {
+        if !visible { state.pause_attachment_preview(); }
+    })
     .keep_running()
     .on_close(|state, tx| {
         if !state.close_in_background() {

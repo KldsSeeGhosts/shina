@@ -301,8 +301,14 @@ pub fn run() -> Result<(), String> {
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
     let input: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    let pdf = pdf_bytes(&input)?;
     let html = input["html"].as_str().ok_or("Missing HTML.")?;
-    if html.len() > crate::html_render::MAX_PAGE {
+    let maximum = if input["attachmentPreview"] == true {
+        crate::attachments::MAX_FILE_BYTES.div_ceil(3) as usize * 4 + 4096
+    } else {
+        crate::html_render::MAX_PAGE
+    };
+    if html.len() > maximum {
         return Err("HTML exceeds 25 MiB.".into());
     }
     let width = input["width"].as_u64().unwrap_or(728).clamp(240, 1600) as f64;
@@ -393,8 +399,17 @@ pub fn run() -> Result<(), String> {
             window.makeKeyAndOrderFront(None);
             application.activate();
         }
-        let source = document(html, dark);
-        view.loadHTMLString_baseURL(&NSString::from_str(&source), None);
+        if let Some(bytes) = &pdf {
+            view.loadData_MIMEType_characterEncodingName_baseURL(
+                &NSData::with_bytes(bytes),
+                &NSString::from_str("application/pdf"),
+                &NSString::from_str("UTF-8"),
+                &NSURL::URLWithString(&NSString::from_str("about:blank")).unwrap(),
+            );
+        } else {
+            let source = document(html, dark);
+            view.loadHTMLString_baseURL(&NSString::from_str(&source), None);
+        }
         if capture {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut measured = json!({"height":80,"consoleMessages":[]});

@@ -131,8 +131,15 @@ fn native() -> Result<()> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let input: Value = serde_json::from_str(&line)?;
+    let pdf = pdf_bytes(&input)
+        .map_err(|e| windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32), e))?;
     let html = input["html"].as_str().ok_or("Missing HTML.")?;
-    if html.len() > crate::html_render::MAX_PAGE {
+    let maximum = if input["attachmentPreview"] == true {
+        crate::attachments::MAX_FILE_BYTES.div_ceil(3) as usize * 4 + 4096
+    } else {
+        crate::html_render::MAX_PAGE
+    };
+    if html.len() > maximum {
         return Err("HTML exceeds 25 MiB.".into());
     }
     let width = input["width"].as_u64().unwrap_or(728).clamp(240, 1600) as i32;
@@ -319,7 +326,14 @@ fn native() -> Result<()> {
             &mut token,
         )?;
         cdp(&view, "Target.setAutoAttach", AUTO_ATTACH)?;
-        let body = Rc::new(document(html, dark).into_bytes());
+        let body = Rc::new(
+            if let Some(bytes) = pdf {
+                pdf_document(&bytes)
+            } else {
+                document(html, dark)
+            }
+            .into_bytes(),
+        );
         let resource_environment = environment.clone();
         view.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
         view.add_WebResourceRequested(&WebResourceRequestedEventHandler::create(Box::new(move |_,args| {

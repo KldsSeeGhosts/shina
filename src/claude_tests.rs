@@ -4,6 +4,38 @@ use crate::model::{AccessMode, Status, Thread};
 const SESSION: &str = "40000000-0000-4000-8000-000000000031";
 
 #[test]
+fn native_image_budget_falls_back_to_the_attachment_path() {
+    let file = crate::attachments::attach_bytes("pixel.png", {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        png.into_inner()
+    })
+    .unwrap();
+    let record = crate::attachments::prompt_record(
+        &crate::attachments::Prompt::new("look".into(), vec![file.clone()]),
+        false,
+    )
+    .unwrap();
+    let (blocks, used) = input_blocks_with_budget(
+        &record,
+        crate::claude_attachment_budget::Usage { bytes: 0, pages: 0 },
+    )
+    .unwrap();
+    assert!(blocks.iter().all(|b| b["type"] != "image"));
+    assert!(
+        blocks[0]["text"].as_str().unwrap().contains(
+            &crate::attachments::path_for(&file)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        )
+    );
+    assert!(used.bytes > 0);
+}
+
+#[test]
 fn ask_user_question_mapping_trims_discards_blank_rows_and_uses_question_text_ids() {
     let mut client = client("full-access");
     client

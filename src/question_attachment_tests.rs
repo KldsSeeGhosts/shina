@@ -18,6 +18,30 @@ fn pending(custom: bool) -> State {
 }
 
 #[test]
+fn removing_question_file_does_not_cancel_an_ordinary_upload_with_the_same_id() {
+    let mut state = pending(true);
+    let path = state.data_dir.join("shared.txt");
+    std::fs::write(&path, "Same file in both drafts").unwrap();
+    let file = attachments::attach_file(&path).unwrap();
+    state.current_mut().draft_images.push(file.clone());
+    state
+        .attachment_uploads
+        .entries
+        .push(crate::attachment_uploads::Entry::fixture(
+            "local",
+            state.current().id,
+            &file,
+            crate::attachment_uploads::Phase::Preparing,
+        ));
+    state.attach_paths(&[path]);
+    assert_eq!(state.current().question_files().len(), 1);
+    state.remove_attachment(&file.id);
+    assert!(state.current().question_files().is_empty());
+    assert_eq!(state.current().draft_images, vec![file]);
+    assert_eq!(state.attachment_uploads.entries.len(), 1);
+}
+
+#[test]
 fn question_attachments_are_scoped_and_do_not_replace_the_ordinary_draft() {
     let mut state = pending(true);
     let path = state.data_dir.join("answer.txt");
