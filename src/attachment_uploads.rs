@@ -1418,6 +1418,25 @@ pub async fn release_upload(link: &Link, id: &str) {
     }
 }
 
+/// Release a staged upload by lease, resolving the link for the environment that
+/// received it. Stash deletion and eviction drop their entries' leases through this.
+pub(crate) fn release_staged(state: &State, uploaded: &crate::attachments::Uploaded) {
+    let machines = std::iter::once("local".to_owned()).chain(
+        state
+            .client
+            .as_ref()
+            .map(|client| client.linked.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    for machine in machines {
+        let (_, _, link) = connection(state, &machine);
+        if let Some(link) = link.filter(|link| link.server_id == uploaded.environment_id) {
+            release_later(link, uploaded.lease_id.clone());
+            return;
+        }
+    }
+}
+
 fn release_later(link: Link, id: String) {
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

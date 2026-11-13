@@ -455,6 +455,10 @@ pub(super) fn composer_pi_key(
     {
         return true;
     }
+    // KSG's stash drawer takes arrows, Enter, Escape and Mod+Backspace while open.
+    if super::composer_stash::menu_key(s, event, tx) {
+        return true;
+    }
     if composer_suggestion_key(s, event, tx.key_repeat()) {
         return true;
     }

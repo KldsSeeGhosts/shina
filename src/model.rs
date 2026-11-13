@@ -4121,6 +4121,12 @@ pub struct State {
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
     pub snooze_edit: TextEdit,
+    /// The composer prompt stash, KSG Code's promptStashStore. `composer-stash.json`.
+    pub stash: crate::ui::composer_stash::Stash,
+    pub stash_menu: bool,
+    pub stash_highlight: usize,
+    /// Bumped once per stash so the badge replays its pulse, KSG's `pulseKey`.
+    pub stash_pulse: u64,
     pub lifecycle_error: Option<String>,
     pub auto_settle_days: u32,
     pub default_harness: String,
@@ -4382,6 +4388,10 @@ impl State {
             snooze_targets: vec![],
             custom_snooze_open: false,
             snooze_edit: TextEdit::default(),
+            stash: Default::default(),
+            stash_menu: false,
+            stash_highlight: 0,
+            stash_pulse: 0,
             lifecycle_error: None,
             auto_settle_days: 3,
             default_harness: "pi".into(),
@@ -12981,6 +12991,12 @@ impl State {
         }
         self.ui_store = Some(crate::store::Store::new(ui_path, wake.clone()));
         self.store = Some(crate::store::Store::new(path, wake));
+        // The stash sits in its own file so a corrupt one never breaks UI state loading.
+        let (stash, stash_warning) = crate::ui::composer_stash::load(&self.data_dir);
+        self.stash = stash;
+        if let Some(warning) = stash_warning {
+            self.composer_notices.push(warning);
+        }
         let running_tasks = self
             .tasks
             .iter()

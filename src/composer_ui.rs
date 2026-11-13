@@ -682,6 +682,8 @@ pub(crate) fn key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
 }
 
 pub(super) fn changed(s: &mut State) {
+    // KSG closes the stash menu as soon as the draft changes.
+    s.stash_menu = false;
     composer_menu::clear_dismissed_if_changed(s);
     let t = s.current_mut();
     t.native.slash_index = 0;
@@ -842,7 +844,13 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         0.0
     }) + vcs_fixed;
     let layout = resolve(
-        width,
+        // The stash badge takes 28 px plus its gap when the stash has entries.
+        width
+            - if s.stash.entries.is_empty() {
+                0.0
+            } else {
+                32.0
+            },
         fixed,
         if resting { 52.0 } else { 0.0 },
         &blocks[..count],
@@ -960,6 +968,8 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             .preserve_focus_on_press(true),
         );
     }
+    // KSG Code's ComposerStashBadge sits at the right end of the composer footer.
+    controls = controls.child(composer_stash::badge(s, p));
     if resting && !layout.visible {
         controls = controls.opacity(0.0).inert();
     }
