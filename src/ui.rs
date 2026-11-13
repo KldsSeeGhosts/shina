@@ -25325,6 +25325,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mention_menu_lists_workspace_files_and_older_threads_at_620_and_1280_px() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            let (id, machine) = {
+                let t = rt.state.current();
+                (t.id, t.machine.clone())
+            };
+            // Results already applied for the current key, as a settled
+            // `workspace.searchEntries`/`threads.search` response leaves them.
+            rt.state.mention_search.key = Some((id, machine.clone(), "deep".into()));
+            rt.state.mention_search.paths_cwd = "/tmp/shina-mention-fixture".into();
+            rt.state.mention_search.paths = vec![crate::workspace_search::WorkspaceEntry {
+                path: "src/deep/nested.rs".into(),
+                kind: "file".into(),
+                ignored: false,
+            }];
+            rt.state.mention_search.threads = vec![crate::ui::composer_menu::MentionThreadRow {
+                server: machine,
+                id: 9,
+                title: "Deep settings rework".into(),
+                branch: None,
+                updated_ms: Some(1),
+                archived: false,
+                parent: false,
+            }];
+            rt.frame(0.0);
+            press(&mut rt, "composer-input");
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text("@deep".into()),
+                mods: Default::default(),
+            });
+            rt.frame(0.0);
+            rt.frame(0.25);
+            let (menu, _) = rt.presented("mention-menu").expect("mention menu");
+            assert!(
+                menu[0] >= 8.0 && menu[0] + menu[2] <= width - 7.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                rt.presented("mention-item-0").is_some(),
+                "{width}: older thread row"
+            );
+            assert!(
+                rt.presented("mention-item-1").is_some(),
+                "{width}: workspace file row"
+            );
+        }
+    }
+
+    #[test]
     fn machine_mention_leaves_thread_host_unchanged_after_insertion_and_send() {
         let mut rt = runtime(1280.0);
         rt.state.peers.push(crate::peer::Peer {

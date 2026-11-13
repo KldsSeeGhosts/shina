@@ -556,6 +556,529 @@ pub fn fold_for_title(text: &str) -> String {
     fold_text_chars(text).0
 }
 
+// ---------------------------------------------------------------------------
+// Mention ranking, ported from KSG Code's `paletteSearch.ts`
+// (`matchSearchFields`, `matchToken`, `matchJoinedWords`, `matchReference`,
+// `scoreThreadSearch`, `threadUsageBoost`, `rankSearchItems`).
+
+const WHOLE_WORD_Q: f64 = 1.0;
+const WHOLE_NAME_Q: f64 = 1.5;
+const MID_WORD_Q: f64 = 0.3;
+const TYPO_Q: f64 = 0.45;
+const JOINED_WORDS_Q: f64 = 0.6;
+const USE_BOOST_LIMIT: f64 = 2.5;
+const DAY_MS: f64 = 86_400_000.0;
+const SEARCH_RECENCY_HALF_LIFE_MS: f64 = 14.0 * DAY_MS;
+const REFERENCE_PREFIX_MIN: usize = 8;
+const PICK_PREFIX_MIN_LENGTH: usize = 3;
+const FILLER_WORDS: [&str; 10] = [
+    "a", "an", "and", "for", "in", "of", "on", "the", "to", "with",
+];
+
+struct SearchField {
+    text: Vec<char>,
+    word_starts: Vec<bool>,
+}
+
+fn fold_search_field(source: &str) -> SearchField {
+    let chars: Vec<char> = source.chars().collect();
+    let mut word_starts = vec![false; chars.len()];
+    for (i, &c) in chars.iter().enumerate() {
+        if is_word_start_chars(
+            i.checked_sub(2).and_then(|j| chars.get(j)).copied(),
+            i.checked_sub(1).and_then(|j| chars.get(j)).copied(),
+            c,
+            chars.get(i + 1).copied(),
+        ) {
+            word_starts[i] = true;
+        }
+    }
+    let folded: Vec<char> = fold_for_title(source).chars().collect();
+    // Folding only changes case, so character counts and word starts still align.
+    if folded.len() == chars.len() {
+        SearchField {
+            text: folded,
+            word_starts,
+        }
+    } else {
+        let mut starts = vec![false; folded.len()];
+        for (i, &c) in folded.iter().enumerate() {
+            starts[i] = is_word_start_chars(
+                i.checked_sub(2).and_then(|j| folded.get(j)).copied(),
+                i.checked_sub(1).and_then(|j| folded.get(j)).copied(),
+                c,
+                folded.get(i + 1).copied(),
+            );
+        }
+        SearchField {
+            text: folded,
+            word_starts: starts,
+        }
+    }
+}
+
+/// `foldSearchQuery`: strip wrapping quotes, fold case, collapse whitespace.
+pub fn fold_search_query(query: &str) -> String {
+    let trimmed = query.trim();
+    let unwrapped = trimmed
+        .trim_matches(|c| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}'
+            )
+        })
+        .trim();
+    fold_for_title(unwrapped)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn word_end(field: &SearchField, index: usize) -> usize {
+    let mut end = index + 1;
+    while end < field.text.len() && !field.word_starts[end] && field.text[end].is_alphanumeric() {
+        end += 1;
+    }
+    end
+}
+
+fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
+    if left.len().abs_diff(right.len()) > usize::from(!swap_only) {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() && index < right.len() && left[index] == right[index] {
+        index += 1;
+    }
+    let rest_left = &left[index..];
+    let rest_right = &right[index..];
+    let swapped = rest_left.len() > 1
+        && rest_right.len() > 1
+        && rest_left[0] == rest_right[1]
+        && rest_left[1] == rest_right[0]
+        && rest_left[2..] == rest_right[2..];
+    if swap_only {
+        return swapped;
+    }
+    swapped
+        || rest_left == rest_right
+        || rest_left.get(1..) == rest_right.get(1..)
+        || rest_left.get(1..) == Some(rest_right)
+        || Some(rest_left) == rest_right.get(1..)
+}
+
+fn find_char(haystack: &[char], needle_first: char, from: usize) -> Option<usize> {
+    haystack[from..]
+        .iter()
+        .position(|&c| c == needle_first)
+        .map(|p| p + from)
+}
+
+fn find_slice(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|p| p + from)
+}
+
+fn match_joined_words(field: &SearchField, token: &[char]) -> Option<f64> {
+    let mut start = find_char(&field.text, token[0], 0);
+    while let Some(at_start) = start {
+        start = find_char(&field.text, token[0], at_start + 1);
+        if !field.word_starts[at_start] {
+            continue;
+        }
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut at = at_start;
+        let mut rest = token.to_vec();
+        while !rest.is_empty() && at < field.text.len() {
+            let end = word_end(field, at);
+            if rest.len() <= end - at && field.text[at..].starts_with(&rest) {
+                runs.push((at, at + rest.len()));
+                rest.clear();
+            } else if rest.starts_with(&field.text[at..end]) {
+                runs.push((at, end));
+                rest.drain(..end - at);
+                at = end;
+                while at < field.text.len() && !field.word_starts[at] {
+                    at += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let Some(&last) = runs.last() else { continue };
+        if !rest.is_empty() || runs.len() < 2 {
+            continue;
+        }
+        if last.1 == word_end(field, last.0)
+            || last.1 - last.0 >= 3
+            || at_start == field.word_starts.iter().position(|s| *s).unwrap_or(0)
+            || runs[..runs.len() - 1].iter().all(|run| run.1 - run.0 >= 3)
+        {
+            return Some(JOINED_WORDS_Q);
+        }
+    }
+    None
+}
+
+fn match_token(
+    field: &SearchField,
+    token: &[char],
+    typos: bool,
+    is_primary: bool,
+    mid_word: bool,
+) -> Option<f64> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut best: Option<f64> = None;
+    let own_boundary = !token[0].is_alphanumeric() && !is_symbol(token[0]);
+    let mut index = find_slice(&field.text, token, 0);
+    while let Some(at) = index {
+        index = find_slice(&field.text, token, at + 1);
+        if field.word_starts[at] || own_boundary {
+            let end = at + token.len();
+            let whole = end >= field.text.len()
+                || field.word_starts.get(end).copied().unwrap_or(false)
+                || !field.text[end].is_alphanumeric();
+            let mut run_end = end;
+            while run_end < field.text.len() && field.text[run_end].is_alphanumeric() {
+                run_end += 1;
+            }
+            let score = if whole {
+                WHOLE_WORD_Q
+            } else {
+                0.7 + 0.2 * token.len() as f64 / (run_end - at) as f64
+            };
+            if best.is_none_or(|b| score > b) {
+                best = Some(score);
+            }
+            if score == WHOLE_WORD_Q {
+                return best;
+            }
+        } else if mid_word && token.len() >= 4 && best.is_none() {
+            best = Some(MID_WORD_Q);
+        }
+    }
+    if best.is_none_or(|b| b <= MID_WORD_Q) && is_primary {
+        if let Some(joined) = match_joined_words(field, token) {
+            return Some(joined);
+        }
+    }
+    if best.is_some_and(|b| b > MID_WORD_Q) || !typos || token.len() < 3 {
+        return best;
+    }
+    if token.iter().any(|c| c.is_alphabetic()) && !token.iter().all(|c| c.is_numeric()) {
+        for at in 0..field.text.len() {
+            if !field.word_starts[at] {
+                continue;
+            }
+            let first = field.text[at];
+            let first_kept = first == token[0]
+                || (token.len() > 3
+                    && first == token[1]
+                    && field.text.get(at + 1) == token.first());
+            if !first_kept {
+                continue;
+            }
+            let mut run_end = at + 1;
+            while run_end < field.text.len() && field.text[run_end].is_alphanumeric() {
+                run_end += 1;
+            }
+            let word = &field.text[at..run_end];
+            let short = token.len() <= 4;
+            let lengths: &[usize] = if short {
+                &[token.len(), token.len() + 1]
+            } else {
+                &[token.len(), token.len() - 1, token.len() + 1]
+            };
+            for &length in lengths {
+                if length > word.len() {
+                    continue;
+                }
+                if within_one_edit(token, &word[..length], short && length == token.len()) {
+                    return Some(TYPO_Q);
+                }
+            }
+        }
+    }
+    best
+}
+
+struct WeightedField<'a> {
+    value: &'a str,
+    weight: f64,
+    mid_word: bool,
+    context: bool,
+}
+
+struct FieldsMatch {
+    quality: f64,
+    whole_words: bool,
+    strong: bool,
+    title_shows_match: bool,
+}
+
+fn match_search_fields(query: &str, fields: &[WeightedField], typos: bool) -> Option<FieldsMatch> {
+    if query.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = query.split(' ').filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let filler_optional = tokens.iter().any(|t| !FILLER_WORDS.contains(t));
+    let primary = fields
+        .first()
+        .filter(|f| !f.value.is_empty())
+        .map(|f| fold_search_field(f.value));
+    let mut total = 0.0;
+    let mut counted = 0usize;
+    let mut not_whole = false;
+    let mut strong = true;
+    let mut title_shows = false;
+    for token in &tokens {
+        let token_chars: Vec<char> = token.chars().collect();
+        let mut best = 0.0;
+        let mut best_primary = false;
+        let mut at_word_start = false;
+        for (i, weighted) in fields.iter().enumerate() {
+            if weighted.value.is_empty() {
+                continue;
+            }
+            let field = fold_search_field(weighted.value);
+            let is_primary = i == 0 && primary.is_some();
+            if best >= weighted.weight && !is_primary && at_word_start {
+                continue;
+            }
+            let field_typos = typos;
+            let score = match_token(
+                &field,
+                &token_chars,
+                field_typos,
+                is_primary,
+                weighted.mid_word,
+            );
+            let Some(score) = score else { continue };
+            if is_primary {
+                best_primary = true;
+            }
+            if score >= 0.7 && !weighted.context {
+                at_word_start = true;
+            }
+            if score * weighted.weight > best {
+                best = score * weighted.weight;
+            }
+        }
+        if best == 0.0 {
+            if filler_optional && FILLER_WORDS.contains(token) {
+                continue;
+            }
+            return None;
+        }
+        strong &= at_word_start;
+        title_shows |= best_primary;
+        total += best;
+        counted += 1;
+        if FILLER_WORDS.contains(token) {
+            not_whole |= !filler_optional;
+        } else {
+            not_whole |= token.len() < PICK_PREFIX_MIN_LENGTH || best < WHOLE_WORD_Q;
+        }
+    }
+    let mut quality = total / counted as f64;
+    if let Some(primary) = &primary {
+        let primary_text: String = primary.text.iter().collect();
+        if primary_text == query {
+            quality += WHOLE_NAME_Q - WHOLE_WORD_Q;
+        } else if tokens.len() > 1 && primary_text.contains(query) {
+            quality += 0.25;
+        }
+    }
+    Some(FieldsMatch {
+        quality,
+        whole_words: !not_whole,
+        strong,
+        title_shows_match: title_shows,
+    })
+}
+
+fn searchable_branch(branch: &str) -> String {
+    for prefix in ["t3code/", "t3/"] {
+        if let Some(rest) = branch.strip_prefix(prefix)
+            && rest.chars().next().is_some_and(|c| !c.is_whitespace())
+        {
+            return rest.to_owned();
+        }
+    }
+    branch.to_owned()
+}
+
+fn thread_field_query(query: &str) -> String {
+    let mut q = query;
+    for prefix in ["pull request", "pull", "pr"] {
+        if let Some(rest) = q.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            if rest.starts_with('#') || rest.chars().next().is_some_and(|c| c.is_numeric()) {
+                q = rest;
+                break;
+            }
+        }
+    }
+    let q = q.strip_prefix('#').map(str::trim_start).unwrap_or(q);
+    let q = if q.starts_with("t3/") || q.starts_with("t3code/") {
+        q.split_once('/').map(|(_, rest)| rest).unwrap_or(q)
+    } else {
+        q
+    };
+    q.to_owned()
+}
+
+/// A thread the `@` menu may rank, like KSG's `ThreadSearchSubject` minus pull
+/// requests, project/environment fields and open stats (absent in Shina).
+pub struct MentionThread<'a> {
+    pub id: usize,
+    pub title: &'a str,
+    pub branch: &'a str,
+    /// Latest activity, epoch ms; `None` when unknown.
+    pub activity_at_ms: Option<i64>,
+}
+
+pub struct MentionMatch {
+    pub score: f64,
+    pub quality: f64,
+    pub whole_words: bool,
+    pub strong: bool,
+}
+
+fn match_reference(query: &str, id: usize) -> Option<FieldsMatch> {
+    if query.chars().count() < REFERENCE_PREFIX_MIN {
+        return None;
+    }
+    let anywhere = query.chars().any(|c| c.is_numeric());
+    let reference = id.to_string();
+    let not_cut =
+        |text: &str, end: usize| !text[end..].chars().next().is_some_and(|c| c.is_numeric());
+    let folded = reference.to_lowercase();
+    let at = folded.find(query);
+    let matches = if anywhere {
+        at.is_some_and(|at| not_cut(&folded, at + query.len()))
+            || (query.starts_with(&folded) && not_cut(query, folded.len()))
+    } else {
+        at == Some(0)
+    };
+    matches.then_some(FieldsMatch {
+        quality: 0.6,
+        whole_words: false,
+        strong: true,
+        title_shows_match: false,
+    })
+}
+
+fn decay(age_ms: f64) -> f64 {
+    2f64.powf(-age_ms.max(0.0) / SEARCH_RECENCY_HALF_LIFE_MS)
+}
+
+fn thread_usage_boost(thread: &MentionThread, now_ms: i64) -> f64 {
+    let recency = thread
+        .activity_at_ms
+        .map_or(0.0, |at| decay(now_ms as f64 - at as f64));
+    USE_BOOST_LIMIT.min(1.0 + recency)
+}
+
+/// `scoreThreadSearch` for a composer subject: title at full weight with mid-word
+/// matching, branch at 0.6, and a whole-query id reference as fallback.
+pub fn score_thread_search(
+    query: &str,
+    thread: &MentionThread,
+    now_ms: i64,
+    typos: bool,
+) -> Option<MentionMatch> {
+    if query.is_empty() {
+        return None;
+    }
+    let branch = searchable_branch(thread.branch);
+    let mut fields = vec![WeightedField {
+        value: thread.title,
+        weight: 1.0,
+        mid_word: true,
+        context: false,
+    }];
+    if !branch.is_empty() {
+        fields.push(WeightedField {
+            value: &branch,
+            weight: 0.6,
+            mid_word: false,
+            context: false,
+        });
+    }
+    let field_query = thread_field_query(query);
+    let field_match = match_search_fields(&field_query, &fields, typos);
+    let reference_match = if field_match.is_none() {
+        match_reference(query, thread.id)
+    } else {
+        None
+    };
+    let matched = field_match.or(reference_match)?;
+    // A multi-word query with no hit in the title is a coincidence; KSG drops it.
+    if !matched.title_shows_match && field_query.contains(' ') {
+        return None;
+    }
+    Some(MentionMatch {
+        score: matched.quality * thread_usage_boost(thread, now_ms),
+        quality: matched.quality,
+        whole_words: matched.whole_words,
+        strong: matched.strong,
+    })
+}
+
+fn match_class(quality: f64) -> i32 {
+    if quality >= WHOLE_NAME_Q {
+        3
+    } else if quality >= 0.7 {
+        2
+    } else if quality >= 0.4 {
+        1
+    } else {
+        0
+    }
+}
+
+/// `rankSearchItems` for a single list: typos only when nothing matched strongly.
+pub fn rank_mentions<T>(
+    items: &[T],
+    score: impl Fn(&T, bool) -> Option<MentionMatch>,
+) -> Vec<(usize, MentionMatch)> {
+    let rank = |typos: bool| -> Vec<(usize, MentionMatch)> {
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| score(item, typos).map(|m| (i, m)))
+            .collect()
+    };
+    let mut ranked = rank(false);
+    if !ranked.iter().any(|(_, m)| m.strong) {
+        ranked = rank(true);
+    }
+    ranked.sort_by(|a, b| {
+        let word = |m: &MentionMatch| match_class(m.quality).min(2);
+        word(&b.1)
+            .cmp(&word(&a.1))
+            .then_with(|| match_class(b.1.quality).cmp(&match_class(a.1.quality)))
+            .then_with(|| (b.1.whole_words as i32).cmp(&(a.1.whole_words as i32)))
+            .then_with(|| {
+                b.1.score
+                    .partial_cmp(&a.1.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    ranked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +1170,85 @@ mod tests {
         assert_eq!(hits[0].thread_id, 3);
         assert_eq!(hits[1].thread_id, 2);
         assert_eq!(hits[2].thread_id, 1);
+    }
+
+    #[test]
+    fn mention_ranking_copies_ksg_composer_thread_cases() {
+        // KSG composerThreadItems.test.ts: "Fix model picker" (whole word)
+        // outranks "Remodel the settings page" (mid-word) for "model".
+        let now = 1_761_206_400_000i64; // 2025-11-02T00:00:00Z
+        let day = 86_400_000i64;
+        let candidates = [
+            MentionThread {
+                id: 1,
+                title: "Remodel the settings page",
+                branch: "",
+                activity_at_ms: Some(now - 3 * day),
+            },
+            MentionThread {
+                id: 2,
+                title: "Fix model picker",
+                branch: "",
+                activity_at_ms: Some(now - 22 * day),
+            },
+            MentionThread {
+                id: 3,
+                title: "Unrelated notes",
+                branch: "",
+                activity_at_ms: Some(now),
+            },
+        ];
+        let ranked = rank_mentions(&candidates, |t, typos| {
+            score_thread_search("model", t, now, typos)
+        });
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(i, _)| candidates[*i].id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        // KSG's matchReference: a query of 8+ chars containing a digit hits a
+        // thread id that contains it (never a digit-cut prefix).
+        let referenced = [
+            MentionThread {
+                id: 12_345_678,
+                title: "Unrelated notes",
+                branch: "",
+                activity_at_ms: Some(now),
+            },
+            MentionThread {
+                id: 12_345_679,
+                title: "Also unrelated",
+                branch: "",
+                activity_at_ms: Some(now),
+            },
+        ];
+        let by_ref = rank_mentions(&referenced, |t, typos| {
+            score_thread_search(&fold_search_query("12345678"), t, now, typos)
+        });
+        assert_eq!(by_ref.len(), 1);
+        assert_eq!(referenced[by_ref[0].0].id, 12_345_678);
+
+        // Recency breaks ties between equal-quality matches.
+        let tied = [
+            MentionThread {
+                id: 1,
+                title: "Deploy older",
+                branch: "",
+                activity_at_ms: Some(now - 60 * day),
+            },
+            MentionThread {
+                id: 2,
+                title: "Deploy newer",
+                branch: "",
+                activity_at_ms: Some(now - day),
+            },
+        ];
+        let ranked = rank_mentions(&tied, |t, typos| {
+            score_thread_search("deploy", t, now, typos)
+        });
+        assert_eq!(tied[ranked[0].0].id, 2);
     }
 }
