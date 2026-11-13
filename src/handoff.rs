@@ -441,7 +441,11 @@ pub fn build_package(
 
 /// `withInlineContext`: the package text precedes the user's own message, once.
 pub fn with_inline_context(context: &str, user_text: &str) -> String {
-    format!("{context}\n\nUser message:\n{user_text}")
+    if context.is_empty() {
+        user_text.to_owned()
+    } else {
+        format!("{context}\n\nUser message:\n{user_text}")
+    }
 }
 
 #[cfg(test)]

@@ -82,6 +82,37 @@ fn running_projection_timestamps_do_not_advance_with_presentation_time() {
     assert!(client.started.unwrap().elapsed() >= Duration::from_secs(1));
     assert!(client.tools[0].started.unwrap().elapsed() >= Duration::from_secs(1));
 }
+
+#[cfg(test)]
+#[test]
+fn handoffs_round_trip_the_thread_projection() {
+    let mut thread = Thread::new(1);
+    thread.handoffs.push(crate::handoff::Handoff::new(
+        "codex".into(),
+        Some("gpt-5.2".into()),
+        "claude".into(),
+        Some("claude-opus-4-5".into()),
+        2,
+        42,
+    ));
+    let view = serde_json::to_value(ThreadView::capture(&thread)).unwrap();
+    let mut client = Thread::new(1);
+    serde_json::from_value::<ThreadView>(view)
+        .unwrap()
+        .apply(&mut client)
+        .unwrap();
+    assert_eq!(client.handoffs, thread.handoffs);
+
+    // An older projection without the field applies as no handoffs.
+    let mut older = serde_json::to_value(ThreadView::capture(&thread)).unwrap();
+    older.as_object_mut().unwrap().remove("handoffs");
+    let mut client = Thread::new(1);
+    serde_json::from_value::<ThreadView>(older)
+        .unwrap()
+        .apply(&mut client)
+        .unwrap();
+    assert!(client.handoffs.is_empty());
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MessageView {
     #[serde(default = "new_message_id")]
@@ -242,6 +273,8 @@ struct ThreadView {
         skip_serializing_if = "Option::is_none"
     )]
     worktree_setup: Option<crate::model::WorktreeSetupState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    handoffs: Vec<crate::handoff::Handoff>,
 }
 
 impl ThreadView {
@@ -386,6 +419,7 @@ impl ThreadView {
             start_from_origin: thread.start_from_origin,
             submission_error: thread.submission_error.clone(),
             worktree_setup: thread.worktree_setup.clone(),
+            handoffs: thread.handoffs.clone(),
         }
     }
 
@@ -620,6 +654,7 @@ impl ThreadView {
         thread.native.projected_operating = self.operating;
         thread.native.projected_queued = self.queued;
         thread.projected_harness_choice = self.harness_choice;
+        thread.handoffs = self.handoffs;
         thread.native.commands_loaded = self.commands_loaded;
         thread.native.commands_error = self.commands_error;
         thread.native.fresh_queue_ids = self.queue_fresh.into_iter().collect();

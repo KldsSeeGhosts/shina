@@ -596,6 +596,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut question_attachments = false;
     let mut question_dismiss = false;
     let mut vcs_worktrees = false;
+    let mut provider_handoff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -691,6 +692,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         vcs_worktrees = minor >= 20;
                         if vcs_worktrees {
                             capabilities.push(protocol::VCS_WORKTREES);
+                        }
+                        provider_handoff = minor >= 21;
+                        if provider_handoff {
+                            capabilities.push(protocol::PROVIDER_HANDOFF);
                         }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
@@ -1063,6 +1068,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     };
                     if method == "thread.user-input.dismiss" && !question_dismiss {
                         if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if method == "thread.configure" && command.params["handoff"] == true && !provider_handoff {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::PROVIDER_HANDOFF_UPDATE_REQUIRED.into()))).await { break; }
                         continue;
                     }
                     if command.params["requestContract"] == true && !composer_requests {
@@ -2818,6 +2827,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_handoff_capability_is_advertised_only_at_latest_minor() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("handoff-cap").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            // Capability is present at protocol::MINOR.
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR))
+            );
+            assert!(crate::client::supports_provider_handoff(&hello));
+
+            // Capability is absent one minor below, and the handoff flag is refused.
+            let older = Fixture::with_minor("handoff-older", protocol::MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                older_hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR - 1))
+            );
+            assert!(!crate::client::supports_provider_handoff(&older_hello));
+            let refusal = crate::client::remote_rpc(
+                &older_link,
+                "thread.configure",
+                json!({"provider":"claude","model":"claude-opus-4-5","handoff":true}),
+            )
+            .await;
+            assert_eq!(
+                refusal.unwrap_err(),
+                protocol::PROVIDER_HANDOFF_UPDATE_REQUIRED
+            );
+        });
+    }
+
+    #[test]
     fn vcs_requests_capabilities_and_authorization() {
         if !crate::vcs::git_available() {
             eprintln!("skipping test: git is not on PATH");
@@ -2839,14 +2889,14 @@ mod tests {
             assert!(crate::client::supports_vcs_worktrees(&hello));
 
             // Capability is absent one minor below, and client wrappers refuse before sending.
-            let older = Fixture::with_minor("vcs-older", protocol::MINOR - 1).await;
+            let older = Fixture::with_minor("vcs-older", protocol::MINOR - 2).await;
             let older_link = older.link(&older.shared.directory.join("client")).await;
             let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
                 .await
                 .unwrap();
             assert_eq!(
                 older_hello["protocolMinor"].as_u64(),
-                Some(u64::from(protocol::MINOR - 1))
+                Some(u64::from(protocol::MINOR - 2))
             );
             assert!(!crate::client::supports_vcs_worktrees(&older_hello));
             let err = crate::client::vcs_status(

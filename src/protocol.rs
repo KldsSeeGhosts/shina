@@ -3,11 +3,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 20;
+pub const MINOR: u32 = 21;
 pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
 pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use branches and worktrees.";
 pub const FRESH_CONTEXT: &str = "fresh-context";
+pub const PROVIDER_HANDOFF: &str = "provider-handoff-v1";
+pub const PROVIDER_HANDOFF_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to switch providers mid-thread.";
 pub const USAGE_LIMITS: &str = "usage-limits";
 pub const PROJECT_WRITE_FILE: &str = "project-write-file";
 pub const QUESTION_DISMISS: &str = "question-dismiss-v1";

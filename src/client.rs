@@ -2172,6 +2172,16 @@ pub fn supports_project_write_file(hello: &Value) -> bool {
         })
 }
 
+pub fn supports_provider_handoff(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::PROVIDER_HANDOFF)
+        })
+}
+
 pub fn supports_vcs_worktrees(hello: &Value) -> bool {
     hello["capabilities"]
         .as_array()
