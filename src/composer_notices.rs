@@ -1,10 +1,56 @@
 //! General notice stack above the composer, ported from KSG Code's `ComposerBannerStack`,
 //! `ComposerBanner`, and the connection-recovery parts of `useSystemComposerBanners`.
 
+use crate::client::{ConnectionPhase, ConnectionState, FailureKind};
 use crate::model::State;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Ported from KSG Code's `ENVIRONMENT_RECONNECT_WARNING_GRACE_MS` in `ChatView.logic.ts`.
+pub const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS: u64 = 2_000;
+
+/// Ported from KSG Code's `presentConnectionDiagnosis` (`locate` + `headline`) in
+/// `packages/client-runtime/src/connection/diagnosis.ts` for direct connections.
+pub fn connection_diagnosis(host_label: &str, state: &ConnectionState) -> Option<String> {
+    if state.phase == ConnectionPhase::Available {
+        return None;
+    }
+    if state.phase == ConnectionPhase::Offline {
+        return Some("This device is offline".into());
+    }
+    match state.last_failure {
+        Some(FailureKind::Outdated) => Some(format!("{host_label} runs an older Shina")),
+        Some(FailureKind::AuthDenied) => {
+            Some(format!("Shina on {host_label} did not accept this device"))
+        }
+        Some(FailureKind::Timeout) => Some(format!("{host_label} did not answer in time")),
+        Some(FailureKind::Dns) => Some(format!("{host_label} address did not resolve")),
+        Some(FailureKind::InvalidResponse) => {
+            Some(format!("Shina on {host_label} sent an unexpected answer"))
+        }
+        Some(FailureKind::Refused | FailureKind::ServerNotAnswering) => {
+            Some(format!("Shina on {host_label} did not answer"))
+        }
+        None if state.phase == ConnectionPhase::Error => {
+            Some(format!("Shina on {host_label} did not answer"))
+        }
+        None => None,
+    }
+}
+
+pub struct EnvironmentStatus {
+    pub server_id: String,
+    pub label: String,
+    pub connection: ConnectionState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReconnectGrace {
+    key: (String, u64),
+    started_at: Instant,
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +182,7 @@ pub struct Store {
     items: Vec<Notice>,
     dismissed: HashSet<String>,
     details_open: Option<String>,
+    grace: Option<ReconnectGrace>,
 }
 
 #[allow(dead_code)]
@@ -221,6 +268,91 @@ impl Store {
         self.items.iter().find(|item| item.id == id)
     }
 
+    /// Synchronize the `Environment` connection-recovery notice for the open thread's machine,
+    /// returning `(changed, next_wake_delay)`.
+    pub fn sync_environment(
+        &mut self,
+        active: Option<EnvironmentStatus>,
+        now: Instant,
+    ) -> (bool, Option<Duration>) {
+        const PREFIX: &str = "environment-unavailable:";
+        let expected_id = active
+            .as_ref()
+            .map(|env| format!("{PREFIX}{}", env.server_id));
+        let stale: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.id.starts_with(PREFIX) && expected_id.as_deref() != Some(item.id.as_str())
+            })
+            .map(|item| item.id.clone())
+            .collect();
+        let mut changed = false;
+        for id in stale {
+            changed |= self.remove(&id);
+        }
+
+        let Some(env) = active else {
+            self.grace = None;
+            return (changed, None);
+        };
+        let notice_id = format!("{PREFIX}{}", env.server_id);
+        let reconnecting = matches!(
+            env.connection.phase,
+            ConnectionPhase::Connecting | ConnectionPhase::Reconnecting
+        );
+        if reconnecting {
+            let key = (env.server_id.clone(), env.connection.attempt_seq);
+            let started_at = match &self.grace {
+                Some(existing) if existing.key == key => existing.started_at,
+                _ => {
+                    self.grace = Some(ReconnectGrace {
+                        key,
+                        started_at: now,
+                    });
+                    now
+                }
+            };
+            let grace = Duration::from_millis(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS);
+            let elapsed = now.saturating_duration_since(started_at);
+            if elapsed < grace {
+                changed |= self.remove(&notice_id);
+                return (changed, Some(grace - elapsed));
+            }
+        } else {
+            self.grace = None;
+        }
+
+        let variant = if env.connection.phase == ConnectionPhase::Error {
+            Variant::Error
+        } else {
+            Variant::Warning
+        };
+        let title = format!(
+            "{} is {}",
+            env.label,
+            if reconnecting {
+                "reconnecting"
+            } else {
+                "offline"
+            }
+        );
+        let description = connection_diagnosis(&env.label, &env.connection);
+        let mut actions = Vec::new();
+        if env.connection.phase != ConnectionPhase::Connecting {
+            let server = env.server_id;
+            actions.push(NoticeAction::new("Retry", move |s| {
+                s.retry_machine(&server);
+            }));
+        }
+        let notice = Notice::new(notice_id.clone(), variant, "alert", title)
+            .group(Group::Environment)
+            .description(description)
+            .actions(actions);
+        changed |= self.sync(&notice_id, Some(notice));
+        (changed, None)
+    }
+
     /// All visible notices in KSG order: `Environment` first, then `Attention`, preserving
     /// insertion order within each group.
     pub fn ordered(&self) -> Vec<&Notice> {
@@ -285,5 +417,65 @@ mod tests {
         assert!(!store.is_dismissed("att-1"));
         store.push(Notice::new("att-1", Variant::Info, "alert", "Raised again"));
         assert_eq!(ids(&store), vec!["env-2", "att-2", "att-1"]);
+    }
+
+    #[test]
+    fn grace_period_delays_reconnecting_notice_and_restarts_on_new_attempt() {
+        let mut store = Store::default();
+        let t0 = Instant::now();
+        let env = |attempt_seq: u64| EnvironmentStatus {
+            server_id: "studio".into(),
+            label: "Studio".into(),
+            connection: ConnectionState {
+                phase: ConnectionPhase::Reconnecting,
+                attempt: attempt_seq as u32,
+                attempt_seq,
+                last_failure: Some(FailureKind::ServerNotAnswering),
+                last_error: Some("Server listener is unavailable.".into()),
+            },
+        };
+
+        let (_, wake) = store.sync_environment(Some(env(1)), t0);
+        assert!(store.ordered().is_empty());
+        assert_eq!(
+            wake,
+            Some(Duration::from_millis(
+                ENVIRONMENT_RECONNECT_WARNING_GRACE_MS
+            ))
+        );
+
+        let (_, wake) = store.sync_environment(Some(env(1)), t0 + Duration::from_millis(1_999));
+        assert!(store.ordered().is_empty());
+        assert_eq!(wake, Some(Duration::from_millis(1)));
+
+        let (_, wake) = store.sync_environment(
+            Some(env(1)),
+            t0 + Duration::from_millis(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS),
+        );
+        assert_eq!(wake, None);
+        let notices = store.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].title, "Studio is reconnecting");
+        assert_eq!(
+            notices[0].description.as_deref(),
+            Some("Shina on Studio did not answer")
+        );
+
+        // A second reconnect attempt restarts the grace period.
+        let t_retry = t0 + Duration::from_millis(3_000);
+        let (_, wake) = store.sync_environment(Some(env(2)), t_retry);
+        assert!(store.ordered().is_empty());
+        assert_eq!(
+            wake,
+            Some(Duration::from_millis(
+                ENVIRONMENT_RECONNECT_WARNING_GRACE_MS
+            ))
+        );
+
+        store.sync_environment(
+            Some(env(2)),
+            t_retry + Duration::from_millis(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS),
+        );
+        assert_eq!(store.ordered().len(), 1);
     }
 }

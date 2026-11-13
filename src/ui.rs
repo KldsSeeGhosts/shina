@@ -6279,23 +6279,6 @@ fn chat_header(s: &State, p: Palette, narrow: bool, _: bool) -> El {
     } else {
         header = header.child(spacer());
     }
-    // The thread on a machine this desktop cannot reach says so beside its status.
-    if let Some(machine) = s.unreachable_selected() {
-        let text = format!("{machine} is unreachable. Reconnecting.");
-        header = header.child(
-            row()
-                .key("chat-unreachable")
-                .role("status")
-                .label(text.clone())
-                .gap(6.0)
-                .center_y()
-                .min_w(0.0)
-                .shrink()
-                .mr(8.0)
-                .child(status_mark(Status::Waiting, p, 6.0))
-                .child(pixel_text(text, p.brass).truncate().shrink().min_w(0.0)),
-        );
-    }
     header = header.child(if s.demo {
         outlined(
             row()
@@ -13285,14 +13268,20 @@ pub(crate) mod tests {
         );
         assert!(rt.presented("machine-unreachable").is_some());
         // Rows still say nothing about the connection.
-        assert!(!rt.accessibility_json().to_string().contains("offline"));
-        // The open thread on an unreachable machine says so.
+        let tree = rt.accessibility_json();
+        let sidebar = find(&tree, "sidebar").expect("sidebar");
+        assert!(!sidebar.to_string().contains("offline"));
+        // The open thread on an unreachable machine says so in the composer notice stack.
         rt.state.open_machine_thread("example-studio", 3);
         poll(&mut rt);
         assert_eq!(rt.state.machines.selected, "example-studio");
         let tree = rt.accessibility_json();
-        let header = find(&tree, "chat-unreachable").expect("the header says so");
-        assert_eq!(header["name"], "Studio is unreachable. Reconnecting.");
+        let notice = find(
+            &tree,
+            "composer-notice-environment-unavailable:example-studio",
+        )
+        .expect("the composer notice says so");
+        assert_eq!(notice["name"], "Studio is offline: This device is offline");
         // Another message is never replaced or cleared by it.
         rt.state.machines.notice = Some("Something else".into());
         poll(&mut rt);

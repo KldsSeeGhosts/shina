@@ -1020,7 +1020,8 @@ impl State {
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
         let changed = self.poll_client_background(tx)
             | self.updater.poll(Instant::now(), self.wake.clone())
-            | self.refresh_machine_notice();
+            | self.refresh_machine_notice()
+            | self.tick_composer_notices_at(Instant::now(), Some(tx));
         if self.background.quitting {
             return true;
         }
@@ -1864,6 +1865,58 @@ impl State {
         self.machines.auto_notice = Some(text);
         true
     }
+    pub(crate) fn tick_composer_notices_at(&mut self, now: Instant, tx: Option<&mut Tx>) -> bool {
+        let active = if self.demo || self.client.is_none() {
+            None
+        } else {
+            let server = &self.machines.selected;
+            let has_view = self.machines.views.contains_key(server);
+            let connected = self.machine_connected(server);
+            if !connected || !has_view {
+                let connection = self
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.connection_state_for(server))
+                    .unwrap_or_default();
+                Some(crate::composer_notices::EnvironmentStatus {
+                    server_id: server.clone(),
+                    label: self.machine_label(server),
+                    connection,
+                })
+            } else {
+                None
+            }
+        };
+        let (changed, wake) = self.composer_notices.sync_environment(active, now);
+        if let (Some(tx), Some(delay)) = (tx, wake) {
+            tx.wake_after(delay);
+        }
+        changed
+    }
+    pub fn retry_machine(&mut self, server: &str) {
+        let result = if server == "local" {
+            self.client
+                .as_ref()
+                .ok_or_else(|| "This machine is not linked.".to_owned())
+                .and_then(|client| client.retry_now())
+        } else {
+            self.client
+                .as_ref()
+                .and_then(|client| client.linked.get(server))
+                .ok_or_else(|| "This machine is not linked.".to_owned())
+                .and_then(|remote| remote.retry_now())
+        };
+        if let Err(error) = result {
+            self.push_toast(
+                ToastKind::Error,
+                "Could not reconnect environment",
+                Some(error),
+                None,
+                None,
+            );
+        }
+        self.tick_composer_notices_at(Instant::now(), None);
+    }
     /// Server/thread ids remain a pair. Only one server's records enter the State facade.
     pub fn select_machine(&mut self, server: &str) {
         self.machines.picker = false;
@@ -1987,6 +2040,7 @@ impl State {
             self.machines.scope_server,
             self.machines.scope_remote,
         ) = filter;
+        self.tick_composer_notices_at(Instant::now(), None);
     }
 
     /// KSG useDraftEnvironmentRouting locks promoted, started and running conversations.
@@ -5734,6 +5788,43 @@ mod tests {
                 id: "fastMode".into(),
                 value: crate::model_selection::OptionValue::Bool(true),
             }]
+        );
+    }
+
+    #[test]
+    fn retry_failure_notifies_could_not_reconnect_environment_and_shows_diagnosis() {
+        let dir = std::env::temp_dir().join(format!("shina-retry-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = State::headless(dir.clone());
+        let (mut client, _) = crate::client::Client::test_connected(dir.clone());
+        let remote = crate::client::Client::new(dir);
+        remote.set_test_connection_state(crate::client::ConnectionState {
+            phase: crate::client::ConnectionPhase::Error,
+            attempt: 1,
+            attempt_seq: 1,
+            last_failure: Some(crate::client::FailureKind::AuthDenied),
+            last_error: Some("Authentication denied.".into()),
+        });
+        client.linked.insert("studio".into(), remote);
+        state.client = Some(client);
+        state.machines.selected = "studio".into();
+        state.tick_composer_notices_at(Instant::now(), None);
+
+        let notices = state.composer_notices.ordered();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].title, "studio is offline");
+        assert_eq!(
+            notices[0].description.as_deref(),
+            Some("Shina on studio did not accept this device")
+        );
+
+        state.retry_machine("studio");
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(state.toasts[0].title, "Could not reconnect environment");
+        assert_eq!(
+            state.toasts[0].description.as_deref(),
+            Some("Authentication denied.")
         );
     }
 }
