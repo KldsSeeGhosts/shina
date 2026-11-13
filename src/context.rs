@@ -24,6 +24,8 @@ pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub context_window: Option<u64>,
     pub percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<Vec<crate::context_breakdown::ContextBreakdownRow>>,
 }
 
 impl ContextUsage {
@@ -48,10 +50,20 @@ impl ContextUsage {
                 }
             }
         };
+        let breakdown = usage
+            .get("breakdown")
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::context_breakdown::ContextBreakdownRow>>(
+                    value.clone(),
+                )
+                .ok()
+            })
+            .filter(|rows| !rows.is_empty());
         Self {
             tokens,
             context_window,
             percent,
+            breakdown,
         }
     }
 
@@ -119,15 +131,16 @@ impl ContextMeter {
     }
 
     /// Applies a stats response only when it belongs to the current request.
-    pub fn accept_response(&mut self, record: &Value) {
+    pub fn accept_response(&mut self, record: &Value) -> bool {
         if !self.accepts(record["id"].as_str()) {
-            return;
+            return false;
         }
         self.pending = None;
         if record["success"] == false {
-            return;
+            return false;
         }
         self.absorb(&record["data"]);
+        true
     }
 
     /// Replaces usage with Pi's current figures. A missing or null percentage keeps the
@@ -146,6 +159,7 @@ impl ContextMeter {
         self.phase = ContextPhase::Compacting;
         self.usage.tokens = None;
         self.usage.percent = None;
+        self.usage.breakdown = None;
     }
 
     pub fn finish_compaction(&mut self) {
@@ -153,6 +167,7 @@ impl ContextMeter {
         self.phase = ContextPhase::AwaitingUsage;
         self.usage.tokens = None;
         self.usage.percent = None;
+        self.usage.breakdown = None;
     }
 
     /// A different model has different capacity and a different cache. Do not show the
@@ -259,7 +274,8 @@ mod tests {
             ContextUsage {
                 tokens: Some(60000),
                 context_window: Some(200000),
-                percent: Some(30.0)
+                percent: Some(30.0),
+                breakdown: None,
             }
             .usage_text(None),
             "60,000 of 200,000 tokens"
@@ -380,6 +396,7 @@ mod tests {
                 tokens: Some(60000),
                 context_window: Some(200000),
                 percent: Some(30.0),
+                breakdown: None,
             },
             ..Default::default()
         };

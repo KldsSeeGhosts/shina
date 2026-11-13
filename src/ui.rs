@@ -14727,6 +14727,7 @@ pub(crate) mod tests {
                 tokens: Some(60_000),
                 context_window: Some(200_000),
                 percent: Some(30.0),
+                breakdown: None,
             };
             t.draft.replace_text("A short draft");
             t.draft.focused = true;
@@ -16525,6 +16526,7 @@ pub(crate) mod tests {
             tokens: Some(60_000),
             context_window: Some(200_000),
             percent: Some(30.0),
+            breakdown: None,
         };
         thread.draft.replace_text("Ready");
         rt.invalidate();
@@ -16650,6 +16652,7 @@ pub(crate) mod tests {
             tokens: None,
             context_window: Some(200_000),
             percent: None,
+            breakdown: None,
         };
         thread.context.phase = ContextPhase::AwaitingUsage;
         thread.draft.replace_text("Ready");
@@ -16725,6 +16728,7 @@ pub(crate) mod tests {
             tokens: Some(61_400),
             context_window: Some(200_000),
             percent: Some(30.7),
+            breakdown: None,
         };
         thread.native.stats = json!({"tokens": {"total": 1_284_000}, "cost": 0.4183});
         thread.draft.replace_text("Ready");

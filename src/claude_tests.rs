@@ -986,3 +986,93 @@ fn auto_mode_maps_to_claude_auto_permission_mode() {
     assert_eq!(client.wire[0]["request"]["subtype"], "set_permission_mode");
     assert_eq!(client.wire[0]["request"]["mode"], "auto");
 }
+
+#[test]
+fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn() {
+    let mut client = client("read-only");
+    client.running = true;
+    client
+        .incoming(json!({
+            "type": "assistant",
+            "uuid": "u1",
+            "message": {
+                "role": "assistant",
+                "id": "m1",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Done"}],
+                "usage": {
+                    "input_tokens": 10000,
+                    "cache_read_input_tokens": 5000,
+                    "cache_creation_input_tokens": 2000,
+                    "output_tokens": 500
+                }
+            }
+        }))
+        .unwrap();
+    client.wire.clear();
+    client
+        .incoming(json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "queued_turn_count": 0,
+            "modelUsage": {
+                "claude-sonnet-4-6": { "contextWindow": 200000 }
+            }
+        }))
+        .unwrap();
+    let req = client
+        .wire
+        .iter()
+        .find(|r| r["request"]["subtype"] == "get_context_usage")
+        .expect("expected get_context_usage control_request")
+        .clone();
+    assert_eq!(req["request"]["detail"], "summary");
+    let req_id = req["request_id"].as_str().unwrap().to_owned();
+
+    client.events.clear();
+    client
+        .incoming(json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": req_id,
+                "response": {
+                    "categories": [
+                        {"name": "System prompt", "tokens": 3200, "kind": "used"},
+                        {"name": "Messages", "tokens": 14300, "kind": "used"},
+                        {"name": "Autocompact buffer", "tokens": 30000, "kind": "buffer"},
+                        {"name": "Free space", "tokens": 152500, "kind": "free"},
+                        {"name": "Deferred tools", "tokens": 4100, "kind": "deferred"}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+    let mut thread = Thread::new(32);
+    thread.harness = "claude".into();
+    for event in client.events {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.context.usage.breakdown,
+        Some(vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "System prompt".into(),
+                tokens: 3200,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 14300,
+                kind: crate::context_breakdown::BreakdownRowKind::Used,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Autocompact buffer".into(),
+                tokens: 30000,
+                kind: crate::context_breakdown::BreakdownRowKind::Buffer,
+            },
+        ])
+    );
+}

@@ -947,3 +947,47 @@ fn managed_policy_denial_and_clamp_behaviour() {
         Some(AccessMode::Edits)
     );
 }
+
+#[test]
+fn pi_session_stats_produce_estimated_and_inferred_breakdown_while_acp_leaves_none() {
+    let (mut t, commands) = thread(Status::Ready);
+    t.apply(json!({
+        "type": "message_start",
+        "message": { "role": "user", "content": [{ "type": "text", "text": &"x".repeat(3500) }] }
+    }));
+    t.refresh_context_usage();
+    let req = command(&commands, "get_session_stats");
+    answer(
+        &mut t,
+        &req,
+        json!({"contextUsage": {"tokens": 5000, "contextWindow": 100000, "percent": 5.0}}),
+    );
+    let breakdown = t
+        .context
+        .usage
+        .breakdown
+        .as_ref()
+        .expect("expected Pi breakdown");
+    assert_eq!(
+        breakdown,
+        &vec![
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "System".into(),
+                tokens: 4000,
+                kind: crate::context_breakdown::BreakdownRowKind::Inferred,
+            },
+            crate::context_breakdown::ContextBreakdownRow {
+                label: "Messages".into(),
+                tokens: 1000,
+                kind: crate::context_breakdown::BreakdownRowKind::Estimated,
+            },
+        ]
+    );
+
+    let (mut acp_thread, acp_commands) = thread(Status::Ready);
+    acp_thread.harness = "acp-fixture".into();
+    acp_thread.refresh_context_usage();
+    let acp_req = command(&acp_commands, "get_session_stats");
+    answer(&mut acp_thread, &acp_req, json!({"contextUsage": null}));
+    assert_eq!(acp_thread.context.usage.breakdown, None);
+}

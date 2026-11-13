@@ -328,12 +328,17 @@ impl Client {
     fn request(&mut self, request: Value, original: Value) {
         self.serial += 1;
         let id = format!("shina-claude-{}", self.serial);
+        let timeout = if request["subtype"] == "get_context_usage" {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(30)
+        };
         self.pending.insert(
             id.clone(),
             Pending {
                 original,
                 request: request.clone(),
-                deadline: Instant::now() + Duration::from_secs(30),
+                deadline: Instant::now() + timeout,
             },
         );
         self.wire
@@ -600,6 +605,9 @@ impl Client {
                             "Claude could not apply the plan's permission mode: {error}"
                         ));
                     }
+                    if pending.request["subtype"] == "get_context_usage" {
+                        return Ok(());
+                    }
                     self.reject(&pending.original, error);
                     return Ok(());
                 }
@@ -668,6 +676,18 @@ impl Client {
                             self.sent.remove(id);
                         }
                         self.reply(&pending.original, json!({}));
+                    }
+                    "get_context_usage" => {
+                        if !self.compacting
+                            && self.usage.is_object()
+                            && let Some(rows) =
+                                crate::context_breakdown::claude_context_breakdown(data)
+                        {
+                            self.usage["breakdown"] = json!(rows);
+                            self.events.push(
+                                json!({"type":"context_usage","data":{"contextUsage":self.usage}}),
+                            );
+                        }
                     }
                     _ => self.reply(&pending.original, data.clone()),
                 }
@@ -749,6 +769,19 @@ impl Client {
                     self.model["contextWindow"] = json!(window);
                 }
                 self.publish_usage();
+                if !self.cancelling
+                    && error.is_none()
+                    && self.usage["tokens"].as_u64().is_some()
+                    && !self
+                        .pending
+                        .values()
+                        .any(|p| p.request["subtype"] == "get_context_usage")
+                {
+                    self.request(
+                        json!({"subtype":"get_context_usage","detail":"summary"}),
+                        json!({"type":"get_context_usage"}),
+                    );
+                }
                 self.running = record["queued_turn_count"].as_u64().unwrap_or(0) > 0;
                 if !self.running {
                     if let Some(error) = &error {
@@ -1466,7 +1499,18 @@ impl Client {
             .get("contextWindow")
             .cloned()
             .unwrap_or(Value::Null);
+        let preserved_breakdown = self
+            .usage
+            .get("breakdown")
+            .filter(|_| {
+                self.usage["contextWindow"] == window
+                    && tokens.is_some_and(|t| self.usage["tokens"].as_u64().is_some_and(|p| t >= p))
+            })
+            .cloned();
         self.usage = json!({"tokens":tokens,"contextWindow":window});
+        if let Some(breakdown) = preserved_breakdown {
+            self.usage["breakdown"] = breakdown;
+        }
         self.events
             .push(json!({"type":"context_usage","data":{"contextUsage":self.usage}}));
     }
@@ -2028,11 +2072,11 @@ fn run_mode(
             {
                 return Err("Claude stopped reading commands.".into());
             }
-            if client
+            let now = Instant::now();
+            client
                 .pending
-                .values()
-                .any(|p| Instant::now() >= p.deadline)
-            {
+                .retain(|_, p| !(p.request["subtype"] == "get_context_usage" && now >= p.deadline));
+            if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
             }
             for record in std::mem::take(&mut client.wire) {

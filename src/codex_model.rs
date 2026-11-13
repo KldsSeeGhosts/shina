@@ -32,6 +32,7 @@ impl Thread {
         if self.context.phase != crate::context::ContextPhase::Compacting {
             self.context.cancel_request();
             self.context.absorb(&record["data"]);
+            self.refresh_estimated_breakdown();
             self.native.stats = record["data"].clone();
         }
         true
