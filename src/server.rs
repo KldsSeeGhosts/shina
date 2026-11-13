@@ -731,6 +731,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut question_dismiss = false;
     let mut vcs_worktrees = false;
     let mut provider_handoff = false;
+    let mut workspace_search = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -836,6 +837,13 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if provider_handoff {
                             capabilities.push(protocol::PROVIDER_HANDOFF);
                         }
+                        workspace_search = minor >= u64::from(protocol::WORKSPACE_SEARCH_MINOR);
+                        if workspace_search {
+                            capabilities.push(protocol::WORKSPACE_SEARCH);
+                        }
+                        if minor >= u64::from(protocol::THREAD_TITLE_SEARCH_MINOR) {
+                            capabilities.push(protocol::THREAD_TITLE_SEARCH);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -926,6 +934,40 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         database.authorize(&device, "filesystem.browse", &json!({}))?;
                         serde_json::to_value(listing).map_err(|_| "Could not encode the folder listing.".into())
                     }).await.unwrap_or_else(|_| Err("Folder listing failed.".into()))
+                } else if method == "workspace.searchEntries" {
+                    if !workspace_search {
+                        Err("Update required. Update Shina on the client and server to search workspace entries.".into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        let cwd = args["cwd"].as_str().unwrap_or("").to_string();
+                        let query = args["query"].as_str().unwrap_or("")
+                            .chars().take(256).collect::<String>();
+                        let limit = args["limit"].as_u64().unwrap_or(80) as usize;
+                        let kind = args["kind"].as_str().map(str::to_owned);
+                        let image_only = args["imageOnly"] == true;
+                        let database = shared.database.clone();
+                        let device = device.clone();
+                        let snapshots = shared.snapshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            database.authorize(&device, "workspace.searchEntries", &json!({}))?;
+                            let roots: Vec<std::path::PathBuf> =
+                                snapshots.borrow()["state"]["index"]["projects"]
+                                    .as_array()
+                                    .map(|projects| projects.iter()
+                                        .filter_map(|project| project["path"].as_str())
+                                        .map(std::path::PathBuf::from)
+                                        .collect())
+                                    .unwrap_or_default();
+                            let cwd = crate::workspace_search::resolve_cwd(&cwd, &roots)?;
+                            let result = crate::workspace_search::search(
+                                &cwd, &query, limit, kind.as_deref(), image_only,
+                            );
+                            database.authorize(&device, "workspace.searchEntries", &json!({}))?;
+                            serde_json::to_value(result).map_err(|_| {
+                                "Could not encode the workspace search result.".into()
+                            })
+                        }).await.unwrap_or_else(|_| Err("Workspace search failed.".into()))
+                    }
                 } else if method == "project.writeFile" {
                     let args = params.get("args").unwrap_or(params);
                     match serde_json::from_value::<protocol::ProjectWriteFileInput>(args.clone()) {
@@ -1172,6 +1214,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     let snapshot = shared.snapshots.borrow().clone();
                     usage_limits_for_request(&snapshot, args)
                 } else if method == "threads.search" {
+                    let args = params.get("args").unwrap_or(params);
                     let index_threads = {
                         let current = shared.snapshots.borrow().clone();
                         if !current["state"].is_null() {
@@ -1183,13 +1226,72 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             shared.database.thread_search_index()
                         }
                     };
-                    index_threads.and_then(|threads| {
-                        shared
-                            .history_streams
-                            .lock()
-                            .expect("history streams")
-                            .search_threads(params, &threads)
-                    })
+                    if args["titlesOnly"] == true {
+                        // Optional `thread-title-search-v1` mode: title/branch rows for the
+                        // composer's `@` menu, matched as KSG's `scoreThreadSearch` matches.
+                        // Older clients never send it, so their `threads.search` is unchanged.
+                        let query = crate::thread_search::fold_search_query(
+                            args["query"].as_str().unwrap_or(""),
+                        );
+                        let limit = args["limit"].as_u64().unwrap_or(50).min(50) as usize;
+                        index_threads.map(|threads| {
+                            let now_ms = crate::lifecycle::now() as i64;
+                            let mut scored: Vec<(usize, f64)> = threads
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, record)| {
+                                    let id = record["id"].as_u64()? as usize;
+                                    let title = record["title"].as_str().unwrap_or("");
+                                    let branch = record["branch"].as_str().unwrap_or("");
+                                    let score = if query.is_empty() {
+                                        0.0
+                                    } else {
+                                        crate::thread_search::score_thread_search(
+                                            &query,
+                                            &crate::thread_search::MentionThread {
+                                                id,
+                                                title,
+                                                branch,
+                                                activity_at_ms: record["updated"]
+                                                    .as_u64()
+                                                    .map(|u| u as i64),
+                                            },
+                                            now_ms,
+                                            true,
+                                        )?
+                                        .score
+                                    };
+                                    Some((index, score))
+                                })
+                                .collect();
+                            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            let rows: Vec<Value> = scored
+                                .into_iter()
+                                .take(limit)
+                                .map(|(index, _)| {
+                                    let record = &threads[index];
+                                    json!({
+                                        "id": record["id"],
+                                        "title": record["title"],
+                                        "branch": record["branch"],
+                                        "project": record["project"],
+                                        "updated": record["updated"],
+                                        "archived": !record["lifecycle"]["archivedAt"].is_null(),
+                                        "parent": record["parent"],
+                                    })
+                                })
+                                .collect();
+                            json!({"matches": [], "threads": rows})
+                        })
+                    } else {
+                        index_threads.and_then(|threads| {
+                            shared
+                                .history_streams
+                                .lock()
+                                .expect("history streams")
+                                .search_threads(params, &threads)
+                        })
+                    }
                 } else {
                     if shared.remote && matches!(method, "devices.grant" | "devices.revokeGrant") {
                         if !send(&mut socket, protocol::response(id, Err("Change update grants on the target machine itself.".into()))).await { break; }
@@ -3036,15 +3138,17 @@ mod tests {
             );
             assert!(crate::client::supports_provider_handoff(&hello));
 
-            // Capability is absent one minor below, and the handoff flag is refused.
-            let older = Fixture::with_minor("handoff-older", protocol::MINOR - 1).await;
+            // Capability is absent one minor below its introduction, and the
+            // handoff flag is refused.
+            let older =
+                Fixture::with_minor("handoff-older", protocol::PROVIDER_HANDOFF_MINOR - 1).await;
             let older_link = older.link(&older.shared.directory.join("client")).await;
             let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
                 .await
                 .unwrap();
             assert_eq!(
                 older_hello["protocolMinor"].as_u64(),
-                Some(u64::from(protocol::MINOR - 1))
+                Some(u64::from(protocol::PROVIDER_HANDOFF_MINOR - 1))
             );
             assert!(!crate::client::supports_provider_handoff(&older_hello));
             let refusal = crate::client::remote_rpc(
@@ -3057,6 +3161,144 @@ mod tests {
                 refusal.unwrap_err(),
                 protocol::PROVIDER_HANDOFF_UPDATE_REQUIRED
             );
+        });
+    }
+
+    #[test]
+    fn workspace_search_entries_runs_in_a_project_and_needs_the_capability() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("workspace-search").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            // A scratch project tree; tests never touch the real home or repo.
+            let root = fixture.shared.directory.join("project");
+            std::fs::create_dir_all(root.join("src/nested")).unwrap();
+            std::fs::write(root.join("src/nested/deep.rs"), "fn deep() {}\n").unwrap();
+            std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+            std::fs::create_dir_all(root.join("ignored")).unwrap();
+            std::fs::write(root.join("ignored/secret.rs"), "fn secret() {}\n").unwrap();
+            let put = crate::client::remote_rpc(
+                &link,
+                "project.put",
+                json!({"path": root, "createFolder": false}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(put["status"], "accepted", "{put}");
+            let expected = crate::projects::normalize_path(&root);
+            wait_until(|| {
+                fixture.shared.snapshots.borrow()["state"]["index"]["projects"]
+                    .as_array()
+                    .is_some_and(|projects| projects.iter().any(|p| p["path"] == json!(expected)))
+            })
+            .await;
+
+            let found = crate::client::remote_rpc(
+                &link,
+                "workspace.searchEntries",
+                json!({"cwd": root, "query": "deep", "limit": 80}),
+            )
+            .await
+            .unwrap();
+            let entries = found["entries"].as_array().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["path"] == "src/nested/deep.rs" && entry["kind"] == "file"),
+                "{found}"
+            );
+            assert!(!found.to_string().contains("secret"));
+
+            let outside = crate::client::remote_rpc(
+                &link,
+                "workspace.searchEntries",
+                json!({"cwd": fixture.shared.directory, "query": "deep", "limit": 80}),
+            )
+            .await;
+            assert!(outside.is_err(), "{outside:?}");
+
+            // One minor below the gate the capability is absent and the request
+            // is refused, so older peers keep their previous behavior.
+            let older =
+                Fixture::with_minor("search-older", protocol::WORKSPACE_SEARCH_MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(
+                !hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cap| cap == protocol::WORKSPACE_SEARCH)
+            );
+            let refused = crate::client::remote_rpc(
+                &older_link,
+                "workspace.searchEntries",
+                json!({"cwd": "/", "query": "x", "limit": 80}),
+            )
+            .await;
+            assert!(refused.unwrap_err().contains("Update required"));
+        });
+    }
+
+    #[test]
+    fn threads_search_titles_only_returns_title_rows_for_the_mention_menu() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("title-search").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            let created = fixture
+                .local_command("thread.create", json!({"harness": "codex"}))
+                .await;
+            let whole = created["result"]["threadId"].as_u64().unwrap();
+            let second = fixture
+                .local_command(
+                    "thread.create",
+                    json!({"harness": "codex", "occupiedDrafts": [whole]}),
+                )
+                .await;
+            let mid_word = second["result"]["threadId"].as_u64().unwrap();
+            fixture
+                .local_command(
+                    "thread.rename",
+                    json!({"threadId": whole, "title": "Fix model picker"}),
+                )
+                .await;
+            fixture
+                .local_command(
+                    "thread.rename",
+                    json!({"threadId": mid_word, "title": "Remodel the settings page"}),
+                )
+                .await;
+            wait_until(|| {
+                fixture.shared.snapshots.borrow()["state"]["index"]["threads"]
+                    .as_array()
+                    .is_some_and(|threads| {
+                        threads.iter().any(|t| t["title"] == "Fix model picker")
+                            && threads
+                                .iter()
+                                .any(|t| t["title"] == "Remodel the settings page")
+                    })
+            })
+            .await;
+
+            let out = crate::client::remote_rpc(
+                &link,
+                "threads.search",
+                json!({"query": "model", "limit": 50, "titlesOnly": true}),
+            )
+            .await
+            .unwrap();
+            let rows = out["threads"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{out}");
+            // KSG's ordering: the whole-word "model" hit outranks "Remodel".
+            assert_eq!(rows[0]["id"].as_u64().unwrap(), whole);
+            assert_eq!(rows[1]["id"].as_u64().unwrap(), mid_word);
+            assert_eq!(rows[0]["title"], "Fix model picker");
+            assert_eq!(out["matches"], json!([]));
         });
     }
 

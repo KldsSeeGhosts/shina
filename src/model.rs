@@ -4061,7 +4061,6 @@ pub struct State {
     recovered_inputs: std::collections::BTreeMap<usize, Value>,
     pub background: background::Background,
     pub attachment_uploads: crate::attachment_uploads::Queue,
-    pub composer_sources: crate::composer_sources::Sources,
     pub data_dir: PathBuf,
     /// The open thread's id and whether it was a draft with content when it was opened. Like
     /// T3 Code's frozen draft row, the open draft's sidebar row neither pops in while typing nor
@@ -4215,6 +4214,7 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub mention_search: crate::ui::composer_menu::MentionSearch,
     pub pending_open_urls: Vec<String>,
     pub next_usage_limits_request_id: u64,
     pub pending_usage_limits_request: Option<(u64, String, usize, String)>,
@@ -4376,7 +4376,6 @@ impl State {
             plan_save_last_path: None,
             next_plan_save_request_id: 0,
             opened_draft: None,
-            composer_sources: crate::composer_sources::Sources::default(),
             assistant_selection: None,
             citation_highlight: None,
             snooze_menu: None,
@@ -4466,6 +4465,7 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            mention_search: crate::ui::composer_menu::MentionSearch::default(),
             pending_open_urls: Vec::new(),
             next_usage_limits_request_id: 0,
             pending_usage_limits_request: None,
@@ -14228,8 +14228,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }) {
         tx.wake_after(Duration::from_millis(30));
     }
-    let composer_changed = state.composer_sources.take_changed()
-        | (!state.headless && crate::ui::composer_ui::tick(state, now, tx));
+    let composer_changed = !state.headless && crate::ui::composer_ui::tick(state, now, tx);
     let mut html_changed = false;
     while let Some(outcome) = state.html_windows.next() {
         html_changed = true;
@@ -14259,6 +14258,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | state.poll_settings()
         | state.poll_thread_find(tx)
         | state.poll_sidebar_search(tx)
+        | crate::ui::composer_menu::poll_mention_search(state, tx)
         | html_changed
         | attachment_changed
         | keybindings_changed;

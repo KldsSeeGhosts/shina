@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 23;
+pub const MINOR: u32 = 24;
 pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
 pub const VCS_WORKTREES_MINOR: u32 = 20;
 pub const DRAFT_ROUTING_MINOR: u32 = 22;
 pub const PROVIDER_HANDOFF_MINOR: u32 = 23;
+pub const WORKSPACE_SEARCH_MINOR: u32 = 24;
+pub const WORKSPACE_SEARCH: &str = "workspace-search-v1";
+pub const THREAD_TITLE_SEARCH_MINOR: u32 = 24;
+pub const THREAD_TITLE_SEARCH: &str = "thread-title-search-v1";
 pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
 pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use branches and worktrees.";
@@ -193,6 +197,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "blobs.read"
         | "filesystem.browse"
         | "usage.limits"
+        | "workspace.searchEntries"
         | "vcs.listBranches"
         | "vcs.status"
         | "vcs.listWorktrees" => "read",
@@ -655,6 +660,7 @@ mod tests {
                 | "blobs.read"
                 | "filesystem.browse"
                 | "usage.limits"
+                | "workspace.searchEntries"
                 | "vcs.listBranches"
                 | "vcs.status"
                 | "vcs.listWorktrees" => "read",
