@@ -102,18 +102,6 @@ fn ordinary(
 }
 
 /// Ported from KSG Code's ChatMarkdown and chat/MarkdownCodeBlock.
-pub(super) fn render(
-    source: &str,
-    p: Palette,
-    dark: bool,
-    wide: bool,
-    user: bool,
-    streaming: bool,
-    identity: &str,
-) -> El {
-    render_with_find(source, p, dark, wide, user, streaming, identity, None)
-}
-
 pub(super) fn render_with_find(
     source: &str,
     p: Palette,

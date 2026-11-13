@@ -752,6 +752,9 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    s.timeline_positions
+        .borrow_mut()
+        .open(&s.machines.selected, s.current().id, cx);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -8660,7 +8663,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let title = match (
+        let work_failed = t
+            .deferred_work
+            .iter()
+            .any(|marker| marker["start"] == start && marker["error"].is_string());
+        let work_loading = expanded
+            && t.deferred_work
+                .iter()
+                .any(|marker| marker["start"] == start && !marker["error"].is_string());
+        let mut title = match (
             work.is_some_and(|work| work.stopped),
             work.and_then(|work| work.elapsed),
         ) {
@@ -8669,6 +8680,9 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
             (false, None) => "Worked".into(),
         };
+        if work_failed {
+            title.push_str(" · Couldn't load work. Click to retry.");
+        }
         let toggle_key = format!("toggle-work-{}-{start}", t.id);
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
@@ -8695,6 +8709,17 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         .as_deref()
                         .and_then(|id| t.messages.iter().position(|m| m.id == id))
                         .unwrap_or(start);
+                    let retry = t
+                        .work
+                        .iter()
+                        .any(|work| work.start == current_start && work.expanded)
+                        && t.deferred_work.iter().any(|marker| {
+                            marker["start"] == current_start && marker["error"].is_string()
+                        });
+                    if retry {
+                        s.load_deferred_work(current_start, true);
+                        return;
+                    }
                     match t.work.iter_mut().find(|work| work.start == current_start) {
                         Some(work) => work.expanded = !work.expanded,
                         // Turns from before work records existed fold too; opening one
@@ -8705,16 +8730,61 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                             stopped_order: 0,
                             expanded: true,
                             elapsed: None,
+                            outcome: None,
                         }),
+                    }
+                    if s.current()
+                        .work
+                        .iter()
+                        .any(|work| work.start == current_start && work.expanded)
+                    {
+                        s.load_deferred_work(current_start, false);
                     }
                 }),
             );
         if expanded {
+            let restored_id = t.messages.get(start).map(|message| message.id.clone());
+            section = section.on_layout_tx(move |s: &mut State, _, tx| {
+                if let Some(start) = restored_id.as_ref().and_then(|id| {
+                    s.current()
+                        .messages
+                        .iter()
+                        .position(|message| &message.id == id)
+                }) {
+                    s.load_deferred_work(start, false);
+                }
+                tx.live_only();
+            });
             // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
-            section = section.child(work_rows(
-                col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
-                true,
-            ));
+            if work_loading {
+                let mut skeleton = col()
+                    .key(format!("work-loading-{}-{start}", t.id))
+                    .role("status")
+                    .label("Loading work history")
+                    .pt(12.0)
+                    .pb(4.0)
+                    .px(4.0)
+                    .gap(8.0);
+                for fraction in [0.4, 0.6, 1.0 / 3.0] {
+                    skeleton = skeleton.child(
+                        row()
+                            .gap(8.0)
+                            .center_y()
+                            .child(el().size(12.0, 12.0).fill(p.selected))
+                            .child(
+                                el().w((lane_width(s.viewport_width, wide) * fraction).max(20.0))
+                                    .h(10.0)
+                                    .fill(p.selected),
+                            ),
+                    );
+                }
+                section = section.child(skeleton);
+            } else if !work_failed {
+                section = section.child(work_rows(
+                    col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+                    true,
+                ));
+            }
         }
         response = response.child(section);
         if let Some(last) = last_work {
@@ -9154,6 +9224,7 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
 /// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
+    let visit = s.timeline_positions.borrow().visit();
     let gutter = lane_gutter(pane_width);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
@@ -9205,6 +9276,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let rows = std::rc::Rc::new(build_timeline_rows(t));
     let key_rows = rows.clone();
     let build_rows = rows.clone();
+    let row_visit = visit.clone();
     let lane = col()
         .key("chat-lane")
         .on_layout_tx(|s: &mut State, rect, tx| {
@@ -9222,31 +9294,59 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             rows.len(),
             90.0,
             move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
-            move |s: &State, index| match &build_rows[index] {
-                TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
-                TimelineRow::Boundary { message_index, .. } => {
-                    work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
-                }
-                TimelineRow::UserOrSystem {
-                    index: msg_idx,
-                    message_id,
-                    ..
-                } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
-                TimelineRow::AssistantTurn { start, end, .. } => {
-                    assistant_turn(s, p, wide, *start, *end)
-                }
-                TimelineRow::LiveTurn { start, .. } => assistant_turn(s, p, wide, *start, *start),
+            move |s: &State, index| {
+                let row = match &build_rows[index] {
+                    TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
+                    TimelineRow::Boundary { message_index, .. } => {
+                        work_ui::boundary_events(s, p, wide, *message_index).unwrap_or_else(el)
+                    }
+                    TimelineRow::UserOrSystem {
+                        index: msg_idx,
+                        message_id,
+                        ..
+                    } => build_user_or_system_row(s, p, wide, pane_width, *msg_idx, message_id),
+                    TimelineRow::AssistantTurn { start, end, .. } => {
+                        assistant_turn(s, p, wide, *start, *end)
+                    }
+                    TimelineRow::LiveTurn { start, .. } => {
+                        assistant_turn(s, p, wide, *start, *start)
+                    }
+                };
+                row_visit.row(build_rows[index].key());
+                row
             },
         );
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
+    let layout_visit = visit.clone();
+    let restore_rows = rows.clone();
     let scroller = col()
         .key(format!("conversation-{thread_id}"))
         .animated_changes()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom })
+        .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
+        .on_layout_tx(move |_: &mut State, _, tx| {
+            if layout_visit
+                .opened
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tx.live_only();
+                return;
+            }
+            if let Some(position) = layout_visit.restore.lock().unwrap().take() {
+                if position.at_end {
+                    tx.scroll_to_bottom_instant(format!("conversation-{thread_id}"));
+                } else if restore_rows.iter().any(|row| row.key() == position.row) {
+                    tx.scroll_into_view_in(format!("conversation-{thread_id}"), &position.row);
+                    tx.scroll_key_to(&position.row, -position.offset);
+                } else {
+                    tx.scroll_to_y(format!("conversation-{thread_id}"), position.scroll);
+                }
+            }
+        })
         .on_far_from_bottom(40.0, move |s: &mut State, far| {
             s.set_timeline_far_from_bottom(thread_id, far);
         })
@@ -9274,7 +9374,13 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .key(format!("conversation-wrap-{thread_id}"))
         .grow(1.0)
         .min_h(0.0)
-        .child(scroller);
+        .child(
+            col()
+                .key(format!("timeline-server-{}", s.machines.selected))
+                .grow(1.0)
+                .min_h(0.0)
+                .child(scroller),
+        );
 
     if s.timeline_is_far_from_bottom(thread_id) && !find_open {
         let pill = framed(
@@ -14516,6 +14622,120 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn timeline_positions_do_not_alias_equal_thread_ids_on_different_servers() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            for index in 0..80 {
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: format!("scope-{index}"),
+                    role: "You",
+                    text: format!("Prompt {index}. {}", "Some wrapping prose. ".repeat(12)),
+                    images: vec![],
+                });
+            }
+            rt.frame(0.0);
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-scope-35"));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let original = rt.presented("row-1-scope-35").unwrap().0[1];
+            rt.update(|s, _| s.machines.selected = "other-server".into());
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                rt.presented("row-1-scope-79").is_some(),
+                "{width}: unseen server opens at end"
+            );
+            rt.update(|s, _| s.machines.selected = "local".into());
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let restored = rt
+                .presented("row-1-scope-35")
+                .expect("local anchor restored")
+                .0[1];
+            assert!(
+                (restored - original).abs() <= 1.0,
+                "{width}: {original} != {restored}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_switch_restores_first_visible_timeline_row_and_offset() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            for turn in 0..80 {
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: format!("remember-{turn}"),
+                    role: "You",
+                    text: format!("Question {turn}. {}", "Wrapping prose. ".repeat(12)),
+                    images: vec![],
+                });
+            }
+            rt.frame(0.0);
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-remember-35"));
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            let first = rt
+                .elements()
+                .into_iter()
+                .filter_map(|e| {
+                    let key = e.key?;
+                    if !key.starts_with("row-1-remember-") {
+                        return None;
+                    }
+                    let rect = rt.presented(&key)?.0;
+                    (rect[1] + rect[3] > viewport[1] && rect[1] < viewport[1] + viewport[3])
+                        .then_some((key, rect))
+                })
+                .min_by(|a, b| a.1[1].total_cmp(&b.1[1]))
+                .unwrap();
+            let original = rt.state.active;
+            rt.update(|s, _| s.new_thread());
+            rt.frame(1.0);
+            rt.update(|s, _| s.active = original);
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            let restored = rt.presented(&first.0).expect("remembered row mounted").0;
+            assert!(
+                (restored[1] - first.1[1]).abs() <= 1.0,
+                "{width}: {} moved from {} to {}",
+                first.0,
+                first.1[1],
+                restored[1]
+            );
+            // Following the end is remembered as following, not as a fixed old row.
+            rt.update(|_, tx| tx.scroll_to_bottom_instant("conversation-1"));
+            rt.frame(1.0);
+            let other = rt.state.threads.iter().position(|t| t.id != 1).unwrap();
+            rt.update(|s, _| s.select_thread(other));
+            rt.frame(1.0);
+            rt.state.threads[original]
+                .messages
+                .push(crate::model::Message {
+                    id: "new-end".into(),
+                    role: "You",
+                    text: "Arrived while away.".into(),
+                    images: vec![],
+                });
+            rt.update(|s, _| s.select_thread(original));
+            for _ in 0..120 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                rt.presented("row-1-new-end").is_some(),
+                "{width}: follow end restored"
+            );
+        }
+    }
+
+    #[test]
     fn virtualised_timeline_mounts_only_viewport_window_and_overscan_for_long_threads() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -14630,6 +14850,7 @@ pub(crate) mod tests {
                             stopped_order: 0,
                             expanded: false,
                             elapsed: Some(3),
+                            outcome: Some(Status::Completed),
                         });
                     }
                 }

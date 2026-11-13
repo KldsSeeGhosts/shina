@@ -21,6 +21,7 @@ pub(crate) struct ProjectionCache {
     pub(crate) notices: VecDeque<String>,
     retries: HashMap<u64, Retry>,
     update_required: bool,
+    deferred_work: bool,
 }
 
 #[derive(Default)]
@@ -40,6 +41,8 @@ struct View {
     load_requested: bool,
     through_entry_id: Option<String>,
     ready: bool,
+    work_requests: VecDeque<String>,
+    work_errors: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -61,6 +64,7 @@ struct History {
     waiting: bool,
     pending: Vec<Value>,
     pending_bytes: usize,
+    work_anchor: Option<String>,
 }
 
 impl ProjectionCache {
@@ -69,6 +73,14 @@ impl ProjectionCache {
         self.subscribed = None;
         self.snapshot_pages.clear();
         self.stream_pages.clear();
+        let deferred = hello["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::DEFERRED_WORK));
+        if self.deferred_work && !deferred {
+            // An older build must re-send inline history, not inherit unresolved work anchors.
+            self.views.clear();
+        }
+        self.deferred_work = deferred;
         if !hello["capabilities"]
             .as_array()
             .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::HISTORY_ITEMS))
@@ -129,6 +141,28 @@ impl ProjectionCache {
         self.dirty = true;
     }
 
+    pub(crate) fn request_work(&mut self, thread: u64, anchor: String) {
+        if !self.deferred_work {
+            return;
+        }
+        let Some(view) = self.views.get_mut(&thread) else {
+            return;
+        };
+        if !view
+            .rows
+            .get(&anchor)
+            .is_some_and(|(_, row)| row.item["deferredWork"].is_object())
+            || view.work_requests.contains(&anchor)
+        {
+            return;
+        }
+        view.work_errors.remove(&anchor);
+        view.work_requests.push_back(anchor);
+        if let Err(error) = self.install(thread) {
+            self.failed(thread, &error, false);
+        }
+    }
+
     fn install(&mut self, thread: u64) -> Result<(), String> {
         let Some(view) = self.views.get(&thread).filter(|view| view.ready) else {
             return Ok(());
@@ -165,6 +199,24 @@ impl ProjectionCache {
                 Some(server_ord)
             }
         };
+        let deferred: Vec<Value> = rows
+            .iter()
+            .filter_map(|row| {
+                let mut marker = row
+                    .item
+                    .get("deferredWork")
+                    .filter(|marker| marker.is_object())?
+                    .clone();
+                marker["sourceItemId"] = json!(row.source_item_id);
+                marker["start"] = json!(remap_msg(marker["start"].as_u64()? as usize)?);
+                marker["loading"] = json!(view.work_requests.contains(&row.source_item_id));
+                marker["error"] = json!(view.work_errors.get(&row.source_item_id));
+                Some(marker)
+            })
+            .collect();
+        if self.deferred_work {
+            history["deferredWork"] = json!(deferred);
+        }
         for field in protocol::HISTORY_FIELDS {
             if history.get(field).is_none() {
                 history[field] = json!([]);
@@ -277,7 +329,7 @@ impl ProjectionCache {
             for event in item["events"].as_array().ok_or("Invalid thread events.")? {
                 match event["type"].as_str() {
                     Some("item.updated") => {
-                        let row: Row = serde_json::from_value(event["row"].clone())
+                        let mut row: Row = serde_json::from_value(event["row"].clone())
                             .map_err(|e| e.to_string())?;
                         if row.source_thread_id != thread {
                             return Err("Cross-thread live item.".into());
@@ -295,6 +347,12 @@ impl ProjectionCache {
                                 .is_some_and(|seq| *seq > sequence)
                         {
                             continue;
+                        }
+                        if let Some((_, previous)) = view.rows.get(&row.source_item_id)
+                            && let Some(marker) = previous.item.get("deferredWork")
+                            && row.item.get("deferredWork").is_none()
+                        {
+                            row.item["deferredWork"] = marker.clone();
                         }
                         view.removed.remove(&row.source_item_id);
                         view.rows
@@ -340,6 +398,7 @@ impl ProjectionCache {
         page: Value,
         snapshot: bool,
         epoch: &str,
+        work_anchor: Option<&str>,
     ) -> Result<(), String> {
         if page["threadId"] != thread {
             return Err("Cross-thread history page.".into());
@@ -397,6 +456,21 @@ impl ProjectionCache {
                 .as_str()
                 .ok_or("Invalid history revision.")?
                 .into();
+        }
+        if let Some(anchor) = work_anchor {
+            let next = page["nextCursor"].as_str();
+            if let Some((_, row)) = view.rows.get_mut(anchor) {
+                if let Some(next) = next {
+                    row.item["deferredWork"]["cursor"] = json!(next);
+                } else {
+                    row.item.as_object_mut().unwrap().remove("deferredWork");
+                }
+            }
+            if next.is_none() {
+                view.work_requests.retain(|request| request != anchor);
+            }
+            view.expanded = true;
+            return self.install(thread);
         }
         view.cursor = page["nextCursor"].as_str().map(str::to_owned);
         view.has_more = page["hasMoreHistory"]
@@ -522,6 +596,14 @@ impl ProjectionCache {
                     let message = value["error"]["message"]
                         .as_str()
                         .unwrap_or("History read failed.");
+                    if let Some(anchor) = &walk.work_anchor {
+                        if let Some(view) = self.views.get_mut(&walk.thread) {
+                            view.work_requests.retain(|request| request != anchor);
+                            view.work_errors.insert(anchor.clone(), message.into());
+                        }
+                        self.install(walk.thread)?;
+                        return Ok(());
+                    }
                     if code == Some(protocol::HISTORY_UPDATE_REQUIRED_CODE) {
                         self.update_required = true;
                     }
@@ -566,12 +648,41 @@ impl ProjectionCache {
                 }
                 walk.fragment = result["nextFragment"].clone();
                 if walk.fragment.is_null() {
-                    let page = serde_json::from_str(&walk.text).map_err(|e| e.to_string())?;
+                    let page: Value =
+                        serde_json::from_str(&walk.text).map_err(|e| e.to_string())?;
+                    if let Some(anchor) = &walk.work_anchor {
+                        let cursor = self
+                            .views
+                            .get(&walk.thread)
+                            .and_then(|view| view.rows.get(anchor))
+                            .and_then(|(_, row)| row.item["deferredWork"]["cursor"].as_str());
+                        if cursor != walk.cursor.as_deref() {
+                            if let Some(view) = self.views.get_mut(&walk.thread) {
+                                view.work_requests.retain(|request| request != anchor);
+                                view.work_errors.insert(
+                                    anchor.clone(),
+                                    "Work history changed. Retry loading it.".into(),
+                                );
+                            }
+                            self.install(walk.thread)?;
+                            return Ok(());
+                        }
+                        if page["nextCursor"].as_str() == walk.cursor.as_deref() {
+                            if let Some(view) = self.views.get_mut(&walk.thread) {
+                                view.work_requests.retain(|request| request != anchor);
+                                view.work_errors
+                                    .insert(anchor.clone(), "Work history did not advance.".into());
+                            }
+                            self.install(walk.thread)?;
+                            return Ok(());
+                        }
+                    }
                     self.merge_page(
                         walk.thread,
                         page,
                         walk.snapshot,
                         walk.cursor.as_deref().unwrap_or(""),
+                        walk.work_anchor.as_deref(),
                     )?;
                     if walk.snapshot {
                         self.subscribed = Some(walk.thread);
@@ -619,11 +730,32 @@ impl ProjectionCache {
                 return None;
             }
             let subscribe = self.subscribed != Some(thread);
+            if let Some(view) = self.views.get_mut(&thread) {
+                view.work_requests.retain(|anchor| {
+                    view.rows
+                        .get(anchor)
+                        .is_some_and(|(_, row)| row.item["deferredWork"].is_object())
+                });
+            }
             let view = self.views.get(&thread);
-            let cursor = view.and_then(|view| view.cursor.clone());
+            let work_anchor = if !subscribe {
+                view.and_then(|view| view.work_requests.front().cloned())
+            } else {
+                None
+            };
+            let cursor = if let Some(anchor) = &work_anchor {
+                view.and_then(|view| view.rows.get(anchor))
+                    .and_then(|(_, row)| {
+                        row.item["deferredWork"]["cursor"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+            } else {
+                view.and_then(|view| view.cursor.clone())
+            };
             let want_earlier =
                 view.is_some_and(|view| view.load_requested && view.cursor.is_some());
-            if !subscribe && !want_earlier {
+            if !subscribe && !want_earlier && work_anchor.is_none() {
                 return None;
             }
             let through_entry_id = view.and_then(|view| view.through_entry_id.clone());
@@ -638,6 +770,7 @@ impl ProjectionCache {
                 waiting: false,
                 pending: Vec::new(),
                 pending_bytes: 0,
+                work_anchor,
             });
         }
         let walk = self.inflight.as_mut()?;
@@ -661,6 +794,9 @@ impl ProjectionCache {
                 params["fragmentCursor"] = walk.fragment.clone();
             } else if let Some(cursor) = &walk.cursor {
                 params["historyCursor"] = json!(cursor);
+                if let Some(anchor) = &walk.work_anchor {
+                    params["workAnchorId"] = json!(anchor);
+                }
                 if let Some(through) = &walk.through_entry_id {
                     params["throughEntryId"] = json!(through);
                 }
@@ -703,6 +839,8 @@ impl ProjectionCache {
                         "loading": view.loading,
                         "error": view.error,
                         "expanded": view.expanded,
+                        "deferredWork":self.histories.get(&id).map(|(_, history, _)| &history["deferredWork"]),
+                        "workLoading": if self.deferred_work { "deferred" } else { "inline-legacy" },
                     });
                 }
                 if let Some(retry) = self.retries.get(&id) {

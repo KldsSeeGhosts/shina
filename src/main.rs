@@ -23,6 +23,7 @@ mod descriptors;
 mod fleet_update;
 mod harness;
 mod history;
+mod history_work;
 mod horizon;
 mod html_fallback;
 #[cfg(any(target_os = "macos", windows, test))]
@@ -56,6 +57,7 @@ mod shell_env;
 mod store;
 mod thread_find;
 mod thread_search;
+mod timeline_position;
 mod tray;
 mod ui;
 mod update;

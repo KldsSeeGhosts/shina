@@ -16,7 +16,7 @@ pub const REPLAY_EVENTS: usize = 128;
 pub const REPLAY_BYTES: usize = 1024 * 1024;
 const RETAIN_EVENTS: usize = 1024;
 const RETAIN_BYTES: usize = 4 * 1024 * 1024;
-const PAGE_ITEMS: usize = 75;
+pub(crate) const PAGE_ITEMS: usize = 75;
 const PAGE_USER_TURNS_INITIAL: usize = 10;
 const PAGE_USER_TURNS_OLDER: usize = 20;
 const PAGE_TURN_ITEMS: usize = 500;
@@ -35,7 +35,10 @@ fn is_user_turn_row(row: &Row) -> bool {
     row.field == "messages" && matches!(row.item["role"].as_str(), Some("You" | "user"))
 }
 
-fn timeline_sort_key(row: &Row, total_messages: usize) -> (usize, u8, u64, usize, usize) {
+pub(crate) fn timeline_sort_key(
+    row: &Row,
+    total_messages: usize,
+) -> (usize, u8, u64, usize, usize) {
     match row.field.as_str() {
         "work" => (
             row.item["start"].as_u64().map(|m| m as usize).unwrap_or(0),
@@ -591,9 +594,18 @@ impl Streams {
         let mut msg_rows: Vec<&Row> = projection
             .rows
             .iter()
-            .filter(|row| row.field == "messages")
+            .filter(|row| {
+                row.field == "messages"
+                    || (row.field == "tools"
+                        && crate::thread_find::proposed_plan_markdown(&row.item).is_some())
+            })
             .collect();
-        msg_rows.sort_by_key(|row| (row.ordinal, row.position));
+        let total_messages = projection
+            .rows
+            .iter()
+            .filter(|row| row.field == "messages")
+            .count();
+        msg_rows.sort_by_key(|row| timeline_sort_key(row, total_messages));
 
         let docs_owned: Vec<(String, &str, String)> = msg_rows
             .into_iter()
@@ -602,6 +614,15 @@ impl Streams {
                     .as_str()
                     .unwrap_or(&row.source_item_id)
                     .to_owned();
+                if row.field == "tools" {
+                    return (
+                        entry_id,
+                        "plan",
+                        crate::thread_find::proposed_plan_markdown(&row.item)
+                            .unwrap()
+                            .to_owned(),
+                    );
+                }
                 let role = row.item["role"].as_str().unwrap_or("Pi");
                 let raw = row.item["text"].as_str().unwrap_or("");
                 let text = if role == "Shina" {
@@ -756,17 +777,31 @@ impl Streams {
 
     /// Ported from KSG ProjectionStore.getThreadHistoryPage and threadHistoryPaging.
     /// Page backwards by source identity. A content revision never invalidates the anchor.
+    #[cfg(test)]
     pub fn page(&self, thread: u64, cursor: Option<&str>, budget: usize) -> Result<Value, String> {
         self.page_with_target(thread, cursor, budget, None)
     }
 
     /// Ported from KSG ProjectionStore.getThreadHistoryPage and olderHistoryPagePolicy.
+    #[cfg(test)]
     pub fn page_with_target(
         &self,
         thread: u64,
         cursor: Option<&str>,
         budget: usize,
         through_entry_id: Option<&str>,
+    ) -> Result<Value, String> {
+        self.page_with_work(thread, cursor, budget, through_entry_id, false, None)
+    }
+
+    pub fn page_with_work(
+        &self,
+        thread: u64,
+        cursor: Option<&str>,
+        budget: usize,
+        through_entry_id: Option<&str>,
+        deferred: bool,
+        work_anchor: Option<&str>,
     ) -> Result<Value, String> {
         let projection = self.threads.get(&thread).ok_or("Unknown thread.")?;
         let total_messages = projection
@@ -780,6 +815,29 @@ impl Streams {
             .filter(|row| is_timeline_field(&row.field))
             .collect();
         timeline.sort_by_key(|row| timeline_sort_key(row, total_messages));
+        if let Some(anchor) = work_anchor {
+            if !deferred {
+                return Err("Update required to load deferred work.".into());
+            }
+            let mut page = crate::history_work::page(
+                &timeline,
+                anchor,
+                cursor.ok_or("Work history cursor is required.")?,
+                projection.sequence,
+                budget,
+            )?;
+            page["threadId"] = json!(thread);
+            page["snapshotSequence"] = json!(projection.sequence);
+            page["historyRevision"] = json!(projection.revision);
+            page["fields"] = projection.fields.clone();
+            return Ok(page);
+        }
+        let deferred_rows = deferred.then(|| crate::history_work::deferred(&timeline));
+        let timeline: Vec<&Row> = if let Some(rows) = &deferred_rows {
+            rows.iter().map(std::borrow::Cow::as_ref).collect()
+        } else {
+            timeline.clone()
+        };
         let control: Vec<&Row> = projection
             .rows
             .iter()
@@ -830,7 +888,7 @@ impl Streams {
                 .iter()
                 .filter(|row| is_user_turn_row(row))
                 .count();
-            let extra = usize::from(!is_user_turn_row(timeline[target_index]));
+            let extra = usize::from(!is_user_turn_row(&timeline[target_index]));
             (
                 (PAGE_USER_TURNS_OLDER * 2).min(PAGE_USER_TURNS_OLDER.max(turns_between + extra)),
                 PAGE_ITEMS * 2,
@@ -1086,6 +1144,45 @@ mod tests {
     fn snapshot(seq: u64, messages: Value) -> Value {
         json!({"seq":seq,"state":{"threads":[{"id":1,"messages":messages,"stats":{}}]}})
     }
+    #[test]
+    fn find_indexes_proposed_plans_in_timeline_order_but_not_todos_or_tool_output() {
+        let mut data = snapshot(
+            1,
+            json!([
+                {"id":"u","role":"You","text":"needle prompt"},
+                {"id":"a","role":"Pi","text":"needle answer"}
+            ]),
+        );
+        data["state"]["threads"][0]["tools"] = json!([
+            {"id":"plan","name":"plan","kind":"plan","input":{"markdown":"# Needle plan\n\n## Summary\n\nUse **needle** here."},
+                "anchor":{"message":1,"offset":0},"order":1},
+            {"id":"todo","name":"plan","kind":"plan","input":{"steps":[{"text":"needle todo"}]},
+                "anchor":{"message":1,"offset":0},"order":2},
+            {"id":"read","name":"read","output":"needle tool output",
+                "anchor":{"message":1,"offset":0},"order":3}
+        ]);
+        let streams = Streams::new(&data);
+        let find = streams.find_thread(1, &json!({"query":"needle"})).unwrap();
+        assert_eq!(find["totalMatches"], 4, "{find}");
+        let next = streams
+            .find_thread(1, &json!({"query":"needle","index":1}))
+            .unwrap();
+        assert_eq!(next["match"]["entryId"], "plan");
+        assert_eq!(next["match"]["occurrence"], 0);
+        let next = streams
+            .find_thread(1, &json!({"query":"needle","index":2}))
+            .unwrap();
+        assert_eq!(next["match"]["entryId"], "plan");
+        assert_eq!(next["match"]["occurrence"], 1);
+        let summary = streams.find_thread(1, &json!({"query":"Summary"})).unwrap();
+        assert_eq!(summary["totalMatches"], 0);
+        // ThreadSearch.ts indexes messages only, not proposed_plan or todo_list.
+        let hits = streams
+            .search_threads(&json!({"query":"Use needle"}), &[json!({"id":1})])
+            .unwrap();
+        assert!(hits["matches"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn fragments_survive_changes_expire_evict_and_reject_cross_thread() {
         let mut leases = Fragments::default();

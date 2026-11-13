@@ -360,7 +360,7 @@ impl ThreadView {
                         .find(|old| old_messages.get(old.start).map(|m| m.id.as_str()) == Some(id))
                 })
                 .or_else(|| thread.work.iter().find(|old| old.start == item.start));
-            item.expanded = matched.is_none_or(|old| old.expanded);
+            item.expanded = matched.is_some_and(|old| old.expanded);
         }
         thread.work = work;
         thread.harness_state = self.harness_state;
@@ -692,6 +692,11 @@ impl State {
                     thread.resumable_run_id = thread.run_id.clone();
                     thread.native.queue_held = true;
                     thread.status = Status::Failed;
+                    for work in &mut thread.work {
+                        if work.outcome == Some(Status::Running) {
+                            work.outcome = Some(Status::Failed);
+                        }
+                    }
                     thread.configuring = false;
                     thread.request = None;
                     thread.started = None;
@@ -1555,6 +1560,9 @@ impl State {
                     thread.history_has_more = meta["hasMoreHistory"] == true;
                     thread.history_loading = meta["loading"] == true;
                     thread.history_error = meta["error"].as_str().map(str::to_owned);
+                    thread.deferred_work =
+                        meta["deferredWork"].as_array().cloned().unwrap_or_default();
+                    thread.deferred_work_supported = meta["workLoading"] == "deferred";
                 }
             }
         }
@@ -1693,6 +1701,32 @@ impl State {
                 client.load_earlier_history(thread_id, through_entry_id);
             } else if let Some(linked) = client.linked.get(&self.machines.selected) {
                 linked.load_earlier_history(thread_id, through_entry_id);
+            }
+        }
+    }
+    pub fn load_deferred_work(&mut self, start: usize, retry: bool) {
+        let Some(client) = &self.client else { return };
+        let target = if self.machines.selected == "local" {
+            Some(client)
+        } else {
+            client.linked.get(&self.machines.selected)
+        };
+        let Some(target) = target else { return };
+        if !target.has_capability(crate::protocol::DEFERRED_WORK) {
+            return;
+        }
+        let thread = &mut self.threads[self.active];
+        for marker in &mut thread.deferred_work {
+            if marker["start"] != start
+                || marker["loading"] == true
+                || (!retry && !marker["error"].is_null())
+            {
+                continue;
+            }
+            if let Some(anchor) = marker["sourceItemId"].as_str().map(str::to_owned) {
+                marker["loading"] = json!(true);
+                marker["error"] = Value::Null;
+                target.load_work_history(thread.id, anchor);
             }
         }
     }

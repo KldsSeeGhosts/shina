@@ -612,12 +612,50 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
     let tool = &t.tools[index];
     let id = format!("{}-{index}", t.id);
     let plan = crate::work::plan_data(&tool.input);
+    let displayed = plan["markdown"]
+        .as_str()
+        .map(crate::thread_find::plan_parts);
+    let query = (s.thread_find_active() && !s.thread_find.query.text.trim().is_empty())
+        .then(|| s.thread_find.query.text.trim());
+    let active_occ = query.and_then(|_| {
+        s.thread_find
+            .active_match
+            .as_ref()
+            .filter(|matched| matched.entry_id == tool.id)
+            .map(|matched| matched.occurrence)
+    });
+    let title = displayed
+        .as_ref()
+        .map_or("Plan", |(title, _)| title.as_str());
+    let mut title_label = label(title, TextStyle::new(14.0, 600.0), p.ink).wrap_anywhere();
+    let title_hits = query
+        .map(|query| crate::thread_find::find_plain_occurrences(title, query))
+        .unwrap_or_default();
+    let title_count = title_hits.len();
+    if !title_hits.is_empty() {
+        title_label =
+            title_label.text_highlights(title_hits.into_iter().enumerate().map(|(i, range)| {
+                let active = Some(i) == active_occ;
+                let mut highlight = rune::TextHighlight::new(
+                    range,
+                    if active {
+                        p.coral.alpha(0.42)
+                    } else {
+                        p.brass.alpha(0.32)
+                    },
+                );
+                if active {
+                    highlight = highlight.key("thread-find-active");
+                }
+                highlight
+            }));
+    }
     let mut body = col().min_w(0.0).gap(8.0).child(
         row()
             .center_y()
             .gap(8.0)
             .child(icon(kind_icon(ToolKind::Plan), p.muted))
-            .child(label("Plan", TextStyle::new(14.0, 600.0), p.ink)),
+            .child(title_label),
     );
     if let Some(explanation) = plan["explanation"].as_str().filter(|s| !s.is_empty()) {
         body = body.child(
@@ -671,10 +709,10 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
     {
         body = body.child(block(format!("plan-steps-{id}"), steps, false));
     }
-    if let Some(markdown) = plan["markdown"].as_str().filter(|s| !s.is_empty()) {
+    if let Some((_, markdown)) = displayed.as_ref().filter(|(_, body)| !body.is_empty()) {
         body = body.child(block(
             format!("plan-markdown-{id}"),
-            markdown_ui::render(
+            markdown_ui::render_with_find(
                 markdown,
                 p,
                 s.dark,
@@ -682,6 +720,12 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
                 false,
                 !tool.done,
                 &format!("plan-{id}"),
+                query.map(|query| {
+                    (
+                        query,
+                        active_occ.and_then(|occ| occ.checked_sub(title_count)),
+                    )
+                }),
             ),
             !tool.done,
         ));

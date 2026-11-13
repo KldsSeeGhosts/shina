@@ -43,6 +43,54 @@ pub struct SearchDocument<'a> {
     pub text: &'a str,
 }
 
+pub fn proposed_plan_markdown(tool: &serde_json::Value) -> Option<&str> {
+    if tool["kind"] != "plan" && tool["name"] != "plan" {
+        return None;
+    }
+    let input = &tool["input"];
+    input["markdown"]
+        .as_str()
+        .or_else(|| input["text"].as_str())
+        .or_else(|| input["plan"].as_str())
+}
+
+/// KSG `proposedPlanText.ts`. The title and displayed body are separate find regions.
+pub fn plan_parts(markdown: &str) -> (String, String) {
+    static HEADING: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+(.+)$").unwrap());
+    static FIRST_HEADING: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^\s{0,3}#{1,6}\s+").unwrap());
+    let title = HEADING
+        .captures(markdown)
+        .map(|capture| capture[1].trim().to_owned())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Proposed plan".into());
+    let lines: Vec<_> = markdown
+        .trim_end()
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let mut start = usize::from(
+        lines
+            .first()
+            .is_some_and(|line| FIRST_HEADING.is_match(line)),
+    );
+    while lines.get(start).is_some_and(|line| line.trim().is_empty()) {
+        start += 1;
+    }
+    if lines.get(start).is_some_and(|line| {
+        HEADING
+            .captures(line)
+            .is_some_and(|capture| capture[1].trim().eq_ignore_ascii_case("summary"))
+    }) {
+        start += 1;
+        while lines.get(start).is_some_and(|line| line.trim().is_empty()) {
+            start += 1;
+        }
+    }
+    (title, lines[start..].join("\n"))
+}
+
 fn fold_apostrophes_with_map(src: &str) -> (String, Vec<usize>) {
     let mut folded = String::with_capacity(src.len());
     let mut map = Vec::with_capacity(src.len() + 1);
@@ -166,10 +214,47 @@ pub fn find_plain_occurrences(src: &str, query: &str) -> Vec<Range<usize>> {
 }
 
 pub fn count_document_occurrences(role: &str, text: &str, query: &str) -> usize {
-    if role == "Shina" {
+    if role == "plan" {
+        let (title, body) = plan_parts(text);
+        find_plain_occurrences(&title, query).len() + find_markdown_occurrences(&body, query).len()
+    } else if role == "Shina" {
         find_plain_occurrences(text, query).len()
     } else {
         find_markdown_occurrences(text, query).len()
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn plans_use_the_displayed_title_and_body_without_a_hidden_summary_heading() {
+        assert_eq!(
+            plan_parts("# Title\n\n## Summary\n\nBody\n"),
+            ("Title".into(), "Body".into())
+        );
+        assert_eq!(plan_parts("Body"), ("Proposed plan".into(), "Body".into()));
+        assert_eq!(
+            count_document_occurrences("plan", "Body", "proposed plan"),
+            1
+        );
+        assert_eq!(
+            count_document_occurrences("plan", "# Title\n\nBody", "Title Body"),
+            0
+        );
+        for key in ["markdown", "text", "plan"] {
+            let mut input = serde_json::json!({});
+            input[key] = serde_json::json!("# Title\n\nBody");
+            let tool = serde_json::json!({"kind":"plan","input":input});
+            assert_eq!(proposed_plan_markdown(&tool), Some("# Title\n\nBody"));
+        }
+        assert!(
+            proposed_plan_markdown(&serde_json::json!({
+                "kind":"plan","input":{"steps":[{"text":"Todo"}]}
+            }))
+            .is_none()
+        );
     }
 }
 

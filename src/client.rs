@@ -24,6 +24,19 @@ type AssetView = Option<(usize, Arc<Value>)>;
 type Registration = (std::sync::Weak<AtomicBool>, std::sync::Weak<Worker>);
 static SUPERVISORS: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
 
+enum HistoryRequest {
+    Earlier(usize, Option<String>),
+    Work(usize, String),
+}
+impl HistoryRequest {
+    fn apply(self, cache: &mut ProjectionCache) {
+        match self {
+            Self::Earlier(thread, through) => cache.request_earlier(thread as u64, through),
+            Self::Work(thread, anchor) => cache.request_work(thread as u64, anchor),
+        }
+    }
+}
+
 /// Actual host exit, not a cancellable Windows session-end callback.
 pub fn shutdown_all() {
     let supervisors = std::mem::take(&mut *SUPERVISORS.lock().expect("supervisors"));
@@ -93,7 +106,7 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
     history_thread: Arc<AtomicUsize>,
-    history_requests: Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
+    history_requests: Arc<Mutex<VecDeque<HistoryRequest>>>,
     rpc_requests: Arc<Mutex<VecDeque<(String, String, Value)>>>,
 }
 
@@ -266,7 +279,13 @@ impl Client {
         self.history_requests
             .lock()
             .expect("history requests")
-            .push_back((thread, through_entry_id));
+            .push_back(HistoryRequest::Earlier(thread, through_entry_id));
+    }
+    pub fn load_work_history(&self, thread: usize, anchor: String) {
+        self.history_requests
+            .lock()
+            .expect("history requests")
+            .push_back(HistoryRequest::Work(thread, anchor));
     }
     pub fn call_rpc(&self, tag: impl Into<String>, method: impl Into<String>, params: Value) {
         self.rpc_requests.lock().expect("rpc requests").push_back((
@@ -493,7 +512,7 @@ async fn supervise(
         PathBuf,
         PathBuf,
         Arc<AtomicUsize>,
-        Arc<Mutex<VecDeque<(usize, Option<String>)>>>,
+        Arc<Mutex<VecDeque<HistoryRequest>>>,
         Arc<Mutex<VecDeque<(String, String, Value)>>>,
         Option<crate::peer::Link>,
     ),
@@ -593,12 +612,12 @@ async fn supervise(
             0 => None,
             id => Some(id as u64),
         };
-        while let Some((thread, through)) = history_requests
+        while let Some(request) = history_requests
             .lock()
             .expect("history requests")
             .pop_front()
         {
-            cache.request_earlier(thread as u64, through);
+            request.apply(&mut cache);
         }
         if socket.is_none() {
             ready.store(false, Ordering::Release);
@@ -807,12 +826,12 @@ async fn supervise(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                while let Some((thread, through)) = history_requests
+                while let Some(request) = history_requests
                     .lock()
                     .expect("history requests")
                     .pop_front()
                 {
-                    cache.request_earlier(thread as u64, through);
+                    request.apply(&mut cache);
                 }
                 let mut disconnect = false;
                 while let Some((tag, method, params)) =

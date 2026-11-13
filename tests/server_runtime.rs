@@ -5,6 +5,8 @@ mod client_history;
 #[allow(dead_code)]
 #[path = "../src/history.rs"]
 mod history;
+#[path = "../src/history_work.rs"]
+mod history_work;
 #[allow(dead_code)]
 #[path = "../src/protocol.rs"]
 mod protocol;
@@ -3338,6 +3340,15 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
             "output":"ok","images":[],"structured":null,"parent_call":null,"exit_code":0,"subagents":[],
             "anchor":{"message":a_idx,"offset":0},"block":0,"order":1
         }));
+        if turn == 3 {
+            let mut plan = tools.last().unwrap().clone();
+            plan["id"] = json!("old-plan");
+            plan["name"] = json!("plan");
+            plan["kind"] = json!("plan");
+            plan["input"] = json!({"markdown":"# Stored proposal\n\n## Summary\n\nA deepplanneedle in a stored plan."});
+            plan["order"] = json!(2);
+            tools.push(plan);
+        }
     }
     let mut index = base["index"].clone();
     index["threads"][0]["title"] = json!("Long searchable thread");
@@ -3411,6 +3422,13 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
     );
     assert_eq!(next["result"]["activeIndex"], 1);
     assert_eq!(next["result"]["match"]["entryId"], "u-895");
+    let plan = linked_client.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"deepplanneedle"}),
+        json!("find-plan"),
+    );
+    assert_eq!(plan["result"]["totalMatches"], 1, "{plan}");
+    assert_eq!(plan["result"]["match"]["entryId"], "old-plan");
 
     // Load initial scoped window via ProjectionCache, then jump to earlier match u-3!
     let mut cache = client_history::ProjectionCache::default();
@@ -3466,6 +3484,26 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
             .iter()
             .any(|m| m["id"] == "u-3")
     );
+    assert!(
+        linked_client.history_cache.as_ref().unwrap().histories[&1].1["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["id"] == "old-plan")
+    );
+    let mut reconnected =
+        Client::with_token(&discovery_b, credential["token"].as_str().unwrap().into());
+    reconnected.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("reconnect"),
+    );
+    let plan = reconnected.rpc(
+        "thread.find",
+        json!({"threadId":1,"query":"Stored proposal"}),
+        json!("plan-title"),
+    );
+    assert_eq!(plan["result"]["match"]["entryId"], "old-plan", "{plan}");
 
     // Peer without thread-find (protocolMinor 9) does not advertise "thread-find".
     let mut old_client =
@@ -3485,6 +3523,177 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
 
     host_a.stop();
     host_b.stop();
+}
+
+#[test]
+fn completed_turn_defers_500_work_records_until_the_fold_loads_them() {
+    let mut template = Profile::new();
+    template.launch(&["serve"]);
+    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    template.stop();
+    let mut profile = Profile::new();
+    let mut index = base["index"].clone();
+    index["threads"][0]["session"] = Value::Null;
+    let mut view = base["threads"][0].clone();
+    view["status"] = json!("Completed");
+    view["messages"] = json!([
+        {"id":"u","role":"You","text":"Do the work","images":[]},
+        {"id":"a","role":"Pi","text":"Finished","images":[]}
+    ]);
+    view["work"] = json!([{"start":1,"stopped":false,"elapsed":10,"outcome":"Completed"}]);
+    view["tools"] = json!(
+        (0..500)
+            .map(|i| json!({
+                "id":format!("work-{i}"),"name":"read","kind":"read","detail":"file.rs",
+                "done":true,"failed":false,"output":"x".repeat(2048),"images":[],
+                "structured":null,"parent_call":null,"exit_code":0,"subagents":[],
+                "anchor":{"message":1,"offset":0},"block":0,"order":i+1
+            }))
+            .collect::<Vec<_>>()
+    );
+    index["threadViews"] = json!([view]);
+    fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("hello-work"),
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "deferred-work"),
+        "{hello}"
+    );
+    let mut cache = client_history::ProjectionCache::default();
+    cache.reconnect(&hello["result"]).unwrap();
+    cache
+        .receive(&protocol::notification(
+            "subscription.snapshot",
+            json!({
+                "state":protocol::compact(&client.snapshot),"seq":client.seq,"epoch":client.epoch
+            }),
+        ))
+        .unwrap();
+    client.history_cache = Some(cache);
+    let mut initial_page_bytes = 0;
+    while let Some(request) = client.history_cache.as_mut().unwrap().next_history() {
+        let reply = client.rpc(
+            request["method"].as_str().unwrap(),
+            request["params"].clone(),
+            json!("history"),
+        );
+        initial_page_bytes = reply["result"]["totalBytes"].as_u64().unwrap_or(0) as usize;
+    }
+    let cache = client.history_cache.as_mut().unwrap();
+    let history = &cache.histories[&1].1;
+    let bytes = history.to_string().len();
+    assert_eq!(history["tools"].as_array().unwrap().len(), 1, "{history}");
+    assert_eq!(history["deferredWork"][0]["itemCount"], 500);
+    assert!(
+        bytes < 16 * 1024,
+        "initial scoped history encoded {bytes} bytes"
+    );
+    assert!(initial_page_bytes > 0 && initial_page_bytes < 16 * 1024);
+    eprintln!(
+        "500 folded work records: initial page {initial_page_bytes} bytes, cached history {bytes} bytes, 1 work record"
+    );
+    let anchor = history["deferredWork"][0]["sourceItemId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    cache.request_work(1, anchor.clone());
+    let _failed = cache.next_history().unwrap();
+    cache
+        .receive(&json!({"id":"history","error":{"code":-32603,"message":"Fixture work failure"}}))
+        .unwrap();
+    assert_eq!(cache.histories[&1].1["deferredWork"][0]["loading"], false);
+    assert_eq!(
+        cache.histories[&1].1["deferredWork"][0]["error"],
+        "Fixture work failure"
+    );
+    cache.request_work(1, anchor);
+    let first = cache.next_history().unwrap();
+    assert!(first["params"]["workAnchorId"].is_string());
+    client.rpc(
+        first["method"].as_str().unwrap(),
+        first["params"].clone(),
+        json!("history"),
+    );
+    // Reconnect in the middle of the work cursor walk, retaining already merged records.
+    let mut saved = client.history_cache.take().unwrap();
+    let token = client.token.clone();
+    drop(client);
+    client = Client::unsubscribed(&profile.discovery(), token);
+    client.snapshot = saved.state.clone();
+    client.seq = saved.seq.unwrap();
+    client.epoch = saved.epoch.clone();
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("work-reconnect"),
+    );
+    saved.reconnect(&hello["result"]).unwrap();
+    client.history_cache = Some(saved);
+    let mut requests = 0;
+    while let Some(request) = client.history_cache.as_mut().unwrap().next_history() {
+        client.rpc(
+            request["method"].as_str().unwrap(),
+            request["params"].clone(),
+            json!("history"),
+        );
+        requests += 1;
+        assert!(requests < 100, "work history did not complete");
+    }
+    let cache = client.history_cache.as_ref().unwrap();
+    assert_eq!(
+        cache.histories[&1].1["tools"].as_array().unwrap().len(),
+        500
+    );
+    assert!(
+        cache.histories[&1].1["deferredWork"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // A peer without the capability sends ordinary inline pages and is never asked for work.
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":10,"projectionSchema":1}),
+        json!("old-work-peer"),
+    );
+    assert!(
+        !hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "deferred-work")
+    );
+    client
+        .history_cache
+        .as_mut()
+        .unwrap()
+        .reconnect(&hello["result"])
+        .unwrap();
+    while let Some(request) = client.history_cache.as_mut().unwrap().next_history() {
+        assert!(request["params"]["workAnchorId"].is_null());
+        client.rpc(
+            request["method"].as_str().unwrap(),
+            request["params"].clone(),
+            json!("history"),
+        );
+    }
+    let cache = client.history_cache.as_mut().unwrap();
+    let projected = cache.projected().unwrap();
+    assert_eq!(
+        projected["threads"][0]["historyMeta"]["workLoading"],
+        "inline-legacy"
+    );
+    assert!(cache.histories[&1].1["deferredWork"].is_null());
+    profile.stop();
 }
 
 #[test]
