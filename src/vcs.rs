@@ -28,8 +28,8 @@ pub const GIT_LIST_BRANCHES_DEFAULT_LIMIT: usize = 100;
 pub const GIT_LIST_BRANCHES_MAX_LIMIT: usize = 200;
 pub const T3_PROJECT_FILE_NAME: &str = "t3.json";
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(300);
 const SETUP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_GIT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -298,7 +298,12 @@ pub fn git_available() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-fn git_error(operation: &str, cwd: &Path, stderr: &str, fallback_detail: &str) -> String {
+pub(crate) fn git_error(
+    operation: &str,
+    cwd: &Path,
+    stderr: &str,
+    fallback_detail: &str,
+) -> String {
     let trimmed = stderr.trim();
     let detail = if trimmed.is_empty() {
         fallback_detail
@@ -311,7 +316,7 @@ fn git_error(operation: &str, cwd: &Path, stderr: &str, fallback_detail: &str) -
     )
 }
 
-fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitContext) {
+pub(crate) fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitContext) {
     cmd.current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -407,7 +412,7 @@ pub fn validate_existing_directory(raw: &str, label: &str) -> Result<PathBuf, St
     Ok(path.to_path_buf())
 }
 
-fn normalize_lexical(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -435,7 +440,7 @@ fn has_only_normal_or_root_components(path: &Path) -> bool {
 
 /// Match Git's symlink-following location: nearest real ancestor plus missing path components.
 /// Ported from KSG Code's `worktreesDirectory.ts`.
-fn real_location(target: &Path) -> PathBuf {
+pub(crate) fn real_location(target: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(target) {
         return real;
     }
@@ -537,7 +542,7 @@ pub fn is_non_repository_stderr(stderr: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
-fn is_unborn_head_stderr(stderr: &str) -> bool {
+pub(crate) fn is_unborn_head_stderr(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("bad revision 'head'")
         || (lower.contains("unknown revision") && lower.contains("path not in the working tree"))
@@ -632,7 +637,7 @@ fn read_worktree_root(cwd: &Path, ctx: &GitContext) -> Result<Option<PathBuf>, S
     }
 }
 
-fn branch_name_from_head_ref(value: &str) -> Option<String> {
+pub(crate) fn branch_name_from_head_ref(value: &str) -> Option<String> {
     let trimmed = value.trim();
     trimmed
         .strip_prefix("refs/heads/")
@@ -1126,7 +1131,7 @@ fn write_config_value(cwd: &Path, key: &str, value: &str, ctx: &GitContext) -> R
     Ok(())
 }
 
-fn branch_exists(cwd: &Path, ref_name: &str, ctx: &GitContext) -> bool {
+pub(crate) fn branch_exists(cwd: &Path, ref_name: &str, ctx: &GitContext) -> bool {
     let full = format!("refs/heads/{ref_name}");
     run_git_raw(
         "GitVcsDriver.branchExists",
@@ -1138,7 +1143,12 @@ fn branch_exists(cwd: &Path, ref_name: &str, ctx: &GitContext) -> bool {
     .is_ok_and(|out| out.exit_code == Some(0))
 }
 
-fn remote_branch_exists(cwd: &Path, remote_name: &str, ref_name: &str, ctx: &GitContext) -> bool {
+pub(crate) fn remote_branch_exists(
+    cwd: &Path,
+    remote_name: &str,
+    ref_name: &str,
+    ctx: &GitContext,
+) -> bool {
     let full = format!("refs/remotes/{remote_name}/{ref_name}");
     run_git_raw(
         "GitVcsDriver.remoteBranchExists",
@@ -1194,7 +1204,7 @@ fn resolve_default_branch_name(cwd: &Path, remote_name: &str, ctx: &GitContext) 
     parse_default_branch_from_remote_head_ref(&out.stdout, remote_name)
 }
 
-fn resolve_comparison_base_ref(
+pub(crate) fn resolve_comparison_base_ref(
     cwd: &Path,
     base_ref: &str,
     ctx: &GitContext,
@@ -1241,10 +1251,11 @@ fn resolve_tracked_remote_base_ref(
         .map(|short| (short.to_owned(), comparison.to_owned()))
 }
 
-fn resolve_base_branch_for_no_upstream(
+pub(crate) fn resolve_base_branch_for_no_upstream(
     cwd: &Path,
     ref_name: &str,
     known_origin_default: Option<&str>,
+    allow_remote_of_current: bool,
     ctx: &GitContext,
 ) -> Option<(String, String)> {
     if let Some(configured_ref) =
@@ -1325,6 +1336,19 @@ fn resolve_base_branch_for_no_upstream(
             continue;
         }
         if normalized == ref_name {
+            if allow_remote_of_current {
+                if let Some(tracked) = resolve_tracked_remote_base_ref(cwd, ref_name, ctx) {
+                    return Some(tracked);
+                }
+                if let Some(remote) = primary_remote.as_deref()
+                    && remote_branch_exists(cwd, remote, normalized, ctx)
+                {
+                    return Some((
+                        format!("{remote}/{normalized}"),
+                        format!("refs/remotes/{remote}/{normalized}"),
+                    ));
+                }
+            }
             continue;
         }
         if let Some(remote) = primary_remote.as_deref()
@@ -1339,7 +1363,6 @@ fn resolve_base_branch_for_no_upstream(
             return Some((normalized.to_owned(), format!("refs/heads/{normalized}")));
         }
     }
-    let _ = resolve_tracked_remote_base_ref;
     None
 }
 
@@ -1350,7 +1373,7 @@ fn compute_ahead_count_against_base(
     ctx: &GitContext,
 ) -> usize {
     let Some((_, comparison_ref)) =
-        resolve_base_branch_for_no_upstream(cwd, ref_name, known_origin_default, ctx)
+        resolve_base_branch_for_no_upstream(cwd, ref_name, known_origin_default, false, ctx)
     else {
         return 0;
     };
