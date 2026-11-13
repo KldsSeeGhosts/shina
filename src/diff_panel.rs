@@ -164,6 +164,13 @@ pub struct ThreadDiff {
     /// The thread's last seen `life.last_completed_at`: a bump means a turn
     /// finished, which marks the diff stale (for local and remote threads).
     pub seen_completed_at: Option<u64>,
+    /// A timeline file-change press named this path while the preview was
+    /// still loading; the next finished request applies it, matching KSG's
+    /// selected-file hand-off into the diff store.
+    pub pending_reveal: Option<String>,
+    /// The `diff-file-*` row a reveal resolved to; the body's one-shot marker
+    /// scrolls it to the list's top, then clears the flag.
+    pub reveal_row: Option<String>,
 }
 
 impl ThreadDiff {
@@ -710,6 +717,15 @@ impl State {
         diff.done = Some(done);
         self.diff_rebuild_rows(panel_key);
         self.diff_load_next(panel_key);
+        // A timeline file press that arrived while the request was out
+        // resolves against the result that just landed.
+        let pending = self
+            .diffs
+            .get_mut(panel_key)
+            .and_then(|diff| diff.pending_reveal.take());
+        if let Some(path) = pending {
+            apply_reveal(self, panel_key, &path);
+        }
     }
 
     /// KSG's `requested` merge on `DiffFileCollapseToggle load` and `requestFile`:
@@ -1061,6 +1077,93 @@ impl State {
             } => self.diff_apply_file(&panel_key, request, &path, outcome),
         }
     }
+}
+
+/// A timeline file-change press, KSG's `onOpenTurnDiff` without the per-turn
+/// source Shina has not ported: open the right panel on the Diff tab, switch
+/// to the working-tree scope, expand the file if it is folded and scroll its
+/// header to the list's top. While the preview is loading the path waits as
+/// `pending_reveal` and applies when the result arrives; a path no file
+/// matches still opens the tab and changes nothing else.
+pub(crate) fn reveal_file(state: &mut State, panel_key: &str, path: &str) {
+    state
+        .right_panels
+        .open(panel_key, crate::right_panel::SingletonKind::Diff);
+    // Timeline file changes are working-tree changes, so the tab opens on
+    // Uncommitted — the one scope whose files the timeline can name.
+    if state.panel_key() == panel_key {
+        state.diff_set_scope(Scope::Uncommitted);
+    }
+    let Some(diff) = state.diffs.get_mut(panel_key) else {
+        return;
+    };
+    if diff.loading || diff.ready().is_none() {
+        diff.pending_reveal = Some(path.to_string());
+        return;
+    }
+    apply_reveal(state, panel_key, path);
+}
+
+/// The ready half of `reveal_file`: match the path, unfold the file, fetch
+/// its patch when it is still a stat row, and name its header row the scroll
+/// target. `hide-tests` filtered files leave no row, so they skip the scroll.
+fn apply_reveal(state: &mut State, panel_key: &str, path: &str) {
+    let index = {
+        let Some(ready) = state.diffs.get(panel_key).and_then(ThreadDiff::ready) else {
+            return;
+        };
+        let Some(index) = ready
+            .files
+            .iter()
+            .position(|entry| file_path_matches(&entry.file, &ready.cwd, path))
+        else {
+            return;
+        };
+        index
+    };
+    {
+        let Some(diff) = state.diffs.get_mut(panel_key) else {
+            return;
+        };
+        let Some(ready) = diff.ready() else {
+            return;
+        };
+        let identity = crate::review_patch::identity_key(&ready.files[index].file);
+        let scope = diff.scope;
+        diff.collapsed.entry(scope).or_default().remove(&identity);
+    }
+    state.diff_rebuild_rows(panel_key);
+    // A stat-row file's patch loads on reveal, as KSG's requestFile does when
+    // a collapsed file opens.
+    state.diff_request_file(panel_key, index);
+    let Some(diff) = state.diffs.get_mut(panel_key) else {
+        return;
+    };
+    diff.reveal_row = diff.ready().and_then(|ready| {
+        ready.rows.iter().find_map(|row| match row {
+            DiffRow::File { file, key, .. } if *file == index => Some(key.clone()),
+            _ => None,
+        })
+    });
+}
+
+/// A timeline path names a diff file when it equals the file's path relative
+/// to the preview's project directory, or is an absolute path inside that
+/// directory reduced to the same relative form. A rename answers to either
+/// its old or its new path.
+fn file_path_matches(file: &FileDiff, cwd: &str, path: &str) -> bool {
+    let cwd = cwd.replace('\\', "/");
+    let cwd = cwd.trim_end_matches('/');
+    let path = path.replace('\\', "/");
+    let relative = match path.strip_prefix(cwd) {
+        // The directory itself, or a sibling whose name shares the prefix
+        // ("/repo-other/..."), is not the file.
+        Some("") => return false,
+        Some(rest) if rest.starts_with('/') => &rest[1..],
+        Some(_) => return false,
+        None => path.as_str(),
+    };
+    file.path == relative || file.previous_path.as_deref() == Some(relative)
 }
 
 /// The `Event::Rpc` half of remote answers: deserialize, then parse on a worker
@@ -1834,12 +1937,44 @@ fn ready_body(p: Palette, panel_key: &str, ready: &Ready) -> El {
     )
 }
 
+/// A one-shot scroll trigger for `reveal_file`'s resolved row: mounting it
+/// scrolls the named row to the list's top and clears the flag. The row key is
+/// part of the element key so a second reveal remounts it and fires again.
+fn reveal_marker(panel_key: &str, row_key: &str) -> El {
+    let panel = panel_key.to_string();
+    el().key(format!("diff-reveal-{row_key}"))
+        .a11y_hidden()
+        .absolute(0.0, 0.0)
+        .size(1.0, 1.0)
+        .on_visible(move |s: &mut State, visible, tx| {
+            if !visible {
+                return;
+            }
+            let Some(row) = s
+                .diffs
+                .get_mut(&panel)
+                .and_then(|diff| diff.reveal_row.take())
+            else {
+                return;
+            };
+            tx.instant();
+            // `scroll_into_view` mounts the virtual row when it is not drawn;
+            // `scroll_key_to` then tops it in the viewport.
+            tx.scroll_into_view_in("diff-rows-virtual", row.clone());
+            tx.scroll_key_to(row, 0.0);
+        })
+}
+
 /// The Diff tab body for the current thread. KSG `DiffPanel`'s state chain:
 /// loading skeleton, the not-a-repository and capability notices, the error
 /// state with retry, the empty states, then the ready content.
 pub(super) fn body(s: &State, p: Palette) -> El {
     let panel_key = s.panel_key();
     let scope = s.diffs.get(&panel_key).map(|d| d.scope).unwrap_or_default();
+    let reveal = s
+        .diffs
+        .get(&panel_key)
+        .and_then(|diff| diff.reveal_row.clone());
     let body = match s.diffs.get(&panel_key).and_then(|diff| diff.done.as_ref()) {
         None => loading_skeleton(scope, p).into(),
         Some(Done::NotRepo) => centered_state(NOT_REPO_TEXT, p, false).into(),
@@ -1854,18 +1989,22 @@ pub(super) fn body(s: &State, p: Palette) -> El {
         Some(Done::Missing) => centered_state(MISSING_TEXT, p, false).into(),
         Some(Done::Ready(ready)) => ready_body(p, &panel_key, ready).into(),
     };
-    // Mounting the tab (or coming back to it) starts a read when the data is
-    // stale — KSG `refreshOnShow` under the live-refresh floor.
-    el().key("diff-body-root")
+    let mut root = el()
+        .key("diff-body-root")
         .w_full()
         .h_full()
+        // Mounting the tab (or coming back to it) starts a read when the data is
+        // stale — KSG `refreshOnShow` under the live-refresh floor.
         .on_visible(move |s: &mut State, visible, tx| {
             if visible {
                 s.diff_shown(tx);
             }
         })
-        .child(body)
-        .into()
+        .child(body);
+    if let Some(row) = reveal {
+        root = root.child(reveal_marker(&panel_key, &row));
+    }
+    root.into()
 }
 
 #[cfg(test)]
@@ -2320,5 +2459,159 @@ mod tests {
         assert_eq!(format_compact_diff_count(999_499), "999k");
         assert_eq!(format_compact_diff_count(1_000_000), "1m");
         assert_eq!(format_compact_diff_count(2_400_000), "2.4m");
+    }
+
+    fn ready_diff(scope: Scope, files: Vec<FileEntry>) -> ThreadDiff {
+        let additions = files.iter().map(|entry| entry.additions).sum();
+        let deletions = files.iter().map(|entry| entry.deletions).sum();
+        ThreadDiff {
+            scope,
+            done: Some(Done::Ready(Box::new(Ready {
+                files,
+                raw: None,
+                additions,
+                deletions,
+                truncated: false,
+                incomplete: false,
+                cwd: "/repo".into(),
+                source_kind: ReviewSourceKind::WorkingTree,
+                base_ref: None,
+                rows: vec![],
+                rows_version: 0,
+            }))),
+            ..ThreadDiff::default()
+        }
+    }
+
+    #[test]
+    fn file_path_matches_relative_absolute_outside_and_renamed_paths() {
+        let plain = file("src/a.rs", ChangeKind::Modified);
+        let mut renamed = file("src/new.rs", ChangeKind::Renamed);
+        renamed.previous_path = Some("src/old.rs".into());
+        // Relative paths compare against the preview's project directory.
+        assert!(file_path_matches(&plain, "/repo", "src/a.rs"));
+        // An absolute path inside the project reduces to the relative form.
+        assert!(file_path_matches(&plain, "/repo", "/repo/src/a.rs"));
+        // An absolute path outside the project is not the file.
+        assert!(!file_path_matches(&plain, "/repo", "/other/src/a.rs"));
+        // A sibling whose name only shares the directory's prefix is outside too.
+        assert!(!file_path_matches(&plain, "/repo", "/repo-other/src/a.rs"));
+        // A rename answers to its old or its new path.
+        assert!(file_path_matches(&renamed, "/repo", "src/old.rs"));
+        assert!(file_path_matches(&renamed, "/repo", "src/new.rs"));
+        assert!(file_path_matches(&renamed, "/repo", "/repo/src/old.rs"));
+        // Separators normalize on both sides (a Windows host's report).
+        assert!(file_path_matches(&plain, "C:\\repo", "C:\\repo\\src\\a.rs"));
+        // A different relative path does not match.
+        assert!(!file_path_matches(&plain, "/repo", "src/b.rs"));
+    }
+
+    #[test]
+    fn reveal_file_expands_the_matching_file_and_marks_its_row() {
+        let mut s = state();
+        let key = s.panel_key();
+        let folded = file("src/a.rs", ChangeKind::Modified);
+        let mut open = file("src/b.rs", ChangeKind::Modified);
+        open.additions = 3;
+        let folded_identity = crate::review_patch::identity_key(&folded);
+        let mut diff = ready_diff(
+            Scope::Uncommitted,
+            vec![
+                entry(folded.clone(), FileBody::Loaded),
+                entry(open, FileBody::Loaded),
+            ],
+        );
+        diff.collapsed
+            .insert(Scope::Uncommitted, HashSet::from([folded_identity.clone()]));
+        s.diffs.insert(key.clone(), diff);
+        s.diff_rebuild_rows(&key);
+
+        reveal_file(&mut s, &key, "/repo/src/a.rs");
+
+        let panel = s.right_panels.get(&key);
+        assert!(panel.open);
+        assert_eq!(panel.active.as_deref(), Some("diff"));
+        let diff = &s.diffs[&key];
+        // The file unfolds and its header row becomes the scroll target.
+        assert!(!diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
+        assert_eq!(diff.reveal_row.as_deref(), Some("diff-file-0"));
+        assert!(diff.pending_reveal.is_none());
+    }
+
+    #[test]
+    fn reveal_file_while_loading_applies_when_the_result_lands() {
+        let mut s = state();
+        let key = s.panel_key();
+        let folded_identity =
+            crate::review_patch::identity_key(&file("src/a.rs", ChangeKind::Modified));
+        s.diffs.insert(
+            key.clone(),
+            ThreadDiff {
+                scope: Scope::Uncommitted,
+                request: 7,
+                loading: true,
+                collapsed: HashMap::from([(
+                    Scope::Uncommitted,
+                    HashSet::from([folded_identity.clone()]),
+                )]),
+                ..ThreadDiff::default()
+            },
+        );
+        reveal_file(&mut s, &key, "src/b.rs");
+        // The press waits on the in-flight request; the tab is already open.
+        assert_eq!(s.diffs[&key].pending_reveal.as_deref(), Some("src/b.rs"));
+        assert_eq!(
+            s.right_panels.active_surface(&key),
+            Some(crate::right_panel::Surface::Diff)
+        );
+        assert!(s.diffs[&key].reveal_row.is_none());
+
+        let folded = file("src/a.rs", ChangeKind::Modified);
+        let mut target = file("src/b.rs", ChangeKind::Modified);
+        target.additions = 3;
+        let mut diff = ready_diff(
+            Scope::Uncommitted,
+            vec![
+                entry(folded, FileBody::Loaded),
+                entry(target, FileBody::Loaded),
+            ],
+        );
+        s.apply_diff_msg(DiffMsg::Preview {
+            panel_key: key.clone(),
+            request: 7,
+            done: diff.done.take().unwrap(),
+        });
+
+        let diff = &s.diffs[&key];
+        assert!(diff.pending_reveal.is_none());
+        // Only the named file unfolds; the unrelated fold survives.
+        assert!(diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
+        assert_eq!(diff.reveal_row.as_deref(), Some("diff-file-1"));
+    }
+
+    #[test]
+    fn reveal_file_an_unknown_path_only_opens_the_tab() {
+        let mut s = state();
+        let key = s.panel_key();
+        let folded = file("src/a.rs", ChangeKind::Modified);
+        let folded_identity = crate::review_patch::identity_key(&folded);
+        let mut diff = ready_diff(Scope::Uncommitted, vec![entry(folded, FileBody::Loaded)]);
+        diff.collapsed
+            .insert(Scope::Uncommitted, HashSet::from([folded_identity.clone()]));
+        s.diffs.insert(key.clone(), diff);
+        s.diff_rebuild_rows(&key);
+
+        reveal_file(&mut s, &key, "src/missing.rs");
+
+        let diff = &s.diffs[&key];
+        // The tab still opens; nothing in the diff state moved.
+        assert!(s.right_panels.get(&key).open);
+        assert_eq!(
+            s.right_panels.active_surface(&key),
+            Some(crate::right_panel::Surface::Diff)
+        );
+        assert!(diff.reveal_row.is_none());
+        assert!(diff.pending_reveal.is_none());
+        assert!(diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
     }
 }

@@ -314,9 +314,25 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                 if file > 0 {
                     body = body.child(rule(p));
                 }
+                // The path is KSG's changed-file row: pressing it opens the
+                // right panel's Diff tab on the file, the hover fill the row
+                // gets on the web.
+                let path = relative(&change.path, &root);
+                let raw = change.path.clone();
                 let mut heading = col().min_w(0.0).gap(4.0).child(
-                    mono(relative(&change.path, &root), p)
-                        .key(format!("tool-file-path-{id}-{file}")),
+                    mono(path.clone(), p)
+                        .key(format!("tool-file-path-{id}-{file}"))
+                        .role("button")
+                        .label(format!("Open diff for {path}"))
+                        .cursor(rune::Cursor::Pointer)
+                        .focusable(true)
+                        .w_full()
+                        .radius(4.0)
+                        .hover(p.selected)
+                        .on_press(move |s: &mut State| {
+                            let panel_key = s.panel_key();
+                            crate::ui::diff_panel::reveal_file(s, &panel_key, &raw);
+                        }),
                 );
                 if let Some(old) = &change.old_path {
                     heading =
