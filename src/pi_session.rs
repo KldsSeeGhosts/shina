@@ -778,6 +778,9 @@ impl Thread {
                 self.native.compact_id = Some(self.command_id());
                 self.context.begin_compaction();
             } else {
+                if !self.native.queue.is_empty() {
+                    self.native.queue_held = true;
+                }
                 self.status = Status::Failed;
             }
             return true;
@@ -1533,6 +1536,9 @@ impl Thread {
                     self.native.compact_id = None;
                     if record["success"] == false {
                         self.error = Some(string(record, "error").into());
+                        if !self.native.queue.is_empty() {
+                            self.native.queue_held = true;
+                        }
                         if !matches!(self.harness.as_str(), "codex" | "claude")
                             || self
                                 .native

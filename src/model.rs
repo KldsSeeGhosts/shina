@@ -2699,6 +2699,9 @@ impl Thread {
             "compaction_end" => {
                 if let Some(error) = record["errorMessage"].as_str() {
                     self.error = Some(error.into());
+                    if !self.native.queue.is_empty() {
+                        self.native.queue_held = true;
+                    }
                 }
                 self.context.finish_compaction();
                 // Pi reports null usage until its next assistant response, so this request
@@ -3144,6 +3147,7 @@ pub struct State {
     next_toast_id: u64,
     pub composer_notices: crate::composer_notices::Store,
     fresh_arm_seq: u64,
+    keep_full_history_threads: std::collections::HashSet<(String, usize)>,
     pub plan_menu: Option<String>,
     pub plan_copied: Option<(String, u64)>,
     pub plan_expanded: std::collections::HashSet<String>,
@@ -3363,6 +3367,7 @@ impl State {
             next_toast_id: 1,
             composer_notices: crate::composer_notices::Store::default(),
             fresh_arm_seq: 0,
+            keep_full_history_threads: Default::default(),
             plan_menu: None,
             plan_copied: None,
             plan_expanded: Default::default(),
@@ -7910,11 +7915,77 @@ impl State {
         self.composer_notices.sync("fresh-session", notice)
     }
 
-    fn dispatch_send(&mut self) -> bool {
-        self.dispatch_send_with_fresh(None)
+    pub(crate) fn keep_full_history(&self, thread: &Thread) -> bool {
+        self.keep_full_history_threads
+            .contains(&(self.machines.selected.clone(), thread.id))
     }
 
-    pub(crate) fn dispatch_send_with_fresh(&mut self, forced_fresh_context: Option<bool>) -> bool {
+    pub(crate) fn set_keep_full_history(&mut self, server: &str, thread_id: usize, keep: bool) {
+        let key = (server.to_owned(), thread_id);
+        if keep {
+            self.keep_full_history_threads.insert(key);
+        } else {
+            self.keep_full_history_threads.remove(&key);
+        }
+    }
+
+    pub fn toggle_keep_full_history(&mut self) {
+        let server = self.machines.selected.clone();
+        let thread_id = self.current().id;
+        let next = !self.keep_full_history(self.current());
+        self.set_keep_full_history(&server, thread_id, next);
+    }
+
+    /// Ported from KSG Code's `compactBeforeSendTokens` / `resumeCompactionTokens`
+    /// (`packages/client-runtime/src/state/contextWindow.ts` and `ChatView.tsx`).
+    pub(crate) fn resume_compaction_tokens(&self, thread: &Thread, now_ms: u64) -> Option<u64> {
+        if self.demo {
+            return None;
+        }
+        if self.fresh_session_available(thread) && thread.fresh_session_arm.is_some() {
+            return None;
+        }
+        if thread.archived()
+            || thread.status.busy()
+            || thread.initializing
+            || thread.configuring
+            || thread.native.operating()
+            || thread.context.phase == crate::context::ContextPhase::Compacting
+            || thread.native.queue_held
+            || thread.request.is_some()
+            || thread.native.questionnaire.is_some()
+            || !crate::harness::supports_compaction(&thread.harness)
+        {
+            return None;
+        }
+        let has_prior_turn = thread.session.is_some()
+            || thread.messages.iter().any(|m| {
+                m.role == "You"
+                    && (!m.text.trim().eq_ignore_ascii_case("/compact") || !m.images.is_empty())
+            });
+        if !has_prior_turn {
+            return None;
+        }
+        let used_tokens = thread.context.usage.tokens?;
+        crate::context::should_offer_resume_compaction(crate::context::ResumeCompactionInput {
+            harness: &thread.harness,
+            used_tokens: Some(used_tokens),
+            updated_at_ms: thread.context.updated_at,
+            prompt_cache_ttl_ms: thread.context.prompt_cache_ttl_ms,
+            now_ms,
+        })
+        .then_some(used_tokens)
+    }
+
+    fn dispatch_send(&mut self) -> bool {
+        self.dispatch_send_with_options(None, None)
+    }
+
+    pub(crate) fn dispatch_send_with_options(
+        &mut self,
+        forced_fresh_context: Option<bool>,
+        forced_compact_before_send: Option<bool>,
+    ) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
@@ -7985,6 +8056,14 @@ impl State {
             None
         };
         let fresh_context = forced_fresh_context.unwrap_or(fresh_arm.is_some());
+        let compact_before_send = forced_compact_before_send.unwrap_or_else(|| {
+            !fresh_context
+                && self
+                    .resume_compaction_tokens(self.current(), lifecycle::now())
+                    .is_some()
+                && !self.keep_full_history(self.current())
+                && !is_compact_command(&draft_markdown)
+        });
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -8036,7 +8115,10 @@ impl State {
                 self.promote_client_draft();
                 return self.current().client_creating.is_some();
             }
-            let mode = if self.current().status.busy()
+            let supports_fresh_cap = self.client.as_ref().is_some_and(|c| {
+                c.supports_capability(&self.current().machine, crate::protocol::FRESH_CONTEXT)
+            });
+            let mut mode = if self.current().status.busy()
                 && (self.current().follow_up_queues() || fresh_context)
             {
                 "queue"
@@ -8049,6 +8131,15 @@ impl State {
                 "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":mode});
             if fresh_context {
                 params["freshContext"] = json!(true);
+            }
+            if compact_before_send {
+                if supports_fresh_cap {
+                    params["compactBeforeSend"] = json!(true);
+                } else {
+                    let _ = self.remote("thread.compact", json!({"instructions": Value::Null}));
+                    mode = "queue";
+                    params["mode"] = json!(mode);
+                }
             }
             let result = self.remote("thread.send", params);
             return match result {
@@ -8177,6 +8268,85 @@ impl State {
             _ => {}
         }
         self.release_task_results(self.current().id);
+        if compact_before_send && !self.current().status.busy() {
+            if self.current().harness == "pi"
+                && !self.current().model_provider.is_empty()
+                && self.current().model_provider != "cpa"
+            {
+                self.current_mut().error = Some(
+                    "Choose a CPA model before sending. Shina will not send prompts to a direct provider.".into(),
+                );
+                return false;
+            }
+            if self.current().draft_images.iter().any(Attachment::is_image)
+                && self.current().supports_images == Some(false)
+            {
+                let err = self.current().image_model_error();
+                self.current_mut().attachment_error = Some(err);
+                return false;
+            }
+            let local_server_id = self.machine_identity(&self.machines.selected);
+            let peers = self.peers.clone();
+            let labels: Vec<(String, String)> = peers
+                .iter()
+                .map(|p| (p.server_id.clone(), p.label.clone()))
+                .collect();
+            let prompt = match crate::composer_tokens::prompt_for_target(
+                &self.current().draft,
+                &self.current().draft_images,
+                &self.current().draft_context,
+                Some(&self.current().machine),
+                Some(&local_server_id),
+                &peers,
+                &|m| {
+                    if m == "local" {
+                        "Local".into()
+                    } else {
+                        labels
+                            .iter()
+                            .find(|(id, _)| id == m)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| m.to_owned())
+                    }
+                },
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.current_mut().attachment_error = Some(error);
+                    return false;
+                }
+            };
+            if !self.headless
+                && let Some(error) = self.current().validate_prompt_length(&prompt)
+            {
+                self.current_mut().submission_error = Some(error);
+                return false;
+            }
+            self.current_mut().submission_error = None;
+            let thread = self.current_mut();
+            thread.prompt_history.reset();
+            thread.typing_guard.on_blur_or_send();
+            thread.paste_history = Default::default();
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.retained_context = Default::default();
+            thread.native.queue_held = false;
+            thread.serial += 1;
+            let queued_id = thread.serial;
+            thread.native.queue.push_back(pi_session::QueuedMessage {
+                id: queued_id,
+                prompt,
+            });
+            thread.life.user_sent(lifecycle::now());
+            let id = thread.id;
+            let server = self.machines.selected.clone();
+            self.set_keep_full_history(&server, id, false);
+            self.invalidate_undo(id);
+            self.compact_context(None);
+            self.checkpoint();
+            return true;
+        }
         if self.current().status.busy() {
             if !self.headless {
                 if let Ok(prompt) = crate::composer_tokens::prompt_for_target(
@@ -8221,8 +8391,10 @@ impl State {
                 if fresh_context {
                     self.persist_transcripts = true;
                 }
+                let thread_id = self.current().id;
+                let server = self.machines.selected.clone();
+                self.set_keep_full_history(&server, thread_id, false);
                 if let Some(arm) = fresh_arm {
-                    let thread_id = self.current().id;
                     self.disarm_fresh_session(thread_id, Some(arm));
                 }
                 self.checkpoint();
@@ -8271,6 +8443,8 @@ impl State {
             return false;
         }
         let id = self.current().id;
+        let server = self.machines.selected.clone();
+        self.set_keep_full_history(&server, id, false);
         self.invalidate_undo(id);
         if fresh_context {
             self.persist_transcripts = true;
@@ -9844,6 +10018,15 @@ impl Thread {
 /// Ported from KSG Code's `isClearComposerCommand` (`packages/shared/src/composerTrigger.ts`).
 pub fn is_clear_command(text: &str) -> bool {
     text.trim().eq_ignore_ascii_case("/clear")
+}
+
+/// Ported from KSG Code's `COMPACT_COMMAND_PATTERN` (`packages/client-runtime/src/state/contextWindow.ts`).
+pub fn is_compact_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/compact"))
+        && trimmed[8..].chars().next().is_none_or(char::is_whitespace)
 }
 
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
@@ -16305,5 +16488,138 @@ mod tests {
                 .current()
                 .is_fresh_session_message(&state.current().messages[1].id)
         );
+    }
+
+    #[test]
+    fn compact_before_send_queues_behind_compaction_respects_keep_and_skips_slash_compact() {
+        let stale_at = lifecycle::now().saturating_sub(80 * 60_000);
+        let setup_stale_claude = |state: &mut State| {
+            let (pi, commands, _events) = Pi::test_connection();
+            let t = state.current_mut();
+            t.pi = Some(pi);
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.session = Some("11111111-1111-4111-8111-111111111111".into());
+            t.status = Status::Completed;
+            t.messages.push(Message {
+                id: "u1".into(),
+                role: "You",
+                text: "Earlier work".into(),
+                images: vec![],
+                context: None,
+            });
+            t.context.absorb(&json!({
+                "contextUsage": {
+                    "tokens": 220_000,
+                    "contextWindow": 1_000_000,
+                    "updatedAt": stale_at
+                }
+            }));
+            commands
+        };
+
+        // 1. Default "Compact" queues the message behind compaction and sends after compaction ends.
+        let mut state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut state);
+        assert_eq!(
+            state.resume_compaction_tokens(state.current(), lifecycle::now()),
+            Some(220_000)
+        );
+        state.current_mut().draft.replace_text("Follow up");
+        state.send();
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert_eq!(state.current().native.queue[0].prompt.text, "Follow up");
+        let compact_cmd = commands.try_recv().unwrap();
+        assert_eq!(compact_cmd["type"], "compact");
+        let compact_id = compact_cmd["id"].as_str().unwrap().to_owned();
+        assert!(
+            commands.try_recv().is_err(),
+            "prompt must wait for compaction"
+        );
+
+        // Compaction completes -> queued message begins its prompt.
+        state.current_mut().apply(json!({"type":"compaction_end"}));
+        state.current_mut().apply(json!({
+            "type":"response","id":compact_id,"command":"compact","success":true,"data":{}
+        }));
+        let probe = commands
+            .try_iter()
+            .find(|c| c["type"] == "get_state")
+            .unwrap();
+        state.current_mut().apply(json!({
+            "type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}
+        }));
+        assert!(state.current().native.queue.is_empty());
+        let sent_prompt = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("queued prompt sent after compaction");
+        assert_eq!(sent_prompt["message"], "Follow up");
+
+        // 2. If compaction fails, the message stays queued and the failure is shown.
+        let mut fail_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut fail_state);
+        fail_state
+            .current_mut()
+            .draft
+            .replace_text("Wait for compact");
+        fail_state.send();
+        let compact_cmd = commands.try_recv().unwrap();
+        assert_eq!(compact_cmd["type"], "compact");
+        let compact_id = compact_cmd["id"].as_str().unwrap().to_owned();
+        fail_state.current_mut().apply(json!({
+            "type":"compaction_end","errorMessage":"Compaction failed"
+        }));
+        fail_state.current_mut().apply(json!({
+            "type":"response","id":compact_id,"command":"compact","success":false,"error":"Compaction failed"
+        }));
+        let probe = commands
+            .try_iter()
+            .find(|c| c["type"] == "get_state")
+            .unwrap();
+        fail_state.current_mut().apply(json!({
+            "type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}
+        }));
+        assert_eq!(fail_state.current().native.queue.len(), 1);
+        assert!(fail_state.current().native.queue_held);
+        assert_eq!(
+            fail_state.current().error.as_deref(),
+            Some("Compaction failed")
+        );
+        assert!(
+            !commands.try_iter().any(|c| c["type"] == "prompt"),
+            "failed compaction must not send queued prompt"
+        );
+
+        // 3. "Keep" sends directly without compacting and resets after sending.
+        let mut keep_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut keep_state);
+        keep_state.toggle_keep_full_history();
+        assert!(keep_state.keep_full_history(keep_state.current()));
+        keep_state.current_mut().draft.replace_text("Direct send");
+        keep_state.send();
+        assert!(keep_state.current().native.queue.is_empty());
+        assert!(!keep_state.keep_full_history(keep_state.current()));
+        let sent_cmds: Vec<_> = commands.try_iter().collect();
+        assert!(!sent_cmds.iter().any(|c| c["type"] == "compact"));
+        let sent = sent_cmds
+            .iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("direct prompt");
+        assert_eq!(sent["message"], "Direct send");
+
+        // 4. Typing `/compact` does not double-compact.
+        let mut cmd_state = State::new(".".into(), false);
+        let commands = setup_stale_claude(&mut cmd_state);
+        cmd_state
+            .current_mut()
+            .draft
+            .replace_text("/compact focus on tests");
+        cmd_state.send();
+        assert!(cmd_state.current().native.queue.is_empty());
+        let compact = commands.try_recv().unwrap();
+        assert_eq!(compact["type"], "compact");
+        assert_eq!(compact["customInstructions"], "focus on tests");
+        assert!(commands.try_recv().is_err());
     }
 }

@@ -357,6 +357,8 @@ pub struct SendInput {
     pub context: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_context: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_before_send: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

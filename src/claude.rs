@@ -1466,7 +1466,30 @@ impl Client {
             .get("contextWindow")
             .cloned()
             .unwrap_or(Value::Null);
-        self.usage = json!({"tokens":tokens,"contextWindow":window});
+        let ttl_ms = if self.last_usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(60 * 60_000u64)
+        } else if self.last_usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(5 * 60_000u64)
+        } else {
+            None
+        };
+        let mut usage = json!({
+            "tokens": tokens,
+            "contextWindow": window,
+            "updatedAt": crate::lifecycle::now(),
+        });
+        if let Some(ttl) = ttl_ms {
+            usage["promptCacheTtlMs"] = json!(ttl);
+        }
+        self.usage = usage;
         self.events
             .push(json!({"type":"context_usage","data":{"contextUsage":self.usage}}));
     }

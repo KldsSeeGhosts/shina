@@ -179,6 +179,10 @@ struct ThreadView {
     fresh_session_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     queue_fresh: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_cache_ttl_ms: Option<u64>,
 }
 
 impl ThreadView {
@@ -302,6 +306,8 @@ impl ThreadView {
                 .filter(|q| thread.native.fresh_queue_ids.contains(&q.id))
                 .map(|q| q.id)
                 .collect(),
+            context_updated_at: thread.context.updated_at,
+            prompt_cache_ttl_ms: thread.context.prompt_cache_ttl_ms,
         }
     }
 
@@ -406,6 +412,8 @@ impl ThreadView {
         thread.context_window = self.context_window;
         thread.context.usage = self.context_usage;
         thread.context.phase = self.context_phase;
+        thread.context.updated_at = self.context_updated_at;
+        thread.context.prompt_cache_ttl_ms = self.prompt_cache_ttl_ms;
         thread.configuring = self.configuring;
         if thread.remote.is_some() {
             thread.initializing = self.initializing;
@@ -1093,6 +1101,7 @@ impl State {
                 let mut open_new_after: Option<(usize, String)> = None;
                 let mut handled_background = false;
                 let mut sync_fresh = false;
+                let mut cleared_keep_id = None;
                 {
                     let threads = if server == self.machines.selected {
                         Some(&mut self.threads)
@@ -1108,6 +1117,9 @@ impl State {
                         })
                     }) {
                         thread.finish_remote_send(command.command_id, accepted);
+                        if accepted {
+                            cleared_keep_id = Some(thread.id);
+                        }
                         sync_fresh = accepted && server == self.machines.selected;
                         let bg = thread.background_send.take();
                         let send_new = thread.pending_send_and_new_thread.take();
@@ -1130,6 +1142,9 @@ impl State {
                             open_new_after = Some((thread.id, pending_server));
                         }
                     }
+                }
+                if let Some(thread_id) = cleared_keep_id {
+                    self.set_keep_full_history(&server, thread_id, false);
                 }
                 if sync_fresh {
                     self.sync_fresh_session_notice();
@@ -2944,7 +2959,10 @@ impl State {
                     .unwrap_or_default();
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
-                let _ = self.dispatch_send_with_fresh(Some(input.fresh_context == Some(true)));
+                let _ = self.dispatch_send_with_options(
+                    Some(input.fresh_context == Some(true)),
+                    input.compact_before_send,
+                );
                 if self.current().has_draft_content() {
                     let error = self
                         .current()

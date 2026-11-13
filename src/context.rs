@@ -88,6 +88,8 @@ impl ContextUsage {
 pub struct ContextMeter {
     pub usage: ContextUsage,
     pub phase: ContextPhase,
+    pub updated_at: Option<u64>,
+    pub prompt_cache_ttl_ms: Option<u64>,
     /// The usage popover was opened with a press, Enter or Space.
     pub details_open: bool,
     /// The pointer rests on the ring, or on the popover the ring opened.
@@ -134,6 +136,14 @@ impl ContextMeter {
     /// unknown state instead of reusing the previous percentage.
     pub fn absorb(&mut self, data: &Value) {
         self.usage = ContextUsage::from_stats(data);
+        if self.usage.tokens.is_some() {
+            let usage = &data["contextUsage"];
+            self.updated_at = count(&usage["updatedAt"]).or_else(|| Some(crate::lifecycle::now()));
+            self.prompt_cache_ttl_ms = count(&usage["promptCacheTtlMs"]);
+        } else {
+            self.updated_at = None;
+            self.prompt_cache_ttl_ms = None;
+        }
         if self.usage.has_usage() || self.phase == ContextPhase::Idle {
             self.phase = ContextPhase::Idle;
         } else {
@@ -146,6 +156,8 @@ impl ContextMeter {
         self.phase = ContextPhase::Compacting;
         self.usage.tokens = None;
         self.usage.percent = None;
+        self.updated_at = None;
+        self.prompt_cache_ttl_ms = None;
     }
 
     pub fn finish_compaction(&mut self) {
@@ -153,6 +165,8 @@ impl ContextMeter {
         self.phase = ContextPhase::AwaitingUsage;
         self.usage.tokens = None;
         self.usage.percent = None;
+        self.updated_at = None;
+        self.prompt_cache_ttl_ms = None;
     }
 
     /// A different model has different capacity and a different cache. Do not show the
@@ -161,6 +175,8 @@ impl ContextMeter {
         self.pending = None;
         self.usage = ContextUsage::default();
         self.phase = ContextPhase::Idle;
+        self.updated_at = None;
+        self.prompt_cache_ttl_ms = None;
     }
 
     pub fn state_text(&self) -> Option<&'static str> {
@@ -224,6 +240,58 @@ fn count(value: &Value) -> Option<u64> {
             .filter(|number| number.is_finite() && *number >= 0.0 && *number <= u64::MAX as f64)
             .map(|number| number as u64)
     })
+}
+
+/// Context size below which KSG Code does not suggest or run a Claude resume compaction.
+/// Ported from `COMPACTION_SUGGESTION_MIN_TOKENS` (`packages/shared/src/claudeCompaction.ts`).
+pub const COMPACTION_SUGGESTION_MIN_TOKENS: u64 = 200_000;
+
+/// Fallback prompt-cache TTL: Claude's 1h cache plus slack.
+/// Ported from `CLAUDE_RESUME_COMPACTION_FALLBACK_MS` (`packages/client-runtime/src/state/contextWindow.ts`).
+pub const CLAUDE_RESUME_COMPACTION_FALLBACK_MS: u64 = 70 * 60_000;
+
+/// Ported from KSG Code's `formatContextWindowTokens` (`apps/web/src/lib/contextWindow.ts`).
+pub fn format_context_window_tokens(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 10_000 {
+        let formatted = format!("{:.1}", value as f64 / 1_000.0);
+        format!("{}k", formatted.strip_suffix(".0").unwrap_or(&formatted))
+    } else if value < 999_500 {
+        format!("{}k", (value as f64 / 1_000.0).round() as u64)
+    } else {
+        let formatted = format!("{:.1}", value as f64 / 1_000_000.0);
+        format!("{}m", formatted.strip_suffix(".0").unwrap_or(&formatted))
+    }
+}
+
+pub struct ResumeCompactionInput<'a> {
+    pub harness: &'a str,
+    pub used_tokens: Option<u64>,
+    pub updated_at_ms: Option<u64>,
+    pub prompt_cache_ttl_ms: Option<u64>,
+    pub now_ms: u64,
+}
+
+/// Ported from KSG Code's `shouldOfferResumeCompaction`
+/// (`packages/client-runtime/src/state/contextWindow.ts`).
+pub fn should_offer_resume_compaction(input: ResumeCompactionInput<'_>) -> bool {
+    if input.harness != "claude" {
+        return false;
+    }
+    let Some(used_tokens) = input.used_tokens else {
+        return false;
+    };
+    if used_tokens < COMPACTION_SUGGESTION_MIN_TOKENS {
+        return false;
+    }
+    let Some(updated_at_ms) = input.updated_at_ms else {
+        return false;
+    };
+    let ttl = input
+        .prompt_cache_ttl_ms
+        .unwrap_or(CLAUDE_RESUME_COMPACTION_FALLBACK_MS);
+    input.now_ms >= updated_at_ms && input.now_ms - updated_at_ms >= ttl
 }
 
 pub fn count_text(value: u64) -> String {
@@ -409,5 +477,59 @@ mod tests {
         assert_eq!(meter.state_text(), Some("Compacting context"));
         meter.finish_compaction();
         assert_eq!(meter.state_text(), Some("Waiting for Pi to report usage"));
+    }
+
+    #[test]
+    fn stale_session_rule_checks_harness_token_floor_and_cache_ttl() {
+        let now = 10_000_000_000u64;
+        // Fresh cache (under 70m fallback TTL): do not compact.
+        assert!(!should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "claude",
+            used_tokens: Some(250_000),
+            updated_at_ms: Some(now - (70 * 60_000 - 1)),
+            prompt_cache_ttl_ms: None,
+            now_ms: now,
+        }));
+        // Expired cache (at or over 70m fallback TTL): offer compaction.
+        assert!(should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "claude",
+            used_tokens: Some(200_000),
+            updated_at_ms: Some(now - 70 * 60_000),
+            prompt_cache_ttl_ms: None,
+            now_ms: now,
+        }));
+        // Custom 5m cache TTL overrides fallback.
+        assert!(should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "claude",
+            used_tokens: Some(200_000),
+            updated_at_ms: Some(now - 5 * 60_000),
+            prompt_cache_ttl_ms: Some(5 * 60_000),
+            now_ms: now,
+        }));
+        // No usage data or below 200k tokens or non-claude harness: do not offer.
+        assert!(!should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "claude",
+            used_tokens: None,
+            updated_at_ms: Some(now - 80 * 60_000),
+            prompt_cache_ttl_ms: None,
+            now_ms: now,
+        }));
+        assert!(!should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "claude",
+            used_tokens: Some(199_999),
+            updated_at_ms: Some(now - 80 * 60_000),
+            prompt_cache_ttl_ms: None,
+            now_ms: now,
+        }));
+        assert!(!should_offer_resume_compaction(ResumeCompactionInput {
+            harness: "pi",
+            used_tokens: Some(250_000),
+            updated_at_ms: Some(now - 80 * 60_000),
+            prompt_cache_ttl_ms: None,
+            now_ms: now,
+        }));
+        assert_eq!(format_context_window_tokens(220_000), "220k");
+        assert_eq!(format_context_window_tokens(1_500), "1.5k");
+        assert_eq!(format_context_window_tokens(1_200_000), "1.2m");
     }
 }

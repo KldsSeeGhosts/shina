@@ -10785,6 +10785,13 @@ fn composer(
         area = area.child(dialog(s, p));
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
+    let compact_before_send_tokens = if !collapsed && !show_resume && t.queued_edit.is_none() {
+        s.resume_compaction_tokens(t, crate::lifecycle::now())
+    } else {
+        None
+    };
+    let keep_full_history = s.keep_full_history(t);
+    let compacts_before_send = compact_before_send_tokens.is_some() && !keep_full_history;
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
@@ -10811,6 +10818,8 @@ fn composer(
             } else {
                 "Update queued message"
             }
+        } else if compacts_before_send {
+            "Compact and send"
         } else if t.status.busy() {
             if t.follow_up_queues() {
                 "Queue message"
@@ -10868,6 +10877,46 @@ fn composer(
             .center_y(),
     );
     if collapsed || !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+        if let Some(tokens) = compact_before_send_tokens {
+            let amount = crate::context::format_context_window_tokens(tokens);
+            let tooltip = if keep_full_history {
+                format!("Next send keeps all {amount} tokens.\nClick to compact first")
+            } else {
+                format!("Next send compacts {amount} tokens first.\nClick to keep full history")
+            };
+            let mut toggle = row()
+                .key("composer-compact-send")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Compact {amount} tokens of history before sending"))
+                .help(tooltip)
+                .focusable(true)
+                .h(28.0)
+                .px(8.0)
+                .radius(4.0)
+                .center_y()
+                .gap(6.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .disabled(
+                    composer_disabled(s)
+                        || (s.client.is_some() && !s.machine_connected(&s.machines.selected)),
+                )
+                .on_press(|s: &mut State| s.toggle_keep_full_history())
+                .child(icon("minimize", p.muted));
+            if !keep_full_history {
+                toggle = toggle.fill(p.selected);
+            }
+            if lane >= 480.0 {
+                toggle = toggle.child(label(
+                    if keep_full_history { "Keep" } else { "Compact" },
+                    TextStyle::new(12.0, 500.0),
+                    p.ink,
+                ));
+            }
+            toggle = toggle.child(label(&amount, PIXEL.features(TABULAR), p.muted));
+            action = action.child(toggle);
+        }
         action = action.child(send);
     }
     if !collapsed
@@ -22132,6 +22181,39 @@ pub(crate) mod tests {
                 rt.presented(&format!("fresh-session-row-{fresh_msg_id}"))
                     .is_some(),
                 "{width}"
+            );
+
+            // Part B: disarm /clear (it's already disarmed after send) and verify the
+            // Compact / Keep toggle appears for a stale Claude session >= 200k tokens.
+            let stale_at = crate::lifecycle::now().saturating_sub(80 * 60_000);
+            {
+                let t = rt.state.current_mut();
+                t.harness = "claude".into();
+                t.model_provider = "claude".into();
+                t.session = Some("11111111-1111-4111-8111-111111111111".into());
+                t.status = Status::Completed;
+                t.context.absorb(&json!({
+                    "contextUsage": {
+                        "tokens": 220_000,
+                        "contextWindow": 1_000_000,
+                        "updatedAt": stale_at
+                    }
+                }));
+            }
+            press(&mut rt, "composer-input");
+            rt.frame(1.0);
+            assert!(rt.presented("composer-compact-send").is_some(), "{width}");
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                tree.contains("Compact 220k tokens of history before sending"),
+                "{width}: {tree}"
+            );
+            assert!(tree.contains("220k"), "{width}: {tree}");
+            press(&mut rt, "composer-compact-send");
+            rt.frame(1.0);
+            assert!(
+                rt.state.keep_full_history(rt.state.current()),
+                "{width}: clicking toggle switches to Keep"
             );
         }
     }
