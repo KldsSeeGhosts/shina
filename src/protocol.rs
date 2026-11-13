@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 21;
+pub const MINOR: u32 = 22;
 pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
 pub const VCS_WORKTREES_MINOR: u32 = 20;
+pub const DRAFT_ROUTING_MINOR: u32 = 22;
 pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
 pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to use branches and worktrees.";
@@ -133,6 +134,9 @@ pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
 pub const PEER_TASKS: &str = "peer-tasks-v2";
 pub const THREAD_READ: &str = "thread-read-v2";
 pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
+/// The answering server can open its scratch project (`project.ensureScratch`),
+/// which a manual draft retarget uses when no logical project matches there.
+pub const DRAFT_ROUTING: &str = "draft-routing-v1";
 pub const PEER_DELEGATION: &str = "peer-delegation";
 pub const LINKED_UPDATES: &str = "linked-updates";
 pub const MAX_BROWSE_ENTRIES: usize = 200;
@@ -237,6 +241,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "queue.returnDraft"
         | "input.claim"
         | "project.put"
+        | "project.ensureScratch"
         | "project.remove"
         | "project.clone"
         | "project.cancelClone"

@@ -130,6 +130,8 @@ mod background;
 pub use background::{BackgroundSettings, BackgroundStatus};
 #[path = "client_state.rs"]
 mod client_state;
+#[path = "draft_routing.rs"]
+mod draft_routing;
 #[path = "queued_edit.rs"]
 mod queued_edit;
 #[path = "run_control.rs"]
@@ -11506,6 +11508,11 @@ impl State {
         forced_compact_before_send: Option<bool>,
     ) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
+            return false;
+        }
+        // KSG's useComposerSend refuses while readPendingEnvironmentChange is
+        // set: the draft is still being addressed to its new machine.
+        if self.machines.draft_retarget.is_some() {
             return false;
         }
         if let Some(reason) = self.attachment_send_block_reason() {
