@@ -23,6 +23,15 @@ pub enum Token {
         name: String,
         harness: String,
     },
+    Model {
+        provider_instance: String,
+        model: String,
+        label: String,
+    },
+    Machine {
+        machine: String,
+        label: String,
+    },
 }
 
 impl Token {
@@ -69,6 +78,22 @@ impl Token {
             }
             // Codex and ACP advertise $name. Pi's bridge expands these exactly as KSG does.
             Self::Skill { name, .. } => format!("${name}"),
+            Self::Model {
+                provider_instance,
+                model,
+                ..
+            } => format!("model:{provider_instance}/{model}"),
+            Self::Machine { machine, label } => {
+                let context_id = crate::composer_context::to_kind_scoped_composer_context_id(
+                    "environment",
+                    machine,
+                );
+                crate::composer_context::format_composer_context_reference(
+                    "environment",
+                    &context_id,
+                    label,
+                )
+            }
         }
     }
 }
@@ -402,5 +427,49 @@ mod tests {
             serde_json::from_str(stamped_id.strip_prefix("shina:").unwrap()).unwrap();
         assert_eq!(stamped_json["machine"], "server-a");
         assert_eq!(stamped_json["futureField"]["nested"], 1);
+    }
+
+    #[test]
+    fn model_and_machine_tokens_round_trip_and_old_tokens_still_decode() {
+        let model = Token::Model {
+            provider_instance: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            label: "GPT-6.1 Sol".into(),
+        };
+        let decoded_model = Token::decode(&model.id()).expect("decode model token");
+        assert!(matches!(
+            decoded_model,
+            Token::Model {
+                ref provider_instance,
+                ref model,
+                ref label,
+            } if provider_instance == "codex" && model == "gpt-6.1-sol" && label == "GPT-6.1 Sol"
+        ));
+        assert_eq!(decoded_model.source(), "model:codex/gpt-6.1-sol");
+
+        let machine = Token::Machine {
+            machine: "env-studio".into(),
+            label: "Studio".into(),
+        };
+        let decoded_machine = Token::decode(&machine.id()).expect("decode machine token");
+        assert!(matches!(
+            decoded_machine,
+            Token::Machine {
+                ref machine,
+                ref label,
+            } if machine == "env-studio" && label == "Studio"
+        ));
+        assert_eq!(
+            decoded_machine.source(),
+            "[Studio](t3-context://v1/environment/environment_env-studio)"
+        );
+
+        for old_id in [
+            r#"shina:{"kind":"file","path":"src/main.rs","directory":false}"#,
+            r#"shina:{"kind":"thread","id":42,"title":"Old thread"}"#,
+            r#"shina:{"kind":"skill","name":"pinchtab","harness":"codex"}"#,
+        ] {
+            assert!(Token::decode(old_id).is_some(), "failed to decode {old_id}");
+        }
     }
 }

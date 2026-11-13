@@ -360,6 +360,94 @@ pub fn rank_model_picker_search<'a, T>(
     ranked.into_iter().map(|entry| entry.0).collect()
 }
 
+pub const COMPOSER_MODEL_MENTION_LIMIT: usize = 8;
+
+fn replace_runs(input: &str, matches: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_run = false;
+    for ch in input.chars() {
+        if matches(ch) {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+        } else {
+            out.push(ch);
+            in_run = false;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn mention_search_queries(query: &str) -> Vec<String> {
+    let spaced = replace_runs(query, |c| matches!(c, ':' | '/'));
+    let unhyphenated = replace_runs(&spaced, |c| c == '-');
+    // One letter would fill the menu with models and push files out of it.
+    if unhyphenated.chars().filter(|c| !c.is_whitespace()).count() < 2 {
+        return Vec::new();
+    }
+    if unhyphenated == spaced {
+        vec![spaced]
+    } else {
+        vec![spaced, unhyphenated]
+    }
+}
+
+fn contains_word_prefix(haystack: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    haystack.match_indices(token).any(|(byte_idx, _)| {
+        byte_idx == 0
+            || haystack[..byte_idx]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric())
+    })
+}
+
+/// Ported from KSG Code's `packages/client-runtime/src/composerModelMentions.ts` (`rankComposerModelMentions`).
+pub fn rank_composer_model_mentions<'a, T>(
+    candidates: &'a [T],
+    query: &str,
+    to_searchable: impl Fn(&'a T) -> ModelPickerSearchableModel<'a>,
+) -> Vec<&'a T> {
+    for words in mention_search_queries(query) {
+        let lower_words = words.to_lowercase();
+        let tokens: Vec<&str> = lower_words.split_whitespace().collect();
+        let literal: Vec<&'a T> = candidates
+            .iter()
+            .filter(|candidate| {
+                let model = to_searchable(candidate);
+                let haystack = [
+                    Some(model.name),
+                    model.short_name,
+                    model.sub_provider,
+                    Some(model.driver_kind),
+                    Some(model.provider_display_name),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+                tokens
+                    .iter()
+                    .all(|token| contains_word_prefix(&haystack, token))
+            })
+            .collect();
+        let ranked = rank_model_picker_search(&literal, &words, |item| to_searchable(*item));
+        if !ranked.is_empty() {
+            return ranked
+                .into_iter()
+                .copied()
+                .take(COMPOSER_MODEL_MENTION_LIMIT)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 pub fn provider_model_key(instance_id: &str, slug: &str) -> String {
     format!("{instance_id}:{slug}")
 }
