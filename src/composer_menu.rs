@@ -10,7 +10,14 @@ enum Action {
     Context(crate::composer_context::ComposerContextRecord, String),
 }
 
+#[derive(Clone, Copy)]
+enum ItemIcon {
+    Provider(Vendor),
+    Machine { local: bool },
+}
+
 struct Item {
+    icon: Option<ItemIcon>,
     label: String,
     description: String,
     source: String,
@@ -67,6 +74,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                     )?
                 };
                 let item = Item {
+                    icon: None,
                     label: format!("${}", skill.name),
                     description: skill.description.clone(),
                     source: t.harness.clone(),
@@ -94,6 +102,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
             .slash_matches()
             .into_iter()
             .map(|command| Item {
+                icon: None,
                 label: format!("/{}", command.name),
                 description: command.description,
                 source: command.source,
@@ -117,6 +126,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
                     .contains(&trigger.query.to_lowercase())
             {
                 items.push(Item {
+                    icon: None,
                     label: format!("/skill:{}", skill.name),
                     description: skill.description.clone(),
                     source: t.harness.clone(),
@@ -145,40 +155,6 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
     let query = trigger.query.to_lowercase();
     let mut items = Vec::new();
     let mut notes = Vec::new();
-    if linked(s) {
-        notes.push("File search needs the machine's own Shina.".into());
-    } else if let Some(project) = s.project(t.project) {
-        let inventory = s.composer_sources.paths(&project.path, s.wake.clone());
-        if inventory.loading {
-            notes.push("Searching workspace files...".into());
-        }
-        for entry in inventory
-            .entries
-            .iter()
-            .filter(|entry| entry.relative.to_lowercase().contains(&query))
-            .take(40)
-        {
-            let label = entry
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            items.push(Item {
-                label: label.clone(),
-                description: entry.relative.clone(),
-                source: if entry.directory { "Folder" } else { "File" }.into(),
-                action: Action::Pill(
-                    Token::File {
-                        path: entry.path.clone(),
-                        directory: entry.directory,
-                        source: None,
-                    },
-                    label,
-                ),
-            });
-        }
-    }
     for thread in s
         .threads
         .iter()
@@ -193,6 +169,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
         let record =
             crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
         items.push(Item {
+            icon: None,
             label: thread.title.clone(),
             description: format!("Thread {}", thread.id),
             source: "Thread".into(),
@@ -213,10 +190,143 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
             let record =
                 crate::composer_context::thread_context_record(&env_id, thread.id, &thread.title);
             items.push(Item {
+                icon: None,
                 label: thread.title.clone(),
                 description: format!("Thread {}", thread.id),
                 source: format!("Thread · {machine_name}"),
                 action: Action::Context(record, thread.title.clone()),
+            });
+        }
+    }
+    let trimmed_query = trigger.query.trim().to_lowercase();
+    if !trimmed_query.is_empty() {
+        let current_identity = s.machine_identity(&t.machine);
+        let local_identity = s.machine_identity("local");
+        let mut seen_machines = std::collections::HashSet::new();
+        let mut machine_candidates = vec!["local".to_owned()];
+        for peer in &s.peers {
+            machine_candidates.push(peer.server_id.clone());
+        }
+        if let Some(client) = &s.client {
+            for server in client.linked.keys() {
+                machine_candidates.push(server.clone());
+            }
+        }
+        for machine in machine_candidates {
+            let env_id = s.machine_identity(&machine);
+            if machine == t.machine || env_id == current_identity {
+                continue;
+            }
+            if !seen_machines.insert(env_id.clone()) {
+                continue;
+            }
+            let machine_name = s.machine_label(&machine);
+            if !machine_name.to_lowercase().contains(&trimmed_query) {
+                continue;
+            }
+            let is_local = machine == "local" || env_id == local_identity;
+            let record =
+                crate::composer_context::environment_context_record(&env_id, &machine_name);
+            items.push(Item {
+                icon: Some(ItemIcon::Machine { local: is_local }),
+                label: machine_name.clone(),
+                description: if is_local {
+                    "This machine".into()
+                } else {
+                    String::new()
+                },
+                source: "Machine".into(),
+                action: Action::Context(record, machine_name),
+            });
+        }
+    }
+    let entries = s.provider_instance_entries();
+    let models_by_instance = s.picker_models_by_instance();
+    let mut model_candidates = Vec::new();
+    for entry in &entries {
+        if !crate::model_picker::is_provider_instance_picker_ready(entry) {
+            continue;
+        }
+        for option in models_by_instance
+            .get(&entry.instance_id)
+            .into_iter()
+            .flatten()
+        {
+            if option.is_legacy || option.is_unavailable {
+                continue;
+            }
+            model_candidates.push((entry, option));
+        }
+    }
+    for (entry, option) in crate::model_picker::rank_composer_model_mentions(
+        &model_candidates,
+        &trigger.query,
+        |(entry, option)| crate::model_picker::ModelPickerSearchableModel {
+            driver_kind: &entry.driver_kind,
+            provider_display_name: &entry.display_name,
+            name: &option.name,
+            short_name: option.short_name.as_deref(),
+            sub_provider: option.sub_provider.as_deref(),
+            is_favorite: false,
+        },
+    ) {
+        let display_label = crate::model_picker::get_display_model_name(
+            &option.name,
+            option.short_name.as_deref(),
+            option.sub_provider.as_deref(),
+            false,
+        );
+        let provider_label = option
+            .sub_provider
+            .clone()
+            .unwrap_or_else(|| entry.display_name.clone());
+        let vendor = model_vendor_for(&option.slug, &entry.driver_kind, &entry.display_name);
+        let record = crate::composer_context::model_context_record(
+            &entry.instance_id,
+            &option.slug,
+            &display_label,
+            Some(&provider_label),
+        );
+        items.push(Item {
+            icon: Some(ItemIcon::Provider(vendor)),
+            label: display_label.clone(),
+            description: provider_label,
+            source: "Model".into(),
+            action: Action::Context(record, display_label),
+        });
+    }
+    if linked(s) {
+        notes.push("File search needs the machine's own Shina.".into());
+    } else if let Some(project) = s.project(t.project) {
+        let inventory = s.composer_sources.paths(&project.path, s.wake.clone());
+        if inventory.loading {
+            notes.push("Searching workspace files...".into());
+        }
+        for entry in inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.relative.to_lowercase().contains(&query))
+            .take(40)
+        {
+            let label = entry
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            items.push(Item {
+                icon: None,
+                label: label.clone(),
+                description: entry.relative.clone(),
+                source: if entry.directory { "Folder" } else { "File" }.into(),
+                action: Action::Pill(
+                    Token::File {
+                        path: entry.path.clone(),
+                        directory: entry.directory,
+                        source: None,
+                    },
+                    label,
+                ),
             });
         }
     }
@@ -356,28 +466,37 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
         .slash_index
         .min(items.len().saturating_sub(1));
     for (i, item) in items.into_iter().enumerate() {
+        let mut row_el = row()
+            .key(format!("{prefix}-item-{i}"))
+            .role("option")
+            .label(format!("{} {}", item.label, item.description))
+            .min_h(32.0)
+            .px(8.0)
+            .gap(8.0)
+            .radius(4.0)
+            .center_y()
+            .cursor(rune::Cursor::Pointer)
+            .fill(if i == at {
+                p.coral_bg
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .on_press_tx(move |s: &mut State, tx| {
+                select(s, item.action.clone());
+                s.restore_composer_focus(composer_ui::FocusReason::Inserted);
+                tx.focus("composer-input", false);
+            });
+        if let Some(item_icon) = item.icon {
+            row_el = row_el.child(match item_icon {
+                ItemIcon::Provider(vendor) => provider_icon(s, p, vendor, 16.0),
+                ItemIcon::Machine { local } => {
+                    icon(if local { "monitor" } else { "cloud" }, p.muted).size(16.0, 16.0)
+                }
+            });
+        }
         list = list.child(
-            row()
-                .key(format!("{prefix}-item-{i}"))
-                .role("option")
-                .label(format!("{} {}", item.label, item.description))
-                .min_h(32.0)
-                .px(8.0)
-                .gap(8.0)
-                .radius(4.0)
-                .center_y()
-                .cursor(rune::Cursor::Pointer)
-                .fill(if i == at {
-                    p.coral_bg
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(p.selected)
-                .on_press_tx(move |s: &mut State, tx| {
-                    select(s, item.action.clone());
-                    s.restore_composer_focus(composer_ui::FocusReason::Inserted);
-                    tx.focus("composer-input", false);
-                })
+            row_el
                 .child(
                     label(item.label, TextStyle::new(12.0, 500.0), p.ink)
                         .max_w(220.0)
@@ -427,6 +546,13 @@ pub(super) fn key(s: &mut State, event: &rune::KeyEvent) -> bool {
     true
 }
 
+fn model_vendor_for(model: &str, provider: &str, display_name: &str) -> Vendor {
+    match model_vendor(model, display_name) {
+        Vendor::Other => model_vendor(provider, display_name),
+        vendor => vendor,
+    }
+}
+
 pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
     if let Some((kind, _)) = crate::composer_context::parse_composer_context_href(id) {
         return Some(context_kind_icon(&kind, false));
@@ -438,6 +564,16 @@ pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
         Token::File { .. } => pixel_icons::glyph("file"),
         Token::Thread { .. } => pixel_icons::glyph("thread"),
         Token::Skill { .. } => pixel_icons::glyph("bolt"),
+        Token::Model {
+            provider_instance,
+            model,
+            label,
+        } => provider_glyph(model_vendor_for(&model, &provider_instance, &label)),
+        Token::Machine { machine, .. } => pixel_icons::glyph(if machine == "local" {
+            "monitor"
+        } else {
+            "cloud"
+        }),
     })
 }
 
@@ -450,6 +586,7 @@ fn context_kind_icon(kind: &str, directory: bool) -> &'static Icon {
         "skill" => pixel_icons::glyph("bolt"),
         "terminal" => pixel_icons::glyph("terminal"),
         "environment" => pixel_icons::glyph("monitor"),
+        "model" => pixel_icons::glyph("chip"),
         "preview-annotation" | "element" => pixel_icons::glyph("eye"),
         "review-comment" => pixel_icons::glyph("issue"),
         "response" => pixel_icons::glyph("thread"),
@@ -567,24 +704,53 @@ pub(super) fn pill_appearance(
             let icon = if let Some((kind, context_id)) =
                 crate::composer_context::parse_composer_context_href(id)
             {
-                let directory = records
-                    .iter()
-                    .find(|r| r.context_id == context_id)
-                    .is_some_and(|r| match &r.data {
-                        crate::composer_context::ComposerContextData::Mention { path } => {
-                            path.ends_with('/')
+                let record = records.iter().rev().find(|r| r.context_id == context_id);
+                if let Some(rec) = record {
+                    match &rec.data {
+                        crate::composer_context::ComposerContextData::Model {
+                            instance_id,
+                            model,
+                            provider_label,
+                        } => provider_glyph(model_vendor_for(
+                            model,
+                            instance_id,
+                            provider_label.as_deref().unwrap_or(""),
+                        )),
+                        crate::composer_context::ComposerContextData::Environment {
+                            environment_id,
+                        } => pixel_icons::glyph(
+                            if environment_id == "local" || rec.label == "Local" {
+                                "monitor"
+                            } else {
+                                "cloud"
+                            },
+                        ),
+                        _ => {
+                            let directory = matches!(
+                                &rec.data,
+                                crate::composer_context::ComposerContextData::Mention { path }
+                                    if path.ends_with('/')
+                            ) || matches!(
+                                &rec.data,
+                                crate::composer_context::ComposerContextData::File { mime_type, .. }
+                                    if mime_type == "inode/directory"
+                            ) || images.iter().any(|a| {
+                                crate::composer_context::to_kind_scoped_composer_context_id(
+                                    &kind, &a.id,
+                                ) == context_id
+                                    && a.mime == "inode/directory"
+                            });
+                            context_kind_icon(&kind, directory)
                         }
-                        crate::composer_context::ComposerContextData::File {
-                            mime_type, ..
-                        } => mime_type == "inode/directory",
-                        _ => false,
-                    })
-                    || images.iter().any(|a| {
+                    }
+                } else {
+                    let directory = images.iter().any(|a| {
                         crate::composer_context::to_kind_scoped_composer_context_id(&kind, &a.id)
                             == context_id
                             && a.mime == "inode/directory"
                     });
-                context_kind_icon(&kind, directory)
+                    context_kind_icon(&kind, directory)
+                }
             } else if let Some(token) = Token::decode(id) {
                 match token {
                     Token::File {
@@ -597,6 +763,16 @@ pub(super) fn pill_appearance(
                     } if owner != machine => pixel_icons::glyph("thread"),
                     Token::Thread { .. } => pixel_icons::glyph("thread"),
                     Token::Skill { .. } => pixel_icons::glyph("bolt"),
+                    Token::Model {
+                        provider_instance,
+                        model,
+                        label,
+                    } => provider_glyph(model_vendor_for(&model, &provider_instance, &label)),
+                    Token::Machine { machine, .. } => pixel_icons::glyph(if machine == "local" {
+                        "monitor"
+                    } else {
+                        "cloud"
+                    }),
                 }
             } else {
                 pixel_icons::glyph("unresolved")
