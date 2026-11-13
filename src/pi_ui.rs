@@ -798,24 +798,8 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));
-    for (mode, description) in [
-        (
-            AccessMode::ReadOnly,
-            "Read files and coordinate. Delegate code changes to a thread.",
-        ),
-        (
-            AccessMode::Supervised,
-            "Ask before commands and file changes.",
-        ),
-        (
-            AccessMode::Edits,
-            "Auto-approve edits, ask before other actions.",
-        ),
-        (
-            AccessMode::Full,
-            "Allow commands and edits without prompts.",
-        ),
-    ] {
+    for mode in AccessMode::ALL {
+        let description = mode.description();
         card = card.child(
             col()
                 .key(format!("access-{}", mode.id()))

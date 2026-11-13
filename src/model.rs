@@ -5454,7 +5454,7 @@ impl State {
             let harness = self.default_harness.clone();
             self.threads[index].harness = harness.clone();
             self.threads[index].native.access =
-                AccessMode::parse(&self.thread_defaults.access).unwrap_or_default();
+                AccessMode::parse(&self.thread_defaults.access).unwrap_or(AccessMode::Supervised);
             if let Some(selection) = self.thread_defaults.models.get(&harness)
                 && !selection.provider.is_empty()
                 && !selection.model.is_empty()
@@ -5476,8 +5476,9 @@ impl State {
         else {
             return;
         };
-        if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-            self.threads[index].native.access = access;
+        if let Some(access) = seed["access"].as_str() {
+            self.threads[index].native.access =
+                AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
         }
         let models = self.harness_models(harness);
         let selection: Option<(String, String)> =
@@ -5490,8 +5491,9 @@ impl State {
             self.inherit_composer(index, &Value::Null);
             // Access inheritance does not depend on model discovery. A missing model
             // must never replace the source thread's read-only mode with a broader default.
-            if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-                self.threads[index].native.access = access;
+            if let Some(access) = seed["access"].as_str() {
+                self.threads[index].native.access =
+                    AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
             }
             return;
         };
@@ -8436,6 +8438,9 @@ impl State {
         self.thread_defaults =
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
+        if AccessMode::parse(&self.thread_defaults.access).is_none() {
+            self.thread_defaults.access = AccessMode::Supervised.id().into();
+        }
         self.thread_defaults.validate()?;
         self.model_favorites = match index.get("modelFavorites") {
             None | Some(Value::Null) => None,
@@ -8543,7 +8548,8 @@ impl State {
                     thread.native.previous_session =
                         record["previousSession"].as_str().map(str::to_owned);
                     if let Some(access) = record.get("accessMode") {
-                        thread.native.access = AccessMode::parse(access.as_str()?)?;
+                        thread.native.access =
+                            AccessMode::parse(access.as_str()?).unwrap_or(AccessMode::Supervised);
                     }
                     if index["version"] == 4 && record.get("lifecycle").is_none() {
                         return None;

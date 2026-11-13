@@ -934,12 +934,7 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
                 rune::Key::Right => 1,
                 _ => return false,
             };
-            let modes = [
-                crate::model::AccessMode::ReadOnly,
-                crate::model::AccessMode::Supervised,
-                crate::model::AccessMode::Edits,
-                crate::model::AccessMode::Full,
-            ];
+            let modes = crate::model::AccessMode::ALL;
             let Some(at) = modes.iter().position(|mode| {
                 tx.focused() == Some(format!("overflow-access-{}", mode.id()).as_str())
             }) else {
@@ -960,24 +955,8 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         .child(pixel_label("Permissions", p.muted));
     let mut options = row().gap(2.0).padding(2.0).radius(4.0).fill(p.selected);
     let mut description = "";
-    for (mode, text) in [
-        (
-            crate::model::AccessMode::ReadOnly,
-            "Read files and coordinate. Delegate code changes to a thread.",
-        ),
-        (
-            crate::model::AccessMode::Supervised,
-            "Ask before commands and file changes.",
-        ),
-        (
-            crate::model::AccessMode::Edits,
-            "Auto-approve edits, ask before other actions.",
-        ),
-        (
-            crate::model::AccessMode::Full,
-            "Allow commands and edits without prompts.",
-        ),
-    ] {
+    for mode in crate::model::AccessMode::ALL {
+        let text = mode.description();
         if mode == shown {
             description = text;
         }

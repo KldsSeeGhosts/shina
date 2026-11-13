@@ -102,15 +102,24 @@ pub enum AccessMode {
     ReadOnly,
     Supervised,
     Edits,
+    Auto,
     #[default]
     Full,
 }
 impl AccessMode {
+    pub const ALL: [Self; 5] = [
+        Self::ReadOnly,
+        Self::Supervised,
+        Self::Edits,
+        Self::Auto,
+        Self::Full,
+    ];
     pub fn id(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised => "approval-required",
             Self::Edits => "auto-accept-edits",
+            Self::Auto => "auto",
             Self::Full => "full-access",
         }
     }
@@ -119,7 +128,17 @@ impl AccessMode {
             Self::ReadOnly => "Read only",
             Self::Supervised => "Supervised",
             Self::Edits => "Auto-accept edits",
+            Self::Auto => "Auto",
             Self::Full => "Full access",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read files and coordinate. Delegate code changes to a thread.",
+            Self::Supervised => "Ask before commands and file changes.",
+            Self::Edits => "Auto-approve edits, ask before other actions.",
+            Self::Auto => "Supported providers approve routine actions; others still ask.",
+            Self::Full => "Allow commands and edits without prompts.",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -127,6 +146,7 @@ impl AccessMode {
             "read-only" => Some(Self::ReadOnly),
             "approval-required" => Some(Self::Supervised),
             "auto-accept-edits" => Some(Self::Edits),
+            "auto" => Some(Self::Auto),
             "full-access" => Some(Self::Full),
             _ => None,
         }

@@ -2244,9 +2244,13 @@ impl State {
                 .ok_or("A bounded brief is required.")?;
             origin.attempt_message = brief.into();
             let mut thread = Thread::new(self.next_id);
-            thread.native.access =
-                AccessMode::parse(args["access"].as_str().unwrap_or("approval-required"))
-                    .ok_or("Unknown peer worker access mode.")?;
+            thread.native.access = match args.get("access") {
+                None | Some(Value::Null) => AccessMode::Supervised,
+                Some(Value::String(access)) => {
+                    AccessMode::parse(access).unwrap_or(AccessMode::Supervised)
+                }
+                Some(_) => return Err("Unknown peer worker access mode.".into()),
+            };
             thread.title = args["title"]
                 .as_str()
                 .unwrap_or("Delegated task")

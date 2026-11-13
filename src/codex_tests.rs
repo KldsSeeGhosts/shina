@@ -944,11 +944,12 @@ fn authentication_denial_stops_without_retry_or_configuration_changes() {
 
 #[test]
 fn runtime_modes_match_ksg_and_read_only_cannot_escalate() {
-    for (mode, approval, sandbox) in [
-        ("approval-required", "untrusted", "readOnly"),
-        ("auto-accept-edits", "on-request", "workspaceWrite"),
-        ("full-access", "never", "dangerFullAccess"),
-        ("read-only", "never", "readOnly"),
+    for (mode, approval, reviewer, sandbox) in [
+        ("approval-required", "untrusted", "user", "readOnly"),
+        ("auto-accept-edits", "on-request", "user", "workspaceWrite"),
+        ("auto", "on-request", "auto_review", "workspaceWrite"),
+        ("full-access", "never", "user", "dangerFullAccess"),
+        ("read-only", "never", "user", "readOnly"),
     ] {
         let mut client = Client::new(spec(SessionSource::New, mode));
         client.session = Some("fixture".into());
@@ -957,6 +958,7 @@ fn runtime_modes_match_ksg_and_read_only_cannot_escalate() {
             .command(json!({"type":"prompt","message":"test"}))
             .unwrap();
         assert_eq!(client.wire[0]["params"]["approvalPolicy"], approval);
+        assert_eq!(client.wire[0]["params"]["approvalsReviewer"], reviewer);
         assert_eq!(client.wire[0]["params"]["sandboxPolicy"]["type"], sandbox);
     }
 }

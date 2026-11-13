@@ -777,3 +777,27 @@ fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
     assert_eq!(t.tools[0].structured["details"]["custom"], "value");
     assert_eq!(t.tools[0].output, "Output");
 }
+
+#[test]
+fn access_mode_id_parse_round_trip_and_unknown_fallback() {
+    for mode in AccessMode::ALL {
+        assert_eq!(AccessMode::parse(mode.id()), Some(mode));
+    }
+    assert_eq!(AccessMode::Auto.id(), "auto");
+    assert_eq!(AccessMode::Auto.label(), "Auto");
+    assert_eq!(AccessMode::parse("future-mode"), None);
+
+    let mut state = State::new(PathBuf::new(), false);
+    let mut snapshot = state.snapshot();
+    snapshot["threads"][0]["accessMode"] = json!("future-mode");
+    state.restore_global(&snapshot).unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+
+    state
+        .execute_command(&crate::protocol::Command::new(
+            "thread.configure",
+            json!({"threadId": state.current().id, "access": "future-mode"}),
+        ))
+        .unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+}

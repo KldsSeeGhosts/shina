@@ -954,3 +954,35 @@ fn claude_reports_manifest_descriptors_and_applies_options_and_1m_suffix() {
     assert_eq!(req["request"]["subtype"], "apply_flag_settings");
     assert_eq!(req["request"]["settings"]["fastMode"], true);
 }
+
+#[test]
+fn auto_mode_maps_to_claude_auto_permission_mode() {
+    let client = Client::new(spec(SessionSource::New, "auto"));
+    let mut command = Command::new("claude");
+    client.launch(&mut command);
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let index = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .unwrap();
+    assert_eq!(args[index + 1], "auto");
+
+    let mut client = client;
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "models": []
+        }))
+        .unwrap();
+    client.wire.clear();
+    client
+        .command(json!({"type":"set_access_mode","accessMode":"auto"}))
+        .unwrap();
+    assert_eq!(client.wire[0]["request"]["subtype"], "set_permission_mode");
+    assert_eq!(client.wire[0]["request"]["mode"], "auto");
+}

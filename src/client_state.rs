@@ -1575,8 +1575,9 @@ impl State {
                 thread.harness_state["serviceTier"] = draft["serviceTier"].clone();
                 thread.native.access = draft["access"]
                     .as_str()
-                    .and_then(AccessMode::parse)
-                    .unwrap_or_default();
+                    .map_or(AccessMode::default(), |access| {
+                        AccessMode::parse(access).unwrap_or(AccessMode::Supervised)
+                    });
                 if let Some(life) = draft.get("life") {
                     thread.life = serde_json::from_value(life.clone())
                         .map_err(|_| "Invalid saved client draft lifecycle.")?;
@@ -2883,7 +2884,9 @@ impl State {
                     }
                 }
                 if let Some(access) = args["access"].as_str() {
-                    self.set_access_mode(AccessMode::parse(access).ok_or("Unknown access mode.")?);
+                    self.set_access_mode(
+                        AccessMode::parse(access).unwrap_or(AccessMode::Supervised),
+                    );
                 }
             }
             "thread.retry" => self.retry(),
@@ -2919,8 +2922,9 @@ impl State {
                 if let Some(tier) = args["serviceTier"].as_str() {
                     self.current_mut().set_service_tier(tier.into());
                 }
-                if let Some(access) = args["access"].as_str().and_then(AccessMode::parse) {
-                    self.current_mut().native.access = access;
+                if let Some(access) = args["access"].as_str() {
+                    self.current_mut().native.access =
+                        AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
                 }
                 return Ok(json!({"threadId":self.current().id}));
             }

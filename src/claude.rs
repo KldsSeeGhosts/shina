@@ -131,6 +131,7 @@ fn permission_mode(access: &str) -> &'static str {
     match access {
         "full-access" => "bypassPermissions",
         "auto-accept-edits" => "acceptEdits",
+        "auto" => "auto",
         "read-only" => "dontAsk",
         _ => "default",
     }

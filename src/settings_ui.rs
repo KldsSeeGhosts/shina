@@ -818,12 +818,7 @@ fn default_access(p: Palette, current: &str) -> El {
         .gap(2.0)
         .radius(4.0)
         .border(1.0, p.line);
-    for mode in [
-        crate::model::AccessMode::ReadOnly,
-        crate::model::AccessMode::Supervised,
-        crate::model::AccessMode::Edits,
-        crate::model::AccessMode::Full,
-    ] {
+    for mode in crate::model::AccessMode::ALL {
         let on = mode.id() == current;
         group = group.child(
             row()
