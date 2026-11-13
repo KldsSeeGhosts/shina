@@ -405,6 +405,246 @@ impl Client {
 }
 
 #[test]
+fn ordinary_files_transfer_between_linked_servers_and_survive_restart() {
+    use sha2::Digest;
+    fn upload(http: &reqwest::blocking::Client, base: &str, token: &str, bytes: &[u8]) -> Value {
+        let start = http
+            .post(format!("{base}/v1/uploads"))
+            .bearer_auth(token)
+            .json(
+                &json!({"type":"file","name":"ordinary.bin","mimeType":"application/octet-stream",
+                "length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(bytes))}),
+            )
+            .send()
+            .unwrap();
+        assert!(start.status().is_success(), "{start:?}");
+        let started: Value = start.json().unwrap();
+        let id = started["uploadId"].as_str().unwrap();
+        let mut offset = 0;
+        for chunk in bytes.chunks(protocol::PAGE_BYTES) {
+            let response = http
+                .put(format!("{base}/v1/uploads/{id}?offset={offset}"))
+                .bearer_auth(token)
+                .body(chunk.to_vec())
+                .send()
+                .unwrap();
+            assert!(response.status().is_success(), "{response:?}");
+            offset += chunk.len();
+        }
+        let response = http
+            .post(format!("{base}/v1/uploads/{id}/commit"))
+            .bearer_auth(token)
+            .send()
+            .unwrap();
+        assert!(response.status().is_success(), "{response:?}");
+        response.json().unwrap()
+    }
+    fn download(
+        http: &reqwest::blocking::Client,
+        base: &str,
+        token: &str,
+        id: &str,
+        length: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while bytes.len() < length {
+            let response = http
+                .get(format!(
+                    "{base}/v1/blobs/{id}?offset={}&limit={}",
+                    bytes.len(),
+                    protocol::PAGE_BYTES
+                ))
+                .bearer_auth(token)
+                .send()
+                .unwrap();
+            assert!(response.status().is_success(), "{response:?}");
+            assert_eq!(
+                response.headers()["x-blob-length"].to_str().unwrap(),
+                length.to_string()
+            );
+            let chunk = response.bytes().unwrap();
+            assert!(!chunk.is_empty() && chunk.len() <= protocol::PAGE_BYTES);
+            bytes.extend_from_slice(&chunk);
+        }
+        assert_eq!(bytes.len(), length);
+        bytes
+    }
+    let mut a = Profile::new();
+    let mut b = Profile::new();
+    a.launch(&["serve"]);
+    b.launch(&["serve"]);
+    let discovery_a = a.discovery();
+    let discovery_b = b.discovery();
+    let base_a = format!("http://127.0.0.1:{}", discovery_a["port"]);
+    let base_b = format!("http://127.0.0.1:{}", discovery_b["port"]);
+    let mut local_a = a.client(uuid::Uuid::new_v4());
+    let mut local_b = b.client(uuid::Uuid::new_v4());
+    let paired = a.cli(&["pair"]);
+    assert!(paired.status.success());
+    let code = String::from_utf8(paired.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host_a = format!("127.0.0.1:{}", discovery_a["port"]);
+    let linked = b.cli(&["link", &host_a, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            b.root
+                .join("Shina/linked")
+                .join(discovery_a["serverId"].as_str().unwrap())
+                .join("credential.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let token_a = credential["token"].as_str().unwrap();
+    let mut linked_a = Client::with_token(&discovery_a, token_a.into());
+    let hello = linked_a.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":10,"projectionSchema":1}),
+        json!("files-hello"),
+    );
+    for capability in [
+        protocol::MODEL_FAVORITES,
+        protocol::MODEL_CATALOG_REFRESH,
+        protocol::MODEL_OPTIONS,
+        protocol::THREAD_FIND,
+        protocol::THREAD_SEARCH,
+        protocol::COMPOSER_CONTEXT,
+        protocol::FILE_ATTACHMENTS,
+    ] {
+        assert!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == capability),
+            "{capability}: {hello}"
+        );
+    }
+    let old = linked_a.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":9,"projectionSchema":1}),
+        json!("files-old-hello"),
+    );
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::FILE_ATTACHMENTS)
+    );
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let bytes: Vec<_> = (0..protocol::PAGE_BYTES * 2 + 71)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let first = upload(&http, &base_a, &local_a.token, &bytes);
+    let id = first["id"].as_str().unwrap();
+    assert_eq!(id, format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)));
+    let fetched = download(&http, &base_a, token_a, id, bytes.len());
+    assert_eq!(fetched, bytes);
+    let second = upload(&http, &base_b, &local_b.token, &fetched);
+    assert_eq!(
+        second["id"], id,
+        "content addressing is independent of the owning machine"
+    );
+    assert_eq!(
+        upload(&http, &base_b, &local_b.token, &bytes)["id"],
+        id,
+        "identical uploads are idempotent"
+    );
+    assert_eq!(
+        download(&http, &base_b, &local_b.token, id, bytes.len()),
+        bytes
+    );
+    assert_eq!(
+        http.get(format!("{base_a}/v1/blobs/{id}"))
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    for (length, error) in [
+        (0, "'ordinary.bin' is empty or could not be read."),
+        (
+            50 * 1024 * 1024 + 1,
+            "'ordinary.bin' exceeds the 50 MB attachment limit.",
+        ),
+    ] {
+        let response = http
+            .post(format!("{base_b}/v1/uploads"))
+            .bearer_auth(&local_b.token)
+            .json(
+                &json!({"type":"file","name":"ordinary.bin","mimeType":"application/octet-stream",
+                "length":length,"sha256":"0".repeat(64)}),
+            )
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.json::<Value>().unwrap()["error"]["message"], error);
+    }
+    let record = json!({"version":1,"contextId":"file_reference","kind":"file","label":"ordinary.bin",
+        "attachmentId":id,"name":"ordinary.bin","mimeType":"application/octet-stream","sizeBytes":bytes.len()});
+    for (client, attachment) in [(&mut local_a, &first), (&mut local_b, &second)] {
+        let sent = client.command(
+            "thread.send",
+            json!({"threadId":1,
+            "text":"Inspect [ordinary.bin](t3-context://v1/file/file_reference)",
+            "attachments":[attachment],"context":{"version":1,"records":[record]},"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+        client.until(|state| state["threads"][0]["status"] == "Completed");
+        assert_eq!(
+            client.snapshot["threads"][0]["messages"][0]["context"]["records"][0]["attachmentId"],
+            id
+        );
+        assert_eq!(
+            client.snapshot["threads"][0]["messages"][0]["images"][0]["id"],
+            id
+        );
+    }
+    drop(local_b);
+    b.stop();
+    b.launch(&["serve"]);
+    let mut restored = b.client(uuid::Uuid::new_v4());
+    restored.until(|state| {
+        !state["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    });
+    assert_eq!(
+        restored.snapshot["threads"][0]["messages"][0]["context"]["records"][0],
+        record
+    );
+    let restarted_base = format!("http://127.0.0.1:{}", b.discovery()["port"]);
+    assert_eq!(
+        download(&http, &restarted_base, &restored.token, id, bytes.len()),
+        bytes
+    );
+    drop(restored);
+    drop(local_a);
+    drop(linked_a);
+    a.stop();
+    b.stop();
+}
+
+#[test]
 fn linked_thread_reads_disambiguate_machine_ids_and_page_unrelated_threads() {
     let mut home = Profile::new();
     let mut target = Profile::new();

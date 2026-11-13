@@ -1,4 +1,5 @@
-//! Composer attachments. Images use owned blobs; ordinary files retain absolute path references.
+//! Composer attachments. Images and transferred files use owned blobs.
+//! Local ordinary files and path mentions retain absolute path references until transfer.
 //!
 //! Pi accepts images as typed prompt parts: `{ type: "image", data, mimeType }`. Shina keeps
 //! the bytes in an immutable, Shina-owned blob store under its local data directory and keeps
@@ -18,7 +19,9 @@ use std::{
 
 /// A message carries at most this many images.
 pub const MAX_IMAGES: usize = 8;
-pub const MAX_ATTACHMENTS: usize = 20;
+pub const MAX_ATTACHMENTS: usize = 100;
+/// KSG contracts/chatAttachment.PROVIDER_SEND_TURN_MAX_FILE_BYTES.
+pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: u64 = 256 * 1024;
 /// The largest single image Shina accepts, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -26,11 +29,11 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 /// Caps one decode at 32 megapixels, below Rune's 64 megapixel clipboard limit.
 pub(crate) const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
-const NAME_LIMIT: usize = 120;
+const NAME_LIMIT: usize = 255;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attachment {
-    /// A blob filename for images, or a hash of the absolute ordinary-file path.
+    /// A content-addressed blob filename, or a hash of a local path reference.
     pub id: String,
     /// The name shown in a chip. Display only, never used as a path.
     pub name: String,
@@ -38,7 +41,7 @@ pub struct Attachment {
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
-    /// Ordinary file or folder. Never copied into Shina's image store.
+    /// An ordinary file or folder, including a staged file's owned blob path.
     pub path: Option<PathBuf>,
 }
 
@@ -62,6 +65,30 @@ impl Attachment {
     /// Restore image blobs only at their expected size. Retain missing ordinary-file references.
     pub fn from_value(value: &Value) -> Option<Self> {
         let id = value["id"].as_str()?;
+        if safe_file_id(id) {
+            let name = value["name"].as_str()?;
+            let mime = value["mime"].as_str()?;
+            let bytes = value["bytes"].as_u64()?;
+            validate_file_metadata(name, mime, bytes).ok()?;
+            let path = value["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.is_absolute()
+                        && path.file_name().is_some_and(|file| file == id)
+                        && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes)
+                })
+                .or_else(|| directory().map(|directory| directory.join(id)))?;
+            return Some(Self {
+                id: id.into(),
+                name: name.into(),
+                mime: mime.into(),
+                width: 0,
+                height: 0,
+                bytes,
+                path: Some(path),
+            });
+        }
         if let Some(path) = value["path"].as_str() {
             let path = PathBuf::from(path);
             let name = value["name"].as_str()?;
@@ -179,7 +206,216 @@ pub fn preview_path_for(attachment: &Attachment) -> Option<PathBuf> {
 }
 
 fn path_for_id(id: &str) -> Option<PathBuf> {
-    safe_id(id).then(|| directory().map(|directory| directory.join(id)))?
+    (safe_id(id) || safe_file_id(id)).then(|| directory().map(|directory| directory.join(id)))?
+}
+
+/// Ordinary files have immutable, content-addressed identities, distinct from image IDs
+/// and legacy path references. No caller-supplied filename is a storage path.
+pub(crate) fn safe_file_id(id: &str) -> bool {
+    id.strip_prefix("file-")
+        .and_then(|id| id.strip_suffix(".bin"))
+        .is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+fn validate_file_metadata(name: &str, mime: &str, length: u64) -> Result<(), String> {
+    if name.trim().is_empty()
+        || name.encode_utf16().count() > 255
+        || mime.trim().is_empty()
+        || mime.encode_utf16().count() > 100
+    {
+        return Err("Invalid file attachment metadata.".into());
+    }
+    if length == 0 {
+        return Err(format!("'{name}' is empty or could not be read."));
+    }
+    if length > MAX_FILE_BYTES {
+        return Err(format!("'{name}' exceeds the 50 MB attachment limit."));
+    }
+    Ok(())
+}
+
+/// Ported from KSG assets/AttachmentUpload.storeAttachmentUpload. Publish without
+/// replacement; a duplicate must contain the same bytes. Shina uses SHA-256 IDs.
+pub(crate) fn store_uploaded_file(
+    directory: &Path,
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<Attachment, String> {
+    use sha2::Digest;
+    use std::io::Write;
+    validate_file_metadata(name, mime, bytes.len() as u64)?;
+    fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let directory = directory.canonicalize().map_err(|e| e.to_string())?;
+    let id = format!("file-{:x}.bin", sha2::Sha256::digest(bytes));
+    let path = directory.join(&id);
+    let staged = directory.join(format!("{}.part", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::File::create_new(&staged).map_err(|e| e.to_string())?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        match fs::hard_link(&staged, &path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64)
+                    && fs::read(&path).is_ok_and(|existing| existing == bytes)
+                {
+                    Ok(())
+                } else {
+                    Err("Attachment already uploaded.".into())
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })();
+    let _ = fs::remove_file(&staged);
+    result?;
+    Ok(Attachment {
+        id,
+        name: name.trim().into(),
+        mime: mime.trim().into(),
+        width: 0,
+        height: 0,
+        bytes: bytes.len() as u64,
+        path: Some(path),
+    })
+}
+
+pub(crate) fn transfer_file_bytes(attachment: &Attachment) -> Result<Vec<u8>, String> {
+    validate_file_metadata(&attachment.name, &attachment.mime, attachment.bytes)?;
+    let path = path_for(attachment).ok_or("The original attachment is no longer available.")?;
+    let file =
+        fs::File::open(&path).map_err(|_| "The original attachment is no longer available.")?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Folders cannot be transferred as file attachments.".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    validate_file_metadata(&attachment.name, &attachment.mime, bytes.len() as u64)?;
+    if safe_file_id(&attachment.id) {
+        use sha2::Digest;
+        if attachment.id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+            return Err("File hash mismatch.".into());
+        }
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn stage_transfer_file(attachment: &Attachment) -> Result<Attachment, String> {
+    let bytes = transfer_file_bytes(attachment)?;
+    store_uploaded_file(
+        &directory().ok_or("The attachment directory is unavailable.")?,
+        &attachment.name,
+        &attachment.mime,
+        &bytes,
+    )
+}
+
+/// Stage only submitted/transferred files. Local path mentions and draft editing keep
+/// their existing path-reference behavior; sent records never depend on that source path.
+pub(crate) fn stage_prompt_files(prompt: &mut Prompt) -> Result<(), String> {
+    validate_prompt_images(&prompt.images)?;
+    let mut replacements = std::collections::HashMap::new();
+    let attached_ids = prompt.draft.as_ref().map(|draft| {
+        draft
+            .attachments
+            .iter()
+            .map(|a| a.id.clone())
+            .chain(
+                prompt
+                    .context
+                    .iter()
+                    .flat_map(|context| context.records.iter())
+                    .filter_map(|r| match &r.data {
+                        crate::composer_context::ComposerContextData::File {
+                            attachment_id,
+                            ..
+                        } => Some(attachment_id.clone()),
+                        _ => None,
+                    }),
+            )
+            .collect::<std::collections::HashSet<_>>()
+    });
+    for attachment in Arc::make_mut(&mut prompt.images) {
+        if attached_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&attachment.id))
+        {
+            continue; // Legacy path mentions are not uploaded file attachments.
+        }
+        let owned = directory().and_then(|d| d.join(&attachment.id).canonicalize().ok());
+        let already_staged = safe_file_id(&attachment.id)
+            && owned.is_some()
+            && attachment.path.as_ref().and_then(|p| p.canonicalize().ok()) == owned;
+        if !attachment.is_image() && attachment.mime != "inode/directory" && !already_staged {
+            let staged = stage_transfer_file(attachment)?;
+            replacements.insert(attachment.id.clone(), staged.clone());
+            *attachment = staged;
+        }
+    }
+    fn rewrite(
+        records: &mut [crate::composer_context::ComposerContextRecord],
+        replacements: &std::collections::HashMap<String, Attachment>,
+    ) {
+        for record in records {
+            if let crate::composer_context::ComposerContextData::File {
+                attachment_id,
+                name,
+                mime_type,
+                size_bytes,
+            } = &mut record.data
+                && let Some(attachment) = replacements.get(attachment_id)
+            {
+                *attachment_id = attachment.id.clone();
+                *name = attachment.name.clone();
+                *mime_type = attachment.mime.clone();
+                *size_bytes = attachment.bytes;
+            }
+        }
+    }
+    if let Some(context) = &mut prompt.context {
+        rewrite(&mut context.records, &replacements);
+    }
+    if let Some(draft) = &mut prompt.draft {
+        for attachment in &mut draft.attachments {
+            if let Some(staged) = replacements.get(&attachment.id) {
+                *attachment = staged.clone();
+            }
+        }
+        rewrite(&mut draft.context, &replacements);
+    }
+    Ok(())
+}
+
+pub(crate) fn stage_clipboard_files(
+    records: &mut Vec<crate::composer_context::ComposerContextRecord>,
+    files: &mut std::collections::HashMap<String, Attachment>,
+) -> Result<(), String> {
+    let mut prompt = Prompt::with_context(
+        String::new(),
+        files.values().cloned().collect(),
+        Some(crate::composer_context::MessageContext {
+            version: 1,
+            records: records.clone(),
+        }),
+    );
+    stage_prompt_files(&mut prompt)?;
+    *records = prompt.context.unwrap().records;
+    *files = prompt
+        .images
+        .iter()
+        .map(|file| (file.id.clone(), file.clone()))
+        .collect();
+    Ok(())
 }
 
 /// A blob id is one filename with a supported image extension.
@@ -484,7 +720,7 @@ pub fn encode_images(images: &[Attachment]) -> Result<Vec<Value>, String> {
 pub fn validate_prompt_images(images: &[Attachment]) -> Result<(), String> {
     if images.len() > MAX_ATTACHMENTS {
         return Err(format!(
-            "A message can carry up to {MAX_ATTACHMENTS} attachments."
+            "You can attach up to {MAX_ATTACHMENTS} files per message or question response."
         ));
     }
     let count = images.iter().filter(|a| a.is_image()).count();
@@ -933,6 +1169,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transferred_files_are_content_addressed_immutable_and_validate_ksg_boundaries() {
+        let directory = crate::store::directory()
+            .unwrap()
+            .join("file-transfer-store");
+        let bytes = b"\0ordinary binary\xff";
+        let first = store_uploaded_file(&directory, "notes.bin", "application/octet-stream", bytes)
+            .unwrap();
+        let again =
+            store_uploaded_file(&directory, "renamed.dat", "application/octet-stream", bytes)
+                .unwrap();
+        assert_eq!(first.id, again.id);
+        assert!(safe_file_id(&first.id));
+        assert!(!first.is_image());
+        assert_eq!(transfer_file_bytes(&first).unwrap(), bytes);
+        assert_eq!(
+            Attachment::from_value(&first.to_value()),
+            Some(first.clone())
+        );
+        assert_ne!(
+            first.id,
+            store_uploaded_file(
+                &directory,
+                "other.bin",
+                "application/octet-stream",
+                b"changed"
+            )
+            .unwrap()
+            .id
+        );
+        assert!(validate_file_metadata("ok", "application/octet-stream", MAX_FILE_BYTES).is_ok());
+        assert_eq!(
+            validate_file_metadata("large.bin", "application/octet-stream", MAX_FILE_BYTES + 1)
+                .unwrap_err(),
+            "'large.bin' exceeds the 50 MB attachment limit."
+        );
+        assert_eq!(
+            store_uploaded_file(&directory, "empty.txt", "text/plain", b"").unwrap_err(),
+            "'empty.txt' is empty or could not be read."
+        );
+        assert!(validate_file_metadata(&"n".repeat(256), "text/plain", 1).is_err());
+        assert!(validate_file_metadata("name", &"m".repeat(101), 1).is_err());
+        for invalid in [
+            "../file-a.bin",
+            "file-a.bin",
+            "file-foo.png",
+            "file-000000000000000000000000000000000000000000000000000000000000000G.bin",
+        ] {
+            assert!(!safe_file_id(invalid), "{invalid}");
+        }
+        fs::write(first.path.as_ref().unwrap(), b"tampered").unwrap();
+        assert_eq!(
+            transfer_file_bytes(&first).unwrap_err(),
+            "File hash mismatch."
+        );
+        assert_eq!(
+            store_uploaded_file(&directory, "notes.bin", "application/octet-stream", bytes)
+                .unwrap_err(),
+            "Attachment already uploaded."
+        );
+    }
+
+    #[test]
+    fn staged_prompt_files_rewrite_context_and_snapshot_but_not_reference_ids_or_source_draft() {
+        let directory = crate::store::directory().unwrap();
+        let path = directory.join("immutable-send.txt");
+        fs::write(&path, b"original").unwrap();
+        let file = attach_file(&path).unwrap();
+        let record = crate::composer_context::attachment_context_record(&file);
+        let text = crate::composer_context::format_composer_context_reference(
+            "file",
+            &record.context_id,
+            "immutable-send.txt",
+        );
+        let mut editor = crate::composer_rich::draft_from_canonical(&text);
+        editor.set_caret(editor.text.len());
+        let mut prompt = Prompt::with_context(
+            text.clone(),
+            vec![file.clone()],
+            Some(crate::composer_context::MessageContext {
+                version: 1,
+                records: vec![record.clone()],
+            }),
+        );
+        prompt.draft = Some(crate::composer_rich::Snapshot::capture_with_context(
+            &editor,
+            &[file.clone()],
+            &[record],
+        ));
+        stage_prompt_files(&mut prompt).unwrap();
+        let staged = &prompt.images[0];
+        assert!(safe_file_id(&staged.id));
+        assert_ne!(staged.id, file.id);
+        assert_eq!(prompt.text, text);
+        assert_eq!(
+            crate::composer_rich::markdown(&prompt.draft.as_ref().unwrap().editor()),
+            text
+        );
+        assert_eq!(
+            prompt.context.as_ref().unwrap().records[0].context_id,
+            crate::composer_context::to_kind_scoped_composer_context_id("file", &file.id)
+        );
+        let crate::composer_context::ComposerContextData::File { attachment_id, .. } =
+            &prompt.context.as_ref().unwrap().records[0].data
+        else {
+            panic!("file")
+        };
+        assert_eq!(attachment_id, &staged.id);
+        assert_eq!(prompt.draft.as_ref().unwrap().attachments[0], *staged);
+        assert_eq!(
+            prompt.draft.as_ref().unwrap().context,
+            prompt.context.as_ref().unwrap().records
+        );
+        fs::write(path, b"new source contents").unwrap();
+        assert_eq!(transfer_file_bytes(staged).unwrap(), b"original");
+    }
+
+    #[test]
     fn file_classification_uses_content_and_retains_missing_references() {
         let directory = crate::store::directory().unwrap();
         for (name, bytes, expected) in [
@@ -1055,7 +1408,7 @@ mod tests {
         assert!(
             validate_prompt_images(&overflow)
                 .unwrap_err()
-                .contains("20 attachments")
+                .contains("100 files")
         );
     }
 

@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 pub const MAJOR: u32 = 1;
 pub const MINOR: u32 = 10;
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
+pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
+pub const FILE_ATTACHMENTS_UPDATE_REQUIRED: &str = "This server does not support file attachments.";
 pub const MODEL_FAVORITES: &str = "model-favorites";
 pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
 pub const MODEL_OPTIONS: &str = "model-options";

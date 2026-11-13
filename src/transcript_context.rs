@@ -66,10 +66,11 @@ fn available(record: &Record, message: &Message) -> bool {
             .images
             .iter()
             .any(|a| a.id == *attachment_id && a.is_image()),
-        Data::File { attachment_id, .. } => message
-            .images
-            .iter()
-            .any(|a| a.id == *attachment_id && !a.is_image()),
+        Data::File { attachment_id, .. } => message.images.iter().any(|a| {
+            a.id == *attachment_id
+                && !a.is_image()
+                && crate::attachments::path_for(a).is_some_and(|path| path.is_file())
+        }),
         _ => true,
     }
 }
@@ -470,6 +471,34 @@ impl<'a> Document<'a> {
         );
         let message_id = self.message.id.clone();
         el.on_link(move |s: &mut State, href, tx| activate(s, &message_id, href, tx))
+            .on_secondary_press(|s: &mut State, at, tx| {
+                let plain = tx
+                    .text_selection()
+                    .map(|selection| rune::ClipboardContent::new(selection.text()));
+                let content = tx
+                    .text_selection()
+                    .map(|selection| selection_payload(s, selection))
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        s.current_mut().attachment_error = Some(error);
+                        None
+                    })
+                    .flatten()
+                    .or(plain);
+                let menu = rune::PopupMenu::new()
+                    .item(rune::PopupItem::new("copy", "Copy").enabled(content.is_some()));
+                tx.popup_menu(
+                    menu,
+                    rune::PopupAnchor::Point(at.x, at.y),
+                    move |_: &mut State, picked, tx| {
+                        if picked == Some("copy")
+                            && let Some(content) = content
+                        {
+                            tx.copy_rich(content);
+                        }
+                    },
+                );
+            })
     }
 }
 
@@ -719,13 +748,30 @@ pub(super) fn preview(s: &State, p: Palette) -> El {
 
 /// KSG's data-markdown-copy selects records by actual selected chip markup, not by
 /// matching lookalike text in a code block. Rune transports the fragment in HTML.
-pub(crate) fn copy_selection(s: &State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
+pub(crate) fn copy_selection(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     if !event.is_command('c') || event.mods.alt || event.mods.shift {
         return false;
     }
     let Some(selection) = tx.text_selection() else {
         return false;
     };
+    match selection_payload(s, selection) {
+        Ok(Some(content)) => {
+            tx.copy_rich(content);
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            s.current_mut().attachment_error = Some(error);
+            true
+        }
+    }
+}
+
+fn selection_payload(
+    s: &State,
+    selection: &rune::TextSelection,
+) -> Result<Option<rune::ClipboardContent>, String> {
     let mut selected = Vec::new();
     let mut records = Vec::new();
     let mut message_id = None;
@@ -762,7 +808,7 @@ pub(crate) fn copy_selection(s: &State, event: &rune::KeyEvent, tx: &mut Tx) -> 
         }
     }
     if records.is_empty() {
-        return false;
+        return Ok(None);
     }
     let bodies: HashMap<_, _> = selected.into_iter().collect();
     let markdown = selection
@@ -778,6 +824,24 @@ pub(crate) fn copy_selection(s: &State, event: &rune::KeyEvent, tx: &mut Tx) -> 
         .join("\n");
     let mut seen = HashSet::new();
     records.retain(|r| seen.insert(r.context_id.clone()));
+    let wanted: HashSet<_> = records
+        .iter()
+        .filter_map(|r| match &r.data {
+            Data::File { attachment_id, .. } | Data::Image { attachment_id, .. } => {
+                Some(attachment_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut files = s
+        .current()
+        .messages
+        .iter()
+        .flat_map(|m| m.images.iter())
+        .filter(|a| wanted.contains(a.id.as_str()))
+        .map(|a| (a.id.clone(), a.clone()))
+        .collect();
+    crate::attachments::stage_clipboard_files(&mut records, &mut files)?;
     let fragment = context::ComposerContextClipboardFragment {
         version: 1,
         source: context::ClipboardSource {
@@ -788,18 +852,9 @@ pub(crate) fn copy_selection(s: &State, event: &rune::KeyEvent, tx: &mut Tx) -> 
         records,
     };
     let Some(encoded) = context::encode_composer_context_fragment(&fragment) else {
-        return false;
+        return Ok(None);
     };
-    context::remember_copied_composer_attachments(
-        &fragment.source.environment_id,
-        s.current()
-            .messages
-            .iter()
-            .flat_map(|m| m.images.iter())
-            .map(|a| (a.id.clone(), a.clone()))
-            .collect(),
-    );
+    context::remember_copied_composer_attachments(&fragment.source.environment_id, files);
     let html = context::encode_composer_context_clipboard_html(&markdown, &encoded, None);
-    tx.copy_rich(rune::ClipboardContent::new(markdown).with_html(html));
-    true
+    Ok(Some(rune::ClipboardContent::new(markdown).with_html(html)))
 }

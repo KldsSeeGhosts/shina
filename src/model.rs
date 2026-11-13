@@ -32,7 +32,11 @@ struct ContextAssetDownload {
     result: Result<Vec<u8>, String>,
 }
 
-fn fetch_linked_blob(link: &crate::peer::Link, attachment_id: &str) -> Result<Vec<u8>, String> {
+fn fetch_linked_blob(
+    link: &crate::peer::Link,
+    attachment_id: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, String> {
     let address = link.address()?;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -54,8 +58,17 @@ fn fetch_linked_blob(link: &crate::peer::Link, attachment_id: &str) -> Result<Ve
         if response.status().as_u16() == 404 || response.status().as_u16() == 400 {
             return Err("The original attachment is no longer available.".into());
         }
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
+        }
         if !response.status().is_success() {
             return Err("Downloading it from the source failed.".into());
+        }
+        if response
+            .content_length()
+            .is_none_or(|n| n > crate::protocol::MAX_PAGE_BYTES as u64)
+        {
+            return Err("Invalid remote blob response.".into());
         }
         let chunk = response
             .bytes()
@@ -63,7 +76,7 @@ fn fetch_linked_blob(link: &crate::peer::Link, attachment_id: &str) -> Result<Ve
         if chunk.is_empty() {
             break;
         }
-        if bytes.len() + chunk.len() > crate::attachments::MAX_IMAGE_BYTES as usize {
+        if bytes.len() + chunk.len() > maximum as usize {
             return Err("The attachment exceeds the maximum size limit.".into());
         }
         bytes.extend_from_slice(&chunk);
@@ -73,6 +86,12 @@ fn fetch_linked_blob(link: &crate::peer::Link, attachment_id: &str) -> Result<Ve
     }
     if bytes.is_empty() {
         return Err("The original attachment is no longer available.".into());
+    }
+    if attachments::safe_file_id(attachment_id) {
+        use sha2::Digest;
+        if attachment_id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+            return Err("File hash mismatch.".into());
+        }
     }
     Ok(bytes)
 }
@@ -6559,6 +6578,11 @@ impl State {
                 records.push(crate::composer_context::attachment_context_record(att));
             }
         }
+        if let Err(error) = attachments::stage_clipboard_files(&mut records, &mut copied_files) {
+            self.current_mut().attachment_error = Some(error);
+            return None;
+        }
+        let t = self.current();
         let source_env = self.machine_identity(&self.machines.selected);
         let content = if !records.is_empty() {
             let fragment = crate::composer_context::ComposerContextClipboardFragment {
@@ -6700,6 +6724,25 @@ impl State {
                 "Couldn't bring {name} into this message. {reason} Remove the chip or attach the file again."
             )
         };
+        let reserved = self
+            .pending_context_imports
+            .iter()
+            .filter(|(machine, id, _)| machine == target_machine && *id == target_thread_id)
+            .count();
+        let attached = if target_machine == self.machines.selected {
+            self.threads.iter().find(|t| t.id == target_thread_id)
+        } else {
+            self.machines
+                .threads
+                .get(target_machine)
+                .and_then(|threads| threads.iter().find(|t| t.id == target_thread_id))
+        }
+        .map_or(0, |thread| thread.draft_images.len());
+        if attached + reserved >= attachments::MAX_ATTACHMENTS {
+            self.current_mut().attachment_error =
+                Some(fail_msg("The attachment limit has been reached."));
+            return;
+        }
         let local_bytes: Option<Vec<u8>> = if let Some(copied) =
             crate::composer_context::copied_composer_attachment(
                 &pending.source_environment_id,
@@ -6708,16 +6751,30 @@ impl State {
             if copied.is_image() {
                 attachments::read(&copied).ok()
             } else {
-                attachments::path_for(&copied).and_then(|p| std::fs::read(p).ok())
+                attachments::transfer_file_bytes(&copied).ok()
             }
         } else if (pending.source_environment_id == self.machine_identity("local")
             || pending.source_environment_id == "local")
-            && kind == "image"
-            && attachments::safe_id(&attachment_id)
+            && (kind == "image" && attachments::safe_id(&attachment_id)
+                || kind == "file" && attachments::safe_file_id(&attachment_id))
         {
             attachments::directory()
                 .map(|d| d.join(&attachment_id))
-                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|path| {
+                    use std::io::Read;
+                    let maximum = if kind == "file" {
+                        attachments::MAX_FILE_BYTES
+                    } else {
+                        attachments::MAX_IMAGE_BYTES
+                    };
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .ok()?
+                        .take(maximum + 1)
+                        .read_to_end(&mut bytes)
+                        .ok()?;
+                    (bytes.len() as u64 <= maximum).then_some(bytes)
+                })
         } else {
             None
         };
@@ -6756,7 +6813,27 @@ impl State {
             ));
             return;
         }
-        if kind != "image" || !attachments::safe_id(&attachment_id) {
+        if kind == "file"
+            && !self
+                .client
+                .as_ref()
+                .and_then(|c| c.linked.get(&pending.source_environment_id))
+                .is_some_and(|c| {
+                    c.info.lock().expect("connection info")["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| {
+                            caps.iter()
+                                .any(|cap| cap == crate::protocol::FILE_ATTACHMENTS)
+                        })
+                })
+        {
+            self.current_mut().attachment_error =
+                Some(fail_msg(crate::protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED));
+            return;
+        }
+        if !(kind == "image" && attachments::safe_id(&attachment_id)
+            || kind == "file" && attachments::safe_file_id(&attachment_id))
+        {
             self.current_mut().attachment_error =
                 Some(fail_msg("The original attachment is no longer available."));
             return;
@@ -6772,7 +6849,12 @@ impl State {
         ));
         self.context_import_rxs.push(rx);
         std::thread::spawn(move || {
-            let result = fetch_linked_blob(&link, &attachment_id);
+            let maximum = if kind == "file" {
+                attachments::MAX_FILE_BYTES
+            } else {
+                attachments::MAX_IMAGE_BYTES
+            };
+            let result = fetch_linked_blob(&link, &attachment_id, maximum);
             let _ = tx.send(ContextAssetDownload {
                 machine: target_machine,
                 thread_id: target_thread_id,
@@ -6823,7 +6905,7 @@ impl State {
         target_thread_id: usize,
         new_context_id: &str,
         name: &str,
-        _mime_type: &str,
+        mime_type: &str,
         kind: &str,
         result: Result<Vec<u8>, String>,
     ) {
@@ -6867,27 +6949,13 @@ impl State {
             }
         } else {
             let dir = match attachments::directory() {
-                Some(d) => d.join(format!("import-{}", uuid::Uuid::new_v4())),
+                Some(d) => d,
                 None => {
                     t.attachment_error = Some("The attachment directory is unavailable.".into());
                     return;
                 }
             };
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                t.attachment_error = Some(e.to_string());
-                return;
-            }
-            let safe_name = std::path::Path::new(name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|n| !n.is_empty())
-                .unwrap_or("attachment");
-            let file_path = dir.join(safe_name);
-            if let Err(e) = std::fs::write(&file_path, &bytes) {
-                t.attachment_error = Some(e.to_string());
-                return;
-            }
-            match attachments::attach_file(&file_path) {
+            match attachments::store_uploaded_file(&dir, name, mime_type, &bytes) {
                 Ok(att) => att,
                 Err(error) => {
                     t.attachment_error = Some(error);
@@ -6940,10 +7008,21 @@ impl State {
     }
     pub fn fold_paste(&mut self, text: &str) -> bool {
         if !crate::composer_paste::should_fold(text)
-            // Ordinary-file references are host-local. The linked upload API transfers images
-            // only, so keep text inline until it can stage a text file on the receiving host.
-            || self.current().machine != "local"
-            || self.client.is_some() && self.machines.selected != "local"
+            || self.current().machine != "local" && self.client.is_none()
+            || self.client.is_some()
+                && self.machines.selected != "local"
+                && !self
+                    .client
+                    .as_ref()
+                    .and_then(|c| c.linked.get(&self.machines.selected))
+                    .is_some_and(|c| {
+                        c.info.lock().expect("connection info")["capabilities"]
+                            .as_array()
+                            .is_some_and(|caps| {
+                                caps.iter()
+                                    .any(|cap| cap == crate::protocol::FILE_ATTACHMENTS)
+                            })
+                    })
             || self.attachment_guard(self.active).is_some()
             || self.current().draft_images.len() >= attachments::MAX_ATTACHMENTS
         {
@@ -12952,6 +13031,29 @@ mod tests {
         assert!(!state.fold_paste(&text));
         assert!(state.current().draft_images.is_empty());
         assert!(state.current().attachment_error.is_none());
+    }
+
+    #[test]
+    fn linked_file_capability_enables_long_paste_folding_and_older_peers_keep_text_inline() {
+        let mut state = State::new(".".into(), false);
+        let (mut client, _local) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote, _commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("linked-machine".into(), remote);
+        state.client = Some(client);
+        state.machines.selected = "linked-machine".into();
+        state.current_mut().machine = "linked-machine".into();
+        let text = "x".repeat(crate::composer_paste::THRESHOLD);
+        assert!(!state.fold_paste(&text));
+        *state.client.as_ref().unwrap().linked["linked-machine"]
+            .info
+            .lock()
+            .unwrap() = json!({"capabilities":[crate::protocol::FILE_ATTACHMENTS]});
+        assert!(state.fold_paste(&text));
+        assert_eq!(state.current().draft_images.len(), 1);
+        assert_eq!(
+            attachments::transfer_file_bytes(&state.current().draft_images[0]).unwrap(),
+            text.as_bytes()
+        );
     }
 
     #[test]

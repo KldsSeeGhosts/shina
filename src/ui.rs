@@ -13111,7 +13111,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .join("transcript-spec.txt");
             std::fs::write(&path, "File preview body").unwrap();
-            let file = crate::attachments::attach_file(&path).unwrap();
+            let file = crate::attachments::stage_transfer_file(
+                &crate::attachments::attach_file(&path).unwrap(),
+            )
+            .unwrap();
             let file_record = crate::composer_context::attachment_context_record(&file);
             let thread_record =
                 crate::composer_context::thread_context_record("local", 2, "Reference thread");
@@ -13202,6 +13205,19 @@ pub(crate) mod tests {
             assert!(content.text().contains(&file_href));
             assert!(content.text().contains(&thread_href));
             assert!(!fragment.records.iter().any(|r| r.context_id == "code"));
+            let (x, y) = rt.find(&file_href).unwrap();
+            rt.secondary_down(x, y);
+            rt.secondary_up(x, y);
+            rt.frame(0.0);
+            assert!(rt.popup_menu().is_some());
+            rt.resolve_popup(Some("copy")).unwrap();
+            rt.frame(0.0);
+            assert_eq!(
+                crate::composer_context::decode_composer_context_clipboard_html(
+                    clipboard.content().unwrap().html()
+                ),
+                Some(fragment)
+            );
             assert!(
                 rt.find("t3-context://v1/terminal/gone").is_none(),
                 "unresolved context has no action"

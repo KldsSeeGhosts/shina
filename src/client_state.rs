@@ -2733,12 +2733,13 @@ impl State {
                     .filter(|v| !v.is_null())
                     .map(|v| crate::composer_context::decode_message_context(&v))
                     .transpose()?;
-                let prompt = crate::composer_tokens::received_prompt_with_context(
+                let mut prompt = crate::composer_tokens::received_prompt_with_context(
                     text,
                     attachments,
                     input.draft,
                     context,
                 )?;
+                attachments::stage_prompt_files(&mut prompt)?;
                 self.current_mut().draft = prompt.draft.as_ref().map_or_else(
                     || crate::composer_rich::draft_from_canonical(&prompt.text),
                     crate::composer_rich::Snapshot::editor,
@@ -3065,12 +3066,13 @@ impl State {
                     .filter(|v| !v.is_null())
                     .map(crate::composer_context::decode_message_context)
                     .transpose()?;
-                let prompt = crate::composer_tokens::received_prompt_with_context(
+                let mut prompt = crate::composer_tokens::received_prompt_with_context(
                     text("text")?,
                     images,
                     args.get("draft").cloned(),
                     context,
                 )?;
+                attachments::stage_prompt_files(&mut prompt)?;
                 self.current_mut().update_queued(
                     number("inputId")?,
                     &text("generation")?,

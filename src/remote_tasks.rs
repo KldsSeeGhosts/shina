@@ -2160,7 +2160,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
