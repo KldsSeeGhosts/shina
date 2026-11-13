@@ -247,6 +247,9 @@ pub struct NativeCatalog {
     pub version: Option<String>,
     pub auth_status: Option<String>,
     pub update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
+    pub usage_limits: Value,
+    pub usage_limits_raw: Value,
+    pub usage_account: Value,
     pi: Option<Pi>,
     attempted: bool,
     complete: bool,
@@ -262,7 +265,9 @@ impl NativeCatalog {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
             "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
             "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
-            "updateRequiredModels":self.update_required_models})
+            "updateRequiredModels":self.update_required_models,
+            "usageLimits":self.usage_limits,"usageLimitsRaw":self.usage_limits_raw,
+            "usageAccount":self.usage_account})
     }
     pub fn loading(&self) -> bool {
         self.pi.is_some()
@@ -328,8 +333,20 @@ impl NativeCatalog {
             changed = true;
             match event {
                 Event::Record(record) if record["type"] == "harness_update" => {
-                    if record["field"] == "codexNativeExtensions" {
-                        self.extensions = record["value"] == true;
+                    match record["field"].as_str() {
+                        Some("codexNativeExtensions") => {
+                            self.extensions = record["value"] == true;
+                        }
+                        Some("usageLimits") => {
+                            self.usage_limits = record["value"].clone();
+                        }
+                        Some("usageLimitsRaw") => {
+                            self.usage_limits_raw = record["value"].clone();
+                        }
+                        Some("usageAccount") => {
+                            self.usage_account = record["value"].clone();
+                        }
+                        _ => {}
                     }
                 }
                 Event::Record(record) if record["type"] == "response" => {

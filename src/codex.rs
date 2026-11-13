@@ -197,6 +197,8 @@ struct Client {
     turns: Vec<Value>,
     turn_items: Vec<Value>,
     usage_limits: Value,
+    usage_limits_raw: Value,
+    usage_account: Value,
     history_mode: String,
     hydration: Option<(Value, Value)>,
     history_cursors: HashSet<String>,
@@ -247,6 +249,8 @@ impl Client {
             turns: vec![],
             turn_items: vec![],
             usage_limits: Value::Null,
+            usage_limits_raw: Value::Null,
+            usage_account: Value::Null,
             history_mode: "legacy".into(),
             hydration: None,
             history_cursors: HashSet::new(),
@@ -265,11 +269,16 @@ impl Client {
     fn request(&mut self, method: &str, params: Value, request: Value) {
         self.serial += 1;
         let id = format!("shina-codex-{}", self.serial);
+        let timeout = if matches!(request["type"].as_str(), Some("rateLimits" | "account")) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
         self.pending.insert(
             id.clone(),
             Pending {
                 request,
-                deadline: Instant::now() + Duration::from_secs(30),
+                deadline: Instant::now() + timeout,
             },
         );
         // app-server omits the JSON-RPC version, exactly as KSG's patched protocol does.
@@ -368,8 +377,8 @@ impl Client {
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
             let error = auth_guidance(&error);
-            if kind == "rateLimits" {
-                // Usage is optional. An older CLI or an API-key account has none to read.
+            if matches!(kind, "rateLimits" | "account") {
+                // Usage and account metadata are optional. An older CLI or API-key account has none.
                 return Ok(());
             }
             if kind == "skills" {
@@ -438,9 +447,8 @@ impl Client {
                     json!({"cwds":[self.start.workspace]}),
                     json!({"type":"skills","id":"commands"}),
                 );
-                if self.probe.is_none() {
-                    // Codex pushes rate limits only when they change, so a quiet turn would
-                    // leave the usage block empty. KSG reads them the same way.
+                if self.probe != Some(false) {
+                    self.request("account/read", json!({}), json!({"type":"account"}));
                     self.request(
                         "account/rateLimits/read",
                         Value::Null,
@@ -453,6 +461,12 @@ impl Client {
                     self.ready = true;
                 }
             }
+            "account" => {
+                let mut acct = result.clone();
+                crate::usage_limits::conceal_account_json(&mut acct);
+                self.usage_account = acct;
+                self.events.push(json!({"type":"harness_update","field":"usageAccount","value":self.usage_account}));
+            }
             "rateLimits" => {
                 let read = &result["rateLimitsByLimitId"]["codex"];
                 let read = if read.is_null() {
@@ -462,6 +476,18 @@ impl Client {
                 };
                 self.usage_limits = crate::usage_limits::codex(read, &self.usage_limits);
                 self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
+                let mut raw = json!({
+                    "checkedAtMs": crate::lifecycle::now(),
+                    "snapshot": result["rateLimits"],
+                });
+                if !result["rateLimitsByLimitId"].is_null() {
+                    raw["rateLimitsByLimitId"] = result["rateLimitsByLimitId"].clone();
+                }
+                if !result["rateLimitResetCredits"].is_null() {
+                    raw["rateLimitResetCredits"] = result["rateLimitResetCredits"].clone();
+                }
+                self.usage_limits_raw = raw;
+                self.events.push(json!({"type":"harness_update","field":"usageLimitsRaw","value":self.usage_limits_raw}));
             }
             "skills" => {
                 self.skill_commands =
@@ -1429,6 +1455,23 @@ impl Client {
                 self.usage_limits =
                     crate::usage_limits::codex(&params["rateLimits"], &self.usage_limits);
                 self.events.push(json!({"type":"harness_update","field":"usageLimits","value":self.usage_limits}));
+                let update = &params["rateLimits"];
+                if update["limitId"].as_str().is_none_or(|id| id == "codex") {
+                    if !self.usage_limits_raw.is_object() {
+                        self.usage_limits_raw = json!({"snapshot": {}});
+                    }
+                    self.usage_limits_raw["checkedAtMs"] = json!(crate::lifecycle::now());
+                    if let Some(target) = self.usage_limits_raw["snapshot"].as_object_mut()
+                        && let Some(src) = update.as_object()
+                    {
+                        for (k, v) in src {
+                            target.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        self.usage_limits_raw["snapshot"] = update.clone();
+                    }
+                    self.events.push(json!({"type":"harness_update","field":"usageLimitsRaw","value":self.usage_limits_raw}));
+                }
             }
             "thread/goal/updated" => {
                 self.goal = params["goal"].clone();
@@ -2229,11 +2272,12 @@ fn run_mode(
                     pending.deadline = Instant::now() + Duration::from_secs(30);
                 }
             }
-            if client
-                .pending
-                .values()
-                .any(|p| Instant::now() >= p.deadline)
-            {
+            let now = Instant::now();
+            client.pending.retain(|_, p| {
+                !(matches!(p.request["type"].as_str(), Some("rateLimits" | "account"))
+                    && now >= p.deadline)
+            });
+            if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Codex did not acknowledge an operation within 30 seconds.".into());
             }
             for record in std::mem::take(&mut client.wire) {

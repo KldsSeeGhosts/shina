@@ -212,6 +212,8 @@ struct Client {
     wire: Vec<Value>,
     events: Vec<Value>,
     usage_limits: Value,
+    usage_limits_raw: Value,
+    usage_account: Value,
 }
 
 impl Client {
@@ -254,6 +256,8 @@ impl Client {
             wire: vec![],
             events: vec![],
             usage_limits: Value::Null,
+            usage_limits_raw: Value::Null,
+            usage_account: Value::Null,
         }
     }
 
@@ -330,6 +334,12 @@ impl Client {
         let id = format!("shina-claude-{}", self.serial);
         let timeout = if request["subtype"] == "get_context_usage" {
             Duration::from_secs(2)
+        } else if request["subtype"] == "get_usage" {
+            if self.start.link.is_none() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(5)
+            }
         } else {
             Duration::from_secs(30)
         };
@@ -532,6 +542,16 @@ impl Client {
             json!({"commands":self.commands}),
         );
         self.update("awareness", json!(true));
+        if data["account"].is_object() {
+            let mut acct = data["account"].clone();
+            crate::usage_limits::conceal_account_json(&mut acct);
+            self.usage_account = acct;
+            self.update("usageAccount", self.usage_account.clone());
+        }
+        self.request(
+            json!({"subtype":"get_usage","skipBehaviors":true}),
+            json!({"type":"get_usage"}),
+        );
         Ok(())
     }
 
@@ -605,7 +625,10 @@ impl Client {
                             "Claude could not apply the plan's permission mode: {error}"
                         ));
                     }
-                    if pending.request["subtype"] == "get_context_usage" {
+                    if matches!(
+                        pending.request["subtype"].as_str(),
+                        Some("get_context_usage" | "get_usage")
+                    ) {
                         return Ok(());
                     }
                     self.reject(&pending.original, error);
@@ -614,6 +637,15 @@ impl Client {
                 let data = &response["response"];
                 match pending.request["subtype"].as_str().unwrap_or("") {
                     "initialize" => self.initialized(data)?,
+                    "get_usage" => {
+                        if data.get("rate_limits_available").is_some() {
+                            self.usage_limits_raw = json!({
+                                "checkedAtMs": crate::lifecycle::now(),
+                                "response": data,
+                            });
+                            self.update("usageLimitsRaw", self.usage_limits_raw.clone());
+                        }
+                    }
                     "set_model" => {
                         self.model = self
                             .models
@@ -2096,9 +2128,12 @@ fn run_mode(
                 return Err("Claude stopped reading commands.".into());
             }
             let now = Instant::now();
-            client
-                .pending
-                .retain(|_, p| !(p.request["subtype"] == "get_context_usage" && now >= p.deadline));
+            client.pending.retain(|_, p| {
+                !(matches!(
+                    p.request["subtype"].as_str(),
+                    Some("get_context_usage" | "get_usage")
+                ) && now >= p.deadline)
+            });
             if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
             }
@@ -2113,7 +2148,13 @@ fn run_mode(
                     return Ok(());
                 }
             }
-            if probe && client.ready {
+            if probe
+                && client.ready
+                && !client
+                    .pending
+                    .values()
+                    .any(|p| p.request["subtype"] == "get_usage")
+            {
                 return Ok(());
             }
             for _ in 0..64 {
