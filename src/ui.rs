@@ -17079,6 +17079,178 @@ pub(crate) mod tests {
         }
     }
 
+    /// A patch parsed into loaded `FileEntry`s, the way `preview_done` leaves a
+    /// non-deferred source.
+    fn parsed_ready(patch: &str) -> diff_panel::Done {
+        let Some(crate::review_patch::RenderablePatch::Files(files)) =
+            crate::review_patch::parse(patch)
+        else {
+            panic!("test patch parses");
+        };
+        let stat = crate::review_patch::line_stat(&files);
+        let files = crate::review_tree::order_like_tree(&files);
+        diff_panel::Done::Ready(Box::new(diff_panel::Ready {
+            files: files
+                .into_iter()
+                .map(|file| diff_panel::FileEntry {
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    file,
+                    body: diff_panel::FileBody::Loaded,
+                    truncated: false,
+                })
+                .collect(),
+            raw: None,
+            additions: stat.additions,
+            deletions: stat.deletions,
+            truncated: false,
+            incomplete: false,
+            cwd: "/repo".into(),
+            source_kind: crate::review::ReviewSourceKind::BranchRange,
+            base_ref: None,
+            rows: vec![],
+            rows_version: 0,
+        }))
+    }
+
+    #[test]
+    fn diff_panel_lists_files_collapses_and_virtualizes_at_all_widths() {
+        use crate::right_panel::SingletonKind;
+        // Two files: +2 -1 on src/a.rs, +3 on src/b.rs — "+5 -1" total.
+        const PATCH: &str = "diff --git a/src/a.rs b/src/a.rs\n\
+            --- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n keep\n-old\n+new\n+more\n tail\n\
+            diff --git a/src/b.rs b/src/b.rs\n\
+            --- a/src/b.rs\n+++ b/src/b.rs\n@@ -5,0 +5,3 @@\n+one\n+two\n+three\n";
+        for width in [960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let key = rt.state.panel_key();
+            rt.state.right_panels.open(&key, SingletonKind::Diff);
+            // `last_refresh_at` is fresh so the mount does not read git.
+            rt.state.diffs.insert(
+                key.clone(),
+                diff_panel::ThreadDiff {
+                    done: Some(parsed_ready(PATCH)),
+                    last_refresh_at: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            );
+            rt.state.diff_rebuild_rows(&key);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.5);
+
+            let (panel, _) = rt
+                .presented("right-panel")
+                .unwrap_or_else(|| panic!("panel mounts at {width}"));
+            for file_key in ["diff-file-0", "diff-file-1"] {
+                let (rect, _) = rt
+                    .presented(file_key)
+                    .unwrap_or_else(|| panic!("{file_key} at {width}"));
+                assert!(
+                    rect[0] >= panel[0] - 0.5
+                        && rect[1] >= panel[1] - 0.5
+                        && rect[0] + rect[2] <= panel[0] + panel[2] + 0.5
+                        && rect[1] + rect[3] <= panel[1] + panel[3] + 0.5,
+                    "{file_key} sits inside the panel at {width}: {rect:?} vs {panel:?}"
+                );
+            }
+            // The header total reads KSG's `+N -N` with its group label.
+            let stat = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("diff-stat"))
+                .unwrap_or_else(|| panic!("diff-stat at {width}"));
+            assert_eq!(
+                stat.label.as_deref(),
+                Some("5 additions, 1 deletions"),
+                "{width}"
+            );
+            assert!(rt.presented("diff-line-0-0-0").is_some(), "{width}");
+            assert!(rt.presented("diff-line-1-0-0").is_some(), "{width}");
+
+            // Folding one file hides only its rows; collapse-all hides the rest.
+            press(&mut rt, "diff-file-toggle-0");
+            rt.frame(0.5);
+            assert!(rt.presented("diff-line-0-0-0").is_none(), "{width}");
+            assert!(rt.presented("diff-line-1-0-0").is_some(), "{width}");
+            press(&mut rt, "diff-collapse-all");
+            rt.frame(0.5);
+            assert!(rt.presented("diff-line-1-0-0").is_none(), "{width}");
+
+            // A 20,000-line diff still builds only the visible rows.
+            let mut big = crate::review_patch::FileDiff {
+                path: "big.rs".into(),
+                previous_path: None,
+                change: crate::review_patch::ChangeKind::Modified,
+                binary: false,
+                old_mode: None,
+                new_mode: None,
+                hunks: vec![],
+                additions: 20_000,
+                deletions: 0,
+            };
+            big.hunks.push(crate::review_patch::Hunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 20_000,
+                section: String::new(),
+                lines: (1..=20_000)
+                    .map(|n| crate::review_patch::Line {
+                        kind: crate::review_patch::LineKind::Added,
+                        text: format!("line {n}"),
+                        old_number: None,
+                        new_number: Some(n),
+                        no_newline: false,
+                    })
+                    .collect(),
+            });
+            rt.state.diffs.insert(
+                key.clone(),
+                diff_panel::ThreadDiff {
+                    done: Some(diff_panel::Done::Ready(Box::new(diff_panel::Ready {
+                        files: vec![diff_panel::FileEntry {
+                            additions: big.additions,
+                            deletions: big.deletions,
+                            file: big,
+                            body: diff_panel::FileBody::Loaded,
+                            truncated: false,
+                        }],
+                        raw: None,
+                        additions: 20_000,
+                        deletions: 0,
+                        truncated: false,
+                        incomplete: false,
+                        cwd: "/repo".into(),
+                        source_kind: crate::review::ReviewSourceKind::BranchRange,
+                        base_ref: None,
+                        rows: vec![],
+                        rows_version: 0,
+                    }))),
+                    last_refresh_at: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            );
+            rt.state.diff_rebuild_rows(&key);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.5);
+            let mounted = rt
+                .elements()
+                .into_iter()
+                .filter(|e| {
+                    e.key
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with("diff-line-"))
+                })
+                .count();
+            assert!(
+                mounted < 400,
+                "{width}: {mounted} line rows mounted of 20,000"
+            );
+        }
+    }
+
     #[test]
     fn questionnaire_replaces_composer_and_supports_keyboard_and_previous_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
