@@ -3598,14 +3598,24 @@ fn streaming_storage_scaling() {
         );
         client.rpc("workspace.subscribe", json!({}), json!("measure-subscribe"));
         let db = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
+        // Startup writes can outlast a fixed pause on a busy machine. Wait for the
+        // WAL to hold still for two seconds, then require it to stay still.
+        let wal = profile.root.join("Shina/state.sqlite-wal");
+        let wal_len = || fs::metadata(&wal).unwrap().len();
+        let mut before_idle = wal_len();
+        let mut still = 0;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_secs(1));
+            let now = wal_len();
+            still = if now == before_idle { still + 1 } else { 0 };
+            before_idle = now;
+            if still == 2 {
+                break;
+            }
+        }
+        assert_eq!(still, 2, "the server never stopped writing after startup");
         std::thread::sleep(Duration::from_secs(3));
-        let before_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
-            .unwrap()
-            .len();
-        std::thread::sleep(Duration::from_secs(3));
-        let after_idle = fs::metadata(profile.root.join("Shina/state.sqlite-wal"))
-            .unwrap()
-            .len();
+        let after_idle = wal_len();
         assert_eq!(before_idle, after_idle, "idle workspace wrote to WAL");
         let receipt = client.command(
             "thread.send",
