@@ -41,6 +41,8 @@ pub(crate) mod composer_stash;
 pub(crate) mod composer_ui;
 #[path = "crew_ui.rs"]
 mod crew_ui;
+#[path = "diff_panel.rs"]
+pub(crate) mod diff_panel;
 #[path = "markdown_ui.rs"]
 mod markdown_ui;
 #[path = "pi_ui.rs"]
@@ -6755,10 +6757,9 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
         .as_deref()
         .and_then(|id| panel.surfaces.iter().find(|surface| surface.id() == id));
     let (key, body) = match active {
-        Some(crate::right_panel::Surface::Diff) => (
-            "right-panel-body-diff".to_string(),
-            label("Changes will appear here", SMALL, p.muted),
-        ),
+        Some(crate::right_panel::Surface::Diff) => {
+            ("right-panel-body-diff".to_string(), diff_panel::body(s, p))
+        }
         Some(crate::right_panel::Surface::Files) => (
             "right-panel-body-files".to_string(),
             label("Files will appear here", SMALL, p.muted),
@@ -6797,7 +6798,10 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
                 .min_w(0.0)
                 .min_h(0.0)
                 .child(right_panel_strip(s, p, strip_h))
-                .child(el().key("right-panel-header").h(28.0).px(8.0))
+                .child(match active {
+                    Some(crate::right_panel::Surface::Diff) => diff_panel::header(s, p),
+                    _ => el().key("right-panel-header").h(28.0).px(8.0),
+                })
                 .child(el().h(12.0))
                 .child(
                     el().key(key)

@@ -1551,6 +1551,11 @@ impl State {
                         .and_then(|s| s.parse::<u64>().ok())
                     {
                         self.handle_vcs_branches_rpc(req_id, result);
+                    } else if let Some(req_id) = tag
+                        .strip_prefix("diff:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        crate::ui::diff_panel::handle_rpc(self, req_id, result);
                     } else if let Some(request) = tag
                         .strip_prefix("mention:preview:")
                         .and_then(|s| s.parse::<u64>().ok())

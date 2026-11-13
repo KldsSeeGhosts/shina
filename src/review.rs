@@ -158,7 +158,7 @@ pub struct ReviewBranchCommitsResult {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewDiffFileStat {
     pub path: String,
@@ -167,7 +167,7 @@ pub struct ReviewDiffFileStat {
     pub deletions: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewDiffPreviewSource {
     pub id: String,
@@ -186,7 +186,7 @@ pub struct ReviewDiffPreviewSource {
     pub files: Option<Vec<ReviewDiffFileStat>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewDiffPreviewResult {
     pub cwd: String,
