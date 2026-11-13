@@ -138,6 +138,7 @@ impl Thread {
         self.prompt_history.reset();
         self.paste_history = Default::default();
         self.composer_rules = Default::default();
+        self.composer_source = Default::default();
     }
 
     pub fn cancel_queued_edit(&mut self) {
@@ -152,6 +153,7 @@ impl Thread {
             self.prompt_history.reset();
             self.paste_history = Default::default();
             self.composer_rules = Default::default();
+            self.composer_source = Default::default();
         }
     }
 

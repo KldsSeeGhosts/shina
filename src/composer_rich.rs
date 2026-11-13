@@ -54,6 +54,15 @@ impl Snapshot {
         attachments: &[crate::attachments::Attachment],
         context: &[crate::composer_context::ComposerContextRecord],
     ) -> Self {
+        if crate::composer_source::has_shown_source(edit) {
+            let (collapsed, _) = crate::composer_source::collapsed_copy(edit);
+            return Self {
+                text: collapsed.text.clone(),
+                html: collapsed.to_html(),
+                attachments: attachments.to_vec(),
+                context: context.to_vec(),
+            };
+        }
         Self {
             text: edit.text.clone(),
             html: edit.to_html(),
@@ -71,6 +80,22 @@ impl Snapshot {
 /// Shina's existing failure recovery prepends the submission to edits made after Send.
 pub fn prepend(submitted: &TextEdit, later: &TextEdit) -> TextEdit {
     let focused = later.focused;
+    let (submitted_ref, _s_holder);
+    let submitted = if crate::composer_source::has_shown_source(submitted) {
+        _s_holder = crate::composer_source::collapsed_copy(submitted).0;
+        submitted_ref = &_s_holder;
+        submitted_ref
+    } else {
+        submitted
+    };
+    let (later_ref, _l_holder);
+    let later = if crate::composer_source::has_shown_source(later) {
+        _l_holder = crate::composer_source::collapsed_copy(later).0;
+        later_ref = &_l_holder;
+        later_ref
+    } else {
+        later
+    };
     let mut edit = if submitted.text.is_empty() && !has_format(submitted) {
         later.clone()
     } else if later.text.is_empty() && !has_format(later) {
@@ -95,6 +120,7 @@ pub fn prepend(submitted: &TextEdit, later: &TextEdit) -> TextEdit {
 pub struct Rules {
     converted: Option<TextEdit>,
     suppress: bool,
+    suppress_history: bool,
 }
 
 fn same_document(a: &TextEdit, b: &TextEdit) -> bool {
@@ -112,17 +138,23 @@ impl Rules {
     pub fn pasted(&mut self) {
         self.converted = None;
         self.suppress = true;
+        self.suppress_history = false;
+    }
+
+    pub fn take_history_suppress(&mut self) -> bool {
+        std::mem::take(&mut self.suppress_history)
     }
 
     /// Ported from ComposerPromptEditorTiptap and the Composer* mark extensions.
     pub fn key(&mut self, edit: &mut TextEdit, ev: &KeyEvent) -> bool {
         if edit.is_composing() {
             self.suppress = false;
+            self.suppress_history = false;
             return false;
         }
+        self.suppress_history = ev.is_command('z') || ev.is_command('y');
         self.suppress = matches!(ev.key, Key::Backspace | Key::Delete)
-            || ev.is_command('z')
-            || ev.is_command('y')
+            || self.suppress_history
             || ev.is_command('x');
         if ev.key == Key::Backspace
             && !ev.mods.cmd
@@ -181,6 +213,21 @@ impl Rules {
                 }
             }
         }
+        if !ev.mods.shift && !ev.mods.alt && !ev.mods.cmd && !ev.mods.ctrl {
+            let direction = match ev.key {
+                Key::Left => Some(-1),
+                Key::Right => Some(1),
+                Key::Up if edit.focus == 0 => Some(-1),
+                Key::Down if edit.focus == edit.text.len() => Some(1),
+                _ => None,
+            };
+            if let Some(dir) = direction
+                && (crate::composer_source::step_caret_across_styled_edge(edit, dir)
+                    || crate::composer_source::should_consume_noop_edge_arrow(edit, dir))
+            {
+                return true;
+            }
+        }
         for (ch, shift, mark) in [
             ('b', None, Mark::Bold),
             ('i', None, Mark::Italic),
@@ -192,7 +239,9 @@ impl Rules {
                 && !ev.mods.alt
                 && !(cfg!(target_os = "macos") && ev.mods.ctrl)
             {
-                edit.toggle_mark(mark);
+                if !crate::composer_source::toggle_mark_command(edit, mark.clone()) {
+                    edit.toggle_mark(mark);
+                }
                 return true;
             }
         }
@@ -219,6 +268,7 @@ impl Rules {
             }
         }
         if ev.key == Key::Enter && !ev.mods.cmd && !ev.mods.ctrl {
+            crate::composer_source::collapse_shown_markdown_source(edit);
             let line_idx = edit.line_of_byte(edit.focus);
             let line = edit.line_range(line_idx);
             let kind = edit.block_kind(line_idx);
@@ -508,6 +558,9 @@ fn open_code_before_text(edit: &mut TextEdit) -> bool {
         return false;
     }
     let from = edit.focus;
+    if crate::composer_source::touches_markdown_source(edit, from, from) {
+        return false;
+    }
     let line = edit.line_range(edit.line_of_byte(from));
     if edit.text[..from].ends_with('`') {
         return false;
@@ -592,7 +645,10 @@ fn surround(edit: &mut TextEdit, opener: &str) -> bool {
         _ => return false,
     };
     let (from, to) = edit.range();
-    if from == to || edit.marks().iter().any(|m| m.start < to && m.end > from) {
+    if from == to
+        || crate::composer_source::touches_markdown_source(edit, from, to)
+        || edit.marks().iter().any(|m| m.start < to && m.end > from)
+    {
         return false;
     }
     let mark = match opener {
@@ -691,6 +747,9 @@ fn input_mark(edit: &mut TextEdit) -> bool {
         let start = line.start + start;
         let content_start = line.start + content_start;
         let content_end = line.start + content_end;
+        if crate::composer_source::touches_markdown_source(edit, start, end) {
+            continue;
+        }
         // Only the delimiters must be outside existing code. Code inside emphasis is allowed.
         if mark != Mark::Code
             && edit.marks().iter().any(|m| {
@@ -1012,6 +1071,194 @@ fn append_mapped(
     out.push_str(text);
 }
 
+pub(crate) struct SourceInlineRun {
+    pub range: std::ops::Range<usize>,
+    pub open: String,
+    pub md_text: String,
+    pub close: String,
+}
+
+pub(crate) fn parse_inline(text: &str) -> Vec<source::Piece> {
+    source::parse(text)
+}
+
+pub(crate) fn inline_runs_for_source(
+    edit: &TextEdit,
+    range: std::ops::Range<usize>,
+) -> Vec<SourceInlineRun> {
+    let mut bounds = vec![range.start, range.end];
+    let marks: Vec<_> = edit
+        .marks()
+        .iter()
+        .filter(|m| !matches!(m.mark, Mark::App(_)) && m.start < range.end && range.start < m.end)
+        .collect();
+    for m in &marks {
+        bounds.extend([m.start.max(range.start), m.end.min(range.end)]);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    struct Run {
+        range: std::ops::Range<usize>,
+        md_text: String,
+        marks: Vec<Mark>,
+        whitespace: bool,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for pair in bounds.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let active: Vec<_> = source::ORDER
+            .into_iter()
+            .filter(|mark| {
+                marks
+                    .iter()
+                    .any(|m| m.start <= start && end <= m.end && m.mark == *mark)
+            })
+            .collect();
+        let context_ref = marks.iter().find_map(|m| {
+            (m.start <= start && end <= m.end)
+                .then(|| m.mark.pill_id())
+                .flatten()
+                .and_then(crate::composer_context::parse_composer_context_href)
+        });
+        if let Some((kind, context_id)) = context_ref {
+            runs.push(Run {
+                range: start..end,
+                md_text: crate::composer_context::format_composer_context_reference(
+                    &kind,
+                    &context_id,
+                    &edit.text[start..end],
+                ),
+                marks: active,
+                whitespace: false,
+            });
+            continue;
+        }
+        let token = marks.iter().find_map(|m| {
+            (m.start <= start && end <= m.end)
+                .then(|| m.mark.pill_id())
+                .flatten()
+                .and_then(crate::composer_tokens::Token::decode)
+        });
+        if let Some(token) = token {
+            runs.push(Run {
+                range: start..end,
+                md_text: token.source_for(None, &str::to_owned),
+                marks: active,
+                whitespace: false,
+            });
+            continue;
+        }
+        let text = &edit.text[start..end];
+        if active.contains(&Mark::Code) {
+            runs.push(Run {
+                range: start..end,
+                md_text: text.into(),
+                marks: active,
+                whitespace: false,
+            });
+            continue;
+        }
+        let trimmed_start = text.len() - text.trim_start_matches(source::space).len();
+        let trimmed_end = trimmed_start.max(text.trim_end_matches(source::space).len());
+        let mut at = 0;
+        for bound in [trimmed_start, trimmed_end, text.len()] {
+            if bound > at {
+                let piece = &text[at..bound];
+                runs.push(Run {
+                    range: start + at..start + bound,
+                    md_text: piece.into(),
+                    marks: active.clone(),
+                    whitespace: piece.chars().all(source::space),
+                });
+            }
+            at = bound;
+        }
+    }
+    for mark in source::ORDER {
+        if mark == Mark::Code {
+            continue;
+        }
+        for reverse in [false, true] {
+            let mut content = false;
+            for offset in 0..runs.len() {
+                let index = if reverse {
+                    runs.len() - 1 - offset
+                } else {
+                    offset
+                };
+                let run = &mut runs[index];
+                if !run.marks.contains(&mark) {
+                    content = false;
+                } else if run.whitespace {
+                    if !content {
+                        run.marks.retain(|m| *m != mark);
+                    }
+                } else {
+                    content = true;
+                }
+            }
+        }
+    }
+    let mut ends = [None; 4];
+    for index in (0..runs.len()).rev() {
+        for (kind, mark) in source::ORDER.iter().enumerate() {
+            if runs[index].marks.contains(mark) {
+                ends[kind].get_or_insert(index);
+            } else {
+                ends[kind] = None;
+            }
+        }
+        runs[index].marks.sort_by_key(|mark| {
+            let kind = source::ORDER.iter().position(|m| m == mark).unwrap();
+            (std::cmp::Reverse(ends[kind]), kind)
+        });
+    }
+    for index in 1..runs.len() {
+        let retained: Vec<_> = runs[index - 1]
+            .marks
+            .iter()
+            .take_while(|mark| runs[index].marks.contains(mark))
+            .cloned()
+            .collect();
+        let remaining: Vec<_> = runs[index]
+            .marks
+            .iter()
+            .filter(|m| !retained.contains(m))
+            .cloned()
+            .collect();
+        runs[index].marks = retained.into_iter().chain(remaining).collect();
+    }
+    let mut out = Vec::with_capacity(runs.len());
+    for index in 0..runs.len() {
+        let prev = if index > 0 {
+            runs[index - 1].marks.as_slice()
+        } else {
+            &[]
+        };
+        let next = if index + 1 < runs.len() {
+            runs[index + 1].marks.as_slice()
+        } else {
+            &[]
+        };
+        let cur = &runs[index].marks;
+        let common_prev = cur.iter().zip(prev).take_while(|(a, b)| a == b).count();
+        let common_next = cur.iter().zip(next).take_while(|(a, b)| a == b).count();
+        let open: String = cur[common_prev..].iter().map(source::delimiter).collect();
+        let close: String = cur[common_next..]
+            .iter()
+            .rev()
+            .map(source::delimiter)
+            .collect();
+        out.push(SourceInlineRun {
+            range: runs[index].range.clone(),
+            open,
+            md_text: runs[index].md_text.clone(),
+            close,
+        });
+    }
+    out
+}
+
 pub fn markdown(edit: &TextEdit) -> String {
     markdown_for(edit, None, &|machine| machine.to_owned())
 }
@@ -1021,6 +1268,10 @@ pub fn markdown_for(
     target_machine: Option<&str>,
     machine_name: &dyn Fn(&str) -> String,
 ) -> String {
+    if crate::composer_source::has_shown_source(edit) {
+        let (collapsed, _) = crate::composer_source::collapsed_copy(edit);
+        return markdown_for(&collapsed, target_machine, machine_name);
+    }
     markdown_mapped(edit, target_machine, machine_name).0
 }
 
@@ -1028,6 +1279,10 @@ pub fn markdown_for(
 /// except a code block's end stays inside its closing fence. Offsets are bytes
 /// here, converted to UTF-16 by the caller at the protocol boundary.
 pub fn markdown_selection(edit: &TextEdit) -> (String, std::ops::Range<usize>) {
+    if crate::composer_source::has_shown_source(edit) {
+        let (collapsed, _) = crate::composer_source::collapsed_copy(edit);
+        return markdown_selection(&collapsed);
+    }
     let (text, spans) = markdown_mapped(edit, None, &|machine| machine.to_owned());
     let offset = |at: usize| {
         for span in &spans {
@@ -1266,6 +1521,22 @@ fn markdown_mapped(
 }
 
 pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String {
+    if crate::composer_source::has_shown_source(edit) {
+        let (collapsed, map) = crate::composer_source::collapsed_copy(edit);
+        let mapped = if let Some(map) = map {
+            let s = map.map(range.start, rune::MapBias::After);
+            let e = map.map(range.end, rune::MapBias::Before).max(s);
+            s..e
+        } else {
+            range.clone()
+        };
+        if mapped.is_empty() && !range.is_empty() {
+            let s = range.start.min(edit.text.len());
+            let e = range.end.min(edit.text.len()).max(s);
+            return edit.text[s..e].to_owned();
+        }
+        return markdown_range(&collapsed, mapped);
+    }
     let start = range.start.min(edit.text.len());
     let end = range.end.min(edit.text.len()).max(start);
     if start == end {
@@ -1507,13 +1778,15 @@ pub fn restore(text: &str, html: Option<&str>) -> TextEdit {
         Some(html) => {
             let edit = TextEdit::from_html(html);
             if edit.text == text {
-                edit.allow_marks([
+                let mut edit = edit.allow_marks([
                     Mark::Bold,
                     Mark::Italic,
                     Mark::Strike,
                     Mark::Code,
                     Mark::Link(String::new()),
-                ])
+                ]);
+                crate::composer_source::strip_shown_source(&mut edit);
+                edit
             } else {
                 draft(text)
             }

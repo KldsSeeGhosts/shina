@@ -23,6 +23,7 @@ mod composer_notices;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;
+mod composer_source;
 mod composer_sources;
 mod composer_tokens;
 mod context;
