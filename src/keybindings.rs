@@ -1049,7 +1049,6 @@ pub fn resolve_shortcut_command<'a>(
     None
 }
 
-#[cfg(test)]
 pub fn effective_shortcuts_for_command(
     keybindings: &[ResolvedKeybindingRule],
     command: &str,
@@ -1074,7 +1073,6 @@ pub fn effective_shortcuts_for_command(
     effective
 }
 
-#[cfg(test)]
 pub fn shortcut_label_for_command(
     keybindings: &[ResolvedKeybindingRule],
     command: &str,

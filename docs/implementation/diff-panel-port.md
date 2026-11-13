@@ -39,11 +39,33 @@ collapse-all uses `review_patch::toggle_all`. Hide-tests filters shown files
 through `review_tree::is_test_changed_file` and persists as `diffHideTests` in
 the UI snapshot, only when on.
 
+## Entry points
+
+KSG keeps the Diff tab's controls in the header and its changed-file rows in
+the timeline; Shina matches:
+
+- `header-diff` in the chat header toggles the Diff tab
+  (`State::right_panel_toggle_diff`, KSG's `onToggleDiff`). Beside it,
+  `header-diff-stat` reads the loaded diff's `+N -N` totals through
+  `diff_stat_label`; it hides below the narrow fold and never starts a request.
+- `header-right-panel` toggles the whole right panel
+  (`State::right_panel_toggle`, KSG's `toggleRightPanel`); it hides when the
+  window is compact.
+- A provider file-change card's path (`tool-file-path-*` in `work_ui.rs`)
+  presses through `diff_panel::reveal_file`: it opens the Diff tab on the
+  Uncommitted scope, expands the file if folded, and scrolls its header row to
+  the list's top. While the preview is loading the path waits as
+  `ThreadDiff::pending_reveal` and applies when the result arrives; a path no
+  diff file matches still opens the tab and changes nothing else.
+  `file_path_matches` compares the timeline path relative to the preview's
+  project directory, folding absolute paths inside it and matching a rename's
+  old or new path.
+
 ## Remaining
 
 Ported behavior still missing, with the KSG source that owns it:
 
-- Turn and tool-call diff sources, and the per-turn file list — `apps/web/src/components/DiffPanel.tsx`.
+- Turn and tool-call diff sources, and the per-turn file list — `apps/web/src/components/DiffPanel.tsx`. KSG's timeline rows open a per-turn diff (`onOpenTurnDiff` selects the turn's checkpoint); Shina's `reveal_file` opens the working-tree diff instead, because turn checkpoints are not ported yet.
 - Commit list and the commits menu — `apps/web/src/components/DiffPanel.tsx` (`review.getBranchCommits`).
 - Branch base picker — `apps/web/src/components/DiffPanel.tsx` (`selectGitScope`'s chosen-base path).
 - File tree sidebar — `apps/web/src/components/diffs/diffFileTree.logic.ts`; `src/review_tree.rs` already holds the `TreeEntry` builder and sorts.
