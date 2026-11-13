@@ -801,3 +801,84 @@ fn access_mode_id_parse_round_trip_and_unknown_fallback() {
         .unwrap();
     assert_eq!(state.current().native.access, AccessMode::Supervised);
 }
+
+#[test]
+fn supported_access_modes_table_and_compatible_resolution() {
+    assert_eq!(
+        supported_access_modes("pi"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("antigravity"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("codex"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("claude"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("opencode"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("deepseek"), &AccessMode::ALL);
+    assert_eq!(
+        supported_access_modes("kiro"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("muse"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("fx"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("grok"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("gemini"), &AccessMode::ALL);
+
+    // Supported current mode is kept.
+    let (modes, resolved) =
+        resolve_compatible_access_mode(AccessMode::Edits, supported_access_modes("pi"));
+    assert!(!modes.contains(&AccessMode::Auto));
+    assert_eq!(resolved, AccessMode::Edits);
+
+    // Read only is preserved when supported.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::ReadOnly, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::ReadOnly);
+
+    // Unsupported current mode falls back to first supported mode skipping Read only.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::Auto, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::Supervised);
+
+    // Empty supported list means all modes are supported.
+    let (modes, resolved) = resolve_compatible_access_mode(AccessMode::Auto, &[]);
+    assert_eq!(modes, AccessMode::ALL);
+    assert_eq!(resolved, AccessMode::Auto);
+}

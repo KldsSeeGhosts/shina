@@ -98,7 +98,10 @@ fn fetch_linked_blob(
 
 #[path = "pi_session.rs"]
 pub(crate) mod pi_session;
-pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+pub use pi_session::{
+    AccessMode, ConversationMode, PiSession, resolve_compatible_access_mode, session_history,
+    supported_access_modes,
+};
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -1050,6 +1053,11 @@ impl Thread {
         } else if self.command("set_model", json!({"provider":provider,"modelId":model_id})) {
             self.configuring = true;
         }
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
     }
 
     pub fn set_thinking(&mut self, level: String) {
@@ -1235,6 +1243,11 @@ impl Thread {
         self.draft_context.clear();
         self.retained_context = Default::default();
         self.native.queue_held = false;
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
         self.begin_prompt(prompt);
     }
 
@@ -5455,6 +5468,11 @@ impl State {
             self.threads[index].harness = harness.clone();
             self.threads[index].native.access =
                 AccessMode::parse(&self.thread_defaults.access).unwrap_or(AccessMode::Supervised);
+            self.threads[index].native.access = resolve_compatible_access_mode(
+                self.threads[index].native.access,
+                supported_access_modes(&harness),
+            )
+            .1;
             if let Some(selection) = self.thread_defaults.models.get(&harness)
                 && !selection.provider.is_empty()
                 && !selection.model.is_empty()
@@ -5527,6 +5545,11 @@ impl State {
         {
             thread.harness_state["serviceTier"] = json!(tier);
         }
+        thread.native.access = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        )
+        .1;
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
@@ -7684,6 +7707,7 @@ impl State {
         if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
             return false;
         }
+        self.reconcile_current_access_mode();
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -8116,6 +8140,11 @@ impl State {
         thread.native.commands_loaded = false;
         thread.error = None;
         thread.prewarm_attempted = false;
+        thread.native.access = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        )
+        .1;
         if id == "pi" {
             self.apply_catalog();
         } else {

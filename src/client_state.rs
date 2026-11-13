@@ -2887,6 +2887,8 @@ impl State {
                     self.set_access_mode(
                         AccessMode::parse(access).unwrap_or(AccessMode::Supervised),
                     );
+                } else {
+                    self.reconcile_current_access_mode();
                 }
             }
             "thread.retry" => self.retry(),
@@ -2926,6 +2928,7 @@ impl State {
                     self.current_mut().native.access =
                         AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
                 }
+                self.reconcile_current_access_mode();
                 return Ok(json!({"threadId":self.current().id}));
             }
             "thread.rename" => {

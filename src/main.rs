@@ -443,7 +443,11 @@ fn dispatch_global_command(
             let open = !t.native.access_picker;
             state.settings_picker = None;
             state.machines.picker = false;
-            state.current_mut().native.access_picker = open;
+            if open {
+                state.open_access_picker();
+            } else {
+                state.current_mut().native.access_picker = false;
+            }
         }
         "modelPicker.previousProvider" => {
             if key_repeat {

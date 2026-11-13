@@ -153,6 +153,66 @@ impl AccessMode {
     }
 }
 
+/// Supported access modes per Shina harness, ported from each KSG provider's
+/// `supportedRuntimeModes` list. Harnesses with no list support all modes.
+/// "Read only" is offered wherever Shina offers it today.
+pub fn supported_access_modes(harness: &str) -> &'static [AccessMode] {
+    match harness {
+        "pi" | "antigravity" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ],
+        "kiro" | "muse" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full,
+        ],
+        "fx" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+        ],
+        "grok" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ],
+        _ => &AccessMode::ALL,
+    }
+}
+
+/// Ported from KSG Code's `resolveCompatibleRuntimeMode`: keeps `current` if supported,
+/// otherwise picks the first supported mode in picker order (skipping "Read only" unless
+/// it was `current`).
+pub fn resolve_compatible_access_mode(
+    current: AccessMode,
+    supported: &[AccessMode],
+) -> (Vec<AccessMode>, AccessMode) {
+    let modes: Vec<AccessMode> = if supported.is_empty() {
+        AccessMode::ALL.to_vec()
+    } else {
+        AccessMode::ALL
+            .iter()
+            .copied()
+            .filter(|mode| supported.contains(mode))
+            .collect()
+    };
+    let mode = if modes.contains(&current) {
+        current
+    } else {
+        modes
+            .iter()
+            .copied()
+            .find(|&mode| mode != AccessMode::ReadOnly)
+            .or_else(|| modes.first().copied())
+            .unwrap_or(current)
+    };
+    (modes, mode)
+}
+
 #[derive(Default)]
 pub struct PiSession {
     pub projected_operating: bool,
@@ -1707,7 +1767,62 @@ impl Thread {
 }
 
 impl State {
+    pub fn effective_access_mode(&self, thread: &crate::model::Thread) -> AccessMode {
+        resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        )
+        .1
+    }
+
+    pub fn reconcile_current_access_mode(&mut self) {
+        let access = self.effective_access_mode(self.current());
+        if self.current().native.access == access {
+            return;
+        }
+        if self.forward(
+            "thread.configure",
+            json!({"threadId":self.current().id,"access":access.id()}),
+        ) {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.demo || self.current().configuring || self.current().archived() {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.current().harness == "claude"
+            && self.current().pi.is_some()
+            && !self.current().initializing
+        {
+            self.current_mut().native.access = access;
+            self.current_mut()
+                .command("set_access_mode", json!({"accessMode":access.id()}));
+            self.checkpoint();
+            return;
+        }
+        if self.current().status.busy() {
+            return;
+        }
+        if self.current().pi.is_some() {
+            self.current_mut().disconnect();
+            self.current_mut().native.access = access;
+            self.connect_thread(self.active);
+        } else {
+            self.current_mut().native.access = access;
+        }
+        self.checkpoint();
+    }
+
+    pub fn open_access_picker(&mut self) {
+        self.reconcile_current_access_mode();
+        self.current_mut().native.access_picker = true;
+    }
+
     pub fn set_access_mode(&mut self, access: AccessMode) {
+        let access =
+            resolve_compatible_access_mode(access, supported_access_modes(&self.current().harness))
+                .1;
         if self.forward(
             "thread.configure",
             json!({"threadId":self.current().id,"access":access.id()}),

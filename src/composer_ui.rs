@@ -739,7 +739,8 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     let captain = t.captain.and_then(|id| s.captains.get(id));
     let captain_width = text_width(captain.map_or("No captain", |c| c.name.as_str()), SMALL)
         + if captain.is_some() { 52.0 } else { 50.0 };
-    let access = text_width(t.native.access.label(), PIXEL) + 20.0;
+    let display_access = s.effective_access_mode(t);
+    let access = text_width(display_access.label(), PIXEL) + 20.0;
     let (name, _) = split_model_label(&t.model);
     let fixed = if resting {
         (text_width(name, TextStyle::new(13.0, 600.0))
@@ -754,7 +755,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         0.0
     };
     let measurement = s.composer_ui.measurement.get();
-    let show_access = !resting || t.native.access.id() != s.thread_defaults.access;
+    let show_access = !resting || display_access.id() != s.thread_defaults.access;
     s.composer_ui.show_access.set(show_access);
     let mut blocks = measurement.map_or([machine, captain_width, access], |m| [m[1], m[2], m[3]]);
     let icon_widths = measurement.map_or(
@@ -827,15 +828,15 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     }
     if visible > 2 {
         let mut access_control = if resting || icon_only(2) {
-            icon_button("access-mode", t.native.access.label(), "shield", p, |s| {
+            icon_button("access-mode", display_access.label(), "shield", p, |s| {
                 s.begin_composer_menu();
-                s.current_mut().native.access_picker = true;
+                s.open_access_picker();
             })
             .size(28.0, 24.0)
         } else {
-            pixel_button("access-mode", t.native.access.label(), p, |s| {
+            pixel_button("access-mode", display_access.label(), p, |s| {
                 s.begin_composer_menu();
-                s.current_mut().native.access_picker = true;
+                s.open_access_picker();
             })
         };
         access_control = access_control
@@ -852,6 +853,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
                 p,
                 |s| {
                     s.begin_composer_menu();
+                    s.reconcile_current_access_mode();
                     s.composer_ui.overflow.set(true);
                 },
             )
@@ -921,11 +923,18 @@ pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
 
 /// KSG's ComposerPermissionsSection. Read only is Shina's additional access option.
 pub(super) fn permissions_section(s: &State, p: Palette) -> El {
-    let shown = s
-        .composer_ui
-        .permission_preview
-        .get()
-        .unwrap_or(s.current().native.access);
+    let t = s.current();
+    let supported = crate::model::supported_access_modes(&t.harness);
+    let (modes, current_mode) =
+        crate::model::resolve_compatible_access_mode(t.native.access, supported);
+    let shown = crate::model::resolve_compatible_access_mode(
+        s.composer_ui
+            .permission_preview
+            .get()
+            .unwrap_or(current_mode),
+        supported,
+    )
+    .1;
     let mut menu = col()
         .key("composer-permissions")
         .on_key(|s: &mut State, event, tx| {
@@ -934,7 +943,11 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
                 rune::Key::Right => 1,
                 _ => return false,
             };
-            let modes = crate::model::AccessMode::ALL;
+            let modes = crate::model::resolve_compatible_access_mode(
+                s.current().native.access,
+                crate::model::supported_access_modes(&s.current().harness),
+            )
+            .0;
             let Some(at) = modes.iter().position(|mode| {
                 tx.focused() == Some(format!("overflow-access-{}", mode.id()).as_str())
             }) else {
@@ -955,7 +968,7 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         .child(pixel_label("Permissions", p.muted));
     let mut options = row().gap(2.0).padding(2.0).radius(4.0).fill(p.selected);
     let mut description = "";
-    for mode in crate::model::AccessMode::ALL {
+    for mode in modes {
         let text = mode.description();
         if mode == shown {
             description = text;
@@ -963,27 +976,27 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         options = options.child(
             el().key(format!("overflow-access-{}", mode.id()))
                 .role("menuitemradio")
-                .checked(mode == s.current().native.access)
+                .checked(mode == current_mode)
                 .label(mode.label())
                 .help(text)
                 .h(24.0)
                 .grow(1.0)
                 .center()
                 .radius(4.0)
-                .fill(if mode == s.current().native.access {
+                .fill(if mode == current_mode {
                     p.card
                 } else {
                     Color::TRANSPARENT
                 })
                 .hover(p.selected)
                 .focus_fill(p.selected)
-                .focus_selected(mode == s.current().native.access)
+                .focus_selected(mode == current_mode)
                 .on_hover_change(move |s: &mut State, inside, _| {
                     s.composer_ui.permission_preview.set(inside.then_some(mode));
                 })
                 .child(
                     icon(
-                        if mode == s.current().native.access {
+                        if mode == current_mode {
                             "check"
                         } else {
                             "shield"

@@ -788,7 +788,11 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
 
 /// Ported from KSG Code's ComposerFooterModeControls and runtimeModeConfig permission menu.
 pub(super) fn access_picker(s: &State, p: Palette) -> El {
-    use crate::model::AccessMode;
+    let t = s.current();
+    let (modes, _) = crate::model::resolve_compatible_access_mode(
+        t.native.access,
+        crate::model::supported_access_modes(&t.harness),
+    );
     let mut card = col()
         .key("access-picker")
         .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
@@ -798,7 +802,7 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));
-    for mode in AccessMode::ALL {
+    for mode in modes {
         let description = mode.description();
         card = card.child(
             col()
