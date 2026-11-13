@@ -202,6 +202,7 @@ struct Client {
     queued: VecDeque<Value>,
     /// Sent UUIDs are only recovered when the interrupt receipt proves cancellation.
     sent: HashMap<String, Value>,
+    attachment_budget: crate::claude_attachment_budget::Budget,
     capabilities: HashSet<String>,
     compact: Option<Value>,
     compacting: bool,
@@ -220,6 +221,7 @@ impl Client {
             _ => uuid::Uuid::new_v4().to_string(),
         };
         Self {
+            attachment_budget: crate::claude_attachment_budget::Budget::load(&session),
             start,
             config: config_directory(),
             session,
@@ -571,7 +573,13 @@ impl Client {
                 .filter_map(Value::as_str)
                 .chain(record["user_message_uuid"].as_str())
             {
+                self.attachment_budget.accept(id, &self.session);
                 self.sent.remove(id);
+            }
+            if record["type"] == "user"
+                && let Some(id) = record["uuid"].as_str()
+            {
+                self.attachment_budget.accept(id, &self.session);
             }
         }
         match record["type"].as_str().unwrap_or("") {
@@ -645,6 +653,7 @@ impl Client {
                             .flatten()
                             .filter_map(Value::as_str)
                         {
+                            self.attachment_budget.pending.remove(id);
                             if let Some(prompt) = self.sent.remove(id) {
                                 recovered.push(prompt["message"].clone());
                                 let mut content =
@@ -664,6 +673,7 @@ impl Client {
                             .flatten()
                             .filter_map(Value::as_str)
                         {
+                            self.attachment_budget.accept(id, &self.session);
                             self.sent.remove(id);
                         }
                         self.reply(&pending.original, json!({}));
@@ -821,11 +831,15 @@ impl Client {
                     }
                 }
                 "compact_boundary" => {
+                    let metadata = &record["compact_metadata"];
+                    let partial = metadata.get("preserved_segment").is_some()
+                        || metadata.get("preserved_messages").is_some();
                     if !self.compact_reported {
                         self.begin_compaction();
                         let error = self.compact_failure.clone();
                         self.end_compaction(error.as_deref());
                     }
+                    self.attachment_budget.compacted(partial, &self.session);
                 }
                 "api_retry" if record["error_status"] == 401 => {
                     return Err(AUTH_ERROR.into());
@@ -1220,11 +1234,13 @@ impl Client {
     }
 
     fn send_input(&mut self, record: &Value) -> Result<(), String> {
-        let content = input_blocks(record)?;
         if self.sent.len() >= 32 {
             return Err("Claude has 32 unconsumed inputs. Wait for the current turn.".into());
         }
+        let (content, usage) =
+            input_blocks_with_budget(record, self.attachment_budget.remaining())?;
         let id = uuid::Uuid::new_v4().to_string();
+        self.attachment_budget.pending.insert(id.clone(), usage);
         self.sent.insert(id.clone(), record.clone());
         self.wire
             .push(json!({"type":"user","uuid":id,"session_id":self.session,
@@ -1472,6 +1488,7 @@ impl Client {
 
     fn begin_compaction(&mut self) {
         if !self.compacting {
+            self.attachment_budget.compacting = Some(self.attachment_budget.committed);
             self.compacting = true;
             self.compact_failure = None;
             self.compact_reported = false;
@@ -1514,7 +1531,24 @@ fn auth_error(message: &str) -> bool {
     .any(|s| text.contains(s))
 }
 
+#[cfg(test)]
 fn input_blocks(record: &Value) -> Result<Vec<Value>, String> {
+    input_blocks_with_budget(
+        record,
+        crate::claude_attachment_budget::Usage {
+            bytes: crate::claude_attachment_budget::MAX_BYTES,
+            pages: crate::claude_attachment_budget::MAX_PAGES,
+        },
+    )
+    .map(|(blocks, _)| blocks)
+}
+
+// Ported from KSG ClaudeAdapterV2.makeClaudeUserMessageWithAttachments.
+fn input_blocks_with_budget(
+    record: &Value,
+    remaining: crate::claude_attachment_budget::Usage,
+) -> Result<(Vec<Value>, crate::claude_attachment_budget::Usage), String> {
+    use crate::claude_attachment_budget::{Usage, pdf_pages};
     let mut text = record["message"].as_str().unwrap_or("").to_owned();
     if let Some(skill) = text.strip_prefix("/skill:") {
         text = format!("/{skill}");
@@ -1526,33 +1560,151 @@ fn input_blocks(record: &Value) -> Result<Vec<Value>, String> {
         .map(|v| crate::attachments::Attachment::from_value(v).ok_or("Invalid Claude attachment."))
         .collect::<Result<_, _>>()?;
     crate::attachments::validate_prompt_images(&attachments)?;
-    for attachment in attachments {
-        let path = attachment
-            .path
-            .as_ref()
+    let paths = record["attachmentPaths"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|v| {
+                    crate::attachments::Attachment::from_value(v)
+                        .ok_or("Invalid Claude attachment path.")
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_else(|| attachments.clone());
+    for attachment in &paths {
+        let path = crate::attachments::path_for(attachment)
             .ok_or("Claude attachment lacks an absolute path.")?;
         text.push_str(&format!(
-            "\n\n[Attached file \"{}\" is saved at: {}]",
+            "\n\n[Attached {} \"{}\" is saved at: {}]",
+            if attachment.is_image() {
+                "image"
+            } else {
+                "file"
+            },
             attachment.name,
             path.display()
         ));
     }
     let mut blocks = vec![];
+    let has_attachments = !paths.is_empty()
+        || record["images"]
+            .as_array()
+            .is_some_and(|images| !images.is_empty());
+    let text_bytes = if !has_attachments {
+        serde_json::to_vec(&text).map_err(|e| e.to_string())?.len() as u64
+    } else {
+        0
+    };
     if !text.is_empty() {
         blocks.push(json!({"type":"text","text":text}));
     }
-    for image in record["images"].as_array().into_iter().flatten() {
+    let mut usage = Usage {
+        bytes: if has_attachments {
+            serde_json::to_vec(&blocks)
+                .map_err(|e| e.to_string())?
+                .len() as u64
+        } else {
+            text_bytes
+        },
+        pages: 0,
+    };
+    let mut media = Vec::new();
+    for (index, image) in record["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let mime = image["mimeType"]
             .as_str()
             .ok_or("Claude image lacks MIME type.")?;
         let data = image["data"].as_str().ok_or("Claude image lacks data.")?;
-        blocks
-            .push(json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}}));
+        if !matches!(
+            mime.to_ascii_lowercase().as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Err(format!("Unsupported Claude image attachment type '{mime}'"));
+        }
+        let retained = data.len() as u64 + 128;
+        if retained > remaining.bytes.saturating_sub(usage.bytes) {
+            if record["imageAttachments"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+            {
+                return Err(
+                    "Claude's native image budget is full and this input has no attachment path."
+                        .into(),
+                );
+            }
+            continue;
+        }
+        usage.bytes += retained;
+        let id = record["imageAttachments"][index]["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        media.push((
+            id,
+            json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}}),
+        ));
     }
+    for attachment in &attachments {
+        if usage.pages >= remaining.pages
+            || attachment
+                .mime
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                != "application/pdf"
+        {
+            continue;
+        }
+        let maximum = remaining
+            .bytes
+            .saturating_sub(usage.bytes)
+            .saturating_sub(1024)
+            .saturating_mul(3)
+            / 4;
+        let maximum = maximum
+            .min(20 * 1024 * 1024)
+            .min(crate::attachments::MAX_FILE_BYTES);
+        let Some(path) = crate::attachments::path_for(attachment) else {
+            continue;
+        };
+        if maximum == 0 || std::fs::metadata(&path).map_or(true, |m| m.len() > maximum) {
+            continue;
+        }
+        let bytes = crate::attachments::transfer_file_bytes(attachment)?;
+        if bytes.len() as u64 > maximum {
+            continue;
+        }
+        let Some(pages) = pdf_pages(&bytes) else {
+            continue;
+        };
+        let retained = (bytes.len() as u64).div_ceil(3) * 4 + 128;
+        if pages > remaining.pages.saturating_sub(usage.pages)
+            || retained > remaining.bytes.saturating_sub(usage.bytes)
+        {
+            continue;
+        }
+        usage.bytes += retained;
+        usage.pages += pages;
+        media.push((
+            attachment.id.clone(),
+            json!({"type":"document","source":{"type":"base64","media_type":"application/pdf",
+            "data":crate::attachments::encode_base64(&bytes)}}),
+        ));
+    }
+    media.sort_by_key(|(id, _)| paths.iter().position(|a| &a.id == id).unwrap_or(usize::MAX));
+    blocks.extend(media.into_iter().map(|(_, block)| block));
     if blocks.is_empty() {
         return Err("Claude requires text or attachments.".into());
     }
-    Ok(blocks)
+    Ok((blocks, usage))
 }
 
 fn config_directory() -> PathBuf {

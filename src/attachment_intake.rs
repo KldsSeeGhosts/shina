@@ -45,6 +45,17 @@ fn generic(mime: &str) -> bool {
     mime.is_empty() || mime.eq_ignore_ascii_case("application/octet-stream")
 }
 
+fn generic_media(mime: &str) -> bool {
+    matches!(
+        mime,
+        "" | "application/octet-stream"
+            | "binary/octet-stream"
+            | "application/unknown"
+            | "video/mp2t"
+            | "video/vnd.dlna.mpeg-tts"
+    )
+}
+
 pub fn is_heic(name: &str, mime: &str) -> bool {
     mime.eq_ignore_ascii_case("image/heic")
         || mime.eq_ignore_ascii_case("image/heif")
@@ -65,13 +76,13 @@ fn is_dng(name: &str, mime: &str) -> bool {
 }
 
 fn is_svg(name: &str, mime: &str) -> bool {
-    extension(name) == "svg"
-        || mime
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case("image/svg+xml")
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mime == "image/svg+xml" || generic_media(&mime) && extension(name) == "svg"
 }
 
 pub fn classify(name: &str, mime: &str) -> Kind {
@@ -124,7 +135,14 @@ pub fn file_mime(name: &str, mime: &str) -> String {
         "image/x-adobe-dng".into()
     } else if is_svg(name, mime) {
         "image/svg+xml".into()
-    } else if generic(mime) {
+    } else if generic_media(
+        &mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase(),
+    ) {
         let inferred = native_mime(name);
         if inferred.starts_with("video/") {
             inferred.into()
@@ -363,6 +381,7 @@ mod tests {
         for (name, mime, expected) in [
             ("diagram.svg", "image/svg+xml", Kind::File),
             ("diagram.SVG", "", Kind::File),
+            ("diagram.svg", "image/jpeg", Kind::Image),
             ("photo.tiff", "image/tiff", Kind::File),
             ("report.pdf", "application/pdf", Kind::File),
             ("picture.bmp", "image/bmp", Kind::File),

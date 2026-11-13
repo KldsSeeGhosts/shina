@@ -9,6 +9,7 @@ mod brand;
 mod cache_persistence;
 mod captains;
 mod claude;
+mod claude_attachment_budget;
 mod client;
 mod client_history;
 mod codex;

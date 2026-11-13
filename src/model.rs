@@ -7191,7 +7191,7 @@ impl State {
             }
             if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
                 errors.push(format!(
-                    "A message can carry up to {} attachments. The remaining files were not attached.",
+                    "You can attach up to {} files per message.",
                     attachments::MAX_ATTACHMENTS
                 ));
                 break;
@@ -15038,15 +15038,15 @@ mod tests {
     fn attachment_count_and_size_limits_keep_the_text_draft_untouched() {
         let mut thread = Thread::new(1);
         thread.draft.replace_text("Keep me");
-        for width in 0..8 {
+        for width in 0..attachments::MAX_ATTACHMENTS {
             thread
-                .add_attachment(test_attachment("image.png", width + 1))
+                .add_attachment(test_attachment("image.png", width as u32 + 1))
                 .unwrap();
         }
         let error = thread
-            .add_attachment(test_attachment("extra.png", 20))
+            .add_attachment(test_attachment("extra.png", 120))
             .unwrap_err();
-        assert!(error.contains("up to 8"));
+        assert!(error.contains("up to 100"));
         assert_eq!(thread.draft.text, "Keep me");
         thread.draft_images.clear();
         let mut oversized = test_attachment("ok.png", 20);
@@ -15058,15 +15058,15 @@ mod tests {
     #[test]
     fn restoring_submitted_images_preserves_a_newer_full_draft() {
         let mut thread = Thread::new(1);
-        let submitted = test_attachment("submitted.png", 30);
+        let submitted = test_attachment("submitted.png", 130);
         let prompt = Prompt::new("Submitted".into(), vec![submitted.clone()]);
-        let newer: Vec<_> = (1..=attachments::MAX_IMAGES as u32)
+        let newer: Vec<_> = (1..=attachments::MAX_ATTACHMENTS as u32)
             .map(|width| test_attachment("newer.png", width))
             .collect();
         thread.draft_images = newer.clone();
         thread.draft.replace_text("Newer draft");
         thread.restore_prompt(&prompt);
-        assert_eq!(thread.draft_images.len(), attachments::MAX_IMAGES + 1);
+        assert_eq!(thread.draft_images.len(), attachments::MAX_ATTACHMENTS + 1);
         assert_eq!(thread.draft_images[0], submitted);
         assert_eq!(&thread.draft_images[1..], newer.as_slice());
         assert_eq!(thread.draft.text, "Submitted\n\nNewer draft");
@@ -15075,7 +15075,7 @@ mod tests {
                 .attachment_error
                 .as_deref()
                 .unwrap()
-                .contains("Remove images")
+                .contains("100 files")
         );
         assert!(attachments::encode_images(&thread.draft_images).is_err());
         thread.remove_attachment(&submitted.id);

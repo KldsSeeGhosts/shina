@@ -17,8 +17,6 @@ use std::{
     },
 };
 
-/// A message carries at most this many images.
-pub const MAX_IMAGES: usize = 8;
 pub const MAX_ATTACHMENTS: usize = 100;
 /// KSG contracts/chatAttachment.PROVIDER_SEND_TURN_MAX_FILE_BYTES.
 pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
@@ -26,9 +24,7 @@ pub const MAX_TEXT_BYTES: u64 = 256 * 1024;
 /// The largest single image Shina accepts, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// The largest combined image payload in one draft.
-pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
-/// Caps one decode at 32 megapixels, below Rune's 64 megapixel clipboard limit.
-pub(crate) const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 80 * 1024 * 1024;
 const NAME_LIMIT: usize = 255;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,10 +92,8 @@ impl Attachment {
             if !path.is_absolute()
                 || name.is_empty()
                 || name.chars().count() > NAME_LIMIT
-                || !matches!(
-                    mime,
-                    "text/plain" | "application/octet-stream" | "inode/directory"
-                )
+                || mime.trim().is_empty()
+                || mime.encode_utf16().count() > 100
                 || id != file_id(&path)
             {
                 return None;
@@ -131,12 +125,7 @@ impl Attachment {
         let width = u32::try_from(value["width"].as_u64()?).ok()?;
         let height = u32::try_from(value["height"].as_u64()?).ok()?;
         let bytes = value["bytes"].as_u64()?;
-        if width == 0
-            || height == 0
-            || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
-            || bytes == 0
-            || bytes > MAX_IMAGE_BYTES
-        {
+        if width == 0 || height == 0 || bytes == 0 || bytes > MAX_IMAGE_BYTES {
             return None;
         }
         let path = path_for_id(id)?;
@@ -486,6 +475,7 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
             }
             crate::attachment_intake::Kind::File => {}
         }
+        validate_file_metadata(&name, mime, metadata.len())?;
         let mut attachment = file_reference(path, &metadata, &name)?;
         if mime != "application/octet-stream" {
             attachment.mime = crate::attachment_intake::file_mime(&name, mime);
@@ -727,24 +717,25 @@ pub fn validate_prompt_images(images: &[Attachment]) -> Result<(), String> {
             "You can attach up to {MAX_ATTACHMENTS} files per message or question response."
         ));
     }
-    let count = images.iter().filter(|a| a.is_image()).count();
-    if count > MAX_IMAGES {
-        return Err(format!(
-            "A message can carry up to {MAX_IMAGES} images. This draft has {} images. Remove images until at most {MAX_IMAGES} remain.",
-            count
-        ));
-    }
     if images
         .iter()
-        .filter(|a| a.is_image())
+        .filter(|a| {
+            a.is_image()
+                || matches!(
+                    a.mime.to_ascii_lowercase().as_str(),
+                    "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+                )
+        })
         .map(|image| image.bytes)
-        .sum::<u64>()
+        .fold(0u64, u64::saturating_add)
         > MAX_TOTAL_BYTES
     {
-        return Err(format!(
-            "These images exceed the {} MB message limit. Remove images before sending.",
-            MAX_TOTAL_BYTES / (1024 * 1024)
-        ));
+        return Err("Images can total up to 80 MiB per message or question response. Use smaller images or send fewer at once.".into());
+    }
+    for attachment in images.iter().filter(|a| a.is_image()) {
+        if attachment.bytes > MAX_IMAGE_BYTES {
+            return Err(crate::attachment_intake::Failure::TooLarge.message(&attachment.name));
+        }
     }
     for attachment in images.iter().filter(|a| !a.is_image()) {
         let path = attachment.path.as_ref().unwrap();
@@ -815,6 +806,23 @@ pub fn prompt_record(prompt: &Prompt, pi: bool) -> Result<Value, String> {
         record["images"] = json!(images);
     }
     if !pi {
+        // Internal native-provider record, not a peer protocol field. Claude keeps paths
+        // available when its retained native-image budget is exhausted.
+        record["imageAttachments"] = json!(
+            prompt
+                .images
+                .iter()
+                .filter(|a| a.is_image())
+                .map(Attachment::to_value)
+                .collect::<Vec<_>>()
+        );
+        record["attachmentPaths"] = json!(
+            prompt
+                .images
+                .iter()
+                .map(Attachment::to_value)
+                .collect::<Vec<_>>()
+        );
         record["attachments"] = json!(
             prompt
                 .images
@@ -932,11 +940,8 @@ fn validate(bytes: &[u8]) -> Result<(Validated, image::DynamicImage), String> {
     let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
         .into_dimensions()
         .map_err(|_| "The image is damaged or incomplete. Choose a valid image.".to_owned())?;
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        return Err(format!(
-            "The image is too large to decode. Choose one under {} megapixels.",
-            MAX_IMAGE_PIXELS / (1024 * 1024)
-        ));
+    if width == 0 || height == 0 {
+        return Err("The image has invalid dimensions.".into());
     }
     // A header alone can look valid while the rest of the file is truncated. Decode once here,
     // off the prompt path, so malformed images fail before they reach Pi.
@@ -1173,6 +1178,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ksg_image_count_and_byte_boundaries() {
+        let image = Attachment {
+            id: "fixture.png".into(),
+            name: "fixture.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            path: None,
+        };
+        assert!(validate_prompt_images(&vec![image.clone(); 100]).is_ok());
+        assert_eq!(
+            validate_prompt_images(&vec![image.clone(); 101]).unwrap_err(),
+            "You can attach up to 100 files per message or question response."
+        );
+        let mut images = vec![image; 8];
+        for image in &mut images {
+            image.bytes = 10 * 1024 * 1024;
+        }
+        assert!(validate_prompt_images(&images).is_ok());
+        images.push(Attachment {
+            bytes: 1,
+            ..images[0].clone()
+        });
+        assert_eq!(
+            validate_prompt_images(&images).unwrap_err(),
+            "Images can total up to 80 MiB per message or question response. Use smaller images or send fewer at once."
+        );
+    }
+
+    #[test]
+    fn supported_image_mime_files_share_the_image_budget_but_dng_does_not() {
+        let path = crate::store::directory().unwrap().join("budget.bin");
+        fs::write(&path, b"file").unwrap();
+        let mut file = attach_file(&path).unwrap();
+        file.bytes = 40 * 1024 * 1024;
+        file.mime = "image/png".into();
+        assert!(validate_prompt_images(&[file.clone(), file.clone()]).is_ok());
+        assert!(validate_prompt_images(&[file.clone(), file.clone(), file.clone()]).is_err());
+        file.mime = "image/x-adobe-dng".into();
+        assert!(validate_prompt_images(&[file.clone(), file.clone(), file]).is_ok());
+    }
+
+    #[test]
     fn transferred_files_are_content_addressed_immutable_and_validate_ksg_boundaries() {
         let directory = crate::store::directory()
             .unwrap()
@@ -1304,7 +1353,6 @@ mod tests {
                 b"\xff\xfe".as_slice(),
                 "application/octet-stream",
             ),
-            ("empty.txt", b"".as_slice(), "text/plain"),
         ] {
             let path = directory.join(name);
             fs::write(&path, bytes).unwrap();

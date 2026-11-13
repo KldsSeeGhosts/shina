@@ -1214,8 +1214,6 @@ fn cached_image_valid(profile: &std::path::Path, value: &Value) -> bool {
         )
         && attachment.width > 0
         && attachment.height > 0
-        && u64::from(attachment.width) * u64::from(attachment.height)
-            <= crate::attachments::MAX_IMAGE_PIXELS
         && attachment.bytes > 0
         && attachment.bytes <= crate::attachments::MAX_IMAGE_BYTES
         && std::fs::metadata(profile.join("attachments").join(&attachment.id))
