@@ -1076,3 +1076,24 @@ fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn(
         ])
     );
 }
+
+#[test]
+fn claude_fresh_session_passes_session_id_and_not_resume() {
+    let client = Client::new(Start {
+        id: "claude".into(),
+        workspace: PathBuf::from("."),
+        source: SessionSource::New,
+        instructions: None,
+        link: None,
+        owner: Arc::default(),
+        context_sent: false,
+    });
+    let mut command = Command::new("claude");
+    client.launch(&mut command);
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.iter().any(|arg| arg == "--session-id"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg == "--resume"), "{args:?}");
+}

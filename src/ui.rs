@@ -9086,7 +9086,34 @@ fn build_user_or_system_row(
             .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
             .child(lbl)
     };
-    col().w_full().child(body.key(key))
+    let mut wrapper = col().w_full();
+    if message.role == "You" && t.is_fresh_session_message(&message.id) {
+        wrapper = wrapper.gap(8.0).child(fresh_session_row(&message.id, p));
+    }
+    wrapper.child(body.key(key))
+}
+
+/// Ported from KSG Code's `FreshSessionRow` (`components/chat/V2LifecycleRow.tsx`) and
+/// `TimelineSystemDivider` (`components/chat/TimelineSystemDivider.tsx`).
+fn fresh_session_row(message_id: &str, p: Palette) -> El {
+    row()
+        .key(format!("fresh-session-row-{message_id}"))
+        .role("status")
+        .label("New session")
+        .w_full()
+        .min_w(0.0)
+        .py(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .child(icon("alert", p.muted))
+                .child(pixel_text("New session", p.muted)),
+        )
+        .child(el().h(1.0).grow(1.0).fill(p.line))
 }
 
 /// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
@@ -10335,7 +10362,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
                 dismiss_label,
                 "close",
                 p,
-                move |s| s.composer_notices.dismiss(&dismiss_id),
+                move |s| s.dismiss_composer_notice(&dismiss_id),
             ));
         }
 
@@ -11049,6 +11076,13 @@ fn composer(
         area = area.child(dialog(s, p));
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
+    let compact_before_send_tokens = if !collapsed && !show_resume && t.queued_edit.is_none() {
+        s.resume_compaction_tokens(t, crate::lifecycle::now())
+    } else {
+        None
+    };
+    let keep_full_history = s.keep_full_history(t);
+    let compacts_before_send = compact_before_send_tokens.is_some() && !keep_full_history;
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
@@ -11075,6 +11109,8 @@ fn composer(
             } else {
                 "Update queued message"
             }
+        } else if compacts_before_send {
+            "Compact and send"
         } else if t.status.busy() {
             if t.follow_up_queues() {
                 "Queue message"
@@ -11132,6 +11168,46 @@ fn composer(
             .center_y(),
     );
     if collapsed || !t.status.busy() || t.has_draft_content() || t.queued_edit.is_some() {
+        if let Some(tokens) = compact_before_send_tokens {
+            let amount = crate::context::format_context_window_tokens(tokens);
+            let tooltip = if keep_full_history {
+                format!("Next send keeps all {amount} tokens.\nClick to compact first")
+            } else {
+                format!("Next send compacts {amount} tokens first.\nClick to keep full history")
+            };
+            let mut toggle = row()
+                .key("composer-compact-send")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Compact {amount} tokens of history before sending"))
+                .help(tooltip)
+                .focusable(true)
+                .h(28.0)
+                .px(8.0)
+                .radius(4.0)
+                .center_y()
+                .gap(6.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .disabled(
+                    composer_disabled(s)
+                        || (s.client.is_some() && !s.machine_connected(&s.machines.selected)),
+                )
+                .on_press(|s: &mut State| s.toggle_keep_full_history())
+                .child(icon("minimize", p.muted));
+            if !keep_full_history {
+                toggle = toggle.fill(p.selected);
+            }
+            if lane >= 480.0 {
+                toggle = toggle.child(label(
+                    if keep_full_history { "Keep" } else { "Compact" },
+                    TextStyle::new(12.0, 500.0),
+                    p.ink,
+                ));
+            }
+            toggle = toggle.child(label(&amount, PIXEL.features(TABULAR), p.muted));
+            action = action.child(toggle);
+        }
         action = action.child(send);
     }
     if !collapsed
@@ -22473,6 +22549,107 @@ pub(crate) mod tests {
             assert!(
                 rt.presented("composer-notice-att-long").is_none(),
                 "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn armed_fresh_session_notice_and_transcript_row_render_at_narrow_and_wide_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "u1".into(),
+                role: "You",
+                text: "Old question".into(),
+                images: vec![],
+                context: None,
+            });
+            rt.state.current_mut().status = Status::Completed;
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            assert!(rt.state.current().fresh_session_arm.is_some(), "{width}");
+            assert!(
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .any(|n| n.id == "fresh-session"),
+                "{width}: notices={:?}",
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .map(|n| &n.id)
+                    .collect::<Vec<_>>()
+            );
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-dismiss-fresh-session")
+                    .is_some(),
+                "{width}"
+            );
+
+            // Dismissing the notice disarms the fresh session.
+            press(&mut rt, "composer-notice-dismiss-fresh-session");
+            rt.frame(1.0);
+            assert!(rt.state.current().fresh_session_arm.is_none(), "{width}");
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_none(),
+                "{width}"
+            );
+
+            // Re-arm and send a fresh turn; the fresh-session divider row appears in transcript.
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            rt.state.current_mut().draft.replace_text("Fresh question");
+            rt.state.send();
+            rt.invalidate();
+            rt.frame(0.0);
+            let fresh_msg_id = rt.state.current().messages[1].id.clone();
+            assert!(
+                rt.presented(&format!("fresh-session-row-{fresh_msg_id}"))
+                    .is_some(),
+                "{width}"
+            );
+
+            // Part B: disarm /clear (it's already disarmed after send) and verify the
+            // Compact / Keep toggle appears for a stale Claude session >= 200k tokens.
+            let stale_at = crate::lifecycle::now().saturating_sub(80 * 60_000);
+            {
+                let t = rt.state.current_mut();
+                t.harness = "claude".into();
+                t.model_provider = "claude".into();
+                t.session = Some("11111111-1111-4111-8111-111111111111".into());
+                t.status = Status::Completed;
+                t.context.absorb(&json!({
+                    "contextUsage": {
+                        "tokens": 220_000,
+                        "contextWindow": 1_000_000,
+                        "updatedAt": stale_at
+                    }
+                }));
+            }
+            press(&mut rt, "composer-input");
+            rt.frame(1.0);
+            assert!(rt.presented("composer-compact-send").is_some(), "{width}");
+            let tree = rt.accessibility_json().to_string();
+            assert!(
+                tree.contains("Compact 220k tokens of history before sending"),
+                "{width}: {tree}"
+            );
+            assert!(tree.contains("220k"), "{width}: {tree}");
+            press(&mut rt, "composer-compact-send");
+            rt.frame(1.0);
+            assert!(
+                rt.state.keep_full_history(rt.state.current()),
+                "{width}: clicking toggle switches to Keep"
             );
         }
     }

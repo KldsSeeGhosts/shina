@@ -1523,3 +1523,42 @@ fn codex_token_usage_notification_produces_estimated_and_inferred_breakdown() {
     }));
     assert_eq!(breakdown.iter().map(|r| r.tokens).sum::<u64>(), 10000);
 }
+
+#[test]
+fn codex_fresh_session_issues_thread_start_and_not_resume() {
+    let mut client = Client::new(Start {
+        id: "codex".into(),
+        workspace: PathBuf::from("."),
+        source: SessionSource::New,
+        instructions: None,
+        link: Some(crate::backend::HostLink {
+            url: "http://127.0.0.1:1/mcp".into(),
+            token: "test-token".into(),
+            extension: PathBuf::new(),
+            access_mode: "workspace".into(),
+        }),
+        owner: Arc::default(),
+        context_sent: false,
+    });
+    client.initialize();
+    let init_id = client.wire[0]["id"].clone();
+    client
+        .incoming(json!({"id": init_id, "result": {"userAgent": "codex/0.120.0"}}))
+        .unwrap();
+    let models_id = client
+        .wire
+        .iter()
+        .find(|msg| msg["method"] == "model/list")
+        .unwrap()["id"]
+        .clone();
+    client
+        .incoming(json!({"id": models_id, "result": {"data": []}}))
+        .unwrap();
+    let methods: Vec<&str> = client
+        .wire
+        .iter()
+        .filter_map(|msg| msg["method"].as_str())
+        .collect();
+    assert!(methods.contains(&"thread/start"), "{methods:?}");
+    assert!(!methods.contains(&"thread/resume"), "{methods:?}");
+}

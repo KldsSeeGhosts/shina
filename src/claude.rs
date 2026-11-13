@@ -1507,10 +1507,33 @@ impl Client {
                     && tokens.is_some_and(|t| self.usage["tokens"].as_u64().is_some_and(|p| t >= p))
             })
             .cloned();
-        self.usage = json!({"tokens":tokens,"contextWindow":window});
-        if let Some(breakdown) = preserved_breakdown {
-            self.usage["breakdown"] = breakdown;
+        let ttl_ms = if self.last_usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(60 * 60_000u64)
+        } else if self.last_usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            Some(5 * 60_000u64)
+        } else {
+            None
+        };
+        let mut usage = json!({
+            "tokens": tokens,
+            "contextWindow": window,
+            "updatedAt": crate::lifecycle::now(),
+        });
+        if let Some(ttl) = ttl_ms {
+            usage["promptCacheTtlMs"] = json!(ttl);
         }
+        if let Some(breakdown) = preserved_breakdown {
+            usage["breakdown"] = breakdown;
+        }
+        self.usage = usage;
         self.events
             .push(json!({"type":"context_usage","data":{"contextUsage":self.usage}}));
     }

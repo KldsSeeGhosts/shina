@@ -790,3 +790,31 @@ fn acp_reports_option_descriptors_and_applies_config_and_mode_options() {
     );
     assert_eq!(client.wire.last().unwrap()["params"]["value"], "high");
 }
+
+#[test]
+fn acp_fresh_session_issues_session_new_and_not_resume_or_load() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.initialize();
+    let init_id = client.wire[0]["id"].clone();
+    client
+        .incoming(json!({
+            "jsonrpc": "2.0",
+            "id": init_id,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "sessionCapabilities": { "resume": {} }
+                }
+            }
+        }))
+        .unwrap();
+    let methods: Vec<&str> = client
+        .wire
+        .iter()
+        .filter_map(|msg| msg["method"].as_str())
+        .collect();
+    assert!(methods.contains(&"session/new"), "{methods:?}");
+    assert!(!methods.contains(&"session/load"), "{methods:?}");
+    assert!(!methods.contains(&"session/resume"), "{methods:?}");
+}

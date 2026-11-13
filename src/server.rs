@@ -668,6 +668,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         deferred_work = minor >= 11;
                         if deferred_work { capabilities.push(protocol::DEFERRED_WORK); }
                         if minor >= 12 { capabilities.push(protocol::PROJECT_WRITE_FILE); }
+                        if minor >= 13 { capabilities.push(protocol::FRESH_CONTEXT); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),

@@ -175,6 +175,14 @@ struct ThreadView {
     commands_error: Option<String>,
     #[serde(default)]
     memory_suggestions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fresh_session_messages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queue_fresh: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_cache_ttl_ms: Option<u64>,
 }
 
 impl ThreadView {
@@ -290,11 +298,22 @@ impl ThreadView {
             commands_loaded: thread.native.commands_loaded,
             commands_error: thread.native.commands_error.clone(),
             memory_suggestions: thread.memory_suggestions.clone(),
+            fresh_session_messages: thread.fresh_session_messages.clone(),
+            queue_fresh: thread
+                .native
+                .queue
+                .iter()
+                .filter(|q| thread.native.fresh_queue_ids.contains(&q.id))
+                .map(|q| q.id)
+                .collect(),
+            context_updated_at: thread.context.updated_at,
+            prompt_cache_ttl_ms: thread.context.prompt_cache_ttl_ms,
         }
     }
 
     fn apply(self, thread: &mut Thread) -> Result<(), String> {
         thread.memory_suggestions = self.memory_suggestions;
+        thread.fresh_session_messages = self.fresh_session_messages;
         if thread.remote.is_some() {
             thread.request_generation = self.generation;
         }
@@ -393,6 +412,8 @@ impl ThreadView {
         thread.context_window = self.context_window;
         thread.context.usage = self.context_usage;
         thread.context.phase = self.context_phase;
+        thread.context.updated_at = self.context_updated_at;
+        thread.context.prompt_cache_ttl_ms = self.prompt_cache_ttl_ms;
         thread.configuring = self.configuring;
         if thread.remote.is_some() {
             thread.initializing = self.initializing;
@@ -470,6 +491,7 @@ impl ThreadView {
         thread.projected_harness_choice = self.harness_choice;
         thread.native.commands_loaded = self.commands_loaded;
         thread.native.commands_error = self.commands_error;
+        thread.native.fresh_queue_ids = self.queue_fresh.into_iter().collect();
         Ok(())
     }
 }
@@ -1078,6 +1100,8 @@ impl State {
                 let mut bg_failed: Option<(String, usize, String)> = None;
                 let mut open_new_after: Option<(usize, String)> = None;
                 let mut handled_background = false;
+                let mut sync_fresh = false;
+                let mut cleared_keep_id = None;
                 {
                     let threads = if server == self.machines.selected {
                         Some(&mut self.threads)
@@ -1093,6 +1117,10 @@ impl State {
                         })
                     }) {
                         thread.finish_remote_send(command.command_id, accepted);
+                        if accepted {
+                            cleared_keep_id = Some(thread.id);
+                        }
+                        sync_fresh = accepted && server == self.machines.selected;
                         let bg = thread.background_send.take();
                         let send_new = thread.pending_send_and_new_thread.take();
                         handled_background = bg.is_some() || send_new.is_some();
@@ -1114,6 +1142,12 @@ impl State {
                             open_new_after = Some((thread.id, pending_server));
                         }
                     }
+                }
+                if let Some(thread_id) = cleared_keep_id {
+                    self.set_keep_full_history(&server, thread_id, false);
+                }
+                if sync_fresh {
+                    self.sync_fresh_session_notice();
                 }
                 if let Some((bg_server, thread_id)) = bg_started {
                     self.notify_background_started(&bg_server, thread_id);
@@ -1906,7 +1940,7 @@ impl State {
         if let (Some(tx), Some(delay)) = (tx, wake) {
             tx.wake_after(delay);
         }
-        changed
+        changed | self.sync_fresh_session_notice()
     }
     pub fn retry_machine(&mut self, server: &str) {
         let result = if server == "local" {
@@ -2925,7 +2959,10 @@ impl State {
                     .unwrap_or_default();
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
-                self.send();
+                let _ = self.dispatch_send_with_options(
+                    Some(input.fresh_context == Some(true)),
+                    input.compact_before_send,
+                );
                 if self.current().has_draft_content() {
                     let error = self
                         .current()

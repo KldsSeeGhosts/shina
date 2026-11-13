@@ -98,7 +98,7 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
         );
     }
     if trigger.marker == '/' {
-        let mut items: Vec<_> = t
+        let mut items: Vec<_> = s
             .slash_matches()
             .into_iter()
             .map(|command| Item {
