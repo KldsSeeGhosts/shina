@@ -635,7 +635,16 @@ impl State {
         };
         self.settings.notice = result.err();
     }
-    fn save_defaults(&mut self, defaults: ThreadDefaults) {
+    fn save_defaults(&mut self, mut defaults: ThreadDefaults) {
+        if let Some(mode) = crate::model::AccessMode::parse(&defaults.access)
+            && let Some(clamped) = crate::model::clamp_managed_access_mode(
+                self.managed_policy.as_ref(),
+                mode,
+                &crate::model::AccessMode::ALL,
+            )
+        {
+            defaults.access = clamped.id().into();
+        }
         self.settings_command("settings.threadDefaults", json!(defaults));
     }
     fn reveal_settings_file(&mut self, name: &str) {
@@ -807,40 +816,65 @@ pub(super) fn destructive_button(
     settings_button(key, title, Palette { ink: p.danger, ..p }, action)
 }
 
-fn default_access(p: Palette, current: &str) -> El {
+fn default_access(s: &State, p: Palette, current: &str) -> El {
+    let selected = crate::model::AccessMode::parse(current).and_then(|mode| {
+        crate::model::clamp_managed_access_mode(
+            s.managed_policy.as_ref(),
+            mode,
+            &crate::model::AccessMode::ALL,
+        )
+    });
     let mut group = col()
         .key("settings-access-value")
         .role("radiogroup")
         .label("Default access mode")
         .focus_group()
-        .w(160.0)
+        .w(220.0)
         .padding(2.0)
         .gap(2.0)
         .radius(4.0)
         .border(1.0, p.line);
     for mode in crate::model::AccessMode::ALL {
-        let on = mode.id() == current;
-        group = group.child(
-            row()
-                .key(format!("settings-default-access-{}", mode.id()))
-                .role("radio")
-                .checked(on)
-                .label(mode.label())
-                .focusable(true)
-                .focus_highlight(p.selected)
-                .h(28.0)
-                .px(8.0)
-                .center_y()
-                .radius(4.0)
-                .fill(if on { p.selected } else { Color::TRANSPARENT })
-                .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
-                .on_press(move |s: &mut State| {
-                    let mut defaults = s.settings_defaults();
-                    defaults.access = mode.id().into();
-                    s.save_defaults(defaults);
-                })
-                .child(label(mode.label(), TextStyle::new(12.0, 500.0), p.ink)),
-        );
+        let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
+        let disabled = denial.is_some();
+        let on = !disabled && selected == Some(mode);
+        let mut content = col().gap(2.0).min_w(0.0).child(label(
+            mode.label(),
+            TextStyle::new(12.0, 500.0),
+            if disabled { p.muted } else { p.ink },
+        ));
+        if let Some(reason) = denial {
+            content = content.child(
+                label(&reason, TextStyle::new(11.0, 400.0).lh(14.0), p.muted)
+                    .key(format!("settings-default-access-{}-denial", mode.id()))
+                    .wrap(),
+            );
+        }
+        let mut item = row()
+            .key(format!("settings-default-access-{}", mode.id()))
+            .role("radio")
+            .checked(on)
+            .label(mode.label())
+            .disabled(disabled)
+            .min_h(28.0)
+            .px(8.0)
+            .py(4.0)
+            .center_y()
+            .radius(4.0)
+            .fill(if on { p.selected } else { Color::TRANSPARENT })
+            .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
+            .child(content);
+        if !disabled {
+            item =
+                item.focusable(true)
+                    .focus_highlight(p.selected)
+                    .on_press(move |s: &mut State| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.access = mode.id().into();
+                        s.save_defaults(defaults);
+                    });
+        }
+        group = group.child(item);
     }
     group
 }
@@ -2070,7 +2104,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 "settings-access",
                 "Default access mode",
                 "Used only when a new thread has nothing to inherit.",
-                default_access(p, &access),
+                default_access(s, p, &access),
                 p,
             );
             pane = add(

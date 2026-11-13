@@ -99,8 +99,9 @@ fn fetch_linked_blob(
 #[path = "pi_session.rs"]
 pub(crate) mod pi_session;
 pub use pi_session::{
-    AccessMode, ConversationMode, PiSession, resolve_compatible_access_mode, session_history,
-    supported_access_modes,
+    AccessMode, ConversationMode, ManagedPolicy, PiSession, clamp_managed_access_mode,
+    managed_access_mode_denial, read_managed_policy, resolve_compatible_access_mode,
+    session_history, supported_access_modes,
 };
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
@@ -3072,6 +3073,7 @@ pub struct State {
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
+    pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
@@ -3279,6 +3281,11 @@ impl State {
             codex_catalog: Default::default(),
             claude_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
+            managed_policy: if cfg!(test) {
+                None
+            } else {
+                read_managed_policy()
+            },
             runtime_enabled: false,
             ownership_denied: false,
             runtime_stop_requested: false,
@@ -3293,6 +3300,7 @@ impl State {
         } else {
             state.projects.next_id = 1;
         }
+        state.threads[0].native.access = state.effective_access_mode(&state.threads[0]);
         if demo {
             state.populate_demo();
         }
@@ -5468,11 +5476,7 @@ impl State {
             self.threads[index].harness = harness.clone();
             self.threads[index].native.access =
                 AccessMode::parse(&self.thread_defaults.access).unwrap_or(AccessMode::Supervised);
-            self.threads[index].native.access = resolve_compatible_access_mode(
-                self.threads[index].native.access,
-                supported_access_modes(&harness),
-            )
-            .1;
+            self.threads[index].native.access = self.effective_access_mode(&self.threads[index]);
             if let Some(selection) = self.thread_defaults.models.get(&harness)
                 && !selection.provider.is_empty()
                 && !selection.model.is_empty()
@@ -5550,6 +5554,8 @@ impl State {
             supported_access_modes(&thread.harness),
         )
         .1;
+        let clamped = self.effective_access_mode(&self.threads[index]);
+        self.threads[index].native.access = clamped;
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
@@ -8140,11 +8146,8 @@ impl State {
         thread.native.commands_loaded = false;
         thread.error = None;
         thread.prewarm_attempted = false;
-        thread.native.access = resolve_compatible_access_mode(
-            thread.native.access,
-            supported_access_modes(&thread.harness),
-        )
-        .1;
+        let access = self.effective_access_mode(self.current());
+        self.current_mut().native.access = access;
         if id == "pi" {
             self.apply_catalog();
         } else {

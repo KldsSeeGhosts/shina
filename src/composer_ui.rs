@@ -925,8 +925,11 @@ pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
 pub(super) fn permissions_section(s: &State, p: Palette) -> El {
     let t = s.current();
     let supported = crate::model::supported_access_modes(&t.harness);
-    let (modes, current_mode) =
+    let (modes, compatible) =
         crate::model::resolve_compatible_access_mode(t.native.access, supported);
+    let current_mode =
+        crate::model::clamp_managed_access_mode(s.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible);
     let shown = crate::model::resolve_compatible_access_mode(
         s.composer_ui
             .permission_preview
@@ -953,14 +956,19 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
             }) else {
                 return false;
             };
-            let next = at as i32 + direction;
-            if !(0..modes.len() as i32).contains(&next) {
-                return false;
+            let mut next = at as i32 + direction;
+            while (0..modes.len() as i32).contains(&next) {
+                let candidate = modes[next as usize];
+                if crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), candidate)
+                    .is_none()
+                {
+                    s.composer_ui.permission_preview.set(Some(candidate));
+                    tx.focus(format!("overflow-access-{}", candidate.id()), true);
+                    return true;
+                }
+                next += direction;
             }
-            let mode = modes[next as usize];
-            s.composer_ui.permission_preview.set(Some(mode));
-            tx.focus(format!("overflow-access-{}", mode.id()), true);
-            true
+            false
         })
         .px(8.0)
         .py(6.0)
@@ -973,6 +981,8 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         if mode == shown {
             description = text;
         }
+        let denied =
+            crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode).is_some();
         options = options.child(
             el().key(format!("overflow-access-{}", mode.id()))
                 .role("menuitemradio")
@@ -988,7 +998,11 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
                 } else {
                     Color::TRANSPARENT
                 })
-                .hover(p.selected)
+                .hover(if denied {
+                    Color::TRANSPARENT
+                } else {
+                    p.selected
+                })
                 .focus_fill(p.selected)
                 .focus_selected(mode == current_mode)
                 .on_hover_change(move |s: &mut State, inside, _| {
@@ -1006,7 +1020,10 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
                     .size(14.0, 14.0),
                 )
                 .disabled(
-                    s.current().status.busy() || s.current().configuring || s.current().archived(),
+                    denied
+                        || s.current().status.busy()
+                        || s.current().configuring
+                        || s.current().archived(),
                 )
                 .on_press(move |s: &mut State| {
                     s.composer_ui.overflow.set(false);
@@ -1021,5 +1038,9 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         .child(options)
         .child(label(shown.label(), SMALL, p.ink))
         .child(label(description, SMALL, p.muted).wrap().min_h(32.0));
+    if let Some(reason) = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), shown)
+    {
+        menu = menu.child(label(&reason, SMALL, p.muted).wrap());
+    }
     menu
 }

@@ -151,6 +151,92 @@ impl AccessMode {
             _ => None,
         }
     }
+    fn rank(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::Supervised => 1,
+            Self::Edits => 2,
+            Self::Auto => 3,
+            Self::Full => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedPolicy {
+    pub organization: String,
+    pub max_access: Option<AccessMode>,
+}
+
+/// System policy file location, matching KSG Code's `managedPolicyPath`.
+pub fn managed_policy_path() -> &'static std::path::Path {
+    if cfg!(target_os = "macos") {
+        std::path::Path::new("/Library/Application Support/T3Code/policy.json")
+    } else if cfg!(target_os = "windows") {
+        std::path::Path::new(r"C:\Program Files\T3Code\policy.json")
+    } else {
+        std::path::Path::new("/etc/t3code/policy.json")
+    }
+}
+
+/// Reads only `organization` and `limits.maxRuntimeMode` from `path`.
+/// Missing, unreadable, or malformed files mean no managed ceiling.
+pub fn read_managed_policy_from_path(path: &std::path::Path) -> Option<ManagedPolicy> {
+    let bytes = std::fs::read(path).ok()?;
+    let doc: Value = serde_json::from_slice(&bytes).ok()?;
+    let organization = doc.get("organization")?.as_str()?.trim();
+    if organization.is_empty() {
+        return None;
+    }
+    let max_access = doc
+        .get("limits")
+        .and_then(|limits| limits.get("maxRuntimeMode"))
+        .and_then(Value::as_str)
+        .and_then(AccessMode::parse);
+    Some(ManagedPolicy {
+        organization: organization.to_owned(),
+        max_access,
+    })
+}
+
+pub fn read_managed_policy() -> Option<ManagedPolicy> {
+    read_managed_policy_from_path(managed_policy_path())
+}
+
+fn is_access_mode_above(mode: AccessMode, ceiling: Option<AccessMode>) -> bool {
+    ceiling.is_some_and(|ceiling| mode.rank() > ceiling.rank())
+}
+
+/// Ported from KSG Code's `managedRuntimeModeDenial`.
+pub fn managed_access_mode_denial(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+) -> Option<String> {
+    let policy = policy?;
+    let ceiling = policy.max_access?;
+    is_access_mode_above(mode, Some(ceiling)).then(|| {
+        format!(
+            "{} limits threads to {}.",
+            policy.organization,
+            ceiling.label()
+        )
+    })
+}
+
+/// Ported from KSG Code's `clampManagedRuntimeMode`.
+pub fn clamp_managed_access_mode(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+    modes: &[AccessMode],
+) -> Option<AccessMode> {
+    let ceiling = policy.and_then(|policy| policy.max_access);
+    if !is_access_mode_above(mode, ceiling) {
+        return Some(mode);
+    }
+    modes
+        .iter()
+        .copied()
+        .rfind(|&candidate| !is_access_mode_above(candidate, ceiling))
 }
 
 /// Supported access modes per Shina harness, ported from each KSG provider's
@@ -1768,11 +1854,12 @@ impl Thread {
 
 impl State {
     pub fn effective_access_mode(&self, thread: &crate::model::Thread) -> AccessMode {
-        resolve_compatible_access_mode(
+        let (modes, compatible) = resolve_compatible_access_mode(
             thread.native.access,
             supported_access_modes(&thread.harness),
-        )
-        .1
+        );
+        clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible)
     }
 
     pub fn reconcile_current_access_mode(&mut self) {
@@ -1820,9 +1907,10 @@ impl State {
     }
 
     pub fn set_access_mode(&mut self, access: AccessMode) {
-        let access =
-            resolve_compatible_access_mode(access, supported_access_modes(&self.current().harness))
-                .1;
+        let (modes, compatible) =
+            resolve_compatible_access_mode(access, supported_access_modes(&self.current().harness));
+        let access = clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible);
         if self.forward(
             "thread.configure",
             json!({"threadId":self.current().id,"access":access.id()}),

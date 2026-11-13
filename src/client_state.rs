@@ -3015,9 +3015,18 @@ impl State {
                 self.sweep_lifecycle(lifecycle::now());
             }
             "settings.threadDefaults" => {
-                let defaults: crate::ui::settings_ui::ThreadDefaults =
+                let mut defaults: crate::ui::settings_ui::ThreadDefaults =
                     serde_json::from_value(args.clone()).map_err(|_| "Invalid thread defaults.")?;
                 defaults.validate()?;
+                if let Some(mode) = AccessMode::parse(&defaults.access)
+                    && let Some(clamped) = crate::model::clamp_managed_access_mode(
+                        self.managed_policy.as_ref(),
+                        mode,
+                        &AccessMode::ALL,
+                    )
+                {
+                    defaults.access = clamped.id().into();
+                }
                 self.thread_defaults = defaults;
                 self.checkpoint();
             }

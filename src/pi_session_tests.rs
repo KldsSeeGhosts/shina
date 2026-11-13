@@ -882,3 +882,68 @@ fn supported_access_modes_table_and_compatible_resolution() {
     assert_eq!(modes, AccessMode::ALL);
     assert_eq!(resolved, AccessMode::Auto);
 }
+
+#[test]
+fn managed_policy_denial_and_clamp_behaviour() {
+    // Missing file means no policy/ceiling.
+    let dir = crate::store::directory().unwrap();
+    let policy_path = dir.join("policy.json");
+    assert_eq!(read_managed_policy_from_path(&policy_path), None);
+    assert_eq!(managed_access_mode_denial(None, AccessMode::Full), None);
+    assert_eq!(
+        clamp_managed_access_mode(None, AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Full)
+    );
+
+    // Policy with extra fields ignores unknown keys and reads only organization + limits.maxRuntimeMode.
+    std::fs::write(
+        &policy_path,
+        r#"{
+            "schemaVersion": 1,
+            "organization": "Example Corp",
+            "supportUrl": "https://example.com/support",
+            "limits": {
+                "maxRuntimeMode": "auto-accept-edits",
+                "webhookTasks": false
+            }
+        }"#,
+    )
+    .unwrap();
+    let policy = read_managed_policy_from_path(&policy_path).unwrap();
+    assert_eq!(policy.organization, "Example Corp");
+    assert_eq!(policy.max_access, Some(AccessMode::Edits));
+
+    // Ceiling above mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Supervised),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Supervised, &AccessMode::ALL),
+        Some(AccessMode::Supervised)
+    );
+
+    // Ceiling equal to mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Edits),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Edits, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+
+    // Ceiling below mode: denied with exact message and clamped to ceiling.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Auto).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Full).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+}
