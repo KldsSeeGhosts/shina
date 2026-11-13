@@ -12759,11 +12759,19 @@ fn composer(
             14.0 / 15.0,
         ],
         heading_weight: [600.0; 6],
+        // KSG's `.composer-tiptap` headings: line-height 1.3, contrast foreground.
+        heading_line_height: [Some(1.3); 6],
+        heading_color: [Some(p.ink); 6],
         checkbox_size: 14.0,
         checkbox_stroke: 2.0,
         checkbox_color: Some(p.ink),
+        checkbox_checked_fill: Some(p.coral),
+        checkbox_mark_color: Some(p.ink),
         rule_thickness: 2.0,
         rule_color: Some(p.line),
+        // KSG's `.composer-tiptap hr { margin: 0.65rem 0 }`.
+        rule_margin_top: Some(10.4),
+        rule_margin_bottom: Some(10.4),
     })
     .caret(p.coral, p.coral_bg)
     .w_full()

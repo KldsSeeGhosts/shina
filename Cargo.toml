@@ -6,8 +6,8 @@ description = "A native Rune workspace for the Pi coding agent"
 license = "MIT"
 
 [dependencies]
-rune = { git = "https://github.com/KldsSeeGhosts/rune", rev = "b5fa208cba77f75936c1bc83460dfb6b44da1253", default-features = false, features = ["accessibility", "embedded-fonts", "native-file-dialog"] }
-rune-kit = { git = "https://github.com/KldsSeeGhosts/rune", rev = "b5fa208cba77f75936c1bc83460dfb6b44da1253", features = ["markdown"] }
+rune = { git = "https://github.com/KldsSeeGhosts/rune", rev = "9a486a4608c06973b52c2388fe213ff6cc175590", default-features = false, features = ["accessibility", "embedded-fonts", "native-file-dialog"] }
+rune-kit = { git = "https://github.com/KldsSeeGhosts/rune", rev = "9a486a4608c06973b52c2388fe213ff6cc175590", features = ["markdown"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 serde_json_lenient = "0.2"
@@ -66,8 +66,8 @@ rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"]
 
 # Rune's Windows integrations require its vendored dependency patches at the app root.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/KldsSeeGhosts/rune", rev = "b5fa208cba77f75936c1bc83460dfb6b44da1253" }
-winit = { git = "https://github.com/KldsSeeGhosts/rune", rev = "b5fa208cba77f75936c1bc83460dfb6b44da1253" }
+wgpu-hal = { git = "https://github.com/KldsSeeGhosts/rune", rev = "9a486a4608c06973b52c2388fe213ff6cc175590" }
+winit = { git = "https://github.com/KldsSeeGhosts/rune", rev = "9a486a4608c06973b52c2388fe213ff6cc175590" }
 
 [profile.release]
 lto = "thin"

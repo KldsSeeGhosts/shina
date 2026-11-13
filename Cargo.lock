@@ -3179,7 +3179,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3254,7 +3254,7 @@ dependencies = [
 [[package]]
 name = "rune-highlights"
 version = "0.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "unicode-ident",
  "wasmparser",
@@ -3263,7 +3263,7 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "pulldown-cmark",
  "rune",
@@ -3275,12 +3275,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "wgpu",
 ]
@@ -3288,7 +3288,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "taffy",
 ]
@@ -4667,7 +4667,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -5038,7 +5038,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/KldsSeeGhosts/rune?rev=b5fa208cba77f75936c1bc83460dfb6b44da1253#b5fa208cba77f75936c1bc83460dfb6b44da1253"
+source = "git+https://github.com/KldsSeeGhosts/rune?rev=9a486a4608c06973b52c2388fe213ff6cc175590#9a486a4608c06973b52c2388fe213ff6cc175590"
 dependencies = [
  "ahash",
  "android-activity",
