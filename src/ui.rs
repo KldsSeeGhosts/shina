@@ -15332,6 +15332,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn heading_task_rule_and_fence_render_inside_the_composer_card_at_620_and_1280() {
+        let source = "# Title\n- [x] Done\n---\n```rs\nlet x = 1;\n```";
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            {
+                let t = rt.state.current_mut();
+                t.draft = crate::composer_rich::draft("");
+                crate::composer_rich::paste_with_path_query(&mut t.draft, source, false, &|_| None);
+                t.draft.focused = true;
+            }
+            rt.frame(0.0);
+            let (card, _) = rt.presented("composer-natural").unwrap();
+            let (input, _) = rt.presented("composer-input").unwrap();
+            assert!(
+                input[0] >= card[0]
+                    && input[0] + input[2] <= card[0] + card[2] + 1.0
+                    && input[1] >= card[1]
+                    && input[1] + input[3] <= card[1] + card[3] + 1.0,
+                "{width}: input {input:?} outside card {card:?}"
+            );
+            assert!(
+                input[3] > 60.0,
+                "{width}: expected multiline height, got {input:?}"
+            );
+            let draft = &rt.state.current().draft;
+            let kinds: Vec<_> = draft.logical_blocks().map(|b| b.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    rune::BlockKind::Heading { level: 1 },
+                    rune::BlockKind::Task {
+                        level: 0,
+                        checked: true,
+                    },
+                    rune::BlockKind::Rule,
+                    rune::BlockKind::Code,
+                ]
+            );
+            assert_eq!(crate::composer_rich::markdown(draft), source);
+        }
+    }
+
+    #[test]
     fn steering_and_rewind_controls_send_native_commands_without_overflow() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);

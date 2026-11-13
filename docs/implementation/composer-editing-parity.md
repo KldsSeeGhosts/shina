@@ -34,9 +34,9 @@ The input regexes and formatting chords also come from KSG's installed Tiptap 3.
 | Selected text plus opening delimiter | `handleTextInput`, `surroundSelectionWithMark` | `surround`, `source::parse` | Shina layer for plain selections, mark round-trip checks, selection retention, all KSG wrapper pairs, styled-text/pill rejection and literal multiline/code wrapping. Formula shielding and mention-source-boundary checks are not fully ported. |
 | Markdown paste and tokens | `handlePaste`, `buildTiptapContent`, shared token collector | `composer_paste::insert`, `paste_with_path_query`, `fragment`, `tokens`, `mention_path` | Shina layer for four inline marks, literal fenced code, CRLF normalization, known file/skill pills, file-link decoding, currency aliases, chip boundary spaces, unknown skills and active-path literal prefixes. Canonical blocks can split top-level prose at the start, middle or end. See deviations below. |
 | Markdown sent for every mark/block | `appendInlineRuns`, `serializeDoc`, `codeBlockSource` | `inline`, `markdown_for`, `fence`, `Token::source_for` | Shina layer for the four marks on representable documents. Stable nesting, whitespace trimming, code whitespace, pill marks, quote separation, empty code and closing-line fence collisions now follow KSG. Block metadata needs R1/R2. Existing links remain compatible. |
-| Headings, checked tasks, horizontal rules | Heading/task/rule input rules and attributed node types | Literal source fallback in `fragment` | Blocked on R1 and R3 for faithful rich behavior. No new heading/task/rule imitation is presented as equivalent. |
-| Full list grammar, authored source and nesting | `parseListPrefix`, list normalization, `composer-list-continuation.ts` | `Rules::changed`, canonical list handling in `fragment`, existing Rune list commands | Partial. Dash conversion now waits for content, so `- [ ]` is not prematurely made a bullet. Rune still loses authored marker, padding, ordered start and nesting data. Full behavior needs R1/R2. |
-| Fence info, code editing and exits | `composer-code-block.ts`, `codeBlockSource` | `composer_code::key`, `indent`, `Rules::key`, `editor_key_before_commands` | Shina layer for the canonical code representation. Two-space Tab, selection indent/outdent, carried indentation, unwrap at start, canonical closing fence and two-blank-line exit are implemented. Enter/Tab run before send/menu commands. Retained info/fence/close and separate adjacent fences need R1/R2. |
+| Headings, checked tasks, horizontal rules | Heading/task/rule input rules and attributed node types | `Rules::changed`, `Rules::key`, `fragment`, `markdown_for`, `BlockStyle` | Ported on top of the Rune fork (`BlockKind::{Heading, Task, Rule}`, `BlockAttributes`, `BlockStyle`, atomic rule selection, checkbox click). |
+| Full list grammar, authored source and nesting | `parseListPrefix`, list normalization, `composer-list-continuation.ts` | `composer_list.rs`, `Rules::changed`, `fragment`, `markdown_for` | Ported with `-`/`*`/`+` markers, ordered start/delimiter, zero-padding, renumbering, KSG Tab/Shift+Tab/Enter-lift and `MAX_LIST_LEVEL` nesting. |
+| Fence info, code editing and exits | `composer-code-block.ts`, `codeBlockSource` | `composer_code.rs`, `Rules::key`, `editor_key_before_commands`, `fragment`, `markdown_for` | Ported with Rune `LogicalBlock` + `CodeAttributes` (fence char/length, info string, exact close/unclosed state, distinct adjacent fences). |
 | Language picker, retained language, highlighting | Language picker/node view and highlight extension | No new picker | Blocked on retained logical code-block identity/attributes, R2, and a per-block view/header, R3. Syntax-color spans already exist in Rune. A picker outside the selected block would differ from KSG's placement and behavior. |
 | Editable source at caret and reparse on leave | `composer-markdown-source.ts`, styled-edge helpers | No imitation | Blocked on R4. Always showing source, hiding it with zero-size spans, or adding separate fields does not reproduce the reference selection/history model. |
 
@@ -126,15 +126,18 @@ Independent per-block `TextEdit` fields could render headers and checkboxes. The
 
 The shipped fallback preserves unsupported pasted source rather than stripping attributes. It is explicitly a fallback, not rich-block parity.
 
+## Fork dependency
+
+Shina builds against the local Rune fork via `[patch]` entries in `Cargo.toml` (adding `BlockKind`, `BlockAttributes`, `BlockStyle`, `LogicalBlock`/`CodeAttributes`, `EditorSelection::Block`, and `MAX_LIST_LEVEL = u8::MAX`). Code-block language picker headers (`InputBlockView`) and caret-triggered Markdown source reveal (`transact`/selection notifications) remain unported pending the remaining fork layout work (`FORK.md`).
+
 ## Deviations and remaining work
 
-- Typed `* ` still uses the existing Rune bullet behavior and serializes as `- `. The full list port is not done. Noncanonical pasted list markers stay literal. Rune nesting and empty-item lifting still differ from KSG.
-- Noncanonical fences, headings, tasks and rules stay literal on paste. Fences keep their contents literal, without creating pills or inline marks.
 - Shina splits top-level prose around representable pasted blocks through newline insertion and block attributes. The split rules were checked against KSG's installed `insertContentAt`/ProseMirror `replaceWith`. Pasting structural content across nested/mixed block selections is not fully verified.
 - Ordinary source parser cases match the copied tests, but KSG's complete math shielding and context/model/citation token import/reconciliation are not ported. File and skill tokens are the supported Shina types. Formula/mention-boundary guards therefore do not establish full selection-wrap parity.
 - KSG's caret-triggered source state, paired-backtick exit and history rebasing are absent. Native Rune undo grouping remains in use outside explicit input-rule reversal and grouped paste.
+- Code-block language picker UI and per-block syntax highlighting remain unported until the fork provides composite block-header layout.
 - Legacy Shina link marks still serialize as links. KSG disables new link marks. Existing file pills without an authored source keep their previous expanded-path transport; newly pasted file references retain their authored source.
-- No new visual design was invented. No language-picker mock or nonfunctional heading/task/rule control was added.
+- `BlockStyle` does not express a separate checked checkbox fill color/check glyph (`checkbox_color` sets both frame and fill in `ink`), per-heading line-height (`1.3`) or `h6` muted color, or vertical margins around rules (`0.65rem`).
 
 ## Verification
 

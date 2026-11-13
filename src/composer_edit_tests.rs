@@ -743,3 +743,199 @@ fn ksg_list_markers_indent_outdent_lift_and_renumbering() {
         "- d0\n  - d1\n    - d2\n      - d3\n        - d4\n          - d5\n            - d6"
     );
 }
+
+#[test]
+fn ksg_code_fences_metadata_unclosed_and_adjacent_identity() {
+    for source in [
+        "```\ncode\n```",
+        "```ts\nconst a = 1;\n```",
+        "before\n```ts\nconst a = 1;\n```\nafter",
+        "```\n```",
+        "```ts\nline one\nline two\nline three\n```",
+        "```ts\n  indented\n    deeper\n```",
+        "```js title=example\ncode\n```",
+        "~~~py\ncode\n~~~",
+        "~~~~\n```\n~~~~",
+        "```ts\ncode without a closing fence",
+        "```",
+        "```ts\n**not bold** and @README.md stay literal\n```",
+        "```ts\ncode\n````",
+        "- [ ] task\n```ts\ncode\n```\n- [ ] after",
+        "  ```ts\nindented fence stays a paragraph\n  ```",
+        "- item one\n```ts\ncode\n```\n- item two",
+        "~~~py title=example\n**bold** @README.md $known\n~~~~ ",
+    ] {
+        let edit = pasted::fragment(source, true, true, 0, &resolve_readme);
+        assert_eq!(markdown(&edit), source, "{source}");
+        if !source.starts_with("  ```") {
+            assert!(edit.marks().is_empty(), "{source}");
+            assert_eq!(edit.pills().count(), 0, "{source}");
+        }
+    }
+
+    // Two adjacent fences with identical text stay distinct through edit, undo and redo.
+    let mut edit = pasted::fragment(
+        "```\nsame\n```\n```\nsame\n```",
+        true,
+        true,
+        0,
+        &resolve_readme,
+    );
+    let blocks_before: Vec<_> = edit.logical_blocks().collect();
+    assert_eq!(blocks_before.len(), 2);
+    assert_ne!(blocks_before[0].id, blocks_before[1].id);
+    assert_eq!(markdown(&edit), "```\nsame\n```\n```\nsame\n```");
+
+    edit.set_caret(4);
+    let mut rules = Rules::default();
+    type_text(&mut edit, &mut rules, "!");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    type_text(&mut edit, &mut rules, "**bold** # heading - [ ] task");
+    assert!(edit.marks().is_empty());
+    assert_eq!(
+        markdown(&edit),
+        "```\nsame!\n**bold** # heading - [ ] task\n```\n```\nsame\n```"
+    );
+    let blocks_edited: Vec<_> = edit.logical_blocks().collect();
+    assert_eq!(blocks_edited.len(), 2);
+    assert_eq!(blocks_edited[0].id, blocks_before[0].id);
+    assert_eq!(blocks_edited[1].id, blocks_before[1].id);
+
+    edit.undo();
+    edit.undo();
+    edit.undo();
+    assert_eq!(markdown(&edit), "```\nsame\n```\n```\nsame\n```");
+    let blocks_undone: Vec<_> = edit.logical_blocks().collect();
+    assert_eq!(blocks_undone.len(), 2);
+    assert_eq!(blocks_undone[0].id, blocks_before[0].id);
+    assert_eq!(blocks_undone[1].id, blocks_before[1].id);
+
+    edit.redo();
+    edit.redo();
+    edit.redo();
+    assert_eq!(
+        markdown(&edit),
+        "```\nsame!\n**bold** # heading - [ ] task\n```\n```\nsame\n```"
+    );
+    assert_eq!(edit.logical_blocks().count(), 2);
+
+    // Input rule for tilde/info fences and closing with ~~~.
+    let mut edit = draft("");
+    let mut rules = Rules::default();
+    type_text(&mut edit, &mut rules, "~~~py title=demo");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    assert_eq!(edit.block_kind(0), BlockKind::Code);
+    press(&mut edit, &mut rules, Key::Backspace, false);
+    assert_eq!(edit.block_kind(0), BlockKind::Paragraph);
+    assert_eq!(edit.text, "~~~py title=demo");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    type_text(&mut edit, &mut rules, "x = 1");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    type_text(&mut edit, &mut rules, "~~~");
+    press(&mut edit, &mut rules, Key::Enter, false);
+    assert_eq!(edit.block_kind(1), BlockKind::Paragraph);
+    assert_eq!(markdown(&edit), "~~~py title=demo\nx = 1\n~~~\n");
+}
+
+#[test]
+fn old_and_new_draft_persistence_restart_and_queued_edit_round_trip() {
+    // Old plain draft (no html) and old legacy HTML (no data-rune-line) still load.
+    let old_plain = restore("plain text", None);
+    assert_eq!(markdown(&old_plain), "plain text");
+    assert_eq!(old_plain.block_kind(0), BlockKind::Paragraph);
+
+    let legacy_html = "<p><b>bold</b></p><ul><li>item</li></ul><pre><code>code</code></pre>";
+    let mut old_rich = restore("bold\nitem\ncode", Some(legacy_html));
+    assert_eq!(old_rich.block_kind(0), BlockKind::Paragraph);
+    assert_eq!(old_rich.block_kind(1), BlockKind::Bullet(0));
+    assert_eq!(old_rich.block_kind(2), BlockKind::Code);
+    assert_eq!(markdown(&old_rich), "**bold**\n- item\n```\ncode\n```");
+    old_rich.set_caret(0);
+    assert!(old_rich.is_rich());
+
+    // Rich draft with every new block kind round-trips through Snapshot, app restart (temp dir),
+    // and queued-message edit.
+    let rich_source = concat!(
+        "# Heading One\n",
+        "######  Six\n",
+        "- [X] Checked upper\n",
+        "- [ ] Unchecked\n",
+        "* * *\n",
+        "+ plus\n",
+        "03)  paren\n",
+        "- d0\n  - d1\n    - d2\n      - d3\n        - d4\n          - d5\n            - d6\n",
+        "~~~py title=demo\n**literal**\n~~~~ \n",
+        "```ts\nunclosed"
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("shina-rich-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    struct CleanDir(std::path::PathBuf);
+    impl Drop for CleanDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = CleanDir(temp_dir.clone());
+
+    crate::store::with_directory(temp_dir, || {
+        let mut state = crate::model::State::new(std::path::PathBuf::new(), false);
+        state.load_global_for_test();
+        let mut t = crate::model::Thread::new(1);
+        t.draft = draft("");
+        paste(&mut t.draft, rich_source, &resolve_readme);
+        assert_eq!(markdown(&t.draft), rich_source);
+
+        // Also exercise queued-message edit round trip.
+        t.status = crate::model::Status::Running;
+        t.model_provider = "cpa".into();
+        t.native.follow_up = true;
+        t.send_during_run();
+        assert_eq!(t.native.queue[0].prompt.text, rich_source);
+        let qid = t.native.queue[0].id;
+        t.draft = draft("");
+        t.edit_queued(qid);
+        assert_eq!(markdown(&t.draft), rich_source);
+        t.draft.set_task_checked(3, true);
+        t.save_queued_edit();
+        assert_eq!(
+            t.native.queue[0].prompt.text,
+            rich_source.replace("- [ ] Unchecked", "- [x] Unchecked")
+        );
+        let restored_queued = t.native.queue[0].prompt.draft.as_ref().unwrap().editor();
+        assert_eq!(
+            restored_queued.block_kind(3),
+            BlockKind::Task {
+                level: 0,
+                checked: true
+            }
+        );
+
+        // Save ordinary draft with all block kinds across simulated app restart.
+        t.draft = draft("");
+        paste(&mut t.draft, rich_source, &resolve_readme);
+        state.threads = vec![t];
+        state.tabs = vec![1];
+        state.active = 0;
+        state.checkpoint_and_flush().unwrap();
+        drop(state);
+
+        let mut restarted = crate::model::State::new(std::path::PathBuf::new(), false);
+        restarted.load_global_for_test();
+        let reloaded = &restarted.threads.iter().find(|t| t.id == 1).unwrap().draft;
+        assert_eq!(markdown(reloaded), rich_source);
+        assert_eq!(reloaded.block_kind(0), BlockKind::Heading { level: 1 });
+        assert_eq!(reloaded.block_kind(1), BlockKind::Heading { level: 6 });
+        assert_eq!(
+            reloaded.block_kind(2),
+            BlockKind::Task {
+                level: 0,
+                checked: true
+            }
+        );
+        assert_eq!(reloaded.block_kind(4), BlockKind::Rule);
+        assert_eq!(reloaded.block_kind(13), BlockKind::Bullet(6));
+        assert_eq!(reloaded.block_kind(14), BlockKind::Code);
+        assert_eq!(reloaded.block_kind(15), BlockKind::Code);
+    });
+}

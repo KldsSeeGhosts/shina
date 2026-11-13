@@ -1,6 +1,9 @@
 //! Rune document editing and Markdown transport, ported from KSG Code's
 //! ComposerPromptEditorTiptap.tsx and composer-rich-text-doc.ts.
-use rune::{Block, BlockAttributes, BlockKind, EditorSelection, Key, KeyEvent, Mark, TextEdit};
+use rune::{
+    Block, BlockAttributes, BlockKind, CodeAttributes, EditorSelection, Key, KeyEvent, Mark,
+    TextEdit,
+};
 
 #[path = "composer_code.rs"]
 mod code;
@@ -222,12 +225,19 @@ impl Rules {
             if edit.anchor == edit.focus
                 && edit.focus == line.end
                 && kind == BlockKind::Paragraph
-                && &edit.text[line.clone()] == "```"
+                && let Some((fence, info)) = pasted::opening_fence(&edit.text[line.clone()])
             {
+                let fence = fence.to_owned();
+                let info = info.to_owned();
                 edit.undo_group(|e| {
                     e.set_selection(line.start, line.end);
                     e.insert("");
-                    e.set_block(Block::Code);
+                    let range = e.line_range(line_idx);
+                    let _ = e.set_logical_block(
+                        range,
+                        BlockKind::Code,
+                        BlockAttributes::default().with_code(CodeAttributes::new(fence, info)),
+                    );
                 });
                 self.converted = Some(edit.clone());
                 return true;
@@ -541,7 +551,7 @@ pub fn editor_key_before_commands(thread: &mut crate::model::Thread, event: &Key
             && edit.anchor == edit.focus
             && edit.focus == line.end
             && edit.block_kind(edit.line_of_byte(edit.focus)) == BlockKind::Paragraph
-            && &edit.text[line] == "```";
+            && pasted::opening_fence(&edit.text[line]).is_some();
     if code_key && thread.composer_rules.key(&mut thread.draft, event) {
         thread.typing_guard.on_type(std::time::Instant::now());
         thread.update_submission_error();
@@ -707,14 +717,38 @@ fn input_mark(edit: &mut TextEdit) -> bool {
     false
 }
 
-fn fence(text: &str, minimum: usize) -> String {
-    let longest = text
+fn serialize_code_block(content: &str, code: Option<&CodeAttributes>, followed: bool) -> String {
+    let mut fence = code
+        .map(CodeAttributes::fence)
+        .filter(|f| !f.is_empty())
+        .unwrap_or("```")
+        .to_owned();
+    let info = code.map(CodeAttributes::info).unwrap_or("");
+    let mut close = match code {
+        Some(c) => c.close().unwrap_or("").to_owned(),
+        None => format!("\n{fence}"),
+    };
+    let longest = content
         .split('\n')
-        .filter(|line| pasted::closes(line, "```"))
-        .map(|line| line.bytes().take_while(|b| *b == b'`').count())
+        .filter(|line| pasted::closes(line, &fence))
+        .map(|line| {
+            let ch = fence.as_bytes()[0];
+            line.bytes().take_while(|b| *b == ch).count()
+        })
         .max()
         .unwrap_or(0);
-    "`".repeat(minimum.max(longest + 1))
+    if longest > 0 {
+        let ch = fence.chars().next().unwrap_or('`');
+        fence = std::iter::repeat_n(ch, longest + 1).collect();
+        if !close.is_empty() {
+            close = format!("\n{fence}");
+        }
+    }
+    if close.is_empty() && followed {
+        close = format!("\n{fence}");
+    }
+    let sep = if content.is_empty() { "" } else { "\n" };
+    format!("{fence}{info}{sep}{content}{close}")
 }
 
 /// Ported from composer-rich-text-doc.ts appendInlineRuns, including per-mark
@@ -945,6 +979,7 @@ pub fn markdown_for(
     machine_name: &dyn Fn(&str) -> String,
 ) -> String {
     let paragraphs = edit.paragraphs();
+    let logical: Vec<_> = edit.logical_blocks().collect();
     let mut out = Vec::new();
     let mut numbers: Vec<usize> = Vec::new();
     let mut at = 0;
@@ -970,17 +1005,24 @@ pub fn markdown_for(
             out.push(String::new());
         }
         if kind == BlockKind::Code {
+            let lb = logical.iter().find(|b| {
+                b.kind == BlockKind::Code
+                    && b.range.start <= p.range.start
+                    && p.range.end <= b.range.end
+            });
             let start = p.range.start;
             let mut end = p.range.end;
             at += 1;
-            while at < paragraphs.len() && edit.block_kind(at) == BlockKind::Code {
+            while at < paragraphs.len()
+                && edit.block_kind(at) == BlockKind::Code
+                && lb.is_some_and(|b| paragraphs[at].range.end <= b.range.end)
+            {
                 end = paragraphs[at].range.end;
                 at += 1;
             }
             let content = &edit.text[start..end];
-            let ticks = fence(content, 3);
-            let newline = if content.is_empty() { "" } else { "\n" };
-            out.push(format!("{ticks}{newline}{content}\n{ticks}"));
+            let followed = at < paragraphs.len();
+            out.push(serialize_code_block(content, attrs.code(), followed));
             numbers.clear();
             continue;
         }
@@ -1136,6 +1178,7 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
         return String::new();
     }
     let paragraphs = edit.paragraphs();
+    let logical: Vec<_> = edit.logical_blocks().collect();
     let mut out = Vec::new();
     let mut at = 0;
     let mut numbers: Vec<usize> = Vec::new();
@@ -1162,19 +1205,24 @@ pub fn markdown_range(edit: &TextEdit, range: std::ops::Range<usize>) -> String 
             continue;
         }
         if kind == BlockKind::Code {
+            let lb = logical.iter().find(|b| {
+                b.kind == BlockKind::Code
+                    && b.range.start <= p.range.start
+                    && p.range.end <= b.range.end
+            });
             let mut code_end = sub_end;
             at += 1;
             while at < paragraphs.len()
                 && edit.block_kind(at) == BlockKind::Code
+                && lb.is_some_and(|b| paragraphs[at].range.end <= b.range.end)
                 && paragraphs[at].range.start <= end
             {
                 code_end = paragraphs[at].range.end.min(end);
                 at += 1;
             }
             let content = &edit.text[sub_start..code_end];
-            let ticks = fence(content, 3);
-            let newline = if content.is_empty() { "" } else { "\n" };
-            out.push(format!("{ticks}{newline}{content}\n{ticks}"));
+            let followed = at < paragraphs.len() && paragraphs[at].range.start <= end;
+            out.push(serialize_code_block(content, attrs.code(), followed));
             numbers.clear();
             continue;
         }

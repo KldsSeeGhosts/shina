@@ -1,6 +1,8 @@
-//! KSG Code's buildTiptapContent and handlePaste, ported to Rune authored blocks.
+//! KSG Code's buildTiptapContent and handlePaste, ported to Rune authored and logical blocks.
 use super::{draft, source};
-use rune::{Block, BlockAttributes, BlockKind, MAX_LIST_LEVEL, MarkRange, TextEdit};
+use rune::{
+    Block, BlockAttributes, BlockKind, CodeAttributes, MAX_LIST_LEVEL, MarkRange, TextEdit,
+};
 use std::{ops::Range, sync::LazyLock};
 
 pub type Resolver<'a> = &'a dyn Fn(&str) -> Option<(String, String)>;
@@ -173,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_blocks_keep_source_and_fences_stay_literal() {
+    fn fences_with_metadata_parse_as_literal_code_blocks() {
         for text in [
             "~~~py title=example\n**bold** @README.md $known\n~~~~ ",
             "```ts\nconst x = 1",
@@ -182,10 +184,9 @@ mod tests {
                 Some(("token".into(), "label".into()))
             });
             assert_eq!(super::super::markdown(&edit), text);
-            assert!(edit.blocks().iter().all(|b| *b == Block::Paragraph));
-            if text.starts_with("~~~") || text.starts_with("```") {
-                assert!(edit.marks().is_empty());
-            }
+            assert!(edit.blocks().iter().all(|b| *b == Block::Code));
+            assert!(edit.marks().is_empty());
+            assert_eq!(edit.pills().count(), 0);
         }
     }
 }
@@ -453,32 +454,33 @@ pub(super) fn fragment(
             while index < lines.len() && !closes(lines[index], fence) {
                 index += 1;
             }
-            let canonical = blocks
-                && fence == "```"
-                && info.is_empty()
-                && lines.get(index) == Some(&"```")
-                && parts
-                    .last()
-                    .is_none_or(|(_, ks)| ks.last().is_none_or(|(k, _)| *k != BlockKind::Code));
-            if canonical {
+            let closed = index < lines.len();
+            if blocks {
+                let close = closed.then(|| format!("\n{}", lines[index]));
+                let code_attrs = CodeAttributes::new(fence, info).with_close(close);
                 let mut part = draft(lines[start + 1..index].join("\n"));
                 let count = part.text.bytes().filter(|b| *b == b'\n').count() + 1;
                 part.set_blocks(vec![Block::Code; count]);
                 parts.push((
                     part,
-                    vec![(BlockKind::Code, BlockAttributes::default()); count],
+                    vec![
+                        (
+                            BlockKind::Code,
+                            BlockAttributes::default().with_code(code_attrs)
+                        );
+                        count
+                    ],
                 ));
             } else {
-                // Do not style code or turn its tokens into pills, even when
-                // the fence's attributes cannot be represented.
-                for line in &lines[start..(index + usize::from(index < lines.len()))] {
+                // Inside lists/quotes, keep fences literal without styling or pills.
+                for line in &lines[start..(index + usize::from(closed))] {
                     parts.push((
                         draft(*line),
                         vec![(BlockKind::Paragraph, BlockAttributes::default())],
                     ));
                 }
             }
-            index += usize::from(index < lines.len());
+            index += usize::from(closed);
             continue;
         }
         let mut kind = BlockKind::Paragraph;
@@ -682,21 +684,9 @@ pub fn paste_with_path_query(
     let first_index = edit.line_of_byte(from);
     let last_index = edit.line_of_byte(to);
     let blocks = edit.block_kind(first_index) == BlockKind::Paragraph;
-    let mut fragment = fragment(&text, blocks, blocks, literal_length, resolve);
+    let fragment = fragment(&text, blocks, blocks, literal_length, resolve);
     let prefix = from > line.start;
     let suffix = to < last_line.end;
-    if !prefix
-        && first_index > 0
-        && edit.block_kind(first_index - 1) == BlockKind::Code
-        && fragment.block_kind(0) == BlockKind::Code
-        || !suffix
-            && edit.blocks().get(last_index + 1) == Some(&Block::Code)
-            && fragment.block_kind(fragment.blocks().len() - 1) == BlockKind::Code
-    {
-        // Adjacent fences require identity that Rune cannot retain. Preserve
-        // the authored fence rather than accidentally merging two code blocks.
-        fragment = self::fragment(&text, false, blocks, literal_length, resolve);
-    }
     let fragment_lines = fragment.blocks().len();
     let structural = blocks
         && (fragment_lines > 1
