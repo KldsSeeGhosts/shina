@@ -1614,12 +1614,36 @@ fn hunk_header_row(text: &str, p: Palette) -> El {
 
 /// A diff line row: old number, new number, `+`/`-`/blank marker, mono text —
 /// green or red tinted for added and deleted, selectable, never wrapping.
-fn line_row(kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str, p: Palette) -> El {
+fn line_row(
+    kind: LineKind,
+    old: Option<u32>,
+    new: Option<u32>,
+    text: &str,
+    p: Palette,
+    language: Option<&'static str>,
+    dark: bool,
+) -> El {
     let (bg, marker, marker_ink, text_ink) = match kind {
         LineKind::Added => (p.sea_bg, "+", p.sea, p.ink),
         LineKind::Deleted => (p.coral_bg, "-", p.danger, p.ink),
         LineKind::Context => (p.panel, "", p.faint, p.ink),
     };
+    let spans: Vec<rune::text::Span> = language
+        .map(|lang| {
+            super::attachment_source_highlight::line_spans(lang, text, dark, p)
+                .into_iter()
+                .map(|span| {
+                    let mut sp = rune::text::Span::new(span.start, span.end);
+                    sp.color = Some(span.color);
+                    sp
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut code = label(text.to_string(), MONO, text_ink).selectable(true);
+    if !spans.is_empty() {
+        code = code.spans(spans);
+    }
     row()
         .w_full()
         .h(LINE_H)
@@ -1632,7 +1656,7 @@ fn line_row(kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str, p: P
                 .align(rune::Align::Center)
                 .w(12.0),
         )
-        .child(label(text.to_string(), MONO, text_ink).selectable(true))
+        .child(code)
         .into()
 }
 
@@ -1717,12 +1741,18 @@ fn diff_row(s: &State, p: Palette, panel_key: &str, i: usize) -> El {
         } => file_header(p, ready, *display, *file, identity, &collapsed, panel_key),
         DiffRow::Hunk { text, .. } => hunk_header_row(text, p),
         DiffRow::Line {
+            file,
             kind,
             old,
             new,
             text,
             ..
-        } => line_row(*kind, *old, *new, text, p),
+        } => {
+            let language = ready.files.get(*file).and_then(|entry| {
+                super::attachment_source_highlight::language_for(&entry.file.path)
+            });
+            line_row(*kind, *old, *new, text, p, language, s.dark)
+        }
         DiffRow::Marker { .. } => marker_row(p),
         DiffRow::Note {
             file,
@@ -2320,5 +2350,40 @@ mod tests {
         assert_eq!(format_compact_diff_count(999_499), "999k");
         assert_eq!(format_compact_diff_count(1_000_000), "1m");
         assert_eq!(format_compact_diff_count(2_400_000), "2.4m");
+    }
+
+    #[test]
+    fn line_row_renders_with_and_without_language_highlighting() {
+        let p = palette(false);
+        let _highlighted = line_row(
+            LineKind::Added,
+            None,
+            Some(1),
+            "fn main() {}",
+            p,
+            Some("rust"),
+            false,
+        );
+        let _plain = line_row(
+            LineKind::Context,
+            Some(1),
+            Some(1),
+            "fn main() {}",
+            p,
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    fn language_for_resolves_rust_and_ignores_plain_text() {
+        assert_eq!(
+            super::super::attachment_source_highlight::language_for("src/main.rs"),
+            Some("rust")
+        );
+        assert_eq!(
+            super::super::attachment_source_highlight::language_for("notes.txt"),
+            None
+        );
     }
 }

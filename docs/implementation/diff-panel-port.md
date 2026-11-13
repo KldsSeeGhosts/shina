@@ -49,5 +49,5 @@ Ported behavior still missing, with the KSG source that owns it:
 - File tree sidebar — `apps/web/src/components/diffs/diffFileTree.logic.ts`; `src/review_tree.rs` already holds the `TreeEntry` builder and sorts.
 - File explorer hand-off — `apps/web/src/components/DiffPanel.tsx`.
 - Diff annotations and comments — `apps/web/src/components/diffs/`.
-- Syntax colouring and word-level highlights inside line rows — `apps/web/src/lib/diffRendering.ts`.
+- Per-line syntax colouring by file extension is done; word-level change highlights and multi-line constructs (coloured line by line) remain — `apps/web/src/lib/diffRendering.ts`.
 - `fnv1a32` (`src/review_patch.rs`) stays unused until the remaining port needs patch hashing.
