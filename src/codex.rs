@@ -120,20 +120,28 @@ fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, Stri
 }
 
 /// KSG's runtime modes, with a non-escalating read-only mode for captain homes.
-fn policy(access: &str) -> (&'static str, &'static str, Value) {
+fn policy(access: &str) -> (&'static str, &'static str, &'static str, Value) {
     match access {
         "full-access" => (
             "never",
+            "user",
             "danger-full-access",
             json!({"type":"dangerFullAccess"}),
         ),
-        "auto-accept-edits" => (
+        "auto" => (
             "on-request",
+            "auto_review",
             "workspace-write",
             json!({"type":"workspaceWrite"}),
         ),
-        "read-only" => ("never", "read-only", json!({"type":"readOnly"})),
-        _ => ("untrusted", "read-only", json!({"type":"readOnly"})),
+        "auto-accept-edits" => (
+            "on-request",
+            "user",
+            "workspace-write",
+            json!({"type":"workspaceWrite"}),
+        ),
+        "read-only" => ("never", "user", "read-only", json!({"type":"readOnly"})),
+        _ => ("untrusted", "user", "read-only", json!({"type":"readOnly"})),
     }
 }
 
@@ -282,10 +290,10 @@ impl Client {
     /// Supply this on BOTH start and resume. Never overwrite baseInstructions or login.
     fn session_params(&self) -> Value {
         let link = self.start.link.as_ref().expect("MCP required at boundary");
-        let (approval, sandbox, _) = policy(self.access());
+        let (approval, reviewer, sandbox, _) = policy(self.access());
         json!({
             "cwd":self.start.workspace,
-            "approvalPolicy":approval,"approvalsReviewer":"user","sandbox":sandbox,
+            "approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,
             "developerInstructions":developer_instructions(&self.start),
             "config":{
                 "tools.update_plan.enabled":true,
@@ -1011,9 +1019,9 @@ impl Client {
                         if params["status"] == "active" {
                             // Codex starts a goal turn itself. Apply the current policy/model
                             // first, natively, so it cannot reuse a stale, broader turn policy.
-                            let (approval, _, sandbox) = policy(self.access());
+                            let (approval, reviewer, _, sandbox) = policy(self.access());
                             let mut settings = json!({"threadId":self.session,"cwd":self.start.workspace,
-                                "approvalPolicy":approval,"approvalsReviewer":"user","sandboxPolicy":sandbox});
+                                "approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":sandbox});
                             if let Some(model) = self.model["id"].as_str() {
                                 settings["model"] = json!(model);
                             }
@@ -1221,9 +1229,9 @@ impl Client {
             self.service_tier = Some(tier.into());
         }
         let input = codex_input(&record)?;
-        let (approval, _, sandbox) = policy(self.access());
+        let (approval, reviewer, _, sandbox) = policy(self.access());
         let mut params = json!({"threadId":self.session,"cwd":self.start.workspace,
-            "input":input,"approvalPolicy":approval,"approvalsReviewer":"user",
+            "input":input,"approvalPolicy":approval,"approvalsReviewer":reviewer,
             "sandboxPolicy":sandbox,"summary":"detailed"});
         if let Some(model) = self.model["id"].as_str() {
             params["model"] = json!(model);

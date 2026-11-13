@@ -788,7 +788,11 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
 
 /// Ported from KSG Code's ComposerFooterModeControls and runtimeModeConfig permission menu.
 pub(super) fn access_picker(s: &State, p: Palette) -> El {
-    use crate::model::AccessMode;
+    let t = s.current();
+    let (modes, _) = crate::model::resolve_compatible_access_mode(
+        t.native.access,
+        crate::model::supported_access_modes(&t.harness),
+    );
     let mut card = col()
         .key("access-picker")
         .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
@@ -798,42 +802,41 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .fill(p.card)
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p));
-    for (mode, description) in [
-        (
-            AccessMode::ReadOnly,
-            "Read files and coordinate. Delegate code changes to a thread.",
-        ),
-        (
-            AccessMode::Supervised,
-            "Ask before commands and file changes.",
-        ),
-        (
-            AccessMode::Edits,
-            "Auto-approve edits, ask before other actions.",
-        ),
-        (
-            AccessMode::Full,
-            "Allow commands and edits without prompts.",
-        ),
-    ] {
-        card = card.child(
-            col()
-                .key(format!("access-{}", mode.id()))
-                .role("button")
-                .label(mode.label())
+    for mode in modes {
+        let description = mode.description();
+        let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
+        let disabled = denial.is_some();
+        let mut row = col()
+            .key(format!("access-{}", mode.id()))
+            .role("button")
+            .label(mode.label())
+            .disabled(disabled)
+            .padding(8.0)
+            .gap(4.0)
+            .radius(4.0)
+            .child(label(
+                mode.label(),
+                LABEL,
+                if disabled { p.muted } else { p.ink },
+            ))
+            .child(label(description, SMALL, p.muted).wrap());
+        if let Some(reason) = denial {
+            row = row.child(
+                label(&reason, SMALL, p.muted)
+                    .key(format!("access-{}-denial", mode.id()))
+                    .wrap(),
+            );
+        } else {
+            row = row
                 .focusable(true)
                 .cursor(rune::Cursor::Pointer)
-                .padding(8.0)
-                .gap(4.0)
-                .radius(4.0)
                 .hover(p.selected)
-                .child(label(mode.label(), LABEL, p.ink))
-                .child(label(description, SMALL, p.muted).wrap())
                 .on_press(move |s: &mut State| {
                     s.set_access_mode(mode);
                     s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-                }),
-        );
+                });
+        }
+        card = card.child(row);
     }
     card = card.child(label("Tool approvals do not sandbox the process. Trusted extensions retain your account's permissions.",SMALL,p.muted).wrap().padding(8.0));
     modal_frame(
@@ -867,6 +870,91 @@ mod tests {
             let (option, _) = rt.presented("access-read-only").expect("Read only option");
             assert!(option[2] > 0.0 && option[3] > 0.0);
             assert!(option[0] >= 0.0 && option[0] + option[2] <= width);
+        }
+    }
+
+    #[test]
+    fn access_picker_filters_by_harness_and_disables_modes_above_managed_ceiling() {
+        fn find_node<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+            if tree["key"] == key {
+                return Some(tree);
+            }
+            tree["children"]
+                .as_array()?
+                .iter()
+                .find_map(|child| find_node(child, key))
+        }
+
+        let dir = crate::store::directory().unwrap();
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            r#"{"schemaVersion":1,"organization":"Example Corp","limits":{"maxRuntimeMode":"auto-accept-edits"}}"#,
+        )
+        .unwrap();
+        let policy = crate::model::pi_session::read_managed_policy_from_path(&policy_path);
+
+        for width in [620.0, 1280.0] {
+            // Codex thread shows Auto.
+            let mut codex_state = State::new(".".into(), false);
+            codex_state.managed_policy = policy.clone();
+            codex_state.current_mut().harness = "codex".into();
+            codex_state.open_access_picker();
+            let mut rt = rune::Runtime::with_text(
+                codex_state,
+                view,
+                (width, 720.0),
+                rune::Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            assert!(
+                rt.presented("access-auto").is_some(),
+                "{width}: codex shows Auto"
+            );
+            let tree = rt.accessibility_json();
+            let full_node = find_node(&tree, "access-full-access").expect("Full access row");
+            assert!(
+                full_node["states"]
+                    .as_array()
+                    .is_some_and(|states| states.iter().any(|s| s == "disabled")),
+                "{width}: Full access should be disabled under auto-accept-edits ceiling"
+            );
+            assert!(
+                rt.presented("access-full-access-denial").is_some(),
+                "{width}: Full access denial reason should be presented"
+            );
+            assert!(
+                tree.to_string()
+                    .contains("Example Corp limits threads to Auto-accept edits."),
+                "{width}: denial reason text should appear in accessibility tree"
+            );
+
+            // Pi thread does not show Auto.
+            let mut pi_state = State::new(".".into(), false);
+            pi_state.managed_policy = policy.clone();
+            pi_state.current_mut().harness = "pi".into();
+            pi_state.open_access_picker();
+            let mut rt = rune::Runtime::with_text(
+                pi_state,
+                view,
+                (width, 720.0),
+                rune::Env::new(false, 1.0),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            );
+            rt.frame(0.0);
+            assert!(
+                rt.presented("access-auto").is_none(),
+                "{width}: pi hides Auto"
+            );
+            let tree = rt.accessibility_json();
+            let full_node = find_node(&tree, "access-full-access").expect("Full access row");
+            assert!(
+                full_node["states"]
+                    .as_array()
+                    .is_some_and(|states| states.iter().any(|s| s == "disabled")),
+                "{width}: Full access should be disabled on pi too"
+            );
         }
     }
 }

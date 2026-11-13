@@ -777,3 +777,173 @@ fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
     assert_eq!(t.tools[0].structured["details"]["custom"], "value");
     assert_eq!(t.tools[0].output, "Output");
 }
+
+#[test]
+fn access_mode_id_parse_round_trip_and_unknown_fallback() {
+    for mode in AccessMode::ALL {
+        assert_eq!(AccessMode::parse(mode.id()), Some(mode));
+    }
+    assert_eq!(AccessMode::Auto.id(), "auto");
+    assert_eq!(AccessMode::Auto.label(), "Auto");
+    assert_eq!(AccessMode::parse("future-mode"), None);
+
+    let mut state = State::new(PathBuf::new(), false);
+    let mut snapshot = state.snapshot();
+    snapshot["threads"][0]["accessMode"] = json!("future-mode");
+    state.restore_global(&snapshot).unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+
+    state
+        .execute_command(&crate::protocol::Command::new(
+            "thread.configure",
+            json!({"threadId": state.current().id, "access": "future-mode"}),
+        ))
+        .unwrap();
+    assert_eq!(state.current().native.access, AccessMode::Supervised);
+}
+
+#[test]
+fn supported_access_modes_table_and_compatible_resolution() {
+    assert_eq!(
+        supported_access_modes("pi"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("antigravity"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("codex"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("claude"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("opencode"), &AccessMode::ALL);
+    assert_eq!(supported_access_modes("deepseek"), &AccessMode::ALL);
+    assert_eq!(
+        supported_access_modes("kiro"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("muse"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("fx"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto
+        ]
+    );
+    assert_eq!(
+        supported_access_modes("grok"),
+        &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ]
+    );
+    assert_eq!(supported_access_modes("gemini"), &AccessMode::ALL);
+
+    // Supported current mode is kept.
+    let (modes, resolved) =
+        resolve_compatible_access_mode(AccessMode::Edits, supported_access_modes("pi"));
+    assert!(!modes.contains(&AccessMode::Auto));
+    assert_eq!(resolved, AccessMode::Edits);
+
+    // Read only is preserved when supported.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::ReadOnly, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::ReadOnly);
+
+    // Unsupported current mode falls back to first supported mode skipping Read only.
+    let (_, resolved) =
+        resolve_compatible_access_mode(AccessMode::Auto, supported_access_modes("pi"));
+    assert_eq!(resolved, AccessMode::Supervised);
+
+    // Empty supported list means all modes are supported.
+    let (modes, resolved) = resolve_compatible_access_mode(AccessMode::Auto, &[]);
+    assert_eq!(modes, AccessMode::ALL);
+    assert_eq!(resolved, AccessMode::Auto);
+}
+
+#[test]
+fn managed_policy_denial_and_clamp_behaviour() {
+    // Missing file means no policy/ceiling.
+    let dir = crate::store::directory().unwrap();
+    let policy_path = dir.join("policy.json");
+    assert_eq!(read_managed_policy_from_path(&policy_path), None);
+    assert_eq!(managed_access_mode_denial(None, AccessMode::Full), None);
+    assert_eq!(
+        clamp_managed_access_mode(None, AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Full)
+    );
+
+    // Policy with extra fields ignores unknown keys and reads only organization + limits.maxRuntimeMode.
+    std::fs::write(
+        &policy_path,
+        r#"{
+            "schemaVersion": 1,
+            "organization": "Example Corp",
+            "supportUrl": "https://example.com/support",
+            "limits": {
+                "maxRuntimeMode": "auto-accept-edits",
+                "webhookTasks": false
+            }
+        }"#,
+    )
+    .unwrap();
+    let policy = read_managed_policy_from_path(&policy_path).unwrap();
+    assert_eq!(policy.organization, "Example Corp");
+    assert_eq!(policy.max_access, Some(AccessMode::Edits));
+
+    // Ceiling above mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Supervised),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Supervised, &AccessMode::ALL),
+        Some(AccessMode::Supervised)
+    );
+
+    // Ceiling equal to mode: allowed, unchanged.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Edits),
+        None
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Edits, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+
+    // Ceiling below mode: denied with exact message and clamped to ceiling.
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Auto).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        managed_access_mode_denial(Some(&policy), AccessMode::Full).as_deref(),
+        Some("Example Corp limits threads to Auto-accept edits.")
+    );
+    assert_eq!(
+        clamp_managed_access_mode(Some(&policy), AccessMode::Full, &AccessMode::ALL),
+        Some(AccessMode::Edits)
+    );
+}

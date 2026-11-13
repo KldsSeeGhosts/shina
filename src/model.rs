@@ -98,7 +98,11 @@ fn fetch_linked_blob(
 
 #[path = "pi_session.rs"]
 pub(crate) mod pi_session;
-pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+pub use pi_session::{
+    AccessMode, ConversationMode, ManagedPolicy, PiSession, clamp_managed_access_mode,
+    managed_access_mode_denial, read_managed_policy, resolve_compatible_access_mode,
+    session_history, supported_access_modes,
+};
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -1050,6 +1054,11 @@ impl Thread {
         } else if self.command("set_model", json!({"provider":provider,"modelId":model_id})) {
             self.configuring = true;
         }
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
     }
 
     pub fn set_thinking(&mut self, level: String) {
@@ -1235,6 +1244,11 @@ impl Thread {
         self.draft_context.clear();
         self.retained_context = Default::default();
         self.native.queue_held = false;
+        self.native.access = resolve_compatible_access_mode(
+            self.native.access,
+            supported_access_modes(&self.harness),
+        )
+        .1;
         self.begin_prompt(prompt);
     }
 
@@ -3059,6 +3073,7 @@ pub struct State {
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
+    pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
@@ -3266,6 +3281,11 @@ impl State {
             codex_catalog: Default::default(),
             claude_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
+            managed_policy: if cfg!(test) {
+                None
+            } else {
+                read_managed_policy()
+            },
             runtime_enabled: false,
             ownership_denied: false,
             runtime_stop_requested: false,
@@ -3280,6 +3300,7 @@ impl State {
         } else {
             state.projects.next_id = 1;
         }
+        state.threads[0].native.access = state.effective_access_mode(&state.threads[0]);
         if demo {
             state.populate_demo();
         }
@@ -5454,7 +5475,8 @@ impl State {
             let harness = self.default_harness.clone();
             self.threads[index].harness = harness.clone();
             self.threads[index].native.access =
-                AccessMode::parse(&self.thread_defaults.access).unwrap_or_default();
+                AccessMode::parse(&self.thread_defaults.access).unwrap_or(AccessMode::Supervised);
+            self.threads[index].native.access = self.effective_access_mode(&self.threads[index]);
             if let Some(selection) = self.thread_defaults.models.get(&harness)
                 && !selection.provider.is_empty()
                 && !selection.model.is_empty()
@@ -5476,8 +5498,9 @@ impl State {
         else {
             return;
         };
-        if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-            self.threads[index].native.access = access;
+        if let Some(access) = seed["access"].as_str() {
+            self.threads[index].native.access =
+                AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
         }
         let models = self.harness_models(harness);
         let selection: Option<(String, String)> =
@@ -5490,8 +5513,9 @@ impl State {
             self.inherit_composer(index, &Value::Null);
             // Access inheritance does not depend on model discovery. A missing model
             // must never replace the source thread's read-only mode with a broader default.
-            if let Some(access) = seed["access"].as_str().and_then(AccessMode::parse) {
-                self.threads[index].native.access = access;
+            if let Some(access) = seed["access"].as_str() {
+                self.threads[index].native.access =
+                    AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
             }
             return;
         };
@@ -5525,6 +5549,13 @@ impl State {
         {
             thread.harness_state["serviceTier"] = json!(tier);
         }
+        thread.native.access = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        )
+        .1;
+        let clamped = self.effective_access_mode(&self.threads[index]);
+        self.threads[index].native.access = clamped;
     }
     fn create_thread_in(&mut self, project: Option<ProjectId>, occupied: &[usize], seed: &Value) {
         if project.is_some() && self.project(project).is_none() {
@@ -7682,6 +7713,7 @@ impl State {
         if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
             return false;
         }
+        self.reconcile_current_access_mode();
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -8114,6 +8146,8 @@ impl State {
         thread.native.commands_loaded = false;
         thread.error = None;
         thread.prewarm_attempted = false;
+        let access = self.effective_access_mode(self.current());
+        self.current_mut().native.access = access;
         if id == "pi" {
             self.apply_catalog();
         } else {
@@ -8436,6 +8470,9 @@ impl State {
         self.thread_defaults =
             serde_json::from_value(index.get("threadDefaults").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid thread defaults.")?;
+        if AccessMode::parse(&self.thread_defaults.access).is_none() {
+            self.thread_defaults.access = AccessMode::Supervised.id().into();
+        }
         self.thread_defaults.validate()?;
         self.model_favorites = match index.get("modelFavorites") {
             None | Some(Value::Null) => None,
@@ -8543,7 +8580,8 @@ impl State {
                     thread.native.previous_session =
                         record["previousSession"].as_str().map(str::to_owned);
                     if let Some(access) = record.get("accessMode") {
-                        thread.native.access = AccessMode::parse(access.as_str()?)?;
+                        thread.native.access =
+                            AccessMode::parse(access.as_str()?).unwrap_or(AccessMode::Supervised);
                     }
                     if index["version"] == 4 && record.get("lifecycle").is_none() {
                         return None;

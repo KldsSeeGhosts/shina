@@ -102,15 +102,24 @@ pub enum AccessMode {
     ReadOnly,
     Supervised,
     Edits,
+    Auto,
     #[default]
     Full,
 }
 impl AccessMode {
+    pub const ALL: [Self; 5] = [
+        Self::ReadOnly,
+        Self::Supervised,
+        Self::Edits,
+        Self::Auto,
+        Self::Full,
+    ];
     pub fn id(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Supervised => "approval-required",
             Self::Edits => "auto-accept-edits",
+            Self::Auto => "auto",
             Self::Full => "full-access",
         }
     }
@@ -119,7 +128,17 @@ impl AccessMode {
             Self::ReadOnly => "Read only",
             Self::Supervised => "Supervised",
             Self::Edits => "Auto-accept edits",
+            Self::Auto => "Auto",
             Self::Full => "Full access",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read files and coordinate. Delegate code changes to a thread.",
+            Self::Supervised => "Ask before commands and file changes.",
+            Self::Edits => "Auto-approve edits, ask before other actions.",
+            Self::Auto => "Supported providers approve routine actions; others still ask.",
+            Self::Full => "Allow commands and edits without prompts.",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -127,10 +146,157 @@ impl AccessMode {
             "read-only" => Some(Self::ReadOnly),
             "approval-required" => Some(Self::Supervised),
             "auto-accept-edits" => Some(Self::Edits),
+            "auto" => Some(Self::Auto),
             "full-access" => Some(Self::Full),
             _ => None,
         }
     }
+    fn rank(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::Supervised => 1,
+            Self::Edits => 2,
+            Self::Auto => 3,
+            Self::Full => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedPolicy {
+    pub organization: String,
+    pub max_access: Option<AccessMode>,
+}
+
+/// System policy file location, matching KSG Code's `managedPolicyPath`.
+pub fn managed_policy_path() -> &'static std::path::Path {
+    if cfg!(target_os = "macos") {
+        std::path::Path::new("/Library/Application Support/T3Code/policy.json")
+    } else if cfg!(target_os = "windows") {
+        std::path::Path::new(r"C:\Program Files\T3Code\policy.json")
+    } else {
+        std::path::Path::new("/etc/t3code/policy.json")
+    }
+}
+
+/// Reads only `organization` and `limits.maxRuntimeMode` from `path`.
+/// Missing, unreadable, or malformed files mean no managed ceiling.
+pub fn read_managed_policy_from_path(path: &std::path::Path) -> Option<ManagedPolicy> {
+    let bytes = std::fs::read(path).ok()?;
+    let doc: Value = serde_json::from_slice(&bytes).ok()?;
+    let organization = doc.get("organization")?.as_str()?.trim();
+    if organization.is_empty() {
+        return None;
+    }
+    let max_access = doc
+        .get("limits")
+        .and_then(|limits| limits.get("maxRuntimeMode"))
+        .and_then(Value::as_str)
+        .and_then(AccessMode::parse);
+    Some(ManagedPolicy {
+        organization: organization.to_owned(),
+        max_access,
+    })
+}
+
+pub fn read_managed_policy() -> Option<ManagedPolicy> {
+    read_managed_policy_from_path(managed_policy_path())
+}
+
+fn is_access_mode_above(mode: AccessMode, ceiling: Option<AccessMode>) -> bool {
+    ceiling.is_some_and(|ceiling| mode.rank() > ceiling.rank())
+}
+
+/// Ported from KSG Code's `managedRuntimeModeDenial`.
+pub fn managed_access_mode_denial(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+) -> Option<String> {
+    let policy = policy?;
+    let ceiling = policy.max_access?;
+    is_access_mode_above(mode, Some(ceiling)).then(|| {
+        format!(
+            "{} limits threads to {}.",
+            policy.organization,
+            ceiling.label()
+        )
+    })
+}
+
+/// Ported from KSG Code's `clampManagedRuntimeMode`.
+pub fn clamp_managed_access_mode(
+    policy: Option<&ManagedPolicy>,
+    mode: AccessMode,
+    modes: &[AccessMode],
+) -> Option<AccessMode> {
+    let ceiling = policy.and_then(|policy| policy.max_access);
+    if !is_access_mode_above(mode, ceiling) {
+        return Some(mode);
+    }
+    modes
+        .iter()
+        .copied()
+        .rfind(|&candidate| !is_access_mode_above(candidate, ceiling))
+}
+
+/// Supported access modes per Shina harness, ported from each KSG provider's
+/// `supportedRuntimeModes` list. Harnesses with no list support all modes.
+/// "Read only" is offered wherever Shina offers it today.
+pub fn supported_access_modes(harness: &str) -> &'static [AccessMode] {
+    match harness {
+        "pi" | "antigravity" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Edits,
+            AccessMode::Full,
+        ],
+        "kiro" | "muse" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Full,
+        ],
+        "fx" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+        ],
+        "grok" => &[
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::Auto,
+            AccessMode::Full,
+        ],
+        _ => &AccessMode::ALL,
+    }
+}
+
+/// Ported from KSG Code's `resolveCompatibleRuntimeMode`: keeps `current` if supported,
+/// otherwise picks the first supported mode in picker order (skipping "Read only" unless
+/// it was `current`).
+pub fn resolve_compatible_access_mode(
+    current: AccessMode,
+    supported: &[AccessMode],
+) -> (Vec<AccessMode>, AccessMode) {
+    let modes: Vec<AccessMode> = if supported.is_empty() {
+        AccessMode::ALL.to_vec()
+    } else {
+        AccessMode::ALL
+            .iter()
+            .copied()
+            .filter(|mode| supported.contains(mode))
+            .collect()
+    };
+    let mode = if modes.contains(&current) {
+        current
+    } else {
+        modes
+            .iter()
+            .copied()
+            .find(|&mode| mode != AccessMode::ReadOnly)
+            .or_else(|| modes.first().copied())
+            .unwrap_or(current)
+    };
+    (modes, mode)
 }
 
 #[derive(Default)]
@@ -1687,7 +1853,64 @@ impl Thread {
 }
 
 impl State {
+    pub fn effective_access_mode(&self, thread: &crate::model::Thread) -> AccessMode {
+        let (modes, compatible) = resolve_compatible_access_mode(
+            thread.native.access,
+            supported_access_modes(&thread.harness),
+        );
+        clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible)
+    }
+
+    pub fn reconcile_current_access_mode(&mut self) {
+        let access = self.effective_access_mode(self.current());
+        if self.current().native.access == access {
+            return;
+        }
+        if self.forward(
+            "thread.configure",
+            json!({"threadId":self.current().id,"access":access.id()}),
+        ) {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.demo || self.current().configuring || self.current().archived() {
+            self.current_mut().native.access = access;
+            return;
+        }
+        if self.current().harness == "claude"
+            && self.current().pi.is_some()
+            && !self.current().initializing
+        {
+            self.current_mut().native.access = access;
+            self.current_mut()
+                .command("set_access_mode", json!({"accessMode":access.id()}));
+            self.checkpoint();
+            return;
+        }
+        if self.current().status.busy() {
+            return;
+        }
+        if self.current().pi.is_some() {
+            self.current_mut().disconnect();
+            self.current_mut().native.access = access;
+            self.connect_thread(self.active);
+        } else {
+            self.current_mut().native.access = access;
+        }
+        self.checkpoint();
+    }
+
+    pub fn open_access_picker(&mut self) {
+        self.reconcile_current_access_mode();
+        self.current_mut().native.access_picker = true;
+    }
+
     pub fn set_access_mode(&mut self, access: AccessMode) {
+        let (modes, compatible) =
+            resolve_compatible_access_mode(access, supported_access_modes(&self.current().harness));
+        let access = clamp_managed_access_mode(self.managed_policy.as_ref(), compatible, &modes)
+            .unwrap_or(compatible);
         if self.forward(
             "thread.configure",
             json!({"threadId":self.current().id,"access":access.id()}),

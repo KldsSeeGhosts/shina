@@ -872,6 +872,7 @@ impl State {
         }
         self.current_mut().draft_model_state = draft_state;
         self.preferences.sticky_composer = sticky;
+        self.reconcile_current_access_mode();
         self.checkpoint();
     }
 
