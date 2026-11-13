@@ -299,6 +299,9 @@ pub struct AssistantWork {
     #[serde(skip)]
     pub expanded: bool,
     pub elapsed: Option<u64>,
+    /// Unknown in old saved histories. Never infer successful completion from a timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Status>,
 }
 
 #[derive(Default)]
@@ -481,6 +484,8 @@ pub struct Thread {
     pub history_has_more: bool,
     pub history_loading: bool,
     pub history_error: Option<String>,
+    pub deferred_work: Vec<Value>,
+    pub deferred_work_supported: bool,
     pub(crate) initializing: bool,
     session_started: Option<Instant>,
     last_activity: Instant,
@@ -727,6 +732,8 @@ impl Thread {
             history_has_more: false,
             history_loading: false,
             history_error: None,
+            deferred_work: Vec::new(),
+            deferred_work_supported: false,
             initializing: false,
             session_started: None,
             last_activity: Instant::now(),
@@ -1624,6 +1631,7 @@ impl Thread {
                 stopped_order: 0,
                 expanded: false,
                 elapsed: None,
+                outcome: None,
             });
         }
         self.work.last_mut().unwrap()
@@ -2053,6 +2061,13 @@ impl Thread {
                                         let order = self.next_work_order();
                                         self.ensure_work().stopped = true;
                                         self.ensure_work().stopped_order = order;
+                                    } else if matches!(
+                                        message["stopReason"].as_str(),
+                                        Some("stop" | "length")
+                                    ) {
+                                        self.ensure_work().outcome = Some(Status::Completed);
+                                    } else if message["stopReason"] == "error" {
+                                        self.ensure_work().outcome = Some(Status::Failed);
                                     }
                                 }
                                 if role == "toolResult"
@@ -2113,6 +2128,12 @@ impl Thread {
                                 }
                             }
                             for work in &mut self.work {
+                                if work.outcome.is_none() {
+                                    work.outcome = saved_work
+                                        .iter()
+                                        .find(|saved| saved.start == work.start)
+                                        .and_then(|saved| saved.outcome);
+                                }
                                 if let Some(saved) = saved_work
                                     .iter()
                                     .find(|saved| saved.start == work.start && saved.stopped)
@@ -2181,7 +2202,7 @@ impl Thread {
                 self.assistant = None;
                 self.phase = "Waiting for the model".into();
                 self.started.get_or_insert_with(Instant::now);
-                self.ensure_work();
+                self.ensure_work().outcome = Some(Status::Running);
             }
             // agent_end is deliberately NOT settlement. Pi can still retry or compact.
             "agent_settled" => {
@@ -2592,6 +2613,17 @@ impl Thread {
             .map(|start| start.elapsed().as_secs())
             .or(self.elapsed);
         self.ensure_work().elapsed = self.elapsed;
+        let start = self.ensure_work().start;
+        let outcome = if self.ensure_work().stopped {
+            None
+        } else {
+            Some(self.status)
+        };
+        for work in &mut self.work {
+            if work.start == start || work.outcome == Some(Status::Running) {
+                work.outcome = outcome;
+            }
+        }
         self.finish_thoughts();
         self.assistant = None;
         self.phase.clear();
@@ -3411,6 +3443,7 @@ impl State {
             return false;
         };
         let tid = t.id;
+        let mut deferred_start = None;
         let row_key = if plan_index.is_some() || t.messages[msg_idx].role == "Pi" {
             let start = t.messages[..=msg_idx]
                 .iter()
@@ -3425,15 +3458,27 @@ impl State {
                     stopped_order: 0,
                     expanded: true,
                     elapsed: None,
+                    outcome: None,
                 });
             }
             if let Some(index) = plan_index {
                 t.tools[index].expanded = true;
             }
+            if t.deferred_work
+                .iter()
+                .any(|marker| marker["start"] == start)
+            {
+                deferred_start = Some(start);
+            }
             format!("turn-{tid}-{}", t.messages[start].id)
         } else {
             format!("row-{tid}-{}", t.messages[msg_idx].id)
         };
+        if let Some(start) = deferred_start {
+            self.load_deferred_work(start, false);
+            // KSG holds find's reveal until the requested fold's history is mounted.
+            return false;
+        }
         self.thread_find.pending_reveal = None;
         tx.scroll_center_in_instant(
             format!("conversation-{tid}"),
@@ -8174,6 +8219,7 @@ impl State {
             stopped_order: 0,
             expanded: true,
             elapsed: Some(42),
+            outcome: Some(Status::Completed),
         });
         thread.messages = vec![
             Message { id: uuid::Uuid::new_v4().to_string(), role: "You", text: "Fix the reconnect race, and add a regression test for the duplicate listener.".into(), images: Vec::new() },

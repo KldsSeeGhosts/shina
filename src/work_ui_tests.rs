@@ -2,6 +2,27 @@ use super::*;
 use crate::ui::tests::{press, runtime};
 
 #[test]
+fn completed_failed_and_unknown_work_outcomes_remain_distinct() {
+    let mut state = State::new(".".into(), false);
+    let t = state.current_mut();
+    t.apply(json!({"type":"agent_start"}));
+    assert_eq!(t.work[0].outcome, Some(crate::model::Status::Running));
+    t.apply(json!({"type":"agent_settled"}));
+    assert_eq!(t.work[0].outcome, Some(crate::model::Status::Completed));
+    t.apply(json!({"type":"agent_start"}));
+    t.error = Some("fixture failure".into());
+    t.apply(json!({"type":"agent_settled"}));
+    assert_eq!(t.work[0].outcome, Some(crate::model::Status::Failed));
+    let saved = serde_json::to_value(&t.work[0]).unwrap();
+    let restored: crate::model::AssistantWork = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(restored.outcome, Some(crate::model::Status::Failed));
+    let mut legacy = saved;
+    legacy.as_object_mut().unwrap().remove("outcome");
+    let legacy: crate::model::AssistantWork = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.outcome, None);
+}
+
+#[test]
 fn html_cards_fit_the_lane_cap_the_snapshot_and_switch_theme_at_every_width() {
     for width in [620.0, 960.0, 1280.0, 1920.0] {
         for snapshot in [false, true] {
@@ -214,6 +235,83 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn a_500_record_fold_mounts_no_work_rows_and_shows_deferred_loading_and_error_states() {
+    for width in [620.0, 960.0, 1280.0, 1920.0] {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        for index in 0..500 {
+            t.apply(
+                json!({"type":"tool_execution_start","toolCallId":format!("work-{index}"),
+                "toolName":"read","args":{"path":"file.rs"}}),
+            );
+            t.apply(
+                json!({"type":"tool_execution_end","toolCallId":format!("work-{index}"),
+                "result":{"content":[{"type":"text","text":"x".repeat(2048)}]}}),
+            );
+        }
+        t.status = crate::model::Status::Completed;
+        t.work[0].outcome = Some(crate::model::Status::Completed);
+        t.work[0].expanded = false;
+        let snapshot = json!({"seq":1,"state":rt.state.projection()});
+        let streams = crate::history::Streams::new(&snapshot);
+        let page = streams
+            .page_with_work(1, None, 65536, None, true, None)
+            .unwrap();
+        let bytes = page.to_string().len();
+        let tools: Vec<_> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["field"] == "tools")
+            .collect();
+        assert_eq!(tools.len(), 1, "{width}");
+        assert!(bytes < 16 * 1024, "{width}: {bytes} bytes");
+        let mut marker = tools[0]["item"]["deferredWork"].clone();
+        marker["sourceItemId"] = tools[0]["sourceItemId"].clone();
+        let t = rt.state.current_mut();
+        t.tools.truncate(1);
+        t.deferred_work = vec![marker];
+        rt.frame(0.0);
+        assert!(
+            rt.find("work-rows-1-0").is_none(),
+            "{width}: folded work rows"
+        );
+        assert!(rt.find("tool-1-0").is_none(), "{width}: folded tool rows");
+        press(&mut rt, "toggle-work-1-0");
+        rt.frame(1.0);
+        let loading = rt.presented("work-loading-1-0").expect("work skeleton").0;
+        let lane = rt.presented("chat-lane").unwrap().0;
+        assert!(
+            loading[0] >= lane[0] && loading[0] + loading[2] <= lane[0] + lane[2] + 0.5,
+            "{width}"
+        );
+        rt.state.current_mut().deferred_work[0]["error"] = json!("fixture failure");
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(
+            rt.elements().iter().any(|e| e
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Couldn't load work. Click to retry."))),
+            "{width}"
+        );
+        assert!(rt.find("work-loading-1-0").is_none());
+        press(&mut rt, "toggle-work-1-0");
+        rt.frame(1.0);
+        assert!(
+            rt.state.current().work[0].expanded,
+            "{width}: retry does not collapse"
+        );
+        // An older peer has inline records and no deferred descriptor, so no skeleton.
+        rt.state.current_mut().deferred_work.clear();
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("work-loading-1-0").is_none());
+        assert!(rt.find("work-rows-1-0").is_some());
     }
 }
 

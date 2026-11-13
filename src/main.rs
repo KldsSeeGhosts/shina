@@ -23,6 +23,7 @@ mod descriptors;
 mod fleet_update;
 mod harness;
 mod history;
+mod history_work;
 mod horizon;
 mod html_fallback;
 #[cfg(any(target_os = "macos", windows, test))]

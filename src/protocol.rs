@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 10;
+pub const MINOR: u32 = 11;
+pub const DEFERRED_WORK: &str = "deferred-work";
 pub const MODEL_FAVORITES: &str = "model-favorites";
 pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
 pub const MODEL_OPTIONS: &str = "model-options";

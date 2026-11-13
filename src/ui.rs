@@ -8663,7 +8663,15 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let title = match (
+        let work_failed = t
+            .deferred_work
+            .iter()
+            .any(|marker| marker["start"] == start && marker["error"].is_string());
+        let work_loading = expanded
+            && t.deferred_work
+                .iter()
+                .any(|marker| marker["start"] == start && !marker["error"].is_string());
+        let mut title = match (
             work.is_some_and(|work| work.stopped),
             work.and_then(|work| work.elapsed),
         ) {
@@ -8672,6 +8680,9 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (false, Some(seconds)) => format!("Worked for {}", elapsed_label(seconds)),
             (false, None) => "Worked".into(),
         };
+        if work_failed {
+            title.push_str(" · Couldn't load work. Click to retry.");
+        }
         let toggle_key = format!("toggle-work-{}-{start}", t.id);
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
@@ -8698,6 +8709,17 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                         .as_deref()
                         .and_then(|id| t.messages.iter().position(|m| m.id == id))
                         .unwrap_or(start);
+                    let retry = t
+                        .work
+                        .iter()
+                        .any(|work| work.start == current_start && work.expanded)
+                        && t.deferred_work.iter().any(|marker| {
+                            marker["start"] == current_start && marker["error"].is_string()
+                        });
+                    if retry {
+                        s.load_deferred_work(current_start, true);
+                        return;
+                    }
                     match t.work.iter_mut().find(|work| work.start == current_start) {
                         Some(work) => work.expanded = !work.expanded,
                         // Turns from before work records existed fold too; opening one
@@ -8708,16 +8730,61 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                             stopped_order: 0,
                             expanded: true,
                             elapsed: None,
+                            outcome: None,
                         }),
+                    }
+                    if s.current()
+                        .work
+                        .iter()
+                        .any(|work| work.start == current_start && work.expanded)
+                    {
+                        s.load_deferred_work(current_start, false);
                     }
                 }),
             );
         if expanded {
+            let restored_id = t.messages.get(start).map(|message| message.id.clone());
+            section = section.on_layout_tx(move |s: &mut State, _, tx| {
+                if let Some(start) = restored_id.as_ref().and_then(|id| {
+                    s.current()
+                        .messages
+                        .iter()
+                        .position(|message| &message.id == id)
+                }) {
+                    s.load_deferred_work(start, false);
+                }
+                tx.live_only();
+            });
             // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
-            section = section.child(work_rows(
-                col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
-                true,
-            ));
+            if work_loading {
+                let mut skeleton = col()
+                    .key(format!("work-loading-{}-{start}", t.id))
+                    .role("status")
+                    .label("Loading work history")
+                    .pt(12.0)
+                    .pb(4.0)
+                    .px(4.0)
+                    .gap(8.0);
+                for fraction in [0.4, 0.6, 1.0 / 3.0] {
+                    skeleton = skeleton.child(
+                        row()
+                            .gap(8.0)
+                            .center_y()
+                            .child(el().size(12.0, 12.0).fill(p.selected))
+                            .child(
+                                el().w((lane_width(s.viewport_width, wide) * fraction).max(20.0))
+                                    .h(10.0)
+                                    .fill(p.selected),
+                            ),
+                    );
+                }
+                section = section.child(skeleton);
+            } else if !work_failed {
+                section = section.child(work_rows(
+                    col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+                    true,
+                ));
+            }
         }
         response = response.child(section);
         if let Some(last) = last_work {
@@ -9307,7 +9374,13 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .key(format!("conversation-wrap-{thread_id}"))
         .grow(1.0)
         .min_h(0.0)
-        .child(scroller);
+        .child(
+            col()
+                .key(format!("timeline-server-{}", s.machines.selected))
+                .grow(1.0)
+                .min_h(0.0)
+                .child(scroller),
+        );
 
     if s.timeline_is_far_from_bottom(thread_id) && !find_open {
         let pill = framed(
@@ -14549,6 +14622,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn timeline_positions_do_not_alias_equal_thread_ids_on_different_servers() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            for index in 0..80 {
+                rt.state.current_mut().messages.push(crate::model::Message {
+                    id: format!("scope-{index}"),
+                    role: "You",
+                    text: format!("Prompt {index}. {}", "Some wrapping prose. ".repeat(12)),
+                    images: vec![],
+                });
+            }
+            rt.frame(0.0);
+            rt.update(|_, tx| tx.scroll_center_in_instant("conversation-1", "row-1-scope-35"));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let original = rt.presented("row-1-scope-35").unwrap().0[1];
+            rt.update(|s, _| s.machines.selected = "other-server".into());
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                rt.presented("row-1-scope-79").is_some(),
+                "{width}: unseen server opens at end"
+            );
+            rt.update(|s, _| s.machines.selected = "local".into());
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let restored = rt
+                .presented("row-1-scope-35")
+                .expect("local anchor restored")
+                .0[1];
+            assert!(
+                (restored - original).abs() <= 1.0,
+                "{width}: {original} != {restored}"
+            );
+        }
+    }
+
+    #[test]
     fn thread_switch_restores_first_visible_timeline_row_and_offset() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -14736,6 +14850,7 @@ pub(crate) mod tests {
                             stopped_order: 0,
                             expanded: false,
                             elapsed: Some(3),
+                            outcome: Some(Status::Completed),
                         });
                     }
                 }

@@ -531,6 +531,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut subscribed = false;
     let mut paged = false;
     let mut history_items = false;
+    let mut deferred_work = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -606,6 +607,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             ]);
                             capabilities.extend([protocol::THREAD_FIND, protocol::THREAD_SEARCH]);
                         }
+                        deferred_work = minor >= 11;
+                        if deferred_work { capabilities.push(protocol::DEFERRED_WORK); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -635,7 +638,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         } else {
                             // Register from this exact snapshot sequence before reading later publishes.
                             let page = shared.history_streams.lock().expect("history streams")
-                                .page(thread, None, crate::history::byte_budget(params));
+                                .page_with_work(thread, None, crate::history::byte_budget(params),
+                                    None, deferred_work, None);
                             if let Ok(page) = &page { active_thread = Some((thread,page["snapshotSequence"].as_u64().unwrap_or(0))); }
                             history_leases.read(thread, &json!({"byteBudget":params["byteBudget"]}), Instant::now(), || page).map(|mut page| {
                                 page["kind"] = json!("snapshot");
@@ -701,11 +705,13 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     } else {
                         params["threadId"].as_u64().ok_or_else(|| "Invalid thread id.".to_owned()).and_then(|thread_id| {
                             history_leases.read(thread_id, params, Instant::now(), || {
-                                shared.history_streams.lock().expect("history streams").page_with_target(
+                                shared.history_streams.lock().expect("history streams").page_with_work(
                                     thread_id,
                                     params["historyCursor"].as_str(),
                                     crate::history::byte_budget(params),
                                     params["throughEntryId"].as_str(),
+                                    deferred_work,
+                                    params["workAnchorId"].as_str(),
                                 )
                             })
                         })
