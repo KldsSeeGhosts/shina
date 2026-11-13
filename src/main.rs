@@ -63,6 +63,7 @@ mod protocol;
 mod question_document;
 mod review;
 mod review_patch;
+mod right_panel;
 mod routines;
 mod runtime;
 mod server;
