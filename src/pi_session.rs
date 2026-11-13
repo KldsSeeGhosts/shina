@@ -377,10 +377,6 @@ impl Thread {
             || self.native.lifecycle_id.is_some()
             || self.native.refreshing_session
             || self.phase == "Stopping"
-            || self
-                .request
-                .as_ref()
-                .is_some_and(|r| r["method"] != "confirm")
             || !self.has_draft_content()
             || self.harness == "pi" && self.model_provider != "cpa"
         {
@@ -708,6 +704,9 @@ impl Thread {
     }
 
     pub(super) fn native_dialog_done(&mut self) {
+        self.question_drafts.clear();
+        self.question_submission = None;
+        self.question_submit_requested = false;
         self.native.approval_more = false;
         self.native.questionnaire_advance = None;
         self.native.questionnaire = None;
@@ -733,6 +732,11 @@ impl Thread {
                 self.reply.replace_text(&form.answers[form.index].other);
             }
             self.request = Some(request);
+            self.refresh_typing_guard();
+            if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+                self.draft.focused = false;
+                self.reply.focused = false;
+            }
             self.status = Status::Waiting;
             break;
         }
@@ -745,6 +749,7 @@ impl Thread {
     }
 
     pub(super) fn cancel_native_dialogs(&mut self) {
+        self.abandon_question("cancelled");
         self.cancel_questionnaire();
         for _ in 0..33 {
             if self.request.is_none() {
@@ -838,11 +843,6 @@ impl Thread {
                 })
             })
             .or_else(|| questionnaire::Questionnaire::pi(request));
-        // A previously focused, hidden composer must not receive questionnaire shortcuts.
-        if self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
-            self.draft.focused = false;
-            self.reply.focused = false;
-        }
     }
     pub(super) fn prepare_remote_questionnaire(&mut self) {
         if let Some(request) = self.request.clone() {
@@ -899,8 +899,8 @@ impl Thread {
             self.native.questionnaire_advance = None;
             return;
         }
+        self.save_question_editor();
         if let Some(form) = &mut self.native.questionnaire {
-            form.edit(self.reply.text.clone());
             if form.toggle(index) {
                 self.reply.replace_text("");
                 if !form.questions[form.index].multi {
@@ -918,13 +918,14 @@ impl Thread {
 
     pub fn questionnaire_changed(&mut self) {
         self.native.questionnaire_advance = None;
-        if let Some(form) = &mut self.native.questionnaire {
-            form.edit(self.reply.text.clone());
-        }
+        self.save_question_editor();
     }
 
     pub fn questionnaire_can_respond(&self) -> bool {
         self.responding_request.is_none()
+            && !self.request_held_by_typing_guard()
+            && self.question_submission.is_none()
+            && !self.question_submit_requested
             && self.question_contract_supported
             && self
                 .request
@@ -1025,15 +1026,18 @@ impl Thread {
         if !self.questionnaire_can_respond() {
             return;
         }
+        self.save_question_editor();
         let Some(form) = &mut self.native.questionnaire else {
             return;
         };
-        form.edit(self.reply.text.clone());
         if previous {
             form.index = form.index.saturating_sub(1);
         } else if form.answer(form.index).is_some() {
             if form.index + 1 == form.questions.len() {
                 if let Some(response) = form.response() {
+                    if self.request_question_submission() {
+                        return;
+                    }
                     self.respond(response);
                 }
                 return;
@@ -1041,6 +1045,7 @@ impl Thread {
             form.index += 1;
         }
         self.reply.replace_text(&form.answers[form.index].other);
+        self.load_question_editor();
         self.reply.focused = false;
     }
 
@@ -1240,10 +1245,13 @@ impl Thread {
         if !self.questionnaire_can_respond() {
             self.native.questionnaire_advance = None;
         }
-        if let Some(form) = &mut self.native.questionnaire
-            && form.answers[form.index].other != self.reply.text
+        if self
+            .native
+            .questionnaire
+            .as_ref()
+            .is_some_and(|form| form.answers[form.index].other != self.current_question_text())
         {
-            form.edit(self.reply.text.clone());
+            self.save_question_editor();
         }
         let before = self.native.notifications.len();
         self.native
@@ -1251,6 +1259,7 @@ impl Thread {
             .retain(|(_, deadline)| *deadline > now);
         let mut changed = (before != self.native.notifications.len()) | self.tick_stop(now);
         if self.native.dialog_deadline.is_some_and(|at| now >= at) {
+            self.abandon_question("expired");
             self.cancel_questionnaire();
             self.native.dialog_deadline = None;
             self.request = None;
@@ -1266,7 +1275,12 @@ impl Thread {
             self.questionnaire_step(false);
             return true;
         }
-        changed |= self.typing_guard.release_if_idle(now);
+        let released = self.typing_guard.release_if_idle(now);
+        if released && self.native.questionnaire.is_some() && !self.request_held_by_typing_guard() {
+            self.draft.focused = false;
+            self.reply.focused = false;
+        }
+        changed |= released;
         changed
     }
 
@@ -1285,6 +1299,7 @@ impl Thread {
                     .as_ref()
                     .is_some_and(|request| request["id"] == record["id"])
                 {
+                    self.abandon_question("cancelled");
                     self.cancel_questionnaire();
                     self.request = None;
                     self.native_dialog_done();

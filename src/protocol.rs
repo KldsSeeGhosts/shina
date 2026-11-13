@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 14;
+pub const MINOR: u32 = 15;
+pub const QUESTION_ATTACHMENTS: &str = "question-attachments-v1";
+pub const QUESTION_ATTACHMENTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to attach files to answers.";
 pub const QUESTION_CONTRACT: &str = "question-contract-v1";
 pub const QUESTIONS_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to answer these questions.";

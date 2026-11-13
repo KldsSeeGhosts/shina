@@ -810,6 +810,14 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.params["questionAttachments"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_ATTACHMENTS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if command.params["questionContract"] == true
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::QUESTION_CONTRACT))
@@ -1732,6 +1740,15 @@ async fn remote_request_outcome(
 ) -> Result<RemoteResponse, String> {
     let timeout = if command.method == "peer.thread.wait" {
         58
+    } else if command.method == "request.respond" && command.params["questionAttachments"] == true {
+        let files = command.params["attachmentsByQuestionId"]
+            .as_object()
+            .into_iter()
+            .flat_map(|map| map.values())
+            .filter_map(Value::as_array)
+            .map(Vec::len)
+            .sum::<usize>();
+        8 + 16 * files as u64
     } else {
         8
     };
@@ -1755,6 +1772,26 @@ async fn remote_request_outcome(
         .await?;
         if command.method == "hello" {
             return Ok(RemoteResponse::Receipt(hello));
+        }
+        for (marker, capability, error) in [
+            (
+                "questionContract",
+                protocol::QUESTION_CONTRACT,
+                protocol::QUESTIONS_UPDATE_REQUIRED,
+            ),
+            (
+                "questionAttachments",
+                protocol::QUESTION_ATTACHMENTS,
+                protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED,
+            ),
+        ] {
+            if command.params[marker] == true
+                && !hello["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == capability))
+            {
+                return Ok(RemoteResponse::Refused(error.into()));
+            }
         }
         if peer
             && command.method != "peer.capabilities"

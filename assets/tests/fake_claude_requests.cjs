@@ -41,7 +41,12 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       capabilities: ["interrupt_receipt_v1", "interrupt_cancel_queued_v1"] });
     emit(record);
     const text = record.message.content.filter(x => x.type === "text").map(x => x.text).join("\n");
-    if (text.includes("approval-fixture")) {
+    if (text.includes("question-file-fixture")) {
+      emit({ type: "control_request", request_id: crypto.randomUUID(), request: {
+        subtype: "can_use_tool", tool_name: "AskUserQuestion", tool_use_id: crypto.randomUUID(),
+        input: { questions: [{ header: "File", question: "Attach a file.", options: [] }] },
+      } });
+    } else if (text.includes("approval-fixture")) {
       emit({ type: "control_request", request_id: crypto.randomUUID(), request: {
         subtype: "can_use_tool", tool_name: "Bash", tool_use_id: crypto.randomUUID(),
         input: { command: "echo fixture" }, title: "Run fixture command?",

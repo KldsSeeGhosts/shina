@@ -177,6 +177,63 @@ verification are recorded separately, not implied by this inventory.
 - Question answers carry attachmentsByQuestionId and questionTextById under
   `packages/contracts/src/providerPolicy.ts:90`. The provider adapters must
   receive the same attachment-answer mechanism, not an unrelated new turn.
+- `provider/userInputAttachments.ts:17` resolves each attachment on the provider's
+  server and refuses missing files. References use JSON-quoted names and paths:
+  `Attached file "name": "path"` or `Attached image "name": "path"`.
+  Multiple references join with a newline. They append to a nonempty string
+  after two newlines, append as another array entry, or replace an empty answer.
+  Extracted documents add ` (text extracted to: "path")`.
+- `provider/DocumentText.ts:13` supports docx, xlsx, pptx, odt, ods, odp, rtf,
+  epub and ipynb. An existing `.txt` sidecar wins. Extraction serializes with one
+  permit, refuses inputs above 16 MiB, runs in an isolated child with a 15-second
+  timeout and a 192 MiB heap, and caps stdout at 4 MiB plus 1,024 bytes.
+  Sidecars use `.txt.part` then atomic rename. Failed paths have a one-second
+  cooldown, permanent rejection on exit 2, and a 1,024-entry failure cache.
+- `provider/documentTextWorker.ts:10` bounds expanded XML/archive text to
+  32 MiB, output to 1,000,000 UTF-16 units, XML to 200,000 nodes and depth 128,
+  archives to 2,048 entries and a 200:1 ratio above 1,024 bytes, and tables to
+  10,000 rows and 512 columns. It rejects encrypted archives, reads UTF-8 and
+  both UTF-16 byte orders, follows internal relationships only, preserves
+  presentation/sheet/chapter order and notes, suppresses hidden and duplicate
+  compatibility content, records skipped XML parts, and uses a fixed truncation
+  notice. Notebook and RTF parsing preserve their source worker's bounded
+  behavior. The worker source is the reference for all format-specific rules.
+- Worker lines 19, 44, 98 and 111 suppress script/style/binary, phonetic,
+  tracked deletion/move, field-code and paragraph-property content; preserve
+  tabs and line breaks; retain one markup-compatibility choice/fallback;
+  emit heading prefixes; and normalize table-cell whitespace.
+  At 174, ODF repeat counts must be positive integers, trailing empty cells
+  disappear, and typed ODF values supply missing displayed text.
+  At 203, archives accept only XML, relationships, XHTML/HTML, OPF and SVG,
+  reject encryption and unsafe names, validate entry sizes and enforce all
+  expansion limits before decoding.
+- At 281, notebooks accept string or string-array source, classify code versus
+  Markdown, emit cell headings, preserve text/text-plain outputs, and format
+  errors with ANSI-stripped tracebacks. There are at most 10,000 cells.
+  At 330, RTF starts with the RTF signature, has group depth 128, default uc=1
+  and Windows-1252, skips metadata/objects/pictures/field instructions, handles
+  Unicode fallback and binary lengths, and accepts only Windows code pages 874
+  and 1250 through 1258.
+- At 427, DOCX reads word/document.xml; ODF reads content.xml; XLSX follows
+  workbook relationships and ordered sheets, shared/inline strings and formulas,
+  preserves gaps, and annotates numeric formats with the 1900/1904 date system.
+  PPTX follows presentation order and internal speaker-note relationships.
+  EPUB follows container, manifest and spine order, decodes chapter hrefs and
+  drops fragments. Missing or malformed XML produces named skipped-part notes.
+  At 631, output charges raw UTF-16 text against its budget before whitespace
+  normalization, removes NULs, trims table cells, collapses excess blank lines,
+  trims the result, rejects empty non-truncated extraction and appends the fixed
+  truncation notice when a bound is reached.
+- `questionAttachments.ts:140` returns edited, unsent custom answers on Stop,
+  provider cancellation or timeout to the ordinary thread draft, including
+  only referenced thread contexts. It trims each answer, uses two newlines
+  between entries and trims the existing prompt's end. At 177 it performs this
+  before pruning resolved answer and attachment drafts. Suggested prefills
+  remain unedited until changed, per `usePendingThreadRequests.ts:160`.
+- `ChatComposer.tsx:3556` uses "Type your own answer, or leave this blank to use
+  the selected option". `ComposerPrimaryActions.tsx:70` uses "Submitting...",
+  compact "Next"/"Submit", wide "Next question", and "Submit answer"/"Submit
+  answers". Previous is absent on the first question.
 
 ## 5. Collapse and dismissal
 
@@ -329,3 +386,88 @@ Tests include `questionnaire_contract_tests.rs`, `question_flow_tests.rs`,
 per-provider fixture messages in each provider's tests, native RPIV transport
 tests, four-width question layout tests and
 `choice_only_questions_use_native_option_ids_and_refuse_an_older_peer`.
+
+## Item 4 implementation map
+
+`question_answers::Draft` retains an editor, files, context records and pending
+imports under a runtime/request/question key on the owning thread and machine.
+`State::with_question_draft` calls the existing intake, paste, removal and rich
+reference functions against that scoped editor. It restores the ordinary editor
+and all ordinary attachment/context state before checkpointing. The attachment
+intake, staging and upload implementations themselves remain unchanged.
+`Thread::{question_reserved_count,save_question_editor,load_question_editor}`
+reserves the shared 100 slots across questions, including pending imports.
+`Questionnaire::answer` blocks pending preparation and accepts attachment-only
+answers only for custom-answer questions.
+
+`State::{attach_paths_to,attach_image_with_options,paste_composer_content,
+poll_context_imports}` captures question ownership, refuses choice-only or
+responding intake, and prevents an async result from entering an ordinary draft
+or a different request. Picker callbacks also check their original machine and
+question target. Typing-guard-held questions retain ordinary draft intake.
+Question attachment removal uses the existing referenced-image confirmation.
+`pi_ui::questionnaire_drawer` calls the existing attachment control and chip
+renderer for the question's files.
+
+`Thread::request_question_submission` defers submission while work is pending.
+`State::poll_question_answers` stages files with `stage_prompt_files`, uploads
+through the existing `client::uploaded_command`, and preserves the request and
+answer drafts on failure. It checks the owning runtime generation on completion.
+`project_threads` converts only linked strings to KSG's `t3-thread://v2` Markdown
+links; non-string selections remain literal. Deleted reference records retained
+for undo are not transferred. Responses carry `attachmentsByQuestionId` and
+`questionTextById`, never a separate provider turn.
+
+`Thread::respond_question_with_files` resolves files only inside the server's
+owned attachment directory. `append_references` applies KSG's string, array and
+empty-answer suffix rules. Pi receives its direct string or comma-joined reply;
+Codex receives its native answer arrays; Claude receives its updatedInput answers.
+Antigravity's choice-only questions cannot take files. Generic ACP supplies no
+answer-bearing questions.
+
+`question_document::{ensure,ensure_named}` uses KSG's unchanged document parser,
+mechanically bundled with its installed dependencies in
+`assets/question_document_worker.cjs`. The Rust caller preserves KSG's process,
+heap, timeout, stdout, input, sidecar, serialization and failure-cache limits.
+It uses Node already used by Shina's provider workflow. Parser failure remains
+optional, as in KSG, and does not reject an otherwise available attachment.
+Shina's immutable ordinary-file blobs end in `.bin`; an owned, typed hard-link
+view gives the parser the original extension without changing the blob or the
+attachment's provider reference. Server extraction runs outside the reducer.
+Concurrent retries share preparation by device, command UUID and argument hash.
+The durable receipt still controls provider response deduplication.
+The generated worker and its dependencies have MIT/ISC notices, also embedded
+in the runtime copy.
+
+Protocol minor 15 adds `question-attachments-v1` and the `questionAttachments`
+marker. Missing support hides the question's attach action and refuses intake.
+The transport rechecks capabilities after reconnect. Server negotiation below
+15 explicitly refuses attachment-bearing answers. Ordinary text answers retain
+the minor-14 contract.
+
+Tests cover independent drafts, ordinary draft preservation, shared capacity,
+pending imports, old peers, native file-path replies, string/array suffixes,
+thread links, stale generations, failed preparation and document sidecars.
+The native integration test
+`question_files_use_server_paths_and_document_text_in_the_native_answer`
+checks Claude's actual response, a notebook sidecar and minor-14 refusal.
+`question_answer_files_fit_without_changing_the_ordinary_composer_at_all_widths`
+checks all four required widths.
+
+Cancelled/expired question resolution records travel in the minor-15 projection.
+`Thread::{abandon_question,return_unsent_question_answers}` and `ThreadView::apply`
+recover edited custom answers and referenced thread chips before pruning their
+question drafts. Explicit answers and dismissals do not recover discarded drafts.
+Older projections default these resolution records to an empty list, so this
+new recovery behavior is unavailable against an older server. Basic text answers
+still use the minor-14 contract.
+
+Item 4 validation passed `cargo fmt --check`, `cargo build` and the full
+`cargo test` suite with temporary profiles and `RUST_TEST_THREADS=4`.
+The main suite passed 1,084 tests with 11 opt-in tests ignored. The integration
+target passed all 70 tests. Native desktop interaction and paid providers remain
+unverified.
+Literal pastes remain literal and do not fold into files. Copy, cut and undo use
+the existing rich-context functions on the scoped answer editor. Question images
+use file-path references, not native prompt image parts, so preparation validates
+and stages each file separately without changing ordinary prompt image limits.

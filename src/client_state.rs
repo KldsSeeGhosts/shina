@@ -133,6 +133,8 @@ struct ThreadView {
     #[serde(default)]
     question_contract_supported: bool,
     questionnaire: Value,
+    #[serde(default)]
+    question_resolutions: Vec<super::question_answers::Resolution>,
     elapsed: Option<u64>,
     #[serde(default)]
     started_at: Option<u64>,
@@ -252,6 +254,7 @@ impl ThreadView {
             requests_supported: true,
             question_contract_supported: true,
             questionnaire: thread.projected_form(),
+            question_resolutions: thread.question_resolutions.clone(),
             elapsed: thread.elapsed,
             started_at: thread.started.map(stable_timestamp),
             tool_started_at: thread
@@ -424,12 +427,29 @@ impl ThreadView {
                 .request
                 .as_ref()
                 .map(|r| (&r["id"], &r["runtimeGeneration"]));
+        if changed_request
+            && thread.request.as_ref().is_some_and(|request| {
+                self.question_resolutions.iter().any(|r| {
+                    r.request == request["id"]
+                        && matches!(r.reason.as_str(), "cancelled" | "expired")
+                        && (request["runtimeGeneration"]
+                            .as_str()
+                            .is_none_or(|generation| generation == r.generation))
+                })
+            })
+        {
+            thread.return_unsent_question_answers();
+        }
+        thread.question_resolutions = self.question_resolutions;
         thread.request = self.request;
         thread.native.projected_approvals = self.pending_approvals;
         thread.refresh_typing_guard();
         thread.requests_supported = self.requests_supported;
         thread.question_contract_supported = self.question_contract_supported;
         if changed_request {
+            thread.question_drafts.clear();
+            thread.question_submission = None;
+            thread.question_submit_requested = false;
             thread.native.approval_more = false;
             thread.reply.replace_text(
                 thread
@@ -440,6 +460,10 @@ impl ThreadView {
             );
             thread.prepare_remote_questionnaire();
             thread.apply_projected_form(self.questionnaire)?;
+            if thread.native.questionnaire.is_some() && !thread.request_held_by_typing_guard() {
+                thread.draft.focused = false;
+                thread.reply.focused = false;
+            }
         }
         thread.elapsed = self.elapsed;
         thread.started = self
@@ -1503,6 +1527,7 @@ impl State {
             tx.wake_after(wait);
         }
         changed |= self.poll_approval_sends();
+        changed |= self.poll_question_answers();
         if self.approval_sends_pending() {
             tx.wake_after(Duration::from_millis(16));
         }
@@ -3145,7 +3170,14 @@ impl State {
                     .filter(Value::is_array)
                     .filter(|_| input.response["cancelled"] != true)
                 {
-                    self.current_mut().respond_projected_form(answers)?;
+                    if args.get("attachmentsByQuestionId").is_some() {
+                        self.current_mut().respond_question_with_files(
+                            answers,
+                            &args["attachmentsByQuestionId"],
+                        )?;
+                    } else {
+                        self.current_mut().respond_projected_form(answers)?;
+                    }
                 } else if input.session && input.response.get("decision").is_none() {
                     self.respond_to_request(
                         input.thread_id,
@@ -3385,6 +3417,38 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_question_projections_recover_unsent_custom_text_but_answers_do_not() {
+        for cancelled in [true, false] {
+            let mut server = Thread::new(1);
+            let (pi, _commands, _) = Pi::test_connection();
+            server.pi = Some(pi);
+            server.apply(
+                json!({"type":"extension_ui_request","method":"input","id":"scoped-question",
+                "questions":[{"id":"one","question":"Answer?","options":[]}]}),
+            );
+            let mut client = Thread::new(1);
+            client.draft.replace_text("Ordinary");
+            ThreadView::capture(&server).apply(&mut client).unwrap();
+            client.reply.replace_text("Unsent local answer");
+            client.questionnaire_changed();
+            if cancelled {
+                server.apply(json!({"type":"extension_ui_cancel","id":"scoped-question"}));
+            } else {
+                server.respond(json!({"value":json!({"one":"Other client answered"}).to_string()}));
+            }
+            ThreadView::capture(&server).apply(&mut client).unwrap();
+            assert_eq!(
+                crate::composer_rich::markdown(&client.draft),
+                if cancelled {
+                    "Ordinary\n\nUnsent local answer"
+                } else {
+                    "Ordinary"
+                }
+            );
+        }
+    }
     use crate::runtime::RuntimeState;
 
     fn tab_client() -> (State, State, tokio::sync::mpsc::Receiver<Command>) {

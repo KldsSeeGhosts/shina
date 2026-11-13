@@ -9974,6 +9974,8 @@ fn attach_control(locked: bool, p: Palette) -> El {
 
 fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
+    let machine = s.machines.selected.clone();
+    let question = s.current().question_scope();
     let options = rune::FileDialogOptions {
         title: if folder {
             "Attach a folder"
@@ -9984,6 +9986,14 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
         ..Default::default()
     };
     let callback = move |s: &mut State, result, _: &mut Tx| {
+        if machine != s.machines.selected
+            || !s
+                .threads
+                .iter()
+                .any(|t| t.id == thread && t.question_scope() == question)
+        {
+            return;
+        }
         match result {
             Ok(Some(path)) => s.attach_paths_to(thread, &[path]),
             Ok(None) => {}
@@ -14046,6 +14056,41 @@ pub(crate) mod tests {
                     .selected
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn question_answer_files_fit_without_changing_the_ordinary_composer_at_all_widths() {
+        let path = crate::store::directory().unwrap().join("answer-file.txt");
+        std::fs::write(&path, "Question attachment").unwrap();
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().draft.replace_text("Ordinary draft");
+            rt.state.current_mut().apply(
+                json!({"type":"extension_ui_request","id":"files","method":"input",
+                "questions":[{"id":"one","question":"Attach the file.","options":[]}]}),
+            );
+            rt.state.attach_paths(&[path.clone()]);
+            rt.frame(0.0);
+            let key = format!("attachment-{}", rt.state.current().question_files()[0].id);
+            for key in [
+                "questionnaire-drawer",
+                "dialog-reply",
+                "attach-image",
+                key.as_str(),
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[0] + rect[2] <= width + 1.0
+                        && rect[1] >= 0.0
+                        && rect[1] + rect[3] <= 721.0,
+                    "{width}: {key} {rect:?}"
+                );
+            }
+            assert_eq!(rt.state.current().draft.text, "Ordinary draft");
         }
     }
 

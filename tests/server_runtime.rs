@@ -73,6 +73,114 @@ fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
 }
 
 #[test]
+fn question_files_use_server_paths_and_document_text_in_the_native_answer() {
+    use sha2::Digest;
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("file-answer-hello"),
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"claude"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"question-file-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "input");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    let bytes = br##"{"cells":[{"cell_type":"markdown","source":["# File answer"]}]}"##;
+    let base = format!("http://127.0.0.1:{}", profile.discovery()["port"]);
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let started: Value = http
+        .post(format!("{base}/v1/uploads"))
+        .bearer_auth(&client.token)
+        .json(
+            &json!({"type":"file","name":"answer.ipynb","mimeType":"application/octet-stream",
+            "length":bytes.len(),"sha256":format!("{:x}",sha2::Sha256::digest(bytes))}),
+        )
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let upload = started["uploadId"].as_str().unwrap();
+    assert!(
+        http.put(format!("{base}/v1/uploads/{upload}?offset=0"))
+            .bearer_auth(&client.token)
+            .body(bytes.to_vec())
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let file: Value = http
+        .post(format!("{base}/v1/uploads/{upload}/commit"))
+        .bearer_auth(&client.token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let args = json!({"threadId":1,"requestId":request["id"],"generation":request["runtimeGeneration"],
+        "requestContract":true,"questionContract":true,"questionAttachments":true,
+        "answers":[{"selected":[],"other":"Review the attached notebook."}],
+        "attachmentsByQuestionId":{"Attach a file.":[file]},"questionTextById":{"Attach a file.":"Attach a file."},
+        "response":{"value":""}});
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":14,"projectionSchema":1}),
+        json!("file-answer-old"),
+    );
+    assert_eq!(
+        client.command("request.respond", args.clone(), uuid::Uuid::new_v4())["error"]["message"],
+        protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED
+    );
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("file-answer-new"),
+    );
+    let response = client.command("request.respond", args, uuid::Uuid::new_v4());
+    assert_eq!(response["result"]["status"], "accepted", "{response}");
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let records: Vec<Value> =
+        fs::read_to_string(profile.root.join("Shina/chats/1/claude-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let native = records
+        .iter()
+        .find(|r| r["response"]["request_id"] == request["id"])
+        .unwrap();
+    let answer = native["response"]["response"]["updatedInput"]["answers"]["Attach a file."]
+        .as_str()
+        .unwrap();
+    assert!(
+        answer.contains("Review the attached notebook.\n\nAttached file \"answer.ipynb\": "),
+        "{answer}"
+    );
+    assert!(answer.contains(" (text extracted to: "), "{answer}");
+    assert!(answer.contains(profile.root.to_str().unwrap()), "{answer}");
+    profile.stop();
+}
+
+#[test]
 fn choice_only_questions_use_native_option_ids_and_refuse_an_older_peer() {
     let mut profile = Profile::new();
     fs::write(profile.root.join("Shina/harnesses.json"), json!([{

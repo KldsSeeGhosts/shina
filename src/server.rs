@@ -33,6 +33,8 @@ struct Shared {
     remote: bool,
     pairing: Arc<Mutex<server_auth::Pairing>>,
     uploads: Arc<Mutex<HashMap<String, Upload>>>,
+    answer_preparations:
+        Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<(), String>>>>>>,
     discovery: Discovery,
     directory: PathBuf,
     database: crate::database::Database,
@@ -591,6 +593,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut composer_requests = false;
     let mut approval_feedback = false;
     let mut question_contract = false;
+    let mut question_attachments = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -676,6 +679,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if approval_feedback { capabilities.push(protocol::APPROVAL_FEEDBACK); }
                         question_contract = minor >= 14;
                         if question_contract { capabilities.push(protocol::QUESTION_CONTRACT); }
+                        question_attachments=minor>=15;
+                        if question_attachments {capabilities.push(protocol::QUESTION_ATTACHMENTS);}
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -839,6 +844,34 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         && !question_contract {
                         if !send(&mut socket, protocol::response(id, Err(protocol::QUESTIONS_UPDATE_REQUIRED.into()))).await { break; }
                         continue;
+                    }
+                    if command.params["questionAttachments"] == true && !question_attachments {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
+                    if method=="request.respond" && command.params.get("attachmentsByQuestionId").is_some()
+                        && shared.database.receipt(&device,command.command_id).ok().flatten().is_none() {
+                        if !question_attachments {
+                            if !send(&mut socket,protocol::response(id,Err(protocol::QUESTION_ATTACHMENTS_UPDATE_REQUIRED.into()))).await {break;}
+                            continue;
+                        }
+                        let params=command.params.clone();
+                        let directory=shared.directory.clone();
+                        use sha2::Digest;
+                        let key=format!("{device}:{}:{:x}",command.command_id,sha2::Sha256::digest(params.to_string().as_bytes()));
+                        let preparation={
+                            let mut preparations=shared.answer_preparations.lock().expect("answer preparations");
+                            preparations.retain(|candidate,cell|candidate==&key || cell.get().is_none());
+                            preparations.entry(key).or_default().clone()
+                        };
+                        let prepared=preparation.get_or_init(||async move {
+                            tokio::task::spawn_blocking(move ||crate::question_document::prepare_answer_attachments(&params,&directory))
+                                .await.map_err(|e|e.to_string()).and_then(|r|r)
+                        }).await;
+                        if let Err(error)=prepared {
+                            if !send(&mut socket,protocol::response(id,Err(error.clone()))).await {break;}
+                            continue;
+                        }
                     }
                     if method == "request.respond" && command.params["response"].get("feedback").is_some()
                         && !approval_feedback {
@@ -1048,6 +1081,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         remote: false,
         pairing: Arc::default(),
         uploads: Arc::default(),
+        answer_preparations: Arc::default(),
         discovery: discovery.clone(),
         directory: directory.clone(),
         database: runtime.database.clone().expect("durable runtime"),
@@ -1290,6 +1324,7 @@ mod tests {
                 remote: true,
                 pairing: Arc::default(),
                 uploads: Arc::default(),
+                answer_preparations: Arc::default(),
                 discovery: Discovery {
                     server_id: uuid::Uuid::new_v4().to_string(),
                     instance_id: uuid::Uuid::new_v4().to_string(),

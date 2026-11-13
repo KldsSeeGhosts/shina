@@ -149,7 +149,10 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                     text_input(&t.reply, BODY)
                         .key("dialog-reply")
                         .label("Other answer")
-                        .placeholder("Other answer...", p.muted)
+                        .placeholder(
+                            "Type your own answer, or leave this blank to use the selected option",
+                            p.muted,
+                        )
                         .color(p.ink)
                         .w_full()
                         .min_h(32.0)
@@ -161,21 +164,74 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                         .field_focus(&t.reply, p)
                         .disabled(disabled)
                         .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
-                        .on_input_change(|s: &mut State, _| s.current_mut().questionnaire_changed())
+                        .on_input_change(|s: &mut State, _| {
+                            s.current_mut().questionnaire_changed();
+                            if let Some(scope) = s.current().question_scope() {
+                                s.with_question_draft(s.active, scope, |s| {
+                                    s.current_mut().reconcile_draft_context()
+                                });
+                            }
+                        })
+                        .on_input_key(|s: &mut State, event, tx| {
+                            if event.is_command('c') || event.is_command('x') {
+                                let cut = event.is_command('x');
+                                if let Some(scope) = s.current().question_scope()
+                                    && let Some(content) = s
+                                        .with_question_draft(s.active, scope, |s| {
+                                            s.copy_composer_selection(cut)
+                                        })
+                                        .flatten()
+                                {
+                                    tx.copy_rich(content);
+                                    return true;
+                                }
+                            }
+                            false
+                        })
+                        .on_input_paste(|s: &mut State, content, _| {
+                            s.paste_composer_content(content, false)
+                        })
                         .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false))
                 } else {
                     el()
                 })
                 .child(
                     row()
+                        .key("question-attachments")
+                        .gap(8.0)
+                        .flex_wrap()
+                        .children(
+                            t.question_files()
+                                .iter()
+                                .map(|file| attachment_chip(s, p, file)),
+                        ),
+                )
+                .child(
+                    row()
                         .gap(6.0)
                         .flex_wrap()
                         .child(
+                            if question.allow_custom
+                                && s.client.as_ref().is_none_or(|c| {
+                                    c.supports_capability(
+                                        &s.machines.selected,
+                                        crate::protocol::QUESTION_ATTACHMENTS,
+                                    )
+                                })
+                            {
+                                attach_control(disabled, p)
+                            } else {
+                                el()
+                            },
+                        )
+                        .child(if form.index > 0 {
                             button("questionnaire-previous", "Previous", p, |s| {
                                 s.current_mut().questionnaire_step(true)
                             })
-                            .disabled(disabled || form.index == 0),
-                        )
+                            .disabled(disabled)
+                        } else {
+                            el()
+                        })
                         .child(
                             button(
                                 if last {
@@ -183,7 +239,18 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette) -> El {
                                 } else {
                                     "questionnaire-next"
                                 },
-                                if last { "Submit reply" } else { "Next" },
+                                if t.responding_request.is_some() || t.question_submission_pending()
+                                {
+                                    "Submitting..."
+                                } else if s.viewport_width < 640.0 {
+                                    if last { "Submit" } else { "Next" }
+                                } else if !last {
+                                    "Next question"
+                                } else if form.index > 0 {
+                                    "Submit answers"
+                                } else {
+                                    "Submit answer"
+                                },
                                 p,
                                 |s| s.current_mut().questionnaire_step(false),
                             )

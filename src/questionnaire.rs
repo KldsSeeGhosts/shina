@@ -3,6 +3,9 @@
 use serde_json::{Value, json};
 
 #[cfg(test)]
+#[path = "question_attachment_contract_tests.rs"]
+mod attachment_contract_tests;
+#[cfg(test)]
 #[path = "questionnaire_contract_tests.rs"]
 mod contract_tests;
 
@@ -32,6 +35,12 @@ pub struct Question {
 pub struct Answer {
     pub selected: Vec<String>,
     pub other: String,
+    #[serde(default)]
+    pub attachment_count: usize,
+    #[serde(default)]
+    pub attachments_blocked: bool,
+    #[serde(default)]
+    pub touched: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -201,7 +210,15 @@ impl Questionnaire {
             answer.selected.clear();
         }
         answer.other = value;
+        answer.touched = true;
         self.share_answer();
+    }
+
+    pub fn edit_at(&mut self, at: usize, value: String) {
+        let previous = self.index;
+        self.index = at;
+        self.edit(value);
+        self.index = previous;
     }
 
     fn share_answer(&mut self) {
@@ -348,6 +365,9 @@ impl Questionnaire {
     pub fn answer(&self, at: usize) -> Option<Value> {
         let q = &self.questions[at];
         let answer = &self.answers[at];
+        if answer.attachments_blocked {
+            return None;
+        }
         let custom = q
             .allow_custom
             .then(|| {
@@ -368,7 +388,9 @@ impl Questionnaire {
             }
         }
         if selected.is_empty() {
-            custom.map(|value| json!(value))
+            custom
+                .map(|value| json!(value))
+                .or_else(|| (q.allow_custom && answer.attachment_count > 0).then(|| json!("")))
         } else if q.multi {
             Some(json!(selected))
         } else {
@@ -384,30 +406,36 @@ impl Questionnaire {
         if !self.can_respond() || !self.complete() {
             return None;
         }
-        if self.direct {
-            return Some(json!({"value": self.rpc_value(0)?}));
-        }
-        let answers = self
-            .questions
+        self.response_with_answers(&self.resolved_answers()?)
+    }
+
+    pub fn resolved_answers(&self) -> Option<serde_json::Map<String, Value>> {
+        self.questions
             .iter()
             .enumerate()
             .map(|(i, q)| Some((q.id.clone(), self.answer(i)?)))
-            .collect::<Option<serde_json::Map<_, _>>>()?;
-        // Pi input/editor transports text. Keep the structured answer in that string.
-        Some(json!({"value": Value::Object(answers).to_string()}))
+            .collect()
     }
 
-    fn rpc_value(&self, at: usize) -> Option<String> {
-        let answer = self.answer(at)?;
-        Some(if let Some(values) = answer.as_array() {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            answer.as_str()?.to_owned()
-        })
+    pub fn response_with_answers(&self, answers: &serde_json::Map<String, Value>) -> Option<Value> {
+        if !self.can_respond() {
+            return None;
+        }
+        if self.direct {
+            let answer = answers.get(&self.questions.first()?.id)?;
+            let value = if let Some(values) = answer.as_array() {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                answer.as_str()?.to_owned()
+            };
+            return Some(json!({"value":value}));
+        }
+        // Pi input/editor transports text. Keep the structured answer in that string.
+        Some(json!({"value": Value::Object(answers.clone()).to_string()}))
     }
 }
 
