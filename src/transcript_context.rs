@@ -475,7 +475,7 @@ impl<'a> Document<'a> {
                             .role("button")
                             .label(format!("Machine, {}", &text[a..b]))
                             .help(if environment_known(self.state, environment_id) {
-                                "T3 Code environment"
+                                "Shina machine"
                             } else {
                                 "Machine not in this app"
                             }),

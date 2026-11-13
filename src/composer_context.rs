@@ -1544,7 +1544,7 @@ fn format_composer_context_provider_payload(
         ComposerContextData::Environment { environment_id } => [
             format!("label: {}", record.label),
             format!("environmentId: {environment_id}"),
-            "The user means this machine. Not linked here yet: call t3_environment_link with this environmentId. Linked: pass it as environmentId, or target.environmentId for delegate_task.".into(),
+            "The user means this machine. To work there, pass this environmentId as target.environmentId for delegate_task, or as machine for read_thread.".into(),
         ]
         .join("\n"),
         ComposerContextData::Model {
@@ -3288,7 +3288,7 @@ mod tests {
         assert!(projected.contains("model:codex/gpt-6.1-sol"), "{projected}");
         assert!(
             projected.contains(&format!(
-                "label: Studio\nenvironmentId: env-studio\nThe user means this machine. Not linked here yet: call t3_environment_link with this environmentId. Linked: pass it as environmentId, or target.environmentId for delegate_task."
+                "label: Studio\nenvironmentId: env-studio\nThe user means this machine. To work there, pass this environmentId as target.environmentId for delegate_task, or as machine for read_thread."
             )),
             "{projected}"
         );
