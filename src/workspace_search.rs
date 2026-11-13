@@ -167,6 +167,42 @@ pub fn resolve_cwd(cwd: &str, project_roots: &[PathBuf]) -> Result<PathBuf, Stri
     }
 }
 
+/// `workspace.readFile` path rule: after following symlinks, the file must land
+/// inside a known project root, the same check `resolve_cwd` applies, or be one
+/// of the skill instruction paths this server reported. A relative `path`
+/// resolves against `cwd`, which must itself sit inside a project.
+pub fn resolve_read(
+    cwd: &str,
+    path: &str,
+    project_roots: &[PathBuf],
+    skill_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let raw = Path::new(path);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        resolve_cwd(cwd, project_roots)?.join(raw)
+    };
+    let canonical = joined
+        .canonicalize()
+        .map_err(|_| "Workspace file could not be resolved.".to_string())?;
+    let inside = project_roots.iter().any(|root| {
+        root.canonicalize()
+            .is_ok_and(|root| canonical == root || canonical.starts_with(&root))
+    });
+    if inside {
+        return Ok(canonical);
+    }
+    let reported = skill_paths
+        .iter()
+        .any(|skill| skill.canonicalize().is_ok_and(|skill| canonical == skill));
+    if reported {
+        Ok(canonical)
+    } else {
+        Err("Workspace path is not inside a project on this server.".into())
+    }
+}
+
 pub fn search(
     cwd: &Path,
     query: &str,
@@ -268,6 +304,53 @@ mod tests {
                 .is_empty()
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_read_stays_inside_projects_or_a_reported_skill_path() {
+        let root = project(&["src/deep.rs", "README.md"]);
+        let outside_dir = project(&["escape.txt"]);
+        let roots = vec![root.clone()];
+        let cwd = root.to_string_lossy().into_owned();
+        // Relative and absolute project paths resolve to their canonical form.
+        assert_eq!(
+            resolve_read(&cwd, "src/deep.rs", &roots, &[]).unwrap(),
+            root.join("src/deep.rs").canonicalize().unwrap()
+        );
+        let absolute = root.join("README.md").to_string_lossy().into_owned();
+        assert!(resolve_read("", &absolute, &roots, &[]).is_ok());
+        // A `..` escape and an absolute path outside every root are refused.
+        let escape = root.join("../escape.txt").to_string_lossy().into_owned();
+        assert!(
+            resolve_read(&cwd, "../escape.txt", &roots, &[]).is_err(),
+            "{escape}"
+        );
+        assert!(resolve_read(&cwd, &escape, &roots, &[]).is_err());
+        let foreign = outside_dir
+            .join("escape.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert!(resolve_read("", &foreign, &roots, &[]).is_err());
+        // Missing files do not resolve at all.
+        assert!(resolve_read(&cwd, "missing.rs", &roots, &[]).is_err());
+        // A skill path outside the roots is allowed only when the server's own
+        // skill inventory reported it.
+        assert!(resolve_read("", &foreign, &roots, &[outside_dir.join("escape.txt")]).is_ok());
+        assert!(resolve_read("", &foreign, &roots, &[outside_dir.join("other.txt")]).is_err());
+        #[cfg(unix)]
+        {
+            // A symlink inside the project resolving outside it is refused.
+            let link = root.join("linked.txt");
+            std::os::unix::fs::symlink(outside_dir.join("escape.txt"), &link).unwrap();
+            let via_link = link.to_string_lossy().into_owned();
+            assert!(
+                resolve_read(&cwd, "linked.txt", &roots, &[]).is_err(),
+                "{via_link}"
+            );
+            let _ = fs::remove_file(&link);
+        }
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside_dir);
     }
 
     #[test]

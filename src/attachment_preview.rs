@@ -151,6 +151,16 @@ fn kind(name: &str, mime: &str) -> Kind {
     Kind::Unsupported
 }
 
+/// A file still being fetched through `workspace.readFile` on a linked
+/// machine. Stored on the preview so Retry re-issues the whole fetch.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteFile {
+    pub machine: String,
+    pub cwd: String,
+    pub path: std::path::PathBuf,
+    pub request: u64,
+}
+
 pub(crate) struct Preview {
     machine: String,
     pub(crate) thread: usize,
@@ -160,6 +170,10 @@ pub(crate) struct Preview {
     /// A composer-pill preview never joins the draft's attachments, so the
     /// remove control stays hidden and retry re-resolves its source.
     pub(crate) transient: bool,
+    /// A remote file still downloading through `workspace.readFile`.
+    pub(crate) loading: bool,
+    /// How a transient preview re-fetches its file from a linked machine.
+    pub(crate) remote: Option<RemoteFile>,
     player: Option<rune::Player>,
     text: String,
     pub(crate) error: Option<String>,
@@ -237,6 +251,8 @@ impl Preview {
             index,
             draft,
             transient: false,
+            loading: false,
+            remote: None,
             player: None,
             text: String::new(),
             error: None,
@@ -465,7 +481,8 @@ impl State {
     /// draft unchanged. This is the settled substitute for KSG Code's right
     /// panel (`ComposerMentionNodeView` calls `actions.openMention(path)`);
     /// Shina has no right panel yet.
-    pub(crate) fn preview_mention(&mut self, attachment: Attachment) {
+    pub(crate) fn preview_mention(&mut self, attachment: Attachment, remote: Option<RemoteFile>) {
+        let remoteless = remote.is_none();
         let mut preview = Preview::blank(
             self.machines.selected.clone(),
             self.current().id,
@@ -474,9 +491,14 @@ impl State {
             false,
         );
         preview.transient = true;
-        preview.load(self.wake.clone());
+        preview.remote = remote;
+        if remoteless {
+            preview.load(self.wake.clone());
+        }
         self.attachment_preview = Some(preview);
-        self.finish_preview_load();
+        if remoteless {
+            self.finish_preview_load();
+        }
     }
 
     /// Once the selected item has local bytes, run the deferred loaders and
@@ -519,7 +541,9 @@ impl State {
     fn retry_attachment_preview(&mut self) {
         if let Some(preview) = &self.attachment_preview {
             if preview.transient {
-                if let Some(path) = preview.selected().path.clone() {
+                if let Some(remote) = preview.remote.clone() {
+                    self.fetch_remote_preview(remote);
+                } else if let Some(path) = preview.selected().path.clone() {
                     self.preview_mention_path(&path);
                 }
                 return;
@@ -1338,6 +1362,8 @@ pub(super) fn view(s: &State, p: Palette) -> El {
             .child(button("retry-attachment-preview", "Retry", p, |s| {
                 s.retry_attachment_preview();
             }));
+    } else if preview.loading {
+        card = card.child(label("Loading file preview…", SMALL, p.muted));
     } else {
         match attachment_kind {
             Kind::Image => {

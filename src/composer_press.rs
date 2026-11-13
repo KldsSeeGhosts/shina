@@ -5,6 +5,8 @@
 //! right panel yet, so the attachment preview dialog is the settled substitute.
 use crate::composer_tokens::Token;
 use crate::model::State;
+use crate::ui::attachment_preview::RemoteFile;
+use serde_json::json;
 use std::path::{Path, PathBuf};
 
 /// What pressing a pill does. The mapping is pure so every token kind is
@@ -81,6 +83,13 @@ impl State {
         };
         if machine == "local" {
             self.preview_mention_path(&path);
+        } else {
+            self.fetch_remote_preview(RemoteFile {
+                machine,
+                cwd: cwd.unwrap_or_default(),
+                path,
+                request: 0,
+            });
         }
     }
 
@@ -91,7 +100,7 @@ impl State {
             crate::attachments::validate_file_metadata(&file.name, &file.mime, file.bytes)
                 .map(|_| file)
         }) {
-            Ok(attachment) => self.preview_mention(attachment),
+            Ok(attachment) => self.preview_mention(attachment, None),
             Err(error) => {
                 let name = path
                     .file_name()
@@ -103,12 +112,149 @@ impl State {
                     name,
                     Some(path.to_path_buf()),
                 );
-                self.preview_mention(attachment);
+                self.preview_mention(attachment, None);
                 if let Some(preview) = &mut self.attachment_preview {
                     preview.error = Some(error);
                 }
             }
         }
+    }
+
+    /// `workspace.readFile` keeps the same press working when the draft targets
+    /// a linked machine; the reply's blob id downloads through `/v1/blobs`.
+    pub(crate) fn fetch_remote_preview(&mut self, remote: RemoteFile) {
+        let client = self
+            .client
+            .as_ref()
+            .and_then(|client| client.linked.get(&remote.machine));
+        let Some(client) = client else { return };
+        if !client.has_capability(crate::protocol::WORKSPACE_READ_FILE) {
+            let label = self.machine_label(&remote.machine);
+            self.composer_notices.push(
+                crate::composer_notices::Notice::new(
+                    "mention-preview-update",
+                    crate::composer_notices::Variant::Warning,
+                    "alert",
+                    format!("Update Shina on {label} to preview its files"),
+                )
+                .dismiss_label("Dismiss"),
+            );
+            return;
+        }
+        client.call_rpc(
+            format!("mention:preview:{}", self.file_preview_seq + 1),
+            "workspace.readFile",
+            json!({"cwd": remote.cwd, "path": remote.path.to_string_lossy()}),
+        );
+        self.file_preview_seq += 1;
+        let remote = RemoteFile {
+            request: self.file_preview_seq,
+            ..remote
+        };
+        let name = remote
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // A foreign path must never be opened locally, so the placeholder
+        // carries no path; the preview's `remote` lets Retry re-fetch.
+        let attachment = placeholder(format!("mention-remote-{}", remote.request), name, None);
+        self.preview_mention(attachment, Some(remote));
+        if let Some(preview) = &mut self.attachment_preview {
+            preview.loading = true;
+        }
+    }
+
+    /// A `mention:preview:{request}` RPC answer: apply it only while the
+    /// matching remote preview is still on screen.
+    pub(crate) fn apply_file_preview_result(
+        &mut self,
+        request: u64,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let Some(preview) = &self.attachment_preview else {
+            return;
+        };
+        let Some(remote) = preview.remote.clone() else {
+            return;
+        };
+        if remote.request != request || preview.thread != self.current().id {
+            return;
+        }
+        let cancel = preview.cancel.clone();
+        let descriptor = result.and_then(|descriptor| {
+            let id = descriptor["id"]
+                .as_str()
+                .filter(|id| crate::attachments::safe_file_id(id))
+                .ok_or("Invalid remote file descriptor.")?
+                .to_owned();
+            let name = descriptor["name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or("Invalid remote file descriptor.")?
+                .to_owned();
+            let mime = descriptor["mime"]
+                .as_str()
+                .filter(|mime| !mime.trim().is_empty())
+                .ok_or("Invalid remote file descriptor.")?
+                .to_owned();
+            let bytes = descriptor["bytes"]
+                .as_u64()
+                .filter(|bytes| *bytes > 0 && *bytes <= crate::attachments::MAX_FILE_BYTES)
+                .ok_or("Invalid remote file length.")?;
+            Ok((id, name, mime, bytes))
+        });
+        let (id, name, mime, bytes) = match descriptor {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                if let Some(preview) = &mut self.attachment_preview {
+                    preview.loading = false;
+                    preview.error = Some(error);
+                }
+                return;
+            }
+        };
+        let (Some(link), Some(handle)) = (
+            self.attachment_preview_link_on(&remote.machine),
+            self.background.handle.clone(),
+        ) else {
+            if let Some(preview) = &mut self.attachment_preview {
+                preview.loading = false;
+                preview.error =
+                    Some("The environment it came from is not reachable right now.".into());
+            }
+            return;
+        };
+        let profile = self.data_dir.clone();
+        std::thread::spawn(move || {
+            let fetched = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(crate::client::fetch_blob_file(
+                        &link, &profile, &id, &name, &mime, bytes,
+                    ))
+                });
+            handle.update(move |state, _| {
+                let Some(preview) = &mut state.attachment_preview else {
+                    return;
+                };
+                if !std::sync::Arc::ptr_eq(&preview.cancel, &cancel) {
+                    return;
+                }
+                preview.loading = false;
+                match fetched {
+                    Ok(attachment) => {
+                        preview.items[preview.index] = attachment;
+                        preview.load(state.wake.clone());
+                        state.finish_preview_load();
+                    }
+                    Err(error) => preview.error = Some(error),
+                }
+            });
+        });
     }
 }
 
@@ -210,7 +356,7 @@ mod tests {
         };
         s.press_composer_pill(&token.id());
         let preview = s.attachment_preview.as_ref().unwrap();
-        assert!(preview.transient && preview.error.is_none());
+        assert!(preview.transient && preview.remote.is_none() && preview.error.is_none());
         assert_eq!(preview.items[preview.index].name, "note.txt");
         assert!(s.current().draft_images.is_empty());
         // A missing file lands on the dialog's failure state.

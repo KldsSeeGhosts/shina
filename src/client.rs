@@ -1503,6 +1503,58 @@ async fn cache_images(
     file_error.map_or(Ok(()), Err)
 }
 
+/// Page one file blob out of a linked machine's `/v1/blobs` store, verify the
+/// content hash, and stage it in this machine's attachment store. The
+/// attachment hydration in `cache_files` and the composer mention preview both
+/// download through this single transfer path.
+pub(crate) async fn fetch_blob_file(
+    remote: &crate::peer::Link,
+    profile: &std::path::Path,
+    id: &str,
+    name: &str,
+    mime: &str,
+    length: u64,
+) -> Result<crate::attachments::Attachment, String> {
+    let http = crate::peer::http()?;
+    let address = remote.address()?;
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < length {
+        let response = http
+            .get(format!(
+                "http://{address}/v1/blobs/{id}?offset={}&limit={}",
+                bytes.len(),
+                protocol::PAGE_BYTES
+            ))
+            .bearer_auth(&remote.token)
+            .send()
+            .await
+            .map_err(|_| "The environment it came from is not reachable right now.")?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_none_or(|n| n > protocol::MAX_PAGE_BYTES as u64)
+        {
+            return Err("The original attachment is no longer available.".into());
+        }
+        let chunk = response
+            .bytes()
+            .await
+            .map_err(|_| "Downloading it from the source failed.")?;
+        if chunk.is_empty() || bytes.len() + chunk.len() > length as usize {
+            return Err("Invalid remote file length.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    use sha2::Digest;
+    if id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
+        return Err("File hash mismatch.".into());
+    }
+    crate::attachments::store_uploaded_file(&profile.join("attachments"), name, mime, &bytes)
+}
+
 /// KSG stages uploaded file resources per environment. Keep ordinary-file bytes in the
 /// same immutable content store as uploads, never trust the source machine's path.
 pub(crate) async fn cache_files(
@@ -1541,82 +1593,49 @@ pub(crate) async fn cache_files(
     }
     let mut paths = Vec::new();
     references(projected, String::new(), &mut paths);
-    let http = crate::peer::http()?;
     let mut failure = None;
     for path in paths {
-        let result: Result<(),String> = async {
-        let reference = projected.pointer(&path).ok_or("Missing file reference.")?;
-        let id = reference["id"]
-            .as_str()
-            .ok_or("Missing file id.")?
-            .to_owned();
-        let length = reference["bytes"]
-            .as_u64()
-            .filter(|n| *n > 0 && *n <= crate::attachments::MAX_FILE_BYTES)
-            .ok_or("Invalid file length.")?;
-        let local_path = profile.join("attachments").join(&id);
-        let mut local = reference.clone();
-        local["path"] = json!(local_path);
-        let valid =
-            std::fs::symlink_metadata(&local_path).is_ok_and(|m| m.is_file() && m.len() == length);
-        if !valid && !fetch {
-            // A foreign path may happen to exist locally. It is never a cached file.
+        let result: Result<(), String> = async {
+            let reference = projected.pointer(&path).ok_or("Missing file reference.")?;
+            let id = reference["id"]
+                .as_str()
+                .ok_or("Missing file id.")?
+                .to_owned();
+            let length = reference["bytes"]
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= crate::attachments::MAX_FILE_BYTES)
+                .ok_or("Invalid file length.")?;
+            let local_path = profile.join("attachments").join(&id);
+            let mut local = reference.clone();
+            local["path"] = json!(local_path);
+            let valid = std::fs::symlink_metadata(&local_path)
+                .is_ok_and(|m| m.is_file() && m.len() == length);
+            if !valid && !fetch {
+                // A foreign path may happen to exist locally. It is never a cached file.
+                *projected.pointer_mut(&path).unwrap() = local;
+                return Ok(());
+            }
+            if !valid {
+                local = fetch_blob_file(
+                    remote,
+                    profile,
+                    &id,
+                    reference["name"].as_str().ok_or("Missing file name.")?,
+                    reference["mime"]
+                        .as_str()
+                        .ok_or("Missing file MIME type.")?,
+                    length,
+                )
+                .await?
+                .to_value();
+                // Downloading bytes must not turn a lazy pasted-text file into a
+                // normal embeddable resource when it is copied into another draft.
+                local["source"] = reference["source"].clone();
+            }
             *projected.pointer_mut(&path).unwrap() = local;
-            return Ok(());
+            Ok(())
         }
-        if !valid {
-            let address = remote.address()?;
-            let mut bytes = Vec::new();
-            while (bytes.len() as u64) < length {
-                let response = http
-                    .get(format!(
-                        "http://{address}/v1/blobs/{id}?offset={}&limit={}",
-                        bytes.len(),
-                        protocol::PAGE_BYTES
-                    ))
-                    .bearer_auth(&remote.token)
-                    .send()
-                    .await
-                    .map_err(|_| "The environment it came from is not reachable right now.")?;
-                if matches!(response.status().as_u16(), 401 | 403) {
-                    return Err("Authentication denied. Reconnect this linked machine manually before fetching assets.".into());
-                }
-                if !response.status().is_success()
-                    || response
-                        .content_length()
-                        .is_none_or(|n| n > protocol::MAX_PAGE_BYTES as u64)
-                {
-                    return Err("The original attachment is no longer available.".into());
-                }
-                let chunk = response
-                    .bytes()
-                    .await
-                    .map_err(|_| "Downloading it from the source failed.")?;
-                if chunk.is_empty() || bytes.len() + chunk.len() > length as usize {
-                    return Err("Invalid remote file length.".into());
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            use sha2::Digest;
-            if id != format!("file-{:x}.bin", sha2::Sha256::digest(&bytes)) {
-                return Err("File hash mismatch.".into());
-            }
-            local = crate::attachments::store_uploaded_file(
-                &profile.join("attachments"),
-                reference["name"].as_str().ok_or("Missing file name.")?,
-                reference["mime"]
-                    .as_str()
-                    .ok_or("Missing file MIME type.")?,
-                &bytes,
-            )?
-            .to_value();
-            // Downloading bytes must not turn a lazy pasted-text file into a
-            // normal embeddable resource when it is copied into another draft.
-            local["source"] = reference["source"].clone();
-        }
-        *projected.pointer_mut(&path).unwrap() = local;
-        Ok(())
-        }.await;
+        .await;
         if let Err(error) = result {
             if error.starts_with("Authentication denied.") {
                 return Err(error);

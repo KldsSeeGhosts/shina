@@ -1551,6 +1551,11 @@ impl State {
                         .and_then(|s| s.parse::<u64>().ok())
                     {
                         self.handle_vcs_branches_rpc(req_id, result);
+                    } else if let Some(request) = tag
+                        .strip_prefix("mention:preview:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.apply_file_preview_result(request, result);
                     } else if tag.starts_with("mention:") {
                         crate::ui::composer_menu::apply_mention_result(self, &server, &tag, result);
                     } else if let Some(rest) = tag.strip_prefix("search:")

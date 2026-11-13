@@ -732,6 +732,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut vcs_worktrees = false;
     let mut provider_handoff = false;
     let mut workspace_search = false;
+    let mut workspace_read_file = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -840,6 +841,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         workspace_search = minor >= u64::from(protocol::WORKSPACE_SEARCH_MINOR);
                         if workspace_search {
                             capabilities.push(protocol::WORKSPACE_SEARCH);
+                        }
+                        workspace_read_file = minor >= u64::from(protocol::WORKSPACE_READ_FILE_MINOR);
+                        if workspace_read_file {
+                            capabilities.push(protocol::WORKSPACE_READ_FILE);
                         }
                         if minor >= u64::from(protocol::THREAD_TITLE_SEARCH_MINOR) {
                             capabilities.push(protocol::THREAD_TITLE_SEARCH);
@@ -967,6 +972,52 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 "Could not encode the workspace search result.".into()
                             })
                         }).await.unwrap_or_else(|_| Err("Workspace search failed.".into()))
+                    }
+                } else if method == "workspace.readFile" {
+                    if !workspace_read_file {
+                        Err("Update required. Update Shina on the client and server to preview workspace files.".into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        let cwd = args["cwd"].as_str().unwrap_or("").to_string();
+                        let path = args["path"].as_str().unwrap_or("").to_string();
+                        let database = shared.database.clone();
+                        let device = device.clone();
+                        let snapshots = shared.snapshots.clone();
+                        let directory = shared.directory.clone();
+                        tokio::task::spawn_blocking(move || {
+                            database.authorize(&device, "workspace.readFile", &json!({}))?;
+                            let snapshot = snapshots.borrow().clone();
+                            let roots: Vec<std::path::PathBuf> = snapshot["state"]["index"]["projects"]
+                                .as_array()
+                                .map(|projects| projects.iter()
+                                    .filter_map(|project| project["path"].as_str())
+                                    .map(std::path::PathBuf::from)
+                                    .collect())
+                                .unwrap_or_default();
+                            // Skill instruction paths this server reported may
+                            // live outside project roots; only those exact
+                            // paths bypass the root check.
+                            let skills: Vec<std::path::PathBuf> = snapshot["state"]["threads"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|thread| thread["skills"].as_array().into_iter().flatten())
+                                .filter_map(|skill| skill["path"].as_str())
+                                .map(std::path::PathBuf::from)
+                                .collect();
+                            let resolved = crate::workspace_search::resolve_read(&cwd, &path, &roots, &skills)?;
+                            let name = resolved
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            let mime = crate::attachment_intake::native_mime(&name);
+                            let stored = crate::attachments::store_read_file(
+                                &directory.join("attachments"), &resolved, &name, mime)?;
+                            // Revocation also fences an in-flight read.
+                            database.authorize(&device, "workspace.readFile", &json!({}))?;
+                            Ok(json!({"id":stored.id,"name":stored.name,"mime":stored.mime,"bytes":stored.bytes}))
+                        }).await.unwrap_or_else(|_| Err("Workspace file read failed.".into()))
                     }
                 } else if method == "project.writeFile" {
                     let args = params.get("args").unwrap_or(params);
@@ -3237,6 +3288,133 @@ mod tests {
                 &older_link,
                 "workspace.searchEntries",
                 json!({"cwd": "/", "query": "x", "limit": 80}),
+            )
+            .await;
+            assert!(refused.unwrap_err().contains("Update required"));
+        });
+    }
+
+    #[test]
+    fn workspace_read_file_reads_only_project_files_and_needs_the_capability() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("workspace-read").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            let root = fixture.shared.directory.join("project");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/deep.rs"), "fn deep() {}\n").unwrap();
+            let put = crate::client::remote_rpc(
+                &link,
+                "project.put",
+                json!({"path": root, "createFolder": false}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(put["status"], "accepted", "{put}");
+            let expected = crate::projects::normalize_path(&root);
+            wait_until(|| {
+                fixture.shared.snapshots.borrow()["state"]["index"]["projects"]
+                    .as_array()
+                    .is_some_and(|projects| projects.iter().any(|p| p["path"] == json!(expected)))
+            })
+            .await;
+
+            // A file inside the project returns a fetchable blob descriptor.
+            let read = crate::client::remote_rpc(
+                &link,
+                "workspace.readFile",
+                json!({"cwd": root, "path": "src/deep.rs"}),
+            )
+            .await
+            .unwrap();
+            let id = read["id"].as_str().unwrap();
+            assert!(crate::attachments::safe_file_id(id), "{read}");
+            assert_eq!(read["name"], "deep.rs");
+            assert_eq!(read["bytes"], "fn deep() {}\n".len() as u64);
+            // The bytes come back through the same paged blob transfer as attachments.
+            let address = link.address().unwrap();
+            let http = crate::peer::http().unwrap();
+            let page = http
+                .get(format!("http://{address}/v1/blobs/{id}?offset=0&limit=64"))
+                .bearer_auth(&link.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(page.bytes().await.unwrap(), &b"fn deep() {}\n"[..]);
+
+            // A relative path escaping the root and an absolute path outside
+            // every root are refused without reading.
+            assert!(
+                crate::client::remote_rpc(
+                    &link,
+                    "workspace.readFile",
+                    json!({"cwd": root, "path": "../escape"}),
+                )
+                .await
+                .is_err()
+            );
+            let foreign = fixture.shared.directory.join("outside.txt");
+            std::fs::write(&foreign, "secret").unwrap();
+            assert!(
+                crate::client::remote_rpc(
+                    &link,
+                    "workspace.readFile",
+                    json!({"cwd": root, "path": foreign}),
+                )
+                .await
+                .is_err()
+            );
+
+            #[cfg(unix)]
+            {
+                // A symlink inside the project resolving outside is refused.
+                let escape = fixture.shared.directory.join("escape-target.txt");
+                std::fs::write(&escape, "secret").unwrap();
+                std::os::unix::fs::symlink(&escape, root.join("linked.txt")).unwrap();
+                let refused = crate::client::remote_rpc(
+                    &link,
+                    "workspace.readFile",
+                    json!({"cwd": root, "path": "linked.txt"}),
+                )
+                .await;
+                assert!(refused.is_err(), "{refused:?}");
+            }
+
+            // A file over the 50 MiB bound is refused.
+            let large = root.join("large.bin");
+            std::fs::write(
+                &large,
+                vec![0u8; crate::attachments::MAX_FILE_BYTES as usize + 1],
+            )
+            .unwrap();
+            let over = crate::client::remote_rpc(
+                &link,
+                "workspace.readFile",
+                json!({"cwd": root, "path": "large.bin"}),
+            )
+            .await;
+            assert!(over.is_err(), "{over:?}");
+
+            // One minor below the gate the capability is absent and the request
+            // is refused, so older peers keep their previous behavior.
+            let older =
+                Fixture::with_minor("read-older", protocol::WORKSPACE_READ_FILE_MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(
+                !hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cap| cap == protocol::WORKSPACE_READ_FILE)
+            );
+            let refused = crate::client::remote_rpc(
+                &older_link,
+                "workspace.readFile",
+                json!({"cwd": "/", "path": "x"}),
             )
             .await;
             assert!(refused.unwrap_err().contains("Update required"));
